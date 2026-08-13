@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Env / secrets
+.env
+.env.local
+*.pem
+
+# Data / caches
+data/
+*.db
+*.sqlite3
+audio_cache/
+image_cache/
+chroma_db/
+
+# Node (web / desktop)
+node_modules/
+.next/
+out/
+dist-electron/
+*.tsbuildinfo
+package-lock.json
+
+# Electron
+apps/desktop/release/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
