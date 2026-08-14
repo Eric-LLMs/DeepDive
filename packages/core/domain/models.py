@@ -1,6 +1,6 @@
 """Domain entities.
 
-The new architecture uses UUID primary keys uniformly (the old project used INTEGER auto-increment; UUIDs suit multi-tenant/distributed scenarios better).
+Uses UUID primary keys uniformly (UUIDs suit multi-tenant/distributed scenarios).
 Entities are decoupled from the ORM and can be built from ORM objects via pydantic from_attributes.
 """
 from datetime import datetime

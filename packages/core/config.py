@@ -1,6 +1,6 @@
 """Application configuration.
 
-Reads from environment variables / .env via pydantic-settings, replacing the old project's config.py + config.yaml.
+Reads from environment variables / .env via pydantic-settings.
 Field names map one-to-one to the environment variables in .env (case-insensitive).
 """
 from pathlib import Path
@@ -19,20 +19,19 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://deepgloss:deepgloss@localhost:5432/deepgloss"
     redis_url: str = "redis://localhost:16379/0"
 
-    # ── LLM ──
+    # ── LLM (via LiteLLM gateway; the gateway routes the virtual model name) ──
     llm_api_key: str = ""
-    llm_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4o-mini"
+    llm_base_url: str = "http://localhost:4000/v1"
+    llm_model: str = "deepgloss-chat"
 
-    # ── TTS (falls back to LLM config when unset) ──
-    tts_api_key: str = ""
-    tts_base_url: str = ""
-    tts_model: str = "tts-1"
-    tts_voice: str = "alloy"
-    # edge-tts fallback voice (used when the OpenAI-compatible TTS fails)
-    edge_tts_voice: str = "en-US-AvaNeural"
+    # ── TTS (Kokoro-FastAPI service, OpenAI-compatible /v1/audio/speech) ──
+    tts_base_url: str = "http://localhost:8880/v1"
+    tts_api_key: str = "not-needed"   # Kokoro-FastAPI ignores auth; the openai SDK needs a non-empty key
+    tts_model: str = "kokoro"
+    tts_voice: str = "am_michael"
 
-    # ── Embedding ──
+    # ── Embedding (TEI service) ──
+    embedding_base_url: str = "http://localhost:8080"   # TEI /embed
     embedding_model: str = "BAAI/bge-m3"
     embedding_dim: int = 1024
 
@@ -41,6 +40,10 @@ class Settings(BaseSettings):
     rag_multi_query_n: int = 2          # number of additional query variants to generate
     rag_hyde: bool = False              # whether to enable HyDE (hypothetical document)
     reranker_model: str = ""            # cross-encoder rerank model name; empty string disables reranking
+
+    # ── Retrieval capability seam ──
+    retrieval_mode: str = "in_process"  # "in_process" (RAGPipeline) | "grpc" (retrieval service)
+    retrieval_grpc_addr: str = "localhost:15051"
 
     # ── STT ──
     stt_model: str = "whisper-1"
@@ -58,16 +61,6 @@ class Settings(BaseSettings):
     # ── Cache paths ──
     audio_cache_path: Path = Path("data/audio_cache")
     image_cache_path: Path = Path("data/image_cache")
-
-    @property
-    def tts_key(self) -> str:
-        """Independent TTS key; falls back to the LLM key by default."""
-        return self.tts_api_key or self.llm_api_key
-
-    @property
-    def tts_url(self) -> str:
-        """Independent TTS base_url; falls back to the LLM base_url by default."""
-        return self.tts_base_url or self.llm_base_url
 
 
 settings = Settings()

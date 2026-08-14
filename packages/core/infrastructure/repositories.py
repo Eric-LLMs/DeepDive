@@ -1,6 +1,6 @@
-"""SQLAlchemy async repository implementations (replacing the old project's SQLite DBManager).
+"""SQLAlchemy async repository implementations.
 
-Deduplication is implemented via "select-then-insert", replacing the old project's reliance on UNIQUE constraints + catching IntegrityError.
+Deduplication is implemented via "select-then-insert" rather than UNIQUE constraints + catching IntegrityError.
 """
 from uuid import UUID
 

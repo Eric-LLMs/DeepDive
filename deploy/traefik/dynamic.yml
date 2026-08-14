@@ -1,0 +1,25 @@
+# Traefik dynamic configuration (routers/services).
+#
+# Skeleton wiring:
+#   - HTTP:  `/api/*` -> api:8000 (FastAPI)
+#   - gRPC:  retrieval path -> retrieval:50051 (h2c, plaintext HTTP/2)
+http:
+  routers:
+    deepgloss-api:
+      entryPoints: ["web"]
+      rule: "PathPrefix(`/api`)"
+      service: deepgloss-api
+    deepgloss-retrieval:
+      entryPoints: ["grpc"]
+      rule: "PathPrefix(`/retrieval.v1.RetrievalService/`)"
+      service: deepgloss-retrieval
+
+  services:
+    deepgloss-api:
+      loadBalancer:
+        servers:
+          - url: "http://api:8000"
+    deepgloss-retrieval:
+      loadBalancer:
+        servers:
+          - url: "h2c://retrieval:50051"

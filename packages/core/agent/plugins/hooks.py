@@ -1,56 +1,32 @@
-"""Hook system: insert extension logic at key points in the Agent lifecycle.
+"""Event names + listener helpers for the tool runtime.
 
-Modeled after claude-code / openclaw: the Agent main flow is a hardcoded while loop (small, testable),
-with extension injected via hooks rather than splitting the flow into config nodes. Only RAG uses a config-node DAG.
+Hooks are expressed as named events on the :class:`EventBus`:
+
+- session: ``agent/session-start``, ``agent/session-end`` (observed by the loop);
+- tool lifecycle: ``tools/pre-execute``, ``tools/execute``, ``tools/post-execute`` (waterfall),
+  ``tools/result`` (observer).
+
+A plugin listener is a ``(kind, event, handler)`` tuple; the manager mounts it onto the bus.
 """
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
+
+# Event name constants
+SESSION_START = "agent/session-start"
+SESSION_END = "agent/session-end"
+PRE_TOOL_USE = "tools/pre-execute"
+TOOL_EXECUTE = "tools/execute"
+POST_TOOL_USE = "tools/post-execute"
+TOOL_RESULT = "tools/result"
+
+WaterfallListener = tuple[str, str, Callable[[Any, Callable[[], Awaitable[Any]]], Awaitable[Any]]]
+ObserverListener = tuple[str, str, Callable[[Any], Awaitable[None]]]
 
 
-class HookEvent(str, Enum):
-    SESSION_START = "session_start"
-    SESSION_END = "session_end"
-    PRE_TOOL_USE = "pre_tool_use"
-    POST_TOOL_USE = "post_tool_use"
-    PRE_COMPACT = "pre_compact"
+def waterfall(event: str, handler: Callable[[Any, Callable[[], Awaitable[Any]]], Awaitable[Any]]) -> WaterfallListener:
+    """Build a waterfall listener tuple ``(kind, event, handler)``."""
+    return ("waterfall", event, handler)
 
 
-@dataclass
-class HookContext:
-    """Context snapshot passed to a hook."""
-
-    event: HookEvent
-    tool_name: str | None = None
-    tool_args: dict | None = None
-    session_id: str | None = None
-    messages: list[dict] = field(default_factory=list)
-
-
-@dataclass
-class HookResult:
-    """The hook's decision result.
-
-    - continue: allow (default)
-    - block: deny (e.g. intercepting a destructive tool)
-    - modify: continue after rewriting arguments (e.g. auto-completion)
-    """
-
-    action: str = "continue"
-    updated_args: dict | None = None
-    new_messages: list[dict] = field(default_factory=list)
-    message: str | None = None
-
-
-@dataclass
-class Hook:
-    """A hook = the event it listens to + a handler + an optional matcher."""
-
-    event: HookEvent
-    handler: Callable[[HookContext], Awaitable[HookResult]]
-    matcher: Callable[[HookContext], bool] | None = None  # only takes effect on matching contexts
-
-    async def run(self, ctx: HookContext) -> HookResult:
-        if self.matcher and not self.matcher(ctx):
-            return HookResult()
-        return await self.handler(ctx)
+def observe(event: str, handler: Callable[[Any], Awaitable[None]]) -> ObserverListener:
+    """Build an observer listener tuple ``(kind, event, handler)``."""
+    return ("observe", event, handler)

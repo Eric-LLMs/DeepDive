@@ -1,7 +1,7 @@
 """RAG retrieval pipeline: rewrite → multi-channel recall → RRF fusion → rerank.
 
-Upgrades the HybridRetriever from the old application/rag.py into a composable pipeline,
-where each stage (rewrite / recall / rank) is an independent module that can be replaced or toggled separately.
+A composable pipeline where each stage (rewrite / recall / rank) is an independent module
+that can be replaced or toggled separately.
 """
 from core.ports.vector import EmbeddingPort
 from core.rag.query_rewrite import QueryRewriter, RewriteResult

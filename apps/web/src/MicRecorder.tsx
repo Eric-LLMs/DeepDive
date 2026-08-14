@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
 // In-browser mic recording with a live volume meter and local playback.
-// Mirrors the old Streamlit demo's "Record & Compare" mic widget.
 export default function MicRecorder() {
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState("");

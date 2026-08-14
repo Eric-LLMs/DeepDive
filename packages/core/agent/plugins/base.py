@@ -1,18 +1,20 @@
-"""Plugin: a packaging unit of a set of hooks + tools + skills.
+"""Plugin: a packaging unit of tools + skills + listeners + guards.
 
-A plugin can extend all three capabilities at once; registration only mounts schemas, execution is lazily triggered.
+A plugin extends every capability at once; the manager mounts each part into its runtime
+(tools → ToolRuntime, guards → ToolRuntime, listeners → EventBus, skills → SkillRegistry).
 """
 from dataclasses import dataclass, field
 
-from core.agent.plugins.hooks import Hook
+from core.agent.decisions import Guard
 from core.agent.skills import Skill
-from core.agent.tools import Tool
+from core.agent.tools import ToolDefinition
 
 
 @dataclass
 class Plugin:
     name: str
     description: str = ""
-    hooks: list[Hook] = field(default_factory=list)
-    tools: list[Tool] = field(default_factory=list)
+    tools: list[ToolDefinition] = field(default_factory=list)
     skills: list[Skill] = field(default_factory=list)
+    listeners: list = field(default_factory=list)  # (kind, event, handler) tuples
+    guards: list[Guard] = field(default_factory=list)

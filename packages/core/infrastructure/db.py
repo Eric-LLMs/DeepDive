@@ -1,6 +1,6 @@
 """Database engine + SQLAlchemy 2.0 async ORM models.
 
-Replaces the old project's SQLite (WAL + timeout). The new architecture uses the asyncpg async driver;
+Uses the asyncpg async driver;
 see docs/architecture.md for table/field names. This first lands the core learning-domain tables;
 materials/chunks/users/conversations etc. are added later at the Agent/RAG layer.
 """

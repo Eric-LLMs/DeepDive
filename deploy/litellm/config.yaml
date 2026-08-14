@@ -1,0 +1,22 @@
+# LiteLLM Proxy configuration for DeepGloss.
+#
+# The API calls one virtual model name (`deepgloss-chat`) against this gateway. LiteLLM
+# maps it to the real upstream provider using the LLM_UPSTREAM_* env vars injected by
+# docker-compose, so swapping providers is a config change, not a code change.
+#
+# `os.environ/KEY` values are resolved by LiteLLM at startup from the container env.
+
+model_list:
+  - model_name: deepgloss-chat               # virtual name the API uses (LLM_MODEL)
+    litellm_params:
+      model: os.environ/LLM_UPSTREAM_MODEL   # e.g. openai/o3-mini, openai/gpt-4o-mini
+      api_base: os.environ/LLM_UPSTREAM_BASE # upstream OpenAI-compatible base URL
+      api_key: os.environ/LLM_UPSTREAM_KEY   # upstream provider key
+
+litellm_settings:
+  drop_params: true         # ignore params the upstream model doesn't accept
+  num_retries: 2
+  request_timeout: 120
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY  # key the API uses to call this gateway

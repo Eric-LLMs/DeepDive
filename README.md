@@ -71,78 +71,73 @@ Toggle terms with smooth switches, rate importance with star icons, click to edi
 - **Unified Visuals**: Star levels are managed via intuitive icon pickers (⭐) instead of raw numbers.
 - **Transactional Page Commits**: Commit all modifications on a single page with one click for high-speed bulk updates while maintaining data integrity.
 - **Global Operation Flow**: Perform global sorting across the entire database and save changes page-by-page.
-- **Self-Healing Logic**: Automatically deduplicates legacy "dirty data" in matches to ensure UI stability.
+- **Self-Healing Logic**: Automatically deduplicates duplicate matches to keep the UI stable.
 
 ### 💬 AI Chat Assistant
-- **Native Function-Calling Agent**: An explicit loop (no LangChain/LangGraph) that calls tools and folds results back into the conversation.
+- **Native Function-Calling Agent**: An explicit loop that calls tools and folds results back into the conversation.
 - **RAG Retrieval**: query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank.
 - **MCP Tool Integration**: Tools are defined once and shared by the Agent, RAG, and MCP (FastMCP).
 - **SSE Streaming**: Real-time token streaming to the frontend.
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Getting Started (from zero)
 
 ### 1. Prerequisites
 
-- **Python 3.11+**
-- **Node.js 18+** (for the web frontend)
-- **Docker** (for PostgreSQL + Redis)
+- **Docker Desktop** — runs PostgreSQL, Redis, and the model services (embedding / rerank / TTS / LLM gateway).
+- **Conda** (Miniconda or Anaconda) — the backend runs in a `deepgloss` env.
+- **Node.js 18+** — for the web frontend (optional; the API runs without it).
+- **Git**.
 
-### 2. Clone the Repository
+### 2. Clone the repository
 
 ```bash
 git clone https://github.com/Eric-LLMs/DeepGloss.git
 cd DeepGloss
 ```
 
-### 3. Configure Environment
-
-Create a `.env` file from the template and fill in your keys:
+### 3. Create & activate the conda environment
 
 ```bash
-cp .env.example .env
+conda create -n deepgloss python=3.11 -y
+conda activate deepgloss
 ```
 
-Key variables:
-
-```env
-# Database / Redis
-DATABASE_URL=postgresql+asyncpg://deepgloss:deepgloss@localhost:5432/deepgloss
-REDIS_URL=redis://localhost:16379/0
-
-# LLM (OpenAI-compatible)
-LLM_API_KEY=sk-...
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=gpt-4o-mini
-
-# Embedding
-EMBEDDING_MODEL=BAAI/bge-m3
-EMBEDDING_DIM=1024
-
-# TTS (leave TTS_API_KEY/TTS_BASE_URL empty to fall back to the LLM config, or use edge-tts)
-TTS_MODEL=tts-1-hd
-TTS_VOICE=alloy
-```
-
-### 4. Start the Database (PostgreSQL + pgvector + Redis)
+### 4. Configure environment
 
 ```bash
-docker compose up -d
+cp .env.example .env      # Windows: copy .env.example .env
 ```
 
-### 5. Install Backend Dependencies
+Fill in `LLM_UPSTREAM_KEY` (your real OpenAI-compatible key). Every other variable has a working local-dev default — see the [configuration reference](#-configuration-reference) below.
+
+### 5. Install backend dependencies
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]"     # runtime + test tooling (== pip install -r requirements-dev.txt)
+pip install -e ".[rag]"     # optional: RAG semantic search (pulls torch / sentence-transformers)
+```
 
-# (optional) RAG semantic search — pulls in sentence-transformers + torch
-pip install -e ".[rag]"
+### 6. Start infrastructure (data + model services)
 
+```bash
+docker compose up -d postgres redis embedding tts llm-gateway
+```
+
+The first start downloads the models (BGE-M3, Kokoro-82M) into Docker volumes — allow a few minutes. The LLM gateway routes the virtual model `deepgloss-chat` to `LLM_UPSTREAM_MODEL` using `LLM_UPSTREAM_KEY`.
+
+> Skip `embedding` if you don't use semantic search, and `tts` if you don't need audio — the API degrades gracefully.
+>
+> **Docker Desktop (Windows) memory note:** the TEI embedding service needs ~9 GB during BGE-M3 warmup. If Docker's WSL2 backend has only ~8 GB (the default on a 16 GB host), the container gets OOM-killed. Raise the limit in `%UserProfile%\.wslconfig`, e.g. `[wsl2]\nmemory=12GB\nswap=4GB`, then run `wsl --shutdown` and restart Docker Desktop.
+
+### 7. Initialize the database
+
+```bash
 python scripts/init_db.py
 ```
 
-### 6. Run the API
+### 8. Run the API
 
 ```bash
 uvicorn api.main:app --reload
@@ -150,7 +145,30 @@ uvicorn api.main:app --reload
 
 Open http://localhost:8000/docs for the interactive API documentation.
 
-### 7. Run the Web Frontend
+### 9. (Optional) gRPC retrieval service
+
+The default `retrieval_mode` is `in_process` (RAG runs inside the API). To run retrieval as a separate gRPC service:
+
+```bash
+bash scripts/gen_proto.sh        # generates retrieval.v1 stubs into packages/shared/proto/
+python -m apps.retrieval.main    # starts the gRPC server on localhost:15051
+```
+
+Then set `RETRIEVAL_MODE=grpc` in `.env` and restart the API:
+
+```bash
+RETRIEVAL_MODE=grpc uvicorn api.main:app --reload
+```
+
+The `rag_search` tool now calls the retrieval service over gRPC instead of the in-process RAG pipeline — no tool code changes (the capability seam does the swap).
+
+### 10. Run the tests
+
+```bash
+pytest
+```
+
+### 11. Run the web frontend (optional)
 
 ```bash
 cd apps/web
@@ -159,6 +177,22 @@ npm run dev
 ```
 
 Open http://localhost:5173. The Vite dev server proxies `/api`, `/audio`, and `/images` to the backend.
+
+---
+
+## ⚙️ Configuration reference
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | `postgresql+asyncpg://deepgloss:deepgloss@localhost:5432/deepgloss` | PostgreSQL + pgvector |
+| `REDIS_URL` | `redis://localhost:16379/0` | cache / queue |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | `sk-local-gateway` / `http://localhost:4000/v1` / `deepgloss-chat` | the LiteLLM gateway the API talks to |
+| `LLM_UPSTREAM_MODEL` / `LLM_UPSTREAM_BASE` / `LLM_UPSTREAM_KEY` | `openai/gpt-4o-mini` / `https://api.openai.com/v1` / `sk-xxx` | real upstream LLM (consumed by the gateway container) |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `http://localhost:8080` / `BAAI/bge-m3` / `1024` | TEI embedding service |
+| `TTS_BASE_URL` / `TTS_MODEL` / `TTS_VOICE` | `http://localhost:8880/v1` / `kokoro` / `am_michael` | Kokoro-FastAPI TTS service |
+| `RETRIEVAL_MODE` / `RETRIEVAL_GRPC_ADDR` | `in_process` / `localhost:15051` | capability seam: `in_process` or `grpc` |
+
+Model inference never runs inside the API process. Swapping a model = change `--model-id` in `docker-compose.yml` and the matching `*_BASE_URL` / dim in `.env` — no business-code change. See [docs/architecture.md](docs/architecture.md) for the full topology.
 
 ---
 

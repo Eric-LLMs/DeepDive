@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package retrieval.v1;
+
+// RetrievalService owns the whole retrieval stack (embedding, vector/FTS recall,
+// RRF fusion, cross-encoder rerank, query rewrite). The API process talks to it over
+// gRPC instead of loading the RAG pipeline in-process.
+service RetrievalService {
+  // Retrieve the top_k text chunks for a query.
+  rpc Retrieve(RetrieveRequest) returns (RetrieveResponse);
+  // Liveness/readiness probe.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message RetrieveRequest {
+  string query = 1;
+  int32 top_k = 2;               // 0 means "use the service default" (5).
+  map<string, string> filters = 3;  // e.g. {"material_id": "..."}
+}
+
+message RetrieveResponse {
+  repeated SearchHit hits = 1;
+}
+
+message SearchHit {
+  string id = 1;
+  string text = 2;
+  double score = 3;
+  string meta = 4;  // JSON-encoded metadata (optional).
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+}

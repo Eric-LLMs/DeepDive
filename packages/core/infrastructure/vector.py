@@ -1,29 +1,29 @@
-"""Embedding implementation (BGE-M3, based on sentence-transformers) + pgvector vector store."""
-import json
+"""Embedding via the TEI (Text Embeddings Inference) service + pgvector vector store."""
 import uuid
 
+import httpx
 from sqlalchemy import select
 
 from core.config import settings
 from core.infrastructure.db import ChunkModel
 
 
-class SentenceTransformerEmbedder:
-    def __init__(self, model_name: str | None = None) -> None:
-        self.model_name = model_name or settings.embedding_model
-        self._model = None
+class TEIEmbedder:
+    """Client for a TEI service serving BGE-M3 (``POST /embed``).
 
-    def _load(self):
-        # Lazy import + load: sentence-transformers pulls in torch (~2GB); only load when embedding
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
+    The embedding model runs in a separate container; this client only POSTs texts and
+    returns vectors, so the API never loads the (heavy) model and model updates don't
+    require an API restart.
+    """
 
-            self._model = SentenceTransformer(self.model_name)
-        return self._model
+    def __init__(self, base_url: str | None = None) -> None:
+        self.base_url = base_url or settings.embedding_base_url
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=120.0)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        # sentence-transformers is synchronous; in a real service it should run in a thread pool (anyio.to_thread)
-        return self._load().encode(texts, normalize_embeddings=True).tolist()
+        resp = await self._client.post("/embed", json={"inputs": texts, "normalize": True})
+        resp.raise_for_status()
+        return resp.json()
 
 
 class PgVectorStore:

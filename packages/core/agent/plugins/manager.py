@@ -1,33 +1,45 @@
-"""Plugin manager: registration + directory discovery + hook dispatch.
+"""Plugin manager: register plugins into the ToolRuntime + EventBus + SkillRegistry.
 
-Registration != execution: register() only mounts schemas (hook/tool/skill) into their registries at very low cost;
-actual execution happens when the Agent loop triggers a hook / calls a tool.
+Registration is reversible: every mount returns a disposer, collected per-plugin so that
+``unregister`` can roll a plugin back cleanly.
 """
 import importlib.util
 from pathlib import Path
 
 from core.agent.plugins.base import Plugin
-from core.agent.plugins.hooks import HookContext, HookEvent, HookResult
+from core.agent.runtime import ToolRuntime
 from core.agent.skills import SkillRegistry
-from core.agent.tools import ToolRegistry
 
 
 class PluginManager:
-    def __init__(self, tools: ToolRegistry, skills: SkillRegistry) -> None:
-        self.tools = tools
+    def __init__(self, runtime: ToolRuntime, skills: SkillRegistry) -> None:
+        self.runtime = runtime
         self.skills = skills
         self._plugins: dict[str, Plugin] = {}
-        self._hooks: dict[HookEvent, list] = {}
+        self._disposers: dict[str, list] = {}
 
     def register(self, plugin: Plugin) -> None:
-        """Register a plugin (lazy: only mounts schemas, executes no handlers)."""
+        """Mount a plugin's tools/guards/listeners/skills; collect disposers."""
         self._plugins[plugin.name] = plugin
+        disposers: list = []
         for tool in plugin.tools:
-            self.tools.register(tool)
+            disposers.append(self.runtime.register(tool))
         for skill in plugin.skills:
             self.skills.register(skill)
-        for hook in plugin.hooks:
-            self._hooks.setdefault(hook.event, []).append(hook)
+        for guard in plugin.guards:
+            disposers.append(self.runtime.guard(guard))
+        for kind, event, handler in plugin.listeners:
+            if kind == "waterfall":
+                disposers.append(self.runtime.events.on(event, handler))
+            else:
+                disposers.append(self.runtime.events.observe(event, handler))
+        self._disposers[plugin.name] = disposers
+
+    def unregister(self, name: str) -> None:
+        """Roll back a plugin by running its collected disposers."""
+        for dispose in self._disposers.pop(name, []):
+            dispose()
+        self._plugins.pop(name, None)
 
     def get(self, name: str) -> Plugin | None:
         return self._plugins.get(name)
@@ -54,22 +66,3 @@ class PluginManager:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return getattr(module, "PLUGIN", None)
-
-    async def dispatch(
-        self, event: HookEvent, ctx: HookContext
-    ) -> tuple[bool, dict | None, list[dict]]:
-        """Trigger all hooks for this event in registration order, returns (blocked, updated_args, new_messages)."""
-        blocked = False
-        updated_args: dict | None = None
-        new_messages: list[dict] = []
-        for hook in self._hooks.get(event, []):
-            result: HookResult = await hook.run(ctx)
-            if result.action == "block":
-                blocked = True
-                if result.message:
-                    new_messages.append({"role": "system", "content": result.message})
-                break
-            if result.updated_args:
-                updated_args = {**(updated_args or {}), **result.updated_args}
-            new_messages.extend(result.new_messages)
-        return blocked, updated_args, new_messages

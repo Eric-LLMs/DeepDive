@@ -1,7 +1,6 @@
-"""OpenAI-compatible LLM implementation (with real streaming).
+"""LLM client for a chat-completions HTTP API, with real streaming.
 
-Fixes the old project's "fake streaming": the old llm_client's get_completion did not accept a stream parameter,
-so study_dialog passing stream=True would raise TypeError and fall back to sync. Here streaming is truly implemented.
+The endpoint, key, and model are read from configuration.
 """
 import json
 from typing import AsyncIterator
@@ -53,7 +52,7 @@ class OpenAILLM:
                 yield chunk.choices[0].delta.content
 
     async def generate_definition(self, term: str) -> str:
-        """Generate an English definition + Chinese translation for a term (based on the old project's study_dialog definition generation)."""
+        """Generate an English definition + Chinese translation for a term."""
         prompt = (
             f"Provide a clear, concise English definition and its Chinese translation "
             f"for the term '{term}'."
@@ -61,7 +60,7 @@ class OpenAILLM:
         return await self.complete(prompt, "You are a helpful dictionary assistant. Output only the definition.")
 
     async def analyze_syntax(self, sentence: str) -> str:
-        """Syntactic/semantic analysis, returns Markdown (based on the old project's study_dialog syntax analysis template)."""
+        """Syntactic/semantic analysis, returns Markdown."""
         prompt = (
             "Please perform a professional syntactic and semantic analysis for the following "
             "sentence, specifically tailored for an industry/technical context.\n"

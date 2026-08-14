@@ -1,11 +1,10 @@
-"""TTS implementation with content-hash caching + free edge-tts fallback.
+"""TTS client for the Kokoro-FastAPI service (OpenAI-compatible ``/v1/audio/speech``).
 
-Primary path: OpenAI-compatible ``/v1/audio/speech`` (via the configured TTS base URL/key).
-Fallback: Microsoft Edge TTS (``edge-tts``), free and key-less, used when the primary path
-fails (e.g. the gateway has no TTS channel) or no TTS key is configured.
+The Kokoro model runs in a separate container; this client only POSTs text and caches the
+returned audio locally (content-hash keyed). The API process never loads the model, so
+swapping or updating the TTS model never requires an API restart.
 
-Cache key = md5(text_<provider-specific suffix>); on a hit the path is returned directly,
-avoiding repeated API cost.
+Cache key = md5(kokoro_text_<voice>_<model>); on a hit the cached .wav path is returned.
 """
 import hashlib
 
@@ -14,40 +13,31 @@ from openai import AsyncOpenAI
 from core.config import settings
 
 
-class OpenAITTS:
+class TTSClient:
     def __init__(
         self,
-        api_key: str | None = None,
         base_url: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         self.client = AsyncOpenAI(
-            base_url=base_url or settings.tts_url,
-            api_key=api_key or settings.tts_key,
+            base_url=base_url or settings.tts_base_url,
+            api_key=api_key or settings.tts_api_key,
         )
         self.output_dir = settings.audio_cache_path
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _hash(text: str, suffix: str) -> str:
-        raw = f"{text}_{suffix}"
+        # "kokoro" prefix namespaces the local WAV cache so it won't collide with other audio.
+        raw = f"kokoro_{text}_{suffix}"
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
     async def synthesize(self, text: str) -> str | None:
         if not text or not text.strip():
             return None
 
-        # Primary: OpenAI-compatible TTS (only when a key is configured).
-        if settings.tts_key:
-            path = await self._synthesize_openai(text)
-            if path:
-                return path
-
-        # Fallback: free edge-tts (always available, no key required).
-        return await self._synthesize_edge(text)
-
-    async def _synthesize_openai(self, text: str) -> str | None:
-        suffix = f"{settings.tts_model}_{settings.tts_voice}"
-        file_path = self.output_dir / f"{self._hash(text, suffix)}.mp3"
+        suffix = f"{settings.tts_voice}_{settings.tts_model}"
+        file_path = self.output_dir / f"{self._hash(text, suffix)}.wav"
         if file_path.exists():
             return str(file_path)
 
@@ -56,22 +46,9 @@ class OpenAITTS:
                 model=settings.tts_model,
                 voice=settings.tts_voice,
                 input=text,
+                response_format="wav",
             )
-            resp.stream_to_file(file_path)
-            return str(file_path)
-        except Exception:
-            return None
-
-    async def _synthesize_edge(self, text: str) -> str | None:
-        import edge_tts
-
-        suffix = f"edge_{settings.edge_tts_voice}"
-        file_path = self.output_dir / f"{self._hash(text, suffix)}.mp3"
-        if file_path.exists():
-            return str(file_path)
-
-        try:
-            await edge_tts.Communicate(text, settings.edge_tts_voice).save(str(file_path))
+            file_path.write_bytes(resp.content)
             return str(file_path)
         except Exception:
             return None

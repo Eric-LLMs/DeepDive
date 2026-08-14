@@ -1,117 +1,109 @@
-"""Tool registry: single source of truth for Agent / RAG / MCP.
+"""Typed tool definition: ``define_tool()`` separates canonical output from model-visible content.
 
-A tool is defined once (name + JSON Schema + handler) and shared by three consumers:
-- Agent (function-calling): get_for_agent()
-- MCP (FastMCP): all()
-- Direct internal invocation: call()
-
-Registration != execution: register() only mounts the schema; the handler actually runs only when called.
+``define_tool()`` is a plain function returning a ``ToolDefinition`` whose ``output`` has
+two parts: ``schema`` (the canonical value's JSON Schema) and ``render`` (``(args, value)`` →
+content blocks the model sees). This keeps that split and wraps the user ``execute`` so
+that args are validated before the body runs and the output is validated/rendered after it.
 """
-import json
+from __future__ import annotations
+
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from jsonschema import Draft7Validator
+
+from core.agent.decisions import ContentBlock, ToolExecution
+
+
+class ToolArgsError(ValueError):
+    """Raised when tool arguments fail their JSON Schema validation."""
+
+
+class ToolOutputError(ValueError):
+    """Raised when the tool's canonical output fails its JSON Schema validation."""
+
+
+def _validate(schema: dict, instance: Any) -> list[str]:
+    """Return human-readable validation errors (empty list = valid)."""
+    if not schema:
+        return []
+    errors = Draft7Validator(schema).iter_errors(instance)
+    return [
+        f"{'->'.join(map(str, e.absolute_path)) or '<root>'}: {e.message}" for e in errors
+    ]
+
+
+def _empty_render(args: dict, value: Any) -> list[ContentBlock]:
+    return []
+
 
 @dataclass
-class ToolResult:
-    """Tool execution result. Either data or error; new_messages lets the tool inject extra messages."""
+class ToolOutput:
+    """The output contract: canonical value schema + model-visible renderer."""
 
-    data: Any = None
-    error: str | None = None
-    new_messages: list[dict] = field(default_factory=list)
-
-    @property
-    def ok(self) -> bool:
-        return self.error is None
-
-    def to_json(self) -> str:
-        """Serialize into a tool message string to feed the LLM."""
-        payload = {"error": self.error} if self.error else {"result": self.data}
-        return json.dumps(payload, ensure_ascii=False, default=str)
+    schema: dict = field(default_factory=dict)
+    render: Callable[[dict, Any], list[ContentBlock]] = _empty_render
 
 
 @dataclass
-class Tool:
+class ToolDefinition:
+    """A tool: schema + render + body (the user ``execute``)."""
+
     name: str
     description: str
-    parameters: dict  # JSON Schema (OpenAI function-calling format)
-    handler: Callable[..., Awaitable[Any]]
-    readonly: bool = True       # read-only tools do not modify external state
-    destructive: bool = False   # destructive tools require hook approval before execution
+    parameters: dict
+    output: ToolOutput
+    execute: Callable[[dict, ToolExecution], Awaitable[Any]]
+    destructive: bool = False
+    is_concurrency_safe: bool | None = None
+
+    def schema(self) -> dict:
+        """Model-visible projection (name/description/parameters only; no execute/render)."""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        }
 
 
-class ToolRegistry:
-    def __init__(self) -> None:
-        self._tools: dict[str, Tool] = {}
+def define_tool(
+    *,
+    name: str,
+    description: str,
+    parameters: dict,
+    output: ToolOutput,
+    execute: Callable[[dict, ToolExecution], Awaitable[Any]],
+    destructive: bool = False,
+    is_concurrency_safe: bool | None = None,
+) -> ToolDefinition:
+    """Define a tool.
 
-    def register(self, tool: Tool) -> None:
-        self._tools[tool.name] = tool
+    - ``parameters``: JSON Schema for the tool arguments (OpenAI function-calling format).
+    - ``output``: a :class:`ToolOutput` carrying the canonical value schema + a renderer.
+    - ``execute``: ``async (args, exec) -> value`` — the actual body.
 
-    def all(self) -> list[Tool]:
-        return list(self._tools.values())
+    The returned ``ToolDefinition.execute`` wraps the user body: validate args → run body →
+    validate output. Validation failures are raised as :class:`ToolArgsError` /
+    :class:`ToolOutputError` (converted into a ``ToolFailure`` by the runtime).
+    """
 
-    def get(self, name: str) -> Tool | None:
-        return self._tools.get(name)
+    async def _execute(args: dict, exec: ToolExecution) -> Any:
+        arg_errors = _validate(parameters, args)
+        if arg_errors:
+            raise ToolArgsError("; ".join(arg_errors))
+        value = await execute(args, exec)
+        out_errors = _validate(output.schema, value)
+        if out_errors:
+            raise ToolOutputError("; ".join(out_errors))
+        return value
 
-    def get_for_agent(self) -> list[dict]:
-        """Convert into the OpenAI function-calling tools parameter."""
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                },
-            }
-            for t in self._tools.values()
-        ]
-
-    async def call(self, name: str, args: dict) -> ToolResult:
-        """Execute a tool, folding exceptions into ToolResult(error)."""
-        tool = self._tools.get(name)
-        if tool is None:
-            return ToolResult(error=f"Unknown tool: {name}")
-        try:
-            return ToolResult(data=await tool.handler(**args))
-        except Exception as exc:  # noqa: BLE001 - tool errors need to be converted into readable results fed back to the LLM
-            return ToolResult(error=str(exc))
-
-
-def build_default_tools(retriever, llm) -> ToolRegistry:
-    """Assemble default tools: rag_search + translate. Add vocabulary/sentence tools following this pattern."""
-    registry = ToolRegistry()
-
-    registry.register(
-        Tool(
-            name="rag_search",
-            description="Search learning material (text chunks) for information relevant "
-            "to the query. Returns matching chunks.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query."},
-                    "top_k": {"type": "integer", "description": "Number of results."},
-                },
-                "required": ["query"],
-            },
-            handler=retriever.retrieve,
-        )
+    return ToolDefinition(
+        name=name,
+        description=description,
+        parameters=parameters,
+        output=output,
+        execute=_execute,
+        destructive=destructive,
+        is_concurrency_safe=is_concurrency_safe,
     )
-
-    registry.register(
-        Tool(
-            name="translate",
-            description="Translate English text into natural, fluent Chinese.",
-            parameters={
-                "type": "object",
-                "properties": {"text": {"type": "string", "description": "English text to translate."}},
-                "required": ["text"],
-            },
-            handler=lambda text: llm.complete(
-                text, "You are a translator. Translate the text into natural Chinese."
-            ),
-        )
-    )
-
-    return registry

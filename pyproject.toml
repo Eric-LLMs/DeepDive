@@ -29,8 +29,8 @@ dependencies = [
     "openai>=1.30",
     "litellm>=1.40",
     "tenacity>=8.2",
-    # TTS fallback (free, key-less Microsoft Edge voices)
-    "edge-tts>=7.0",
+    # NOTE: TTS (Kokoro) and embedding (BGE-M3) run as separate Docker services;
+    # the API only calls them over HTTP via `openai` / `httpx` (declared above).
     # MCP
     "fastmcp>=0.2",
     # gRPC (internal)
@@ -38,6 +38,7 @@ dependencies = [
     "grpcio-tools>=1.62",
     # Misc
     "httpx>=0.27",
+    "jsonschema>=4.21",
 ]
 
 [project.optional-dependencies]

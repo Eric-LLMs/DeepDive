@@ -1,0 +1,25 @@
+# Traefik static configuration (gateway skeleton).
+#
+# Entrypoints:
+#   - web:  edge HTTP (FastAPI REST/SSE)
+#   - grpc: internal gRPC (retrieval service), plaintext HTTP/2 (h2c)
+#
+# The file provider watches ./dynamic for router/service definitions, so routes can be
+# added without restarting Traefik.
+entryPoints:
+  web:
+    address: ":80"
+  grpc:
+    address: ":50052"
+
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+api:
+  dashboard: true
+  insecure: true
+
+log:
+  level: INFO

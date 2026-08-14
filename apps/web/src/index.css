@@ -38,7 +38,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* ── Streamlit-style headings ── */
+/* ── Headings ── */
 h1 {
   margin: 0;
   padding: 20px 0 16px;
@@ -352,7 +352,7 @@ a.back:hover {
   border: 1px solid #bfdbfe;
 }
 
-/* ── Info box (Streamlit st.info style) ── */
+/* ── Info box ── */
 .info {
   background: rgba(28, 131, 255, 0.1);
   border-radius: 8px;
@@ -372,7 +372,7 @@ a.back:hover {
   color: inherit;
 }
 
-/* ── Success box (Streamlit st.success style) ── */
+/* ── Success box ── */
 .success {
   background: rgba(46, 173, 40, 0.1);
   border-radius: 8px;
@@ -500,7 +500,7 @@ code {
   background: #f9fafb;
 }
 
-/* ── Streamlit st.table style (grid lines + row index column) ── */
+/* ── Table (grid lines + row index column) ── */
 .st-table {
   width: 100%;
   border-collapse: collapse;
@@ -590,7 +590,7 @@ code {
   color: var(--text);
 }
 
-/* ── Tabs (Streamlit st.tabs style) ── */
+/* ── Tabs ── */
 .tabs {
   display: flex;
   gap: 8px;
@@ -754,8 +754,8 @@ button.tab.active:hover {
   padding: 96px 80px 160px;
 }
 
-/* ── Streamlit header bar (Deploy + ⋮ menu) ── */
-.streamlit-header {
+/* ── Header bar (Deploy + ⋮ menu) ── */
+.topbar {
   position: fixed;
   top: 0;
   right: 0;
@@ -766,7 +766,7 @@ button.tab.active:hover {
   padding: 0 24px;
   z-index: 40;
 }
-.streamlit-header .header-btn {
+.topbar .header-btn {
   font-size: 13px;
   padding: 4px 12px;
   line-height: 1.4;
@@ -775,7 +775,7 @@ button.tab.active:hover {
   background: #ffffff;
   color: #31333f;
 }
-.streamlit-header .header-menu {
+.topbar .header-menu {
   padding: 4px 9px;
   font-size: 15px;
 }
@@ -838,7 +838,7 @@ input[type="file"]::file-selector-button:hover {
   border-color: var(--border-strong);
 }
 
-/* ── Streamlit-style widget field + label ── */
+/* ── Widget field + label ── */
 .field {
   margin-bottom: 16px;
 }
@@ -853,7 +853,7 @@ input[type="file"]::file-selector-button:hover {
   width: 100%;
 }
 
-/* ── Streamlit file uploader dropzone ── */
+/* ── File uploader dropzone ── */
 .file-dropzone {
   border: 1px dashed rgba(49, 51, 63, 0.4);
   border-radius: 8px;
@@ -885,7 +885,7 @@ input[type="file"]::file-selector-button:hover {
   color: rgba(49, 51, 63, 0.6);
 }
 
-/* ── Streamlit-style green note box ── */
+/* ── Green note box ── */
 .note {
   background: #f0fdf4;
   border-left: 5px solid #22c55e;

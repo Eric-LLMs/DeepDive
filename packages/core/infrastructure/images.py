@@ -1,4 +1,4 @@
-"""Contextual image scraping (Google Images → Bing fallback), ported from the old project.
+"""Contextual image scraping (Google Images → Bing fallback).
 
 Downloads the top image for each of several query variants (term alone, term+definition,
 term+context), caches them under the image cache dir, and returns URL paths.

@@ -1,17 +1,17 @@
-"""Agent main loop: hardcoded while loop + hook extension points.
+"""Agent main loop: an explicit while loop delegating tool lifecycle to the ToolRuntime.
 
-Modeled after claude-code / openclaw: the main flow is an explicit while loop (small, testable),
-with extension injected via hooks (SESSION_START / PRE_TOOL_USE / POST_TOOL_USE / SESSION_END),
-rather than splitting the flow into config nodes. Only RAG uses a config-node DAG.
+The loop stays small and testable; the tool lifecycle (pre/execute/post/result) is a single
+:meth:`ToolRuntime.execute` call. Session-level hooks (``agent/session-start`` /
+``agent/session-end``) are the loop's own extension points, mirroring the agent session
+lifecycle.
 """
 import json
 from dataclasses import dataclass
 from typing import Protocol
 
 from core.agent.context import ContextBuilder
-from core.agent.plugins.hooks import HookContext, HookEvent
-from core.agent.plugins.manager import PluginManager
-from core.agent.tools import ToolRegistry
+from core.agent.decisions import ToolExecution, ToolExecutionResult
+from core.agent.runtime import ToolRuntime
 
 
 class AgentLLMPort(Protocol):
@@ -30,16 +30,15 @@ class Agent:
     def __init__(
         self,
         llm: AgentLLMPort,
-        registry: ToolRegistry,
-        plugins: PluginManager | None = None,
+        runtime: ToolRuntime,
         context: ContextBuilder | None = None,
         max_steps: int = 5,
     ) -> None:
         self.llm = llm
-        self.registry = registry
-        self.plugins = plugins
+        self.runtime = runtime
         self.context = context
         self.max_steps = max_steps
+        self.events = runtime.events
 
     async def run(
         self,
@@ -53,8 +52,8 @@ class Agent:
         else:
             messages = (history or []) + [{"role": "user", "content": user_msg}]
 
-        tools = self.registry.get_for_agent()
-        await self._dispatch(HookEvent.SESSION_START, HookContext(event=HookEvent.SESSION_START, messages=messages))
+        tools = [{"type": "function", "function": s} for s in self.runtime.schemas()]
+        await self.events.serial("agent/session-start", {"messages": messages})
 
         for _ in range(self.max_steps):
             resp = await self.llm.chat(messages, tools=tools)
@@ -69,47 +68,31 @@ class Agent:
 
             for tc in resp["tool_calls"]:
                 args = json.loads(tc["arguments"] or "{}")
-
-                blocked, updated_args = await self._dispatch(
-                    HookEvent.PRE_TOOL_USE,
-                    HookContext(
-                        event=HookEvent.PRE_TOOL_USE,
-                        tool_name=tc["name"],
-                        tool_args=args,
-                        messages=messages,
-                    ),
-                )
-                if blocked:
-                    result = json.dumps({"error": "blocked by hook"})
-                else:
-                    if updated_args:
-                        args = updated_args
-                    result = (await self.registry.call(tc["name"], args)).to_json()
+                exec = ToolExecution(call_id=tc["id"], name=tc["name"], arguments=args, agent=self)
+                result = await self.runtime.execute(exec)
 
                 messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": result}
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": self._tool_content(result),
+                    }
                 )
+                messages.extend(exec.deferred_contexts)
 
-                await self._dispatch(
-                    HookEvent.POST_TOOL_USE,
-                    HookContext(
-                        event=HookEvent.POST_TOOL_USE,
-                        tool_name=tc["name"],
-                        tool_args=args,
-                        messages=messages,
-                    ),
-                )
+                if exec.concludes_turn:
+                    break
 
-        await self._dispatch(HookEvent.SESSION_END, HookContext(event=HookEvent.SESSION_END, messages=messages))
-
+        await self.events.serial("agent/session-end", {"messages": messages})
         return AgentResult(messages=messages, final_answer=self._final(messages))
 
-    async def _dispatch(self, event: HookEvent, ctx: HookContext) -> tuple[bool, dict | None]:
-        if not self.plugins:
-            return False, None
-        blocked, updated_args, new_msgs = await self.plugins.dispatch(event, ctx)
-        ctx.messages.extend(new_msgs)
-        return blocked, updated_args
+    @staticmethod
+    def _tool_content(result: ToolExecutionResult) -> str:
+        if result.is_error:
+            return json.dumps({"error": result.error.message}, ensure_ascii=False)
+        if result.content:
+            return "\n".join(b.text for b in result.content if b.type == "text")
+        return json.dumps(result.value, ensure_ascii=False, default=str)
 
     @staticmethod
     def _final(messages: list[dict]) -> str:

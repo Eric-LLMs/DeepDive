@@ -212,12 +212,8 @@ async def analyze_syntax(body: SyntaxAnalysisRequest, svc=Depends(get_vocab_serv
 @app.post("/chat")
 async def chat(body: ChatRequest):
     agent = get_agent()
-    messages = await agent.run(body.message, body.history)
-    answer = next(
-        (m["content"] for m in reversed(messages) if m["role"] == "assistant" and m.get("content")),
-        "",
-    )
-    return {"answer": answer, "messages": messages}
+    result = await agent.run(body.message, body.history)
+    return {"answer": result.final_answer, "messages": result.messages}
 
 
 @app.post("/chat/stream")

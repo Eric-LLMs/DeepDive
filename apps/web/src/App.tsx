@@ -20,7 +20,7 @@ export default function App() {
         {page === "study" && <StudyMode />}
         {page === "manage" && <ManageVocabulary />}
       </main>
-      <div className="streamlit-header">
+      <div className="topbar">
         <button className="header-btn" title="Deploy this app">Deploy</button>
         <button className="header-btn header-menu" title="Menu" aria-label="Menu">⋮</button>
       </div>
@@ -147,7 +147,7 @@ function parseTableFile(file: File): Promise<{ columns: string[]; rows: string[]
   });
 }
 
-// Streamlit-style file uploader (dropzone + "Browse files" button).
+// File uploader (dropzone + "Browse files" button).
 function FileUploader({
   label,
   accept,
@@ -226,7 +226,7 @@ function ImportData() {
         <ol>
           <li><strong>Domain Management</strong>: Create separate topics (e.g., 'Physics', 'Daily Life').</li>
           <li><strong>Import Vocabulary</strong>: Bulk upload terms. Supports Excel/CSV (Columns: Word, Frequency).</li>
-          <li><strong>Import Sentences (SQL)</strong>: Add sentences to SQLite for keyword matching. Supports TXT/Excel/CSV.</li>
+          <li><strong>Import Sentences (SQL)</strong>: Add sentences to the database for keyword matching. Supports TXT/Excel/CSV.</li>
           <li><strong>Import VectorDB (Independent)</strong>: Add sentences to VectorDB for semantic search. Supports TXT/Excel/CSV.</li>
         </ol>
       </div>
@@ -561,7 +561,7 @@ function SentencesTab() {
 
   return (
     <div className="panel">
-      <h3 style={{ marginTop: 0 }}>Import to SQLite Corpus</h3>
+      <h3 style={{ marginTop: 0 }}>Import to Sentence Corpus</h3>
       <p className="muted">Sentences imported here are stored in SQL for exact keyword matching.</p>
       <div className="field">
         <label className="field-label">Target Domain:</label>
@@ -645,7 +645,7 @@ function SentencesTab() {
             disabled={!text.trim() || !activeDomain}
             style={{ marginTop: 8 }}
           >
-            💾 Save to SQLite
+            💾 Save to Database
           </button>
         </div>
       )}
@@ -748,7 +748,7 @@ function VectorTab() {
       <h3 style={{ marginTop: 0 }}>Direct Import to Vector Database</h3>
       <div className="note">
         <strong>Note:</strong> Data here is stored <strong>independently</strong> in the AI Vector
-        Database (ChromaDB). It is NOT synced with SQLite. Use this for semantic search when exact
+        Database (pgvector). It is NOT synced with the sentence corpus. Use this for semantic search when exact
         matches fail.
       </div>
       <div className="field">

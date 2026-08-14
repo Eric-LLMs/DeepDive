@@ -119,8 +119,7 @@ class VocabularyService:
         return await self.sentences.list_by_domain(domain_id)
 
     async def search_sentences(self, domain_id: UUID, term_text: str) -> list[Sentence] | list[dict]:
-        # Hybrid search: keyword first, fall back to semantic when there are no hits
-        # (mirrors the old demo's search_sentences_hybrid).
+        # Hybrid search: keyword first, fall back to semantic when there are no hits.
         keyword = await self.sentences.search_by_text(domain_id, term_text)
         if keyword or self.embedder is None:
             return keyword
@@ -191,7 +190,7 @@ class VocabularyService:
     async def _auto_link(self, domain_id: UUID) -> None:
         """Auto-link every term to sentences that contain it.
 
-        Mirrors the old demo's IngestionEngine: for each term, scan every sentence in
+        For each term, scan every sentence in
         the domain using a ``\\b``-bounded regex (case-insensitive) so that e.g. "apple"
         does not match "pineapple". Idempotent — existing links are left untouched.
         """

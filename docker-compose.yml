@@ -1,4 +1,17 @@
+# DeepGloss — data + model-serving infrastructure.
+#
+# The FastAPI app itself runs on the host during development (uvicorn), and talks to
+# these containers over HTTP. Model inference (LLM / embedding / rerank / TTS) never
+# runs inside the API process, so model updates don't require an API restart.
+#
+# Model services:
+#   - embedding   TEI serving BAAI/bge-m3            -> POST /embed   (port 8080)
+#   - reranker    TEI serving BAAI/bge-reranker-v2-m3 -> POST /rerank (port 18081)
+#   - tts         Kokoro-FastAPI (OpenAI-compatible)  -> /v1/audio/speech (port 8880)
+#   - llm-gateway LiteLLM proxy (unified LLM routing / keys / cost)   (port 4000)
+
 services:
+  # ── Data ──────────────────────────────────────────────────────────────
   postgres:
     image: pgvector/pgvector:pg16
     container_name: deepgloss-postgres
@@ -30,6 +43,137 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── Embedding (BGE-M3 via TEI) ────────────────────────────────────────
+  embedding:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    container_name: deepgloss-embedding
+    command: --model-id BAAI/bge-m3 --port 80 --max-batch-tokens 2048 --max-concurrent-requests 16
+    ports:
+      - "8080:80"
+    volumes:
+      - embedding-cache:/data
+    restart: unless-stopped
+    environment:
+      # Override via .env (gitignored), e.g. HF_ENDPOINT=https://hf-mirror.com for faster CN downloads.
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    # GPU variant (requires WSL2 + NVIDIA container toolkit):
+    #   image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest
+    #   deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
+  # ── Reranker (BGE-reranker-v2-m3 via TEI) ─────────────────────────────
+  # NOTE: not currently wired into the app — core.rag.rerank uses sentence-transformers
+  # CrossEncoder in-process (config.reranker_model), not this HTTP service. BGE-reranker-v2-m3
+  # also ships without ONNX weights, so TEI cannot serve it as-is. Leave this stopped unless
+  # you export the model to ONNX first.
+  reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    container_name: deepgloss-reranker
+    command: --model-id BAAI/bge-reranker-v2-m3 --port 80 --max-batch-tokens 2048 --max-concurrent-requests 16
+    ports:
+      - "18081:80"
+    volumes:
+      - reranker-cache:/data
+    restart: unless-stopped
+    environment:
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+
+  # ── TTS (Kokoro-82M via Kokoro-FastAPI) ───────────────────────────────
+  tts:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    container_name: deepgloss-tts
+    ports:
+      - "8880:8880"
+    volumes:
+      - kokoro-cache:/root/.cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8880/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    # GPU variant: image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
+
+  # ── LLM gateway (LiteLLM proxy) ───────────────────────────────────────
+  # The API calls a virtual model name (LLM_MODEL=deepgloss-chat); LiteLLM routes it to
+  # the real upstream provider (set via LLM_UPSTREAM_* in .env), with key management,
+  # cost tracking, rate limits, and per-model fallback all in one place.
+  llm-gateway:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: deepgloss-litellm
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "4000:4000"
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local-gateway}
+      LLM_UPSTREAM_MODEL: ${LLM_UPSTREAM_MODEL:-openai/gpt-4o-mini}
+      LLM_UPSTREAM_BASE: ${LLM_UPSTREAM_BASE:-https://api.openai.com/v1}
+      LLM_UPSTREAM_KEY: ${LLM_UPSTREAM_KEY:-sk-xxx}
+    volumes:
+      - ./deploy/litellm/config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── Retrieval service (RAG pipeline over gRPC) ───────────────────────
+  # Owns the whole retrieval stack (embedding → recall → RRF → rerank → rewrite) behind a
+  # single Retrieve(query, top_k, filters) RPC. The API switches to this via RETRIEVAL_MODE=grpc.
+  retrieval:
+    build:
+      context: .
+      dockerfile: deploy/retrieval/Dockerfile
+    container_name: deepgloss-retrieval
+    environment:
+      DATABASE_URL: postgresql+asyncpg://deepgloss:deepgloss@postgres:5432/deepgloss
+      EMBEDDING_BASE_URL: http://embedding:80
+      RERANKER_MODEL: ""            # cross-encoder disabled by default (runs via the TEI reranker instead)
+      RAG_QUERY_REWRITE: "true"
+      LLM_BASE_URL: http://llm-gateway:4000/v1
+      LLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-gateway}
+      LLM_MODEL: deepgloss-chat
+      RETRIEVAL_GRPC_ADDR: 0.0.0.0:50051
+    ports:
+      - "15051:50051"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      embedding:
+        condition: service_healthy
+      llm-gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Edge gateway (Traefik) ───────────────────────────────────────────
+  # Routes edge HTTP (/api -> FastAPI) and internal gRPC (retrieval service). Skeleton only:
+  # the FastAPI app still runs on the host during development.
+  traefik:
+    image: traefik:v3.0
+    container_name: deepgloss-traefik
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    ports:
+      - "80:80"
+      - "15052:50052"
+      - "8082:8080"   # dashboard (insecure, dev only)
+    volumes:
+      - ./deploy/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./deploy/traefik/dynamic.yml:/etc/traefik/dynamic/dynamic.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
+  embedding-cache:
+  reranker-cache:
+  kokoro-cache:
