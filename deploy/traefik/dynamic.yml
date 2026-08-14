@@ -5,21 +5,21 @@
 #   - gRPC:  retrieval path -> retrieval:50051 (h2c, plaintext HTTP/2)
 http:
   routers:
-    deepgloss-api:
+    deepdive-api:
       entryPoints: ["web"]
       rule: "PathPrefix(`/api`)"
-      service: deepgloss-api
-    deepgloss-retrieval:
+      service: deepdive-api
+    deepdive-retrieval:
       entryPoints: ["grpc"]
       rule: "PathPrefix(`/retrieval.v1.RetrievalService/`)"
-      service: deepgloss-retrieval
+      service: deepdive-retrieval
 
   services:
-    deepgloss-api:
+    deepdive-api:
       loadBalancer:
         servers:
           - url: "http://api:8000"
-    deepgloss-retrieval:
+    deepdive-retrieval:
       loadBalancer:
         servers:
           - url: "h2c://retrieval:50051"

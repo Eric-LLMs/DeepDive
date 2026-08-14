@@ -1,6 +1,6 @@
 """MCP Server: expose the tool runtime over the MCP protocol (FastMCP).
 
-Direction one: expose DeepGloss's tools externally so other AI clients can call them.
+Direction one: expose DeepDive's tools externally so other AI clients can call them.
 Direction two (MCP Client consuming external tools) is wired up on demand at the API layer,
 and registered into the ToolRuntime the same way.
 """
@@ -10,7 +10,7 @@ from core.agent.decisions import ToolExecution
 from core.agent.runtime import ToolRuntime
 
 
-def build_mcp_server(runtime: ToolRuntime, name: str = "deepgloss") -> FastMCP:
+def build_mcp_server(runtime: ToolRuntime, name: str = "deepdive") -> FastMCP:
     mcp = FastMCP(name)
 
     def _make_handler(tool):

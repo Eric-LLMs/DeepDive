@@ -1,4 +1,4 @@
-# DeepGloss — data + model-serving infrastructure.
+# DeepDive — data + model-serving infrastructure.
 #
 # The FastAPI app itself runs on the host during development (uvicorn), and talks to
 # these containers over HTTP. Model inference (LLM / embedding / rerank / TTS) never
@@ -14,24 +14,24 @@ services:
   # ── Data ──────────────────────────────────────────────────────────────
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: deepgloss-postgres
+    container_name: deepdive-postgres
     environment:
-      POSTGRES_USER: deepgloss
-      POSTGRES_PASSWORD: deepgloss
-      POSTGRES_DB: deepgloss
+      POSTGRES_USER: deepdive
+      POSTGRES_PASSWORD: deepdive
+      POSTGRES_DB: deepdive
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U deepgloss"]
+      test: ["CMD-SHELL", "pg_isready -U deepdive"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: deepgloss-redis
+    container_name: deepdive-redis
     ports:
       # 6379 sits inside a Windows Hyper-V excluded port range on some hosts; use 16379 instead.
       - "16379:6379"
@@ -46,7 +46,7 @@ services:
   # ── Embedding (BGE-M3 via TEI) ────────────────────────────────────────
   embedding:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
-    container_name: deepgloss-embedding
+    container_name: deepdive-embedding
     command: --model-id BAAI/bge-m3 --port 80 --max-batch-tokens 2048 --max-concurrent-requests 16
     ports:
       - "8080:80"
@@ -73,7 +73,7 @@ services:
   # you export the model to ONNX first.
   reranker:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
-    container_name: deepgloss-reranker
+    container_name: deepdive-reranker
     command: --model-id BAAI/bge-reranker-v2-m3 --port 80 --max-batch-tokens 2048 --max-concurrent-requests 16
     ports:
       - "18081:80"
@@ -86,7 +86,7 @@ services:
   # ── TTS (Kokoro-82M via Kokoro-FastAPI) ───────────────────────────────
   tts:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
-    container_name: deepgloss-tts
+    container_name: deepdive-tts
     ports:
       - "8880:8880"
     volumes:
@@ -101,12 +101,12 @@ services:
     # GPU variant: image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
 
   # ── LLM gateway (LiteLLM proxy) ───────────────────────────────────────
-  # The API calls a virtual model name (LLM_MODEL=deepgloss-chat); LiteLLM routes it to
+  # The API calls a virtual model name (LLM_MODEL=deepdive-chat); LiteLLM routes it to
   # the real upstream provider (set via LLM_UPSTREAM_* in .env), with key management,
   # cost tracking, rate limits, and per-model fallback all in one place.
   llm-gateway:
     image: ghcr.io/berriai/litellm:main-stable
-    container_name: deepgloss-litellm
+    container_name: deepdive-litellm
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     ports:
       - "4000:4000"
@@ -132,15 +132,15 @@ services:
     build:
       context: .
       dockerfile: deploy/retrieval/Dockerfile
-    container_name: deepgloss-retrieval
+    container_name: deepdive-retrieval
     environment:
-      DATABASE_URL: postgresql+asyncpg://deepgloss:deepgloss@postgres:5432/deepgloss
+      DATABASE_URL: postgresql+asyncpg://deepdive:deepdive@postgres:5432/deepdive
       EMBEDDING_BASE_URL: http://embedding:80
       RERANKER_MODEL: ""            # cross-encoder disabled by default (runs via the TEI reranker instead)
       RAG_QUERY_REWRITE: "true"
       LLM_BASE_URL: http://llm-gateway:4000/v1
       LLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-gateway}
-      LLM_MODEL: deepgloss-chat
+      LLM_MODEL: deepdive-chat
       RETRIEVAL_GRPC_ADDR: 0.0.0.0:50051
     ports:
       - "15051:50051"
@@ -158,7 +158,7 @@ services:
   # the FastAPI app still runs on the host during development.
   traefik:
     image: traefik:v3.0
-    container_name: deepgloss-traefik
+    container_name: deepdive-traefik
     command:
       - "--configFile=/etc/traefik/traefik.yml"
     ports:

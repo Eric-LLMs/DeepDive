@@ -16,13 +16,13 @@ class Settings(BaseSettings):
     )
 
     # ── Database / cache ──
-    database_url: str = "postgresql+asyncpg://deepgloss:deepgloss@localhost:5432/deepgloss"
+    database_url: str = "postgresql+asyncpg://deepdive:deepdive@localhost:5432/deepdive"
     redis_url: str = "redis://localhost:16379/0"
 
     # ── LLM (via LiteLLM gateway; the gateway routes the virtual model name) ──
     llm_api_key: str = ""
     llm_base_url: str = "http://localhost:4000/v1"
-    llm_model: str = "deepgloss-chat"
+    llm_model: str = "deepdive-chat"
 
     # ── TTS (Kokoro-FastAPI service, OpenAI-compatible /v1/audio/speech) ──
     tts_base_url: str = "http://localhost:8880/v1"

@@ -1,4 +1,4 @@
-# DeepGloss — runtime dependencies.
+# DeepDive — runtime dependencies.
 # Mirrors [project].dependencies in pyproject.toml. Prefer the editable install:
 #   pip install -e .
 # This file is the pip-only alternative (no build backend needed).

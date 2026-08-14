@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "deepgloss"
+name = "deepdive"
 version = "0.1.0"
 description = "AI learning workbench: vocabulary + video + document + AI assistant"
 readme = "README.md"

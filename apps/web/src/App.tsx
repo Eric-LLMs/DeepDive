@@ -37,7 +37,7 @@ function Sidebar({ page, onNavigate }: { page: Page; onNavigate: (p: Page) => vo
   ];
   return (
     <aside className="sidebar">
-      <div className="sidebar-brand">🧠 DeepGloss</div>
+      <div className="sidebar-brand">🧠 DeepDive</div>
       <hr />
       <nav>
         {items.map((it) => (
@@ -66,8 +66,8 @@ function Home() {
 
   return (
     <div>
-      <h1 style={{ marginTop: 0 }}>🧠 DeepGloss Learning Assistant</h1>
-      <h3 style={{ marginTop: 0 }}>Welcome to DeepGloss</h3>
+      <h1 style={{ marginTop: 0 }}>🧠 DeepDive Learning Assistant</h1>
+      <h3 style={{ marginTop: 0 }}>Welcome to DeepDive</h3>
       <p className="muted">
         A domain-specific English learning tool tailored for your specific needs.
       </p>

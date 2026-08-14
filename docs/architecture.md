@@ -1,6 +1,6 @@
-# DeepGloss Architecture Design
+# DeepDive Architecture Design
 
-> This document is the single source of truth (SSOT) for DeepGloss. Every technical decision,
+> This document is the single source of truth (SSOT) for DeepDive. Every technical decision,
 > module boundary, and deployment topology is governed here.
 
 > **Implementation status:** this document is the SSOT, but not every part is implemented yet.
@@ -35,7 +35,7 @@
 
 ## 1. Product Positioning
 
-DeepGloss is an "AI learning workbench" unified by a single abstraction:
+DeepDive is an "AI learning workbench" unified by a single abstraction:
 
 - **Vocabulary learning**: domain vocabulary + example sentences + definitions + TTS + images + star ratings
 - **Video / document learning**: media → timestamped/paginated text chunks → searchable, annotatable
@@ -68,7 +68,7 @@ API-only: REST/SSE at the edge, gRPC between internal services, HTTP to model se
 ## 3. Repository Structure (Monorepo)
 
 ```
-deepgloss/
+deepdive/
 ├── apps/
 │   ├── api/                      # package `api` (FastAPI edge)
 │   │   ├── main.py               # uvicorn api.main:app (REST/SSE endpoints)
@@ -99,7 +99,7 @@ deepgloss/
 ```
 
 > `packages/core` and `apps/api` are independent packages (import names `core` / `api`); no
-> nested `deepgloss` package layer. Generated proto lives under `packages/shared/proto` and is
+> nested `deepdive` package layer. Generated proto lives under `packages/shared/proto` and is
 > imported as `retrieval.v1.retrieval_pb2` (put on `sys.path` once by `core.infrastructure.proto`).
 
 ## 4. Layered Architecture (Hexagonal + Capability Seam)
@@ -179,7 +179,7 @@ skills→`SkillRegistry`, collecting disposers so `unregister` rolls back cleanl
 These runtime mechanisms are intentionally out of scope for the Python runtime:
 a microkernel (Loader / patch-layer boot), append-only session-log stream, two-queue Inbox,
 `AsyncLocalStorage` initiator tracking, Code Mode (`run_code`), and scoped per-agent registration.
-DeepGloss uses a small `EventBus` + FastAPI DI instead.
+DeepDive uses a small `EventBus` + FastAPI DI instead.
 
 ## 6. Capability Seam (Definition / Provider / Consumer)
 

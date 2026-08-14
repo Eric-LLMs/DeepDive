@@ -1,1 +1,1 @@
-"""DeepGloss core: domain services (pure Python, zero framework dependencies)."""
+"""DeepDive core: domain services (pure Python, zero framework dependencies)."""

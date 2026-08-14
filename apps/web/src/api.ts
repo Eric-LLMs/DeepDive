@@ -1,4 +1,4 @@
-// Thin fetch wrapper around the DeepGloss REST API.
+// Thin fetch wrapper around the DeepDive REST API.
 // In dev, Vite proxies /api/* to http://localhost:8000 (see vite.config.ts).
 import type { Domain, ExplainResult, Sentence, Term } from "./types";
 

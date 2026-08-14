@@ -59,7 +59,7 @@ class PluginManager:
 
     @staticmethod
     def _load_plugin_file(path: Path) -> Plugin | None:
-        module_name = f"deepgloss_plugin_{abs(hash(path))}"
+        module_name = f"deepdive_plugin_{abs(hash(path))}"
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:
             return None

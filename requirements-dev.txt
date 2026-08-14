@@ -1,4 +1,4 @@
-# DeepGloss — development / CI dependencies.
+# DeepDive — development / CI dependencies.
 # Mirrors [project.optional-dependencies].dev in pyproject.toml.
 
 -r requirements.txt

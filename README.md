@@ -1,4 +1,4 @@
-# 🧠 DeepGloss
+# 🧠 DeepDive
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
@@ -6,7 +6,7 @@
 [![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**DeepGloss** is an AI learning workbench for domain-specific English learning. It focuses on **contextual learning** within specific domains (e.g. "Stanford CS336 Lectures", "Legal English", "Medical Terms"): import vocabulary and example sentences, automatically fetch definitions, generate Text-to-Speech (TTS) audio, retrieve contextual images, and get context-aware AI explanations. A **hybrid search engine** (PostgreSQL keyword + pgvector semantic search) finds relevant example sentences even when exact keywords are missing, and a **native function-calling agent** powers interactive Q&A with RAG and MCP tooling.
+**DeepDive** is an AI learning workbench for domain-specific English learning. It focuses on **contextual learning** within specific domains (e.g. "Stanford CS336 Lectures", "Legal English", "Medical Terms"): import vocabulary and example sentences, automatically fetch definitions, generate Text-to-Speech (TTS) audio, retrieve contextual images, and get context-aware AI explanations. A **hybrid search engine** (PostgreSQL keyword + pgvector semantic search) finds relevant example sentences even when exact keywords are missing, and a **native function-calling agent** powers interactive Q&A with RAG and MCP tooling.
 
 ---
 
@@ -86,22 +86,22 @@ Toggle terms with smooth switches, rate importance with star icons, click to edi
 ### 1. Prerequisites
 
 - **Docker Desktop** — runs PostgreSQL, Redis, and the model services (embedding / rerank / TTS / LLM gateway).
-- **Conda** (Miniconda or Anaconda) — the backend runs in a `deepgloss` env.
+- **Conda** (Miniconda or Anaconda) — the backend runs in a `deepdive` env.
 - **Node.js 18+** — for the web frontend (optional; the API runs without it).
 - **Git**.
 
 ### 2. Clone the repository
 
 ```bash
-git clone https://github.com/Eric-LLMs/DeepGloss.git
-cd DeepGloss
+git clone https://github.com/Eric-LLMs/DeepDive.git
+cd DeepDive
 ```
 
 ### 3. Create & activate the conda environment
 
 ```bash
-conda create -n deepgloss python=3.11 -y
-conda activate deepgloss
+conda create -n deepdive python=3.11 -y
+conda activate deepdive
 ```
 
 ### 4. Configure environment
@@ -125,7 +125,7 @@ pip install -e ".[rag]"     # optional: RAG semantic search (pulls torch / sente
 docker compose up -d postgres redis embedding tts llm-gateway
 ```
 
-The first start downloads the models (BGE-M3, Kokoro-82M) into Docker volumes — allow a few minutes. The LLM gateway routes the virtual model `deepgloss-chat` to `LLM_UPSTREAM_MODEL` using `LLM_UPSTREAM_KEY`.
+The first start downloads the models (BGE-M3, Kokoro-82M) into Docker volumes — allow a few minutes. The LLM gateway routes the virtual model `deepdive-chat` to `LLM_UPSTREAM_MODEL` using `LLM_UPSTREAM_KEY`.
 
 > Skip `embedding` if you don't use semantic search, and `tts` if you don't need audio — the API degrades gracefully.
 >
@@ -184,9 +184,9 @@ Open http://localhost:5173. The Vite dev server proxies `/api`, `/audio`, and `/
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://deepgloss:deepgloss@localhost:5432/deepgloss` | PostgreSQL + pgvector |
+| `DATABASE_URL` | `postgresql+asyncpg://deepdive:deepdive@localhost:5432/deepdive` | PostgreSQL + pgvector |
 | `REDIS_URL` | `redis://localhost:16379/0` | cache / queue |
-| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | `sk-local-gateway` / `http://localhost:4000/v1` / `deepgloss-chat` | the LiteLLM gateway the API talks to |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | `sk-local-gateway` / `http://localhost:4000/v1` / `deepdive-chat` | the LiteLLM gateway the API talks to |
 | `LLM_UPSTREAM_MODEL` / `LLM_UPSTREAM_BASE` / `LLM_UPSTREAM_KEY` | `openai/gpt-4o-mini` / `https://api.openai.com/v1` / `sk-xxx` | real upstream LLM (consumed by the gateway container) |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `http://localhost:8080` / `BAAI/bge-m3` / `1024` | TEI embedding service |
 | `TTS_BASE_URL` / `TTS_MODEL` / `TTS_VOICE` | `http://localhost:8880/v1` / `kokoro` / `am_michael` | Kokoro-FastAPI TTS service |
