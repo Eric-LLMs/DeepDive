@@ -15,10 +15,12 @@
 |----|------|
 | Vocabulary subdomain | domains / terms / sentences / matches / materials / chunks (6 tables) |
 | Hybrid search | pgvector (semantic) + tsvector (keyword) + RRF fusion |
-| Tool runtime | define_tool / ToolRuntime / EventBus / monotonic guards / capability seam |
+| Agent runtime | Cordis-style DI (`Context`/`Fiber`) + layered `SystemPrompt` + `ReactLoopAgent` step loop + plugin `ToolRuntime` |
 | Retrieval | RAG pipeline (rewrite → recall → RRF → rerank); `in_process` default, gRPC service available |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
-| Enrichment | TTS audio, image fetch, auto-fetch definitions (LLM) |
+| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}` |
+| Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize |
+| Migrations | Alembic (replaces `create_all` + manual `ALTER`) |
 | Chat | agent loop with tool use, SSE streaming |
 
 ### Designed, not yet implemented
@@ -28,7 +30,6 @@
 | Auth / multi-tenancy | users / roles / user_roles tables + PostgreSQL RLS not created |
 | Billing | subscriptions / credit_ledger not created |
 | Observability | audit_logs / ai_call_logs / activity_logs / job_logs not created |
-| Chat persistence | conversations / messages / enrichment tables not created |
 | Video / document learning | media → chunks pipeline (ingestion / transcription / chunking) designed only |
 | Reranking | in-process cross-encoder exists but disabled (`reranker_model` empty); TEI reranker not wired |
 | Edge gateway | Traefik skeleton only; dev runs FastAPI directly on the host |
@@ -58,7 +59,7 @@ DeepDive is an "AI learning workbench" unified by a single abstraction:
 | Embedding | BGE-M3 (dim 1024) via TEI | multilingual, moderate dim |
 | Reranking | BGE-reranker cross-encoder | post-recall precision |
 | Retrieval (RAG) | query rewrite → pgvector + tsvector recall → RRF fusion → rerank | hybrid keyword + semantic search |
-| Agent | plugin-based tool runtime (native function-calling) | controllable, testable, plugin-based |
+| Agent | Cordis-style DI (`Context`/`Fiber`) + `ReactLoopAgent` step loop + layered `SystemPrompt` + plugin tool runtime | controllable, testable, plugin-based |
 | MCP | FastMCP | tool exposure + bidirectional integration |
 | Speech | STT: faster-whisper / Whisper API; TTS: local Kokoro-82M | |
 
@@ -70,37 +71,43 @@ API-only: REST/SSE at the edge, gRPC between internal services, HTTP to model se
 ```
 deepdive/
 ├── apps/
-│   ├── api/                      # package `api` (FastAPI edge)
-│   │   ├── main.py               # uvicorn api.main:app (REST/SSE endpoints)
-│   │   ├── deps.py               # DI assembly (wires capability seam + tools + plugins)
+│   ├── api/                      # package `api` (FastAPI gateway: REST/SSE + job enqueue)
+│   │   ├── main.py               # uvicorn api.main:app (REST/SSE endpoints + GET /jobs/{id})
+│   │   ├── deps.py               # DI assembly (capability seam + tools + plugins + prompt)
+│   │   ├── tools.py              # gateway built-in tools (rag_search / translate)
 │   │   └── schemas.py            # Pydantic request/response models
+│   ├── worker/                   # arq worker (executes async enrichment jobs)
+│   │   ├── settings.py           # WorkerSettings (functions / redis / startup clients)
+│   │   ├── tasks.py              # tts / image_fetch / explain / ... job functions
+│   │   └── main.py               # run_worker entrypoint
 │   ├── retrieval/                # retrieval service (gRPC), run: python -m apps.retrieval.main
 │   │   ├── server.py             # RetrievalService servicer (proto -> RAGPipeline)
 │   │   └── main.py               # grpc.aio.server entrypoint
 │   ├── web/                      # Vite + React frontend (TS)
 │   └── desktop/                  # Electron shell (placeholder)
 ├── packages/
-│   ├── core/                     # package `core`
-│   │   ├── config.py             # Settings (incl. retrieval_mode / retrieval_grpc_addr)
-│   │   ├── domain/  application/  ports/  infrastructure/
-│   │   ├── rag/                  # retrieval DAG (rewrite -> recall -> RRF -> rerank)
-│   │   └── agent/                # plugin-based tool runtime (runtime / tools / events / decisions)
-│   └── shared/proto/             # generated protobuf/gRPC stubs (retrieval.v1.*)
+│   ├── agent/                    # package `agent`: DI + loop + runtime + plugins + memory + skills + prompt
+│   ├── rag/                      # package `rag`: retrieval DAG + build_pipeline factory
+│   ├── core/                     # package `core`: config + domain/application/ports/infrastructure
+│   └── shared/proto/retrieval/   # generated protobuf/gRPC stubs (import name `retrieval.v1`)
+├── migrations/                   # Alembic migrations (env.py + versions/)
 ├── proto/retrieval/v1/retrieval.proto   # RetrievalService contract
 ├── buf.yaml / buf.gen.yaml             # proto lint / breaking / codegen
 ├── scripts/gen_proto.sh                # grpc_tools.protoc (or buf) codegen
 ├── deploy/
 │   ├── traefik/                  # gateway static + dynamic config
 │   ├── retrieval/Dockerfile      # retrieval service image
+│   ├── worker/Dockerfile         # arq worker image
 │   └── litellm/config.yaml
-├── tests/                        # pytest smoke tests
+├── tests/                        # pytest (di / system_prompt / loop / memory / rrf / jobs / tool_runtime)
 ├── .github/workflows/ci.yml      # buf lint + pytest
-└── docker-compose.yml            # data + model services + retrieval + traefik
+└── docker-compose.yml            # data + model services + worker + retrieval + traefik
 ```
 
-> `packages/core` and `apps/api` are independent packages (import names `core` / `api`); no
-> nested `deepdive` package layer. Generated proto lives under `packages/shared/proto` and is
-> imported as `retrieval.v1.retrieval_pb2` (put on `sys.path` once by `core.infrastructure.proto`).
+> `packages/agent`, `packages/rag`, `packages/core`, and `apps/api` are independent top-level
+> packages (import names `agent` / `rag` / `core` / `api`); no nested `deepdive` package layer.
+> Generated proto stubs live under `packages/shared/proto` and are imported as
+> `retrieval.v1.retrieval_pb2` (a real package on the editable-install path, no `sys.path` hack).
 
 ## 4. Layered Architecture (Hexagonal + Capability Seam)
 
@@ -117,14 +124,65 @@ packages/core/ports             → interfaces (Repository / LLMPort / TTSPort /
 packages/core/infrastructure    → concrete implementations (postgres / openai / tts / pgvector / grpc)
 ```
 
-- **Technical capability** (horizontal): `agent/`, `rag/`, `infrastructure/{llm,embedding,tts,vector,mcp,retrieval_grpc}`
+- **Technical capability** (horizontal): `agent/`, `rag/`, `infrastructure/{llm,tts,vector,images,mcp,retrieval_grpc}`
 - **Business subdomain** (vertical): `vocabulary`, `materials`, `assistant`
 - **Dependencies point inward**: `domain`/`application` depend on no framework; `ports` define
   interfaces; `infrastructure` implements them; `apps/api` injects them in `deps.py`.
 - **Capability seam**: cross-cutting capabilities (retrieval) are provided by *name* and required
   by *name*; the provider (in-process vs gRPC) is chosen at assembly time, invisible to consumers.
 
-## 5. Tool Runtime
+## 5. Agent Module
+
+The `agent` package is the pluggable agent runtime. Three pieces compose a turn: a Cordis-style
+**DI state machine** wires plugins into a shared `Context`, the **`ReactLoopAgent`** runs the
+tool-use loop, and a layered **`SystemPrompt`** assembles the model context. Memory, skills, and
+the append-only session log are optional collaborators injected into the loop.
+
+### 5.1 DI state machine — `Context` / `Fiber`
+
+- A `Context` resolves named capabilities lazily via attribute access (`ctx.retrieval` →
+  `ctx.resolve("retrieval")`).
+- Each plugin is a `Fiber` declaring `inject` (capabilities it needs) and `provides` (what it
+  exports). States: `PENDING → LOADING → ACTIVE`; a mount error moves it to `FAILED` rather than
+  silently stalling. `DISPOSED` / `UNLOADING` cover teardown.
+- `Context.provide(name, value)` registers an external capability (immediately resolvable);
+  `Context.plugin(...)` / `Context.service(...)` register fibers.
+- `_settle()` is a topological fixpoint: it activates any `PENDING` fiber whose deps are all
+  `ACTIVE`, so dependency order falls out of the state machine (replacing the old
+  `_drain_pending` loop).
+- `Service` is an optional base for class-based providers (`provide`/`inject` + `start`/`stop`).
+
+### 5.2 Agent loop — `ReactLoopAgent`
+
+`run(user_msg, history, …)` fires `agent/session-start`, assembles the prompt, then steps until a
+final answer or `max_steps`, closing with `agent/session-end`. Each step is one LLM call
+(`AgentLLMPort.chat`) plus execution of any returned tool calls. Concurrency-safe tools are
+batched in parallel (`asyncio.gather`, capped by `max_parallel_tool_calls`); the rest run as
+serial barriers. A tool whose execution `concludes_turn` stops the loop early. Returns
+`AgentResult {messages, final_answer}`.
+
+### 5.3 System prompt — layered `SystemPrompt`
+
+Prompt sections register with an `order` and merge ascending, so persona / tool guidance /
+memory / skills each contribute independently without knowing one another. Order conventions:
+harness identity `-100` < persona `0` < tool guidance `100` < memory `200` < skills `250`.
+A section's text may be static or an async callable over the assemble context (used for on-demand
+memory/skill retrieval). `{{name}}` placeholders interpolate from registered variables;
+`render_prompt()` drops empty sections and joins the rest with blank lines.
+
+### 5.4 Memory, skills, sessions
+
+- **Memory** — `MemoryStore` protocol (`load`/`save`/`list`/`search`) + `FileMemoryStore`
+  (claude-code memdir style: `MEMORY.md` index + one frontmatter `.md` per memory,
+  description-weighted keyword recall). `Memory` records carry a `type` in
+  {`user`,`feedback`,`project`,`reference`} and a staleness caveat via `age_days`.
+- **Skills** — `Skill` (Markdown instructions + frontmatter + keywords) registered in a
+  `SkillRegistry` (`register` / `relevant(query)` keyword scoring / `from_dir` for `*.skill.md`).
+- **Sessions** — `SessionLog` is an append-only event stream
+  (`session-start` / `session-end` / `llm-call` / `tool-call` / `tool-result`), serializable to
+  JSONL for audit.
+
+## 6. Tool Runtime
 
 The Agent core implements a plugin-based tool runtime in Python. The essentials:
 
@@ -133,7 +191,7 @@ The Agent core implements a plugin-based tool runtime in Python. The essentials:
 - **monotonic guards** can only deny (never allow);
 - **registration is reversible** (every `register`/`guard`/`on` returns a disposer).
 
-### 5.1 Typed tool definition — `define_tool`
+### 6.1 Typed tool definition — `define_tool`
 
 ```
 define_tool(name, description, parameters, output, execute, destructive, is_concurrency_safe)
@@ -147,7 +205,7 @@ define_tool(name, description, parameters, output, execute, destructive, is_conc
 - `execute(args, exec)`: the body. The returned `ToolDefinition.execute` wraps it:
   validate args (`ToolArgsError`) → run body → validate output (`ToolOutputError`).
 
-### 5.2 Lifecycle — `ToolRuntime.execute`
+### 6.2 Lifecycle — `ToolRuntime.execute`
 
 ```
 tools/pre-execute   (waterfall; base = allow)
@@ -167,73 +225,94 @@ tools/result         (serial observer)
 - `EventBus` provides `waterfall` (middleware chain, short-circuit by not calling `next()`),
   `serial`/`emit` (read-only observers), all with disposer-based `on`/`observe`.
 
-### 5.3 Plugins
+### 6.3 Plugins
 
-`Plugin = {name, description, tools, skills, listeners, guards}`. `PluginManager.register` mounts
+`Plugin = {name, description, tools, skills, listeners, guards, inject, provides}`. `PluginManager.register` mounts
 tools→`ToolRuntime.register`, guards→`ToolRuntime.guard`, listeners→`EventBus.on/observe`,
 skills→`SkillRegistry`, collecting disposers so `unregister` rolls back cleanly. Built-in
 `tool_audit` demonstrates both deny (pre-execute listener) and guard (monotonic) plus result audit.
 
-### 5.4 What is deliberately *not* implemented
+### 6.4 What is deliberately *not* implemented
 
 These runtime mechanisms are intentionally out of scope for the Python runtime:
-a microkernel (Loader / patch-layer boot), append-only session-log stream, two-queue Inbox,
+a microkernel (Loader / patch-layer boot), two-queue Inbox,
 `AsyncLocalStorage` initiator tracking, Code Mode (`run_code`), and scoped per-agent registration.
-DeepDive uses a small `EventBus` + FastAPI DI instead.
+DeepDive uses a small `EventBus` + `SessionLog` (append-only session events) and Cordis-style
+`Context`/`Fiber` DI instead.
 
-## 6. Capability Seam (Definition / Provider / Consumer)
+## 7. Capability Seam (Definition / Provider / Consumer)
 
 ```
 ports/retrieval.py  Retriever Protocol (retrieve(query, top_k, filters) -> [{id,text,score,meta}])
         ▲                              ▲
-        │ provide("retrieval", ...)    │ implement
+        │ ctx.provide("retrieval", …)  │ implement
         │                              │
    deps.py (assembly)          RAGPipeline (in-process)  |  GrpcRetriever (gRPC client)
 ```
 
-The `rag_search` tool calls `Capabilities.require("retrieval")`. `deps.py` provides the concrete
-provider based on `settings.retrieval_mode`:
+The `rag_search` tool calls `ctx.resolve("retrieval")` (a `Context` capability seam). `deps.py`
+registers the concrete provider via `ctx.provide("retrieval", …)` based on `settings.retrieval_mode`:
 
 | `retrieval_mode` | provider | notes |
 |---|---|---|
 | `in_process` (default) | `RAGPipeline` | full RAG DAG inside the API process |
 | `grpc` | `GrpcRetriever` | thin gRPC client → retrieval service |
 
-Switching modes never touches the tool code — it only changes what `provide()` injects.
+Switching modes never touches the tool code — it only changes what `ctx.provide()` injects.
 
-## 7. Distributed Topology
+## 8. Distributed Topology
 
 ```
                          ┌──────────────────────────────────────────────┐
  browser ── HTTP/SSE ──▶ │ Traefik (edge gateway)                        │
-                         │   /api/*      → FastAPI (REST/SSE)            │
+                         │   /api/*      → FastAPI gateway (REST/SSE)    │
                          │   retrieval   → retrieval service (gRPC h2c)  │
                          └──────────────────────────────────────────────┘
                                     │                        │
                           REST/SSE  │                        │ gRPC (plaintext HTTP/2)
                                     ▼                        ▼
-                              FastAPI (api)          retrieval service (gRPC)
-                              - Agent loop           - RAGPipeline (embed → recall → RRF → rerank)
-                              - vocabulary usecases  - owns TEI/pgvector/FTS/rerank/rewrite
-                                    │                        │
+                         FastAPI gateway (api)         retrieval service (gRPC)
+                         - Agent loop                  - RAGPipeline (embed → recall → RRF → rerank)
+                         - vocabulary usecases         - owns TEI/pgvector/FTS/rerank/rewrite
+                         - enqueues enrichment jobs
+                                    │
+                                    │  enqueue (arq)
+                                    ▼
+                                 Redis ─────────────▶ worker (arq)
+                                 (queue)              - TTS / image fetch / explain / definition
+                                                      - syntax analysis / sentence indexing
+                                                      - session finalize (embed + summary)
+                                    │
                                     │    HTTP (OpenAI-compatible) to model services:
                                     ├───────────────▶ TEI embedding  (POST /embed)
                                     ├───────────────▶ Kokoro TTS     (/v1/audio/speech)
                                     └───────────────▶ LiteLLM gateway (/v1)
                                     │
-                                    │    DB direct (no service in front)
+                                    │    DB direct (no service in front); jobs table = job state
                                     ▼
-                            PostgreSQL (pgvector + tsvector) via SQLAlchemy+asyncpg
+                            PostgreSQL (pgvector + tsvector + jobs) via SQLAlchemy+asyncpg
 ```
 
-- **Model inference never runs in the API/retrieval process** — embedding/TTS/LLM are separate
-  containers; model updates don't restart the app. Reranking is the exception: the cross-encoder
-  loads in-process via `sentence-transformers` when `reranker_model` is set (disabled by default).
-- **DB is accessed directly** (SQLAlchemy + asyncpg) by both the API and the retrieval service;
-  no DB proxy service. Production scaling adds pgBouncer + read replicas.
-- **Retrieval is the first extracted service** because it owns the heavy, model-coupled stack.
+- **Model inference never runs in the API/retrieval/worker process** — embedding/TTS/LLM are
+  separate containers; model updates don't restart the app. Reranking is the exception: the
+  cross-encoder loads in-process via `sentence-transformers` when `reranker_model` is set
+  (disabled by default).
+- **DB is accessed directly** (SQLAlchemy + asyncpg) by the gateway, worker, and retrieval
+  service; no DB proxy service. Production scaling adds pgBouncer + read replicas.
+- **Retrieval is the first extracted service** because it owns the heavy, model-coupled stack;
+  the **worker is the second**, moving every enrichment job off the gateway's request path.
 
-## 8. Retrieval Service (gRPC)
+### 8.1 Async enrichment (job model)
+
+Enrichment endpoints (`/tts`, `/image-fetch`, `/explain`, `/terms/definition`,
+`/sentences/analyze`, `/domains/{id}/sentences/index`) enqueue a job and return `{job_id}`
+immediately; the frontend polls `GET /jobs/{id}` until the worker marks the job
+`succeeded`/`failed`. The PostgreSQL `jobs` table is the single source of truth for job state
+(`queued → running → succeeded | failed`); Redis only carries the work to the worker (arq).
+Chat sessions finalize the same way: the gateway flushes session events synchronously on
+`close()`, then enqueues `session_finalize` to backfill message embeddings and write the summary.
+
+## 9. Retrieval Service (gRPC)
 
 Contract (`proto/retrieval/v1/retrieval.proto`, `package retrieval.v1`):
 
@@ -252,7 +331,7 @@ message SearchHit { string id = 1; string text = 2; double score = 3; string met
 - `core/infrastructure/retrieval_grpc.py` (`GrpcRetriever`) maps proto `SearchHit` back to dicts.
 - Codegen: `scripts/gen_proto.sh` (buf if present, else `grpc_tools.protoc`) → `packages/shared/proto/retrieval/v1/`.
 
-## 9. RAG Module (Config-Node DAG)
+## 10. RAG Module (Config-Node DAG)
 
 Retrieval is a deterministic DAG (declarative node order + parameters), each node independently togglable:
 
@@ -266,7 +345,7 @@ rewrite → multi-recall → RRF fusion → rerank
 - **rerank** `rank/cross_encoder.py`: BGE-reranker, lazy-loaded, `asyncio.to_thread`.
 - **orchestration** `pipeline.py`: `RAGPipeline.retrieve(query, top_k, filters)`.
 
-## 10. Feature → Mechanism Map
+## 11. Feature → Mechanism Map
 
 | Feature | Mechanism |
 |---|---|
@@ -276,10 +355,17 @@ rewrite → multi-recall → RRF fusion → rerank
 | Irreversibly block a tool | monotonic `ToolRuntime.guard(fn)` returning a reason string |
 | Rewrite args / augment result | `tools/post-execute` returns `PostToolDecision.accept(value=..., content=...)` |
 | Observe results without blocking | `EventBus.observe("tools/result", ...)` (serial) / `emit` (fire-and-forget) |
-| Swap retrieval provider | `Capabilities.provide("retrieval", ...)` + `settings.retrieval_mode` |
+| Swap retrieval provider | `Context.provide("retrieval", …)` + `settings.retrieval_mode` |
 | Session extension points | `agent/session-start` / `agent/session-end` observers in the loop |
 
-## 11. Data Model (Core Table DDL)
+## 12. Data Model (Core Table DDL)
+
+> **Migration note:** the implemented schema is managed by **Alembic**
+> (`migrations/versions/0001_init.py`); `init_db()` runs `alembic upgrade head` at startup
+> (replacing the old `create_all` + manual `ALTER`). The implemented tables include `sessions`,
+> `messages`, `session_events`, and `jobs` — which the design DDL below expresses as
+> `conversations` / `messages` / `job_logs`. The DDL below is the full designed schema; some
+> tables are design-only (auth / billing / observability).
 
 Unified multi-tenancy: business tables carry `user_id`, enabling PostgreSQL RLS.
 
@@ -385,7 +471,7 @@ CREATE TABLE messages (
 );
 ```
 
-### 11.1 Indexes and Retrieval
+### 12.1 Indexes and Retrieval
 
 ```sql
 ALTER TABLE chunks ADD COLUMN fts tsvector
@@ -395,7 +481,7 @@ CREATE INDEX ON chunks USING ivfflat (embedding vector_cosine_ops);
 -- or HNSW for large data: CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
 ```
 
-### 11.2 Billing and Logs
+### 12.2 Billing and Logs
 
 ```sql
 CREATE TABLE subscriptions (
@@ -429,7 +515,7 @@ CREATE TABLE job_logs (
 );
 ```
 
-## 12. Multi-Tenancy and Deployment Strategy
+## 13. Multi-Tenancy and Deployment Strategy
 
 | Scenario | Strategy |
 |------|------|

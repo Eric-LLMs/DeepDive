@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://deepdive:deepdive@localhost:5432/deepdive"
     redis_url: str = "redis://localhost:16379/0"
 
+    # ── Worker / jobs ──
+    worker_concurrency: int = 10         # arq max concurrent jobs
+    worker_job_timeout: int = 300        # arq per-job timeout (seconds)
+
     # ── LLM (via LiteLLM gateway; the gateway routes the virtual model name) ──
     llm_api_key: str = ""
     llm_base_url: str = "http://localhost:4000/v1"
@@ -52,6 +56,8 @@ class Settings(BaseSettings):
     memory_dir: Path = Path("data/memory")     # file memory directory (MEMORY.md index)
     skills_dir: Path = Path("data/skills")     # *.skill.md skills directory
     plugins_dir: Path = Path("data/plugins")   # third-party plugin directory (*/plugin.py)
+    session_summary_enabled: bool = True       # generate an LLM summary on session close
+    memory_recall_top_k: int = 5               # vector recall count for the prompt memory section
 
     # ── Auth ──
     jwt_secret: str = "change-me"

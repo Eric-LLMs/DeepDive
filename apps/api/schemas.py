@@ -103,3 +103,5 @@ class ExplainRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list[dict] = []
+    user_id: UUID | None = None      # optional: per-user memory isolation
+    session_id: UUID | None = None   # optional: resume an existing session

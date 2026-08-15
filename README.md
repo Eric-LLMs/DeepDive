@@ -122,7 +122,7 @@ pip install -e ".[rag]"     # optional: RAG semantic search (pulls torch / sente
 ### 6. Start infrastructure (data + model services)
 
 ```bash
-docker compose up -d postgres redis embedding tts llm-gateway
+docker compose up -d postgres redis embedding tts llm-gateway worker
 ```
 
 The first start downloads the models (BGE-M3, Kokoro-82M) into Docker volumes — allow a few minutes. The LLM gateway routes the virtual model `deepdive-chat` to `LLM_UPSTREAM_MODEL` using `LLM_UPSTREAM_KEY`.
@@ -131,10 +131,12 @@ The first start downloads the models (BGE-M3, Kokoro-82M) into Docker volumes �
 >
 > **Docker Desktop (Windows) memory note:** the TEI embedding service needs ~9 GB during BGE-M3 warmup. If Docker's WSL2 backend has only ~8 GB (the default on a 16 GB host), the container gets OOM-killed. Raise the limit in `%UserProfile%\.wslconfig`, e.g. `[wsl2]\nmemory=12GB\nswap=4GB`, then run `wsl --shutdown` and restart Docker Desktop.
 
-### 7. Initialize the database
+### 7. Initialize the database (Alembic migrations)
 
 ```bash
-python scripts/init_db.py
+python scripts/init_db.py     # runs `alembic upgrade head` (creates all tables incl. jobs)
+# or directly:
+alembic upgrade head
 ```
 
 ### 8. Run the API
@@ -144,6 +146,9 @@ uvicorn api.main:app --reload
 ```
 
 Open http://localhost:8000/docs for the interactive API documentation.
+
+> The **worker** (async enrichment) runs as a docker-compose service (see step 6). To run it on
+> the host instead: `arq apps.worker.settings.WorkerSettings`.
 
 ### 9. (Optional) gRPC retrieval service
 
@@ -191,6 +196,7 @@ Open http://localhost:5173. The Vite dev server proxies `/api`, `/audio`, and `/
 | `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `http://localhost:8080` / `BAAI/bge-m3` / `1024` | TEI embedding service |
 | `TTS_BASE_URL` / `TTS_MODEL` / `TTS_VOICE` | `http://localhost:8880/v1` / `kokoro` / `am_michael` | Kokoro-FastAPI TTS service |
 | `RETRIEVAL_MODE` / `RETRIEVAL_GRPC_ADDR` | `in_process` / `localhost:15051` | capability seam: `in_process` or `grpc` |
+| `WORKER_CONCURRENCY` / `WORKER_JOB_TIMEOUT` | `10` / `300` | arq worker max concurrent jobs / per-job timeout (seconds) |
 
 Model inference never runs inside the API process. Swapping a model = change `--model-id` in `docker-compose.yml` and the matching `*_BASE_URL` / dim in `.env` — no business-code change. See [docs/architecture.md](docs/architecture.md) for the full topology.
 

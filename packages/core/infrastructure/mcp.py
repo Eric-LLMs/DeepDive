@@ -6,8 +6,8 @@ and registered into the ToolRuntime the same way.
 """
 from fastmcp import FastMCP
 
-from core.agent.decisions import ToolExecution
-from core.agent.runtime import ToolRuntime
+from agent.decisions import ToolExecution
+from agent.runtime import ToolRuntime
 
 
 def build_mcp_server(runtime: ToolRuntime, name: str = "deepdive") -> FastMCP:

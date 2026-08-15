@@ -19,7 +19,8 @@ RUN pip install --no-cache-dir ".[rag]"
 # Generate the protobuf/gRPC stubs (falls back to grpc_tools.protoc when buf is absent).
 RUN bash scripts/gen_proto.sh
 
-ENV PYTHONPATH="/app/packages/core:/app/packages/shared/proto"
+# No PYTHONPATH needed: the editable install resolves `agent`/`rag`/`core`/`retrieval.v1`
+# packages (see pyproject.toml [tool.hatch.build.targets.wheel].packages).
 
 EXPOSE 50051
 

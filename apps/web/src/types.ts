@@ -29,7 +29,15 @@ export interface Sentence {
   score?: number;
 }
 
-export interface ExplainResult {
-  translation: string;
-  explanation: string;
+// Async job model (mirrors GET /jobs/{id} from apps/api/main.py).
+export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "unknown";
+
+export interface JobInfo<T = unknown> {
+  status: JobStatus;
+  result: T | null;
+  error: string | null;
+}
+
+export interface JobId {
+  job_id: string;
 }

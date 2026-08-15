@@ -6,12 +6,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID
 
+from arq import create_pool
+from arq.connections import RedisSettings
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
-from api.deps import get_agent, get_vocab_service, llm
+from api.deps import _embedder, get_agent, get_task_queue, get_vocab_service, llm
 from api.schemas import (
     BulkUpdateRequest,
     ChatRequest,
@@ -31,13 +33,32 @@ from api.schemas import (
     TTSRequest,
 )
 from core.config import settings
-from core.infrastructure.db import init_db
+from core.infrastructure.db import SessionLocal, init_db
+from core.infrastructure.jobs import (
+    ANALYZE_SYNTAX,
+    EXPLAIN,
+    GENERATE_DEFINITION,
+    IMAGE_FETCH,
+    INDEX_SENTENCES,
+    SESSION_FINALIZE,
+    TTS,
+    TaskQueue,
+)
+from core.infrastructure.memory import (
+    SessionMemoryStore,
+    create_session,
+    ensure_user,
+    load_session_messages,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+    app.state.redis = redis
     yield
+    await redis.aclose()
 
 
 app = FastAPI(title="DeepDive API", version="0.1.0", lifespan=lifespan)
@@ -135,8 +156,17 @@ async def import_sentences_structured(body: SentenceImportRequest, svc=Depends(g
 
 
 @app.post("/image-fetch")
-async def fetch_images(body: ImageFetchRequest, svc=Depends(get_vocab_service)):
-    return {"image_paths": await svc.fetch_term_images(body.word, body.definition, body.context, body.regenerate)}
+async def fetch_images(body: ImageFetchRequest, queue: TaskQueue = Depends(get_task_queue)):
+    job_id = await queue.enqueue(
+        IMAGE_FETCH,
+        {
+            "word": body.word,
+            "definition": body.definition,
+            "context": body.context,
+            "regenerate": body.regenerate,
+        },
+    )
+    return {"job_id": str(job_id)}
 
 
 # ── Sentences ──
@@ -162,8 +192,9 @@ async def search_sentences(domain_id: UUID, q: str, svc=Depends(get_vocab_servic
 
 
 @app.post("/domains/{domain_id}/sentences/index")
-async def index_sentences(domain_id: UUID, svc=Depends(get_vocab_service)):
-    return await svc.index_sentences(domain_id)
+async def index_sentences(domain_id: UUID, queue: TaskQueue = Depends(get_task_queue)):
+    job_id = await queue.enqueue(INDEX_SENTENCES, {"domain_id": str(domain_id)})
+    return {"job_id": str(job_id)}
 
 
 @app.get("/domains/{domain_id}/sentences/semantic")
@@ -185,35 +216,61 @@ async def list_sentences_for_term(term_id: UUID, svc=Depends(get_vocab_service))
 
 # ── TTS ──
 @app.post("/tts")
-async def synthesize_audio(body: TTSRequest, svc=Depends(get_vocab_service)):
-    path = await svc.synthesize_audio(body.text)
-    if not path:
-        raise HTTPException(status_code=500, detail="TTS synthesis failed")
-    return {"url": f"/audio/{Path(path).name}"}
+async def synthesize_audio(body: TTSRequest, queue: TaskQueue = Depends(get_task_queue)):
+    job_id = await queue.enqueue(TTS, {"text": body.text})
+    return {"job_id": str(job_id)}
 
 
 # ── AI capabilities ──
 @app.post("/explain")
-async def explain(body: ExplainRequest, svc=Depends(get_vocab_service)):
-    return await svc.explain_term_in_context(body.term, body.context)
+async def explain(body: ExplainRequest, queue: TaskQueue = Depends(get_task_queue)):
+    job_id = await queue.enqueue(EXPLAIN, {"term": body.term, "context": body.context})
+    return {"job_id": str(job_id)}
 
 
 @app.post("/terms/definition")
-async def generate_definition(body: GenerateDefinitionRequest, svc=Depends(get_vocab_service)):
-    return {"definition": await svc.generate_definition(body.term)}
+async def generate_definition(body: GenerateDefinitionRequest, queue: TaskQueue = Depends(get_task_queue)):
+    job_id = await queue.enqueue(GENERATE_DEFINITION, {"term": body.term})
+    return {"job_id": str(job_id)}
 
 
 @app.post("/sentences/analyze")
-async def analyze_syntax(body: SyntaxAnalysisRequest, svc=Depends(get_vocab_service)):
-    return {"analysis": await svc.analyze_syntax(body.sentence)}
+async def analyze_syntax(body: SyntaxAnalysisRequest, queue: TaskQueue = Depends(get_task_queue)):
+    job_id = await queue.enqueue(ANALYZE_SYNTAX, {"sentence": body.sentence})
+    return {"job_id": str(job_id)}
 
 
 # ── Chat (Agent) ──
 @app.post("/chat")
-async def chat(body: ChatRequest):
-    agent = get_agent()
-    result = await agent.run(body.message, body.history)
-    return {"answer": result.final_answer, "messages": result.messages}
+async def chat(body: ChatRequest, queue: TaskQueue = Depends(get_task_queue)):
+    user_id = await ensure_user(SessionLocal, body.user_id)
+    session_id = body.session_id or await create_session(SessionLocal, user_id)
+    session_memory = SessionMemoryStore(SessionLocal, _embedder(), llm, session_id, user_id)
+    history = body.history or await session_memory.load_messages()
+    result = await get_agent().run(body.message, history, session_memory=session_memory)
+    # close() (inside run) already flushed events; defer the expensive embed+summary work.
+    await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
+    return {
+        "answer": result.final_answer,
+        "messages": result.messages,
+        "session_id": str(session_id),
+        "user_id": str(user_id),
+    }
+
+
+@app.get("/sessions/{session_id}")
+async def get_session_messages(session_id: UUID):
+    """Return a session's message history (for resume)."""
+    messages = await load_session_messages(SessionLocal, session_id)
+    if not messages:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"session_id": str(session_id), "messages": messages}
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: UUID, queue: TaskQueue = Depends(get_task_queue)):
+    """Return the state of an async enrichment job (single source of truth: the jobs table)."""
+    return await queue.get(job_id)
 
 
 @app.post("/chat/stream")

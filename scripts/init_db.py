@@ -1,4 +1,4 @@
-"""Explicitly initialize the database: enable the pgvector extension + create tables.
+"""Explicitly initialize the database via Alembic migrations.
 
 Equivalent to init_db inside the FastAPI lifespan, split out for convenient script/CI use.
 Usage: python scripts/init_db.py

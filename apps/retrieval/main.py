@@ -14,36 +14,26 @@ from core.infrastructure.db import SessionLocal
 from core.infrastructure.llm import OpenAILLM
 from core.infrastructure.proto import retrieval_pb2_grpc
 from core.infrastructure.vector import PgVectorStore, TEIEmbedder
-from core.rag import (
-    CrossEncoderReranker,
-    KeywordRecaller,
-    QueryRewriter,
-    RAGPipeline,
-    VectorRecaller,
-)
+from rag import RAGPipeline, build_pipeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("retrieval")
 
 
-def build_pipeline() -> RAGPipeline:
-    llm = OpenAILLM()
-    embedder = TEIEmbedder()
-    vector_recaller = VectorRecaller(PgVectorStore(SessionLocal))
-    keyword_recaller = KeywordRecaller(SessionLocal)
-    rewriter = (
-        QueryRewriter(llm, n_variants=settings.rag_multi_query_n, hyde=settings.rag_hyde)
-        if settings.rag_query_rewrite
-        else None
+def _build_pipeline() -> RAGPipeline:
+    return build_pipeline(
+        embedder=TEIEmbedder(),
+        vector_store=PgVectorStore(SessionLocal),
+        session_factory=SessionLocal,
+        llm=OpenAILLM(),
+        settings=settings,
     )
-    reranker = CrossEncoderReranker(settings.reranker_model) if settings.reranker_model else None
-    return RAGPipeline(embedder, vector_recaller, keyword_recaller, rewriter, reranker)
 
 
 async def serve() -> None:
     server = grpc.aio.server()
     retrieval_pb2_grpc.add_RetrievalServiceServicer_to_server(
-        RetrievalService(build_pipeline()), server
+        RetrievalService(_build_pipeline()), server
     )
     address = settings.retrieval_grpc_addr
     server.add_insecure_port(address)

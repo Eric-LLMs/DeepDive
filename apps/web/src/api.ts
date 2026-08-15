@@ -1,6 +1,6 @@
 // Thin fetch wrapper around the DeepDive REST API.
 // In dev, Vite proxies /api/* to http://localhost:8000 (see vite.config.ts).
-import type { Domain, ExplainResult, Sentence, Term } from "./types";
+import type { Domain, JobId, JobInfo, Sentence, Term } from "./types";
 
 const BASE = "/api";
 
@@ -65,9 +65,9 @@ export const api = {
       body: JSON.stringify({ domain_id: domainId, items }),
     }),
 
-  // Images
-  fetchImages: (word: string, definition: string, context: string, regenerate: boolean) =>
-    request<{ image_paths: string[] }>("/image-fetch", {
+  // Images (enqueued, poll GET /jobs/{id})
+  enqueueImageFetch: (word: string, definition: string, context: string, regenerate: boolean) =>
+    request<JobId>("/image-fetch", {
       method: "POST",
       body: JSON.stringify({ word, definition, context, regenerate }),
     }),
@@ -88,8 +88,8 @@ export const api = {
     request<Sentence[]>(`/domains/${domainId}/sentences/search?q=${encodeURIComponent(q)}`),
   semanticSearch: (domainId: string, q: string) =>
     request<Sentence[]>(`/domains/${domainId}/sentences/semantic?q=${encodeURIComponent(q)}`),
-  indexSentences: (domainId: string) =>
-    request<{ indexed: number; error?: string }>(`/domains/${domainId}/sentences/index`, { method: "POST" }),
+  enqueueIndexSentences: (domainId: string) =>
+    request<JobId>(`/domains/${domainId}/sentences/index`, { method: "POST" }),
 
   // Matches / relations
   linkTermToSentence: (termId: string, sentenceId: string, explanation?: string) =>
@@ -99,26 +99,29 @@ export const api = {
     }),
   listSentencesForTerm: (termId: string) => request<Sentence[]>(`/terms/${termId}/sentences`),
 
-  // TTS
-  synthesize: (text: string) => request<{ url: string }>("/tts", {
+  // TTS (enqueued, poll GET /jobs/{id})
+  enqueueTts: (text: string) => request<JobId>("/tts", {
     method: "POST",
     body: JSON.stringify({ text }),
   }),
 
-  // AI capabilities
-  generateDefinition: (term: string) =>
-    request<{ definition: string }>("/terms/definition", {
+  // AI capabilities (enqueued, poll GET /jobs/{id})
+  enqueueGenerateDefinition: (term: string) =>
+    request<JobId>("/terms/definition", {
       method: "POST",
       body: JSON.stringify({ term }),
     }),
-  explain: (term: string, context: string) =>
-    request<ExplainResult>("/explain", {
+  enqueueExplain: (term: string, context: string) =>
+    request<JobId>("/explain", {
       method: "POST",
       body: JSON.stringify({ term, context }),
     }),
-  analyzeSyntax: (sentence: string) =>
-    request<{ analysis: string }>("/sentences/analyze", {
+  enqueueAnalyzeSyntax: (sentence: string) =>
+    request<JobId>("/sentences/analyze", {
       method: "POST",
       body: JSON.stringify({ sentence }),
     }),
+
+  // Jobs
+  getJob: (jobId: string) => request<JobInfo>(`/jobs/${jobId}`),
 };

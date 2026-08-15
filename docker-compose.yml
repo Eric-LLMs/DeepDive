@@ -67,7 +67,7 @@ services:
     #   deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
 
   # ── Reranker (BGE-reranker-v2-m3 via TEI) ─────────────────────────────
-  # NOTE: not currently wired into the app — core.rag.rerank uses sentence-transformers
+  # NOTE: not currently wired into the app — rag.rank.cross_encoder uses sentence-transformers
   # CrossEncoder in-process (config.reranker_model), not this HTTP service. BGE-reranker-v2-m3
   # also ships without ONNX weights, so TEI cannot serve it as-is. Leave this stopped unless
   # you export the model to ONNX first.
@@ -124,6 +124,40 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  # ── Worker (arq) ─────────────────────────────────────────────────────
+  # Executes enrichment jobs (TTS / image fetch / explain / definition / syntax analysis /
+  # sentence indexing / session finalize) enqueued by the FastAPI gateway. PostgreSQL's jobs
+  # table is the source of truth for job state; Redis only carries the work to this worker.
+  worker:
+    build:
+      context: .
+      dockerfile: deploy/worker/Dockerfile
+    container_name: deepdive-worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://deepdive:deepdive@postgres:5432/deepdive
+      REDIS_URL: redis://redis:6379/0
+      EMBEDDING_BASE_URL: http://embedding:80
+      LLM_BASE_URL: http://llm-gateway:4000/v1
+      LLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-gateway}
+      LLM_MODEL: deepdive-chat
+      TTS_BASE_URL: http://tts:8880/v1
+    volumes:
+      # Share the audio/image caches with the host-run FastAPI gateway, which serves /audio
+      # and /images from the same directories.
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      embedding:
+        condition: service_healthy
+      tts:
+        condition: service_healthy
+      llm-gateway:
+        condition: service_healthy
+    restart: unless-stopped
 
   # ── Retrieval service (RAG pipeline over gRPC) ───────────────────────
   # Owns the whole retrieval stack (embedding → recall → RRF → rerank → rewrite) behind a

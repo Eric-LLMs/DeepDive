@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 import { api } from "./api";
 import MicRecorder from "./MicRecorder";
+import { useJob } from "./useJob";
 import type { Domain, Sentence, Term } from "./types";
 
 type Page = "home" | "import" | "study" | "manage";
@@ -671,6 +672,7 @@ function VectorTab() {
   const [error, setError] = useState("");
 
   const activeDomain = domainId || domains[0]?.id || "";
+  const indexJob = useJob<{ indexed: number }>();
 
   const splitLines = (raw: string): string[] =>
     raw.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 5);
@@ -681,12 +683,9 @@ function VectorTab() {
     setIndexMsg("Importing & building embeddings… (first run downloads the embedding model)");
     try {
       const r = await api.importSentencesStructured(activeDomain, sentences);
-      const idx = await api.indexSentences(activeDomain);
-      setIndexMsg(
-        idx.error
-          ? `✅ Imported ${r.added} sentences, but indexing failed: ${idx.error}`
-          : `✅ Imported ${r.added} & indexed ${idx.indexed} sentences.`
-      );
+      setIndexMsg(`Imported ${r.added} sentences. Indexing in the background…`);
+      const idx = await indexJob.run(() => api.enqueueIndexSentences(activeDomain));
+      setIndexMsg(`✅ Imported ${r.added} & indexed ${idx.indexed} sentences.`);
       return true;
     } catch (e) {
       setError(String(e));
@@ -1298,6 +1297,10 @@ function SentenceCard({ term, sentence }: { term: Term; sentence: Sentence }) {
   const [error, setError] = useState("");
   const [msg, setMsg] = useState("");
 
+  const audioJob = useJob<{ url: string }>();
+  const explainJob = useJob<{ translation: string; explanation: string }>();
+  const syntaxJob = useJob<{ analysis: string }>();
+
   const run = async (key: string, fn: () => Promise<void>) => {
     setBusy(key);
     setError("");
@@ -1313,7 +1316,7 @@ function SentenceCard({ term, sentence }: { term: Term; sentence: Sentence }) {
 
   const genAudio = () =>
     run("audio", async () => {
-      const { url } = await api.synthesize(sentence.content_en);
+      const { url } = await audioJob.run(() => api.enqueueTts(sentence.content_en));
       setAudio(url);
       await api.updateSentence(sentence.id, { audio_hash: url });
       setMsg("✅ Pronunciation saved.");
@@ -1321,7 +1324,7 @@ function SentenceCard({ term, sentence }: { term: Term; sentence: Sentence }) {
 
   const aiExplain = () =>
     run("explain", async () => {
-      const res = await api.explain(term.word, sentence.content_en);
+      const res = await explainJob.run(() => api.enqueueExplain(term.word, sentence.content_en));
       setTranslation(res.translation);
       setExplanation(res.explanation);
       await api.updateSentence(sentence.id, { content_cn: res.translation });
@@ -1331,7 +1334,7 @@ function SentenceCard({ term, sentence }: { term: Term; sentence: Sentence }) {
 
   const analyze = () =>
     run("syntax", async () => {
-      const { analysis } = await api.analyzeSyntax(sentence.content_en);
+      const { analysis } = await syntaxJob.run(() => api.enqueueAnalyzeSyntax(sentence.content_en));
       setSyntax(analysis);
     });
 
@@ -1418,6 +1421,12 @@ function TermDetail({
   const [linkResults, setLinkResults] = useState<Sentence[]>([]);
   const [images, setImages] = useState<string[]>(current.image_paths ?? []);
 
+  const defJob = useJob<{ definition: string }>();
+  const explainJob = useJob<{ translation: string; explanation: string }>();
+  const syntaxJob = useJob<{ analysis: string }>();
+  const ttsJob = useJob<{ url: string }>();
+  const imageJob = useJob<{ image_paths: string[] }>();
+
   useEffect(() => {
     api.listTerms(domain.id).then(setSiblings).catch(() => {});
     api.listSentencesForTerm(current.id).then(setLinked).catch(() => {});
@@ -1441,7 +1450,7 @@ function TermDetail({
     setBusy("definition");
     setError("");
     try {
-      const { definition: d } = await api.generateDefinition(current.word);
+      const { definition: d } = await defJob.run(() => api.enqueueGenerateDefinition(current.word));
       setDefinition(d);
       await api.updateTerm(current.id, { definition: d });
       setCurrent({ ...current, definition: d });
@@ -1457,7 +1466,7 @@ function TermDetail({
     setBusy("explain");
     setError("");
     try {
-      setExplainResult(await api.explain(current.word, context.trim()));
+      setExplainResult(await explainJob.run(() => api.enqueueExplain(current.word, context.trim())));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1470,7 +1479,7 @@ function TermDetail({
     setBusy("analyze");
     setError("");
     try {
-      const { analysis: a } = await api.analyzeSyntax(sentence.trim());
+      const { analysis: a } = await syntaxJob.run(() => api.enqueueAnalyzeSyntax(sentence.trim()));
       setAnalysis(a);
     } catch (e) {
       setError(String(e));
@@ -1483,7 +1492,7 @@ function TermDetail({
     setBusy("tts");
     setError("");
     try {
-      const { url } = await api.synthesize(text);
+      const { url } = await ttsJob.run(() => api.enqueueTts(text));
       const audio = new Audio(url);
       await audio.play();
     } catch (e) {
@@ -1497,7 +1506,7 @@ function TermDetail({
     setBusy("tts");
     setError("");
     try {
-      const { url } = await api.synthesize(current.word);
+      const { url } = await ttsJob.run(() => api.enqueueTts(current.word));
       setCurrent({ ...current, audio_hash: url });
       await api.updateTerm(current.id, { audio_hash: url });
     } catch (e) {
@@ -1535,11 +1544,8 @@ function TermDetail({
     setBusy("images");
     setError("");
     try {
-      const { image_paths } = await api.fetchImages(
-        current.word,
-        current.definition ?? "",
-        context.trim(),
-        regenerate
+      const { image_paths } = await imageJob.run(() =>
+        api.enqueueImageFetch(current.word, current.definition ?? "", context.trim(), regenerate)
       );
       setImages(image_paths);
       await api.updateTerm(current.id, { image_paths });

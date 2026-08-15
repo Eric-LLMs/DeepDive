@@ -34,7 +34,7 @@ echo "  ✓ Docker 正常"
 # [3/5] 启动数据 + 模型服务(Postgres/pgvector + Redis + TEI + Kokoro + LiteLLM)
 echo ""
 echo "[3/5] 启动数据 + 模型服务..."
-docker compose up -d postgres redis embedding tts llm-gateway
+docker compose up -d postgres redis embedding tts llm-gateway worker
 echo "  ✓ 容器已启动(首次会下载模型权重,需要几分钟)"
 
 # [4/5] 安装 Python 依赖

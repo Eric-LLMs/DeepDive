@@ -54,7 +54,13 @@ rag = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["packages/core", "apps/api"]
+packages = [
+    "packages/agent",
+    "packages/rag",
+    "packages/core",
+    "packages/shared/proto/retrieval",
+    "apps/api",
+]
 
 [tool.ruff]
 line-length = 100
