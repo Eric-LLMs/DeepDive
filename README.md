@@ -131,12 +131,12 @@ The first start downloads the models (BGE-M3, Kokoro-82M) into Docker volumes â€
 >
 > **Docker Desktop (Windows) memory note:** the TEI embedding service needs ~9 GB during BGE-M3 warmup. If Docker's WSL2 backend has only ~8 GB (the default on a 16 GB host), the container gets OOM-killed. Raise the limit in `%UserProfile%\.wslconfig`, e.g. `[wsl2]\nmemory=12GB\nswap=4GB`, then run `wsl --shutdown` and restart Docker Desktop.
 
-### 7. Initialize the database (Alembic migrations)
+### 7. Initialize the database (SQL migrations)
 
 ```bash
-python scripts/init_db.py     # runs `alembic upgrade head` (creates all tables incl. jobs)
-# or directly:
-alembic upgrade head
+python scripts/init_db.py     # applies migrations/*.sql in order (creates all tables incl. jobs)
+# or run a single script directly with psql:
+psql -d deepdive -f migrations/0001_init.sql
 ```
 
 ### 8. Run the API

@@ -20,7 +20,7 @@
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
 | Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}` |
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize |
-| Migrations | Alembic (replaces `create_all` + manual `ALTER`) |
+| Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
 
 ### Designed, not yet implemented
@@ -360,9 +360,9 @@ rewrite → multi-recall → RRF fusion → rerank
 
 ## 12. Data Model (Core Table DDL)
 
-> **Migration note:** the implemented schema is managed by **Alembic**
-> (`migrations/versions/0001_init.py`); `init_db()` runs `alembic upgrade head` at startup
-> (replacing the old `create_all` + manual `ALTER`). The implemented tables include `sessions`,
+> **Migration note:** the implemented schema is managed by **plain SQL migrations**
+> (`migrations/*.sql`, applied in filename order by `init_db()` via asyncpg and tracked in the
+> `schema_migrations` table), replacing Alembic. The implemented tables include `sessions`,
 > `messages`, `session_events`, and `jobs` — which the design DDL below expresses as
 > `conversations` / `messages` / `job_logs`. The DDL below is the full designed schema; some
 > tables are design-only (auth / billing / observability).

@@ -4,7 +4,6 @@ Uses the asyncpg async driver;
 see docs/architecture.md for table/field names. This first lands the core learning-domain tables;
 materials/chunks/users/conversations etc. are added later at the Agent/RAG layer.
 """
-import asyncio
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -211,15 +210,44 @@ class JobModel(Base):
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+_MIGRATIONS_DIR = _REPO_ROOT / "migrations"
 
 
-def _run_migrations() -> None:
-    from alembic import command
-    from alembic.config import Config
-
-    command.upgrade(Config(str(_REPO_ROOT / "alembic.ini")), "head")
+def _asyncpg_dsn(database_url: str) -> str:
+    """asyncpg connects with a plain ``postgresql://`` DSN, not SQLAlchemy's ``+asyncpg``."""
+    return database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 
 async def init_db() -> None:
-    """Bring the schema up to date via Alembic (replaces ``create_all`` + manual ALTER)."""
-    await asyncio.to_thread(_run_migrations)
+    """Apply pending SQL migrations in order (replaces Alembic).
+
+    Each ``migrations/NNNN_*.sql`` file runs once, inside a transaction; applied versions are
+    recorded in ``schema_migrations`` so re-runs are no-ops.
+    """
+    import asyncpg
+
+    conn = await asyncpg.connect(_asyncpg_dsn(settings.database_url))
+    try:
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "version TEXT PRIMARY KEY,"
+            "name TEXT NOT NULL,"
+            "applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        applied = {
+            row["version"] for row in await conn.fetch("SELECT version FROM schema_migrations")
+        }
+        for path in sorted(_MIGRATIONS_DIR.glob("*.sql")):
+            version = path.stem
+            if version in applied:
+                continue
+            sql = path.read_text(encoding="utf-8")
+            async with conn.transaction():
+                await conn.execute(sql)
+                await conn.execute(
+                    "INSERT INTO schema_migrations (version, name) VALUES ($1, $2)",
+                    version,
+                    path.name,
+                )
+    finally:
+        await conn.close()
