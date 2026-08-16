@@ -79,6 +79,13 @@ Toggle terms with smooth switches, rate importance with star icons, click to edi
 - **MCP Tool Integration**: Tools are defined once and shared by the Agent, RAG, and MCP (FastMCP).
 - **SSE Streaming**: Real-time token streaming to the frontend.
 
+### 👥 Multi-User, Roles & Billing
+- **Admin console** (`/admin`): a single self-contained page to manage LLM providers, models, users, and wallets. A default `admin`/`admin` credential is seeded into the DB on first boot.
+- **User accounts**: admins create username/password accounts; users log in to receive an opaque token. Roles (`regular` / `pro` / `vip` / `admin`) carry per-role quota (daily/monthly requests, tokens, RPM, cost) and an optional default model.
+- **Server-managed config**: LLM provider keys, the model catalog, and the admin credential live in PostgreSQL (`app_settings`) — not `.env` or repo files — and are edited from the admin console.
+- **Pay-as-you-go billing**: per-model pricing (prompt/completion per 1k tokens), a cash wallet per user, and an append-only ledger with a `balance_after` snapshot. Chat usage is priced and debited atomically.
+- **Guest access**: anonymous users can chat without an account, capped per day (`guest_daily_limit`, default 10); exceeding the cap prompts them to sign in.
+
 ---
 
 ## 🚀 Getting Started (from zero)
@@ -183,13 +190,31 @@ npm run dev
 
 Open http://localhost:5173. The Vite dev server proxies `/api`, `/audio`, and `/images` to the backend.
 
+### 12. Run the desktop workbench (Electron, optional)
+
+The desktop app is a standalone **learning workbench** with its own renderer (not the React web UI):
+a local folder tree, a multi-format viewer (video/audio/image/PDF/text with OS-default
+fallback for Office files), one-click video screenshots, and a chat pane.
+
+```bash
+cd apps/desktop
+npm install
+npm start                      # opens the workbench window
+```
+
+The file tree, viewer, and video screenshot work **without the backend**. Chat, "生成 PPT /
+生成书" (media generation), and the ⚙️ Settings panel need the backend running on
+`localhost:8000` — the Electron main process forwards `/api`, `/audio`, and `/images` to it.
+⚙️ Settings opens a dropdown list (Account / Theme / Help): sign in with an account created in
+the admin console, or chat anonymously as a guest (limited to `guest_daily_limit` per day).
+
 ---
 
 ## ⚙️ Configuration reference
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://deepdive:deepdive@localhost:5432/deepdive` | PostgreSQL + pgvector |
+| `DATABASE_URL` | `postgresql+asyncpg://deepdive:deepdive@localhost:15432/deepdive` | PostgreSQL + pgvector |
 | `REDIS_URL` | `redis://localhost:16379/0` | cache / queue |
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | `sk-local-gateway` / `http://localhost:4000/v1` / `deepdive-chat` | the LiteLLM gateway the API talks to |
 | `LLM_UPSTREAM_MODEL` / `LLM_UPSTREAM_BASE` / `LLM_UPSTREAM_KEY` | `openai/gpt-4o-mini` / `https://api.openai.com/v1` / `sk-xxx` | real upstream LLM (consumed by the gateway container) |

@@ -3,6 +3,8 @@
 Modeled after claude-code memdir (file) + openclaw layered memory (session / disk / vector).
 Only a minimal interface is defined here; concrete implementations are swapped per layer.
 """
+from __future__ import annotations
+
 from typing import Protocol
 
 from agent.memory.types import Memory

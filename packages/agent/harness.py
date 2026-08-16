@@ -9,7 +9,9 @@ class FakeLLM:
         self.script = list(script)
         self.calls: list[tuple[list[dict], list[dict] | None]] = []
 
-    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    async def chat(
+        self, messages: list[dict], tools: list[dict] | None = None, model: str | None = None
+    ) -> dict:
         self.calls.append((list(messages), tools))
         if not self.script:
             return {"content": None, "tool_calls": []}

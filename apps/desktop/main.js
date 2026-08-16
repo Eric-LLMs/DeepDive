@@ -1,0 +1,414 @@
+// Electron main process for the DeepDive learning workbench.
+//
+// Serves the desktop renderer (apps/desktop/renderer) over a privileged `app://`
+// protocol, proxies /api to the FastAPI backend, and gives the renderer access to
+// local files through a `local://` protocol + a small IPC surface (folder pick,
+// file tree, open-with-OS-default, text read, screenshot save).
+const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, Menu } = require("electron");
+const path = require("path");
+const fs = require("fs");
+const os = require("os");
+const { execFile } = require("child_process");
+const { Readable } = require("stream");
+const { pathToFileURL } = require("url");
+const { PDFDocument, rgb } = require("pdf-lib");
+
+function hexToRgb(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
+  if (!m) return rgb(1, 0.84, 0.33);
+  const n = parseInt(m[1], 16);
+  return rgb(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
+}
+
+const BACKEND = "http://localhost:8000";
+const RENDERER_DIR = path.join(__dirname, "renderer");
+
+const MAX_TREE_DEPTH = 8;
+const IGNORED_DIRS = new Set(["node_modules", ".git", ".svn", "__pycache__", ".venv", "venv", "dist", "build"]);
+const MAX_TEXT_PREVIEW = 2 * 1024 * 1024; // 2 MB
+
+// `app://` and `local://` must be standard + secure so fetch and relative URLs
+// resolve like a normal origin.
+protocol.registerSchemesAsPrivileged([
+  { scheme: "app", privileges: { standard: true, secure: true, supportFetchAPI: true } },
+  { scheme: "local", privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
+]);
+
+async function proxy(target, request) {
+  const init = {
+    method: request.method,
+    headers: request.headers,
+  };
+  // net.fetch defaults to GET; forward the body for anything that has one.
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    init.body = await request.text();
+  }
+  return net
+    .fetch(target, init)
+    .catch((err) => new Response(`Backend unavailable: ${target} — ${err.message}`, { status: 502 }));
+}
+
+function handleAppRequest(request) {
+  const { pathname, search } = new URL(request.url);
+
+  // API: the renderer calls /api/... (same convention as the web app); strip prefix.
+  if (pathname.startsWith("/api/")) {
+    return proxy(BACKEND + pathname.slice("/api".length) + search, request);
+  }
+  // Cached TTS audio / images are served by the backend at /audio and /images.
+  if (pathname.startsWith("/audio/") || pathname.startsWith("/images/")) {
+    return proxy(BACKEND + pathname + search, request);
+  }
+
+  // Static files from the desktop renderer, falling back to index.html (SPA).
+  const relative = pathname === "/" ? "index.html" : pathname.replace(/^\//, "");
+  let filePath = path.join(RENDERER_DIR, relative);
+  if (!fs.existsSync(filePath)) {
+    filePath = path.join(RENDERER_DIR, "index.html");
+  }
+  return net.fetch(pathToFileURL(filePath).toString());
+}
+
+const MIME = {
+  mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime", m4v: "video/x-m4v",
+  mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", flac: "audio/flac", ogg: "audio/ogg",
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+  webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
+  pdf: "application/pdf",
+};
+
+function mimeOf(filePath) {
+  const ext = path.extname(filePath).slice(1).toLowerCase();
+  return MIME[ext] || "application/octet-stream";
+}
+
+// Decode a text buffer, sniffing the encoding: UTF-8 (with/without BOM), falling
+// back to GB18030 (a superset of GBK/GB2312) for legacy Chinese subtitle/text files.
+function decodeText(buf) {
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    return buf.subarray(3).toString("utf-8");
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    return new TextDecoder("gb18030").decode(buf);
+  }
+}
+
+// `local://file/?path=<abs-path>` → stream the local file. The path travels in the
+// query string so Windows drive letters never mangle the URL authority. Byte-range
+// requests are honoured so <video>/<audio> seeking and PDF.js random access work; a
+// permissive CORS header lets the renderer canvas-read frames and lets PDF.js fetch
+// the document, even though `local://` and `app://` are different origins.
+function handleLocalRequest(request) {
+  const filePath = new URL(request.url).searchParams.get("path");
+  if (!filePath) return new Response("missing path", { status: 400 });
+
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    return new Response("not found", { status: 404 });
+  }
+  const size = stat.size;
+
+  const headers = new Headers();
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Content-Type", mimeOf(filePath));
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length");
+
+  const range = request.headers.get("range");
+  if (range) {
+    const m = /bytes=(\d*)-(\d*)/.exec(range);
+    if (m) {
+      let start = m[1] === "" ? null : parseInt(m[1], 10);
+      let end = m[2] === "" ? null : parseInt(m[2], 10);
+      if (start === null) {
+        // Suffix range: "bytes=-N" → the last N bytes.
+        const suffix = parseInt(m[2], 10);
+        start = Math.max(0, size - suffix);
+        end = size - 1;
+      } else if (end === null || end >= size) {
+        end = size - 1;
+      }
+      if (start > end || start >= size) {
+        headers.set("Content-Range", `bytes */${size}`);
+        return new Response(null, { status: 416, headers });
+      }
+      headers.set("Content-Range", `bytes ${start}-${end}/${size}`);
+      headers.set("Content-Length", String(end - start + 1));
+      const webStream = Readable.toWeb(fs.createReadStream(filePath, { start, end }));
+      return new Response(webStream, { status: 206, headers });
+    }
+  }
+
+  headers.set("Content-Length", String(size));
+  const webStream = Readable.toWeb(fs.createReadStream(filePath));
+  return new Response(webStream, { status: 200, headers });
+}
+
+function readTree(dir, depth = 0) {
+  if (depth > MAX_TREE_DEPTH) return [];
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const result = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith(".")) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (IGNORED_DIRS.has(entry.name)) continue;
+      result.push({ name: entry.name, path: full, type: "dir", children: readTree(full, depth + 1) });
+    } else if (entry.isFile()) {
+      result.push({ name: entry.name, path: full, type: "file" });
+    }
+  }
+  result.sort((a, b) =>
+    a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1
+  );
+  return result;
+}
+
+// Locate a LibreOffice `soffice` binary (on PATH or common Windows install dirs).
+function findSoffice() {
+  const candidates = [
+    "soffice",
+    "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+    "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+  ];
+  for (const c of candidates) {
+    if (c === "soffice" || fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+// Convert a PowerPoint file (.ppt/.pptx) to PDF via LibreOffice headless, writing
+// the result into a fresh temp dir. Resolves to { ok, pdfPath } or { ok, error }.
+function convertSlidesToPdf(filePath) {
+  return new Promise((resolve) => {
+    const soffice = findSoffice();
+    if (!soffice) {
+      return resolve({
+        ok: false,
+        error: "LibreOffice (soffice) not found. Install LibreOffice or add soffice to PATH.",
+      });
+    }
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "deepdive-ppt-"));
+    const base = path.basename(filePath, path.extname(filePath)) + ".pdf";
+    execFile(
+      soffice,
+      ["--headless", "--convert-to", "pdf", "--outdir", outDir, filePath],
+      { timeout: 120000 },
+      (err) => {
+        if (err) return resolve({ ok: false, error: err.message });
+        const pdfPath = path.join(outDir, base);
+        resolve(
+          fs.existsSync(pdfPath)
+            ? { ok: true, pdfPath }
+            : { ok: false, error: "Conversion produced no PDF file." }
+        );
+      }
+    );
+  });
+}
+
+function registerIpcHandlers() {
+  ipcMain.handle("pick-folder", async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ["openDirectory"] });
+    return canceled || filePaths.length === 0 ? null : filePaths[0];
+  });
+
+  ipcMain.handle("read-tree", (_event, dir) => readTree(dir));
+
+  ipcMain.handle("open-external", (_event, filePath) => shell.openPath(filePath));
+
+  ipcMain.handle("convert-slides", (_event, filePath) => convertSlidesToPdf(filePath));
+
+  ipcMain.handle("find-subtitle", (_event, videoPath) => {
+    const dir = path.dirname(videoPath);
+    const base = path.basename(videoPath, path.extname(videoPath));
+    for (const ext of [".srt", ".vtt", ".lrc"]) {
+      const candidate = path.join(dir, base + ext);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    return null;
+  });
+
+  ipcMain.handle("pick-subtitle", async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+      properties: ["openFile"],
+      filters: [
+        { name: "Subtitle files", extensions: ["srt", "vtt", "lrc"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    return canceled || filePaths.length === 0 ? null : filePaths[0];
+  });
+
+  ipcMain.handle("read-text", (_event, filePath) => {
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.size > MAX_TEXT_PREVIEW) {
+        return { ok: false, error: "File too large to preview." };
+      }
+      const buf = fs.readFileSync(filePath);
+      if (buf.includes(0)) {
+        return { ok: false, error: "Binary file — cannot preview as text." };
+      }
+      return { ok: true, content: decodeText(buf) };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("read-annotations", (_event, pdfPath) => {
+    const annotPath = pdfPath + ".annot.json";
+    try {
+      if (!fs.existsSync(annotPath)) return { ok: true, data: null };
+      return { ok: true, data: JSON.parse(fs.readFileSync(annotPath, "utf-8")) };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("save-annotations", (_event, { pdfPath, data }) => {
+    try {
+      fs.writeFileSync(pdfPath + ".annot.json", JSON.stringify(data, null, 2), "utf-8");
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Flatten sidecar annotations into a copy of the PDF so other readers can see them.
+  ipcMain.handle("embed-annotations", async (_event, { pdfPath, annotations }) => {
+    try {
+      const doc = await PDFDocument.load(fs.readFileSync(pdfPath));
+      const pages = doc.getPages();
+      for (const s of annotations.strokes || []) {
+        const page = pages[s.page];
+        if (!page || !s.points || !s.points.length) continue;
+        const { width, height } = page.getSize();
+        const px = (p) => ({ x: p.x * width, y: height - p.y * height });
+        const color = hexToRgb(s.color);
+        const borderWidth = Math.max(0.5, (s.width || 3) * 0.75);
+        if (s.points.length === 1) {
+          const { x, y } = px(s.points[0]);
+          page.drawCircle({ x, y, size: borderWidth, color, borderColor: color, borderWidth: 0 });
+          continue;
+        }
+        const d = "M " + s.points.map((p) => {
+          const q = px(p);
+          return `${q.x.toFixed(2)} ${q.y.toFixed(2)}`;
+        }).join(" L ");
+        page.drawSvgPath(d, { borderColor: color, borderWidth });
+      }
+      for (const n of annotations.notes || []) {
+        const page = pages[n.page];
+        if (!page) continue;
+        const { width, height } = page.getSize();
+        const x = n.x * width;
+        const y = height - n.y * height;
+        page.drawRectangle({
+          x: x - 4, y: y - 4, width: 8, height: 8,
+          color: rgb(1, 0.84, 0.33),
+          borderColor: rgb(0.72, 0.55, 0.1),
+          borderWidth: 0.6,
+        });
+      }
+      const outPath = pdfPath.replace(/\.pdf$/i, "") + ".annotated.pdf";
+      fs.writeFileSync(outPath, await doc.save());
+      return { ok: true, path: outPath };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("save-screenshot", async (_event, { dataURL, defaultName }) => {
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      defaultPath: defaultName || "screenshot.png",
+      filters: [{ name: "PNG Image", extensions: ["png"] }],
+    });
+    if (canceled || !filePath) return null;
+    const base64 = dataURL.replace(/^data:image\/png;base64,/, "");
+    fs.writeFileSync(filePath, Buffer.from(base64, "base64"));
+    return filePath;
+  });
+}
+
+function setupMenu() {
+  const menu = Menu.buildFromTemplate([
+    {
+      label: "File",
+      submenu: [{ role: "quit" }],
+    },
+    {
+      label: "Edit",
+      submenu: [
+        { role: "undo" }, { role: "redo" }, { type: "separator" },
+        { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" },
+      ],
+    },
+    {
+      label: "View",
+      submenu: [
+        { role: "reload" }, { role: "toggleDevTools" }, { type: "separator" },
+        { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" },
+        { role: "togglefullscreen" },
+      ],
+    },
+    {
+      label: "Help",
+      submenu: [
+        {
+          label: "DeepDive on GitHub",
+          click: () => shell.openExternal("https://github.com/Eric-LLMs/DeepDive"),
+        },
+      ],
+    },
+  ]);
+  Menu.setApplicationMenu(menu);
+}
+
+function createWindow() {
+  const win = new BrowserWindow({
+    width: 1280,
+    height: 820,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      preload: path.join(__dirname, "preload.js"),
+    },
+  });
+  // Surface renderer console output / load failures in the main-process log.
+  win.webContents.on("console-message", (_e, level, message, line, sourceId) => {
+    console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`);
+  });
+  win.webContents.on("did-fail-load", (_e, code, desc, url) => {
+    console.error(`[renderer] did-fail-load ${code} ${desc} ${url}`);
+  });
+  win.loadURL("app://bundle/index.html");
+}
+
+app.whenReady().then(() => {
+  if (!fs.existsSync(path.join(RENDERER_DIR, "index.html"))) {
+    console.error(`Renderer not found at ${RENDERER_DIR}.`);
+  }
+  protocol.handle("app", handleAppRequest);
+  protocol.handle("local", handleLocalRequest);
+  registerIpcHandlers();
+  setupMenu();
+  createWindow();
+
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
+});

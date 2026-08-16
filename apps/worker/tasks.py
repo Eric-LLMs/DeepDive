@@ -5,9 +5,12 @@ enrichment work the gateway used to do in-process. arq calls every task as
 ``task(ctx, job_id, payload)``; the job row in PostgreSQL is the source of truth, so each
 task drives its own status transitions via :class:`JobStore`.
 """
+import asyncio
 from pathlib import Path
 from uuid import UUID
 
+from core.config import settings
+from core.infrastructure import media
 from core.infrastructure.jobs import JobStore
 from core.infrastructure.memory import finalize_session
 from core.infrastructure.repositories import SqlSentenceRepository
@@ -95,5 +98,39 @@ async def session_finalize(ctx, job_id: str, payload: dict) -> dict:
         return await finalize_session(
             ctx["session_factory"], ctx["embedder"], ctx["llm"], session_id
         )
+
+    return await _run(ctx, job_id, work())
+
+
+def _build_media(payload: dict) -> dict:
+    """Blocking body of generate_media: subtitle parse → keyframes → PPT/PDF."""
+    video_path = payload["video_path"]
+    subtitle_path = payload.get("subtitle_path")
+    fmt = payload.get("format", "pptx")
+    title = payload.get("title") or Path(video_path).stem
+
+    out_dir = Path(settings.media_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cues = media.parse_subtitles(subtitle_path) if subtitle_path else []
+    timestamps = [c.start_ms for c in cues]
+    frames = media.extract_keyframes(video_path, timestamps, out_dir / "frames")
+
+    slides = [(frame, cues[i].text if i < len(cues) else "") for i, frame in enumerate(frames)]
+
+    if fmt == "pdf":
+        out = out_dir / f"{title}.pdf"
+        media.build_pdf(slides, out, title)
+    else:
+        out = out_dir / f"{title}.pptx"
+        media.build_pptx(slides, out, title)
+    return {"path": str(out)}
+
+
+async def generate_media(ctx, job_id: str, payload: dict) -> dict:
+    """Generate a PPT or PDF "book" from a local video (subtitles + keyframes)."""
+
+    async def work() -> dict:
+        return await asyncio.to_thread(_build_media, payload)
 
     return await _run(ctx, job_id, work())

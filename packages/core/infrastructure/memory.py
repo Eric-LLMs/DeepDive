@@ -62,10 +62,14 @@ class SessionMemoryStore:
         ``session_finalize`` worker job via :func:`finalize_session`.
         """
         async with self.session_factory() as session:
-            for type_, payload in self._events:
+            for seq, (type_, payload) in enumerate(self._events):
                 session.add(
                     SessionEventModel(
-                        session_id=self.session_id, type=type_, timestamp=time.time(), payload=payload
+                        session_id=self.session_id,
+                        seq=seq,
+                        type=type_,
+                        timestamp=time.time(),
+                        payload=payload,
                     )
                 )
             self._events.clear()
@@ -152,6 +156,26 @@ async def load_session_messages(session_factory, session_id: UUID) -> list[dict]
             )
         ).scalars().all()
         return [{"role": m.role, "content": m.text} for m in rows]
+
+
+async def list_sessions(session_factory, user_id: UUID) -> list[dict]:
+    """Return a user's sessions (newest first) as ``[{id, created_at, summary}]``."""
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(SessionModel)
+                .where(SessionModel.user_id == user_id)
+                .order_by(SessionModel.created_at.desc())
+            )
+        ).scalars().all()
+        return [
+            {
+                "id": str(s.id),
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "summary": s.summary,
+            }
+            for s in rows
+        ]
 
 
 async def ensure_user(session_factory, user_id: UUID | None = None) -> UUID:

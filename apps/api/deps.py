@@ -38,6 +38,7 @@ from core.infrastructure.repositories import (
 )
 from core.infrastructure.tts import TTSClient
 from core.infrastructure.vector import PgVectorStore, TEIEmbedder
+from core.infrastructure.web_search import get_web_search_provider
 from rag import RAGPipeline, build_pipeline
 
 # Lightweight singletons
@@ -72,6 +73,8 @@ def _agent() -> ReactLoopAgent:
         ctx.provide("retrieval", GrpcRetriever(settings.retrieval_grpc_addr))
     else:
         ctx.provide("retrieval", _retriever())
+
+    ctx.provide("web_search", get_web_search_provider())
 
     register_builtin_tools(runtime, ctx, llm)
 

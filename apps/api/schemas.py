@@ -1,4 +1,5 @@
 """API request/response models."""
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -105,3 +106,125 @@ class ChatRequest(BaseModel):
     history: list[dict] = []
     user_id: UUID | None = None      # optional: per-user memory isolation
     session_id: UUID | None = None   # optional: resume an existing session
+
+
+class MediaGenerateRequest(BaseModel):
+    video_path: str
+    subtitle_path: str | None = None
+    format: str = "pptx"             # "pptx" | "pdf"
+    title: str | None = None
+
+
+class ConfigUpdateRequest(BaseModel):
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    llm_model: str | None = None
+    web_search_provider: str | None = None
+    web_search_api_key: str | None = None
+
+
+class LLMProviderModel(BaseModel):
+    """One OpenAI-compatible provider card (id/name/endpoint/key/model catalog)."""
+
+    id: str
+    name: str = ""
+    base_url: str = ""
+    api_key: str = ""          # empty string means "keep the existing stored key"
+    models: list[str] = []
+    model: str = ""
+
+
+class ProvidersUpdateRequest(BaseModel):
+    """Full provider-card list + active selection, written wholesale by the settings UI."""
+
+    providers: list[LLMProviderModel] = []
+    active_provider: str = ""
+    web_search_provider: str | None = None
+    web_search_api_key: str | None = None
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UserLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UserCreateRequest(BaseModel):
+    username: str
+    password: str
+    display_name: str | None = None
+    role_id: str = "regular"        # "regular" | "pro" | "vip" | "admin"
+
+
+class UserUpdateRequest(BaseModel):
+    display_name: str | None = None
+    role_id: str | None = None
+    is_active: bool | None = None
+    password: str | None = None
+
+
+class TokenCreateRequest(BaseModel):
+    name: str
+    role: str = "user"              # "admin" | "user"
+    user_id: UUID | None = None     # required for role="user"
+    role_id: str | None = None      # optional quota-role override
+    expires_at: datetime | None = None
+
+
+class TokenUpdateRequest(BaseModel):
+    name: str | None = None
+    is_active: bool | None = None
+    expires_at: datetime | None = None
+
+
+class RoleUpdateRequest(BaseModel):
+    role_name: str | None = None
+    daily_request_limit: int | None = None
+    monthly_request_limit: int | None = None
+    daily_token_limit: int | None = None
+    rpm_limit: int | None = None
+    monthly_cost_limit: float | None = None
+    default_model: str | None = None
+    models: list[str] | None = None
+    features: dict | None = None
+    is_active: bool | None = None
+
+
+class ModelCreateRequest(BaseModel):
+    name: str
+    description: str | None = None
+    prompt_price_per_1k: float = 0.0
+    completion_price_per_1k: float = 0.0
+    is_active: bool = True
+
+
+class ModelUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    prompt_price_per_1k: float | None = None
+    completion_price_per_1k: float | None = None
+    is_active: bool | None = None
+
+
+class CredentialCreateRequest(BaseModel):
+    name: str
+    base_url: str
+    api_key: str
+    is_active: bool = True
+
+
+class CredentialUpdateRequest(BaseModel):
+    name: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    is_active: bool | None = None
+
+
+class WalletTopupRequest(BaseModel):
+    user_id: UUID
+    amount: float
+    description: str = ""

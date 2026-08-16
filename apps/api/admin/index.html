@@ -1,0 +1,1066 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeepDive Admin</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --panel: #181b21;
+        --border: #2a2f3a;
+        --text: #e6e8ee;
+        --muted: #8a90a0;
+        --accent: #4f7cff;
+        --accent-text: #fff;
+        --danger: #e05252;
+        --ok: #34c07a;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 14px;
+      }
+      .hidden { display: none !important; }
+      .wrap { max-width: 820px; margin: 0 auto; padding: 32px 20px 80px; }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      h2 { font-size: 15px; margin: 24px 0 12px; }
+      .muted { color: var(--muted); }
+      .bar {
+        display: flex; align-items: center; justify-content: space-between;
+        border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 8px;
+      }
+      .bar .brand { display: flex; align-items: center; gap: 10px; }
+      .bar button {
+        background: transparent; border: 1px solid var(--border); color: var(--text);
+        padding: 7px 14px; border-radius: 6px; cursor: pointer;
+      }
+      .bar button:hover { border-color: var(--accent); }
+
+      /* login */
+      .login-card {
+        max-width: 360px; margin: 80px auto; background: var(--panel);
+        border: 1px solid var(--border); border-radius: 10px; padding: 28px;
+      }
+      .login-card h1 { font-size: 18px; margin-bottom: 20px; }
+      .login-card label { display: block; margin-bottom: 14px; }
+      .login-card label span { display: block; margin-bottom: 6px; color: var(--muted); }
+      .login-card input {
+        width: 100%; background: var(--bg); border: 1px solid var(--border);
+        color: var(--text); padding: 9px 12px; border-radius: 6px;
+      }
+      .login-card input:focus { outline: none; border-color: var(--accent); }
+      .login-card button {
+        width: 100%; margin-top: 6px; background: var(--accent); color: var(--accent-text);
+        border: none; padding: 10px; border-radius: 6px; cursor: pointer; font-weight: 600;
+      }
+      .login-card .err { color: var(--danger); margin-top: 12px; }
+
+      /* provider cards */
+      .provider-card {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+        padding: 16px; margin-bottom: 14px;
+      }
+      .provider-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+      .provider-head input[type="text"] {
+        flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+        padding: 7px 10px; border-radius: 6px;
+      }
+      .provider-head input[type="radio"] { width: 16px; height: 16px; }
+      .provider-head .del {
+        background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 16px;
+      }
+      .provider-head .del:hover { color: var(--danger); }
+      .cfg-field { display: block; margin-bottom: 10px; }
+      .cfg-field > span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 12px; }
+      .cfg-field input, .cfg-field select {
+        width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+        padding: 8px 10px; border-radius: 6px;
+      }
+      .cfg-field input:focus, .cfg-field select:focus { outline: none; border-color: var(--accent); }
+      .cfg-model-row { display: flex; gap: 10px; align-items: flex-end; }
+      .cfg-model-row .cfg-field { flex: 1; margin-bottom: 0; }
+      .cfg-model-row button {
+        background: transparent; border: 1px solid var(--border); color: var(--text);
+        padding: 8px 12px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+      }
+      .cfg-model-row button:hover { border-color: var(--accent); }
+
+      .toolbar { display: flex; gap: 10px; margin: 20px 0; }
+      .toolbar button {
+        background: transparent; border: 1px solid var(--border); color: var(--text);
+        padding: 8px 16px; border-radius: 6px; cursor: pointer;
+      }
+      .toolbar button:hover { border-color: var(--accent); }
+      .toolbar button.primary { background: var(--accent); color: var(--accent-text); border: none; font-weight: 600; }
+
+      .cfg-status { margin-top: 16px; font-size: 13px; }
+      .cfg-status.ok { color: var(--ok); }
+      .cfg-status.err { color: var(--danger); }
+
+      fieldset {
+        border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin: 20px 0 0;
+      }
+      fieldset legend { color: var(--muted); padding: 0 8px; font-size: 12px; }
+
+      .user-form { display: flex; gap: 10px; flex-wrap: wrap; }
+      .user-form input, .user-form select {
+        background: var(--bg); border: 1px solid var(--border); color: var(--text);
+        padding: 8px 10px; border-radius: 6px; flex: 1; min-width: 120px;
+      }
+      .user-form button {
+        background: transparent; border: 1px solid var(--border); color: var(--text);
+        padding: 8px 14px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+      }
+      .user-form button:hover { border-color: var(--accent); }
+      .user-row {
+        display: flex; align-items: center; gap: 10px; padding: 10px 0;
+        border-bottom: 1px solid var(--border); flex-wrap: wrap;
+      }
+      .user-row .who { flex: 1; min-width: 140px; }
+      .user-row .who .name { font-weight: 600; }
+      .user-row .who .sub { color: var(--muted); font-size: 12px; }
+      .user-row select, .user-row input {
+        background: var(--bg); border: 1px solid var(--border); color: var(--text);
+        padding: 5px 8px; border-radius: 6px;
+      }
+      .user-row button {
+        background: transparent; border: 1px solid var(--border); color: var(--text);
+        padding: 5px 10px; border-radius: 6px; cursor: pointer;
+      }
+      .user-row button:hover { border-color: var(--accent); }
+      .user-row button.danger:hover { border-color: var(--danger); color: var(--danger); }
+      .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); }
+      .badge.vip { color: var(--accent); border-color: var(--accent); }
+      .badge.admin { color: var(--danger); border-color: var(--danger); }
+      .badge.inactive { color: var(--danger); border-color: var(--danger); }
+
+      .role-card {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+        padding: 14px; margin-bottom: 12px;
+      }
+      .role-card .head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+      .role-card .head .id { font-weight: 600; }
+      .role-card .head .name { color: var(--muted); font-size: 12px; }
+      .role-card .grid { display: flex; gap: 10px; flex-wrap: wrap; }
+      .role-card .grid .cfg-field { flex: 1; min-width: 120px; margin-bottom: 0; }
+
+      .token-reveal {
+        background: var(--panel); border: 1px solid var(--accent); border-radius: 8px;
+        padding: 12px; margin-top: 10px; word-break: break-all; font-family: monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <!-- Login view -->
+      <div id="login-view" class="hidden">
+        <div class="login-card">
+          <h1>DeepDive Admin</h1>
+          <label><span>Username</span><input id="login-user" type="text" autocomplete="username" /></label>
+          <label><span>Password</span><input id="login-pass" type="password" autocomplete="current-password" /></label>
+          <button id="login-btn" type="button">Sign in</button>
+          <p id="login-err" class="err"></p>
+        </div>
+      </div>
+
+      <!-- Dashboard view -->
+      <div id="dash-view" class="hidden">
+        <div class="bar">
+          <div class="brand">
+            <h1>DeepDive Admin</h1>
+            <span class="muted">providers · roles · users · tokens</span>
+          </div>
+          <button id="logout-btn" type="button">Sign out</button>
+        </div>
+
+        <h2>Providers</h2>
+        <div id="cfg-providers"></div>
+        <div class="toolbar">
+          <button id="add-provider" type="button">+ Add provider</button>
+        </div>
+
+        <fieldset>
+          <legend>Web search</legend>
+          <div class="cfg-field">
+            <span>Provider</span>
+            <select id="ws-provider">
+              <option value="tavily">tavily (requires key)</option>
+              <option value="duckduckgo">duckduckgo (no key)</option>
+            </select>
+          </div>
+          <div class="cfg-field">
+            <span>API key</span>
+            <input id="ws-key" type="password" placeholder="Optional; leave empty for duckduckgo" />
+          </div>
+        </fieldset>
+
+        <h2>Roles</h2>
+        <div id="admin-roles"></div>
+
+        <h2>Users</h2>
+        <div class="user-form">
+          <input id="user-username" type="text" placeholder="Username" autocomplete="off" />
+          <input id="user-password" type="password" placeholder="Initial password" autocomplete="off" />
+          <input id="user-display" type="text" placeholder="Display name (optional)" autocomplete="off" />
+          <select id="user-role"></select>
+          <button id="add-user" type="button">+ Add user</button>
+        </div>
+        <p id="users-status" class="cfg-status"></p>
+        <div id="admin-users"></div>
+
+        <h2>Tokens</h2>
+        <div class="user-form">
+          <input id="token-name" type="text" placeholder="Token name" autocomplete="off" />
+          <select id="token-role">
+            <option value="user">user</option>
+            <option value="admin">admin</option>
+          </select>
+          <input id="token-user" type="text" placeholder="User ID (user tokens)" autocomplete="off" />
+          <select id="token-role-id"><option value="">(use user's role)</option></select>
+          <input id="token-expires" type="datetime-local" title="Expiry (optional)" />
+          <button id="add-token" type="button">+ Create token</button>
+        </div>
+        <p id="tokens-status" class="cfg-status"></p>
+        <div id="token-reveal" class="hidden"></div>
+        <div id="admin-tokens"></div>
+
+        <h2>Models</h2>
+        <div class="user-form">
+          <input id="model-name" type="text" placeholder="Model name (e.g. gpt-4o-mini)" autocomplete="off" />
+          <input id="model-prompt-price" type="number" step="0.000001" placeholder="Prompt $/1k" autocomplete="off" />
+          <input id="model-completion-price" type="number" step="0.000001" placeholder="Completion $/1k" autocomplete="off" />
+          <input id="model-description" type="text" placeholder="Description (optional)" autocomplete="off" />
+          <button id="add-model" type="button">+ Add model</button>
+        </div>
+        <p id="models-status" class="cfg-status"></p>
+        <div id="admin-models"></div>
+
+        <h2>Wallets</h2>
+        <div class="user-form">
+          <input id="wallet-user" type="text" placeholder="User ID" autocomplete="off" />
+          <input id="wallet-amount" type="number" step="0.000001" placeholder="Amount (USD)" autocomplete="off" />
+          <input id="wallet-desc" type="text" placeholder="Note (optional)" autocomplete="off" />
+          <button id="topup-btn" type="button">+ Top up</button>
+        </div>
+        <p id="wallets-status" class="cfg-status"></p>
+        <div id="admin-wallets"></div>
+
+        <div class="toolbar">
+          <button class="primary" id="save-btn" type="button">Save providers</button>
+        </div>
+        <p id="cfg-status" class="cfg-status"></p>
+      </div>
+    </div>
+
+    <script>
+      (() => {
+        const TOKEN_KEY = "deepdive_admin_token";
+        const loginView = document.getElementById("login-view");
+        const dashView = document.getElementById("dash-view");
+        const cfgProvidersEl = document.getElementById("cfg-providers");
+        const wsProviderEl = document.getElementById("ws-provider");
+        const wsKeyEl = document.getElementById("ws-key");
+        const cfgStatus = document.getElementById("cfg-status");
+
+        const userUsernameEl = document.getElementById("user-username");
+        const userPasswordEl = document.getElementById("user-password");
+        const userDisplayEl = document.getElementById("user-display");
+        const userRoleEl = document.getElementById("user-role");
+        const adminUsersEl = document.getElementById("admin-users");
+        const usersStatus = document.getElementById("users-status");
+
+        const adminRolesEl = document.getElementById("admin-roles");
+        const tokenNameEl = document.getElementById("token-name");
+        const tokenRoleEl = document.getElementById("token-role");
+        const tokenUserEl = document.getElementById("token-user");
+        const tokenRoleIdEl = document.getElementById("token-role-id");
+        const tokenExpiresEl = document.getElementById("token-expires");
+        const adminTokensEl = document.getElementById("admin-tokens");
+        const tokensStatus = document.getElementById("tokens-status");
+        const tokenRevealEl = document.getElementById("token-reveal");
+
+        const modelNameEl = document.getElementById("model-name");
+        const modelPromptEl = document.getElementById("model-prompt-price");
+        const modelCompletionEl = document.getElementById("model-completion-price");
+        const modelDescEl = document.getElementById("model-description");
+        const adminModelsEl = document.getElementById("admin-models");
+        const modelsStatus = document.getElementById("models-status");
+
+        const walletUserEl = document.getElementById("wallet-user");
+        const walletAmountEl = document.getElementById("wallet-amount");
+        const walletDescEl = document.getElementById("wallet-desc");
+        const adminWalletsEl = document.getElementById("admin-wallets");
+        const walletsStatus = document.getElementById("wallets-status");
+
+        let providers = [];
+        let activeProviderId = "";
+        let roles = [];
+
+        const token = () => localStorage.getItem(TOKEN_KEY) || "";
+
+        async function apiFetch(path, opts = {}) {
+          const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+          if (token()) headers.Authorization = `Bearer ${token()}`;
+          const res = await fetch(path, { ...opts, headers });
+          if (res.status === 401) { showLogin(); throw new Error("Unauthorized"); }
+          if (!res.ok) {
+            const body = await res.text().catch(() => "");
+            throw new Error(`${res.status} ${res.statusText}: ${body}`);
+          }
+          return res.json();
+        }
+
+        function setStatus(text, cls) {
+          cfgStatus.textContent = text;
+          cfgStatus.className = "cfg-status" + (cls ? " " + cls : "");
+        }
+
+        function showLogin() {
+          loginView.classList.remove("hidden");
+          dashView.classList.add("hidden");
+        }
+        function showDash() {
+          loginView.classList.add("hidden");
+          dashView.classList.remove("hidden");
+        }
+
+        async function login() {
+          const username = document.getElementById("login-user").value.trim();
+          const password = document.getElementById("login-pass").value;
+          document.getElementById("login-err").textContent = "";
+          try {
+            const res = await fetch("/admin/login", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ username, password }),
+            });
+            if (!res.ok) throw new Error("Invalid credentials");
+            const data = await res.json();
+            localStorage.setItem(TOKEN_KEY, data.access_token);
+            await boot();
+          } catch (err) {
+            document.getElementById("login-err").textContent = err.message;
+          }
+        }
+
+        function logout() {
+          localStorage.removeItem(TOKEN_KEY);
+          showLogin();
+        }
+
+        // ── provider cards ──
+        function field(labelText, input) {
+          const label = document.createElement("label");
+          label.className = "cfg-field";
+          const span = document.createElement("span");
+          span.textContent = labelText;
+          label.append(span, input);
+          return label;
+        }
+
+        function providerCard(p) {
+          const card = document.createElement("div");
+          card.className = "provider-card";
+
+          const head = document.createElement("div");
+          head.className = "provider-head";
+
+          const radio = document.createElement("input");
+          radio.type = "radio";
+          radio.name = "active";
+          radio.checked = p.id === activeProviderId;
+          radio.title = "Use this provider";
+          radio.addEventListener("change", () => { activeProviderId = p.id; });
+          head.appendChild(radio);
+
+          const nameInput = document.createElement("input");
+          nameInput.type = "text";
+          nameInput.placeholder = "Name";
+          nameInput.value = p.name || "";
+          nameInput.addEventListener("input", () => { p.name = nameInput.value; });
+          head.appendChild(nameInput);
+
+          const del = document.createElement("button");
+          del.type = "button";
+          del.className = "del";
+          del.textContent = "✕";
+          del.title = "Delete provider";
+          del.addEventListener("click", () => {
+            providers = providers.filter((x) => x !== p);
+            if (activeProviderId === p.id) activeProviderId = providers[0]?.id || "";
+            renderProviders();
+          });
+          head.appendChild(del);
+          card.appendChild(head);
+
+          const baseInput = document.createElement("input");
+          baseInput.type = "text";
+          baseInput.placeholder = "Base URL (e.g. https://api.deepseek.com/v1)";
+          baseInput.value = p.base_url || "";
+          baseInput.addEventListener("input", () => { p.base_url = baseInput.value; });
+          card.appendChild(field("Base URL", baseInput));
+
+          const keyInput = document.createElement("input");
+          keyInput.type = "password";
+          keyInput.placeholder = p.api_key_set ? "Configured — leave empty to keep" : "API key";
+          keyInput.autocomplete = "off";
+          keyInput.addEventListener("input", () => { p.api_key = keyInput.value.trim(); });
+          card.appendChild(field("API Key", keyInput));
+
+          const modelRow = document.createElement("div");
+          modelRow.className = "cfg-model-row";
+
+          const select = document.createElement("select");
+          const ensureModel = () => {
+            if (p.model && !p.models.includes(p.model)) p.models.push(p.model);
+            select.innerHTML = "";
+            for (const m of p.models) {
+              const opt = document.createElement("option");
+              opt.value = m;
+              opt.textContent = m;
+              if (m === p.model) opt.selected = true;
+              select.appendChild(opt);
+            }
+            if (!p.models.length) {
+              const opt = document.createElement("option");
+              opt.value = "";
+              opt.textContent = "No models";
+              select.appendChild(opt);
+            }
+          };
+          ensureModel();
+          select.addEventListener("change", () => { p.model = select.value; });
+          modelRow.appendChild(field("Model", select));
+
+          const addModel = document.createElement("input");
+          addModel.type = "text";
+          addModel.placeholder = "Add model id…";
+          addModel.addEventListener("keydown", (e) => {
+            if (e.key !== "Enter") return;
+            const id = addModel.value.trim();
+            if (!id) return;
+            if (!p.models.includes(id)) p.models.push(id);
+            p.model = id;
+            renderProviders();
+          });
+          modelRow.appendChild(field("Add model", addModel));
+
+          const fetchBtn = document.createElement("button");
+          fetchBtn.type = "button";
+          fetchBtn.textContent = "Fetch";
+          fetchBtn.title = "Fetch model list from the endpoint";
+          fetchBtn.addEventListener("click", async () => {
+            fetchBtn.textContent = "…";
+            try {
+              const data = await apiFetch("/config/probe-models", {
+                method: "POST",
+                body: JSON.stringify({ base_url: p.base_url, api_key: p.api_key }),
+              });
+              for (const id of data.models) if (!p.models.includes(id)) p.models.push(id);
+              if (!p.model && data.models.length) p.model = data.models[0];
+              renderProviders();
+            } catch (err) {
+              setStatus(`Fetch failed: ${err.message}`, "err");
+              fetchBtn.textContent = "Fetch";
+            }
+          });
+          modelRow.appendChild(fetchBtn);
+
+          card.appendChild(modelRow);
+          return card;
+        }
+
+        function renderProviders() {
+          cfgProvidersEl.innerHTML = "";
+          for (const p of providers) cfgProvidersEl.appendChild(providerCard(p));
+        }
+
+        function newProvider() {
+          return {
+            id: crypto.randomUUID(), name: "", base_url: "", api_key: "",
+            api_key_set: false, models: [], model: "",
+          };
+        }
+
+        // ── Roles ──
+        function roleOptions(selected) {
+          const opts = [];
+          for (const r of roles) {
+            const opt = document.createElement("option");
+            opt.value = r.role_id;
+            opt.textContent = `${r.role_id} (${r.role_name})`;
+            if (r.role_id === selected) opt.selected = true;
+            opts.push(opt);
+          }
+          return opts;
+        }
+
+        function renderRoleSelects() {
+          userRoleEl.innerHTML = "";
+          for (const opt of roleOptions(roles[0]?.role_id)) userRoleEl.appendChild(opt);
+
+          tokenRoleIdEl.innerHTML = "<option value=\"\">(use user's role)</option>";
+          for (const r of roles) {
+            const opt = document.createElement("option");
+            opt.value = r.role_id;
+            opt.textContent = r.role_id;
+            tokenRoleIdEl.appendChild(opt);
+          }
+        }
+
+        function roleCard(r) {
+          const card = document.createElement("div");
+          card.className = "role-card";
+
+          const head = document.createElement("div");
+          head.className = "head";
+          const id = document.createElement("span");
+          id.className = "id";
+          id.textContent = r.role_id;
+          const name = document.createElement("span");
+          name.className = "name";
+          name.textContent = r.role_name;
+          head.append(id, name);
+          card.appendChild(head);
+
+          const grid = document.createElement("div");
+          grid.className = "grid";
+
+          const daily = document.createElement("input");
+          daily.type = "number";
+          daily.value = r.daily_request_limit ?? -1;
+          grid.appendChild(field("Daily requests (-1 = ∞)", daily));
+
+          const monthly = document.createElement("input");
+          monthly.type = "number";
+          monthly.value = r.monthly_request_limit ?? -1;
+          grid.appendChild(field("Monthly requests (-1 = ∞)", monthly));
+
+          const model = document.createElement("input");
+          model.type = "text";
+          model.placeholder = "blank = active provider";
+          model.value = r.default_model || "";
+          grid.appendChild(field("Default model", model));
+
+          const save = document.createElement("button");
+          save.textContent = "Save";
+          save.addEventListener("click", async () => {
+            save.textContent = "…";
+            try {
+              await apiFetch(`/admin/roles/${r.role_id}`, {
+                method: "PATCH",
+                body: JSON.stringify({
+                  daily_request_limit: parseInt(daily.value || "-1", 10),
+                  monthly_request_limit: parseInt(monthly.value || "-1", 10),
+                  default_model: model.value.trim(),
+                }),
+              });
+              setStatus(`Role "${r.role_id}" saved`, "ok");
+            } catch (err) {
+              setStatus(`Role save failed: ${err.message}`, "err");
+            }
+            save.textContent = "Save";
+          });
+          grid.appendChild(field("", save));
+          card.appendChild(grid);
+          return card;
+        }
+
+        function renderRoles() {
+          adminRolesEl.innerHTML = "";
+          for (const r of roles) adminRolesEl.appendChild(roleCard(r));
+          renderRoleSelects();
+        }
+
+        // ── Users ──
+        function setUsersStatus(text, cls) {
+          usersStatus.textContent = text;
+          usersStatus.className = "cfg-status" + (cls ? " " + cls : "");
+        }
+
+        function userRow(u) {
+          const row = document.createElement("div");
+          row.className = "user-row";
+
+          const who = document.createElement("div");
+          who.className = "who";
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = u.username + (u.display_name ? ` (${u.display_name})` : "");
+          const sub = document.createElement("div");
+          sub.className = "sub";
+          sub.textContent = `created ${u.created_at ? new Date(u.created_at).toLocaleString() : ""}`;
+          who.append(name, sub);
+          row.appendChild(who);
+
+          const badge = document.createElement("span");
+          badge.className = "badge" + (u.role_id === "vip" || u.role_id === "admin" ? " admin" : "");
+          badge.textContent = u.role_id;
+          row.appendChild(badge);
+
+          if (!u.is_active) {
+            const inactive = document.createElement("span");
+            inactive.className = "badge inactive";
+            inactive.textContent = "inactive";
+            row.appendChild(inactive);
+          }
+
+          const roleSelect = document.createElement("select");
+          for (const opt of roleOptions(u.role_id)) roleSelect.appendChild(opt);
+          roleSelect.addEventListener("change", async () => {
+            await updateUser(u.id, { role_id: roleSelect.value });
+          });
+          row.appendChild(roleSelect);
+
+          const toggleBtn = document.createElement("button");
+          toggleBtn.textContent = u.is_active ? "Disable" : "Enable";
+          toggleBtn.addEventListener("click", async () => {
+            await updateUser(u.id, { is_active: !u.is_active });
+          });
+          row.appendChild(toggleBtn);
+
+          const del = document.createElement("button");
+          del.className = "danger";
+          del.textContent = "Delete";
+          del.addEventListener("click", async () => {
+            if (!confirm(`Delete user "${u.username}"?`)) return;
+            await apiFetch(`/admin/users/${u.id}`, { method: "DELETE" });
+            loadUsers();
+          });
+          row.appendChild(del);
+
+          return row;
+        }
+
+        async function loadUsers() {
+          setUsersStatus("");
+          try {
+            const data = await apiFetch("/admin/users");
+            adminUsersEl.innerHTML = "";
+            if (!data.users.length) {
+              adminUsersEl.innerHTML = '<div class="muted">No users yet.</div>';
+              return;
+            }
+            for (const u of data.users) adminUsersEl.appendChild(userRow(u));
+          } catch (err) {
+            setUsersStatus(`Failed to load users: ${err.message}`, "err");
+          }
+        }
+
+        async function createUser() {
+          const username = userUsernameEl.value.trim();
+          const password = userPasswordEl.value;
+          if (!username || !password) {
+            setUsersStatus("Username and password are required", "err");
+            return;
+          }
+          setUsersStatus("");
+          try {
+            await apiFetch("/admin/users", {
+              method: "POST",
+              body: JSON.stringify({
+                username,
+                password,
+                display_name: userDisplayEl.value.trim() || undefined,
+                role_id: userRoleEl.value,
+              }),
+            });
+            userUsernameEl.value = "";
+            userPasswordEl.value = "";
+            userDisplayEl.value = "";
+            loadUsers();
+          } catch (err) {
+            setUsersStatus(`Create failed: ${err.message}`, "err");
+          }
+        }
+
+        async function updateUser(id, patch) {
+          setUsersStatus("");
+          try {
+            await apiFetch(`/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
+            loadUsers();
+          } catch (err) {
+            setUsersStatus(`Update failed: ${err.message}`, "err");
+          }
+        }
+
+        // ── Tokens ──
+        function setTokensStatus(text, cls) {
+          tokensStatus.textContent = text;
+          tokensStatus.className = "cfg-status" + (cls ? " " + cls : "");
+        }
+
+        function tokenRow(t) {
+          const row = document.createElement("div");
+          row.className = "user-row";
+
+          const who = document.createElement("div");
+          who.className = "who";
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = t.name;
+          const sub = document.createElement("div");
+          sub.className = "sub";
+          sub.textContent = [
+            t.role,
+            t.role_id ? `role=${t.role_id}` : "",
+            t.user_id ? `user=${t.user_id.slice(0, 8)}` : "",
+            t.expires_at ? `expires ${new Date(t.expires_at).toLocaleString()}` : "no expiry",
+          ].filter(Boolean).join(" · ");
+          who.append(name, sub);
+          row.appendChild(who);
+
+          const badge = document.createElement("span");
+          badge.className = "badge" + (t.role === "admin" ? " admin" : "");
+          badge.textContent = t.role;
+          row.appendChild(badge);
+
+          if (!t.is_active) {
+            const inactive = document.createElement("span");
+            inactive.className = "badge inactive";
+            inactive.textContent = "revoked";
+            row.appendChild(inactive);
+          }
+
+          const toggleBtn = document.createElement("button");
+          toggleBtn.textContent = t.is_active ? "Revoke" : "Enable";
+          toggleBtn.addEventListener("click", async () => {
+            await apiFetch(`/admin/tokens/${t.id}`, {
+              method: "PATCH",
+              body: JSON.stringify({ is_active: !t.is_active }),
+            });
+            loadTokens();
+          });
+          row.appendChild(toggleBtn);
+
+          const del = document.createElement("button");
+          del.className = "danger";
+          del.textContent = "Delete";
+          del.addEventListener("click", async () => {
+            if (!confirm(`Delete token "${t.name}"?`)) return;
+            await apiFetch(`/admin/tokens/${t.id}`, { method: "DELETE" });
+            loadTokens();
+          });
+          row.appendChild(del);
+
+          return row;
+        }
+
+        async function loadTokens() {
+          setTokensStatus("");
+          try {
+            const data = await apiFetch("/admin/tokens");
+            adminTokensEl.innerHTML = "";
+            if (!data.tokens.length) {
+              adminTokensEl.innerHTML = '<div class="muted">No tokens yet.</div>';
+              return;
+            }
+            for (const t of data.tokens) adminTokensEl.appendChild(tokenRow(t));
+          } catch (err) {
+            setTokensStatus(`Failed to load tokens: ${err.message}`, "err");
+          }
+        }
+
+        async function createToken() {
+          const name = tokenNameEl.value.trim();
+          if (!name) {
+            setTokensStatus("Token name is required", "err");
+            return;
+          }
+          setTokensStatus("");
+          tokenRevealEl.classList.add("hidden");
+          const role = tokenRoleEl.value;
+          const payload = {
+            name,
+            role,
+            user_id: tokenUserEl.value.trim() || undefined,
+            role_id: tokenRoleIdEl.value || undefined,
+            expires_at: tokenExpiresEl.value ? new Date(tokenExpiresEl.value).toISOString() : undefined,
+          };
+          try {
+            const data = await apiFetch("/admin/tokens", {
+              method: "POST",
+              body: JSON.stringify(payload),
+            });
+            tokenNameEl.value = "";
+            tokenUserEl.value = "";
+            tokenRoleIdEl.value = "";
+            tokenExpiresEl.value = "";
+            tokenRevealEl.classList.remove("hidden");
+            tokenRevealEl.textContent = `Copy this token now (shown once): ${data.token}`;
+            loadTokens();
+          } catch (err) {
+            setTokensStatus(`Create failed: ${err.message}`, "err");
+          }
+        }
+
+        // ── Models ──
+        function setModelsStatus(text, cls) {
+          modelsStatus.textContent = text;
+          modelsStatus.className = "cfg-status" + (cls ? " " + cls : "");
+        }
+
+        function modelRow(m) {
+          const row = document.createElement("div");
+          row.className = "user-row";
+
+          const who = document.createElement("div");
+          who.className = "who";
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = m.name;
+          const sub = document.createElement("div");
+          sub.className = "sub";
+          sub.textContent = [m.description, m.is_active ? "" : "inactive", m.created_at ? `created ${new Date(m.created_at).toLocaleString()}` : ""].filter(Boolean).join(" · ");
+          who.append(name, sub);
+          row.appendChild(who);
+
+          const promptInput = document.createElement("input");
+          promptInput.type = "number";
+          promptInput.step = "0.000001";
+          promptInput.value = m.prompt_price_per_1k ?? 0;
+          promptInput.title = "Prompt $/1k";
+          row.appendChild(promptInput);
+
+          const completionInput = document.createElement("input");
+          completionInput.type = "number";
+          completionInput.step = "0.000001";
+          completionInput.value = m.completion_price_per_1k ?? 0;
+          completionInput.title = "Completion $/1k";
+          row.appendChild(completionInput);
+
+          const save = document.createElement("button");
+          save.textContent = "Save";
+          save.addEventListener("click", async () => {
+            save.textContent = "…";
+            try {
+              await apiFetch(`/admin/models/${m.id}`, {
+                method: "PATCH",
+                body: JSON.stringify({
+                  prompt_price_per_1k: parseFloat(promptInput.value || "0"),
+                  completion_price_per_1k: parseFloat(completionInput.value || "0"),
+                }),
+              });
+              setModelsStatus(`Model "${m.name}" saved`, "ok");
+            } catch (err) {
+              setModelsStatus(`Save failed: ${err.message}`, "err");
+            }
+            save.textContent = "Save";
+          });
+          row.appendChild(save);
+
+          const del = document.createElement("button");
+          del.className = "danger";
+          del.textContent = "Delete";
+          del.addEventListener("click", async () => {
+            if (!confirm(`Delete model "${m.name}"?`)) return;
+            await apiFetch(`/admin/models/${m.id}`, { method: "DELETE" });
+            loadModels();
+          });
+          row.appendChild(del);
+
+          return row;
+        }
+
+        async function loadModels() {
+          setModelsStatus("");
+          try {
+            const data = await apiFetch("/admin/models");
+            adminModelsEl.innerHTML = "";
+            if (!data.models.length) {
+              adminModelsEl.innerHTML = '<div class="muted">No models yet — add models to enable PAYG billing.</div>';
+              return;
+            }
+            for (const m of data.models) adminModelsEl.appendChild(modelRow(m));
+          } catch (err) {
+            setModelsStatus(`Failed to load models: ${err.message}`, "err");
+          }
+        }
+
+        async function createModel() {
+          const name = modelNameEl.value.trim();
+          if (!name) {
+            setModelsStatus("Model name is required", "err");
+            return;
+          }
+          setModelsStatus("");
+          try {
+            await apiFetch("/admin/models", {
+              method: "POST",
+              body: JSON.stringify({
+                name,
+                prompt_price_per_1k: parseFloat(modelPromptEl.value || "0"),
+                completion_price_per_1k: parseFloat(modelCompletionEl.value || "0"),
+                description: modelDescEl.value.trim() || undefined,
+              }),
+            });
+            modelNameEl.value = "";
+            modelPromptEl.value = "";
+            modelCompletionEl.value = "";
+            modelDescEl.value = "";
+            loadModels();
+          } catch (err) {
+            setModelsStatus(`Create failed: ${err.message}`, "err");
+          }
+        }
+
+        // ── Wallets ──
+        function setWalletsStatus(text, cls) {
+          walletsStatus.textContent = text;
+          walletsStatus.className = "cfg-status" + (cls ? " " + cls : "");
+        }
+
+        function walletRow(w) {
+          const row = document.createElement("div");
+          row.className = "user-row";
+
+          const who = document.createElement("div");
+          who.className = "who";
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = w.username || w.user_id.slice(0, 8);
+          const sub = document.createElement("div");
+          sub.className = "sub";
+          sub.textContent = `${Number(w.balance).toFixed(6)} ${w.currency} · id ${w.user_id}`;
+          who.append(name, sub);
+          row.appendChild(who);
+
+          const amountInput = document.createElement("input");
+          amountInput.type = "number";
+          amountInput.step = "0.000001";
+          amountInput.placeholder = "Amount";
+          row.appendChild(amountInput);
+
+          const topupBtn = document.createElement("button");
+          topupBtn.textContent = "Top up";
+          topupBtn.addEventListener("click", async () => {
+            const amount = parseFloat(amountInput.value || "0");
+            if (amount <= 0) { setWalletsStatus("Amount must be positive", "err"); return; }
+            topupBtn.textContent = "…";
+            try {
+              await apiFetch("/admin/wallets/topup", {
+                method: "POST",
+                body: JSON.stringify({ user_id: w.user_id, amount }),
+              });
+              amountInput.value = "";
+              setWalletsStatus(`Topped up ${amount} for ${w.username || w.user_id.slice(0, 8)}`, "ok");
+              loadWallets();
+            } catch (err) {
+              setWalletsStatus(`Top up failed: ${err.message}`, "err");
+            }
+            topupBtn.textContent = "Top up";
+          });
+          row.appendChild(topupBtn);
+
+          return row;
+        }
+
+        async function loadWallets() {
+          setWalletsStatus("");
+          try {
+            const data = await apiFetch("/admin/wallets");
+            adminWalletsEl.innerHTML = "";
+            if (!data.wallets.length) {
+              adminWalletsEl.innerHTML = '<div class="muted">No wallets yet — a wallet is created on first topup or usage.</div>';
+              return;
+            }
+            for (const w of data.wallets) adminWalletsEl.appendChild(walletRow(w));
+          } catch (err) {
+            setWalletsStatus(`Failed to load wallets: ${err.message}`, "err");
+          }
+        }
+
+        async function topupByUserId() {
+          const userId = walletUserEl.value.trim();
+          const amount = parseFloat(walletAmountEl.value || "0");
+          if (!userId || amount <= 0) {
+            setWalletsStatus("User ID and a positive amount are required", "err");
+            return;
+          }
+          setWalletsStatus("");
+          try {
+            await apiFetch("/admin/wallets/topup", {
+              method: "POST",
+              body: JSON.stringify({ user_id: userId, amount, description: walletDescEl.value.trim() || undefined }),
+            });
+            walletUserEl.value = "";
+            walletAmountEl.value = "";
+            walletDescEl.value = "";
+            setWalletsStatus(`Topped up ${amount}`, "ok");
+            loadWallets();
+          } catch (err) {
+            setWalletsStatus(`Top up failed: ${err.message}`, "err");
+          }
+        }
+
+        async function loadConfig() {
+          const c = await apiFetch("/config");
+          providers = c.providers.map((p) => ({ ...p, api_key: "" }));
+          activeProviderId = c.active_provider || "";
+          wsProviderEl.value = c.web_search_provider || "tavily";
+          wsKeyEl.placeholder = c.web_search_api_key_set ? "Configured (leave empty to keep)" : "Optional; leave empty for duckduckgo";
+          roles = c.roles || [];
+          renderProviders();
+          renderRoles();
+          loadUsers();
+          loadTokens();
+          loadModels();
+          loadWallets();
+        }
+
+        async function saveConfig() {
+          setStatus("");
+          const body = {
+            providers: providers.map((p) => ({
+              id: p.id, name: p.name, base_url: p.base_url,
+              api_key: p.api_key || "", models: p.models, model: p.model,
+            })),
+            active_provider: activeProviderId,
+            web_search_provider: wsProviderEl.value,
+            web_search_api_key: wsKeyEl.value.trim() || undefined,
+          };
+          try {
+            const data = await apiFetch("/config", { method: "POST", body: JSON.stringify(body) });
+            providers = data.providers.map((p) => ({ ...p, api_key: "" }));
+            activeProviderId = data.active_provider;
+            renderProviders();
+            wsKeyEl.value = "";
+            setStatus(`Saved (${data.providers.length} provider${data.providers.length === 1 ? "" : "s"})`, "ok");
+          } catch (err) {
+            setStatus(`Save failed: ${err.message}`, "err");
+          }
+        }
+
+        async function boot() {
+          if (!token()) { showLogin(); return; }
+          try {
+            await apiFetch("/admin/me");
+            await loadConfig();
+            showDash();
+          } catch {
+            showLogin();
+          }
+        }
+
+        document.getElementById("login-btn").addEventListener("click", login);
+        document.getElementById("login-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+        document.getElementById("logout-btn").addEventListener("click", logout);
+        document.getElementById("add-provider").addEventListener("click", () => {
+          providers.push(newProvider());
+          renderProviders();
+        });
+        document.getElementById("add-user").addEventListener("click", createUser);
+        document.getElementById("add-token").addEventListener("click", createToken);
+        document.getElementById("add-model").addEventListener("click", createModel);
+        document.getElementById("topup-btn").addEventListener("click", topupByUserId);
+        document.getElementById("save-btn").addEventListener("click", saveConfig);
+
+        boot();
+      })();
+    </script>
+  </body>
+</html>

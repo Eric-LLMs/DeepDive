@@ -20,7 +20,8 @@ services:
       POSTGRES_PASSWORD: deepdive
       POSTGRES_DB: deepdive
     ports:
-      - "5432:5432"
+      # 5432 sits inside a Windows Hyper-V excluded port range on some hosts; use 15432 instead.
+      - "15432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

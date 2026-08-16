@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeepDive Workbench</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div id="sidebar-toolbar">
+          <button id="sidebar-toggle" type="button" title="Collapse / Expand">«</button>
+          <button id="pick-folder" type="button">📁 Open Workspace</button>
+        </div>
+        <div id="sidebar-tabs">
+          <button id="tab-files" class="active" type="button">Files</button>
+          <button id="tab-sessions" type="button">Sessions</button>
+        </div>
+        <div id="tree" class="tree"></div>
+        <div id="sessions" class="sessions hidden"></div>
+        <div id="sidebar-footer">
+          <button id="open-settings" type="button" title="Settings">⚙️ Settings</button>
+        </div>
+      </aside>
+      <div id="splitter" class="splitter"></div>
+
+      <main id="main">
+        <section id="viewer">
+          <div id="viewer-empty" class="empty">Select a file on the left to begin</div>
+        </section>
+
+        <section id="chat">
+          <div id="chat-header">
+            <span>Chat</span>
+            <div class="chat-header-actions">
+              <button id="chat-mic" type="button" title="Voice input (talk to the assistant)">🎤</button>
+              <button id="chat-speak" type="button" title="Speak replies aloud">🔊</button>
+              <button id="chat-float" type="button" title="Float the chat window">⤢</button>
+              <button id="chat-dock" type="button" title="Move chat to the right column">Dock right</button>
+            </div>
+          </div>
+          <div id="chat-log"></div>
+          <form id="chat-form">
+            <input id="chat-input" type="text" placeholder="Ask about the current material, or just chat…" autocomplete="off" />
+            <button id="chat-send" type="submit">Send</button>
+          </form>
+        </section>
+      </main>
+    </div>
+
+    <!-- Settings dropdown (list) -->
+    <div id="settings-panel" class="settings-panel hidden">
+      <div class="settings-list">
+        <button id="settings-account-btn" type="button" class="settings-row">
+          <span class="settings-row-label">Account</span>
+          <span id="settings-account-value" class="settings-row-value">Sign in</span>
+        </button>
+        <div id="settings-account-info" class="account-box hidden">
+          <div id="account-who" class="account-who"></div>
+          <button id="account-logout" type="button" class="account-signout">Sign out</button>
+        </div>
+        <div class="settings-row">
+          <span class="settings-row-label">Theme</span>
+          <select id="account-theme">
+            <option value="dark">Dark</option>
+            <option value="light">Light</option>
+          </select>
+        </div>
+        <button id="account-help" type="button" class="settings-row">
+          <span class="settings-row-label">Help</span>
+          <span class="settings-row-value">Open GitHub ↗</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Login modal -->
+    <div id="account-overlay" class="overlay hidden">
+      <div class="modal">
+        <div class="modal-header">
+          <h3>Sign in</h3>
+          <button id="account-close" type="button" class="modal-close" title="Close">×</button>
+        </div>
+
+        <div id="account-login">
+          <label>Username
+            <input id="account-user" type="text" autocomplete="username" />
+          </label>
+          <label>Password
+            <input id="account-pass" type="password" autocomplete="current-password" />
+          </label>
+          <label class="remember">
+            <input id="account-remember" type="checkbox" checked /> Keep me signed in
+          </label>
+          <p id="account-status" class="cfg-status"></p>
+          <div class="modal-actions">
+            <button id="account-login-btn" type="button" class="primary">Sign in</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PDF.js (vendored; pdf.min.js sets window.pdfjsLib) -->
+    <script src="vendor/pdf.min.js"></script>
+    <script src="viewer.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

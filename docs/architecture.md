@@ -22,13 +22,17 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
+| Auth / RBAC | opaque `access_tokens` (admin + user) + `user_roles` (regular/pro/vip/admin) + role quota + `/auth/*` login |
+| Billing | `llm_models` (per-1k pricing) + `user_wallets` + `wallet_transactions` + `llm_credentials` + `credential_models`; cost calc + atomic wallet deduct |
+| Settings in DB | `app_settings` key/value JSONB (admin credential + LLM provider config + tiers), written by the admin console |
+| Guest access | anonymous chat with per-day Redis limit (`guest_daily_limit`), 429 → prompt login |
 
 ### Designed, not yet implemented
 
 | Area | Gap |
 |----|------|
-| Auth / multi-tenancy | users / roles / user_roles tables + PostgreSQL RLS not created |
-| Billing | subscriptions / credit_ledger not created |
+| Multi-tenancy isolation | PostgreSQL RLS not enabled (app-level isolation by `user_id` only) |
+| Subscriptions | recurring plan billing not created (pay-as-you-go wallet exists) |
 | Observability | audit_logs / ai_call_logs / activity_logs / job_logs not created |
 | Video / document learning | media → chunks pipeline (ingestion / transcription / chunking) designed only |
 | Reranking | in-process cross-encoder exists but disabled (`reranker_model` empty); TEI reranker not wired |
@@ -84,7 +88,7 @@ deepdive/
 │   │   ├── server.py             # RetrievalService servicer (proto -> RAGPipeline)
 │   │   └── main.py               # grpc.aio.server entrypoint
 │   ├── web/                      # Vite + React frontend (TS)
-│   └── desktop/                  # Electron shell (placeholder)
+│   └── desktop/                  # Electron shell (wraps web UI, proxies API to the backend)
 ├── packages/
 │   ├── agent/                    # package `agent`: DI + loop + runtime + plugins + memory + skills + prompt
 │   ├── rag/                      # package `rag`: retrieval DAG + build_pipeline factory
@@ -514,6 +518,32 @@ CREATE TABLE job_logs (
     started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ
 );
 ```
+
+### 12.3 Implemented auth, RBAC & billing schema
+
+The multi-user + billing surface that runs today (`migrations/0002_auth.sql`, `0003_rbac.sql`,
+`0004_billing.sql`):
+
+- **users** — `username` (unique where non-null), `password_hash` (stdlib pbkdf2), `display_name`,
+  `is_active`, `role_id` (FK → `user_roles`), `meta`, `created_at`. Legacy anonymous rows keep `username NULL`.
+- **user_roles** — `role_id` TEXT PK, quota limits (`daily_request_limit`, `monthly_request_limit`,
+  `daily_token_limit`, `rpm_limit`, `monthly_cost_limit`; `-1` = unlimited), `default_model`,
+  `models` (allowed ids), `features`, `is_active`. Seeded: `regular` (50/day) / `pro` / `vip` (unlimited) / `admin`.
+- **access_tokens** — opaque server-side tokens: `token_hash` (sha256 of the raw token shown once),
+  `role` (`admin` | `user`), `user_id`, optional `role_id` override, `expires_at`, `last_used_at`, `is_active`.
+- **app_settings** — `key` PK + `value` JSONB. Stores the admin credential, LLM provider config,
+  and tier overrides — moved out of `.env` / `data/config.json`.
+- **user_usage_counters** — `(user_id, period_type, period_start)` PK; atomic UPSERT counters for
+  O(1) quota enforcement (deliberately not Redis, not `COUNT` over logs).
+- **user_usage_logs** — append-only per-call audit (`model_name`, `tool`, token counts, `cost_usd`,
+  `role_id`, `token_id`).
+- **llm_models** — virtual model catalog with `prompt_price_per_1k` / `completion_price_per_1k`.
+- **llm_credentials** — provider `base_url` + `api_key`.
+- **credential_models** — N:M routing (credential ↔ model) with `priority` / `weight` + per-key price override.
+- **user_wallets** — one row per user (`balance`, `currency`).
+- **wallet_transactions** — append-only ledger (`type`, `amount`, `balance_after` snapshot,
+  `idempotency_key`). Chat usage is priced via `compute_cost` and debited atomically
+  (`UPDATE … WHERE balance >= cost`), so insufficient funds never overdraw.
 
 ## 13. Multi-Tenancy and Deployment Strategy
 

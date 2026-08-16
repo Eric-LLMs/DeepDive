@@ -5,11 +5,24 @@ see docs/architecture.md for table/field names. This first lands the core learni
 materials/chunks/users/conversations etc. are added later at the Agent/RAG layer.
 """
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from pgvector.sqlalchemy import Vector
@@ -127,6 +140,220 @@ class UserModel(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
+    username: Mapped[str | None] = mapped_column(String, unique=True)
+    password_hash: Mapped[str | None] = mapped_column(String)
+    display_name: Mapped[str | None] = mapped_column(String)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    role_id: Mapped[str] = mapped_column(
+        String, ForeignKey("user_roles.role_id"), default="regular"
+    )
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+
+class UserRoleModel(Base):
+    """A quota/feature tier: daily+monthly request limits, token limits, and model gating."""
+
+    __tablename__ = "user_roles"
+
+    role_id: Mapped[str] = mapped_column(String, primary_key=True)
+    role_name: Mapped[str] = mapped_column(String, nullable=False)
+    daily_request_limit: Mapped[int] = mapped_column(Integer, default=50)
+    monthly_request_limit: Mapped[int] = mapped_column(Integer, default=1500)
+    daily_token_limit: Mapped[int] = mapped_column(BigInteger, default=-1)
+    rpm_limit: Mapped[int] = mapped_column(Integer, default=-1)
+    monthly_cost_limit: Mapped[float] = mapped_column(Numeric(12, 6), default=-1)
+    default_model: Mapped[str] = mapped_column(String, default="")
+    models: Mapped[list] = mapped_column(ARRAY(Text), default=list)
+    features: Mapped[dict] = mapped_column(JSONB, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AccessTokenModel(Base):
+    """An opaque API/login token: sha256 hash stored, raw value returned to the client once.
+
+    ``role`` is the principal kind (``admin`` — unlimited, or ``user``); ``role_id`` is an
+    optional quota-role override for user tokens (falls back to the owner's role when null).
+    """
+
+    __tablename__ = "access_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    token_hash: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    role: Mapped[str] = mapped_column(String, nullable=False, default="user")
+    role_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("user_roles.role_id", ondelete="SET NULL")
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class UserUsageCounterModel(Base):
+    """O(1) quota accounting: one row per (user, period). Atomic UPSERT on each call."""
+
+    __tablename__ = "user_usage_counters"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    period_type: Mapped[str] = mapped_column(String, primary_key=True)  # 'day' | 'month'
+    period_start: Mapped[date] = mapped_column(Date, primary_key=True)
+    request_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    token_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class UserUsageLogModel(Base):
+    """Append-only per-request usage detail (audit); aggregates live in the counters table."""
+
+    __tablename__ = "user_usage_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    token_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("access_tokens.id", ondelete="SET NULL")
+    )
+    role_id: Mapped[str | None] = mapped_column(String)
+    model_name: Mapped[str | None] = mapped_column(String)
+    tool: Mapped[str | None] = mapped_column(String)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Numeric(12, 6), default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AppSettingModel(Base):
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[dict] = mapped_column(JSONB, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class LLMCredentialModel(Base):
+    """A provider API credential (base_url + api_key), maintained by the admin."""
+
+    __tablename__ = "llm_credentials"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    base_url: Mapped[str] = mapped_column(String, nullable=False)
+    api_key: Mapped[str] = mapped_column(String, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LLMModelModel(Base):
+    """Model catalog entry; per-1k-token prices are the PAYG cost source."""
+
+    __tablename__ = "llm_models"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    prompt_price_per_1k: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    completion_price_per_1k: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class CredentialModelModel(Base):
+    """N:M routing between a credential and a model (provider id + per-key price override)."""
+
+    __tablename__ = "credential_models"
+
+    credential_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("llm_credentials.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    model_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("llm_models.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    actual_model_name: Mapped[str] = mapped_column(String, nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    weight: Mapped[int] = mapped_column(Integer, default=1)
+    prompt_price_per_1k: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    completion_price_per_1k: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class UserWalletModel(Base):
+    """Cash wallet: one row per user; balance is authoritative for PAYG deduction."""
+
+    __tablename__ = "user_wallets"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    balance: Mapped[Decimal] = mapped_column(Numeric(14, 6), default=Decimal("0"))
+    currency: Mapped[str] = mapped_column(String, default="USD")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class WalletTransactionModel(Base):
+    """Append-only wallet ledger; balance_after is a snapshot, never recomputed."""
+
+    __tablename__ = "wallet_transactions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    type: Mapped[str] = mapped_column(String, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 6), nullable=False)
+    balance_after: Mapped[Decimal] = mapped_column(Numeric(14, 6), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+    idempotency_key: Mapped[str | None] = mapped_column(String, unique=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

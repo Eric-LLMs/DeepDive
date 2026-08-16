@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     )
 
     # ── Database / cache ──
-    database_url: str = "postgresql+asyncpg://deepdive:deepdive@localhost:5432/deepdive"
+    database_url: str = "postgresql+asyncpg://deepdive:deepdive@localhost:15432/deepdive"
     redis_url: str = "redis://localhost:16379/0"
 
     # ── Worker / jobs ──
@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     # ── STT ──
     stt_model: str = "whisper-1"
 
+    # ── Media (desktop workbench: keyframes → PPT / PDF book) ──
+    media_output_dir: Path = Path("data/media_output")
+
+    # ── Web search (agent web_search tool) ──
+    web_search_provider: str = "tavily"   # "tavily" (needs key) | "duckduckgo" (no key)
+    web_search_api_key: str = ""
+
     # ── Agent ──
     memory_dir: Path = Path("data/memory")     # file memory directory (MEMORY.md index)
     skills_dir: Path = Path("data/skills")     # *.skill.md skills directory
@@ -64,9 +71,15 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 10080
 
+    # Anonymous guests may chat without an account, capped per day (-1 = unlimited).
+    guest_daily_limit: int = 10
+
     # ── Cache paths ──
     audio_cache_path: Path = Path("data/audio_cache")
     image_cache_path: Path = Path("data/image_cache")
+
+    # ── Runtime config (legacy JSON file; imported into DB once on startup) ──
+    config_path: Path = Path("data/config.json")
 
 
 settings = Settings()

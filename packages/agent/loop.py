@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from agent.decisions import ToolExecution, ToolExecutionResult
@@ -23,7 +23,9 @@ from agent.system_prompt import SystemPrompt, render_prompt
 
 
 class AgentLLMPort(Protocol):
-    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    async def chat(
+        self, messages: list[dict], tools: list[dict] | None = None, model: str | None = None
+    ) -> dict:
         """Return {"content": str | None, "tool_calls": [{id, name, arguments}]}."""
         ...
 
@@ -32,6 +34,17 @@ class AgentLLMPort(Protocol):
 class AgentResult:
     messages: list[dict]
     final_answer: str
+    usage: dict[str, int] = field(default_factory=dict)
+
+
+def _sum_usage(total: dict[str, int], step: dict | None) -> dict[str, int]:
+    """Accumulate per-call token counts into a running total."""
+    if not step:
+        return total
+    out = dict(total)
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        out[key] = out.get(key, 0) + int(step.get(key) or 0)
+    return out
 
 
 class ReactLoopAgent:
@@ -65,6 +78,7 @@ class ReactLoopAgent:
         history: list[dict] | None = None,
         memory_keys: list[str] | None = None,
         session_memory: Any | None = None,
+        model: str | None = None,
     ) -> AgentResult:
         """Run one turn: assemble prompt → step until a final answer or max_steps."""
         self._session_memory = session_memory
@@ -84,11 +98,13 @@ class ReactLoopAgent:
         messages = (history or []) + [{"role": "user", "content": user_msg}]
         await self._persist_message(session_memory, "user", user_msg)
 
+        usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         try:
             for _ in range(self.max_steps):
                 await self.events.serial("agent/step-start", {})
                 self._log("step-start")
-                finished = await self._step(system, tools, messages, session_memory)
+                finished, step_usage = await self._step(system, tools, messages, session_memory, model)
+                usage = _sum_usage(usage, step_usage)
                 await self.events.serial("agent/step-end", {})
                 self._log("step-end")
                 if finished:
@@ -100,7 +116,7 @@ class ReactLoopAgent:
                 await session_memory.close()
             self._session_memory = None
 
-        return AgentResult(messages=messages, final_answer=self._final(messages))
+        return AgentResult(messages=messages, final_answer=self._final(messages), usage=usage)
 
     def _runtime_schemas(self) -> list[dict]:
         return [{"type": "function", "function": s} for s in self.runtime.schemas()]
@@ -111,11 +127,17 @@ class ReactLoopAgent:
         tools: list[dict],
         messages: list[dict],
         session_memory: Any | None,
-    ) -> bool:
-        """Run one LLM call + execute any tool calls. Returns True when the turn is done."""
+        model: str | None = None,
+    ) -> tuple[bool, dict | None]:
+        """Run one LLM call + execute any tool calls.
+
+        Returns ``(finished, usage)`` where ``usage`` is the token counts from this step's
+        LLM call (``None`` when the port reported none).
+        """
         request = [{"role": "system", "content": system}] + messages
-        resp = await self.llm.chat(request, tools=tools)
+        resp = await self.llm.chat(request, tools=tools, model=model)
         tool_calls = resp.get("tool_calls") or []
+        usage = resp.get("usage")
         self._log("llm-call", tool_calls=len(tool_calls))
 
         assistant: dict = {"role": "assistant", "content": resp["content"]}
@@ -126,10 +148,10 @@ class ReactLoopAgent:
             await self._persist_message(session_memory, "assistant", resp["content"])
 
         if not tool_calls:
-            return True
+            return True, usage
 
         concludes = await self._execute_tool_calls(tool_calls, messages, session_memory)
-        return concludes
+        return concludes, usage
 
     async def _execute_tool_calls(
         self, tool_calls: list[dict], messages: list[dict], session_memory: Any | None

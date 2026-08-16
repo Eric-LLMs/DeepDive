@@ -15,6 +15,7 @@ dependencies = [
     "uvicorn[standard]>=0.29",
     "sse-starlette>=2.0",
     "python-multipart>=0.0.9",
+    "PyJWT>=2.8",
     # Data
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.29",
@@ -50,6 +51,12 @@ dev = [
 # RAG semantic search (pulls in torch, heavy; install on demand)
 rag = [
     "sentence-transformers>=2.7",
+]
+# Desktop media generation (video → PPT / PDF book)
+media = [
+    "python-pptx>=0.6.21",
+    "reportlab>=4.0",
+    "imageio-ffmpeg>=0.4.9",
 ]
 
 [tool.hatch.build.targets.wheel]

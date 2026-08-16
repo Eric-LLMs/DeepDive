@@ -1,0 +1,18 @@
+{
+  "name": "deepdive-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Electron shell wrapping the DeepDive web UI",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "pdfjs-dist": "^3.11.174"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
+  }
+}

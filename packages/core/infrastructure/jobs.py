@@ -24,6 +24,7 @@ GENERATE_DEFINITION = "generate_definition"
 ANALYZE_SYNTAX = "analyze_syntax"
 INDEX_SENTENCES = "index_sentences"
 SESSION_FINALIZE = "session_finalize"
+GENERATE_MEDIA = "generate_media"
 
 # Job status values.
 QUEUED = "queued"
