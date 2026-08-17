@@ -463,162 +463,50 @@ rewrite → multi-recall → RRF fusion → rerank
 | Recall / write memory as a tool | `memory_search` / `memory_save` (the latter requires `confirmed=True`) |
 | Lazy-load a skill body | `skill` meta-tool over `SkillCatalog.render()` compressed index |
 
-## 12. Data Model (Core Table DDL)
+## 12. Data Model
 
-> **Migration note:** the implemented schema is managed by **plain SQL migrations**
-> (`migrations/*.sql`, applied in filename order by `init_db()` via asyncpg and tracked in the
-> `schema_migrations` table), replacing Alembic. The implemented tables include `sessions`,
-> `messages`, `session_events`, and `jobs` — which the design DDL below expresses as
-> `conversations` / `messages` / `job_logs`. The DDL below is the full designed schema; some
-> tables are design-only (auth / billing / observability).
+> **Migration note:** the schema is defined **only** in `migrations/*.sql` — applied in filename
+> order by `init_db()` via asyncpg and tracked in the `schema_migrations` table (no Alembic, no
+> `create_all`). This document does not repeat the DDL; the migration files are the single source
+> of truth. Table names below are the implemented ones (`sessions`, `messages`, `jobs` …), not the
+> earlier design names (`conversations`, `job_logs` …).
 
-Unified multi-tenancy: business tables carry `user_id`, enabling PostgreSQL RLS.
+The core learning + chat tables that run today (`migrations/0001_init.sql`):
 
-```sql
-CREATE TABLE users (
-    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email         TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    display_name  TEXT,
-    created_at    TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE roles (
-    id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT UNIQUE NOT NULL
-);
-CREATE TABLE user_roles (
-    user_id UUID REFERENCES users(id),
-    role_id UUID REFERENCES roles(id),
-    PRIMARY KEY (user_id, role_id)
-);
+- **domains** — `id`, `name` (unique), `created_at`.
+- **materials** — `id`, `type` (`domain` | `video` | `document`), `title`, `source_url`, `meta` (JSONB), `created_at`.
+- **users** — `id`, `created_at`; the auth columns come from `0002_auth.sql` (see §12.3).
+- **terms** — `id`, `domain_id` (FK → `domains`), `word`, `definition`, `frequency`, `star_level`, `audio_hash`, `image_paths` (JSONB), `is_active`.
+- **sentences** — `id`, `domain_id` (FK → `domains`), `origin_source`, `content_en` (unique), `content_cn`, `audio_hash`, `cn_explanation`, `embedding` (vector(1024)).
+- **chunks** — `id`, `material_id` (FK → `materials`), `seq`, `content_en`, `content_cn`, `meta` (JSONB), `embedding` (vector(1024)).
+- **sessions** — `id`, `user_id` (FK → `users`), `created_at`, `closed_at`, `summary`.
+- **messages** — `id`, `user_id`, `session_id` (FK → `sessions`), `role` (`user` | `assistant` | `tool`), `text`, `embedding` (vector(1024)), `created_at`.
+- **session_events** — `id`, `session_id` (FK → `sessions`), `seq`, `type`, `timestamp`, `payload` (JSONB).
+- **matches** — `id`, `term_id` (FK → `terms`), `sentence_id` (FK → `sentences`), `cn_explanation`.
+- **jobs** — `id`, `type`, `status`, `payload` (JSONB), `result` (JSONB), `error`, `created_at`, `started_at`, `completed_at`.
 
-CREATE TABLE domains (
-    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id    UUID REFERENCES users(id),
-    name       TEXT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE materials (
-    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id    UUID REFERENCES users(id),
-    type       TEXT NOT NULL,        -- 'domain' | 'video' | 'document'
-    title      TEXT NOT NULL,
-    source_url TEXT,
-    meta       JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE chunks (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    material_id UUID REFERENCES materials(id),
-    seq         INT NOT NULL,
-    content_en  TEXT NOT NULL,
-    content_cn  TEXT,
-    meta        JSONB DEFAULT '{}',
-    embedding   vector(1024),
-    UNIQUE (material_id, seq)
-);
-
-CREATE TABLE terms (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id     UUID REFERENCES users(id),
-    domain_id   UUID REFERENCES domains(id),
-    word        TEXT NOT NULL,
-    definition  TEXT,
-    frequency   INT DEFAULT 0,
-    star_level  INT DEFAULT 0,
-    audio_hash  TEXT,
-    image_paths JSONB DEFAULT '[]',
-    is_active   BOOLEAN DEFAULT true
-);
-
-CREATE TABLE sentences (
-    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id       UUID REFERENCES users(id),
-    domain_id     UUID REFERENCES domains(id),
-    origin_source TEXT,
-    content_en    TEXT UNIQUE NOT NULL,
-    content_cn    TEXT,
-    audio_hash    TEXT,
-    cn_explanation TEXT
-);
-
-CREATE TABLE matches (
-    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    term_id       UUID REFERENCES terms(id),
-    sentence_id   UUID REFERENCES sentences(id),
-    cn_explanation TEXT
-);
-
-CREATE TABLE enrichment (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    content_hash TEXT NOT NULL,
-    kind        TEXT NOT NULL,
-    payload     JSONB,
-    created_at  TIMESTAMPTZ DEFAULT now(),
-    UNIQUE (content_hash, kind)
-);
-
-CREATE TABLE conversations (
-    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id    UUID REFERENCES users(id),
-    title      TEXT,
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE messages (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    conversation_id UUID REFERENCES conversations(id),
-    role            TEXT NOT NULL,
-    content         TEXT NOT NULL,
-    tool_calls      JSONB,
-    created_at      TIMESTAMPTZ DEFAULT now()
-);
-```
+Multi-tenancy is carried by `user_id` on `sessions` / `messages` and the auth/billing tables;
+PostgreSQL RLS is the isolation strategy (see §13). Runtime access is via the SQLAlchemy 2.0
+async models in `packages/core/infrastructure/db.py`.
 
 ### 12.1 Indexes and Retrieval
 
-```sql
-ALTER TABLE chunks ADD COLUMN fts tsvector
-    GENERATED ALWAYS AS (to_tsvector('english', content_en)) STORED;
-CREATE INDEX ON chunks USING GIN (fts);
-CREATE INDEX ON chunks USING ivfflat (embedding vector_cosine_ops);
--- or HNSW for large data: CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
-```
+Hybrid recall is computed in code, not stored in schema:
+
+- **Keyword (tsvector)** — `to_tsvector('english', …) @@ websearch_to_tsquery` evaluated at query
+  time over `chunks.content_en` / `messages.text` (`packages/rag/recall/keyword.py`,
+  `packages/core/infrastructure/memory_retrieval.py`); no stored tsvector column.
+- **Semantic (pgvector)** — cosine search over the `embedding vector(1024)` columns.
+- **Indexes** — the migrations currently define no explicit FTS / vector index; the design
+  proposes a GIN index on a generated `fts` column and an ivfflat (or HNSW for large data) index
+  on `embedding`.
 
 ### 12.2 Billing and Logs
 
-```sql
-CREATE TABLE subscriptions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(id),
-    plan TEXT NOT NULL, status TEXT NOT NULL,
-    started_at TIMESTAMPTZ DEFAULT now(), ends_at TIMESTAMPTZ
-);
-CREATE TABLE credit_ledger (
-    id BIGSERIAL PRIMARY KEY,
-    user_id UUID REFERENCES users(id),
-    amount BIGINT NOT NULL, balance_after BIGINT NOT NULL, reason TEXT NOT NULL,
-    idempotency_key TEXT UNIQUE NOT NULL, created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE audit_logs (
-    id BIGSERIAL PRIMARY KEY, user_id UUID, action TEXT, entity TEXT, entity_id UUID,
-    before JSONB, after JSONB, created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE ai_call_logs (
-    id BIGSERIAL PRIMARY KEY, user_id UUID, model TEXT,
-    prompt_tokens INT, completion_tokens INT, latency_ms INT, cost_micro BIGINT,
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE activity_logs (
-    id BIGSERIAL PRIMARY KEY, user_id UUID, event TEXT, payload JSONB,
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE job_logs (
-    id BIGSERIAL PRIMARY KEY, job_type TEXT, status TEXT, input JSONB, error TEXT,
-    started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ
-);
-```
+- **Implemented** — the billing surface in `migrations/0004_billing.sql`: `llm_credentials`,
+  `llm_models`, `credential_models`, `user_wallets`, `wallet_transactions` (documented in §12.3).
+- **Design-only (not created)** — `subscriptions`, `credit_ledger`, `audit_logs`, `ai_call_logs`,
+  `activity_logs`, `job_logs` (job state lives in the implemented `jobs` table).
 
 ### 12.3 Implemented auth, RBAC & billing schema
 

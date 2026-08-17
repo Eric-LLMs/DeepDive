@@ -42,3 +42,6 @@ apps/desktop/release/
 
 # Claude Code (local-only settings)
 .claude/settings.local.json
+
+# Local temp record (never committed)
+docs/temp.md
