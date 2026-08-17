@@ -25,7 +25,7 @@ flowchart LR
         desk[Electron Workbench]
     end
     subgraph Backend
-        api[FastAPI gateway<br/>agent kernel + usecases + job enqueue]
+        api[FastAPI gateway<br/>HTTP/SSE entry · usecases · job enqueue]
         wk[arq worker<br/>TTS / images / explanations / finalize]
         rs[Retrieval service<br/>RAG pipeline · gRPC]
     end
@@ -38,11 +38,9 @@ flowchart LR
         tts[Kokoro TTS]
         llm[LiteLLM gateway<br/>→ upstream LLM]
     end
-    agt[Agent tools & skills<br/>tool gateway · skill catalog]
 
     web --> api
     desk --> api
-    agt <--> api
     api --> rd
     rd --> wk
     api --> pg
@@ -54,6 +52,18 @@ flowchart LR
     api --> llm
     wk --> tts
     rs --> emb
+```
+
+**Agent kernel** — the core, composed in and running inside the FastAPI gateway process:
+
+```mermaid
+flowchart TB
+    kernel[AgentKernel] --> loop[ReactLoopAgent step loop]
+    loop --> prompt[CacheBoundaryAssembler<br/>cache-boundary prompt]
+    loop --> tools[ToolGateway<br/>deferred tool loading]
+    loop --> skills[SkillCatalog · SKILL.md]
+    loop --> memory[MemoryService<br/>PG tsvector + pgvector RRF]
+    tools --> sandbox[Sandbox<br/>READ / WRITE / NETWORK]
 ```
 
 > [docs/architecture.md](docs/architecture.md) is the single source of truth for the full design —
