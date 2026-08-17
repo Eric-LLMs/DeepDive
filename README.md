@@ -23,9 +23,10 @@ flowchart LR
     subgraph Frontends
         web[React Web UI]
         desk[Electron Workbench]
+        lt[Local Tools]
     end
     subgraph Backend
-        api[FastAPI gateway<br/>HTTP/SSE entry · usecases · job enqueue]
+        api["FastAPI gateway · AgentKernel<br/>HTTP/SSE entry · usecases · job enqueue"]
         wk[arq worker<br/>TTS / images / explanations / finalize]
         rs[Retrieval service<br/>RAG pipeline · gRPC]
     end
