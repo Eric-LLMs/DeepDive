@@ -1,27 +1,26 @@
 """Dependency injection: wire up singletons + per-request resources.
 
 Singletons are lightweight clients (llm/tts/embedder) that talk to model services over
-HTTP; no model is loaded into the API process itself. The agent is assembled from a
-:class:`Context` (capability DI), a :class:`SystemPrompt` (layered prompt), and a
-:class:`ReactLoopAgent` (step pipeline).
+HTTP; no model is loaded into the API process itself. The agent is a :class:`AgentKernel`
+composition: a :class:`Context` (capability DI), a cache-boundary :class:`SystemPrompt`
+assembler, a deferred-tool :class:`ToolGateway`, dual-track memory, and a
+:class:`ReactLoopAgent` step pipeline.
 """
 from functools import lru_cache
 
-from fastapi import Depends, Request
-
 from agent import (
-    MEMORY_ORDER,
-    PERSONA_ORDER,
-    SKILLS_ORDER,
     Context,
     FileMemoryStore,
     PluginManager,
-    ReactLoopAgent,
     SkillRegistry,
-    SystemPrompt,
     ToolRuntime,
     register_builtin_plugins,
 )
+from agent.fs_tools import register_fs_tools
+from agent.kernel import AgentKernel
+from agent.memory.retrieval import RRFMemoryRetriever
+from agent.memory.service import MemoryService
+from agent.sandbox import Sandbox
 from api.tools import register_builtin_tools
 from core.application.services import VocabularyService
 from core.config import settings
@@ -29,16 +28,18 @@ from core.infrastructure.db import SessionLocal
 from core.infrastructure.images import ImageScraper
 from core.infrastructure.jobs import JobStore, TaskQueue
 from core.infrastructure.llm import OpenAILLM
-from core.infrastructure.retrieval_grpc import GrpcRetriever
+from core.infrastructure.memory_retrieval import PgKeywordRecaller, PgVectorRecaller
 from core.infrastructure.repositories import (
     SqlDomainRepository,
     SqlMatchRepository,
     SqlSentenceRepository,
     SqlTermRepository,
 )
+from core.infrastructure.retrieval_grpc import GrpcRetriever
 from core.infrastructure.tts import TTSClient
 from core.infrastructure.vector import PgVectorStore, TEIEmbedder
 from core.infrastructure.web_search import get_web_search_provider
+from fastapi import Depends, Request
 from rag import RAGPipeline, build_pipeline
 
 # Lightweight singletons
@@ -63,7 +64,7 @@ def _retriever() -> RAGPipeline:
 
 
 @lru_cache
-def _agent() -> ReactLoopAgent:
+def _agent() -> AgentKernel:
     runtime = ToolRuntime()
     ctx = Context()
 
@@ -76,47 +77,50 @@ def _agent() -> ReactLoopAgent:
 
     ctx.provide("web_search", get_web_search_provider())
 
+    # Domain tools first (the kernel registers the core meta-tools on top).
     register_builtin_tools(runtime, ctx, llm)
+    register_fs_tools(runtime, settings.workspace_dir)
 
     skills = SkillRegistry.from_dir(settings.skills_dir)
+
+    # Dual-track memory: session recall = RRF over pgvector + tsvector (tsvector-only when
+    # the embedding service is offline — never a silent empty); the file track stays local.
     file_memory = FileMemoryStore(settings.memory_dir)
+    retriever = RRFMemoryRetriever(
+        keyword=PgKeywordRecaller(SessionLocal),
+        vector=PgVectorRecaller(SessionLocal, _embedder()),
+    )
+    memory = MemoryService(
+        file_store=file_memory,
+        retriever=retriever,
+        memory_md_path=settings.memory_dir / "MEMORY.md",
+    )
 
-    system_prompt = SystemPrompt()
-    system_prompt.section("persona", PERSONA_ORDER, "You are a helpful learning assistant.")
+    soul = _read_soul()
+    sandbox = Sandbox()  # default session = READ-only; WRITE/NETWORK tools are gated
 
-    async def memory_section(context: dict) -> str:
-        user_msg = context.get("user_msg", "")
-        parts: list[str] = []
-        for mem in await file_memory.search(user_msg, limit=3):
-            parts.append(f"## 记忆:{mem.name}\n{mem.content}")
-            if mem.freshness_note:
-                parts.append(mem.freshness_note)
-        session_memory = context.get("session_memory")
-        if session_memory is not None:
-            try:
-                query_embedding = (await _embedder().embed([user_msg]))[0]
-                recalled = await session_memory.search(
-                    query_embedding, top_k=settings.memory_recall_top_k
-                )
-            except Exception:  # noqa: BLE001 - memory recall must not break the prompt
-                recalled = []
-            for m in recalled:
-                parts.append(f"[{m['role']}] {m['text']}")
-        return "\n\n".join(parts)
-
-    async def skills_section(context: dict) -> str:
-        relevant = skills.relevant(context.get("user_msg", ""))
-        if not relevant:
-            return ""
-        return "\n\n".join(f"### skill:{s.name}\n{s.instructions}" for s in relevant)
-
-    system_prompt.section("memory", MEMORY_ORDER, memory_section)
-    system_prompt.section("skills", SKILLS_ORDER, skills_section)
+    kernel = AgentKernel(
+        llm,
+        runtime,
+        soul=soul,
+        memory=memory,
+        skills=skills,
+        sandbox=sandbox,
+    )
 
     manager = PluginManager(runtime, skills, ctx)
     register_builtin_plugins(manager)
     manager.discover(settings.plugins_dir)
-    return ReactLoopAgent(llm, runtime, system_prompt)
+    return kernel
+
+
+def _read_soul() -> str:
+    """Load the identity persona (``data/soul.md``), falling back to a one-line persona."""
+    soul_path = settings.memory_dir.parent / "soul.md"
+    try:
+        return soul_path.read_text(encoding="utf-8")
+    except OSError:
+        return "You are DeepDive, a focused learning-workbench assistant."
 
 
 async def get_session():
@@ -137,7 +141,7 @@ def get_vocab_service(session=Depends(get_session)) -> VocabularyService:
     )
 
 
-def get_agent() -> ReactLoopAgent:
+def get_agent() -> AgentKernel:
     return _agent()
 
 

@@ -15,7 +15,7 @@
 |----|------|
 | Vocabulary subdomain | domains / terms / sentences / matches / materials / chunks (6 tables) |
 | Hybrid search | pgvector (semantic) + tsvector (keyword) + RRF fusion |
-| Agent runtime | Cordis-style DI (`Context`/`Fiber`) + layered `SystemPrompt` + `ReactLoopAgent` step loop + plugin `ToolRuntime` |
+| Agent runtime | `AgentKernel` composition root: cache-boundary `CacheBoundaryAssembler` (3 zones + `snapshot_key`) + deferred-tool `ToolGateway` + dual-track `MemoryService` (PG tsvector/pgvector RRF) + skill catalog + READ-only `Sandbox`, over `ReactLoopAgent` step loop + plugin `ToolRuntime` |
 | Retrieval | RAG pipeline (rewrite → recall → RRF → rerank); `in_process` default, gRPC service available |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
 | Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}` |
@@ -44,7 +44,7 @@ DeepDive is an "AI learning workbench" unified by a single abstraction:
 
 - **Vocabulary learning**: domain vocabulary + example sentences + definitions + TTS + images + star ratings
 - **Video / document learning**: media → timestamped/paginated text chunks → searchable, annotatable
-- **AI chat assistant**: interactive Q&A with tool use (RAG + vocabulary lookup + external MCP)
+- **AI chat assistant**: interactive Q&A with tool use (RAG + vocabulary lookup + sandboxed file/network tools)
 - **Unifying principle: everything is a text chunk**
 
 ## 2. Tech Stack
@@ -63,8 +63,8 @@ DeepDive is an "AI learning workbench" unified by a single abstraction:
 | Embedding | BGE-M3 (dim 1024) via TEI | multilingual, moderate dim |
 | Reranking | BGE-reranker cross-encoder | post-recall precision |
 | Retrieval (RAG) | query rewrite → pgvector + tsvector recall → RRF fusion → rerank | hybrid keyword + semantic search |
-| Agent | Cordis-style DI (`Context`/`Fiber`) + `ReactLoopAgent` step loop + layered `SystemPrompt` + plugin tool runtime | controllable, testable, plugin-based |
-| MCP | FastMCP | tool exposure + bidirectional integration |
+| Agent | `AgentKernel` (cache-boundary prompt + deferred tool loading + dual-track memory + sandbox) over `ReactLoopAgent` + plugin `ToolRuntime` | controllable, testable, plugin-based |
+| MCP | FastMCP | optional external exposure of the tool runtime (`core/infrastructure/mcp.py`) |
 | Speech | STT: faster-whisper / Whisper API; TTS: local Kokoro-82M | |
 
 **Language boundary**: backend in Python (AI deps), frontend in TypeScript. The boundary is
@@ -77,24 +77,38 @@ deepdive/
 ├── apps/
 │   ├── api/                      # package `api` (FastAPI gateway: REST/SSE + job enqueue)
 │   │   ├── main.py               # uvicorn api.main:app (REST/SSE endpoints + GET /jobs/{id})
-│   │   ├── deps.py               # DI assembly (capability seam + tools + plugins + prompt)
-│   │   ├── tools.py              # gateway built-in tools (rag_search / translate)
+│   │   ├── deps.py               # DI assembly (capability seam + agent kernel wiring + plugins)
+│   │   ├── tools/                # gateway tools, auto-discovered by `_tool.py` modules (rag_search / translate / web_search)
 │   │   └── schemas.py            # Pydantic request/response models
 │   ├── worker/                   # arq worker (executes async enrichment jobs)
 │   │   ├── settings.py           # WorkerSettings (functions / redis / startup clients)
-│   │   ├── tasks.py              # tts / image_fetch / explain / ... job functions
+│   │   ├── tasks.py              # tts / image_fetch / explain / generate_media / ... job functions
 │   │   └── main.py               # run_worker entrypoint
 │   ├── retrieval/                # retrieval service (gRPC), run: python -m apps.retrieval.main
 │   │   ├── server.py             # RetrievalService servicer (proto -> RAGPipeline)
 │   │   └── main.py               # grpc.aio.server entrypoint
 │   ├── web/                      # Vite + React frontend (TS)
-│   └── desktop/                  # Electron shell (wraps web UI, proxies API to the backend)
+│   └── desktop/                  # Electron workbench (file tree + media viewer + chat; proxies API to the backend)
 ├── packages/
-│   ├── agent/                    # package `agent`: DI + loop + runtime + plugins + memory + skills + prompt
+│   ├── agent/                    # package `agent`: kernel + DI + loop + runtime + memory + skills + prompt
+│   │   ├── kernel.py             # AgentKernel composition root (core tools + sandbox guard + zone sections)
+│   │   ├── system_prompt.py      # PromptZone + CacheBoundaryAssembler (inject / snapshot_key / refresh_dynamic)
+│   │   ├── tool_gateway.py       # ToolCatalog + ToolVisibilityPolicy + ToolGateway + tool_search meta-tool
+│   │   ├── tool_permissions.py   # ToolPermission (READ/WRITE/NETWORK) + classify_permissions
+│   │   ├── sandbox.py            # Sandbox permission gate (default READ-only; ASK w/o approver → deny)
+│   │   ├── fs_tools.py           # resident read_file / edit_file / bash (workspace-rooted; escape rejected)
+│   │   ├── skills.py             # Skill + SkillRegistry + SkillCatalog + skill meta-tool (lazy load)
+│   │   ├── memory/               # base/file (memdir store) + retrieval (RRF fusion) + service (memory tools)
+│   │   ├── loop.py               # ReactLoopAgent step loop (gateway-aware, per-step dynamic diff)
+│   │   ├── runtime.py            # ToolRuntime lifecycle (pre-execute → guard → execute → post-execute)
+│   │   └── plugins/              # plugin manager + built-in tool_audit
 │   ├── rag/                      # package `rag`: retrieval DAG + build_pipeline factory
 │   ├── core/                     # package `core`: config + domain/application/ports/infrastructure
+│   │   └── infrastructure/memory_retrieval.py  # PG tsvector + pgvector session-recall channels
 │   └── shared/proto/retrieval/   # generated protobuf/gRPC stubs (import name `retrieval.v1`)
-├── migrations/                   # Alembic migrations (env.py + versions/)
+├── data/
+│   └── soul.md                   # agent identity persona (STATIC_PREFIX source)
+├── migrations/                   # numbered SQL migrations (applied by init_db.py; replaces Alembic)
 ├── proto/retrieval/v1/retrieval.proto   # RetrievalService contract
 ├── buf.yaml / buf.gen.yaml             # proto lint / breaking / codegen
 ├── scripts/gen_proto.sh                # grpc_tools.protoc (or buf) codegen
@@ -103,7 +117,7 @@ deepdive/
 │   ├── retrieval/Dockerfile      # retrieval service image
 │   ├── worker/Dockerfile         # arq worker image
 │   └── litellm/config.yaml
-├── tests/                        # pytest (di / system_prompt / loop / memory / rrf / jobs / tool_runtime)
+├── tests/                        # pytest (di / jobs / loop / memory / memory_rrf / prompt_engine / rrf / system_prompt / tool_gateway / tool_runtime)
 ├── .github/workflows/ci.yml      # buf lint + pytest
 └── docker-compose.yml            # data + model services + worker + retrieval + traefik
 ```
@@ -137,10 +151,23 @@ packages/core/infrastructure    → concrete implementations (postgres / openai 
 
 ## 5. Agent Module
 
-The `agent` package is the pluggable agent runtime. Three pieces compose a turn: a Cordis-style
-**DI state machine** wires plugins into a shared `Context`, the **`ReactLoopAgent`** runs the
-tool-use loop, and a layered **`SystemPrompt`** assembles the model context. Memory, skills, and
-the append-only session log are optional collaborators injected into the loop.
+The `agent` package is the pluggable agent runtime, composed by an **`AgentKernel`** root. The
+kernel wires five pieces around a **`ReactLoopAgent`** step loop:
+
+- a **cache-boundary prompt** (`CacheBoundaryAssembler`) — three zones whose stable head is
+  byte-identical across requests so the provider reuses its prefix cache;
+- **deferred tool loading** (`ToolGateway`) — the prompt carries a compact catalog + the
+  `tool_search` meta-tool; full schemas are mounted on demand;
+- **dual-track memory** (`MemoryService`) — PG tsvector + pgvector recall fused by RRF, exposed
+  as `memory_search` / `memory_save` tools (writes need human confirmation);
+- a **skill catalog** — SKILL.md skills advertised as a one-line index, body lazy-loaded via the
+  `skill` meta-tool;
+- a **read-only sandbox** (`Sandbox`) — a monotonic permission gate (READ / WRITE / NETWORK) that
+  denies anything the session lacks permission for.
+
+Beneath the kernel, a Cordis-style **DI state machine** wires plugins into a shared `Context`,
+and the append-only session log is an optional collaborator. `AgentKernel.run(...)` mirrors the
+`ReactLoopAgent.run` signature, so the API's `/chat` handler is unchanged.
 
 ### 5.1 DI state machine — `Context` / `Fiber`
 
@@ -165,23 +192,59 @@ batched in parallel (`asyncio.gather`, capped by `max_parallel_tool_calls`); the
 serial barriers. A tool whose execution `concludes_turn` stops the loop early. Returns
 `AgentResult {messages, final_answer}`.
 
-### 5.3 System prompt — layered `SystemPrompt`
+When built through `AgentKernel`, each step's model-visible tool array comes from
+`ToolGateway.visible_schemas(context)` (core resident tools + whatever `tool_search` has mounted +
+any scope allowlist, minus the denylist). The prompt's dynamic suffix is re-rendered per step via
+`CacheBoundaryAssembler.refresh_dynamic(context)`; if it is unchanged from the previous step the
+system message is not resent, and the byte-stable static head is reused as-is.
 
-Prompt sections register with an `order` and merge ascending, so persona / tool guidance /
-memory / skills each contribute independently without knowing one another. Order conventions:
-harness identity `-100` < persona `0` < tool guidance `100` < memory `200` < skills `250`.
+### 5.3 System prompt — `CacheBoundaryAssembler` (three-zone, cache-boundary)
+
+Sections register with an `order` plus a `zone` and merge ascending within it. The zones are the
+**cache-boundary contract**:
+
+| zone | content | stability |
+|---|---|---|
+| `PromptZone.STATIC_PREFIX` | SOUL.md identity (`data/soul.md`) + compact tool catalog + compressed skill catalog | byte-identical across requests → the provider reuses its prefix cache |
+| `PromptZone.PROJECT_CONTEXT` | CLAUDE.md / AGENTS.md project rules | stable per project |
+| `PromptZone.DYNAMIC_SUFFIX` | per-step session memory brief + any `inject()` content | re-rendered every step |
+
+`assemble()` returns a `PromptAssembly {static_prefix, project_context, dynamic_suffix, tools,
+variables}`; the static/project render is cached, and only the dynamic suffix is recomputed.
+`refresh_dynamic(context)` recomputes just that zone for each loop step.
+
+- `inject(text, *, name)` — session-scoped persistent content that survives across steps
+  (aligned with `agent.inject()`); cleared on the next `begin_session()`.
+- `snapshot_key()` — `sha256(static + project)[:16]`; the observable identity of the stable head,
+  making prefix-cache hit rate measurable.
+- `render_prompt(assembly)` — joins the zones with a fixed `CACHE_BOUNDARY` marker
+  (`"\n\n<CACHE_BOUNDARY/>\n\n"`) between the stable head and the dynamic suffix.
+
 A section's text may be static or an async callable over the assemble context (used for on-demand
-memory/skill retrieval). `{{name}}` placeholders interpolate from registered variables;
-`render_prompt()` drops empty sections and joins the rest with blank lines.
+memory/skill retrieval). `{{name}}` placeholders interpolate from registered variables. The legacy
+flat `SystemPrompt` (no zones, no boundary) still renders for backward compatibility.
 
 ### 5.4 Memory, skills, sessions
 
-- **Memory** — `MemoryStore` protocol (`load`/`save`/`list`/`search`) + `FileMemoryStore`
-  (claude-code memdir style: `MEMORY.md` index + one frontmatter `.md` per memory,
-  description-weighted keyword recall). `Memory` records carry a `type` in
-  {`user`,`feedback`,`project`,`reference`} and a staleness caveat via `age_days`.
+- **Memory** — dual-track, orchestrated by `MemoryService`:
+  - **Long-term file memory** — `MemoryStore` protocol (`load`/`save`/`list`/`search`) +
+    `FileMemoryStore` (claude-code memdir style: `MEMORY.md` index + one frontmatter `.md` per
+    memory, description-weighted keyword recall). `Memory` records carry a `type` in
+    {`user`,`feedback`,`project`,`reference`} and a staleness caveat via `age_days`.
+  - **Session memory** — PostgreSQL-backed recall (`core/infrastructure/memory_retrieval.py`):
+    `PgKeywordRecaller` (tsvector `to_tsvector('english', text)`, deterministic, no vectors —
+    `fts_config` is a constructor param so zhparser/jieba can be swapped in for CJK) +
+    `PgVectorRecaller` (pgvector cosine over `messages.embedding`). `RRFMemoryRetriever` fuses the
+    two via `rag.rank.rrf.rrf_fusion`; a vector-channel failure degrades to tsvector-only —
+    **never a silent empty**.
+  - **Memory as tools** — `memory_search` (RRF-fused recall) and `memory_save` (writes require
+    `confirmed=True`, a human-confirmation gate). At `begin_session()` the `MEMORY.md` head is
+    loaded as the dynamic-suffix session brief.
 - **Skills** — `Skill` (Markdown instructions + frontmatter + keywords) registered in a
   `SkillRegistry` (`register` / `relevant(query)` keyword scoring / `from_dir` for `*.skill.md`).
+  `SkillCatalog.render()` emits a compressed one-line directory (name + truncated description,
+  XML-escaped, within a character budget) into the STATIC_PREFIX; the `skill` meta-tool
+  lazy-loads the full SKILL.md body on demand and reports `allowed_tools`.
 - **Sessions** — `SessionLog` is an append-only event stream
   (`session-start` / `session-end` / `llm-call` / `tool-call` / `tool-result`), serializable to
   JSONL for audit.
@@ -198,10 +261,13 @@ The Agent core implements a plugin-based tool runtime in Python. The essentials:
 ### 6.1 Typed tool definition — `define_tool`
 
 ```
-define_tool(name, description, parameters, output, execute, destructive, is_concurrency_safe)
+define_tool(name, description, parameters, output, execute, destructive,
+            is_concurrency_safe, permission)
   → ToolDefinition
 ```
 
+- `permission`: optional explicit `{READ, WRITE, NETWORK}` class; `None` → `classify_permissions`
+  infers it (destructive → WRITE, file/network-hinting params → WRITE/NETWORK, else READ).
 - `parameters`: JSON Schema for the tool args (OpenAI function-calling format).
 - `output = ToolOutput(schema, render)` — the **canonical value** is validated against `schema`
   (`jsonschema`); `render(args, value) -> [ContentBlock]` produces the **model-visible content**.
@@ -243,6 +309,35 @@ a microkernel (Loader / patch-layer boot), two-queue Inbox,
 `AsyncLocalStorage` initiator tracking, Code Mode (`run_code`), and scoped per-agent registration.
 DeepDive uses a small `EventBus` + `SessionLog` (append-only session events) and Cordis-style
 `Context`/`Fiber` DI instead.
+
+### 6.5 Deferred loading, permissions & sandbox
+
+**`tool_permissions.py`** — `ToolPermission {READ, WRITE, NETWORK}` and
+`classify_permissions(defn)`: an explicit `permission` on the `ToolDefinition` wins; otherwise
+`destructive` or write-hinting parameters → WRITE, url/http/network hints → NETWORK, else READ.
+`ToolDefinition.permissions` is the effective (post-classify) class.
+
+**`tool_gateway.py`** — deferred tool loading for the 1000-tool scaling problem (prompt bloat):
+- `ToolCatalog` — a compact `name + blurb` index (no schemas); `render_index()` emits `- name:
+  blurb` lines within a character budget (blurbs truncated per-line); `search(query)` does
+  word-level scoring over name/blurb/permission tags.
+- `ToolVisibilityPolicy` — per-request scope: `allow(name)` / `deny(name)` / `present_as(mode,
+  names)`, each returning a disposer for rollback; `deny` beats both `allow` and a mounted tool.
+- `ToolGateway` — `core_schemas()` (resident tools: `tool_search` / `skill` / `memory_search` /
+  `memory_save`) + `visible_schemas(context)` = core ∪ mounted ∪ scope-allowlist − denylist;
+  `mount(name)` pulls a tool's full schema into the visible set after the model asked for it via
+  `tool_search`. The mounted set resets per session (`reset_session`).
+
+**`sandbox.py`** — `Sandbox` holds `SandboxRule(permission, decision)` and exposes a monotonic
+`guard()` (deny-only) used as the runtime's pre-execute gate: it computes the session's permitted
+permissions (default **READ-only**), and any tool requiring WRITE / NETWORK is denied unless the
+host granted it or a human approver confirms. `ASK` with no approver degrades to **deny**
+(safe-by-default). It composes with `ToolRuntime`'s existing `approval` hook for human gates.
+
+**`fs_tools.py`** — the resident filesystem/shell tools: `read_file` (READ), `edit_file` (WRITE),
+`bash` (WRITE + NETWORK). All file access is rooted at `settings.workspace_dir` and path escape is
+rejected (`_resolve`). The desktop workbench's "generate media" flow (`/media/generate` → worker
+`generate_media`) stays a separate HTTP+job pipeline, not an agent tool.
 
 ## 7. Capability Seam (Definition / Provider / Consumer)
 
@@ -361,6 +456,12 @@ rewrite → multi-recall → RRF fusion → rerank
 | Observe results without blocking | `EventBus.observe("tools/result", ...)` (serial) / `emit` (fire-and-forget) |
 | Swap retrieval provider | `Context.provide("retrieval", …)` + `settings.retrieval_mode` |
 | Session extension points | `agent/session-start` / `agent/session-end` observers in the loop |
+| Stable prompt head for prefix cache | `CacheBoundaryAssembler` zones + `CACHE_BOUNDARY` marker + `snapshot_key()` |
+| Load a tool schema on demand | `tool_search` meta-tool → `ToolGateway.mount(name)` |
+| Scope tool visibility per request | `ToolVisibilityPolicy` `allow` / `deny` / `present_as` (disposers) |
+| Gate a tool by session permission | `Sandbox.guard()` + `ToolPermission` (`classify_permissions`) |
+| Recall / write memory as a tool | `memory_search` / `memory_save` (the latter requires `confirmed=True`) |
+| Lazy-load a skill body | `skill` meta-tool over `SkillCatalog.render()` compressed index |
 
 ## 12. Data Model (Core Table DDL)
 

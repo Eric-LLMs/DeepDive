@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     web_search_api_key: str = ""
 
     # ── Agent ──
+    workspace_dir: Path = Path(".")            # root for the agent's read_file/edit_file/bash
     memory_dir: Path = Path("data/memory")     # file memory directory (MEMORY.md index)
     skills_dir: Path = Path("data/skills")     # *.skill.md skills directory
     plugins_dir: Path = Path("data/plugins")   # third-party plugin directory (*/plugin.py)

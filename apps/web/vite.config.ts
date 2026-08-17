@@ -8,13 +8,13 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: "http://localhost:8000",
+        target: "http://localhost:8300",
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ""),
       },
       // Serve cached TTS audio / images straight from the backend.
-      "/audio": { target: "http://localhost:8000", changeOrigin: true },
-      "/images": { target: "http://localhost:8000", changeOrigin: true },
+      "/audio": { target: "http://localhost:8300", changeOrigin: true },
+      "/images": { target: "http://localhost:8300", changeOrigin: true },
     },
   },
 });

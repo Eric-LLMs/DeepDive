@@ -39,3 +39,6 @@ apps/desktop/release/
 .idea/
 .vscode/
 .DS_Store
+
+# Claude Code (local-only settings)
+.claude/settings.local.json

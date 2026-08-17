@@ -6,35 +6,57 @@
 [![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**DeepDive** is an AI learning workbench for domain-specific English learning. It focuses on **contextual learning** within specific domains (e.g. "Stanford CS336 Lectures", "Legal English", "Medical Terms"): import vocabulary and example sentences, automatically fetch definitions, generate Text-to-Speech (TTS) audio, retrieve contextual images, and get context-aware AI explanations. A **hybrid search engine** (PostgreSQL keyword + pgvector semantic search) finds relevant example sentences even when exact keywords are missing, and a **native function-calling agent** powers interactive Q&A with RAG and MCP tooling.
+**DeepDive** is an AI-powered learning workbench — a monorepo spanning a FastAPI backend, a React web UI, and an Electron desktop workbench. It unifies **vocabulary learning**, **video/document learning**, and an **AI chat assistant** around a single abstraction: *everything is a text chunk*.
+
+The engine is a native function-calling **agent** — an `AgentKernel` composition root that wires a cache-boundary prompt (a byte-stable static head so the provider reuses its prefix cache), deferred tool loading, dual-track memory (PostgreSQL tsvector + pgvector fused by RRF), a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop. A **hybrid search engine** finds context even when exact keywords are missing, and a **RAG pipeline** (rewrite → recall → RRF → rerank) grounds every chat answer.
+
+Model inference never runs inside the API: embedding (**BGE-M3** via TEI), **TTS (Kokoro)**, and **LLM routing (LiteLLM)** are separate Docker services, and retrieval can be extracted behind a capability seam into its own **gRPC service**. Async enrichment (TTS, images, explanations, session finalize) runs on an arq **worker** off the request path.
+
+Also included: multi-user accounts with per-role quotas, pay-as-you-go **billing** with atomic wallet deduction, a self-contained **admin console**, and a desktop workbench with a file tree, a multi-format media viewer, and one-click video screenshots.
 
 ---
 
-## 📸 Screenshots
+## 🏗️ Architecture at a glance
 
-**1. Clean & Modern Vocabulary List**
+```mermaid
+flowchart LR
+    subgraph Frontends
+        web[React Web UI]
+        desk[Electron Workbench]
+    end
+    subgraph Backend
+        api[FastAPI gateway<br/>agent kernel + usecases + job enqueue]
+        wk[arq worker<br/>TTS / images / explanations / finalize]
+        rs[Retrieval service<br/>RAG pipeline · gRPC]
+    end
+    subgraph Data
+        pg[(PostgreSQL<br/>pgvector + tsvector)]
+        rd[(Redis<br/>cache / queue)]
+    end
+    subgraph Model services
+        emb[TEI embedding · BGE-M3]
+        tts[Kokoro TTS]
+        llm[LiteLLM gateway<br/>→ upstream LLM]
+    end
 
-Seamlessly sort, search, and view inline definitions via hover popovers without leaving the page.
+    web --> api
+    desk --> api
+    api --> rd
+    rd --> wk
+    api --> pg
+    wk --> pg
+    api --> rs
+    rs --> pg
+    api --> emb
+    api --> tts
+    api --> llm
+    wk --> tts
+    rs --> emb
+```
 
-![Vocabulary List](docs/images/listpage_demo.png)
-
-**2. Interactive Study Dialog**
-
-Practice pronunciation with the built-in mic widget, compare with native TTS, visualize abstract concepts with automatically fetched contextual images, and get AI-powered contextual explanations. The system retrieves sentences via both keyword match and semantic vector search.
-
-![Practice Dialog](docs/images/practice_demo.png)
-
-**3. Smart Data Import Center**
-
-Manage domains and import vocabulary, raw corpus (SQL), and semantic embeddings (VectorDB) with intelligent deduplication in one place.
-
-![Data Import](docs/images/data_upload_demo.png)
-
-**4. Efficient Library Governance**
-
-Toggle terms with smooth switches, rate importance with star icons, click to edit definitions, and commit page-level changes transactionally.
-
-![Manage Vocabulary](docs/images/manage_vocab_demo.png)
+> [docs/architecture.md](docs/architecture.md) is the single source of truth for the full design —
+> tech stack, repository layout, agent-kernel internals, tool runtime, data model, and deployment
+> topology (including what is implemented today vs. designed-only).
 
 ---
 
@@ -74,9 +96,13 @@ Toggle terms with smooth switches, rate importance with star icons, click to edi
 - **Self-Healing Logic**: Automatically deduplicates duplicate matches to keep the UI stable.
 
 ### 💬 AI Chat Assistant
-- **Native Function-Calling Agent**: An explicit loop that calls tools and folds results back into the conversation.
+- **Agentic Kernel** (`AgentKernel`): a composition root wiring a cache-boundary prompt assembler, deferred tool loading, dual-track memory, a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop.
+- **Cache-Boundary Prompt**: the system prompt is partitioned into three zones — a byte-stable static prefix (SOUL.md + compact tool/skill catalog), project context, and a per-step dynamic suffix — separated by a fixed `<CACHE_BOUNDARY/>` marker, so the provider's prefix cache reuses the stable head across steps. `snapshot_key()` makes the cache identity measurable.
+- **Deferred Tool Loading**: the prompt carries only a compact `name + blurb` catalog plus the resident `tool_search` meta-tool; full tool schemas are mounted on demand into the visible tool set, keeping the prompt small at any tool count.
+- **Dual-Track Memory**: session recall fuses PostgreSQL tsvector (keyword) + pgvector (semantic) via RRF; when the embedding service is offline it degrades to tsvector-only — never a silent empty. `memory_search` / `memory_save` are tools; `memory_save` writes only with human confirmation.
+- **Skill Catalog**: skills (SKILL.md) are advertised as a one-line compressed index; the full instructions are lazy-loaded through the `skill` meta-tool.
+- **Read-Only Sandbox**: every tool call is gated by session permissions (READ / WRITE / NETWORK); file tools are rooted at the workspace dir and path escape is rejected. Writes and network access need an explicit grant or human approval.
 - **RAG Retrieval**: query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank.
-- **MCP Tool Integration**: Tools are defined once and shared by the Agent, RAG, and MCP (FastMCP).
 - **SSE Streaming**: Real-time token streaming to the frontend.
 
 ### 👥 Multi-User, Roles & Billing
@@ -221,6 +247,9 @@ the admin console, or chat anonymously as a guest (limited to `guest_daily_limit
 | `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `http://localhost:8080` / `BAAI/bge-m3` / `1024` | TEI embedding service |
 | `TTS_BASE_URL` / `TTS_MODEL` / `TTS_VOICE` | `http://localhost:8880/v1` / `kokoro` / `am_michael` | Kokoro-FastAPI TTS service |
 | `RETRIEVAL_MODE` / `RETRIEVAL_GRPC_ADDR` | `in_process` / `localhost:15051` | capability seam: `in_process` or `grpc` |
+| `WORKSPACE_DIR` | `.` | agent filesystem-tool root (`read_file` / `edit_file` / `bash`; path escape rejected) |
+| `MEMORY_DIR` | `data/memory` | file memory directory (`MEMORY.md` index + one frontmatter `.md` per memory) |
+| `SKILLS_DIR` | `data/skills` | `SKILL.md` skills directory (lazy-loaded via the `skill` tool) |
 | `WORKER_CONCURRENCY` / `WORKER_JOB_TIMEOUT` | `10` / `300` | arq worker max concurrent jobs / per-job timeout (seconds) |
 
 Model inference never runs inside the API process. Swapping a model = change `--model-id` in `docker-compose.yml` and the matching `*_BASE_URL` / dim in `.env` — no business-code change. See [docs/architecture.md](docs/architecture.md) for the full topology.

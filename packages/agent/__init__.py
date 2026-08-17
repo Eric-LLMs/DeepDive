@@ -1,8 +1,7 @@
-"""Agent module: Cordis-style DI + plugin runtime + loop + plugins + memory + skills + prompt.
+"""Agent module: Cordis-style DI + microkernel orchestration + loop + plugins + memory + skills.
 
 Exposes composable parts for assembly/testing/replacement in deps.
 """
-from agent.di import CapabilityError, Context, Fiber, FiberState, Service
 from agent.decisions import (
     ContentBlock,
     PostToolDecision,
@@ -14,10 +13,15 @@ from agent.decisions import (
     ToolFailure,
     text_block,
 )
+from agent.di import CapabilityError, Context, Fiber, FiberState, Service
 from agent.events import EventBus
+from agent.fs_tools import register_fs_tools
 from agent.harness import FakeLLM, assistant, tool_call
+from agent.kernel import AgentKernel, KernelConfig
 from agent.loop import AgentLLMPort, AgentResult, ReactLoopAgent
 from agent.memory import MEMORY_TYPES, FileMemoryStore, Memory, MemoryStore
+from agent.memory.retrieval import MemoryHit, RRFMemoryRetriever
+from agent.memory.service import MemoryService, memory_save_tool, memory_search_tool
 from agent.plugins import (
     POST_TOOL_USE,
     PRE_TOOL_USE,
@@ -32,19 +36,31 @@ from agent.plugins import (
     waterfall,
 )
 from agent.runtime import ToolRuntime
+from agent.sandbox import Sandbox, SandboxDecision, SandboxRule
 from agent.sessions import SessionEvent, SessionLog
-from agent.skills import Skill, SkillRegistry
+from agent.skills import Skill, SkillCatalog, SkillRegistry, skill_tool
 from agent.system_prompt import (
+    CACHE_BOUNDARY,
     HARNESS_IDENTITY_ORDER,
     MEMORY_ORDER,
     PERSONA_ORDER,
     SKILLS_ORDER,
     TOOL_GUIDANCE_ORDER,
+    CacheBoundaryAssembler,
     PromptAssembly,
     PromptSection,
+    PromptZone,
     SystemPrompt,
     render_prompt,
 )
+from agent.tool_gateway import (
+    ToolCatalog,
+    ToolGateway,
+    ToolIndexEntry,
+    ToolVisibilityPolicy,
+    tool_search_tool,
+)
+from agent.tool_permissions import ToolPermission
 from agent.tools import (
     ToolArgsError,
     ToolDefinition,
@@ -54,59 +70,81 @@ from agent.tools import (
 )
 
 __all__ = [
-    "Context",
-    "Service",
-    "Fiber",
-    "FiberState",
-    "CapabilityError",
-    "ReactLoopAgent",
+    "CACHE_BOUNDARY",
+    "HARNESS_IDENTITY_ORDER",
+    "MEMORY_ORDER",
+    "MEMORY_TYPES",
+    "PERSONA_ORDER",
+    "POST_TOOL_USE",
+    "PRE_TOOL_USE",
+    "SESSION_END",
+    "SESSION_START",
+    "SKILLS_ORDER",
+    "TOOL_EXECUTE",
+    "TOOL_GUIDANCE_ORDER",
+    "TOOL_RESULT",
+    "AgentKernel",
     "AgentLLMPort",
     "AgentResult",
-    "SystemPrompt",
-    "PromptSection",
-    "PromptAssembly",
-    "render_prompt",
-    "PERSONA_ORDER",
-    "HARNESS_IDENTITY_ORDER",
-    "TOOL_GUIDANCE_ORDER",
-    "MEMORY_ORDER",
-    "SKILLS_ORDER",
-    "define_tool",
-    "ToolDefinition",
-    "ToolOutput",
-    "ToolArgsError",
-    "ToolOutputError",
-    "ToolRuntime",
-    "EventBus",
+    "CacheBoundaryAssembler",
+    "CapabilityError",
     "ContentBlock",
-    "text_block",
-    "PreToolDecision",
-    "PostToolDecision",
-    "ToolFailure",
-    "ToolExecution",
-    "ToolExecutionResult",
-    "ToolExecutionSuccess",
-    "ToolExecutionFailure",
+    "Context",
+    "EventBus",
+    "FakeLLM",
+    "Fiber",
+    "FiberState",
+    "FileMemoryStore",
+    "KernelConfig",
+    "Memory",
+    "MemoryHit",
+    "MemoryService",
+    "MemoryStore",
     "Plugin",
     "PluginManager",
-    "register_builtin_plugins",
-    "SESSION_START",
-    "SESSION_END",
-    "PRE_TOOL_USE",
-    "TOOL_EXECUTE",
-    "POST_TOOL_USE",
-    "TOOL_RESULT",
-    "waterfall",
-    "observe",
-    "Skill",
-    "SkillRegistry",
-    "MemoryStore",
-    "FileMemoryStore",
-    "Memory",
-    "MEMORY_TYPES",
-    "SessionLog",
+    "PostToolDecision",
+    "PreToolDecision",
+    "PromptAssembly",
+    "PromptSection",
+    "PromptZone",
+    "RRFMemoryRetriever",
+    "ReactLoopAgent",
+    "Sandbox",
+    "SandboxDecision",
+    "SandboxRule",
+    "Service",
     "SessionEvent",
-    "FakeLLM",
+    "SessionLog",
+    "Skill",
+    "SkillCatalog",
+    "SkillRegistry",
+    "SystemPrompt",
+    "ToolArgsError",
+    "ToolCatalog",
+    "ToolDefinition",
+    "ToolExecution",
+    "ToolExecutionFailure",
+    "ToolExecutionResult",
+    "ToolExecutionSuccess",
+    "ToolFailure",
+    "ToolGateway",
+    "ToolIndexEntry",
+    "ToolOutput",
+    "ToolOutputError",
+    "ToolPermission",
+    "ToolRuntime",
+    "ToolVisibilityPolicy",
     "assistant",
+    "define_tool",
+    "memory_save_tool",
+    "memory_search_tool",
+    "observe",
+    "register_builtin_plugins",
+    "register_fs_tools",
+    "render_prompt",
+    "skill_tool",
+    "text_block",
     "tool_call",
+    "tool_search_tool",
+    "waterfall",
 ]

@@ -19,7 +19,8 @@ from typing import Any, Protocol
 from agent.decisions import ToolExecution, ToolExecutionResult
 from agent.runtime import ToolRuntime
 from agent.sessions import SessionLog
-from agent.system_prompt import SystemPrompt, render_prompt
+from agent.system_prompt import CacheBoundaryAssembler, PromptAssembly, SystemPrompt, render_prompt
+from agent.tool_gateway import ToolGateway
 
 
 class AgentLLMPort(Protocol):
@@ -56,6 +57,7 @@ class ReactLoopAgent:
         session_log: SessionLog | None = None,
         max_steps: int = 5,
         max_parallel_tool_calls: int = 10,
+        gateway: ToolGateway | None = None,
     ) -> None:
         self.llm = llm
         self.runtime = runtime
@@ -63,6 +65,7 @@ class ReactLoopAgent:
         self.session_log = session_log
         self.max_steps = max_steps
         self.max_parallel_tool_calls = max_parallel_tool_calls
+        self.gateway = gateway
         self.events = runtime.events
         self._session_memory: Any | None = None
 
@@ -80,21 +83,31 @@ class ReactLoopAgent:
         session_memory: Any | None = None,
         model: str | None = None,
     ) -> AgentResult:
-        """Run one turn: assemble prompt → step until a final answer or max_steps."""
-        self._session_memory = session_memory
-        await self.events.serial("agent/session-start", {"user_msg": user_msg})
-        self._log("session-start", user_msg=user_msg)
+        """Run one turn: assemble prompt → step until a final answer or max_steps.
 
-        assembly = await self.system_prompt.assemble(
-            {
-                "user_msg": user_msg,
-                "history": history,
-                "memory_keys": memory_keys,
-                "session_memory": session_memory,
-            }
-        )
+        With a :class:`CacheBoundaryAssembler` the static/project head is assembled once
+        and only the dynamic suffix is re-rendered per step (reused when unchanged);
+        with a :class:`ToolGateway` the model-visible tool schemas are recomputed per step
+        (core + mounted, so deferred ``tool_search`` loads appear on the next step).
+        """
+        self._session_memory = session_memory
+        context = {
+            "user_msg": user_msg,
+            "history": history,
+            "memory_keys": memory_keys,
+            "session_memory": session_memory,
+        }
+        if isinstance(self.system_prompt, CacheBoundaryAssembler):
+            self.system_prompt.begin_session()
+        if self.gateway is not None:
+            self.gateway.reset_session()
+
+        assembly = await self.system_prompt.assemble(context)
         system = render_prompt(assembly)
-        tools = assembly.tools or self._runtime_schemas()
+
+        await self.events.serial("agent/session-start", {"user_msg": user_msg})
+        self._log("session-start", user_msg=user_msg, snapshot_key=self._snapshot_key())
+
         messages = (history or []) + [{"role": "user", "content": user_msg}]
         await self._persist_message(session_memory, "user", user_msg)
 
@@ -103,6 +116,12 @@ class ReactLoopAgent:
             for _ in range(self.max_steps):
                 await self.events.serial("agent/step-start", {})
                 self._log("step-start")
+                if isinstance(self.system_prompt, CacheBoundaryAssembler):
+                    dynamic = await self.system_prompt.refresh_dynamic(context)
+                    if dynamic != assembly.dynamic_suffix:
+                        assembly.dynamic_suffix = dynamic
+                        system = render_prompt(assembly)
+                tools = self._step_tools(context, assembly)
                 finished, step_usage = await self._step(system, tools, messages, session_memory, model)
                 usage = _sum_usage(usage, step_usage)
                 await self.events.serial("agent/step-end", {})
@@ -120,6 +139,18 @@ class ReactLoopAgent:
 
     def _runtime_schemas(self) -> list[dict]:
         return [{"type": "function", "function": s} for s in self.runtime.schemas()]
+
+    def _snapshot_key(self) -> str:
+        """Prefix-cache identity: sha256(static + project), stable across steps."""
+        if isinstance(self.system_prompt, CacheBoundaryAssembler):
+            return self.system_prompt.snapshot_key()
+        return ""
+
+    def _step_tools(self, context: dict, assembly: PromptAssembly) -> list[dict]:
+        """Model-visible tool schemas: gateway (core + mounted) when present, else fallback."""
+        if self.gateway is not None:
+            return self.gateway.visible_schemas(context)
+        return assembly.tools or self._runtime_schemas()
 
     async def _step(
         self,

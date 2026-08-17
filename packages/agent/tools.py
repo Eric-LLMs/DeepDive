@@ -7,13 +7,14 @@ that args are validated before the body runs and the output is validated/rendere
 """
 from __future__ import annotations
 
-import inspect
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from jsonschema import Draft7Validator
 
 from agent.decisions import ContentBlock, ToolExecution
+from agent.tool_permissions import ToolPermission, permission_names
 
 
 class ToolArgsError(ValueError):
@@ -46,6 +47,47 @@ class ToolOutput:
     render: Callable[[dict, Any], list[ContentBlock]] = _empty_render
 
 
+_WRITE_HINTS = (
+    "file",
+    "path",
+    "write",
+    "save",
+    "append",
+    "overwrite",
+    "delete",
+    "remove",
+    "mkdir",
+    "create",
+)
+_NETWORK_HINTS = ("url", "http", "web", "network", "host", "curl", "socket")
+
+
+def classify_permissions(defn: ToolDefinition) -> frozenset[ToolPermission]:
+    """Auto-classify a tool's permission class from its definition.
+
+    An explicit ``defn.permission`` wins. Otherwise: destructive → WRITE; parameter
+    names/descriptions hinting at file mutation → WRITE; URL/HTTP/network hints → NETWORK;
+    anything else defaults to READ-only.
+    """
+    if defn.permission is not None:
+        return frozenset(defn.permission)
+
+    perms: set[ToolPermission] = set()
+    if defn.destructive:
+        perms.add(ToolPermission.WRITE)
+
+    for pname, pspec in defn.parameters.get("properties", {}).items():
+        blob = f"{pname} {pspec}".lower()
+        if any(w in blob for w in _WRITE_HINTS):
+            perms.add(ToolPermission.WRITE)
+        if any(w in blob for w in _NETWORK_HINTS):
+            perms.add(ToolPermission.NETWORK)
+
+    if not perms:
+        perms.add(ToolPermission.READ)
+    return frozenset(perms)
+
+
 @dataclass
 class ToolDefinition:
     """A tool: schema + render + body (the user ``execute``)."""
@@ -57,6 +99,7 @@ class ToolDefinition:
     execute: Callable[[dict, ToolExecution], Awaitable[Any]]
     destructive: bool = False
     is_concurrency_safe: bool | None = None
+    permission: set[ToolPermission] | None = None  # explicit override; None → classify
 
     def schema(self) -> dict:
         """Model-visible projection (name/description/parameters only; no execute/render)."""
@@ -65,6 +108,16 @@ class ToolDefinition:
             "description": self.description,
             "parameters": self.parameters,
         }
+
+    @property
+    def permissions(self) -> frozenset[ToolPermission]:
+        """The effective permission class (explicit or auto-classified)."""
+        return classify_permissions(self)
+
+    @property
+    def permission_tag(self) -> str:
+        """Comma-joined permission names, e.g. ``"read,network"`` (catalog hint)."""
+        return ",".join(permission_names(self.permissions))
 
 
 def define_tool(
@@ -76,6 +129,7 @@ def define_tool(
     execute: Callable[[dict, ToolExecution], Awaitable[Any]],
     destructive: bool = False,
     is_concurrency_safe: bool | None = None,
+    permission: set[ToolPermission] | None = None,
 ) -> ToolDefinition:
     """Define a tool.
 
@@ -106,4 +160,5 @@ def define_tool(
         execute=_execute,
         destructive=destructive,
         is_concurrency_safe=is_concurrency_safe,
+        permission=permission,
     )

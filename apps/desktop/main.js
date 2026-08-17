@@ -20,7 +20,7 @@ function hexToRgb(hex) {
   return rgb(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
 }
 
-const BACKEND = "http://localhost:8000";
+const BACKEND = "http://localhost:8300";
 const RENDERER_DIR = path.join(__dirname, "renderer");
 
 const MAX_TREE_DEPTH = 8;
