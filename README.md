@@ -38,9 +38,11 @@ flowchart LR
         tts[Kokoro TTS]
         llm[LiteLLM gateway<br/>→ upstream LLM]
     end
+    agt[Agent tools & skills<br/>tool gateway · skill catalog]
 
     web --> api
     desk --> api
+    agt <--> api
     api --> rd
     rd --> wk
     api --> pg
@@ -61,6 +63,23 @@ flowchart LR
 ---
 
 ## ✨ Key Features
+
+### 💬 AI Chat Assistant
+- **Agentic Kernel** (`AgentKernel`): a composition root wiring a cache-boundary prompt assembler, deferred tool loading, dual-track memory, a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop.
+- **Cache-Boundary Prompt**: the system prompt is partitioned into three zones — a byte-stable static prefix (SOUL.md + compact tool/skill catalog), project context, and a per-step dynamic suffix — separated by a fixed `<CACHE_BOUNDARY/>` marker, so the provider's prefix cache reuses the stable head across steps. `snapshot_key()` makes the cache identity measurable.
+- **Deferred Tool Loading**: the prompt carries only a compact `name + blurb` catalog plus the resident `tool_search` meta-tool; full tool schemas are mounted on demand into the visible tool set, keeping the prompt small at any tool count.
+- **Dual-Track Memory**: session recall fuses PostgreSQL tsvector (keyword) + pgvector (semantic) via RRF; when the embedding service is offline it degrades to tsvector-only — never a silent empty. `memory_search` / `memory_save` are tools; `memory_save` writes only with human confirmation.
+- **Skill Catalog**: skills (SKILL.md) are advertised as a one-line compressed index; the full instructions are lazy-loaded through the `skill` meta-tool.
+- **Read-Only Sandbox**: every tool call is gated by session permissions (READ / WRITE / NETWORK); file tools are rooted at the workspace dir and path escape is rejected. Writes and network access need an explicit grant or human approval.
+- **RAG Retrieval**: query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank.
+- **SSE Streaming**: Real-time token streaming to the frontend.
+
+### 👥 Multi-User, Roles & Billing
+- **Admin console** (`/admin`): a single self-contained page to manage LLM providers, models, users, and wallets. A default `admin`/`admin` credential is seeded into the DB on first boot.
+- **User accounts**: admins create username/password accounts; users log in to receive an opaque token. Roles (`regular` / `pro` / `vip` / `admin`) carry per-role quota (daily/monthly requests, tokens, RPM, cost) and an optional default model.
+- **Server-managed config**: LLM provider keys, the model catalog, and the admin credential live in PostgreSQL (`app_settings`) — not `.env` or repo files — and are edited from the admin console.
+- **Pay-as-you-go billing**: per-model pricing (prompt/completion per 1k tokens), a cash wallet per user, and an append-only ledger with a `balance_after` snapshot. Chat usage is priced and debited atomically.
+- **Guest access**: anonymous users can chat without an account, capped per day (`guest_daily_limit`, default 10); exceeding the cap prompts them to sign in.
 
 ### 📥 Smart Data Ingestion
 - **Domain Management**: Organize your learning materials into isolated domains.
@@ -94,23 +113,6 @@ flowchart LR
 - **Transactional Page Commits**: Commit all modifications on a single page with one click for high-speed bulk updates while maintaining data integrity.
 - **Global Operation Flow**: Perform global sorting across the entire database and save changes page-by-page.
 - **Self-Healing Logic**: Automatically deduplicates duplicate matches to keep the UI stable.
-
-### 💬 AI Chat Assistant
-- **Agentic Kernel** (`AgentKernel`): a composition root wiring a cache-boundary prompt assembler, deferred tool loading, dual-track memory, a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop.
-- **Cache-Boundary Prompt**: the system prompt is partitioned into three zones — a byte-stable static prefix (SOUL.md + compact tool/skill catalog), project context, and a per-step dynamic suffix — separated by a fixed `<CACHE_BOUNDARY/>` marker, so the provider's prefix cache reuses the stable head across steps. `snapshot_key()` makes the cache identity measurable.
-- **Deferred Tool Loading**: the prompt carries only a compact `name + blurb` catalog plus the resident `tool_search` meta-tool; full tool schemas are mounted on demand into the visible tool set, keeping the prompt small at any tool count.
-- **Dual-Track Memory**: session recall fuses PostgreSQL tsvector (keyword) + pgvector (semantic) via RRF; when the embedding service is offline it degrades to tsvector-only — never a silent empty. `memory_search` / `memory_save` are tools; `memory_save` writes only with human confirmation.
-- **Skill Catalog**: skills (SKILL.md) are advertised as a one-line compressed index; the full instructions are lazy-loaded through the `skill` meta-tool.
-- **Read-Only Sandbox**: every tool call is gated by session permissions (READ / WRITE / NETWORK); file tools are rooted at the workspace dir and path escape is rejected. Writes and network access need an explicit grant or human approval.
-- **RAG Retrieval**: query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank.
-- **SSE Streaming**: Real-time token streaming to the frontend.
-
-### 👥 Multi-User, Roles & Billing
-- **Admin console** (`/admin`): a single self-contained page to manage LLM providers, models, users, and wallets. A default `admin`/`admin` credential is seeded into the DB on first boot.
-- **User accounts**: admins create username/password accounts; users log in to receive an opaque token. Roles (`regular` / `pro` / `vip` / `admin`) carry per-role quota (daily/monthly requests, tokens, RPM, cost) and an optional default model.
-- **Server-managed config**: LLM provider keys, the model catalog, and the admin credential live in PostgreSQL (`app_settings`) — not `.env` or repo files — and are edited from the admin console.
-- **Pay-as-you-go billing**: per-model pricing (prompt/completion per 1k tokens), a cash wallet per user, and an append-only ledger with a `balance_after` snapshot. Chat usage is priced and debited atomically.
-- **Guest access**: anonymous users can chat without an account, capped per day (`guest_daily_limit`, default 10); exceeding the cap prompts them to sign in.
 
 ---
 
