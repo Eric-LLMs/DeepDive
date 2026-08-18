@@ -13,6 +13,18 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   // Open a path with the OS default application.
   openExternal: (path) => ipcRenderer.invoke("open-external", path),
 
+  // Open a URL in the system default browser.
+  openUrl: (url) => ipcRenderer.invoke("open-url", url),
+
+  // Resolve the packaged app version (for About / Software Update).
+  getAppVersion: () => ipcRenderer.invoke("app-version"),
+
+  // Persist a preference into the main process store (e.g. window.rememberBounds).
+  setPref: (key, value) => ipcRenderer.invoke("set-pref", key, value),
+
+  // Compare against the latest GitHub release; { ok, status, latest, current, notes, url }.
+  checkUpdate: () => ipcRenderer.invoke("check-update"),
+
   // Read a small text file as a UTF-8 string (for text/code preview).
   readText: (path) => ipcRenderer.invoke("read-text", path),
 

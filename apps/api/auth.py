@@ -12,6 +12,11 @@ mint time. ``require_user`` re-reads the user row + role each request, so role c
 deactivation take effect immediately without a re-login. Each authenticated request also
 refreshes ``last_used_at``.
 """
+import base64
+import hashlib
+import hmac
+import secrets
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
@@ -29,6 +34,7 @@ from core.infrastructure.db import (
 from core.infrastructure.security import (
     get_role,
     get_setting,
+    set_setting,
     hash_token,
     verify_password,
 )
@@ -51,7 +57,7 @@ class AuthUser:
 @dataclass
 class AuthAdmin:
     username: str
-    token_id: UUID
+    token_id: UUID | None  # None for stateless console sessions (not stored in access_tokens)
 
 
 async def _lookup_token(token: str) -> AccessTokenModel:
@@ -86,6 +92,67 @@ async def verify_admin(username: str, password: str) -> bool:
     )
 
 
+# ── Stateless admin console sessions ──
+_CONSOLE_PREFIX = "cc_"
+
+
+async def _console_secret() -> str:
+    """Load (or lazily create) the HMAC secret used to sign console session tokens.
+
+    Kept in app_settings so it survives restarts; minted once on first use. Console
+    sessions are signed strings held by the browser — nothing is written to access_tokens.
+    """
+    async with SessionLocal() as session:
+        row = await get_setting(session, "console_secret")
+        if row and row.get("secret"):
+            return row["secret"]
+        secret = secrets.token_hex(32)
+        await set_setting(session, "console_secret", {"secret": secret})
+        return secret
+
+
+def _sign_console_token(secret: str, username: str, expires_at: datetime) -> str:
+    """Return a signed console session token: ``cc_<payload_b64>.<sig_hex>``.
+
+    The payload is ``username|expiry_ts``; the signature is HMAC-SHA256 of the payload
+    with the console secret, so the token is unforgeable and self-contained.
+    """
+    payload = f"{username}|{int(expires_at.timestamp())}"
+    payload_b64 = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    sig = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{_CONSOLE_PREFIX}{payload_b64}.{sig}"
+
+
+def _verify_console_token(secret: str, token: str) -> str | None:
+    """Return the username if ``token`` is a valid, unexpired console session, else None."""
+    if not token.startswith(_CONSOLE_PREFIX):
+        return None
+    body = token[len(_CONSOLE_PREFIX):]
+    if "." not in body:
+        return None
+    payload_b64, sig = body.split(".", 1)
+    try:
+        payload = base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4)).decode()
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None
+    try:
+        username, ts = payload.rsplit("|", 1)
+        if int(ts) < time.time():
+            return None
+    except (ValueError, TypeError):
+        return None
+    return username
+
+
+async def sign_console_token(username: str, expires_at: datetime) -> str:
+    """Mint a stateless console session token (loads the signing secret from settings)."""
+    secret = await _console_secret()
+    return _sign_console_token(secret, username, expires_at)
+
+
 async def verify_user(username: str, password: str) -> dict | None:
     """Check credentials against the users table; return a masked dict on success."""
     async with SessionLocal() as session:
@@ -107,10 +174,20 @@ async def verify_user(username: str, password: str) -> dict | None:
 async def require_admin(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> AuthAdmin:
-    """FastAPI dependency: return the admin identity if the token has the admin role."""
+    """FastAPI dependency: return the admin identity if the token has the admin role.
+
+    Accepts both persisted API tokens (``dd_``, hashed in access_tokens) and stateless
+    console session tokens (``cc_``, signed with the console secret — never stored).
+    """
     if credentials is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    token = await _lookup_token(credentials.credentials)
+    raw = credentials.credentials
+    if raw.startswith(_CONSOLE_PREFIX):
+        username = _verify_console_token(await _console_secret(), raw)
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        return AuthAdmin(username=username, token_id=None)
+    token = await _lookup_token(raw)
     if token.role != ADMIN_ROLE:
         raise HTTPException(status_code=403, detail="Admin role required")
     return AuthAdmin(username=token.name, token_id=token.id)

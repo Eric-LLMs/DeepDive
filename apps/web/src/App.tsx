@@ -1,16 +1,95 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
-import { api } from "./api";
+import { api, clearToken, getToken, setToken } from "./api";
 import MicRecorder from "./MicRecorder";
 import { useJob } from "./useJob";
-import type { Domain, Sentence, Term } from "./types";
+import type { Domain, Me, Sentence, Term } from "./types";
 
 type Page = "home" | "import" | "study" | "manage";
 
+type AuthState =
+  | { status: "loading" }
+  | { status: "anon" }
+  | { status: "authed"; user: Me };
+
 const PAGE_SIZE = 10;
 
+// ── Appearance prefs (theme / font size), persisted per-browser ──
+const THEME_KEY = "deepdive_web_theme";
+const FONT_KEY = "deepdive_web_fontsize";
+const THEME_LABELS: Record<string, string> = {
+  system: "Follow System",
+  dark: "Dark",
+  light: "Light",
+};
+const FONT_SIZES = [12, 13, 14, 15, 16, 17, 18];
+
+function readPref(key: string, fallback: string): string {
+  try {
+    return localStorage.getItem(key) || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function effectiveTheme(theme: string): string {
+  return theme === "system"
+    ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+    : theme;
+}
+function applyThemePref(theme: string) {
+  document.documentElement.dataset.theme = effectiveTheme(theme);
+}
+function applyFontSizePref(px: number) {
+  document.documentElement.style.setProperty("zoom", String(px / 14));
+}
+// Apply before first paint so a dark/font choice does not flash.
+(function initAppearance() {
+  try {
+    applyThemePref(readPref(THEME_KEY, "system"));
+    applyFontSizePref(parseInt(readPref(FONT_KEY, "14"), 10) || 14);
+  } catch { /* ignore */ }
+})();
+
 export default function App() {
+  const [auth, setAuth] = useState<AuthState>({ status: "loading" });
   const [page, setPage] = useState<Page>("home");
+
+  useEffect(() => {
+    // SSO handoff from the desktop client: ?sso=<token>. Store it, then drop the
+    // token from the address bar so it does not linger in history/logs.
+    const sso = new URLSearchParams(location.search).get("sso");
+    if (sso) {
+      setToken(sso);
+      history.replaceState({}, "", location.pathname);
+    }
+    (async () => {
+      if (!getToken()) {
+        setAuth({ status: "anon" });
+        return;
+      }
+      try {
+        const me = await api.me();
+        setAuth({ status: "authed", user: me });
+      } catch {
+        clearToken();
+        setAuth({ status: "anon" });
+      }
+    })();
+  }, []);
+
+  const logout = () => {
+    clearToken();
+    setPage("home");
+    setAuth({ status: "anon" });
+  };
+
+  if (auth.status === "loading") {
+    return <div className="login-wrap"><p className="muted">Loading…</p></div>;
+  }
+  if (auth.status === "anon") {
+    return <LoginPage onLogin={(me) => setAuth({ status: "authed", user: me })} />;
+  }
 
   return (
     <div className="layout">
@@ -22,9 +101,141 @@ export default function App() {
         {page === "manage" && <ManageVocabulary />}
       </main>
       <div className="topbar">
-        <button className="header-btn" title="Deploy this app">Deploy</button>
-        <button className="header-btn header-menu" title="Menu" aria-label="Menu">⋮</button>
+        <SettingsMenu />
+        <AccountChip user={auth.user} onLogout={logout} />
       </div>
+    </div>
+  );
+}
+
+// ── Top-right settings: theme + font size ──
+function SettingsMenu() {
+  const [open, setOpen] = useState(false);
+  const [theme, setTheme] = useState(() => readPref(THEME_KEY, "system"));
+  const [fontSize, setFontSize] = useState(() => parseInt(readPref(FONT_KEY, "14"), 10) || 14);
+
+  // Re-resolve "system" when the OS preference changes.
+  useEffect(() => {
+    if (theme !== "system") return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = () => applyThemePref("system");
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [theme]);
+
+  const changeTheme = (t: string) => {
+    setTheme(t);
+    try { localStorage.setItem(THEME_KEY, t); } catch { /* ignore */ }
+    applyThemePref(t);
+  };
+  const changeFontSize = (px: number) => {
+    setFontSize(px);
+    try { localStorage.setItem(FONT_KEY, String(px)); } catch { /* ignore */ }
+    applyFontSizePref(px);
+  };
+
+  return (
+    <div className="settings-wrap">
+      {open && <div className="settings-backdrop" onClick={() => setOpen(false)} />}
+      <button className="header-btn header-menu" title="Settings" onClick={() => setOpen((o) => !o)}>
+        ⚙
+      </button>
+      {open && (
+        <div className="settings-pop">
+          <div className="settings-title">Theme</div>
+          {(["system", "dark", "light"] as const).map((t) => (
+            <button
+              key={t}
+              className={"settings-row" + (theme === t ? " on" : "")}
+              onClick={() => changeTheme(t)}
+            >
+              <span>{THEME_LABELS[t]}</span>
+              <span className="check">✓</span>
+            </button>
+          ))}
+          <div className="settings-title">Font size</div>
+          <select
+            className="settings-select"
+            value={fontSize}
+            onChange={(e) => changeFontSize(parseInt(e.target.value, 10) || 14)}
+          >
+            {FONT_SIZES.map((px) => (
+              <option key={px} value={px}>
+                {px}px
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Login (direct visits; the desktop client auto-signs-in via ?sso=) ──
+function LoginPage({ onLogin }: { onLogin: (me: Me) => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const res = await api.login(username.trim(), password);
+      setToken(res.access_token);
+      onLogin(await api.me());
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="login-wrap">
+      <form className="login-card" onSubmit={submit}>
+        <div className="login-logo">🧠 DeepDive</div>
+        <h2>Sign in to Web Console</h2>
+        <label className="field-label">Username</label>
+        <input
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          autoComplete="username"
+          autoFocus
+        />
+        <label className="field-label">Password</label>
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          autoComplete="current-password"
+        />
+        {error && <p className="error">{error}</p>}
+        <button type="submit" className="primary" disabled={busy || !username || !password}>
+          {busy ? "Signing in…" : "Sign in"}
+        </button>
+        <p className="muted" style={{ margin: "12px 0 0", textAlign: "center", fontSize: 12 }}>
+          Tip: open Web Console from the desktop app to sign in automatically.
+        </p>
+      </form>
+    </div>
+  );
+}
+
+// ── Top-right identity: avatar initial + username + role badge ──
+function AccountChip({ user, onLogout }: { user: Me; onLogout: () => void }) {
+  const name = user.display_name || user.username;
+  const initial = name ? name.trim()[0]?.toUpperCase() : "?";
+  return (
+    <div className="account-chip">
+      <span className="account-avatar">{initial}</span>
+      <span className="account-name" title={name}>{user.username}</span>
+      <span className={"account-role tier" + (user.role_id === "admin" ? " vip" : "")}>
+        {user.role_name}
+      </span>
+      <button className="header-btn" onClick={onLogout} title="Sign out">Sign out</button>
     </div>
   );
 }

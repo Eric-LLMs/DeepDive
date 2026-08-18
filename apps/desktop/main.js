@@ -20,6 +20,37 @@ function hexToRgb(hex) {
   return rgb(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
 }
 
+// Compare two dotted numeric versions ("1.2.0"); true when a > b. Prerelease tags
+// are ignored for the simple stable-check path.
+function semverGt(a, b) {
+  const pa = String(a).split(".").map(Number);
+  const pb = String(b).split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true;
+    if ((pa[i] || 0) < (pb[i] || 0)) return false;
+  }
+  return false;
+}
+
+// Tiny JSON preference store next to the app's userData dir (window bounds,
+// remember-bounds flag, etc.). No database involved.
+function prefsPath() {
+  return path.join(app.getPath("userData"), "prefs.json");
+}
+function readPrefs() {
+  try {
+    return JSON.parse(fs.readFileSync(prefsPath(), "utf-8"));
+  } catch {
+    return {};
+  }
+}
+function writePrefs(patch) {
+  try {
+    const all = { ...readPrefs(), ...patch };
+    fs.writeFileSync(prefsPath(), JSON.stringify(all, null, 2));
+  } catch { /* non-fatal */ }
+}
+
 const BACKEND = "http://localhost:8300";
 const RENDERER_DIR = path.join(__dirname, "renderer");
 
@@ -226,6 +257,44 @@ function registerIpcHandlers() {
 
   ipcMain.handle("open-external", (_event, filePath) => shell.openPath(filePath));
 
+  ipcMain.handle("open-url", (_event, url) => shell.openExternal(url));
+
+  ipcMain.handle("app-version", () => app.getVersion());
+
+  ipcMain.handle("set-pref", (_event, key, value) => {
+    writePrefs({ [key]: value });
+  });
+
+  // Check for a newer release on GitHub by comparing the latest tag to the
+  // packaged version (SemVer 2.0). The release page is opened by the renderer.
+  ipcMain.handle("check-update", async () => {
+    try {
+      const res = await net.fetch(
+        "https://api.github.com/repos/Eric-LLMs/DeepDive/releases/latest",
+        { headers: { Accept: "application/vnd.github+json", "User-Agent": "DeepDive-Desktop" } }
+      );
+      // No releases published yet → nothing newer than the current build.
+      if (res.status === 404) {
+        return { ok: true, status: "latest", latest: "", current: app.getVersion(), url: "" };
+      }
+      if (!res.ok) return { ok: false, error: `Update server responded ${res.status}` };
+      const rel = await res.json();
+      const latest = String(rel.tag_name || "").replace(/^v/, "");
+      const current = app.getVersion();
+      return {
+        ok: true,
+        status: semverGt(latest, current) ? "update" : "latest",
+        latest,
+        current,
+        name: rel.name,
+        notes: rel.body,
+        url: rel.html_url,
+      };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
   ipcMain.handle("convert-slides", (_event, filePath) => convertSlidesToPdf(filePath));
 
   ipcMain.handle("find-subtitle", (_event, videoPath) => {
@@ -375,9 +444,13 @@ function setupMenu() {
 }
 
 function createWindow() {
+  const saved = readPrefs().window || {};
+  const remember = saved.rememberBounds !== false;
   const win = new BrowserWindow({
-    width: 1280,
-    height: 820,
+    width: remember && saved.width ? saved.width : 1280,
+    height: remember && saved.height ? saved.height : 820,
+    x: remember && Number.isInteger(saved.x) ? saved.x : undefined,
+    y: remember && Number.isInteger(saved.y) ? saved.y : undefined,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -392,6 +465,14 @@ function createWindow() {
     console.error(`[renderer] did-fail-load ${code} ${desc} ${url}`);
   });
   win.loadURL("app://bundle/index.html");
+
+  // Remember the last window position/size (unless the user turned it off).
+  win.on("close", () => {
+    if (readPrefs().window?.rememberBounds === false) return;
+    if (win.isMaximized() || win.isMinimized()) return;
+    const b = win.getBounds();
+    writePrefs({ window: { ...readPrefs().window, x: b.x, y: b.y, width: b.width, height: b.height } });
+  });
 }
 
 app.whenReady().then(() => {

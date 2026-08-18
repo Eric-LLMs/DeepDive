@@ -1,14 +1,31 @@
 // Thin fetch wrapper around the DeepDive REST API.
-// In dev, Vite proxies /api/* to http://localhost:8000 (see vite.config.ts).
-import type { Domain, JobId, JobInfo, Sentence, Term } from "./types";
+// In dev, Vite proxies /api/* to http://localhost:8300 (see vite.config.ts).
+import type { Domain, JobId, JobInfo, Me, Sentence, Term } from "./types";
 
 const BASE = "/api";
+const TOKEN_KEY = "deepdive_token";
+
+// Shared session token. The desktop client hands it over via ?sso=<token> on the
+// web console URL; direct visits can sign in through the login page instead.
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+export function setToken(token: string): void {
+  localStorage.setItem(TOKEN_KEY, token);
+}
+export function clearToken(): void {
+  localStorage.removeItem(TOKEN_KEY);
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getToken();
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
+    headers,
     ...init,
   });
+  if (res.status === 401) clearToken();
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`${res.status} ${res.statusText}: ${body}`);
@@ -16,7 +33,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+export interface LoginResponse {
+  access_token: string;
+  username: string;
+  display_name: string | null;
+  role_id: string;
+  role_name: string;
+}
+
 export const api = {
+  // Auth
+  login: (username: string, password: string) =>
+    request<LoginResponse>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  me: () => request<Me>("/auth/me"),
+
   // Domains
   listDomains: () => request<Domain[]>("/domains"),
   createDomain: (name: string) =>

@@ -228,3 +228,42 @@ class WalletTopupRequest(BaseModel):
     user_id: UUID
     amount: float
     description: str = ""
+
+
+class RoleCreateRequest(BaseModel):
+    """Create a brand-new quota/feature role (mirrors UserRoleModel columns)."""
+
+    role_id: str
+    role_name: str = ""
+    daily_request_limit: int = 50
+    monthly_request_limit: int = 1500
+    daily_token_limit: int = -1
+    rpm_limit: int = -1
+    monthly_cost_limit: float = -1.0
+    default_model: str = ""
+    models: list[str] = []
+    features: dict = {}
+    is_active: bool = True
+
+
+class RoleCredentialsUpdateRequest(BaseModel):
+    """Wholesale-replace a role's channel bindings (role ↔ llm_credentials, via PK)."""
+
+    credential_ids: list[UUID] = []
+
+
+class RouteUpsertRequest(BaseModel):
+    """Upsert one credential↔model route (composite PK credential_id+model_id).
+
+    ``prompt_price_per_1k`` / ``completion_price_per_1k`` override the catalog price
+    for this channel when set; ``None`` means "inherit the catalog price".
+    """
+
+    credential_id: UUID
+    model_id: UUID
+    actual_model_name: str
+    priority: int = 0
+    weight: int = 1
+    prompt_price_per_1k: float | None = None
+    completion_price_per_1k: float | None = None
+    is_active: bool = True

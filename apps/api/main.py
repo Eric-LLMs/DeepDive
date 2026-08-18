@@ -3,6 +3,7 @@
 Start: uvicorn api.main:app --reload
 """
 import json
+import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from api.auth import (
     require_admin,
     require_user,
     require_user_optional,
+    sign_console_token,
     verify_admin,
     verify_user,
 )
@@ -43,7 +45,10 @@ from api.schemas import (
     ModelCreateRequest,
     ModelUpdateRequest,
     ProvidersUpdateRequest,
+    RoleCreateRequest,
+    RoleCredentialsUpdateRequest,
     RoleUpdateRequest,
+    RouteUpsertRequest,
     SentenceCreate,
     SentenceImportRequest,
     SentenceUpdate,
@@ -69,11 +74,15 @@ from core.infrastructure.billing import (
 )
 from core.infrastructure.db import (
     AccessTokenModel,
+    CredentialModelModel,
     LLMCredentialModel,
     LLMModelModel,
+    RoleCredentialModel,
     SessionLocal,
     SessionModel,
     UserModel,
+    UserRoleModel,
+    UserUsageCounterModel,
     UserUsageLogModel,
     UserWalletModel,
     init_db,
@@ -108,7 +117,10 @@ from core.infrastructure.security import (
     role_to_dict,
     set_setting,
 )
-from sqlalchemy import select
+from collections import defaultdict
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 
 @asynccontextmanager
@@ -157,6 +169,7 @@ async def _mint_token(
     name: str,
     user_id: UUID | None = None,
     role_id: str | None = None,
+    credential_id: UUID | None = None,
     expires_at: datetime | None = None,
 ) -> str:
     """Create an access_tokens row and return the raw token (shown to the client once)."""
@@ -169,11 +182,154 @@ async def _mint_token(
                 token_hash=token_hash,
                 role=role,
                 role_id=role_id,
+                credential_id=credential_id,
                 expires_at=expires_at,
             )
         )
         await session.commit()
     return raw
+
+
+async def _login_token(
+    session,
+    *,
+    user_id: UUID,
+    name: str,
+    credential_id: UUID | None,
+    expires_at: datetime,
+) -> str:
+    """Return a user token for (user, channel), reusing the existing row when possible.
+
+    One row per (user, pinned channel): a re-login on the same channel rotates the secret
+    and bumps the timestamps instead of inserting a new row, so ``access_tokens`` stops
+    growing with every login (enforced by a partial unique index in 0006).
+    """
+    existing = (
+        await session.execute(
+            select(AccessTokenModel)
+            .where(
+                AccessTokenModel.user_id == user_id,
+                (
+                    AccessTokenModel.credential_id.is_(None)
+                    if credential_id is None
+                    else AccessTokenModel.credential_id == credential_id
+                ),
+            )
+            .order_by(AccessTokenModel.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raw, token_hash = generate_token()
+        existing.token_hash = token_hash
+        existing.is_active = True
+        existing.last_used_at = datetime.now(timezone.utc)
+        existing.expires_at = expires_at
+        await session.commit()
+        return raw
+    raw, token_hash = generate_token()
+    session.add(
+        AccessTokenModel(
+            user_id=user_id,
+            name=name,
+            token_hash=token_hash,
+            role="user",
+            role_id=None,
+            credential_id=credential_id,
+            expires_at=expires_at,
+        )
+    )
+    await session.commit()
+    return raw
+
+
+async def _pick_credential(session, role_id: str) -> UUID | None:
+    """Randomly pick one active LLM channel bound to a role (None if none is usable).
+
+    Only bindings whose own ``is_active`` flag and the channel's ``is_active`` are both set
+    qualify, so the admin can disable a channel either via its credential row or via the
+    per-role binding without touching the other.
+    """
+    rows = (
+        await session.execute(
+            select(RoleCredentialModel.credential_id)
+            .join(
+                LLMCredentialModel,
+                LLMCredentialModel.id == RoleCredentialModel.credential_id,
+            )
+            .where(
+                RoleCredentialModel.role_id == role_id,
+                RoleCredentialModel.is_active.is_(True),
+                LLMCredentialModel.is_active.is_(True),
+            )
+        )
+    ).scalars().all()
+    if not rows:
+        return None
+    return random.choice(list(rows))
+
+
+async def _resolve_chat_route(
+    session, token: AccessTokenModel | None, role_id: str
+) -> tuple[str, str, str]:
+    """Resolve ``(base_url, api_key, model)`` for one chat request.
+
+    ``token`` carries the channel pinned at login when present; ``role_id`` is the effective
+    role (the user's role, or ``anonymous`` for guests).
+
+    - A pinned channel that is still active is used directly; ``model`` is the channel's
+      preferred active route, else the role's ``default_model``, else the global default.
+    - A pinned channel that was disabled fails over to another active channel of the same role.
+    - No pinned channel (guest, or admin/legacy token) picks fresh from the role; if the role
+      has none, empty strings signal "use the configured global client".
+    """
+    credential_id = token.credential_id if token is not None else None
+    if credential_id is not None:
+        credential = await session.get(LLMCredentialModel, credential_id)
+        if credential is not None and credential.is_active:
+            return await _channel_route(session, credential, role_id)
+        alt = await _pick_credential(session, role_id)
+        if alt is not None and alt != credential_id:
+            credential = await session.get(LLMCredentialModel, alt)
+            if credential is not None:
+                return await _channel_route(session, credential, role_id)
+        return "", "", ""
+    picked = await _pick_credential(session, role_id)
+    if picked is not None:
+        credential = await session.get(LLMCredentialModel, picked)
+        if credential is not None:
+            return await _channel_route(session, credential, role_id)
+    return "", "", ""
+
+
+async def _channel_route(
+    session, credential: LLMCredentialModel, role_id: str | None
+) -> tuple[str, str, str]:
+    """Return ``(base_url, api_key, model)`` for a credential.
+
+    The model is the credential's preferred active route (lowest priority), else the role's
+    ``default_model``, else the global default model.
+    """
+    model = ""
+    if role_id:
+        role = await get_role(session, role_id)
+        if role is not None and role.default_model:
+            model = role.default_model
+    if not model:
+        route = (
+            await session.execute(
+                select(CredentialModelModel.actual_model_name)
+                .where(
+                    CredentialModelModel.credential_id == credential.id,
+                    CredentialModelModel.is_active.is_(True),
+                )
+                .order_by(CredentialModelModel.priority)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if route:
+            model = route
+    return credential.base_url, credential.api_key, model or settings.llm_model
 
 
 def _login_expiry() -> datetime:
@@ -184,10 +340,16 @@ def _login_expiry() -> datetime:
 # ── Admin console ──
 @app.post("/admin/login")
 async def admin_login(body: AdminLoginRequest) -> dict:
-    """Verify the single admin account and mint an opaque admin token."""
+    """Verify the single admin account and return a stateless console session token.
+
+    Console sessions are signed strings held in the browser's localStorage — nothing is
+    written to access_tokens, so console logins no longer accumulate duplicate rows.
+    Persisted tokens (hashed in access_tokens) are only minted via the Tokens page for
+    external API use.
+    """
     if not await verify_admin(body.username, body.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = await _mint_token(role="admin", name=body.username, expires_at=_login_expiry())
+    token = await sign_console_token(body.username, _login_expiry())
     return {"access_token": token, "username": body.username}
 
 
@@ -213,11 +375,18 @@ async def user_login(body: UserLoginRequest) -> dict:
     user = await verify_user(body.username, body.password)
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = await _mint_token(
-        role="user", name=user["username"], user_id=user["user_id"], expires_at=_login_expiry()
-    )
+    # Pick the LLM channel this session will use: one random active channel from the
+    # user's role bindings (None → the legacy /config route at request time).
     async with SessionLocal() as session:
         role = await get_role(session, user["role_id"])
+        credential_id = await _pick_credential(session, user["role_id"])
+        token = await _login_token(
+            session,
+            user_id=user["user_id"],
+            name=user["username"],
+            credential_id=credential_id,
+            expires_at=_login_expiry(),
+        )
     return {
         "access_token": token,
         "username": user["username"],
@@ -362,6 +531,53 @@ async def update_role(
         return {"role": role_to_dict(role)}
 
 
+@app.post("/admin/roles")
+async def create_role(body: RoleCreateRequest, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """Create a new quota/feature role (admin console)."""
+    async with SessionLocal() as session:
+        if await get_role(session, body.role_id) is not None:
+            raise HTTPException(status_code=409, detail=f"Role '{body.role_id}' already exists")
+        row = UserRoleModel(
+            role_id=body.role_id,
+            role_name=body.role_name or body.role_id,
+            daily_request_limit=body.daily_request_limit,
+            monthly_request_limit=body.monthly_request_limit,
+            daily_token_limit=body.daily_token_limit,
+            rpm_limit=body.rpm_limit,
+            monthly_cost_limit=body.monthly_cost_limit,
+            default_model=body.default_model,
+            models=body.models,
+            features=body.features,
+            is_active=body.is_active,
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return {"role": role_to_dict(row)}
+
+
+@app.delete("/admin/roles/{role_id}")
+async def delete_role(role_id: str, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """Delete a role, unless users still reference it (soft-deactivate instead)."""
+    async with SessionLocal() as session:
+        role = await get_role(session, role_id)
+        if role is None:
+            raise HTTPException(status_code=404, detail="Role not found")
+        in_use = (
+            await session.execute(
+                select(func.count()).select_from(UserModel).where(UserModel.role_id == role_id)
+            )
+        ).scalar_one()
+        if in_use > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Role '{role_id}' is assigned to {in_use} user(s) — set is_active=false instead",
+            )
+        await session.delete(role)
+        await session.commit()
+    return {"status": "ok"}
+
+
 # ── Token management (admin-only) ──
 def _masked_token(t: AccessTokenModel) -> dict:
     return {
@@ -379,12 +595,26 @@ def _masked_token(t: AccessTokenModel) -> dict:
 
 @app.get("/admin/tokens")
 async def list_tokens(_: AuthAdmin = Depends(require_admin)) -> dict:
-    """List all access tokens (masked; the raw value is never returned again)."""
+    """List all access tokens (masked; the raw value is never returned again).
+
+    Each row also carries its pinned ``credential_id`` + channel name so the admin table
+    can show the model column and open the ``llm_credentials`` detail modal on click.
+    """
     async with SessionLocal() as session:
         rows = (
             await session.execute(select(AccessTokenModel).order_by(AccessTokenModel.created_at))
         ).scalars().all()
-    return {"tokens": [_masked_token(t) for t in rows]}
+        cred_names = {
+            c.id: c.name
+            for c in (await session.execute(select(LLMCredentialModel))).scalars().all()
+        }
+    tokens = []
+    for t in rows:
+        d = _masked_token(t)
+        d["credential_id"] = str(t.credential_id) if t.credential_id else None
+        d["credential_name"] = cred_names.get(t.credential_id)
+        tokens.append(d)
+    return {"tokens": tokens}
 
 
 @app.post("/admin/tokens")
@@ -525,9 +755,52 @@ async def delete_model(model_id: UUID, _: AuthAdmin = Depends(require_admin)) ->
     return {"status": "ok"}
 
 
-# ── Provider credentials (admin-only; N:M model routing arrives with the retrieval service) ──
-def _masked_credential(c: LLMCredentialModel) -> dict:
-    return {
+# ── Provider credentials (admin-only; one row = one LLM channel/"token") ──
+async def _credential_prices(session) -> dict[UUID, dict]:
+    """Map credential_id → derived pricing from its active credential_models routes.
+
+    Price = route override when set, else the llm_models catalog price. Multiple routes
+    yield a min…max range (displayed as a range on the channel card).
+    """
+    rows = (
+        await session.execute(
+            select(CredentialModelModel, LLMModelModel)
+            .join(LLMModelModel, LLMModelModel.id == CredentialModelModel.model_id)
+            .where(CredentialModelModel.is_active.is_(True))
+        )
+    ).all()
+    out: dict[UUID, dict] = {}
+    for route, model in rows:
+        d = out.setdefault(
+            route.credential_id,
+            {"models": [], "p_min": None, "p_max": None, "c_min": None, "c_max": None, "count": 0},
+        )
+        pp = float(route.prompt_price_per_1k) if route.prompt_price_per_1k is not None else float(
+            model.prompt_price_per_1k
+        )
+        cp = float(route.completion_price_per_1k) if route.completion_price_per_1k is not None else float(
+            model.completion_price_per_1k
+        )
+        d["models"].append(
+            {
+                "model_id": str(model.id),
+                "model_name": model.name,
+                "actual_model_name": route.actual_model_name,
+                "prompt_price_per_1k": pp,
+                "completion_price_per_1k": cp,
+                "price_override": route.prompt_price_per_1k is not None or route.completion_price_per_1k is not None,
+            }
+        )
+        d["count"] += 1
+        d["p_min"] = pp if d["p_min"] is None else min(d["p_min"], pp)
+        d["p_max"] = pp if d["p_max"] is None else max(d["p_max"], pp)
+        d["c_min"] = cp if d["c_min"] is None else min(d["c_min"], cp)
+        d["c_max"] = cp if d["c_max"] is None else max(d["c_max"], cp)
+    return out
+
+
+def _masked_credential(c: LLMCredentialModel, pricing: dict | None = None) -> dict:
+    d = {
         "id": str(c.id),
         "name": c.name,
         "base_url": c.base_url,
@@ -535,16 +808,49 @@ def _masked_credential(c: LLMCredentialModel) -> dict:
         "is_active": c.is_active,
         "created_at": c.created_at.isoformat() if c.created_at else None,
     }
+    if pricing is not None:
+        d.update(
+            {
+                "model_count": pricing.get("count", 0),
+                "models": pricing.get("models", []),
+                "price_prompt_min": pricing.get("p_min"),
+                "price_prompt_max": pricing.get("p_max"),
+                "price_completion_min": pricing.get("c_min"),
+                "price_completion_max": pricing.get("c_max"),
+            }
+        )
+    return d
 
 
 @app.get("/admin/credentials")
 async def list_credentials(_: AuthAdmin = Depends(require_admin)) -> dict:
-    """List provider credentials (keys masked)."""
+    """List provider channels (keys masked; each row carries its derived price + model list)."""
     async with SessionLocal() as session:
         rows = (
             await session.execute(select(LLMCredentialModel).order_by(LLMCredentialModel.created_at))
         ).scalars().all()
-    return {"credentials": [_masked_credential(c) for c in rows]}
+        pricing = await _credential_prices(session)
+    return {"credentials": [_masked_credential(c, pricing.get(c.id)) for c in rows]}
+
+
+@app.get("/admin/credentials/{credential_id}")
+async def get_credential(credential_id: UUID, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """Channel detail by primary key (drives the token-management detail modal)."""
+    async with SessionLocal() as session:
+        c = await session.get(LLMCredentialModel, credential_id)
+        if c is None:
+            raise HTTPException(status_code=404, detail="Credential not found")
+        pricing = (await _credential_prices(session)).get(c.id)
+        roles = (
+            await session.execute(
+                select(RoleCredentialModel.role_id, UserRoleModel.role_name)
+                .join(UserRoleModel, UserRoleModel.role_id == RoleCredentialModel.role_id)
+                .where(RoleCredentialModel.credential_id == c.id)
+            )
+        ).all()
+        d = _masked_credential(c, pricing)
+        d["roles"] = [{"role_id": rid, "role_name": rname} for rid, rname in roles]
+    return {"credential": d}
 
 
 @app.post("/admin/credentials")
@@ -594,6 +900,232 @@ async def delete_credential(
         if c is None:
             raise HTTPException(status_code=404, detail="Credential not found")
         await session.delete(c)
+        await session.commit()
+    return {"status": "ok"}
+
+
+# ── Role ↔ channel bindings (admin-only; the routing source for per-role LLM keys) ──
+def _credential_summary(c: LLMCredentialModel, pricing: dict | None) -> dict:
+    """Compact channel card for the token-management browser."""
+    p = pricing or {}
+    return {
+        "id": str(c.id),
+        "name": c.name,
+        "base_url": c.base_url,
+        "is_active": c.is_active,
+        "model_count": p.get("count", 0),
+        "price_prompt_min": p.get("p_min"),
+        "price_prompt_max": p.get("p_max"),
+        "price_completion_min": p.get("c_min"),
+        "price_completion_max": p.get("c_max"),
+    }
+
+
+@app.get("/admin/roles/{role_id}/credentials")
+async def list_role_credentials(role_id: str, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """List the channels currently bound to a role (with derived price + binding state)."""
+    async with SessionLocal() as session:
+        if await get_role(session, role_id) is None:
+            raise HTTPException(status_code=404, detail="Role not found")
+        pricing = await _credential_prices(session)
+        binds = (
+            await session.execute(
+                select(RoleCredentialModel, LLMCredentialModel)
+                .join(LLMCredentialModel, LLMCredentialModel.id == RoleCredentialModel.credential_id)
+                .where(RoleCredentialModel.role_id == role_id)
+            )
+        ).all()
+        creds = []
+        for bind, cred in binds:
+            d = _masked_credential(cred, pricing.get(cred.id))
+            d["binding_is_active"] = bind.is_active
+            creds.append(d)
+    return {"credentials": creds}
+
+
+@app.put("/admin/roles/{role_id}/credentials")
+async def update_role_credentials(
+    role_id: str, body: RoleCredentialsUpdateRequest, _: AuthAdmin = Depends(require_admin)
+) -> dict:
+    """Wholesale-replace a role's channel bindings (delete missing rows, insert new ones).
+
+    Uses ``llm_credentials`` primary keys, per the channel-management requirement.
+    """
+    async with SessionLocal() as session:
+        if await get_role(session, role_id) is None:
+            raise HTTPException(status_code=404, detail="Role not found")
+        ids = list(set(body.credential_ids))
+        if ids:
+            existing = set(
+                (
+                    await session.execute(
+                        select(LLMCredentialModel.id).where(LLMCredentialModel.id.in_(ids))
+                    )
+                ).scalars().all()
+            )
+            missing = [str(i) for i in ids if i not in existing]
+            if missing:
+                raise HTTPException(status_code=400, detail=f"Unknown credential(s): {', '.join(missing)}")
+        await session.execute(delete(RoleCredentialModel).where(RoleCredentialModel.role_id == role_id))
+        for cid in ids:
+            session.add(RoleCredentialModel(role_id=role_id, credential_id=cid))
+        await session.commit()
+    return {"status": "ok", "count": len(ids)}
+
+
+@app.get("/admin/tokens/relations")
+async def token_relations(_: AuthAdmin = Depends(require_admin)) -> dict:
+    """Relationship graph for the token-management browser.
+
+    Returns roles with their users and bound channels, plus each channel's bound roles,
+    so the UI can render drop-down filters (role / credential / user) and drill into any
+    channel's detail by primary key.
+    """
+    async with SessionLocal() as session:
+        roles = (
+            await session.execute(select(UserRoleModel).order_by(UserRoleModel.role_id))
+        ).scalars().all()
+        users = (await session.execute(select(UserModel))).scalars().all()
+        creds = (
+            await session.execute(select(LLMCredentialModel).order_by(LLMCredentialModel.created_at))
+        ).scalars().all()
+        pricing = await _credential_prices(session)
+        binds = (await session.execute(select(RoleCredentialModel))).scalars().all()
+
+        by_role: dict[str, list[UUID]] = defaultdict(list)
+        by_cred: dict[UUID, list[str]] = defaultdict(list)
+        for b in binds:
+            by_role[b.role_id].append(b.credential_id)
+            by_cred[b.credential_id].append(b.role_id)
+
+        users_by_role: dict[str, list[dict]] = defaultdict(list)
+        for u in users:
+            users_by_role[u.role_id or "regular"].append(
+                {
+                    "id": str(u.id),
+                    "username": u.username or "",
+                    "display_name": u.display_name,
+                }
+            )
+
+        roles_out = []
+        for r in roles:
+            bound = [c for c in creds if c.id in by_role.get(r.role_id, [])]
+            roles_out.append(
+                {
+                    "role_id": r.role_id,
+                    "role_name": r.role_name,
+                    "is_active": r.is_active,
+                    "users": users_by_role.get(r.role_id, []),
+                    "credentials": [_credential_summary(c, pricing.get(c.id)) for c in bound],
+                }
+            )
+        creds_out = []
+        for c in creds:
+            p = pricing.get(c.id) or {}
+            creds_out.append(
+                {
+                    "id": str(c.id),
+                    "name": c.name,
+                    "base_url": c.base_url,
+                    "is_active": c.is_active,
+                    "model_count": p.get("count", 0),
+                    "price_prompt_min": p.get("p_min"),
+                    "price_prompt_max": p.get("p_max"),
+                    "roles": by_cred.get(c.id, []),
+                }
+            )
+    return {"roles": roles_out, "credentials": creds_out}
+
+
+# ── Credential↔Model routing (admin-only; N:M weights + per-key price override) ──
+def _masked_route(r: CredentialModelModel, credential_name: str, model_name: str) -> dict:
+    return {
+        "credential_id": str(r.credential_id),
+        "credential_name": credential_name,
+        "model_id": str(r.model_id),
+        "model_name": model_name,
+        "actual_model_name": r.actual_model_name,
+        "priority": r.priority,
+        "weight": r.weight,
+        "prompt_price_per_1k": float(r.prompt_price_per_1k) if r.prompt_price_per_1k is not None else None,
+        "completion_price_per_1k": (
+            float(r.completion_price_per_1k) if r.completion_price_per_1k is not None else None
+        ),
+        "price_override": r.prompt_price_per_1k is not None or r.completion_price_per_1k is not None,
+        "is_active": r.is_active,
+    }
+
+
+@app.get("/admin/routes")
+async def list_routes(_: AuthAdmin = Depends(require_admin)) -> dict:
+    """List every credential↔model route (names joined; prices may override the catalog)."""
+    async with SessionLocal() as session:
+        rows = (await session.execute(select(CredentialModelModel))).scalars().all()
+        creds = {
+            c.id: c.name
+            for c in (await session.execute(select(LLMCredentialModel))).scalars().all()
+        }
+        models = {
+            m.id: m.name
+            for m in (await session.execute(select(LLMModelModel))).scalars().all()
+        }
+    return {
+        "routes": [
+            _masked_route(r, creds.get(r.credential_id, ""), models.get(r.model_id, ""))
+            for r in rows
+        ]
+    }
+
+
+@app.post("/admin/routes")
+async def upsert_route(body: RouteUpsertRequest, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """Create or update one route (composite PK credential_id+model_id)."""
+    async with SessionLocal() as session:
+        if await session.get(LLMCredentialModel, body.credential_id) is None:
+            raise HTTPException(status_code=404, detail="Credential not found")
+        if await session.get(LLMModelModel, body.model_id) is None:
+            raise HTTPException(status_code=404, detail="Model not found")
+        stmt = (
+            pg_insert(CredentialModelModel)
+            .values(
+                credential_id=body.credential_id,
+                model_id=body.model_id,
+                actual_model_name=body.actual_model_name,
+                priority=body.priority,
+                weight=body.weight,
+                prompt_price_per_1k=body.prompt_price_per_1k,
+                completion_price_per_1k=body.completion_price_per_1k,
+                is_active=body.is_active,
+            )
+            .on_conflict_do_update(
+                constraint="credential_models_pkey",
+                set_={
+                    "actual_model_name": body.actual_model_name,
+                    "priority": body.priority,
+                    "weight": body.weight,
+                    "prompt_price_per_1k": body.prompt_price_per_1k,
+                    "completion_price_per_1k": body.completion_price_per_1k,
+                    "is_active": body.is_active,
+                },
+            )
+            .returning(CredentialModelModel)
+        )
+        row = (await session.execute(stmt)).scalar_one()
+        await session.commit()
+    return {"route": _masked_route(row, "", "")}
+
+
+@app.delete("/admin/routes/{credential_id}/{model_id}")
+async def delete_route(
+    credential_id: UUID, model_id: UUID, _: AuthAdmin = Depends(require_admin)
+) -> dict:
+    """Remove a credential↔model route."""
+    async with SessionLocal() as session:
+        row = await session.get(CredentialModelModel, (credential_id, model_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="Route not found")
+        await session.delete(row)
         await session.commit()
     return {"status": "ok"}
 
@@ -653,6 +1185,71 @@ async def wallet_transactions(user_id: UUID, _: AuthAdmin = Depends(require_admi
             }
             for t in rows
         ]
+    }
+
+
+@app.get("/admin/users/{user_id}/usage")
+async def user_usage(user_id: UUID, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """Aggregate a user's daily counters, recent usage logs, and wallet ledger."""
+    async with SessionLocal() as session:
+        user = await session.get(UserModel, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        counters = (
+            await session.execute(
+                select(UserUsageCounterModel)
+                .where(
+                    UserUsageCounterModel.user_id == user_id,
+                    UserUsageCounterModel.period_type == "day",
+                )
+                .order_by(UserUsageCounterModel.period_start.desc())
+                .limit(30)
+            )
+        ).scalars().all()
+        logs = (
+            await session.execute(
+                select(UserUsageLogModel)
+                .where(UserUsageLogModel.user_id == user_id)
+                .order_by(UserUsageLogModel.created_at.desc())
+                .limit(50)
+            )
+        ).scalars().all()
+        txs = await list_transactions(session, user_id, limit=50)
+    return {
+        "counters": [
+            {
+                "period_start": c.period_start.isoformat(),
+                "request_count": c.request_count,
+                "token_count": c.token_count,
+            }
+            for c in counters
+        ],
+        "logs": [
+            {
+                "id": str(l.id),
+                "created_at": l.created_at.isoformat() if l.created_at else None,
+                "token_id": str(l.token_id) if l.token_id else None,
+                "role_id": l.role_id,
+                "model_name": l.model_name,
+                "tool": l.tool,
+                "prompt_tokens": l.prompt_tokens,
+                "completion_tokens": l.completion_tokens,
+                "total_tokens": l.total_tokens,
+                "cost_usd": float(l.cost_usd) if l.cost_usd is not None else None,
+            }
+            for l in logs
+        ],
+        "transactions": [
+            {
+                "id": str(t.id),
+                "type": t.type,
+                "amount": float(t.amount),
+                "balance_after": float(t.balance_after),
+                "description": t.description,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in txs
+        ],
     }
 
 
@@ -1009,13 +1606,6 @@ async def analyze_syntax(body: SyntaxAnalysisRequest, queue: TaskQueue = Depends
 
 
 # ── Chat (Agent) ──
-async def _chat_quota(user: AuthUser) -> str:
-    """Enforce the user's role quota and return the model id for their role."""
-    async with SessionLocal() as session:
-        await check_quota(session, user.user_id, user.role)
-    return user.role.default_model or settings.llm_model
-
-
 async def _guest_quota(redis, guest_id: UUID) -> None:
     """Cap anonymous guest chat to ``guest_daily_limit`` requests per day (Redis counter)."""
     if settings.guest_daily_limit <= 0:
@@ -1072,21 +1662,36 @@ async def chat(
     user: AuthUser | None = Depends(require_user_optional),
     queue: TaskQueue = Depends(get_task_queue),
 ):
-    if user is None:
-        # Anonymous guest: reuse a persisted guest id (or mint one) and cap daily usage.
-        user_id = body.user_id or await ensure_user(SessionLocal)
-        await _guest_quota(request.app.state.redis, user_id)
-        model = settings.llm_model
-        log_user = None
-    else:
-        user_id = user.user_id
-        model = await _chat_quota(user)
-        log_user = user
+    # Resolve the LLM channel for this request: a logged-in user uses the channel pinned on
+    # their token at login (failing over to another active channel of the same role); a guest
+    # uses the ``anonymous`` role's channels. A role with no usable channel falls back to the
+    # legacy /config route (empty base_url/api_key → the configured global client).
+    async with SessionLocal() as session:
+        if user is None:
+            user_id = body.user_id or await ensure_user(SessionLocal)
+            await _guest_quota(request.app.state.redis, user_id)
+            token = None
+            role_id = "anonymous"
+            log_user = None
+        else:
+            user_id = user.user_id
+            await check_quota(session, user.user_id, user.role)
+            token = await session.get(AccessTokenModel, user.token_id)
+            role_id = user.role.role_id
+            log_user = user
+        base_url, api_key, model = await _resolve_chat_route(session, token, role_id)
 
     session_id = body.session_id or await create_session(SessionLocal, user_id)
     session_memory = SessionMemoryStore(SessionLocal, _embedder(), llm, session_id, user_id)
     history = body.history or await session_memory.load_messages()
-    result = await get_agent().run(body.message, history, session_memory=session_memory, model=model)
+    result = await get_agent().run(
+        body.message,
+        history,
+        session_memory=session_memory,
+        model=model,
+        base_url=base_url or None,
+        api_key=api_key or None,
+    )
     # close() (inside run) already flushed events; defer the expensive embed+summary work.
     await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
     if log_user is not None:
@@ -1129,12 +1734,17 @@ async def chat_stream(
     body: ChatRequest,
     user: AuthUser = Depends(require_user),
 ):
-    """SSE streaming (role quota enforced; model from the user's role)."""
-    model = await _chat_quota(user)
+    """SSE streaming (role quota enforced; channel from the user's pinned token, else role)."""
+    async with SessionLocal() as session:
+        await check_quota(session, user.user_id, user.role)
+        token = await session.get(AccessTokenModel, user.token_id)
+        base_url, api_key, model = await _resolve_chat_route(session, token, user.role.role_id)
     await _log_usage(user, model, "chat_stream")
 
     async def gen():
-        async for token in llm.complete_stream(body.message, model=model):
-            yield {"data": token}
+        async for chunk in llm.complete_stream(
+            body.message, model=model, base_url=base_url or None, api_key=api_key or None
+        ):
+            yield {"data": chunk}
 
     return EventSourceResponse(gen())

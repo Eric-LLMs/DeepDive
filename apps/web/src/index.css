@@ -780,6 +780,83 @@ button.tab.active:hover {
   font-size: 15px;
 }
 
+/* ── Login page ── */
+.login-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: linear-gradient(135deg, #eff6ff 0%, #f5f3ff 100%);
+}
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.login-logo {
+  font-size: 28px;
+  font-weight: 700;
+  text-align: center;
+}
+.login-card h2 {
+  font-size: 20px;
+  padding: 0 0 8px;
+  text-align: center;
+}
+.login-card .field-label {
+  font-size: 13px;
+}
+
+/* ── Account chip (topbar identity) ── */
+.account-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.account-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.account-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #31333f;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-role.tier {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #4338ca;
+  border: 1px solid #e0e7ff;
+}
+.account-role.tier.vip {
+  background: #fef3c7;
+  color: #92400e;
+  border-color: #fde68a;
+}
+
 /* ── Filter row (domain + level dropdowns) ── */
 .filter-row {
   display: grid;
@@ -892,4 +969,266 @@ input[type="file"]::file-selector-button:hover {
   border-radius: 5px;
   padding: 10px;
   margin-bottom: 16px;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Theme: dark. Toggled via data-theme on <html> by the settings
+   menu (localStorage "deepdive_web_theme"). Additive block —
+   light theme rules above are left untouched.
+   ───────────────────────────────────────────────────────────── */
+[data-theme="dark"] {
+  --bg: #0f1115;
+  --panel: #16181e;
+  --panel-raised: #1d2129;
+  --border: #2a2f3a;
+  --border-strong: #3a4150;
+  --text: #e6e8ee;
+  --muted: #8a90a0;
+  --accent: #4f7cff;
+  --accent-2: #a78bfa;
+  --accent-hover: #6b93ff;
+  --danger: #f16666;
+  --gold: #f5b93f;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}
+
+[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: #3a4150;
+}
+[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: #4a5261;
+}
+
+[data-theme="dark"] button,
+[data-theme="dark"] input,
+[data-theme="dark"] textarea,
+[data-theme="dark"] select,
+[data-theme="dark"] input[type="file"]::file-selector-button {
+  background: var(--panel);
+}
+[data-theme="dark"] button:hover:not(:disabled),
+[data-theme="dark"] button.ghost:hover:not(:disabled),
+[data-theme="dark"] input[type="file"]::file-selector-button:hover {
+  background: var(--panel-raised);
+}
+[data-theme="dark"] input::placeholder,
+[data-theme="dark"] textarea::placeholder {
+  color: #6b7280;
+}
+[data-theme="dark"] code {
+  background: #1d2129;
+  color: #e6e8ee;
+}
+[data-theme="dark"] pre.markdown {
+  background: #13161c;
+}
+[data-theme="dark"] .popover {
+  background: var(--panel-raised);
+}
+
+/* toggle / badge / status chips */
+[data-theme="dark"] button.toggle {
+  background: #2a2f3a;
+  color: #9aa0ad;
+}
+[data-theme="dark"] button.toggle.on {
+  background: #1e3a6e;
+  color: #7fb0ff;
+  border-color: #2f5488;
+}
+[data-theme="dark"] .switch .slider {
+  background: #3a4150;
+}
+[data-theme="dark"] .switch .slider::before {
+  background: #e6e8ee;
+}
+[data-theme="dark"] .switch input:checked + .slider {
+  background: var(--accent);
+}
+[data-theme="dark"] .badge {
+  background: #1e3a6e;
+  color: #7fb0ff;
+  border-color: #2f5488;
+}
+[data-theme="dark"] .info {
+  background: rgba(79, 124, 255, 0.15);
+  color: #8ab4ff;
+}
+[data-theme="dark"] .success {
+  background: rgba(52, 192, 122, 0.15);
+  color: #4fd08e;
+}
+[data-theme="dark"] .mic-pill {
+  background: #2a2f3a;
+  color: #9aa0ad;
+}
+[data-theme="dark"] .mic-pill.recording {
+  background: #1e3a2a;
+  color: #4fd08e;
+}
+[data-theme="dark"] .mic-meter-track {
+  background: #2a2f3a;
+}
+[data-theme="dark"] .stars span {
+  color: #3a4150;
+}
+[data-theme="dark"] .note {
+  background: #12301f;
+}
+
+/* tables */
+[data-theme="dark"] .table tbody tr:hover {
+  background: var(--panel-raised);
+}
+[data-theme="dark"] .st-table {
+  background: var(--panel);
+}
+[data-theme="dark"] .st-table th,
+[data-theme="dark"] .st-table td {
+  border-color: #2a2f3a;
+  color: #d7dbe3;
+}
+[data-theme="dark"] .st-table thead th,
+[data-theme="dark"] .st-table tbody td:first-child {
+  color: #8a90a0;
+}
+
+/* tabs */
+[data-theme="dark"] button.tab {
+  background: #1d2129;
+  border-color: #2a2f3a;
+  color: #9aa0ad;
+  box-shadow: none;
+}
+[data-theme="dark"] button.tab:hover {
+  background: #2a2f3a;
+}
+[data-theme="dark"] button.tab.active,
+[data-theme="dark"] button.tab.active:hover {
+  background: #123a5e;
+  color: #4db4ff;
+  border-color: #1f6ea8;
+  box-shadow: none;
+}
+
+/* misc greys */
+[data-theme="dark"] .def-editable:hover {
+  background: var(--panel-raised);
+}
+[data-theme="dark"] .mic {
+  background: #13161c;
+}
+[data-theme="dark"] .field-label {
+  color: #d7dbe3;
+}
+[data-theme="dark"] .file-dropzone {
+  background: var(--panel);
+  border-color: #2a2f3a;
+}
+[data-theme="dark"] .file-dropzone:hover,
+[data-theme="dark"] .file-dropzone.drag-over {
+  background: var(--panel-raised);
+  border-color: #3a4150;
+}
+[data-theme="dark"] .file-dropzone-main {
+  color: #d7dbe3;
+}
+[data-theme="dark"] .file-dropzone-limit {
+  color: #8a90a0;
+}
+
+/* shell: sidebar / topbar / login / modal / account */
+[data-theme="dark"] .sidebar {
+  background: #12151b;
+}
+[data-theme="dark"] .nav,
+[data-theme="dark"] .nav.active {
+  color: #d7dbe3;
+}
+[data-theme="dark"] .nav:hover {
+  background: var(--panel-raised);
+}
+[data-theme="dark"] .nav.active {
+  background: rgba(79, 124, 255, 0.12);
+  color: #e6e8ee;
+}
+[data-theme="dark"] .topbar .header-btn {
+  background: var(--panel);
+  color: #d7dbe3;
+}
+[data-theme="dark"] .login-wrap {
+  background: linear-gradient(135deg, #0d1015 0%, #131122 100%);
+}
+[data-theme="dark"] .login-card,
+[data-theme="dark"] .modal {
+  background: var(--panel);
+}
+[data-theme="dark"] .account-name {
+  color: #d7dbe3;
+}
+
+/* ── Topbar settings menu ── */
+.settings-wrap {
+  position: relative;
+}
+.settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+}
+.settings-pop {
+  position: absolute;
+  top: 42px;
+  right: 0;
+  width: 236px;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 10px;
+  z-index: 60;
+}
+.settings-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--muted);
+  margin: 10px 6px 6px;
+}
+.settings-title:first-child {
+  margin-top: 0;
+}
+button.settings-row {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+}
+button.settings-row:hover {
+  background: var(--panel-raised);
+}
+button.settings-row.on {
+  color: var(--accent);
+  font-weight: 600;
+}
+button.settings-row .check {
+  opacity: 0;
+}
+button.settings-row.on .check {
+  opacity: 1;
+}
+.settings-select {
+  width: 100%;
+  margin-top: 4px;
 }

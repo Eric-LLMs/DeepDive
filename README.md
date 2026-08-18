@@ -10,9 +10,9 @@
 
 The engine is a native function-calling **agent** — an `AgentKernel` composition root that wires a cache-boundary prompt (a byte-stable static head so the provider reuses its prefix cache), deferred tool loading, dual-track memory (PostgreSQL tsvector + pgvector fused by RRF), a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop. A **hybrid search engine** finds context even when exact keywords are missing, and a **RAG pipeline** (rewrite → recall → RRF → rerank) grounds every chat answer.
 
-Model inference never runs inside the API: embedding (**BGE-M3** via TEI), **TTS (Kokoro)**, and **LLM routing (LiteLLM)** are separate Docker services, and retrieval can be extracted behind a capability seam into its own **gRPC service**. Async enrichment (TTS, images, explanations, session finalize) runs on an arq **worker** off the request path.
+Model inference never runs inside the API: embedding (**BGE-M3** via TEI) and **TTS (Kokoro)** are separate Docker services, and retrieval can be extracted behind a capability seam into its own **gRPC service**. **LLM calls** go directly to the provider channel pinned to the session (managed in the admin console), with the LiteLLM gateway as the legacy fallback. Async enrichment (TTS, images, explanations, session finalize) runs on an arq **worker** off the request path.
 
-Also included: multi-user accounts with per-role quotas, pay-as-you-go **billing** with atomic wallet deduction, a self-contained **admin console**, and a desktop workbench with a file tree, a multi-format media viewer, and one-click video screenshots.
+Also included: multi-user accounts with per-role quotas, **per-role LLM channels** (role ↔ credential bindings with one channel pinned per login), pay-as-you-go **billing** with atomic wallet deduction, a self-contained 4-module **admin console** (Providers / Roles / Users / Tokens), and a desktop workbench with a file tree, a multi-format media viewer, and one-click video screenshots.
 
 ---
 
@@ -86,8 +86,9 @@ flowchart TB
 - **SSE Streaming**: Real-time token streaming to the frontend.
 
 ### 👥 Multi-User, Roles & Billing
-- **Admin console** (`/admin`): a single self-contained page to manage LLM providers, models, users, and wallets. A default `admin`/`admin` credential is seeded into the DB on first boot.
-- **User accounts**: admins create username/password accounts; users log in to receive an opaque token. Roles (`regular` / `pro` / `vip` / `admin`) carry per-role quota (daily/monthly requests, tokens, RPM, cost) and an optional default model.
+- **Admin console** (`/admin`): a self-contained single-file SPA with four modules — **Providers** (credentials + model catalog + routing weights), **Roles**, **Users**, and **Tokens**. A default `admin`/`admin` credential is seeded into the DB on first boot; console login is stateless (a signed session token, never persisted), so it never pollutes the tokens table.
+- **Per-role LLM channels**: every role binds the provider channels it may use (`role_credentials`); each login pins one random active channel to the token, and chat routes through it per-request with failover. `access_tokens` keeps **one row per (user, channel)** — re-login rotates the secret in place instead of growing the table.
+- **User accounts**: admins create username/password accounts; users (and the web/desktop console) log in to receive an opaque token. Roles (`regular` / `pro` / `vip` / `admin` / `anonymous`) carry per-role quota (daily/monthly requests, tokens, RPM, cost) and an optional default model.
 - **Server-managed config**: LLM provider keys, the model catalog, and the admin credential live in PostgreSQL (`app_settings`) — not `.env` or repo files — and are edited from the admin console.
 - **Pay-as-you-go billing**: per-model pricing (prompt/completion per 1k tokens), a cash wallet per user, and an append-only ledger with a `balance_after` snapshot. Chat usage is priced and debited atomically.
 - **Guest access**: anonymous users can chat without an account, capped per day (`guest_daily_limit`, default 10); exceeding the cap prompts them to sign in.
@@ -188,10 +189,10 @@ psql -d deepdive -f migrations/0001_init.sql
 ### 8. Run the API
 
 ```bash
-uvicorn api.main:app --reload
+uvicorn apps.api.main:app --reload
 ```
 
-Open http://localhost:8000/docs for the interactive API documentation.
+Open http://localhost:8300/docs for the interactive API documentation.
 
 > The **worker** (async enrichment) runs as a docker-compose service (see step 6). To run it on
 > the host instead: `arq apps.worker.settings.WorkerSettings`.
@@ -208,7 +209,7 @@ python -m apps.retrieval.main    # starts the gRPC server on localhost:15051
 Then set `RETRIEVAL_MODE=grpc` in `.env` and restart the API:
 
 ```bash
-RETRIEVAL_MODE=grpc uvicorn api.main:app --reload
+RETRIEVAL_MODE=grpc uvicorn apps.api.main:app --reload
 ```
 
 The `rag_search` tool now calls the retrieval service over gRPC instead of the in-process RAG pipeline — no tool code changes (the capability seam does the swap).
@@ -236,14 +237,20 @@ a local folder tree, a multi-format viewer (video/audio/image/PDF/text with OS-d
 fallback for Office files), one-click video screenshots, and a chat pane.
 
 ```bash
+bash scripts/start_desktop.sh    # one-click: infra (postgres/redis) + backend + workbench
+# or manually:
 cd apps/desktop
 npm install
-npm start                      # opens the workbench window
+npm start                        # opens the workbench window
 ```
+
+`scripts/start_desktop.sh` probes the backend at `http://localhost:8300/health` first, starts the
+infra + `uvicorn apps.api.main:app --port 8300` in the background if it is down (pid in
+`data/uvicorn.pid`), then opens the Electron window.
 
 The file tree, viewer, and video screenshot work **without the backend**. Chat, "生成 PPT /
 生成书" (media generation), and the ⚙️ Settings panel need the backend running on
-`localhost:8000` — the Electron main process forwards `/api`, `/audio`, and `/images` to it.
+`localhost:8300` — the Electron main process forwards `/api`, `/audio`, and `/images` to it.
 ⚙️ Settings opens a dropdown list (Account / Theme / Help): sign in with an account created in
 the admin console, or chat anonymously as a guest (limited to `guest_daily_limit` per day).
 
@@ -255,7 +262,7 @@ the admin console, or chat anonymously as a guest (limited to `guest_daily_limit
 |---|---|---|
 | `DATABASE_URL` | `postgresql+asyncpg://deepdive:deepdive@localhost:15432/deepdive` | PostgreSQL + pgvector |
 | `REDIS_URL` | `redis://localhost:16379/0` | cache / queue |
-| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | `sk-local-gateway` / `http://localhost:4000/v1` / `deepdive-chat` | the LiteLLM gateway the API talks to |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | `""` / `http://localhost:4000/v1` / `deepdive-chat` | legacy default client (LiteLLM gateway); active channels + keys live in the DB and are managed in the admin console |
 | `LLM_UPSTREAM_MODEL` / `LLM_UPSTREAM_BASE` / `LLM_UPSTREAM_KEY` | `openai/gpt-4o-mini` / `https://api.openai.com/v1` / `sk-xxx` | real upstream LLM (consumed by the gateway container) |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `http://localhost:8080` / `BAAI/bge-m3` / `1024` | TEI embedding service |
 | `TTS_BASE_URL` / `TTS_MODEL` / `TTS_VOICE` | `http://localhost:8880/v1` / `kokoro` / `am_michael` | Kokoro-FastAPI TTS service |
@@ -265,7 +272,11 @@ the admin console, or chat anonymously as a guest (limited to `guest_daily_limit
 | `SKILLS_DIR` | `data/skills` | `SKILL.md` skills directory (lazy-loaded via the `skill` tool) |
 | `WORKER_CONCURRENCY` / `WORKER_JOB_TIMEOUT` | `10` / `300` | arq worker max concurrent jobs / per-job timeout (seconds) |
 
-Model inference never runs inside the API process. Swapping a model = change `--model-id` in `docker-compose.yml` and the matching `*_BASE_URL` / dim in `.env` — no business-code change. See [docs/architecture.md](docs/architecture.md) for the full topology.
+Model inference never runs inside the API process. LLM channels are managed in the admin
+console (Providers → Credentials); each is an OpenAI-compatible `base_url` + `api_key`, and a role
+bound to a channel routes chat straight to that provider (no code change). Swapping embedding/TTS
+models = change `--model-id` in `docker-compose.yml` and the matching `*_BASE_URL` / dim in `.env` —
+no business-code change. See [docs/architecture.md](docs/architecture.md) for the full topology.
 
 ---
 

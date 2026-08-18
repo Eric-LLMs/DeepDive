@@ -198,6 +198,9 @@ class AccessTokenModel(Base):
     role_id: Mapped[str | None] = mapped_column(
         String, ForeignKey("user_roles.role_id", ondelete="SET NULL")
     )
+    credential_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("llm_credentials.id", ondelete="SET NULL")
+    )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -320,6 +323,30 @@ class CredentialModelModel(Base):
     prompt_price_per_1k: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
     completion_price_per_1k: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class RoleCredentialModel(Base):
+    """N:M binding of a role to the LLM channels (llm_credentials) it may use.
+
+    This is the routing source: a role's channel set decides which provider key its
+    users are pinned to at login (one channel is randomly picked and stored on the
+    access token). ``user_roles.models`` is a legacy display-only field.
+    """
+
+    __tablename__ = "role_credentials"
+
+    role_id: Mapped[str] = mapped_column(
+        String, ForeignKey("user_roles.role_id", ondelete="CASCADE"), primary_key=True
+    )
+    credential_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("llm_credentials.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class UserWalletModel(Base):

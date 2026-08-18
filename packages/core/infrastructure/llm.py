@@ -61,8 +61,16 @@ class OpenAILLM:
         prompt: str,
         system_prompt: str = "You are a helpful assistant.",
         model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ) -> AsyncIterator[str]:
-        stream = await self.client.chat.completions.create(
+        client = self.client
+        if base_url or api_key:
+            client = AsyncOpenAI(
+                base_url=base_url or settings.llm_base_url,
+                api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+            )
+        stream = await client.chat.completions.create(
             model=model or self.model,
             messages=self._messages(prompt, system_prompt),
             temperature=0.3,
@@ -124,17 +132,32 @@ class OpenAILLM:
             return {"translation": "Error parsing AI response.", "explanation": "LLM call failed."}
 
     async def chat(
-        self, messages: list[dict], tools: list[dict] | None = None, model: str | None = None
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ) -> dict:
         """Conversation with tool calls (used by the Agent loop).
+
+        ``base_url`` / ``api_key`` optionally route this single call through a specific LLM
+        channel (e.g. the credential pinned on a user's access token); the shared client is
+        never mutated, so concurrent requests can each use their own channel.
 
         Returns ``{content, tool_calls, usage}`` where ``usage`` is the token counts from the
         provider (``prompt_tokens``/``completion_tokens``/``total_tokens``, all 0 if absent).
         """
+        client = self.client
+        if base_url or api_key:
+            client = AsyncOpenAI(
+                base_url=base_url or settings.llm_base_url,
+                api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+            )
         kwargs = {"model": model or self.model, "messages": messages, "temperature": 0.3}
         if tools:
             kwargs["tools"] = tools
-        resp = await self.client.chat.completions.create(**kwargs)
+        resp = await client.chat.completions.create(**kwargs)
         msg = resp.choices[0].message
         usage = resp.usage
         return {

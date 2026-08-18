@@ -82,6 +82,8 @@ class ReactLoopAgent:
         memory_keys: list[str] | None = None,
         session_memory: Any | None = None,
         model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ) -> AgentResult:
         """Run one turn: assemble prompt → step until a final answer or max_steps.
 
@@ -89,6 +91,10 @@ class ReactLoopAgent:
         and only the dynamic suffix is re-rendered per step (reused when unchanged);
         with a :class:`ToolGateway` the model-visible tool schemas are recomputed per step
         (core + mounted, so deferred ``tool_search`` loads appear on the next step).
+
+        ``base_url`` / ``api_key`` route every model call in this turn through a specific
+        LLM channel (the credential pinned on the caller's access token); ``None`` keeps
+        the shared, config-driven client.
         """
         self._session_memory = session_memory
         context = {
@@ -122,7 +128,9 @@ class ReactLoopAgent:
                         assembly.dynamic_suffix = dynamic
                         system = render_prompt(assembly)
                 tools = self._step_tools(context, assembly)
-                finished, step_usage = await self._step(system, tools, messages, session_memory, model)
+                finished, step_usage = await self._step(
+                    system, tools, messages, session_memory, model, base_url, api_key
+                )
                 usage = _sum_usage(usage, step_usage)
                 await self.events.serial("agent/step-end", {})
                 self._log("step-end")
@@ -159,6 +167,8 @@ class ReactLoopAgent:
         messages: list[dict],
         session_memory: Any | None,
         model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ) -> tuple[bool, dict | None]:
         """Run one LLM call + execute any tool calls.
 
@@ -166,7 +176,7 @@ class ReactLoopAgent:
         LLM call (``None`` when the port reported none).
         """
         request = [{"role": "system", "content": system}] + messages
-        resp = await self.llm.chat(request, tools=tools, model=model)
+        resp = await self.llm.chat(request, tools=tools, model=model, base_url=base_url, api_key=api_key)
         tool_calls = resp.get("tool_calls") or []
         usage = resp.get("usage")
         self._log("llm-call", tool_calls=len(tool_calls))

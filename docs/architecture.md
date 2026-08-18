@@ -22,10 +22,12 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
-| Auth / RBAC | opaque `access_tokens` (admin + user) + `user_roles` (regular/pro/vip/admin) + role quota + `/auth/*` login |
+| Auth / RBAC | opaque `access_tokens` (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login |
+| Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover |
+| Admin console | single-file SPA at `/admin` with 4 modules (Providers / Roles / Users / Tokens): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions |
 | Billing | `llm_models` (per-1k pricing) + `user_wallets` + `wallet_transactions` + `llm_credentials` + `credential_models`; cost calc + atomic wallet deduct |
 | Settings in DB | `app_settings` key/value JSONB (admin credential + LLM provider config + tiers), written by the admin console |
-| Guest access | anonymous chat with per-day Redis limit (`guest_daily_limit`), 429 → prompt login |
+| Guest access | anonymous chat via the `anonymous` role's channels, with per-day Redis limit (`guest_daily_limit`), 429 → prompt login |
 
 ### Designed, not yet implemented
 
@@ -59,7 +61,7 @@ DeepDive is an "AI learning workbench" unified by a single abstraction:
 | ORM | SQLAlchemy 2.0 (async) | native async |
 | Config | pydantic-settings | env vars + type validation |
 | Cache / queue | Redis + arq | result caching, async enrichment |
-| LLM gateway | LiteLLM Proxy | unified routing / keys / cost |
+| LLM gateway | LiteLLM Proxy | legacy default client; pinned channels call their provider directly (`llm_credentials.base_url` + `api_key`) |
 | Embedding | BGE-M3 (dim 1024) via TEI | multilingual, moderate dim |
 | Reranking | BGE-reranker cross-encoder | post-recall precision |
 | Retrieval (RAG) | query rewrite → pgvector + tsvector recall → RRF fusion → rerank | hybrid keyword + semantic search |
@@ -76,7 +78,9 @@ API-only: REST/SSE at the edge, gRPC between internal services, HTTP to model se
 deepdive/
 ├── apps/
 │   ├── api/                      # package `api` (FastAPI gateway: REST/SSE + job enqueue)
-│   │   ├── main.py               # uvicorn api.main:app (REST/SSE endpoints + GET /jobs/{id})
+│   │   ├── main.py               # uvicorn apps.api.main:app (REST/SSE endpoints + GET /jobs/{id})
+│   │   ├── auth.py               # opaque-token auth (require_admin / require_user + stateless console session signing)
+│   │   ├── admin/                # admin console SPA (single-file index.html: Providers / Roles / Users / Tokens)
 │   │   ├── deps.py               # DI assembly (capability seam + agent kernel wiring + plugins)
 │   │   ├── tools/                # gateway tools, auto-discovered by `_tool.py` modules (rag_search / translate / web_search)
 │   │   └── schemas.py            # Pydantic request/response models
@@ -112,6 +116,9 @@ deepdive/
 ├── proto/retrieval/v1/retrieval.proto   # RetrievalService contract
 ├── buf.yaml / buf.gen.yaml             # proto lint / breaking / codegen
 ├── scripts/gen_proto.sh                # grpc_tools.protoc (or buf) codegen
+├── scripts/init_db.py                  # apply migrations/*.sql (same runner as the app lifespan)
+├── scripts/setup.sh                    # host setup (venv / deps / proto)
+├── scripts/start_desktop.sh            # one-click launch: infra + uvicorn (port 8300) + Electron workbench
 ├── deploy/
 │   ├── traefik/                  # gateway static + dynamic config
 │   ├── retrieval/Dockerfile      # retrieval service image
@@ -392,10 +399,13 @@ Switching modes never touches the tool code — it only changes what `ctx.provid
                             PostgreSQL (pgvector + tsvector + jobs) via SQLAlchemy+asyncpg
 ```
 
-- **Model inference never runs in the API/retrieval/worker process** — embedding/TTS/LLM are
-  separate containers; model updates don't restart the app. Reranking is the exception: the
-  cross-encoder loads in-process via `sentence-transformers` when `reranker_model` is set
-  (disabled by default).
+- **Model inference never runs in the API/retrieval/worker process** — embedding/TTS are separate
+  containers; model updates don't restart the app. Reranking is the exception: the cross-encoder
+  loads in-process via `sentence-transformers` when `reranker_model` is set (disabled by default).
+- **Pinned LLM channels call their provider directly** — a session's chat request builds a
+  per-request OpenAI client from the channel's `base_url`/`api_key` (the shared client is never
+  mutated). The LiteLLM gateway (`llm_base_url`, default `:4000`) is used only for roles with no
+  bound channel and for the legacy `/config` route / enrichment summaries.
 - **DB is accessed directly** (SQLAlchemy + asyncpg) by the gateway, worker, and retrieval
   service; no DB proxy service. Production scaling adds pgBouncer + read replicas.
 - **Retrieval is the first extracted service** because it owns the heavy, model-coupled stack;
@@ -469,7 +479,9 @@ rewrite → multi-recall → RRF fusion → rerank
 > order by `init_db()` via asyncpg and tracked in the `schema_migrations` table (no Alembic, no
 > `create_all`). This document does not repeat the DDL; the migration files are the single source
 > of truth. Table names below are the implemented ones (`sessions`, `messages`, `jobs` …), not the
-> earlier design names (`conversations`, `job_logs` …).
+> earlier design names (`conversations`, `job_logs` …). The current surface spans
+> `0001_init.sql` … `0007_console_tokens_stateless.sql`; each file is written as one idempotent unit
+> (final shape in a single pass, no repeated ALTERs).
 
 The core learning + chat tables that run today (`migrations/0001_init.sql`):
 
@@ -503,23 +515,38 @@ Hybrid recall is computed in code, not stored in schema:
 
 ### 12.2 Billing and Logs
 
-- **Implemented** — the billing surface in `migrations/0004_billing.sql`: `llm_credentials`,
-  `llm_models`, `credential_models`, `user_wallets`, `wallet_transactions` (documented in §12.3).
+- **Implemented** — the billing surface in `migrations/0004_billing.sql` + `0005_roles_credentials.sql`:
+  `llm_credentials`, `llm_models`, `credential_models`, `role_credentials`, `user_wallets`,
+  `wallet_transactions` (documented in §12.3).
 - **Design-only (not created)** — `subscriptions`, `credit_ledger`, `audit_logs`, `ai_call_logs`,
   `activity_logs`, `job_logs` (job state lives in the implemented `jobs` table).
 
 ### 12.3 Implemented auth, RBAC & billing schema
 
-The multi-user + billing surface that runs today (`migrations/0002_auth.sql`, `0003_rbac.sql`,
-`0004_billing.sql`):
+The multi-user + billing surface that runs today (`migrations/0002_auth.sql` … `0005_roles_credentials.sql`):
 
 - **users** — `username` (unique where non-null), `password_hash` (stdlib pbkdf2), `display_name`,
   `is_active`, `role_id` (FK → `user_roles`), `meta`, `created_at`. Legacy anonymous rows keep `username NULL`.
 - **user_roles** — `role_id` TEXT PK, quota limits (`daily_request_limit`, `monthly_request_limit`,
   `daily_token_limit`, `rpm_limit`, `monthly_cost_limit`; `-1` = unlimited), `default_model`,
-  `models` (allowed ids), `features`, `is_active`. Seeded: `regular` (50/day) / `pro` / `vip` (unlimited) / `admin`.
+  `models` (**legacy** allowed-model ids — the routing source is now `role_credentials`, the field is
+  kept only for compatibility display), `features`, `is_active`. Seeded: `regular` (50/day) /
+  `pro` / `vip` (unlimited) / `admin` / **`anonymous`** (guest tier).
+- **role_credentials** — N:M binding of **roles → LLM channels** (`role_id` ↔ `credential_id`,
+  both CASCADE, `is_active`, `created_at`). This is what decides which provider key a role may use:
+  VIP/pro bind the expensive channels, `regular` / `anonymous` the cheap ones.
 - **access_tokens** — opaque server-side tokens: `token_hash` (sha256 of the raw token shown once),
-  `role` (`admin` | `user`), `user_id`, optional `role_id` override, `expires_at`, `last_used_at`, `is_active`.
+  `role` (`admin` | `user`), `user_id`, optional `role_id` override, **`credential_id`** (the channel
+  randomly picked from the user's role at login and pinned for the token's lifetime), `expires_at`,
+  `last_used_at`, `is_active`. User tokens are **unique per (user, channel)**: re-login on the same
+  channel rotates the secret and bumps `last_used_at` in place instead of inserting a new row, so the
+  table stops growing with every login (partial unique indexes `access_tokens_user_credential_uniq`
+  for pinned channels + `access_tokens_user_no_cred_uniq` for the no-channel case).
+  **Admin console logins are stateless** — `/admin/login` returns a signed `cc_` session token (HMAC,
+  held in the browser) instead of minting a row, so console sessions never pollute `access_tokens`;
+  only Tokens-page API tokens (hashed `dd_`) are persisted. The admin Access Tokens table therefore
+  shows one row per (user, model) — fuzzy search by person name, a role dropdown filter, and clickable
+  Model / User cells opening the `llm_credentials` detail / the user detail drawer.
 - **app_settings** — `key` PK + `value` JSONB. Stores the admin credential, LLM provider config,
   and tier overrides — moved out of `.env` / `data/config.json`.
 - **user_usage_counters** — `(user_id, period_type, period_start)` PK; atomic UPSERT counters for
@@ -527,12 +554,30 @@ The multi-user + billing surface that runs today (`migrations/0002_auth.sql`, `0
 - **user_usage_logs** — append-only per-call audit (`model_name`, `tool`, token counts, `cost_usd`,
   `role_id`, `token_id`).
 - **llm_models** — virtual model catalog with `prompt_price_per_1k` / `completion_price_per_1k`.
-- **llm_credentials** — provider `base_url` + `api_key`.
-- **credential_models** — N:M routing (credential ↔ model) with `priority` / `weight` + per-key price override.
+- **llm_credentials** — provider channels (`base_url` + `api_key`); **one row = one "token"/key** the
+  admin manages, `is_active` is the per-channel availability switch. A channel's displayed price is
+  derived from its `credential_models` routes (single model) or a price range (multiple models).
+- **credential_models** — N:M routing (credential ↔ model) with `priority` / `weight` + per-key price
+  override; the source of each channel's model list and displayed price.
 - **user_wallets** — one row per user (`balance`, `currency`).
 - **wallet_transactions** — append-only ledger (`type`, `amount`, `balance_after` snapshot,
   `idempotency_key`). Chat usage is priced via `compute_cost` and debited atomically
   (`UPDATE … WHERE balance >= cost`), so insufficient funds never overdraw.
+
+**Credential-pinning flow (how a request picks its LLM channel):**
+
+1. `POST /auth/login` — verify user → resolve `user.role_id` → active `role_credentials` →
+   active `llm_credentials`; pick **one randomly** and write it as `access_tokens.credential_id`
+   (guest requests resolve to the `anonymous` role instead, keeping the per-day Redis guest limit).
+2. Each chat request — `require_user` already loads the token row, so `credential_id` comes along
+   for free; the channel's `base_url` / `api_key` drive the main model call (endpoint resolved
+   per-request, the shared client is never mutated), and the model is the channel's preferred active
+   route, else `role.default_model`, else the global default.
+3. If the pinned channel was disabled by the admin, fall back to another active channel from the same
+   role (failover); an `admin` / legacy token without `credential_id` uses the legacy `/config`
+   active provider.
+4. Billing stays model-catalog-based (`get_model_prices` by model name) — the channel selects *which*
+   model/key is used, the per-1k catalog price determines the cost.
 
 ## 13. Multi-Tenancy and Deployment Strategy
 

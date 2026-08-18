@@ -135,8 +135,14 @@ class AgentKernel:
         memory_keys: list[str] | None = None,
         session_memory: Any | None = None,
         model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ) -> AgentResult:
-        """Run one turn through the assembled kernel (assemble → step loop → session-end)."""
+        """Run one turn through the assembled kernel (assemble → step loop → session-end).
+
+        ``base_url`` / ``api_key`` optionally route every model call in this turn through a
+        specific LLM channel (the credential pinned on the caller's access token).
+        """
         if self.memory is not None:
             self.memory.begin_session()
         return await self.loop.run(
@@ -145,4 +151,6 @@ class AgentKernel:
             memory_keys=memory_keys,
             session_memory=session_memory,
             model=model,
+            base_url=base_url,
+            api_key=api_key,
         )

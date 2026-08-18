@@ -7,16 +7,25 @@
     <style>
       :root {
         --bg: #0f1115;
+        --bg2: #13161c;
         --panel: #181b21;
+        --panel2: #1d2128;
         --border: #2a2f3a;
         --text: #e6e8ee;
         --muted: #8a90a0;
         --accent: #4f7cff;
+        --accent-dim: rgba(79, 124, 255, 0.14);
         --accent-text: #fff;
         --danger: #e05252;
+        --danger-dim: rgba(224, 82, 82, 0.14);
         --ok: #34c07a;
+        --ok-dim: rgba(52, 192, 122, 0.14);
+        --warn: #e0a23c;
+        --gold: #d9b450;
+        --mono: "SF Mono", "Cascadia Code", Consolas, "Courier New", monospace;
       }
       * { box-sizing: border-box; }
+      html, body { height: 100%; }
       body {
         margin: 0;
         font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -25,25 +34,12 @@
         font-size: 14px;
       }
       .hidden { display: none !important; }
-      .wrap { max-width: 820px; margin: 0 auto; padding: 32px 20px 80px; }
-      h1 { font-size: 20px; margin: 0 0 4px; }
-      h2 { font-size: 15px; margin: 24px 0 12px; }
       .muted { color: var(--muted); }
-      .bar {
-        display: flex; align-items: center; justify-content: space-between;
-        border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 8px;
-      }
-      .bar .brand { display: flex; align-items: center; gap: 10px; }
-      .bar button {
-        background: transparent; border: 1px solid var(--border); color: var(--text);
-        padding: 7px 14px; border-radius: 6px; cursor: pointer;
-      }
-      .bar button:hover { border-color: var(--accent); }
 
-      /* login */
+      /* ── login ── */
       .login-card {
         max-width: 360px; margin: 80px auto; background: var(--panel);
-        border: 1px solid var(--border); border-radius: 10px; padding: 28px;
+        border: 1px solid var(--border); border-radius: 12px; padding: 28px;
       }
       .login-card h1 { font-size: 18px; margin-bottom: 20px; }
       .login-card label { display: block; margin-bottom: 14px; }
@@ -57,293 +53,659 @@
         width: 100%; margin-top: 6px; background: var(--accent); color: var(--accent-text);
         border: none; padding: 10px; border-radius: 6px; cursor: pointer; font-weight: 600;
       }
-      .login-card .err { color: var(--danger); margin-top: 12px; }
+      .login-card .err { color: var(--danger); margin-top: 12px; font-size: 13px; }
 
-      /* provider cards */
-      .provider-card {
-        background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-        padding: 16px; margin-bottom: 14px;
+      /* ── app shell ── */
+      .app { display: flex; flex-direction: column; height: 100vh; }
+      .topbar {
+        height: 52px; flex: none; display: flex; align-items: center; justify-content: space-between;
+        padding: 0 18px; border-bottom: 1px solid var(--border); background: var(--bg2);
       }
-      .provider-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-      .provider-head input[type="text"] {
-        flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text);
-        padding: 7px 10px; border-radius: 6px;
+      .topbar .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 15px; }
+      .logo {
+        width: 26px; height: 26px; border-radius: 7px; background: var(--accent); color: #fff;
+        display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 800;
       }
-      .provider-head input[type="radio"] { width: 16px; height: 16px; }
-      .provider-head .del {
-        background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 16px;
+      .topbar .right { display: flex; align-items: center; gap: 14px; }
+      .admin-chip { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+      .admin-chip .avatar {
+        width: 26px; height: 26px; border-radius: 50%; background: var(--accent); color: #fff;
+        display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600;
       }
-      .provider-head .del:hover { color: var(--danger); }
-      .cfg-field { display: block; margin-bottom: 10px; }
-      .cfg-field > span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 12px; }
-      .cfg-field input, .cfg-field select {
+      .body { flex: 1; display: flex; min-height: 0; }
+      .sidenav {
+        width: 196px; flex: none; border-right: 1px solid var(--border); background: var(--bg2);
+        padding: 12px 8px; display: flex; flex-direction: column; gap: 2px;
+      }
+      .nav-item {
+        padding: 9px 12px; border-radius: 6px; cursor: pointer; color: var(--muted);
+        font-size: 13.5px; font-weight: 500; display: flex; align-items: center; gap: 10px;
+        transition: background 0.12s ease, color 0.12s ease;
+      }
+      .nav-item:hover { background: var(--panel); color: var(--text); }
+      .nav-item.active { background: var(--accent-dim); color: var(--accent); font-weight: 600; }
+      .content { flex: 1; overflow-y: auto; padding: 22px 26px 80px; }
+
+      /* ── page header / bars ── */
+      .page-head { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 18px; }
+      .page-head h2 { margin: 0; font-size: 18px; }
+      .page-head .sub { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+      .bar-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+      .bar-title { font-size: 13.5px; font-weight: 600; }
+      .bar-title .count { color: var(--muted); font-weight: 500; }
+
+      /* ── buttons ── */
+      .btn {
+        background: transparent; border: 1px solid var(--border); color: var(--text);
+        padding: 7px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500;
+      }
+      .btn:hover { border-color: var(--accent); }
+      .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+      .btn.primary:hover { filter: brightness(1.08); }
+      .btn.primary:disabled { opacity: 0.6; cursor: default; }
+      .btn.danger { border-color: var(--danger); color: var(--danger); }
+      .btn.danger:hover { background: var(--danger-dim); }
+      .btn.ghost { color: var(--muted); }
+      .btn.sm { padding: 4px 9px; font-size: 12px; }
+      .icon-btn { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 15px; padding: 4px 6px; border-radius: 5px; }
+      .icon-btn:hover { color: var(--text); background: var(--panel); }
+      .row-actions { display: flex; gap: 6px; align-items: center; }
+
+      /* ── tabs (raised 3D buttons) ── */
+      .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+      .tab {
+        padding: 8px 16px; cursor: pointer; color: var(--muted); font-size: 13px; font-weight: 500;
+        border-radius: 6px; user-select: none; text-align: center;
+        background: linear-gradient(180deg, var(--panel2), var(--panel));
+        border: 1px solid var(--border);
+        transition: filter 0.12s ease;
+      }
+      .tab:hover { color: var(--text); filter: brightness(1.1); }
+      .tab.active {
+        color: #fff; font-weight: 600;
+        background: linear-gradient(180deg, #5a86ff, #4f7cff);
+        border-color: #3a5fd0;
+      }
+
+      /* ── tables ── */
+      .tbl-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; }
+      table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .tbl th {
+        text-align: left; padding: 10px 14px; color: var(--muted); font-weight: 600;
+        font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em;
+        border-bottom: 1px solid var(--border); background: var(--bg2); white-space: nowrap;
+      }
+      .tbl td { padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+      .tbl tr:last-child td { border-bottom: none; }
+      .tbl tbody tr:hover td { background: rgba(255, 255, 255, 0.02); }
+      .cell-main { font-weight: 600; }
+      .cell-sub { color: var(--muted); font-size: 11.5px; margin-top: 1px; }
+      .code { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+      .link { color: var(--accent); cursor: pointer; }
+      .link:hover { text-decoration: underline; }
+
+      /* ── badges ── */
+      .badge {
+        display: inline-flex; align-items: center; gap: 4px; font-size: 11px; padding: 2px 9px;
+        border-radius: 10px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+      }
+      .badge.accent { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+      .badge.ok { color: var(--ok); border-color: var(--ok); background: var(--ok-dim); }
+      .badge.danger { color: var(--danger); border-color: var(--danger); background: var(--danger-dim); }
+      .badge.gold { color: var(--gold); border-color: var(--gold); background: rgba(217, 180, 80, 0.12); }
+      .badge.warn { color: var(--warn); border-color: var(--warn); background: rgba(224, 162, 60, 0.12); }
+      .mini-chip {
+        display: inline-block; font-size: 11px; color: var(--muted); background: var(--bg);
+        border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; margin: 1px 2px 1px 0;
+      }
+      .mini-chip b { color: var(--text); font-weight: 600; }
+
+      /* ── switch ── */
+      .switch {
+        position: relative; width: 34px; height: 20px; background: var(--border);
+        border-radius: 10px; cursor: pointer; border: none; flex: none; padding: 0;
+      }
+      .switch::after {
+        content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+        border-radius: 50%; background: #cfd3dc; transition: transform 0.15s, background 0.15s;
+      }
+      .switch.on { background: var(--ok); }
+      .switch.on::after { transform: translateX(14px); background: #fff; }
+
+      /* ── key / token chips ── */
+      .key-chip {
+        font-family: var(--mono); font-size: 12px; color: var(--muted); background: var(--bg);
+        border: 1px solid var(--border); border-radius: 5px; padding: 2px 8px;
+        display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
+      }
+      .key-chip button { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 11px; padding: 0; }
+      .key-chip button:hover { color: var(--accent); }
+
+      /* ── forms ── */
+      .field { display: block; margin-bottom: 14px; }
+      .field > span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 12px; }
+      .field input, .field select, .field textarea {
         width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
-        padding: 8px 10px; border-radius: 6px;
+        padding: 8px 10px; border-radius: 6px; font-size: 13px; font-family: inherit;
       }
-      .cfg-field input:focus, .cfg-field select:focus { outline: none; border-color: var(--accent); }
-      .cfg-model-row { display: flex; gap: 10px; align-items: flex-end; }
-      .cfg-model-row .cfg-field { flex: 1; margin-bottom: 0; }
-      .cfg-model-row button {
-        background: transparent; border: 1px solid var(--border); color: var(--text);
-        padding: 8px 12px; border-radius: 6px; cursor: pointer; white-space: nowrap;
-      }
-      .cfg-model-row button:hover { border-color: var(--accent); }
+      .field input:focus, .field select:focus, .field textarea:focus { outline: none; border-color: var(--accent); }
+      .field textarea { min-height: 84px; resize: vertical; font-family: var(--mono); font-size: 12px; }
+      .field input[type="password"] { font-family: var(--mono); }
+      .field .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
+      .field-row { display: flex; gap: 12px; }
+      .field-row .field { flex: 1; }
+      .switch-row { display: flex; align-items: center; gap: 10px; }
 
-      .toolbar { display: flex; gap: 10px; margin: 20px 0; }
-      .toolbar button {
-        background: transparent; border: 1px solid var(--border); color: var(--text);
-        padding: 8px 16px; border-radius: 6px; cursor: pointer;
+      /* ── chips (multi-select) ── */
+      .chip-group { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0; }
+      .chip-toggle { position: relative; cursor: pointer; }
+      .chip-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+      .chip {
+        display: inline-block; padding: 4px 10px; border-radius: 12px; border: 1px solid var(--border);
+        color: var(--muted); font-size: 12px;
       }
-      .toolbar button:hover { border-color: var(--accent); }
-      .toolbar button.primary { background: var(--accent); color: var(--accent-text); border: none; font-weight: 600; }
+      .chip-toggle input:checked + .chip, .chip.on { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
 
-      .cfg-status { margin-top: 16px; font-size: 13px; }
-      .cfg-status.ok { color: var(--ok); }
-      .cfg-status.err { color: var(--danger); }
+      /* ── drawer / modal ── */
+      .overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 50; display: flex; }
+      .overlay.center { align-items: center; justify-content: center; }
+      .drawer { margin-left: auto; width: 480px; max-width: 94vw; background: var(--panel); border-left: 1px solid var(--border); height: 100%; display: flex; flex-direction: column; animation: slideIn 0.16s ease-out; }
+      .drawer.wide { width: 720px; max-width: 96vw; }
+      @keyframes slideIn { from { transform: translateX(30px); opacity: 0.4; } to { transform: translateX(0); opacity: 1; } }
+      .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 15px 20px; border-bottom: 1px solid var(--border); }
+      .drawer-head h3 { margin: 0; font-size: 15px; }
+      .drawer-body { flex: 1; overflow-y: auto; padding: 18px 20px; }
+      .drawer-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px; border-top: 1px solid var(--border); }
+      .modal-card { width: 540px; max-width: 94vw; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+      .modal-title { margin: 0 0 8px; font-size: 16px; }
+      .modal-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+      .confirm-text { color: var(--text); font-size: 13.5px; line-height: 1.5; margin: 0; }
 
-      fieldset {
-        border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin: 20px 0 0;
+      /* ── reveal box ── */
+      .reveal-box {
+        margin-top: 12px; background: var(--bg); border: 1px dashed var(--accent); border-radius: 8px;
+        padding: 10px 12px; font-family: var(--mono); font-size: 12px; word-break: break-all;
+        display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--accent);
       }
-      fieldset legend { color: var(--muted); padding: 0 8px; font-size: 12px; }
 
-      .user-form { display: flex; gap: 10px; flex-wrap: wrap; }
-      .user-form input, .user-form select {
-        background: var(--bg); border: 1px solid var(--border); color: var(--text);
-        padding: 8px 10px; border-radius: 6px; flex: 1; min-width: 120px;
+      /* ── toast ── */
+      .toast-wrap { position: fixed; bottom: 18px; right: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 100; }
+      .toast {
+        padding: 10px 16px; border-radius: 8px; background: var(--panel2); border: 1px solid var(--border);
+        font-size: 13px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4); max-width: 400px; animation: fadeUp 0.15s ease-out;
       }
-      .user-form button {
-        background: transparent; border: 1px solid var(--border); color: var(--text);
-        padding: 8px 14px; border-radius: 6px; cursor: pointer; white-space: nowrap;
-      }
-      .user-form button:hover { border-color: var(--accent); }
-      .user-row {
-        display: flex; align-items: center; gap: 10px; padding: 10px 0;
-        border-bottom: 1px solid var(--border); flex-wrap: wrap;
-      }
-      .user-row .who { flex: 1; min-width: 140px; }
-      .user-row .who .name { font-weight: 600; }
-      .user-row .who .sub { color: var(--muted); font-size: 12px; }
-      .user-row select, .user-row input {
-        background: var(--bg); border: 1px solid var(--border); color: var(--text);
-        padding: 5px 8px; border-radius: 6px;
-      }
-      .user-row button {
-        background: transparent; border: 1px solid var(--border); color: var(--text);
-        padding: 5px 10px; border-radius: 6px; cursor: pointer;
-      }
-      .user-row button:hover { border-color: var(--accent); }
-      .user-row button.danger:hover { border-color: var(--danger); color: var(--danger); }
-      .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); }
-      .badge.vip { color: var(--accent); border-color: var(--accent); }
-      .badge.admin { color: var(--danger); border-color: var(--danger); }
-      .badge.inactive { color: var(--danger); border-color: var(--danger); }
+      @keyframes fadeUp { from { transform: translateY(8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+      .toast.ok { border-color: var(--ok); }
+      .toast.err { border-color: var(--danger); }
 
-      .role-card {
-        background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-        padding: 14px; margin-bottom: 12px;
-      }
-      .role-card .head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-      .role-card .head .id { font-weight: 600; }
-      .role-card .head .name { color: var(--muted); font-size: 12px; }
-      .role-card .grid { display: flex; gap: 10px; flex-wrap: wrap; }
-      .role-card .grid .cfg-field { flex: 1; min-width: 120px; margin-bottom: 0; }
+      /* ── misc ── */
+      .empty { color: var(--muted); text-align: center; padding: 40px; font-size: 13px; }
+      .loading { color: var(--muted); text-align: center; padding: 28px; font-size: 13px; }
+      .err-box { background: var(--danger-dim); border: 1px solid var(--danger); color: var(--danger); border-radius: 8px; padding: 12px 14px; font-size: 13px; }
+      .filter-bar { display: flex; gap: 10px; margin-bottom: 14px; align-items: center; flex-wrap: wrap; }
+      .filter-bar input, .filter-bar select { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 7px 10px; border-radius: 6px; font-size: 13px; }
+      .filter-bar input:focus, .filter-bar select:focus { outline: none; border-color: var(--accent); }
+      .test-res { font-size: 12px; margin-top: -8px; margin-bottom: 12px; }
+      .test-res.ok { color: var(--ok); }
+      .test-res.err { color: var(--danger); }
+      .legacy-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-top: 20px; }
+      .section-title { font-size: 14px; font-weight: 600; margin: 22px 0 12px; display: flex; align-items: center; gap: 8px; }
+      .section-title:first-child { margin-top: 0; }
+      .kbd-note { font-size: 12px; color: var(--muted); }
+      .scroll-x { overflow-x: auto; }
 
-      .token-reveal {
-        background: var(--panel); border: 1px solid var(--accent); border-radius: 8px;
-        padding: 12px; margin-top: 10px; word-break: break-all; font-family: monospace;
+      /* ── channel picker / relation cards ── */
+      .channel-picker { max-height: 420px; overflow-y: auto; margin-top: 12px; border: 1px solid var(--border); border-radius: 8px; }
+      .chan-row {
+        display: flex; align-items: center; gap: 12px; padding: 10px 14px; cursor: pointer;
+        border-bottom: 1px solid var(--border); background: var(--panel);
+      }
+      .chan-row:last-child { border-bottom: none; }
+      .chan-row:hover { background: var(--bg2); }
+      .chan-row input[type="checkbox"] { flex: none; }
+      .chan-info { flex: 1; min-width: 0; }
+      .chan-price { flex: none; font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
+      .chan-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; margin-bottom: 18px; }
+      .chan-card {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; cursor: pointer;
+      }
+      .chan-card:hover { border-color: var(--accent); }
+      .chan-card .top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      .rel-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
+      .rel-card h4 { margin: 0 0 10px; font-size: 13.5px; display: flex; align-items: center; gap: 8px; }
+      .detail-row { display: flex; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+      .detail-row:last-child { border-bottom: none; }
+      .detail-row .k { flex: none; width: 120px; color: var(--muted); }
+      .detail-row .v { flex: 1; min-width: 0; word-break: break-word; }
+
+      /* ── theme: light ── */
+      [data-theme="light"] {
+        --bg: #f4f5f7;
+        --bg2: #eceef1;
+        --panel: #ffffff;
+        --panel2: #f2f4f7;
+        --border: #d8dce2;
+        --text: #1f2329;
+        --muted: #5f6773;
+        --accent: #3b6fe0;
+        --accent-dim: rgba(59, 111, 224, 0.10);
+        --accent-text: #ffffff;
+        --danger: #d64545;
+        --danger-dim: rgba(214, 69, 69, 0.10);
+        --ok: #1f9d55;
+        --ok-dim: rgba(31, 157, 85, 0.12);
+        --warn: #b8860b;
+        --gold: #b8860b;
+      }
+      [data-theme="light"] .tbl tbody tr:hover td { background: rgba(0, 0, 0, 0.03); }
+      [data-theme="light"] .switch::after { background: #ffffff; }
+      [data-theme="light"] .overlay { background: rgba(30, 35, 45, 0.4); }
+      [data-theme="light"] .toast { box-shadow: 0 6px 20px rgba(20, 25, 35, 0.12); }
+      [data-theme="light"] .badge.gold { background: rgba(184, 134, 11, 0.10); }
+      [data-theme="light"] .badge.warn { background: rgba(184, 134, 11, 0.10); }
+      [data-theme="light"] .settings-pop { box-shadow: 0 10px 30px rgba(20, 25, 35, 0.12); }
+
+      /* ── settings popover ── */
+      .settings-wrap { position: relative; }
+      .settings-backdrop { position: fixed; inset: 0; z-index: 55; }
+      .settings-pop {
+        position: absolute; top: 44px; right: 0; width: 236px; background: var(--panel);
+        border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+        padding: 8px; z-index: 60;
+      }
+      .settings-title {
+        font-size: 11px; color: var(--muted); padding: 6px 10px 4px;
+        text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
+      }
+      button.settings-row {
+        display: flex; align-items: center; justify-content: space-between; width: 100%;
+        background: transparent; border: none; color: var(--text); font-size: 13px; padding: 7px 10px;
+        border-radius: 6px; cursor: pointer; text-align: left; font-family: inherit;
+      }
+      button.settings-row:hover { background: var(--panel2); }
+      button.settings-row.on { color: var(--accent); font-weight: 600; }
+      button.settings-row .check { visibility: hidden; }
+      button.settings-row.on .check { visibility: visible; }
+      .settings-select {
+        width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+        padding: 7px 10px; border-radius: 6px; font-size: 13px;
       }
     </style>
   </head>
   <body>
-    <div class="wrap">
-      <!-- Login view -->
-      <div id="login-view" class="hidden">
-        <div class="login-card">
-          <h1>DeepDive Admin</h1>
-          <label><span>Username</span><input id="login-user" type="text" autocomplete="username" /></label>
-          <label><span>Password</span><input id="login-pass" type="password" autocomplete="current-password" /></label>
-          <button id="login-btn" type="button">Sign in</button>
-          <p id="login-err" class="err"></p>
-        </div>
-      </div>
-
-      <!-- Dashboard view -->
-      <div id="dash-view" class="hidden">
-        <div class="bar">
-          <div class="brand">
-            <h1>DeepDive Admin</h1>
-            <span class="muted">providers · roles · users · tokens</span>
-          </div>
-          <button id="logout-btn" type="button">Sign out</button>
-        </div>
-
-        <h2>Providers</h2>
-        <div id="cfg-providers"></div>
-        <div class="toolbar">
-          <button id="add-provider" type="button">+ Add provider</button>
-        </div>
-
-        <fieldset>
-          <legend>Web search</legend>
-          <div class="cfg-field">
-            <span>Provider</span>
-            <select id="ws-provider">
-              <option value="tavily">tavily (requires key)</option>
-              <option value="duckduckgo">duckduckgo (no key)</option>
-            </select>
-          </div>
-          <div class="cfg-field">
-            <span>API key</span>
-            <input id="ws-key" type="password" placeholder="Optional; leave empty for duckduckgo" />
-          </div>
-        </fieldset>
-
-        <h2>Roles</h2>
-        <div id="admin-roles"></div>
-
-        <h2>Users</h2>
-        <div class="user-form">
-          <input id="user-username" type="text" placeholder="Username" autocomplete="off" />
-          <input id="user-password" type="password" placeholder="Initial password" autocomplete="off" />
-          <input id="user-display" type="text" placeholder="Display name (optional)" autocomplete="off" />
-          <select id="user-role"></select>
-          <button id="add-user" type="button">+ Add user</button>
-        </div>
-        <p id="users-status" class="cfg-status"></p>
-        <div id="admin-users"></div>
-
-        <h2>Tokens</h2>
-        <div class="user-form">
-          <input id="token-name" type="text" placeholder="Token name" autocomplete="off" />
-          <select id="token-role">
-            <option value="user">user</option>
-            <option value="admin">admin</option>
-          </select>
-          <input id="token-user" type="text" placeholder="User ID (user tokens)" autocomplete="off" />
-          <select id="token-role-id"><option value="">(use user's role)</option></select>
-          <input id="token-expires" type="datetime-local" title="Expiry (optional)" />
-          <button id="add-token" type="button">+ Create token</button>
-        </div>
-        <p id="tokens-status" class="cfg-status"></p>
-        <div id="token-reveal" class="hidden"></div>
-        <div id="admin-tokens"></div>
-
-        <h2>Models</h2>
-        <div class="user-form">
-          <input id="model-name" type="text" placeholder="Model name (e.g. gpt-4o-mini)" autocomplete="off" />
-          <input id="model-prompt-price" type="number" step="0.000001" placeholder="Prompt $/1k" autocomplete="off" />
-          <input id="model-completion-price" type="number" step="0.000001" placeholder="Completion $/1k" autocomplete="off" />
-          <input id="model-description" type="text" placeholder="Description (optional)" autocomplete="off" />
-          <button id="add-model" type="button">+ Add model</button>
-        </div>
-        <p id="models-status" class="cfg-status"></p>
-        <div id="admin-models"></div>
-
-        <h2>Wallets</h2>
-        <div class="user-form">
-          <input id="wallet-user" type="text" placeholder="User ID" autocomplete="off" />
-          <input id="wallet-amount" type="number" step="0.000001" placeholder="Amount (USD)" autocomplete="off" />
-          <input id="wallet-desc" type="text" placeholder="Note (optional)" autocomplete="off" />
-          <button id="topup-btn" type="button">+ Top up</button>
-        </div>
-        <p id="wallets-status" class="cfg-status"></p>
-        <div id="admin-wallets"></div>
-
-        <div class="toolbar">
-          <button class="primary" id="save-btn" type="button">Save providers</button>
-        </div>
-        <p id="cfg-status" class="cfg-status"></p>
+    <!-- Login view -->
+    <div id="login-view" class="hidden">
+      <div class="login-card">
+        <h1>DeepDive Admin</h1>
+        <label><span>Username</span><input id="login-user" type="text" autocomplete="username" /></label>
+        <label><span>Password</span><input id="login-pass" type="password" autocomplete="current-password" /></label>
+        <button id="login-btn" type="button">Sign in</button>
+        <p id="login-err" class="err"></p>
       </div>
     </div>
+
+    <!-- App view -->
+    <div id="app-view" class="hidden">
+      <div class="app">
+        <div class="topbar">
+          <div class="brand">
+            <div class="logo">DD</div>
+            <span>DeepDive Admin</span>
+          </div>
+          <div class="right">
+            <div class="settings-wrap">
+              <button id="settings-btn" class="icon-btn" title="Theme & font size" type="button">⚙</button>
+              <div class="settings-backdrop hidden" id="settings-backdrop"></div>
+              <div class="settings-pop hidden" id="settings-pop">
+                <div class="settings-title">Theme</div>
+                <button class="settings-row" type="button" data-theme-opt="dark"><span>Dark</span><span class="check">✓</span></button>
+                <button class="settings-row" type="button" data-theme-opt="light"><span>Light</span><span class="check">✓</span></button>
+                <button class="settings-row" type="button" data-theme-opt="system"><span>Follow System</span><span class="check">✓</span></button>
+                <div class="settings-title">Font size</div>
+                <select id="settings-font" class="settings-select">
+                  <option value="12">12 px</option>
+                  <option value="13">13 px</option>
+                  <option value="14">14 px</option>
+                  <option value="15">15 px</option>
+                  <option value="16">16 px</option>
+                  <option value="17">17 px</option>
+                  <option value="18">18 px</option>
+                </select>
+              </div>
+            </div>
+            <button id="refresh-btn" class="icon-btn" title="Refresh page">⟳</button>
+            <div class="admin-chip">
+              <span class="avatar" id="admin-avatar">A</span>
+              <span id="admin-name"></span>
+            </div>
+            <button id="logout-btn" class="btn ghost" type="button">Sign out</button>
+          </div>
+        </div>
+        <div class="body">
+          <div class="sidenav">
+            <div class="nav-item" data-page="providers">Providers</div>
+            <div class="nav-item" data-page="roles">Roles</div>
+            <div class="nav-item" data-page="users">Users</div>
+            <div class="nav-item" data-page="tokens">Tokens</div>
+          </div>
+          <div class="content" id="content"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast-wrap" id="toasts"></div>
 
     <script>
       (() => {
         const TOKEN_KEY = "deepdive_admin_token";
         const loginView = document.getElementById("login-view");
-        const dashView = document.getElementById("dash-view");
-        const cfgProvidersEl = document.getElementById("cfg-providers");
-        const wsProviderEl = document.getElementById("ws-provider");
-        const wsKeyEl = document.getElementById("ws-key");
-        const cfgStatus = document.getElementById("cfg-status");
+        const appView = document.getElementById("app-view");
+        const content = document.getElementById("content");
 
-        const userUsernameEl = document.getElementById("user-username");
-        const userPasswordEl = document.getElementById("user-password");
-        const userDisplayEl = document.getElementById("user-display");
-        const userRoleEl = document.getElementById("user-role");
-        const adminUsersEl = document.getElementById("admin-users");
-        const usersStatus = document.getElementById("users-status");
+        // ───────────────────────── shared state ─────────────────────────
+        const state = {};
 
-        const adminRolesEl = document.getElementById("admin-roles");
-        const tokenNameEl = document.getElementById("token-name");
-        const tokenRoleEl = document.getElementById("token-role");
-        const tokenUserEl = document.getElementById("token-user");
-        const tokenRoleIdEl = document.getElementById("token-role-id");
-        const tokenExpiresEl = document.getElementById("token-expires");
-        const adminTokensEl = document.getElementById("admin-tokens");
-        const tokensStatus = document.getElementById("tokens-status");
-        const tokenRevealEl = document.getElementById("token-reveal");
+        // ───────────────────────── appearance (theme + font size) ─────────────────────────
+        const THEME_KEY = "deepdive_admin_theme";
+        const FONT_KEY = "deepdive_admin_fontsize";
 
-        const modelNameEl = document.getElementById("model-name");
-        const modelPromptEl = document.getElementById("model-prompt-price");
-        const modelCompletionEl = document.getElementById("model-completion-price");
-        const modelDescEl = document.getElementById("model-description");
-        const adminModelsEl = document.getElementById("admin-models");
-        const modelsStatus = document.getElementById("models-status");
+        function readPref(key, fallback) {
+          try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
+        }
+        function writePref(key, val) {
+          try { localStorage.setItem(key, val); } catch { /* ignore */ }
+        }
+        function effectiveTheme(t) {
+          if (t !== "system") return t;
+          try { return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; }
+          catch { return "dark"; }
+        }
+        function applyTheme(t) {
+          document.documentElement.dataset.theme = effectiveTheme(t);
+          document.querySelectorAll("[data-theme-opt]").forEach((b) => {
+            b.classList.toggle("on", b.dataset.themeOpt === t);
+          });
+        }
+        function applyFontSize(px) {
+          document.documentElement.style.setProperty("zoom", String(px / 14));
+        }
 
-        const walletUserEl = document.getElementById("wallet-user");
-        const walletAmountEl = document.getElementById("wallet-amount");
-        const walletDescEl = document.getElementById("wallet-desc");
-        const adminWalletsEl = document.getElementById("admin-wallets");
-        const walletsStatus = document.getElementById("wallets-status");
+        let theme = readPref(THEME_KEY, "dark");
+        let fontSize = parseInt(readPref(FONT_KEY, "14"), 10) || 14;
+        try {
+          applyTheme(theme);
+          applyFontSize(fontSize);
+          const sel = document.getElementById("settings-font");
+          if (sel) sel.value = String(fontSize);
+        } catch { /* ignore */ }
 
-        let providers = [];
-        let activeProviderId = "";
-        let roles = [];
+        // ───────────────────────── dom helpers ─────────────────────────
+        const $ = (sel) => document.querySelector(sel);
 
-        const token = () => localStorage.getItem(TOKEN_KEY) || "";
+        function el(tag, cls, text) {
+          const node = document.createElement(tag);
+          if (cls) node.className = cls;
+          if (text !== undefined && text !== null) node.textContent = text;
+          return node;
+        }
+
+        function td(content) {
+          const c = el("td");
+          if (content == null) return c;
+          if (typeof content === "string") c.textContent = content;
+          else c.appendChild(content);
+          return c;
+        }
+
+        function textInput(value, opts = {}) {
+          const i = el("input");
+          i.type = opts.type || "text";
+          i.value = value ?? "";
+          if (opts.placeholder) i.placeholder = opts.placeholder;
+          if (opts.autocomplete) i.autocomplete = opts.autocomplete;
+          return i;
+        }
+
+        function numInput(value, opts = {}) {
+          const i = textInput(value == null ? "" : String(value), opts);
+          i.type = "number";
+          i.step = opts.step || "1";
+          return i;
+        }
+
+        function select(options, value) {
+          const s = el("select");
+          for (const o of options) {
+            const opt = el("option", "", o.label);
+            opt.value = o.value;
+            if (String(o.value) === String(value)) opt.selected = true;
+            s.appendChild(opt);
+          }
+          return s;
+        }
+
+        function field(labelText, input, hint) {
+          const label = el("label", "field");
+          label.appendChild(el("span", "", labelText));
+          label.appendChild(input);
+          if (hint) label.appendChild(el("div", "hint", hint));
+          return label;
+        }
+
+        function badge(text, kind) {
+          return el("span", "badge" + (kind ? " " + kind : ""), text);
+        }
+
+        function switchToggle(checked, onChange) {
+          const b = el("button", "switch" + (checked ? " on" : ""));
+          b.type = "button";
+          b.onclick = () => {
+            b.classList.toggle("on");
+            if (onChange) onChange(b.classList.contains("on"));
+          };
+          return b;
+        }
+
+        function actionBtns(actions) {
+          const div = el("div", "row-actions");
+          for (const a of actions) {
+            const b = el("button", "btn sm" + (a.danger ? " danger" : " ghost"), a.label);
+            b.type = "button";
+            b.onclick = a.onClick;
+            div.appendChild(b);
+          }
+          return div;
+        }
+
+        function table(headers) {
+          const wrap = el("div", "tbl-wrap scroll-x");
+          const t = el("table", "tbl");
+          const thead = el("thead");
+          const hr = el("tr");
+          for (const h of headers) hr.appendChild(el("th", "", h));
+          thead.appendChild(hr);
+          t.appendChild(thead);
+          const tbody = el("tbody");
+          t.appendChild(tbody);
+          wrap.appendChild(t);
+          return { wrap, tbody };
+        }
+
+        function emptyState(text) {
+          return el("div", "empty", text);
+        }
+
+        function errBox(err) {
+          const box = el("div", "err-box");
+          box.textContent = "Failed to load: " + (err && err.message ? err.message : err);
+          return box;
+        }
+
+        function maskKey(s) {
+          if (!s) return "not set";
+          if (s.length <= 8) return "•".repeat(s.length);
+          return s.slice(0, 4) + "••••" + s.slice(-4);
+        }
+
+        // ───────────────────────── api ─────────────────────────
+        function token() { return localStorage.getItem(TOKEN_KEY) || ""; }
 
         async function apiFetch(path, opts = {}) {
           const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
-          if (token()) headers.Authorization = `Bearer ${token()}`;
+          if (token()) headers.Authorization = "Bearer " + token();
           const res = await fetch(path, { ...opts, headers });
-          if (res.status === 401) { showLogin(); throw new Error("Unauthorized"); }
-          if (!res.ok) {
-            const body = await res.text().catch(() => "");
-            throw new Error(`${res.status} ${res.statusText}: ${body}`);
+          if (res.status === 401) {
+            localStorage.removeItem(TOKEN_KEY);
+            showLogin();
+            throw new Error("Session expired — sign in again");
           }
-          return res.json();
+          let data = null;
+          try { data = await res.json(); } catch { /* non-JSON body */ }
+          if (!res.ok) {
+            const detail = data && (data.detail || data.message);
+            const msg = typeof detail === "string" ? detail : (res.statusText || "Request failed");
+            throw new Error(res.status + ": " + msg);
+          }
+          return data;
         }
 
-        function setStatus(text, cls) {
-          cfgStatus.textContent = text;
-          cfgStatus.className = "cfg-status" + (cls ? " " + cls : "");
+        // ───────────────────────── toast / dialogs ─────────────────────────
+        function toast(msg, kind) {
+          const wrap = document.getElementById("toasts");
+          const t = el("div", "toast" + (kind ? " " + kind : ""), msg);
+          wrap.appendChild(t);
+          setTimeout(() => t.remove(), 3800);
         }
 
+        async function copyText(text) {
+          try {
+            await navigator.clipboard.writeText(text);
+            return true;
+          } catch {
+            try {
+              const ta = document.createElement("textarea");
+              ta.value = text;
+              ta.style.position = "fixed";
+              ta.style.opacity = "0";
+              document.body.appendChild(ta);
+              ta.select();
+              document.execCommand("copy");
+              ta.remove();
+              return true;
+            } catch { return false; }
+          }
+        }
+
+        function confirmDialog(message, title) {
+          return new Promise((resolve) => {
+            const overlay = el("div", "overlay center");
+            const card = el("div", "modal-card");
+            if (title) card.appendChild(el("h3", "modal-title", title));
+            card.appendChild(el("p", "confirm-text", message));
+            const foot = el("div", "modal-foot");
+            const cancel = el("button", "btn", "Cancel");
+            const ok = el("button", "btn danger", "Delete");
+            cancel.onclick = () => { overlay.remove(); resolve(false); };
+            ok.onclick = () => { overlay.remove(); resolve(true); };
+            foot.append(cancel, ok);
+            card.appendChild(foot);
+            overlay.appendChild(card);
+            document.body.appendChild(overlay);
+            overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") { overlay.remove(); resolve(false); } });
+            setTimeout(() => ok.focus(), 0);
+          });
+        }
+
+        function openDrawer({ title, subtitle, width, body, footer, onClose }) {
+          const overlay = el("div", "overlay");
+          const drawer = el("div", "drawer" + (width === "wide" ? " wide" : ""));
+          const head = el("div", "drawer-head");
+          const t = el("h3", "", title);
+          if (subtitle) t.appendChild(el("div", "cell-sub", subtitle));
+          head.appendChild(t);
+          const closeBtn = el("button", "icon-btn", "✕");
+          closeBtn.title = "Close (Esc)";
+          closeBtn.onclick = close;
+          head.appendChild(closeBtn);
+          const bodyEl = el("div", "drawer-body");
+          bodyEl.appendChild(body);
+          drawer.append(head, bodyEl);
+          if (footer) drawer.appendChild(footer);
+          overlay.appendChild(drawer);
+          document.body.appendChild(overlay);
+          const esc = (e) => { if (e.key === "Escape") close(); };
+          document.addEventListener("keydown", esc);
+          function close() {
+            document.removeEventListener("keydown", esc);
+            overlay.remove();
+            if (onClose) onClose();
+          }
+          return { close };
+        }
+
+        function drawerFoot() { return el("div", "drawer-foot"); }
+
+        // ───────────────────────── formatting ─────────────────────────
+        function fmtDate(s) {
+          if (!s) return "—";
+          const d = new Date(s);
+          return isNaN(d) ? "—" : d.toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+        }
+        function fmtMoney(n) {
+          if (n == null) return "—";
+          const v = Number(n);
+          return "$" + (v % 1 === 0 ? v.toFixed(0) : v.toFixed(4).replace(/0+$/, "").replace(/\.$/, ""));
+        }
+        function infOr(n) { return n === -1 || n === null || n === undefined ? "∞" : String(n); }
+        function limitChip(label, value) {
+          const c = el("span", "mini-chip", label + " ");
+          c.appendChild(el("b", "", infOr(value)));
+          return c;
+        }
+        function roleKind(roleId) {
+          if (roleId === "admin") return "danger";
+          if (roleId === "vip") return "gold";
+          if (roleId === "pro") return "accent";
+          return "";
+        }
+        function roleBadge(roleId) {
+          return badge(roleId, roleKind(roleId));
+        }
+        function expired(d) {
+          return d && new Date(d).getTime() < Date.now();
+        }
+
+        // ───────────────────────── auth / boot ─────────────────────────
         function showLogin() {
           loginView.classList.remove("hidden");
-          dashView.classList.add("hidden");
+          appView.classList.add("hidden");
         }
-        function showDash() {
+        function showApp() {
           loginView.classList.add("hidden");
-          dashView.classList.remove("hidden");
+          appView.classList.remove("hidden");
         }
 
         async function login() {
           const username = document.getElementById("login-user").value.trim();
           const password = document.getElementById("login-pass").value;
-          document.getElementById("login-err").textContent = "";
+          const errEl = document.getElementById("login-err");
+          errEl.textContent = "";
           try {
             const res = await fetch("/admin/login", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ username, password }),
             });
-            if (!res.ok) throw new Error("Invalid credentials");
-            const data = await res.json();
+            let data = null;
+            try { data = await res.json(); } catch {}
+            if (!res.ok) {
+              const msg = data && typeof data.detail === "string" ? data.detail : "Invalid credentials";
+              throw new Error(msg);
+            }
             localStorage.setItem(TOKEN_KEY, data.access_token);
             await boot();
           } catch (err) {
-            document.getElementById("login-err").textContent = err.message;
+            errEl.textContent = err.message;
           }
         }
 
@@ -352,712 +714,1623 @@
           showLogin();
         }
 
-        // ── provider cards ──
-        function field(labelText, input) {
-          const label = document.createElement("label");
-          label.className = "cfg-field";
-          const span = document.createElement("span");
-          span.textContent = labelText;
-          label.append(span, input);
-          return label;
-        }
-
-        function providerCard(p) {
-          const card = document.createElement("div");
-          card.className = "provider-card";
-
-          const head = document.createElement("div");
-          head.className = "provider-head";
-
-          const radio = document.createElement("input");
-          radio.type = "radio";
-          radio.name = "active";
-          radio.checked = p.id === activeProviderId;
-          radio.title = "Use this provider";
-          radio.addEventListener("change", () => { activeProviderId = p.id; });
-          head.appendChild(radio);
-
-          const nameInput = document.createElement("input");
-          nameInput.type = "text";
-          nameInput.placeholder = "Name";
-          nameInput.value = p.name || "";
-          nameInput.addEventListener("input", () => { p.name = nameInput.value; });
-          head.appendChild(nameInput);
-
-          const del = document.createElement("button");
-          del.type = "button";
-          del.className = "del";
-          del.textContent = "✕";
-          del.title = "Delete provider";
-          del.addEventListener("click", () => {
-            providers = providers.filter((x) => x !== p);
-            if (activeProviderId === p.id) activeProviderId = providers[0]?.id || "";
-            renderProviders();
+        // ───────────────────────── router ─────────────────────────
+        function navigate() {
+          const page = location.hash.replace(/^#\/?/, "") || "providers";
+          document.querySelectorAll(".nav-item").forEach((n) => {
+            n.classList.toggle("active", n.dataset.page === page);
           });
-          head.appendChild(del);
-          card.appendChild(head);
-
-          const baseInput = document.createElement("input");
-          baseInput.type = "text";
-          baseInput.placeholder = "Base URL (e.g. https://api.deepseek.com/v1)";
-          baseInput.value = p.base_url || "";
-          baseInput.addEventListener("input", () => { p.base_url = baseInput.value; });
-          card.appendChild(field("Base URL", baseInput));
-
-          const keyInput = document.createElement("input");
-          keyInput.type = "password";
-          keyInput.placeholder = p.api_key_set ? "Configured — leave empty to keep" : "API key";
-          keyInput.autocomplete = "off";
-          keyInput.addEventListener("input", () => { p.api_key = keyInput.value.trim(); });
-          card.appendChild(field("API Key", keyInput));
-
-          const modelRow = document.createElement("div");
-          modelRow.className = "cfg-model-row";
-
-          const select = document.createElement("select");
-          const ensureModel = () => {
-            if (p.model && !p.models.includes(p.model)) p.models.push(p.model);
-            select.innerHTML = "";
-            for (const m of p.models) {
-              const opt = document.createElement("option");
-              opt.value = m;
-              opt.textContent = m;
-              if (m === p.model) opt.selected = true;
-              select.appendChild(opt);
-            }
-            if (!p.models.length) {
-              const opt = document.createElement("option");
-              opt.value = "";
-              opt.textContent = "No models";
-              select.appendChild(opt);
-            }
+          const renderers = {
+            providers: renderProvidersPage,
+            roles: renderRolesPage,
+            users: renderUsersPage,
+            tokens: renderTokensPage,
           };
-          ensureModel();
-          select.addEventListener("change", () => { p.model = select.value; });
-          modelRow.appendChild(field("Model", select));
-
-          const addModel = document.createElement("input");
-          addModel.type = "text";
-          addModel.placeholder = "Add model id…";
-          addModel.addEventListener("keydown", (e) => {
-            if (e.key !== "Enter") return;
-            const id = addModel.value.trim();
-            if (!id) return;
-            if (!p.models.includes(id)) p.models.push(id);
-            p.model = id;
-            renderProviders();
-          });
-          modelRow.appendChild(field("Add model", addModel));
-
-          const fetchBtn = document.createElement("button");
-          fetchBtn.type = "button";
-          fetchBtn.textContent = "Fetch";
-          fetchBtn.title = "Fetch model list from the endpoint";
-          fetchBtn.addEventListener("click", async () => {
-            fetchBtn.textContent = "…";
-            try {
-              const data = await apiFetch("/config/probe-models", {
-                method: "POST",
-                body: JSON.stringify({ base_url: p.base_url, api_key: p.api_key }),
-              });
-              for (const id of data.models) if (!p.models.includes(id)) p.models.push(id);
-              if (!p.model && data.models.length) p.model = data.models[0];
-              renderProviders();
-            } catch (err) {
-              setStatus(`Fetch failed: ${err.message}`, "err");
-              fetchBtn.textContent = "Fetch";
-            }
-          });
-          modelRow.appendChild(fetchBtn);
-
-          card.appendChild(modelRow);
-          return card;
-        }
-
-        function renderProviders() {
-          cfgProvidersEl.innerHTML = "";
-          for (const p of providers) cfgProvidersEl.appendChild(providerCard(p));
-        }
-
-        function newProvider() {
-          return {
-            id: crypto.randomUUID(), name: "", base_url: "", api_key: "",
-            api_key_set: false, models: [], model: "",
-          };
-        }
-
-        // ── Roles ──
-        function roleOptions(selected) {
-          const opts = [];
-          for (const r of roles) {
-            const opt = document.createElement("option");
-            opt.value = r.role_id;
-            opt.textContent = `${r.role_id} (${r.role_name})`;
-            if (r.role_id === selected) opt.selected = true;
-            opts.push(opt);
-          }
-          return opts;
-        }
-
-        function renderRoleSelects() {
-          userRoleEl.innerHTML = "";
-          for (const opt of roleOptions(roles[0]?.role_id)) userRoleEl.appendChild(opt);
-
-          tokenRoleIdEl.innerHTML = "<option value=\"\">(use user's role)</option>";
-          for (const r of roles) {
-            const opt = document.createElement("option");
-            opt.value = r.role_id;
-            opt.textContent = r.role_id;
-            tokenRoleIdEl.appendChild(opt);
-          }
-        }
-
-        function roleCard(r) {
-          const card = document.createElement("div");
-          card.className = "role-card";
-
-          const head = document.createElement("div");
-          head.className = "head";
-          const id = document.createElement("span");
-          id.className = "id";
-          id.textContent = r.role_id;
-          const name = document.createElement("span");
-          name.className = "name";
-          name.textContent = r.role_name;
-          head.append(id, name);
-          card.appendChild(head);
-
-          const grid = document.createElement("div");
-          grid.className = "grid";
-
-          const daily = document.createElement("input");
-          daily.type = "number";
-          daily.value = r.daily_request_limit ?? -1;
-          grid.appendChild(field("Daily requests (-1 = ∞)", daily));
-
-          const monthly = document.createElement("input");
-          monthly.type = "number";
-          monthly.value = r.monthly_request_limit ?? -1;
-          grid.appendChild(field("Monthly requests (-1 = ∞)", monthly));
-
-          const model = document.createElement("input");
-          model.type = "text";
-          model.placeholder = "blank = active provider";
-          model.value = r.default_model || "";
-          grid.appendChild(field("Default model", model));
-
-          const save = document.createElement("button");
-          save.textContent = "Save";
-          save.addEventListener("click", async () => {
-            save.textContent = "…";
-            try {
-              await apiFetch(`/admin/roles/${r.role_id}`, {
-                method: "PATCH",
-                body: JSON.stringify({
-                  daily_request_limit: parseInt(daily.value || "-1", 10),
-                  monthly_request_limit: parseInt(monthly.value || "-1", 10),
-                  default_model: model.value.trim(),
-                }),
-              });
-              setStatus(`Role "${r.role_id}" saved`, "ok");
-            } catch (err) {
-              setStatus(`Role save failed: ${err.message}`, "err");
-            }
-            save.textContent = "Save";
-          });
-          grid.appendChild(field("", save));
-          card.appendChild(grid);
-          return card;
-        }
-
-        function renderRoles() {
-          adminRolesEl.innerHTML = "";
-          for (const r of roles) adminRolesEl.appendChild(roleCard(r));
-          renderRoleSelects();
-        }
-
-        // ── Users ──
-        function setUsersStatus(text, cls) {
-          usersStatus.textContent = text;
-          usersStatus.className = "cfg-status" + (cls ? " " + cls : "");
-        }
-
-        function userRow(u) {
-          const row = document.createElement("div");
-          row.className = "user-row";
-
-          const who = document.createElement("div");
-          who.className = "who";
-          const name = document.createElement("div");
-          name.className = "name";
-          name.textContent = u.username + (u.display_name ? ` (${u.display_name})` : "");
-          const sub = document.createElement("div");
-          sub.className = "sub";
-          sub.textContent = `created ${u.created_at ? new Date(u.created_at).toLocaleString() : ""}`;
-          who.append(name, sub);
-          row.appendChild(who);
-
-          const badge = document.createElement("span");
-          badge.className = "badge" + (u.role_id === "vip" || u.role_id === "admin" ? " admin" : "");
-          badge.textContent = u.role_id;
-          row.appendChild(badge);
-
-          if (!u.is_active) {
-            const inactive = document.createElement("span");
-            inactive.className = "badge inactive";
-            inactive.textContent = "inactive";
-            row.appendChild(inactive);
-          }
-
-          const roleSelect = document.createElement("select");
-          for (const opt of roleOptions(u.role_id)) roleSelect.appendChild(opt);
-          roleSelect.addEventListener("change", async () => {
-            await updateUser(u.id, { role_id: roleSelect.value });
-          });
-          row.appendChild(roleSelect);
-
-          const toggleBtn = document.createElement("button");
-          toggleBtn.textContent = u.is_active ? "Disable" : "Enable";
-          toggleBtn.addEventListener("click", async () => {
-            await updateUser(u.id, { is_active: !u.is_active });
-          });
-          row.appendChild(toggleBtn);
-
-          const del = document.createElement("button");
-          del.className = "danger";
-          del.textContent = "Delete";
-          del.addEventListener("click", async () => {
-            if (!confirm(`Delete user "${u.username}"?`)) return;
-            await apiFetch(`/admin/users/${u.id}`, { method: "DELETE" });
-            loadUsers();
-          });
-          row.appendChild(del);
-
-          return row;
-        }
-
-        async function loadUsers() {
-          setUsersStatus("");
-          try {
-            const data = await apiFetch("/admin/users");
-            adminUsersEl.innerHTML = "";
-            if (!data.users.length) {
-              adminUsersEl.innerHTML = '<div class="muted">No users yet.</div>';
-              return;
-            }
-            for (const u of data.users) adminUsersEl.appendChild(userRow(u));
-          } catch (err) {
-            setUsersStatus(`Failed to load users: ${err.message}`, "err");
-          }
-        }
-
-        async function createUser() {
-          const username = userUsernameEl.value.trim();
-          const password = userPasswordEl.value;
-          if (!username || !password) {
-            setUsersStatus("Username and password are required", "err");
-            return;
-          }
-          setUsersStatus("");
-          try {
-            await apiFetch("/admin/users", {
-              method: "POST",
-              body: JSON.stringify({
-                username,
-                password,
-                display_name: userDisplayEl.value.trim() || undefined,
-                role_id: userRoleEl.value,
-              }),
-            });
-            userUsernameEl.value = "";
-            userPasswordEl.value = "";
-            userDisplayEl.value = "";
-            loadUsers();
-          } catch (err) {
-            setUsersStatus(`Create failed: ${err.message}`, "err");
-          }
-        }
-
-        async function updateUser(id, patch) {
-          setUsersStatus("");
-          try {
-            await apiFetch(`/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
-            loadUsers();
-          } catch (err) {
-            setUsersStatus(`Update failed: ${err.message}`, "err");
-          }
-        }
-
-        // ── Tokens ──
-        function setTokensStatus(text, cls) {
-          tokensStatus.textContent = text;
-          tokensStatus.className = "cfg-status" + (cls ? " " + cls : "");
-        }
-
-        function tokenRow(t) {
-          const row = document.createElement("div");
-          row.className = "user-row";
-
-          const who = document.createElement("div");
-          who.className = "who";
-          const name = document.createElement("div");
-          name.className = "name";
-          name.textContent = t.name;
-          const sub = document.createElement("div");
-          sub.className = "sub";
-          sub.textContent = [
-            t.role,
-            t.role_id ? `role=${t.role_id}` : "",
-            t.user_id ? `user=${t.user_id.slice(0, 8)}` : "",
-            t.expires_at ? `expires ${new Date(t.expires_at).toLocaleString()}` : "no expiry",
-          ].filter(Boolean).join(" · ");
-          who.append(name, sub);
-          row.appendChild(who);
-
-          const badge = document.createElement("span");
-          badge.className = "badge" + (t.role === "admin" ? " admin" : "");
-          badge.textContent = t.role;
-          row.appendChild(badge);
-
-          if (!t.is_active) {
-            const inactive = document.createElement("span");
-            inactive.className = "badge inactive";
-            inactive.textContent = "revoked";
-            row.appendChild(inactive);
-          }
-
-          const toggleBtn = document.createElement("button");
-          toggleBtn.textContent = t.is_active ? "Revoke" : "Enable";
-          toggleBtn.addEventListener("click", async () => {
-            await apiFetch(`/admin/tokens/${t.id}`, {
-              method: "PATCH",
-              body: JSON.stringify({ is_active: !t.is_active }),
-            });
-            loadTokens();
-          });
-          row.appendChild(toggleBtn);
-
-          const del = document.createElement("button");
-          del.className = "danger";
-          del.textContent = "Delete";
-          del.addEventListener("click", async () => {
-            if (!confirm(`Delete token "${t.name}"?`)) return;
-            await apiFetch(`/admin/tokens/${t.id}`, { method: "DELETE" });
-            loadTokens();
-          });
-          row.appendChild(del);
-
-          return row;
-        }
-
-        async function loadTokens() {
-          setTokensStatus("");
-          try {
-            const data = await apiFetch("/admin/tokens");
-            adminTokensEl.innerHTML = "";
-            if (!data.tokens.length) {
-              adminTokensEl.innerHTML = '<div class="muted">No tokens yet.</div>';
-              return;
-            }
-            for (const t of data.tokens) adminTokensEl.appendChild(tokenRow(t));
-          } catch (err) {
-            setTokensStatus(`Failed to load tokens: ${err.message}`, "err");
-          }
-        }
-
-        async function createToken() {
-          const name = tokenNameEl.value.trim();
-          if (!name) {
-            setTokensStatus("Token name is required", "err");
-            return;
-          }
-          setTokensStatus("");
-          tokenRevealEl.classList.add("hidden");
-          const role = tokenRoleEl.value;
-          const payload = {
-            name,
-            role,
-            user_id: tokenUserEl.value.trim() || undefined,
-            role_id: tokenRoleIdEl.value || undefined,
-            expires_at: tokenExpiresEl.value ? new Date(tokenExpiresEl.value).toISOString() : undefined,
-          };
-          try {
-            const data = await apiFetch("/admin/tokens", {
-              method: "POST",
-              body: JSON.stringify(payload),
-            });
-            tokenNameEl.value = "";
-            tokenUserEl.value = "";
-            tokenRoleIdEl.value = "";
-            tokenExpiresEl.value = "";
-            tokenRevealEl.classList.remove("hidden");
-            tokenRevealEl.textContent = `Copy this token now (shown once): ${data.token}`;
-            loadTokens();
-          } catch (err) {
-            setTokensStatus(`Create failed: ${err.message}`, "err");
-          }
-        }
-
-        // ── Models ──
-        function setModelsStatus(text, cls) {
-          modelsStatus.textContent = text;
-          modelsStatus.className = "cfg-status" + (cls ? " " + cls : "");
-        }
-
-        function modelRow(m) {
-          const row = document.createElement("div");
-          row.className = "user-row";
-
-          const who = document.createElement("div");
-          who.className = "who";
-          const name = document.createElement("div");
-          name.className = "name";
-          name.textContent = m.name;
-          const sub = document.createElement("div");
-          sub.className = "sub";
-          sub.textContent = [m.description, m.is_active ? "" : "inactive", m.created_at ? `created ${new Date(m.created_at).toLocaleString()}` : ""].filter(Boolean).join(" · ");
-          who.append(name, sub);
-          row.appendChild(who);
-
-          const promptInput = document.createElement("input");
-          promptInput.type = "number";
-          promptInput.step = "0.000001";
-          promptInput.value = m.prompt_price_per_1k ?? 0;
-          promptInput.title = "Prompt $/1k";
-          row.appendChild(promptInput);
-
-          const completionInput = document.createElement("input");
-          completionInput.type = "number";
-          completionInput.step = "0.000001";
-          completionInput.value = m.completion_price_per_1k ?? 0;
-          completionInput.title = "Completion $/1k";
-          row.appendChild(completionInput);
-
-          const save = document.createElement("button");
-          save.textContent = "Save";
-          save.addEventListener("click", async () => {
-            save.textContent = "…";
-            try {
-              await apiFetch(`/admin/models/${m.id}`, {
-                method: "PATCH",
-                body: JSON.stringify({
-                  prompt_price_per_1k: parseFloat(promptInput.value || "0"),
-                  completion_price_per_1k: parseFloat(completionInput.value || "0"),
-                }),
-              });
-              setModelsStatus(`Model "${m.name}" saved`, "ok");
-            } catch (err) {
-              setModelsStatus(`Save failed: ${err.message}`, "err");
-            }
-            save.textContent = "Save";
-          });
-          row.appendChild(save);
-
-          const del = document.createElement("button");
-          del.className = "danger";
-          del.textContent = "Delete";
-          del.addEventListener("click", async () => {
-            if (!confirm(`Delete model "${m.name}"?`)) return;
-            await apiFetch(`/admin/models/${m.id}`, { method: "DELETE" });
-            loadModels();
-          });
-          row.appendChild(del);
-
-          return row;
-        }
-
-        async function loadModels() {
-          setModelsStatus("");
-          try {
-            const data = await apiFetch("/admin/models");
-            adminModelsEl.innerHTML = "";
-            if (!data.models.length) {
-              adminModelsEl.innerHTML = '<div class="muted">No models yet — add models to enable PAYG billing.</div>';
-              return;
-            }
-            for (const m of data.models) adminModelsEl.appendChild(modelRow(m));
-          } catch (err) {
-            setModelsStatus(`Failed to load models: ${err.message}`, "err");
-          }
-        }
-
-        async function createModel() {
-          const name = modelNameEl.value.trim();
-          if (!name) {
-            setModelsStatus("Model name is required", "err");
-            return;
-          }
-          setModelsStatus("");
-          try {
-            await apiFetch("/admin/models", {
-              method: "POST",
-              body: JSON.stringify({
-                name,
-                prompt_price_per_1k: parseFloat(modelPromptEl.value || "0"),
-                completion_price_per_1k: parseFloat(modelCompletionEl.value || "0"),
-                description: modelDescEl.value.trim() || undefined,
-              }),
-            });
-            modelNameEl.value = "";
-            modelPromptEl.value = "";
-            modelCompletionEl.value = "";
-            modelDescEl.value = "";
-            loadModels();
-          } catch (err) {
-            setModelsStatus(`Create failed: ${err.message}`, "err");
-          }
-        }
-
-        // ── Wallets ──
-        function setWalletsStatus(text, cls) {
-          walletsStatus.textContent = text;
-          walletsStatus.className = "cfg-status" + (cls ? " " + cls : "");
-        }
-
-        function walletRow(w) {
-          const row = document.createElement("div");
-          row.className = "user-row";
-
-          const who = document.createElement("div");
-          who.className = "who";
-          const name = document.createElement("div");
-          name.className = "name";
-          name.textContent = w.username || w.user_id.slice(0, 8);
-          const sub = document.createElement("div");
-          sub.className = "sub";
-          sub.textContent = `${Number(w.balance).toFixed(6)} ${w.currency} · id ${w.user_id}`;
-          who.append(name, sub);
-          row.appendChild(who);
-
-          const amountInput = document.createElement("input");
-          amountInput.type = "number";
-          amountInput.step = "0.000001";
-          amountInput.placeholder = "Amount";
-          row.appendChild(amountInput);
-
-          const topupBtn = document.createElement("button");
-          topupBtn.textContent = "Top up";
-          topupBtn.addEventListener("click", async () => {
-            const amount = parseFloat(amountInput.value || "0");
-            if (amount <= 0) { setWalletsStatus("Amount must be positive", "err"); return; }
-            topupBtn.textContent = "…";
-            try {
-              await apiFetch("/admin/wallets/topup", {
-                method: "POST",
-                body: JSON.stringify({ user_id: w.user_id, amount }),
-              });
-              amountInput.value = "";
-              setWalletsStatus(`Topped up ${amount} for ${w.username || w.user_id.slice(0, 8)}`, "ok");
-              loadWallets();
-            } catch (err) {
-              setWalletsStatus(`Top up failed: ${err.message}`, "err");
-            }
-            topupBtn.textContent = "Top up";
-          });
-          row.appendChild(topupBtn);
-
-          return row;
-        }
-
-        async function loadWallets() {
-          setWalletsStatus("");
-          try {
-            const data = await apiFetch("/admin/wallets");
-            adminWalletsEl.innerHTML = "";
-            if (!data.wallets.length) {
-              adminWalletsEl.innerHTML = '<div class="muted">No wallets yet — a wallet is created on first topup or usage.</div>';
-              return;
-            }
-            for (const w of data.wallets) adminWalletsEl.appendChild(walletRow(w));
-          } catch (err) {
-            setWalletsStatus(`Failed to load wallets: ${err.message}`, "err");
-          }
-        }
-
-        async function topupByUserId() {
-          const userId = walletUserEl.value.trim();
-          const amount = parseFloat(walletAmountEl.value || "0");
-          if (!userId || amount <= 0) {
-            setWalletsStatus("User ID and a positive amount are required", "err");
-            return;
-          }
-          setWalletsStatus("");
-          try {
-            await apiFetch("/admin/wallets/topup", {
-              method: "POST",
-              body: JSON.stringify({ user_id: userId, amount, description: walletDescEl.value.trim() || undefined }),
-            });
-            walletUserEl.value = "";
-            walletAmountEl.value = "";
-            walletDescEl.value = "";
-            setWalletsStatus(`Topped up ${amount}`, "ok");
-            loadWallets();
-          } catch (err) {
-            setWalletsStatus(`Top up failed: ${err.message}`, "err");
-          }
-        }
-
-        async function loadConfig() {
-          const c = await apiFetch("/config");
-          providers = c.providers.map((p) => ({ ...p, api_key: "" }));
-          activeProviderId = c.active_provider || "";
-          wsProviderEl.value = c.web_search_provider || "tavily";
-          wsKeyEl.placeholder = c.web_search_api_key_set ? "Configured (leave empty to keep)" : "Optional; leave empty for duckduckgo";
-          roles = c.roles || [];
-          renderProviders();
-          renderRoles();
-          loadUsers();
-          loadTokens();
-          loadModels();
-          loadWallets();
-        }
-
-        async function saveConfig() {
-          setStatus("");
-          const body = {
-            providers: providers.map((p) => ({
-              id: p.id, name: p.name, base_url: p.base_url,
-              api_key: p.api_key || "", models: p.models, model: p.model,
-            })),
-            active_provider: activeProviderId,
-            web_search_provider: wsProviderEl.value,
-            web_search_api_key: wsKeyEl.value.trim() || undefined,
-          };
-          try {
-            const data = await apiFetch("/config", { method: "POST", body: JSON.stringify(body) });
-            providers = data.providers.map((p) => ({ ...p, api_key: "" }));
-            activeProviderId = data.active_provider;
-            renderProviders();
-            wsKeyEl.value = "";
-            setStatus(`Saved (${data.providers.length} provider${data.providers.length === 1 ? "" : "s"})`, "ok");
-          } catch (err) {
-            setStatus(`Save failed: ${err.message}`, "err");
-          }
+          (renderers[page] || renderProvidersPage)();
         }
 
         async function boot() {
           if (!token()) { showLogin(); return; }
           try {
-            await apiFetch("/admin/me");
-            await loadConfig();
-            showDash();
-          } catch {
-            showLogin();
+            const me = await apiFetch("/admin/me");
+            document.getElementById("admin-name").textContent = me.username;
+            document.getElementById("admin-avatar").textContent = (me.username || "A")[0].toUpperCase();
+            showApp();
+            navigate();
+          } catch { showLogin(); }
+        }
+
+        // ───────────────────────── PROVIDERS ─────────────────────────
+        let providerTab = "credentials";
+
+        async function renderProvidersPage() {
+          content.innerHTML = "";
+          const head = el("div", "page-head");
+          const t = el("div");
+          t.appendChild(el("h2", "", "Providers"));
+          t.appendChild(el("div", "sub", "Credential endpoints, model catalog, and routing weights"));
+          head.appendChild(t);
+          content.appendChild(head);
+
+          const tabs = el("div", "tabs");
+          for (const [key, label] of [["credentials", "Credentials"], ["models", "Model Catalog"], ["routes", "Routing & Weights"], ["legacy", "Live Chat"]]) {
+            const tab = el("div", "tab" + (providerTab === key ? " active" : ""), label);
+            tab.onclick = () => { providerTab = key; renderProvidersPage(); };
+            tabs.appendChild(tab);
+          }
+          content.appendChild(tabs);
+
+          const section = el("div");
+          content.appendChild(section);
+          if (providerTab === "credentials") await renderCredentials(section);
+          else if (providerTab === "models") await renderModels(section);
+          else if (providerTab === "routes") await renderRoutes(section);
+          else await renderLegacy(section);
+        }
+
+        // ── Credentials tab ──
+        async function renderCredentials(container) {
+          container.innerHTML = '<div class="loading">Loading…</div>';
+          let creds, routes;
+          try {
+            [creds, routes] = await Promise.all([
+              apiFetch("/admin/credentials").then((d) => d.credentials || []),
+              apiFetch("/admin/routes").then((d) => d.routes || []),
+            ]);
+          } catch (e) { container.innerHTML = ""; container.appendChild(errBox(e)); return; }
+          container.innerHTML = "";
+
+          const bar = el("div", "bar-row");
+          const title = el("div", "bar-title", "Credentials ");
+          title.appendChild(el("span", "count", "(" + creds.length + ")"));
+          const add = el("button", "btn primary", "+ New credential");
+          add.onclick = () => credentialForm(null, { routes });
+          bar.append(title, add);
+          container.appendChild(bar);
+
+          if (!creds.length) {
+            container.appendChild(emptyState("No credentials yet — add your first provider endpoint."));
+            return;
+          }
+          const { wrap, tbody } = table(["Name", "Base URL", "API Key", "Routes", "Price", "Active", "Created", ""]);
+          for (const c of creds) {
+            const row = el("tr");
+            row.appendChild(td(c.name));
+            row.appendChild(td(el("span", "code", c.base_url)));
+            row.appendChild(td(keyChip(c.api_key_set)));
+            const n = routes.filter((r) => r.credential_id === c.id).length;
+            row.appendChild(td(el("span", "muted", n ? n + " route" + (n > 1 ? "s" : "") : "—")));
+            row.appendChild(priceCell(c));
+            const tdSw = td();
+            tdSw.appendChild(switchToggle(c.is_active, async (on) => {
+              try {
+                await apiFetch("/admin/credentials/" + c.id, { method: "PATCH", body: JSON.stringify({ is_active: on }) });
+                toast(on ? "Credential enabled" : "Credential disabled");
+              } catch (e) { toast(e.message, "err"); renderProvidersPage(); }
+            }));
+            row.appendChild(tdSw);
+            row.appendChild(td(el("span", "muted", fmtDate(c.created_at))));
+            row.appendChild(td(actionBtns([
+              { label: "Edit", onClick: () => credentialForm(c, { routes }) },
+              { label: "Delete", danger: true, onClick: () => deleteCredential(c, routes) },
+            ])));
+            tbody.appendChild(row);
+          }
+          container.appendChild(wrap);
+        }
+
+        function keyChip(apiKeySet) {
+          const chip = el("span", "key-chip");
+          chip.appendChild(el("span", "", apiKeySet ? maskKey("sk-" + "•".repeat(24)) : "—"));
+          const dot = el("span", "badge " + (apiKeySet ? "ok" : "danger"), apiKeySet ? "set" : "missing");
+          chip.appendChild(dot);
+          return chip;
+        }
+
+        // Derived price: route override else catalog; multiple routes → min…max range.
+        function priceText(pMin, pMax) {
+          if (pMin == null) return "—";
+          if (pMax != null && Number(pMax) !== Number(pMin)) return fmtMoney(pMin) + " – " + fmtMoney(pMax);
+          return fmtMoney(pMin);
+        }
+        function priceCell(c) {
+          if (!c.model_count) return td(el("span", "muted", "—"));
+          const t = el("div");
+          t.appendChild(el("span", "code", priceText(c.price_prompt_min, c.price_prompt_max)));
+          t.appendChild(el("div", "cell-sub", "out " + priceText(c.price_completion_min, c.price_completion_max)));
+          return td(t);
+        }
+        function modelChips(c) {
+          const ms = (c.models || []).slice(0, 3);
+          const chips = ms.map((m) => el("span", "mini-chip", m.actual_model_name || m.model_name));
+          if ((c.models || []).length > 3) chips.push(el("span", "mini-chip", "+" + ((c.models || []).length - 3)));
+          return chips.length ? chips : [el("span", "muted", "no routes")];
+        }
+
+        function credentialForm(cred, ctx) {
+          const isEdit = !!cred;
+          const name = textInput(cred ? cred.name : "", { placeholder: "e.g. deepseek" });
+          const baseUrl = textInput(cred ? cred.base_url : "", { placeholder: "https://api.deepseek.com/v1" });
+          const apiKey = textInput("", { type: "password", placeholder: isEdit ? "Leave empty to keep stored key" : "API key (required)" });
+          const active = switchToggle(cred ? cred.is_active : true);
+          const body = el("div");
+          body.append(
+            field("Name", name),
+            field("Base URL", baseUrl),
+            field("API Key", apiKey, isEdit ? "Blank keeps the existing key." : "Required for new credentials.")
+          );
+          const activeRow = el("div", "switch-row");
+          activeRow.append(active, el("span", "muted", "Allow this endpoint to be routed to"));
+          body.appendChild(field("Active", activeRow));
+
+          const test = el("button", "btn ghost", "Test Connection");
+          const testRes = el("div", "test-res");
+          test.onclick = async () => {
+            test.disabled = true;
+            test.textContent = "Testing…";
+            testRes.textContent = "";
+            try {
+              const d = await apiFetch("/config/probe-models", {
+                method: "POST",
+                body: JSON.stringify({ base_url: baseUrl.value.trim(), api_key: apiKey.value.trim() }),
+              });
+              testRes.textContent = "✓ " + d.models.length + " models reachable";
+              testRes.className = "test-res ok";
+            } catch (e) {
+              testRes.textContent = "✗ " + e.message;
+              testRes.className = "test-res err";
+            }
+            test.disabled = false;
+            test.textContent = "Test Connection";
+          };
+          body.appendChild(field("Connectivity", test));
+          body.appendChild(testRes);
+
+          const foot = drawerFoot();
+          const save = el("button", "btn primary", isEdit ? "Save changes" : "Create");
+          save.onclick = async () => {
+            if (!name.value.trim()) { toast("Name is required", "err"); return; }
+            if (!baseUrl.value.trim()) { toast("Base URL is required", "err"); return; }
+            if (!isEdit && !apiKey.value.trim()) { toast("API key is required", "err"); return; }
+            save.disabled = true;
+            try {
+              const payload = { name: name.value.trim(), base_url: baseUrl.value.trim(), is_active: active.classList.contains("on") };
+              if (apiKey.value.trim()) payload.api_key = apiKey.value.trim();
+              if (isEdit) await apiFetch("/admin/credentials/" + cred.id, { method: "PATCH", body: JSON.stringify(payload) });
+              else await apiFetch("/admin/credentials", { method: "POST", body: JSON.stringify(payload) });
+              toast(isEdit ? "Credential saved" : "Credential created");
+              drawer.close();
+              renderProvidersPage();
+            } catch (e) { toast(e.message, "err"); }
+            save.disabled = false;
+          };
+          foot.appendChild(save);
+          const drawer = openDrawer({ title: isEdit ? "Edit credential" : "New credential", subtitle: "OpenAI-compatible provider endpoint", body, footer: foot });
+        }
+
+        async function deleteCredential(c, routes) {
+          const n = routes.filter((r) => r.credential_id === c.id).length;
+          const msg = n
+            ? `Delete "${c.name}"? It has ${n} routing link(s) — they will be removed too.`
+            : `Delete credential "${c.name}"? This cannot be undone.`;
+          if (!(await confirmDialog(msg, "Delete credential"))) return;
+          try {
+            await apiFetch("/admin/credentials/" + c.id, { method: "DELETE" });
+            toast("Credential deleted");
+            renderProvidersPage();
+          } catch (e) { toast(e.message, "err"); }
+        }
+
+        // ── Model Catalog tab ──
+        async function renderModels(container) {
+          container.innerHTML = '<div class="loading">Loading…</div>';
+          let models;
+          try {
+            models = (await apiFetch("/admin/models")).models || [];
+          } catch (e) { container.innerHTML = ""; container.appendChild(errBox(e)); return; }
+          container.innerHTML = "";
+
+          const bar = el("div", "bar-row");
+          const title = el("div", "bar-title", "Model Catalog ");
+          title.appendChild(el("span", "count", "(" + models.length + ")"));
+          const add = el("button", "btn primary", "+ New model");
+          add.onclick = () => modelForm(null);
+          bar.append(title, add);
+          container.appendChild(bar);
+
+          if (!models.length) {
+            container.appendChild(emptyState("No models registered yet — add models to enable PAYG billing."));
+            return;
+          }
+          const { wrap, tbody } = table(["Model", "Description", "Prompt $/1k", "Completion $/1k", "Active", "Created", ""]);
+          for (const m of models) {
+            const row = el("tr");
+            row.appendChild(td(el("span", "code", m.name)));
+            row.appendChild(td(m.description ? el("span", "muted", m.description) : "—"));
+            row.appendChild(td(fmtMoney(m.prompt_price_per_1k)));
+            row.appendChild(td(fmtMoney(m.completion_price_per_1k)));
+            const tdSw = td();
+            tdSw.appendChild(switchToggle(m.is_active, async (on) => {
+              try {
+                await apiFetch("/admin/models/" + m.id, { method: "PATCH", body: JSON.stringify({ is_active: on }) });
+                toast("Model updated");
+              } catch (e) { toast(e.message, "err"); renderProvidersPage(); }
+            }));
+            row.appendChild(tdSw);
+            row.appendChild(td(el("span", "muted", fmtDate(m.created_at))));
+            row.appendChild(td(actionBtns([
+              { label: "Edit", onClick: () => modelForm(m) },
+              { label: "Delete", danger: true, onClick: () => deleteModel(m) },
+            ])));
+            tbody.appendChild(row);
+          }
+          container.appendChild(wrap);
+        }
+
+        function modelForm(model) {
+          const isEdit = !!model;
+          const name = textInput(model ? model.name : "", { placeholder: "e.g. gpt-4o-mini" });
+          const desc = textInput(model ? model.description || "" : "", { placeholder: "Optional description" });
+          const promptPrice = numInput(model ? model.prompt_price_per_1k : 0, { step: "0.000001" });
+          const completionPrice = numInput(model ? model.completion_price_per_1k : 0, { step: "0.000001" });
+          const active = switchToggle(model ? model.is_active : true);
+          const body = el("div");
+          body.append(
+            field("Model name", name, "The model id the provider expects (e.g. gpt-4o-mini)."),
+            field("Description", desc)
+          );
+          const prices = el("div", "field-row");
+          prices.append(
+            field("Prompt price $/1k", promptPrice),
+            field("Completion price $/1k", completionPrice)
+          );
+          body.appendChild(prices);
+          const activeRow = el("div", "switch-row");
+          activeRow.append(active, el("span", "muted", "Available for routing and billing"));
+          body.appendChild(field("Active", activeRow));
+
+          const foot = drawerFoot();
+          const save = el("button", "btn primary", isEdit ? "Save changes" : "Create");
+          save.onclick = async () => {
+            if (!name.value.trim()) { toast("Model name is required", "err"); return; }
+            save.disabled = true;
+            try {
+              const payload = {
+                name: name.value.trim(),
+                description: desc.value.trim() || undefined,
+                prompt_price_per_1k: parseFloat(promptPrice.value || "0"),
+                completion_price_per_1k: parseFloat(completionPrice.value || "0"),
+                is_active: active.classList.contains("on"),
+              };
+              if (isEdit) await apiFetch("/admin/models/" + model.id, { method: "PATCH", body: JSON.stringify(payload) });
+              else await apiFetch("/admin/models", { method: "POST", body: JSON.stringify(payload) });
+              toast(isEdit ? "Model saved" : "Model created");
+              drawer.close();
+              renderProvidersPage();
+            } catch (e) { toast(e.message, "err"); }
+            save.disabled = false;
+          };
+          foot.appendChild(save);
+          const drawer = openDrawer({ title: isEdit ? "Edit model" : "New model", subtitle: "Catalog entry with per-1k pricing", body, footer: foot });
+        }
+
+        async function deleteModel(m) {
+          if (!(await confirmDialog(`Delete model "${m.name}"? Routes referencing it will be removed.`, "Delete model"))) return;
+          try {
+            await apiFetch("/admin/models/" + m.id, { method: "DELETE" });
+            toast("Model deleted");
+            renderProvidersPage();
+          } catch (e) { toast(e.message, "err"); }
+        }
+
+        // ── Routing & Weights tab ──
+        async function renderRoutes(container) {
+          container.innerHTML = '<div class="loading">Loading…</div>';
+          let routes, creds, models;
+          try {
+            [routes, creds, models] = await Promise.all([
+              apiFetch("/admin/routes").then((d) => d.routes || []),
+              apiFetch("/admin/credentials").then((d) => d.credentials || []),
+              apiFetch("/admin/models").then((d) => d.models || []),
+            ]);
+          } catch (e) { container.innerHTML = ""; container.appendChild(errBox(e)); return; }
+          container.innerHTML = "";
+
+          const bar = el("div", "bar-row");
+          const title = el("div", "bar-title", "Routing & Weights ");
+          title.appendChild(el("span", "count", "(" + routes.length + ")"));
+          const add = el("button", "btn primary", "+ New route");
+          add.onclick = () => routeForm(null, { creds, models });
+          bar.append(title, add);
+          container.appendChild(bar);
+
+          if (!routes.length) {
+            container.appendChild(emptyState("No routes yet — link a credential to a model to enable traffic."));
+            return;
+          }
+          const { wrap, tbody } = table(["Credential", "Model", "Actual name", "Priority", "Weight", "Prices", "Active", ""]);
+          for (const r of routes) {
+            const row = el("tr");
+            row.appendChild(td(el("span", "cell-main", r.credential_name || "—")));
+            row.appendChild(td(el("span", "code", r.model_name || "—")));
+            row.appendChild(td(el("span", "code", r.actual_model_name || "—")));
+            row.appendChild(td(infOr(r.priority)));
+            row.appendChild(td(infOr(r.weight)));
+            const prices = el("div");
+            const pr = r.prompt_price_per_1k != null ? fmtMoney(r.prompt_price_per_1k) : "inherit";
+            const co = r.completion_price_per_1k != null ? fmtMoney(r.completion_price_per_1k) : "inherit";
+            prices.appendChild(el("span", "muted", "in " + pr + " · out " + co + " "));
+            if (r.price_override) prices.appendChild(badge("override", "accent"));
+            row.appendChild(td(prices));
+            const tdSw = td();
+            tdSw.appendChild(switchToggle(r.is_active, async (on) => {
+              try {
+                await apiFetch("/admin/routes", {
+                  method: "POST",
+                  body: JSON.stringify({
+                    credential_id: r.credential_id, model_id: r.model_id,
+                    actual_model_name: r.actual_model_name, priority: r.priority, weight: r.weight,
+                    prompt_price_per_1k: r.prompt_price_per_1k, completion_price_per_1k: r.completion_price_per_1k,
+                    is_active: on,
+                  }),
+                });
+                toast("Route updated");
+              } catch (e) { toast(e.message, "err"); renderProvidersPage(); }
+            }));
+            row.appendChild(tdSw);
+            row.appendChild(td(actionBtns([
+              { label: "Edit", onClick: () => routeForm(r, { creds, models }) },
+              { label: "Delete", danger: true, onClick: () => deleteRoute(r) },
+            ])));
+            tbody.appendChild(row);
+          }
+          container.appendChild(wrap);
+        }
+
+        function routeForm(route, ctx) {
+          const isEdit = !!route;
+          const credSel = select(ctx.creds.map((c) => ({ value: c.id, label: c.name })), route ? route.credential_id : "");
+          const modelSel = select(ctx.models.map((m) => ({ value: m.id, label: m.name })), route ? route.model_id : "");
+          const actualName = textInput(route ? route.actual_model_name || "" : "", { placeholder: "Same as the model id by default" });
+          const priority = numInput(route ? route.priority : 0);
+          const weight = numInput(route ? route.weight : 1);
+          const promptPrice = numInput(route && route.prompt_price_per_1k != null ? route.prompt_price_per_1k : "", { step: "0.000001", placeholder: "inherit catalog price" });
+          const completionPrice = numInput(route && route.completion_price_per_1k != null ? route.completion_price_per_1k : "", { step: "0.000001", placeholder: "inherit catalog price" });
+          const active = switchToggle(route ? route.is_active : true);
+
+          modelSel.addEventListener("change", () => {
+            if (!actualName.value.trim()) {
+              const m = ctx.models.find((x) => x.id === modelSel.value);
+              if (m) actualName.value = m.name;
+            }
+          });
+          if (!isEdit) {
+            const first = ctx.models.find((x) => x.id === modelSel.value);
+            if (first) actualName.value = first.name;
+          }
+
+          const body = el("div");
+          const picks = el("div", "field-row");
+          picks.append(field("Credential", credSel), field("Catalog model", modelSel));
+          body.append(picks);
+          body.appendChild(field("Actual model name", actualName, "The model id sent to this provider for this route."));
+          const w = el("div", "field-row");
+          w.append(field("Priority", priority, "Lower wins when weights tie."), field("Weight", weight, "Relative traffic share."));
+          body.appendChild(w);
+          const prices = el("div", "field-row");
+          prices.append(
+            field("Prompt price $/1k (override)", promptPrice, "Blank = inherit catalog"),
+            field("Completion price $/1k (override)", completionPrice, "Blank = inherit catalog")
+          );
+          body.appendChild(prices);
+          const activeRow = el("div", "switch-row");
+          activeRow.append(active, el("span", "muted", "Traffic may flow through this route"));
+          body.appendChild(field("Active", activeRow));
+
+          const foot = drawerFoot();
+          const save = el("button", "btn primary", isEdit ? "Save changes" : "Create route");
+          save.onclick = async () => {
+            if (!credSel.value || !modelSel.value) { toast("Credential and model are required", "err"); return; }
+            if (!actualName.value.trim()) { toast("Actual model name is required", "err"); return; }
+            save.disabled = true;
+            try {
+              const payload = {
+                credential_id: credSel.value,
+                model_id: modelSel.value,
+                actual_model_name: actualName.value.trim(),
+                priority: parseInt(priority.value || "0", 10),
+                weight: parseInt(weight.value || "1", 10),
+                prompt_price_per_1k: promptPrice.value !== "" ? parseFloat(promptPrice.value) : null,
+                completion_price_per_1k: completionPrice.value !== "" ? parseFloat(completionPrice.value) : null,
+                is_active: active.classList.contains("on"),
+              };
+              await apiFetch("/admin/routes", { method: "POST", body: JSON.stringify(payload) });
+              toast(isEdit ? "Route saved" : "Route created");
+              drawer.close();
+              renderProvidersPage();
+            } catch (e) { toast(e.message, "err"); }
+            save.disabled = false;
+          };
+          foot.appendChild(save);
+          const drawer = openDrawer({ title: isEdit ? "Edit route" : "New route", subtitle: "Credential ↔ model link with priority & weight", body, footer: foot });
+        }
+
+        async function deleteRoute(r) {
+          const label = (r.credential_name || "?") + " → " + (r.model_name || "?");
+          if (!(await confirmDialog(`Remove the route "${label}"?`, "Delete route"))) return;
+          try {
+            await apiFetch("/admin/routes/" + r.credential_id + "/" + r.model_id, { method: "DELETE" });
+            toast("Route deleted");
+            renderProvidersPage();
+          } catch (e) { toast(e.message, "err"); }
+        }
+
+        // ── Live Chat tab (legacy /config) ──
+        async function renderLegacy(container) {
+          container.innerHTML = '<div class="loading">Loading…</div>';
+          let cfg;
+          try {
+            cfg = await apiFetch("/config");
+          } catch (e) { container.innerHTML = ""; container.appendChild(errBox(e)); return; }
+          container.innerHTML = "";
+
+          const note = el("div", "legacy-card");
+          note.appendChild(el("div", "bar-title", "LLM connection for the live client"));
+          note.appendChild(el("div", "kbd-note", "This drives the desktop/web chat client directly. The structured Credentials + Model Catalog above are the routing source; this card mirrors the active provider onto the live client."));
+
+          const providers = cfg.providers.map((p) => ({ ...p, api_key: "" }));
+          let activeProviderId = cfg.active_provider || (providers[0] ? providers[0].id : "");
+
+          const listEl = el("div");
+          const renderList = () => {
+            listEl.innerHTML = "";
+            for (const p of providers) listEl.appendChild(legacyProviderCard(p));
+          };
+
+          function legacyProviderCard(p) {
+            const card = el("div", "provider-card");
+            card.style.border = "1px solid var(--border)";
+            card.style.borderRadius = "8px";
+            card.style.padding = "14px";
+            card.style.marginBottom = "10px";
+            card.style.background = "var(--bg2)";
+
+            const head = el("div", "bar-row");
+            const radio = el("input");
+            radio.type = "radio";
+            radio.name = "legacy-active";
+            radio.checked = p.id === activeProviderId;
+            radio.style.accentColor = "var(--accent)";
+            radio.title = "Use this provider for live chat";
+            radio.onchange = () => { activeProviderId = p.id; renderList(); };
+            const nameInput = textInput(p.name, { placeholder: "Name" });
+            nameInput.oninput = () => { p.name = nameInput.value; };
+            const del = el("button", "icon-btn", "✕");
+            del.onclick = () => {
+              providers.splice(providers.indexOf(p), 1);
+              if (activeProviderId === p.id) activeProviderId = providers[0] ? providers[0].id : "";
+              renderList();
+            };
+            const left = el("div", "row-actions");
+            left.append(radio, nameInput);
+            head.append(left, del);
+            card.appendChild(head);
+
+            const baseInput = textInput(p.base_url, { placeholder: "https://api.deepseek.com/v1" });
+            baseInput.oninput = () => { p.base_url = baseInput.value; };
+            card.appendChild(field("Base URL", baseInput));
+
+            const keyInput = textInput("", { type: "password", placeholder: p.api_key_set ? "Configured — leave empty to keep" : "API key" });
+            keyInput.oninput = () => { p.api_key = keyInput.value.trim(); };
+            card.appendChild(field("API Key", keyInput));
+
+            const modelSel = select([{ value: "", label: "— select —" }], p.model || "");
+            const fillModels = () => {
+              modelSel.innerHTML = "";
+              if (!p.models.length) {
+                const opt = el("option", "", "No models");
+                opt.value = "";
+                modelSel.appendChild(opt);
+              } else {
+                for (const m of p.models) {
+                  const opt = el("option", "", m);
+                  opt.value = m;
+                  if (m === p.model) opt.selected = true;
+                  modelSel.appendChild(opt);
+                }
+              }
+            };
+            fillModels();
+            modelSel.onchange = () => { p.model = modelSel.value; };
+            card.appendChild(field("Active model", modelSel));
+
+            const addModel = textInput("", { placeholder: "Add model id, press Enter" });
+            addModel.onkeydown = (e) => {
+              if (e.key !== "Enter") return;
+              const id = addModel.value.trim();
+              if (!id) return;
+              if (!p.models.includes(id)) p.models.push(id);
+              p.model = id;
+              renderList();
+            };
+            card.appendChild(field("Add model", addModel));
+
+            const fetchBtn = el("button", "btn sm ghost", "Fetch models");
+            const fetchRes = el("div", "test-res");
+            fetchBtn.onclick = async () => {
+              fetchBtn.disabled = true;
+              fetchBtn.textContent = "…";
+              try {
+                const d = await apiFetch("/config/probe-models", {
+                  method: "POST",
+                  body: JSON.stringify({ base_url: p.base_url, api_key: p.api_key }),
+                });
+                for (const id of d.models) if (!p.models.includes(id)) p.models.push(id);
+                if (!p.model && d.models.length) p.model = d.models[0];
+                fetchRes.textContent = "✓ " + d.models.length + " models";
+                fetchRes.className = "test-res ok";
+                renderList();
+              } catch (e) {
+                fetchRes.textContent = "✗ " + e.message;
+                fetchRes.className = "test-res err";
+              }
+              fetchBtn.disabled = false;
+              fetchBtn.textContent = "Fetch models";
+            };
+            const frow = el("div", "row-actions");
+            frow.append(fetchBtn, fetchRes);
+            card.appendChild(field("Model discovery", frow));
+            return card;
+          }
+
+          note.appendChild(listEl);
+          const addBtn = el("button", "btn sm ghost", "+ Add provider");
+          addBtn.onclick = () => {
+            providers.push({ id: crypto.randomUUID(), name: "", base_url: "", api_key: "", api_key_set: false, models: [], model: "" });
+            renderList();
+          };
+          note.appendChild(addBtn);
+
+          // web search
+          const wsProvider = select([
+            { value: "tavily", label: "tavily (requires key)" },
+            { value: "duckduckgo", label: "duckduckgo (no key)" },
+          ], cfg.web_search_provider || "tavily");
+          const wsKey = textInput("", { type: "password", placeholder: cfg.web_search_api_key_set ? "Configured — leave empty to keep" : "Optional; leave empty for duckduckgo" });
+          note.appendChild(el("div", "section-title", "Web search"));
+          note.appendChild(field("Provider", wsProvider));
+          note.appendChild(field("API key", wsKey));
+
+          const save = el("button", "btn primary", "Save connection");
+          const saveRes = el("div", "test-res");
+          save.onclick = async () => {
+            save.disabled = true;
+            saveRes.textContent = "";
+            try {
+              await apiFetch("/config", {
+                method: "POST",
+                body: JSON.stringify({
+                  providers: providers.map((p) => ({ id: p.id, name: p.name, base_url: p.base_url, api_key: p.api_key || "", models: p.models, model: p.model })),
+                  active_provider: activeProviderId,
+                  web_search_provider: wsProvider.value,
+                  web_search_api_key: wsKey.value.trim() || undefined,
+                }),
+              });
+              saveRes.textContent = "✓ Saved — the live client will pick up the change on next chat";
+              saveRes.className = "test-res ok";
+            } catch (e) {
+              saveRes.textContent = "✗ " + e.message;
+              saveRes.className = "test-res err";
+            }
+            save.disabled = false;
+          };
+          const footRow = el("div", "row-actions");
+          footRow.append(save, saveRes);
+          note.appendChild(field("", footRow));
+
+          renderList();
+          container.appendChild(note);
+        }
+
+        // ───────────────────────── ROLES ─────────────────────────
+        async function renderRolesPage() {
+          content.innerHTML = "";
+          const head = el("div", "page-head");
+          const t = el("div");
+          t.appendChild(el("h2", "", "Roles"));
+          t.appendChild(el("div", "sub", "Quota limits, default model, and feature flags per tier"));
+          head.appendChild(t);
+          content.appendChild(head);
+
+          const section = el("div");
+          section.innerHTML = '<div class="loading">Loading…</div>';
+          content.appendChild(section);
+
+          let roles, models;
+          const bindingOf = {};
+          try {
+            const modelsP = apiFetch("/admin/models").then((d) => d.models || []);
+            roles = await apiFetch("/admin/roles").then((d) => d.roles || []);
+            const per = await Promise.all(roles.map((r) =>
+              apiFetch("/admin/roles/" + encodeURIComponent(r.role_id) + "/credentials")
+                .then((d) => d.credentials || [])
+                .catch(() => [])
+            ));
+            roles.forEach((r, i) => { bindingOf[r.role_id] = per[i]; });
+            models = await modelsP;
+          } catch (e) { section.innerHTML = ""; section.appendChild(errBox(e)); return; }
+          section.innerHTML = "";
+
+          const bar = el("div", "bar-row");
+          const title = el("div", "bar-title", "Roles ");
+          title.appendChild(el("span", "count", "(" + roles.length + ")"));
+          const add = el("button", "btn primary", "+ New role");
+          add.onclick = () => roleForm(null, { roles, models });
+          bar.append(title, add);
+          section.appendChild(bar);
+
+          if (!roles.length) {
+            section.appendChild(emptyState("No roles defined."));
+            return;
+          }
+          const { wrap, tbody } = table(["Role", "Limits", "Default model", "Channels", "Active", ""]);
+          for (const r of roles) {
+            const row = el("tr");
+            const who = el("div");
+            who.appendChild(el("div", "cell-main", r.role_id));
+            if (r.role_name) who.appendChild(el("div", "cell-sub", r.role_name));
+            row.appendChild(td(who));
+
+            const limits = el("div");
+            limits.appendChild(limitChip("day", r.daily_request_limit));
+            limits.appendChild(limitChip("mo", r.monthly_request_limit));
+            limits.appendChild(limitChip("tok", r.daily_token_limit));
+            limits.appendChild(limitChip("rpm", r.rpm_limit));
+            limits.appendChild(limitChip("cost", r.monthly_cost_limit));
+            row.appendChild(td(limits));
+
+            row.appendChild(td(r.default_model ? el("span", "code", r.default_model) : el("span", "muted", "active provider")));
+            const bound = bindingOf[r.role_id] || [];
+            const chBtn = el("button", "btn sm ghost", "Channels (" + bound.length + ")");
+            chBtn.type = "button";
+            chBtn.onclick = () => channelPickerModal(r.role_id, r.role_name, bound);
+            row.appendChild(td(chBtn));
+            const tdSw = td();
+            tdSw.appendChild(switchToggle(r.is_active, async (on) => {
+              try {
+                await apiFetch("/admin/roles/" + r.role_id, { method: "PATCH", body: JSON.stringify({ is_active: on }) });
+                toast("Role updated");
+              } catch (e) { toast(e.message, "err"); renderRolesPage(); }
+            }));
+            row.appendChild(tdSw);
+            row.appendChild(td(actionBtns([
+              { label: "Edit", onClick: () => roleForm(r, { roles, models }) },
+              { label: "Clone", onClick: () => roleForm(r, { roles, models, clone: true }) },
+              { label: "Delete", danger: true, onClick: () => deleteRole(r) },
+            ])));
+            tbody.appendChild(row);
+          }
+          section.appendChild(wrap);
+        }
+
+        function modelMultiSelect(selected, models) {
+          const wrap = el("div", "chip-group");
+          for (const m of models) {
+            const lbl = el("label", "chip-toggle");
+            const cb = el("input");
+            cb.type = "checkbox";
+            cb.checked = (selected || []).includes(m.name);
+            const chip = el("span", "chip", m.name);
+            lbl.append(cb, chip);
+            wrap.appendChild(lbl);
+          }
+          return wrap;
+        }
+        function readChipSelection(wrap) {
+          return [...wrap.querySelectorAll("input[type=checkbox]:checked")].map((i) => i.parentElement.querySelector(".chip").textContent.trim());
+        }
+
+        function roleForm(role, ctx) {
+          const isEdit = !!role;
+          const isClone = !!ctx.clone;
+          const roleId = textInput(isEdit && !isClone ? role.role_id : "", { placeholder: "e.g. premium", autocomplete: "off" });
+          const roleName = textInput(isEdit ? role.role_name || "" : "", { placeholder: "Display name" });
+          const daily = numInput(isEdit ? role.daily_request_limit : 50);
+          const monthly = numInput(isEdit ? role.monthly_request_limit : 1500);
+          const dailyTokens = numInput(isEdit ? role.daily_token_limit : -1);
+          const rpm = numInput(isEdit ? role.rpm_limit : -1);
+          const cost = numInput(isEdit ? role.monthly_cost_limit : -1, { step: "0.01" });
+          const defaultModel = textInput(isEdit ? role.default_model || "" : "", { placeholder: "Blank = active provider" });
+          const modelChips = modelMultiSelect(isEdit ? role.models : [], ctx.models);
+          const features = el("textarea");
+          features.placeholder = '{ "chat": true, "web": false }';
+          features.value = JSON.stringify(isEdit ? role.features || {} : {}, null, 2);
+          const active = switchToggle(isEdit ? role.is_active : true);
+
+          const body = el("div");
+          body.append(
+            field("Role ID", roleId, isEdit && !isClone ? "Not editable after creation." : "Lowercase id used in tokens and user records."),
+            field("Role name", roleName)
+          );
+          const row1 = el("div", "field-row");
+          row1.append(field("Daily requests", daily, "-1 = unlimited"), field("Monthly requests", monthly, "-1 = unlimited"));
+          body.appendChild(row1);
+          const row2 = el("div", "field-row");
+          row2.append(field("Daily tokens", dailyTokens, "-1 = unlimited"), field("RPM", rpm, "-1 = unlimited"));
+          body.appendChild(row2);
+          body.appendChild(field("Monthly cost cap ($)", cost, "-1 = no cap"));
+          body.appendChild(field("Default model", defaultModel));
+          body.appendChild(field("Allowed models", modelChips, "Leave empty = all models"));
+          body.appendChild(field("Features (JSON)", features));
+          const activeRow = el("div", "switch-row");
+          activeRow.append(active, el("span", "muted", "Accounts with this role can use the service"));
+          body.appendChild(field("Active", activeRow));
+
+          const foot = drawerFoot();
+          const save = el("button", "btn primary", isClone ? "Create clone" : isEdit ? "Save changes" : "Create role");
+          save.onclick = async () => {
+            if (!roleId.value.trim()) { toast("Role ID is required", "err"); return; }
+            let parsed;
+            try { parsed = JSON.parse(features.value || "{}"); }
+            catch { toast("Features is not valid JSON", "err"); return; }
+            save.disabled = true;
+            const payload = {
+              role_id: roleId.value.trim(),
+              role_name: roleName.value.trim(),
+              daily_request_limit: parseInt(daily.value || "-1", 10),
+              monthly_request_limit: parseInt(monthly.value || "-1", 10),
+              daily_token_limit: parseInt(dailyTokens.value || "-1", 10),
+              rpm_limit: parseInt(rpm.value || "-1", 10),
+              monthly_cost_limit: parseFloat(cost.value || "-1"),
+              default_model: defaultModel.value.trim(),
+              models: readChipSelection(modelChips),
+              features: parsed,
+              is_active: active.classList.contains("on"),
+            };
+            try {
+              if (isEdit && !isClone) {
+                delete payload.role_id;
+                await apiFetch("/admin/roles/" + role.role_id, { method: "PATCH", body: JSON.stringify(payload) });
+              } else {
+                await apiFetch("/admin/roles", { method: "POST", body: JSON.stringify(payload) });
+              }
+              toast(isClone ? "Role cloned" : isEdit ? "Role saved" : "Role created");
+              drawer.close();
+              renderRolesPage();
+            } catch (e) { toast(e.message, "err"); }
+            save.disabled = false;
+          };
+          foot.appendChild(save);
+          const drawer = openDrawer({
+            title: isClone ? "Clone role" : isEdit ? "Edit role" : "New role",
+            subtitle: isEdit && !isClone ? role.role_id : "Define a quota/feature tier",
+            body, footer: foot,
+          });
+        }
+
+        async function deleteRole(r) {
+          if (!(await confirmDialog(`Delete role "${r.role_id}"?`, "Delete role"))) return;
+          try {
+            await apiFetch("/admin/roles/" + r.role_id, { method: "DELETE" });
+            toast("Role deleted");
+            renderRolesPage();
+          } catch (e) {
+            toast(e.message, "err");
+            if (String(e.message).indexOf("409") === 0) {
+              toast("Tip: set is_active=false to retire it instead of deleting", "err");
+            }
           }
         }
 
+        // ── Role ↔ channel picker (llm_credentials multi-select by PK) ──
+        function channelPickerModal(roleId, roleName, bound) {
+          const overlay = el("div", "overlay center");
+          const card = el("div", "modal-card");
+          card.appendChild(el("h3", "modal-title", "Channels for " + roleId));
+          card.appendChild(el("p", "confirm-text", (roleName ? roleName + " — " : "") + "select which provider channels this role may route through."));
+          const list = el("div", "channel-picker");
+          list.innerHTML = '<div class="loading">Loading…</div>';
+          card.appendChild(list);
+          overlay.appendChild(card);
+          document.body.appendChild(overlay);
+
+          const sel = new Set((bound || []).map((c) => c.id));
+          apiFetch("/admin/credentials").then((d) => {
+            const creds = d.credentials || [];
+            list.innerHTML = "";
+            if (!creds.length) {
+              list.appendChild(el("div", "empty", "No credentials yet — add them under Providers."));
+              return;
+            }
+            for (const c of creds) {
+              const rowEl = el("label", "chan-row");
+              const cb = el("input");
+              cb.type = "checkbox";
+              cb.value = c.id;
+              cb.checked = sel.has(c.id);
+              const info = el("div", "chan-info");
+              const top = el("div", "cell-main");
+              top.textContent = c.name;
+              if (!c.is_active) top.appendChild(el("span", "badge danger", "inactive"));
+              info.appendChild(top);
+              info.appendChild(el("div", "cell-sub code", c.base_url));
+              const meta = el("div", "cell-sub");
+              meta.append(...modelChips(c));
+              info.appendChild(meta);
+              const price = el("span", "chan-price", priceText(c.price_prompt_min, c.price_prompt_max));
+              rowEl.append(cb, info, price);
+              list.appendChild(rowEl);
+            }
+          }).catch((e) => { list.innerHTML = ""; list.appendChild(errBox(e)); });
+
+          const foot = el("div", "modal-foot");
+          const cancel = el("button", "btn ghost", "Cancel");
+          cancel.onclick = () => overlay.remove();
+          const save = el("button", "btn primary", "Save channels");
+          save.onclick = async () => {
+            const ids = [...list.querySelectorAll("input[type=checkbox]:checked")].map((i) => i.value);
+            save.disabled = true;
+            try {
+              await apiFetch("/admin/roles/" + encodeURIComponent(roleId) + "/credentials", { method: "PUT", body: JSON.stringify({ credential_ids: ids }) });
+              toast("Role channels saved");
+              overlay.remove();
+              navigate();
+            } catch (e) { toast(e.message, "err"); }
+            save.disabled = false;
+          };
+          foot.append(cancel, save);
+          card.appendChild(foot);
+        }
+
+        // ── Channel detail modal (fetches the credential by primary key) ──
+        function detailRow(k, v) {
+          const row = el("div", "detail-row");
+          row.appendChild(el("span", "k", k));
+          const val = el("span", "v");
+          if (typeof v === "string") val.textContent = v;
+          else val.appendChild(v);
+          row.appendChild(val);
+          return row;
+        }
+        function footClose(overlay) {
+          const foot = el("div", "modal-foot");
+          const done = el("button", "btn primary", "Close");
+          done.onclick = () => overlay.remove();
+          foot.appendChild(done);
+          return foot;
+        }
+        async function credentialDetailModal(id) {
+          const overlay = el("div", "overlay center");
+          const card = el("div", "modal-card");
+          card.innerHTML = '<div class="loading">Loading…</div>';
+          overlay.appendChild(card);
+          document.body.appendChild(overlay);
+          let c;
+          try { c = (await apiFetch("/admin/credentials/" + id)).credential; }
+          catch (e) { card.innerHTML = ""; card.appendChild(errBox(e)); card.appendChild(footClose(overlay)); return; }
+          card.innerHTML = "";
+          card.appendChild(el("h3", "modal-title", c.name));
+          card.appendChild(el("p", "confirm-text", "OpenAI-compatible provider channel"));
+          const body = el("div");
+          body.appendChild(detailRow("Base URL", c.base_url));
+          body.appendChild(detailRow("API key", c.api_key_set ? "•••• set" : "not set"));
+          body.appendChild(detailRow("Status", c.is_active ? "active" : "inactive"));
+          if (c.model_count) {
+            body.appendChild(detailRow("Prompt $/1k", priceText(c.price_prompt_min, c.price_prompt_max)));
+            body.appendChild(detailRow("Completion $/1k", priceText(c.price_completion_min, c.price_completion_max)));
+            const ms = el("div");
+            for (const m of c.models || []) {
+              ms.appendChild(el("div", "cell-sub", (m.actual_model_name || m.model_name) + (m.price_override ? " · price override" : "")));
+            }
+            body.appendChild(detailRow("Routed models", ms));
+          } else {
+            body.appendChild(detailRow("Pricing", "no active routes"));
+          }
+          if (c.roles && c.roles.length) {
+            body.appendChild(detailRow("Bound roles", c.roles.map((r) => r.role_id).join(", ")));
+          }
+          card.appendChild(body);
+          card.appendChild(footClose(overlay));
+        }
+
+        // ───────────────────────── USERS ─────────────────────────
+        async function renderUsersPage() {
+          content.innerHTML = "";
+          const head = el("div", "page-head");
+          const t = el("div");
+          t.appendChild(el("h2", "", "Users"));
+          t.appendChild(el("div", "sub", "Accounts, roles, wallets, and usage"));
+          head.appendChild(t);
+          content.appendChild(head);
+
+          const section = el("div");
+          section.innerHTML = '<div class="loading">Loading…</div>';
+          content.appendChild(section);
+
+          let users, wallets, roles;
+          try {
+            [users, wallets, roles] = await Promise.all([
+              apiFetch("/admin/users").then((d) => d.users || []),
+              apiFetch("/admin/wallets").then((d) => d.wallets || []),
+              apiFetch("/admin/roles").then((d) => d.roles || []),
+            ]);
+          } catch (e) { section.innerHTML = ""; section.appendChild(errBox(e)); return; }
+          section.innerHTML = "";
+
+          const balanceOf = {};
+          for (const w of wallets) balanceOf[w.user_id] = w.balance;
+
+          const kw = textInput("", { placeholder: "Search username / display / id" });
+          kw.style.width = "220px";
+          const roleFilter = select([{ value: "", label: "All roles" }, ...roles.map((r) => ({ value: r.role_id, label: r.role_id }))], "");
+          const stateFilter = select([{ value: "", label: "All states" }, { value: "active", label: "Active" }, { value: "inactive", label: "Inactive" }], "");
+
+          const listEl = el("div");
+          const renderList = () => {
+            listEl.innerHTML = "";
+            const q = kw.value.trim().toLowerCase();
+            const filtered = users.filter((u) => {
+              if (roleFilter.value && u.role_id !== roleFilter.value) return false;
+              if (stateFilter.value === "active" && !u.is_active) return false;
+              if (stateFilter.value === "inactive" && u.is_active) return false;
+              if (q && !((u.username || "").toLowerCase().includes(q) || (u.display_name || "").toLowerCase().includes(q) || u.id.includes(q))) return false;
+              return true;
+            });
+            if (!filtered.length) { listEl.appendChild(emptyState("No users match.")); return; }
+            const { wrap, tbody } = table(["User", "Role", "Wallet", "Active", "Created", ""]);
+            for (const u of filtered) {
+              const row = el("tr");
+              const who = el("div");
+              who.appendChild(el("div", "cell-main", u.username || "—"));
+              if (u.display_name) who.appendChild(el("div", "cell-sub", u.display_name));
+              who.appendChild(el("div", "cell-sub", u.id.slice(0, 8) + "…"));
+              row.appendChild(td(who));
+              row.appendChild(td(roleBadge(u.role_id)));
+              row.appendChild(td(fmtMoney(balanceOf[u.id])));
+              const tdSw = td();
+              tdSw.appendChild(switchToggle(u.is_active, async (on) => {
+                try {
+                  await apiFetch("/admin/users/" + u.id, { method: "PATCH", body: JSON.stringify({ is_active: on }) });
+                  toast("User updated");
+                  renderUsersPage();
+                } catch (e) { toast(e.message, "err"); renderUsersPage(); }
+              }));
+              row.appendChild(tdSw);
+              row.appendChild(td(el("span", "muted", fmtDate(u.created_at))));
+              row.appendChild(td(actionBtns([
+                { label: "Details", onClick: () => userDetails(u, { roles, balance: balanceOf[u.id] }) },
+                { label: "Edit", onClick: () => userForm(u, { roles }) },
+                { label: "Delete", danger: true, onClick: () => deleteUser(u) },
+              ])));
+              tbody.appendChild(row);
+            }
+            listEl.appendChild(wrap);
+          };
+
+          kw.addEventListener("input", renderList);
+          roleFilter.addEventListener("change", renderList);
+          stateFilter.addEventListener("change", renderList);
+
+          const bar = el("div", "bar-row");
+          const title = el("div", "bar-title", "Users ");
+          title.appendChild(el("span", "count", "(" + users.length + ")"));
+          const add = el("button", "btn primary", "+ New user");
+          add.onclick = () => userForm(null, { roles });
+          bar.append(title, add);
+          section.appendChild(bar);
+
+          const fb = el("div", "filter-bar");
+          fb.append(kw, roleFilter, stateFilter);
+          section.appendChild(fb);
+          section.appendChild(listEl);
+          renderList();
+        }
+
+        function userForm(user, ctx) {
+          const isEdit = !!user;
+          const username = textInput(isEdit ? user.username || "" : "", { placeholder: "Username" });
+          const password = textInput("", { type: "password", placeholder: isEdit ? "Leave empty to keep" : "Initial password" });
+          const display = textInput(isEdit ? user.display_name || "" : "", { placeholder: "Display name (optional)" });
+          const roleSel = select(ctx.roles.map((r) => ({ value: r.role_id, label: r.role_id })), isEdit ? user.role_id : "");
+          const active = switchToggle(isEdit ? user.is_active : true);
+
+          const body = el("div");
+          body.append(
+            field("Username", username, isEdit ? "Not editable." : "Required."),
+            field("Password", password, isEdit ? "Blank keeps the current password." : "Required."),
+            field("Display name", display),
+            field("Role", roleSel)
+          );
+          if (isEdit) {
+            const activeRow = el("div", "switch-row");
+            activeRow.append(active, el("span", "muted", "Allow sign-in"));
+            body.appendChild(field("Active", activeRow));
+          }
+
+          const foot = drawerFoot();
+          const save = el("button", "btn primary", isEdit ? "Save changes" : "Create user");
+          save.onclick = async () => {
+            if (!username.value.trim()) { toast("Username is required", "err"); return; }
+            if (!isEdit && !password.value) { toast("Initial password is required", "err"); return; }
+            save.disabled = true;
+            try {
+              if (isEdit) {
+                const payload = { display_name: display.value.trim() || null, role_id: roleSel.value };
+                if (password.value) payload.password = password.value;
+                payload.is_active = active.classList.contains("on");
+                await apiFetch("/admin/users/" + user.id, { method: "PATCH", body: JSON.stringify(payload) });
+              } else {
+                await apiFetch("/admin/users", {
+                  method: "POST",
+                  body: JSON.stringify({
+                    username: username.value.trim(),
+                    password,
+                    display_name: display.value.trim() || null,
+                    role_id: roleSel.value,
+                  }),
+                });
+              }
+              toast(isEdit ? "User saved" : "User created");
+              drawer.close();
+              renderUsersPage();
+            } catch (e) { toast(e.message, "err"); }
+            save.disabled = false;
+          };
+          foot.appendChild(save);
+          const drawer = openDrawer({ title: isEdit ? "Edit user" : "New user", subtitle: isEdit ? user.username : "Create an account", body, footer: foot });
+        }
+
+        async function deleteUser(u) {
+          if (!(await confirmDialog(`Delete user "${u.username || u.id}"? Their wallet and usage records are removed too.`, "Delete user"))) return;
+          try {
+            await apiFetch("/admin/users/" + u.id, { method: "DELETE" });
+            toast("User deleted");
+            renderUsersPage();
+          } catch (e) { toast(e.message, "err"); }
+        }
+
+        async function userDetails(user, ctx) {
+          const body = el("div");
+          body.innerHTML = '<div class="loading">Loading…</div>';
+          const drawer = openDrawer({ title: user.username || "User", subtitle: user.id, body, width: "wide" });
+
+          let usage;
+          try {
+            usage = await apiFetch("/admin/users/" + user.id + "/usage");
+          } catch (e) {
+            body.innerHTML = "";
+            body.appendChild(errBox(e));
+            return;
+          }
+          body.innerHTML = "";
+
+          const profile = el("div", "legacy-card");
+          const pTitle = el("div", "bar-title", "Profile");
+          const chips = el("div");
+          chips.style.marginTop = "8px";
+          chips.appendChild(roleBadge(user.role_id));
+          chips.appendChild(badge(user.is_active ? "active" : "inactive", user.is_active ? "ok" : "danger"));
+          if (user.display_name) chips.appendChild(badge(user.display_name));
+          profile.append(pTitle, chips);
+          const details = el("div", "kbd-note");
+          details.style.marginTop = "8px";
+          details.textContent = "Created " + fmtDate(user.created_at) + " · id " + user.id;
+          profile.appendChild(details);
+          body.appendChild(profile);
+
+          // wallet + topup
+          const wallet = el("div", "legacy-card");
+          const wTitle = el("div", "bar-title", "Wallet");
+          const bal = el("div", "cell-main");
+          bal.style.fontSize = "20px";
+          bal.textContent = fmtMoney(ctx.balance);
+          wallet.appendChild(wTitle);
+          wallet.appendChild(bal);
+
+          const amount = numInput("", { step: "0.000001", placeholder: "Amount (USD)" });
+          const note = textInput("", { placeholder: "Note (optional)" });
+          const top = el("button", "btn primary", "Top up");
+          top.onclick = async () => {
+            const amt = parseFloat(amount.value || "0");
+            if (amt <= 0) { toast("Amount must be positive", "err"); return; }
+            top.disabled = true;
+            try {
+              await apiFetch("/admin/wallets/topup", { method: "POST", body: JSON.stringify({ user_id: user.id, amount: amt, description: note.value.trim() || "admin topup" }) });
+              toast("Wallet credited");
+              drawer.close();
+              navigate();
+            } catch (e) { toast(e.message, "err"); }
+            top.disabled = false;
+          };
+          const topRow = el("div", "row-actions");
+          topRow.append(amount, note, top);
+          wallet.appendChild(topRow);
+          body.appendChild(wallet);
+
+          // usage counters
+          const counters = usage.counters || [];
+          if (counters.length) {
+            const cSec = el("div", "section-title", "Usage — last " + counters.length + " days");
+            body.appendChild(cSec);
+            const { wrap, tbody } = table(["Day", "Requests", "Tokens"]);
+            for (const c of counters) {
+              const row = el("tr");
+              row.appendChild(td(el("span", "code", c.period_start.slice(0, 10))));
+              row.appendChild(td(String(c.request_count)));
+              row.appendChild(td(String(c.token_count)));
+              tbody.appendChild(row);
+            }
+            body.appendChild(wrap);
+          }
+
+          // transactions
+          const txs = usage.transactions || [];
+          if (txs.length) {
+            body.appendChild(el("div", "section-title", "Recent transactions"));
+            const { wrap, tbody } = table(["Type", "Amount", "Balance after", "Note", "When"]);
+            for (const tx of txs) {
+              const row = el("tr");
+              const kind = tx.type === "topup" ? "ok" : tx.amount < 0 ? "danger" : "";
+              row.appendChild(td(badge(tx.type, kind)));
+              row.appendChild(td((tx.amount < 0 ? "-" : "+") + fmtMoney(Math.abs(tx.amount))));
+              row.appendChild(td(fmtMoney(tx.balance_after)));
+              row.appendChild(td(el("span", "muted", tx.description || "—")));
+              row.appendChild(td(el("span", "muted", fmtDate(tx.created_at))));
+              tbody.appendChild(row);
+            }
+            body.appendChild(wrap);
+          }
+
+          // usage logs
+          const logs = usage.logs || [];
+          if (logs.length) {
+            body.appendChild(el("div", "section-title", "Recent usage logs (" + logs.length + ")"));
+            const { wrap, tbody } = table(["When", "Model", "Tool", "Tokens", "Cost"]);
+            for (const l of logs) {
+              const row = el("tr");
+              row.appendChild(td(el("span", "muted", fmtDate(l.created_at))));
+              row.appendChild(td(el("span", "code", l.model_name || "—")));
+              row.appendChild(td(l.tool || "—"));
+              row.appendChild(td(String(l.total_tokens ?? (l.prompt_tokens + " / " + l.completion_tokens))));
+              row.appendChild(td(fmtMoney(l.cost_usd)));
+              tbody.appendChild(row);
+            }
+            body.appendChild(wrap);
+          }
+
+          if (!counters.length && !txs.length && !logs.length) {
+            body.appendChild(emptyState("No usage yet."));
+          }
+        }
+
+        // ───────────────────────── TOKENS ─────────────────────────
+        let tokenTab = "relations";
+
+        async function renderTokensPage() {
+          content.innerHTML = "";
+          const head = el("div", "page-head");
+          const t = el("div");
+          t.appendChild(el("h2", "", "Tokens"));
+          t.appendChild(el("div", "sub", "Channel ↔ role ↔ user relationships, and API access tokens"));
+          head.appendChild(t);
+          content.appendChild(head);
+
+          const tabs = el("div", "tabs");
+          for (const [key, label] of [["relations", "Channels & Relations"], ["access", "Access Tokens"]]) {
+            const tab = el("div", "tab" + (tokenTab === key ? " active" : ""), label);
+            tab.onclick = () => { tokenTab = key; renderTokensPage(); };
+            tabs.appendChild(tab);
+          }
+          content.appendChild(tabs);
+
+          const section = el("div");
+          content.appendChild(section);
+          if (tokenTab === "relations") await renderTokenRelations(section);
+          else await renderAccessTokens(section);
+        }
+
+        // ── Tab 1: channel ↔ role ↔ user relationship browser ──
+        async function renderTokenRelations(container) {
+          container.innerHTML = '<div class="loading">Loading…</div>';
+          let rel;
+          try {
+            rel = await apiFetch("/admin/tokens/relations");
+          } catch (e) { container.innerHTML = ""; container.appendChild(errBox(e)); return; }
+          const roles = rel.roles || [];
+          const creds = rel.credentials || [];
+          container.innerHTML = "";
+
+          const bar = el("div", "filter-bar");
+          const roleSel = select([{ value: "", label: "role: all" }, ...roles.map((r) => ({ value: r.role_id, label: r.role_id }))], "");
+          const credSel = select([{ value: "", label: "channel: all" }, ...creds.map((c) => ({ value: c.id, label: c.name }))], "");
+          bar.append(roleSel, credSel);
+          container.appendChild(bar);
+
+          const panel = el("div");
+          container.appendChild(panel);
+
+          const pickRole = (id) => { roleSel.value = id; render(); };
+          const pickCred = (id) => { credSel.value = id; render(); };
+          const render = () => {
+            panel.innerHTML = "";
+            const rf = roleSel.value, cf = credSel.value;
+            if (rf) renderRelRole(panel, rel, roles.find((r) => r.role_id === rf), { pickCred });
+            else if (cf) renderRelCred(panel, rel, creds.find((c) => c.id === cf), { pickRole });
+            else renderRelAll(panel, rel, { pickRole, pickCred });
+          };
+          roleSel.addEventListener("change", render);
+          credSel.addEventListener("change", render);
+          render();
+        }
+
+        function renderRelAll(panel, rel, nav) {
+          const creds = rel.credentials || [];
+          const roles = rel.roles || [];
+          const title = el("div", "section-title", "Channels ");
+          title.appendChild(el("span", "muted", creds.length + " provider channels — click a name for detail"));
+          panel.appendChild(title);
+          if (!creds.length) { panel.appendChild(emptyState("No provider channels yet.")); }
+          else {
+            const grid = el("div", "chan-grid");
+            for (const c of creds) {
+              const card = el("div", "chan-card");
+              const top = el("div", "top");
+              const nm = el("span", "cell-main", c.name);
+              nm.style.cursor = "pointer";
+              nm.onclick = () => credentialDetailModal(c.id);
+              top.append(nm, c.is_active ? badge("active", "ok") : badge("inactive", "danger"));
+              card.appendChild(top);
+              card.appendChild(el("div", "cell-sub code", c.base_url));
+              const meta = el("div", "cell-sub");
+              meta.appendChild(el("span", "mini-chip", (c.model_count || 0) + " routes"));
+              meta.appendChild(el("span", "mini-chip", priceText(c.price_prompt_min, c.price_prompt_max)));
+              card.appendChild(meta);
+              if (c.roles && c.roles.length) {
+                const rt = el("div", "cell-sub");
+                rt.appendChild(el("span", "", "roles: "));
+                for (const rid of c.roles) {
+                  const chip = el("span", "mini-chip", rid);
+                  chip.style.cursor = "pointer";
+                  chip.onclick = () => nav.pickRole(rid);
+                  rt.appendChild(chip);
+                }
+                card.appendChild(rt);
+              }
+              grid.appendChild(card);
+            }
+            panel.appendChild(grid);
+          }
+
+          panel.appendChild(el("div", "section-title", "Roles → channels"));
+          const { wrap, tbody } = table(["Role", "Bound channels"]);
+          for (const r of roles) {
+            const row = el("tr");
+            const who = el("div");
+            who.appendChild(el("span", "cell-main", r.role_id));
+            if (r.role_name) who.appendChild(el("div", "cell-sub", r.role_name));
+            row.appendChild(td(who));
+            const cc = el("div");
+            for (const c of (r.credentials || [])) {
+              const chip = el("span", "mini-chip", c.name);
+              chip.style.cursor = "pointer";
+              chip.onclick = () => nav.pickCred(c.id);
+              cc.appendChild(chip);
+            }
+            const manage = el("button", "btn sm ghost", "manage");
+            manage.type = "button";
+            manage.onclick = () => channelPickerModal(r.role_id, r.role_name, r.credentials || []);
+            if ((r.credentials || []).length) {
+              cc.appendChild(manage);
+              row.appendChild(td(cc));
+            } else {
+              row.appendChild(td(manage));
+            }
+            tbody.appendChild(row);
+          }
+          panel.appendChild(wrap);
+        }
+
+        function renderRelRole(panel, rel, role, nav) {
+          if (!role) { panel.appendChild(emptyState("Role not found")); return; }
+          const card = el("div", "rel-card");
+          const h = el("h4");
+          h.append(badge(role.role_id, roleKind(role.role_id)), role.is_active ? badge("active", "ok") : badge("inactive", "danger"));
+          card.appendChild(h);
+          panel.appendChild(card);
+
+          panel.appendChild(el("div", "section-title", "Bound channels"));
+          const manage = el("button", "btn sm ghost", "Manage channels");
+          manage.type = "button";
+          manage.onclick = () => channelPickerModal(role.role_id, role.role_name, role.credentials || []);
+          panel.appendChild(manage);
+          if (!(role.credentials || []).length) { panel.appendChild(emptyState("No channels bound to this role yet.")); }
+          else {
+            const { wrap, tbody } = table(["Channel", "Routes", "Price", "Status"]);
+            for (const c of (role.credentials || [])) {
+              const row = el("tr");
+              const nm = el("span", "cell-main", c.name);
+              nm.style.cursor = "pointer";
+              nm.onclick = () => credentialDetailModal(c.id);
+              row.appendChild(td(nm));
+              row.appendChild(td(el("span", "muted", (c.model_count || 0) + " routes")));
+              row.appendChild(td(el("span", "code", priceText(c.price_prompt_min, c.price_prompt_max))));
+              row.appendChild(td(c.is_active ? badge("active", "ok") : badge("inactive", "danger")));
+              tbody.appendChild(row);
+            }
+            panel.appendChild(wrap);
+          }
+        }
+
+        function renderRelCred(panel, rel, cred, nav) {
+          if (!cred) { panel.appendChild(emptyState("Channel not found")); return; }
+          const card = el("div", "rel-card");
+          const h = el("h4");
+          h.append(cred.name, cred.is_active ? badge("active", "ok") : badge("inactive", "danger"));
+          card.appendChild(h);
+          card.appendChild(detailRow("Base URL", cred.base_url));
+          card.appendChild(detailRow("Routes", (cred.model_count || 0) + " routed"));
+          card.appendChild(detailRow("Prompt $/1k", priceText(cred.price_prompt_min, cred.price_prompt_max)));
+          card.appendChild(detailRow("Completion $/1k", priceText(cred.price_completion_min, cred.price_completion_max)));
+          const rb = el("div");
+          for (const rid of (cred.roles || [])) {
+            const chip = el("span", "mini-chip", rid);
+            chip.style.cursor = "pointer";
+            chip.onclick = () => nav.pickRole(rid);
+            rb.appendChild(chip);
+          }
+          card.appendChild(detailRow("Bound roles", (cred.roles || []).length ? rb : "none"));
+          panel.appendChild(card);
+          const detail = el("button", "btn ghost", "Full channel detail");
+          detail.type = "button";
+          detail.onclick = () => credentialDetailModal(cred.id);
+          panel.appendChild(detail);
+        }
+
+        // ── Tab 2: access tokens table (generate / revoke / delete) ──
+        async function renderAccessTokens(container) {
+          container.innerHTML = '<div class="loading">Loading…</div>';
+          let tokens, users, roles, wallets;
+          try {
+            [tokens, users, roles, wallets] = await Promise.all([
+              apiFetch("/admin/tokens").then((d) => d.tokens || []),
+              apiFetch("/admin/users").then((d) => d.users || []),
+              apiFetch("/admin/roles").then((d) => d.roles || []),
+              apiFetch("/admin/wallets").then((d) => d.wallets || []),
+            ]);
+          } catch (e) { container.innerHTML = ""; container.appendChild(errBox(e)); return; }
+          container.innerHTML = "";
+
+          const bar = el("div", "bar-row");
+          const title = el("div", "bar-title", "Access tokens ");
+          title.appendChild(el("span", "count", "(" + tokens.length + ")"));
+          const add = el("button", "btn primary", "+ Generate token");
+          add.onclick = () => tokenForm({ users, roles });
+          bar.append(title, add);
+          container.appendChild(bar);
+
+          const userOf = {}, userRoleOf = {}, displayOf = {}, userById = {}, balanceOf = {};
+          for (const u of users) {
+            userOf[u.id] = u.username;
+            userRoleOf[u.id] = u.role_id;
+            displayOf[u.id] = u.display_name;
+            userById[u.id] = u;
+          }
+          for (const w of wallets) balanceOf[w.user_id] = w.balance;
+          // Effective role: per-token role_id override → the user's role → token kind.
+          const effRole = (tk) => tk.role_id || (tk.user_id ? userRoleOf[tk.user_id] || "regular" : "admin");
+          const search = textInput("", { placeholder: "Search by person or token name…" });
+          const roleSel = select([{ value: "", label: "role: all" }, ...roles.map((r) => ({ value: r.role_id, label: r.role_id }))], "");
+          const filters = el("div", "filter-bar");
+          filters.append(search, roleSel);
+          container.appendChild(filters);
+
+          const wrapBox = el("div");
+          container.appendChild(wrapBox);
+          const render = () => {
+            wrapBox.innerHTML = "";
+            const q = search.value.trim().toLowerCase();
+            const rf = roleSel.value;
+            const list = tokens.filter((tk) => {
+              if (rf && effRole(tk) !== rf) return false;
+              if (!q) return true;
+              const hay = [userOf[tk.user_id] || "", displayOf[tk.user_id] || "", tk.name || ""].join(" ").toLowerCase();
+              return hay.includes(q);
+            });
+            if (!list.length) {
+              wrapBox.appendChild(emptyState(tokens.length ? "No tokens match." : "No tokens yet."));
+              return;
+            }
+            const { wrap, tbody } = table(["Model", "User", "Role", "Expires", "Last login", "Active", ""]);
+            for (const tk of list) {
+              const row = el("tr");
+              // Model = the pinned channel; click opens the llm_credentials detail modal.
+              if (tk.credential_id) {
+                const nm = el("span", "link", tk.credential_name || tk.credential_id.slice(0, 8));
+                nm.onclick = () => credentialDetailModal(tk.credential_id);
+                row.appendChild(td(nm));
+              } else {
+                row.appendChild(td(el("span", "muted", "—")));
+              }
+              // User = the logged-in account; click opens the user detail drawer.
+              const who = el("div");
+              const user = tk.user_id ? userById[tk.user_id] : null;
+              if (user) {
+                const un = el("span", "link", userOf[tk.user_id]);
+                un.onclick = () => userDetails(user, { roles, balance: balanceOf[tk.user_id] });
+                who.appendChild(un);
+              } else {
+                who.appendChild(el("span", "cell-main", "admin"));
+              }
+              const sub = [];
+              if (tk.name && tk.name !== userOf[tk.user_id]) sub.push(tk.name);
+              if (tk.role_id) sub.push("role " + tk.role_id);
+              if (sub.length) who.appendChild(el("div", "cell-sub", sub.join(" · ")));
+              row.appendChild(td(who));
+              const rkind = effRole(tk);
+              row.appendChild(td(badge(rkind, rkind === "admin" ? "danger" : roleKind(rkind))));
+              if (expired(tk.expires_at)) row.appendChild(td(badge("expired", "danger")));
+              else row.appendChild(td(el("span", "muted", tk.expires_at ? fmtDate(tk.expires_at) : "never")));
+              row.appendChild(td(el("span", "muted", tk.last_used_at ? fmtDate(tk.last_used_at) : "—")));
+              const tdSw = td();
+              tdSw.appendChild(switchToggle(tk.is_active, async (on) => {
+                try {
+                  await apiFetch("/admin/tokens/" + tk.id, { method: "PATCH", body: JSON.stringify({ is_active: on }) });
+                  toast(on ? "Token enabled" : "Token revoked");
+                  renderTokensPage();
+                } catch (e) { toast(e.message, "err"); renderTokensPage(); }
+              }));
+              row.appendChild(tdSw);
+              row.appendChild(td(actionBtns([
+                { label: "Delete", danger: true, onClick: () => deleteToken(tk) },
+              ])));
+              tbody.appendChild(row);
+            }
+            wrapBox.appendChild(wrap);
+          };
+          search.addEventListener("input", render);
+          roleSel.addEventListener("change", render);
+          render();
+        }
+
+        function tokenForm(ctx) {
+          const name = textInput("", { placeholder: "e.g. ci-robot" });
+          const roleSel = select([
+            { value: "user", label: "user — bound to an account" },
+            { value: "admin", label: "admin — unrestricted" },
+          ], "user");
+          const userSel = select(ctx.users.map((u) => ({ value: u.id, label: u.username || u.id.slice(0, 8) })), "");
+          const roleIdSel = select([{ value: "", label: "(inherit the user's role)" }, ...ctx.roles.map((r) => ({ value: r.role_id, label: r.role_id }))], "");
+          const expirySel = select([
+            { value: "7", label: "7 days" },
+            { value: "30", label: "30 days" },
+            { value: "90", label: "90 days" },
+            { value: "never", label: "Never expires" },
+          ], "30");
+
+          const userField = field("User", userSel, "Required for user tokens.");
+          const roleIdField = field("Role override", roleIdSel, "Optional quota-role override.");
+          const userBlock = el("div");
+          userBlock.append(userField, roleIdField);
+          const sync = () => {
+            userBlock.style.display = roleSel.value === "user" ? "" : "none";
+          };
+          roleSel.addEventListener("change", sync);
+          sync();
+
+          const body = el("div");
+          body.append(
+            field("Name", name),
+            field("Role", roleSel),
+            userBlock,
+            field("Expiry", expirySel)
+          );
+
+          const foot = drawerFoot();
+          const save = el("button", "btn primary", "Generate");
+          save.onclick = async () => {
+            if (!name.value.trim()) { toast("Token name is required", "err"); return; }
+            save.disabled = true;
+            const payload = { name: name.value.trim(), role: roleSel.value };
+            if (roleSel.value === "user") {
+              if (!userSel.value) { toast("Select a user for user tokens", "err"); save.disabled = false; return; }
+              payload.user_id = userSel.value;
+              if (roleIdSel.value) payload.role_id = roleIdSel.value;
+            }
+            if (expirySel.value !== "never") {
+              payload.expires_at = new Date(Date.now() + parseInt(expirySel.value, 10) * 86400000).toISOString();
+            }
+            try {
+              const d = await apiFetch("/admin/tokens", { method: "POST", body: JSON.stringify(payload) });
+              drawer.close();
+              revealTokenModal(d.token, d.name, d.role);
+              renderTokensPage();
+            } catch (e) { toast(e.message, "err"); }
+            save.disabled = false;
+          };
+          foot.appendChild(save);
+          openDrawer({ title: "Generate token", subtitle: "Raw value shown once", body, footer: foot });
+        }
+
+        function revealTokenModal(raw, name, role) {
+          const overlay = el("div", "overlay center");
+          const card = el("div", "modal-card");
+          card.appendChild(el("h3", "modal-title", "Token created"));
+          card.appendChild(el("p", "confirm-text", `"${name}" (${role}) is shown only once — copy it now.`));
+          const box = el("div", "reveal-box");
+          const code = el("span", "", raw);
+          const copyBtn = el("button", "btn sm ghost", "Copy");
+          copyBtn.onclick = async () => {
+            if (await copyText(raw)) toast("Token copied to clipboard");
+            else toast("Copy failed — select and copy manually", "err");
+          };
+          box.append(code, copyBtn);
+          card.appendChild(box);
+          const foot = el("div", "modal-foot");
+          const done = el("button", "btn primary", "Done");
+          done.onclick = () => overlay.remove();
+          foot.appendChild(done);
+          card.appendChild(foot);
+          overlay.appendChild(card);
+          document.body.appendChild(overlay);
+        }
+
+        async function deleteToken(tk) {
+          if (!(await confirmDialog(`Delete token "${tk.name}"?`, "Delete token"))) return;
+          try {
+            await apiFetch("/admin/tokens/" + tk.id, { method: "DELETE" });
+            toast("Token deleted");
+            renderTokensPage();
+          } catch (e) { toast(e.message, "err"); }
+        }
+
+        // ───────────────────────── wire up ─────────────────────────
         document.getElementById("login-btn").addEventListener("click", login);
         document.getElementById("login-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
         document.getElementById("logout-btn").addEventListener("click", logout);
-        document.getElementById("add-provider").addEventListener("click", () => {
-          providers.push(newProvider());
-          renderProviders();
+        document.getElementById("refresh-btn").addEventListener("click", () => navigate());
+        document.querySelectorAll(".nav-item").forEach((n) => {
+          n.addEventListener("click", () => { location.hash = n.dataset.page; });
         });
-        document.getElementById("add-user").addEventListener("click", createUser);
-        document.getElementById("add-token").addEventListener("click", createToken);
-        document.getElementById("add-model").addEventListener("click", createModel);
-        document.getElementById("topup-btn").addEventListener("click", topupByUserId);
-        document.getElementById("save-btn").addEventListener("click", saveConfig);
+        window.addEventListener("hashchange", navigate);
+
+        // appearance wiring
+        const settingsBtn = document.getElementById("settings-btn");
+        const settingsBackdrop = document.getElementById("settings-backdrop");
+        const settingsPop = document.getElementById("settings-pop");
+        const settingsFont = document.getElementById("settings-font");
+
+        function openSettings(open) {
+          settingsPop.classList.toggle("hidden", !open);
+          settingsBackdrop.classList.toggle("hidden", !open);
+        }
+        settingsBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openSettings(settingsPop.classList.contains("hidden"));
+        });
+        settingsBackdrop.addEventListener("click", () => openSettings(false));
+        document.querySelectorAll("[data-theme-opt]").forEach((b) => {
+          b.addEventListener("click", () => {
+            theme = b.dataset.themeOpt;
+            writePref(THEME_KEY, theme);
+            applyTheme(theme);
+            openSettings(false);
+          });
+        });
+        settingsFont.addEventListener("change", () => {
+          fontSize = parseInt(settingsFont.value, 10) || 14;
+          writePref(FONT_KEY, String(fontSize));
+          applyFontSize(fontSize);
+        });
+        document.addEventListener("keydown", (e) => {
+          if (e.key === "Escape" && !settingsPop.classList.contains("hidden")) openSettings(false);
+        });
+        if (window.matchMedia) {
+          try {
+            window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+              if (theme === "system") applyTheme("system");
+            });
+          } catch { /* ignore */ }
+        }
 
         boot();
       })();

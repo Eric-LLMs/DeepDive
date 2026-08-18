@@ -20,7 +20,11 @@
         <div id="tree" class="tree"></div>
         <div id="sessions" class="sessions hidden"></div>
         <div id="sidebar-footer">
-          <button id="open-settings" type="button" title="Settings">⚙️ Settings</button>
+          <button id="user-menu-trigger" type="button" title="Account menu">
+            <span id="user-avatar" class="user-avatar">👤</span>
+            <span id="user-name" class="user-name">Sign in</span>
+          </button>
+          <button id="quick-settings" type="button" title="Settings" class="footer-icon">⚙️</button>
         </div>
       </aside>
       <div id="splitter" class="splitter"></div>
@@ -49,28 +53,173 @@
       </main>
     </div>
 
-    <!-- Settings dropdown (list) -->
-    <div id="settings-panel" class="settings-panel hidden">
-      <div class="settings-list">
-        <button id="settings-account-btn" type="button" class="settings-row">
-          <span class="settings-row-label">Account</span>
-          <span id="settings-account-value" class="settings-row-value">Sign in</span>
+    <!-- User action menu (upward from the bottom bar) -->
+    <div id="user-menu" class="user-menu hidden">
+      <div class="user-menu-group">
+        <div class="user-menu-group-label">Account</div>
+        <button type="button" class="user-menu-item" data-action="profile">
+          <span class="user-menu-item-label">👤 Profile</span>
+          <span id="profile-menu-value" class="user-menu-item-value"></span>
         </button>
-        <div id="settings-account-info" class="account-box hidden">
-          <div id="account-who" class="account-who"></div>
-          <button id="account-logout" type="button" class="account-signout">Sign out</button>
-        </div>
-        <div class="settings-row">
-          <span class="settings-row-label">Theme</span>
-          <select id="account-theme">
-            <option value="dark">Dark</option>
-            <option value="light">Light</option>
-          </select>
-        </div>
-        <button id="account-help" type="button" class="settings-row">
-          <span class="settings-row-label">Help</span>
-          <span class="settings-row-value">Open GitHub ↗</span>
+      </div>
+      <div class="user-menu-group">
+        <div class="user-menu-group-label">Cloud &amp; Web Services</div>
+        <button type="button" class="user-menu-item disabled" data-action="cloud-drive" disabled>
+          <span class="user-menu-item-label">☁️ Cloud Drive</span>
+          <span class="soon">Soon</span>
         </button>
+        <button type="button" class="user-menu-item" data-action="web-console">
+          <span class="user-menu-item-label">🌐 Web Console</span>
+        </button>
+      </div>
+      <div id="user-menu-admin-group" class="user-menu-group hidden">
+        <div class="user-menu-group-label">System</div>
+        <button type="button" class="user-menu-item" data-action="admin-console">
+          <span class="user-menu-item-label">🛠️ Admin Console</span>
+        </button>
+      </div>
+      <div class="user-menu-group">
+        <div class="user-menu-group-label">App &amp; Support</div>
+        <button type="button" class="user-menu-item" data-action="settings">
+          <span class="user-menu-item-label">⚙️ Settings</span>
+        </button>
+      </div>
+      <div id="user-menu-signout-group" class="user-menu-group hidden">
+        <div class="user-menu-group-label">Session</div>
+        <button type="button" class="user-menu-item signout" data-action="signout">
+          <span class="user-menu-item-label">↩ Sign Out</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Settings modal (opened from the user menu or the footer ⚙️ button) -->
+    <div id="settings-overlay" class="overlay hidden">
+      <div class="modal modal-settings">
+        <div class="modal-header">
+          <h3>Settings</h3>
+          <button id="settings-close" type="button" class="modal-close" title="Close">×</button>
+        </div>
+        <div class="settings-body">
+          <nav id="settings-tabs" class="settings-tabs">
+            <button type="button" class="settings-tab active" data-settings-tab="appearance">Appearance</button>
+            <button type="button" class="settings-tab" data-settings-tab="window">Window &amp; Display</button>
+            <button type="button" class="settings-tab" data-settings-tab="updates">Updates</button>
+            <button type="button" class="settings-tab" data-settings-tab="help">Help &amp; Feedback</button>
+            <button type="button" class="settings-tab" data-settings-tab="about">About</button>
+          </nav>
+          <div class="settings-content">
+            <!-- Appearance -->
+            <section id="settings-tab-appearance" class="settings-tab-body active">
+              <div class="settings-section">
+                <div class="settings-section-title">Theme</div>
+                <div class="option-group">
+                  <button type="button" class="settings-row option-row" data-theme="system"><span class="settings-row-label">Follow System</span><span class="option-check">✓</span></button>
+                  <button type="button" class="settings-row option-row" data-theme="dark"><span class="settings-row-label">Dark</span><span class="option-check">✓</span></button>
+                  <button type="button" class="settings-row option-row" data-theme="light"><span class="settings-row-label">Light</span><span class="option-check">✓</span></button>
+                </div>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">Accent Color</div>
+                <div id="accent-swatches" class="accent-swatches"></div>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">Background</div>
+                <button type="button" class="settings-row disabled" disabled><span class="settings-row-label">Vibrancy / Acrylic</span><span class="soon">Soon</span></button>
+              </div>
+            </section>
+
+            <!-- Window & Display -->
+            <section id="settings-tab-window" class="settings-tab-body hidden">
+              <div class="settings-section">
+                <div class="settings-section-title">Font Size</div>
+                <select id="pref-font-size" class="settings-select">
+                  <option value="13">13px · Small</option>
+                  <option value="14">14px · Standard</option>
+                  <option value="16">16px · Large</option>
+                </select>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">Monospace Font</div>
+                <select id="pref-mono-font" class="settings-select">
+                  <option value="default">Default</option>
+                  <option value="JetBrains Mono">JetBrains Mono</option>
+                  <option value="Fira Code">Fira Code</option>
+                  <option value="Consolas">Consolas</option>
+                </select>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">UI Scale</div>
+                <select id="pref-zoom" class="settings-select">
+                  <option value="0.8">80%</option>
+                  <option value="1">100%</option>
+                  <option value="1.25">125%</option>
+                  <option value="1.5">150%</option>
+                </select>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">Window</div>
+                <button type="button" class="settings-row option-row" data-pref="rememberBounds"><span class="settings-row-label">Remember window size &amp; position</span><span class="option-check">✓</span></button>
+                <button type="button" class="settings-row disabled" disabled><span class="settings-row-label">Minimize to tray</span><span class="soon">Soon</span></button>
+                <button type="button" class="settings-row disabled" disabled><span class="settings-row-label">Launch at startup</span><span class="soon">Soon</span></button>
+              </div>
+            </section>
+
+            <!-- Updates -->
+            <section id="settings-tab-updates" class="settings-tab-body hidden">
+              <div class="settings-section">
+                <div class="settings-section-title">Version</div>
+                <div class="settings-detail-note">DeepDive Workbench <span id="updates-version">…</span></div>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">Distribution Channel</div>
+                <div class="option-group">
+                  <button type="button" class="settings-row option-row" data-channel="stable"><span class="settings-row-label">Stable (正式版)</span><span class="option-check">✓</span></button>
+                  <button type="button" class="settings-row option-row" data-channel="beta"><span class="settings-row-label">Beta (尝鲜版)</span><span class="option-check">✓</span></button>
+                </div>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">Update</div>
+                <button id="check-updates-btn" type="button" class="settings-row"><span class="settings-row-label">Check for Updates</span></button>
+                <div id="update-status" class="settings-detail-note">…</div>
+                <button id="update-open-release" type="button" class="settings-row hidden"><span class="settings-row-label">Open Release Page</span></button>
+              </div>
+            </section>
+
+            <!-- Help & Feedback -->
+            <section id="settings-tab-help" class="settings-tab-body hidden">
+              <div class="settings-section">
+                <div class="settings-section-title">Quick Links</div>
+                <button type="button" class="settings-row" data-link="https://github.com/Eric-LLMs/DeepDive"><span class="settings-row-label">Official Docs &amp; Source</span></button>
+                <button type="button" class="settings-row" data-link="https://github.com/Eric-LLMs/DeepDive/issues"><span class="settings-row-label">FAQ &amp; GitHub Issues</span></button>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">Send Feedback</div>
+                <select id="feedback-category" class="settings-select">
+                  <option value="feature">功能建议</option>
+                  <option value="bug">缺陷报告</option>
+                  <option value="ai">AI 生成异常</option>
+                </select>
+                <textarea id="feedback-text" class="settings-textarea" rows="4" placeholder="Describe the issue or suggestion…"></textarea>
+                <label class="settings-check"><input id="feedback-logs" type="checkbox" checked /> Attach sanitized diagnostics (OS, app version)</label>
+                <button id="feedback-submit" type="button" class="primary-btn">提交反馈</button>
+              </div>
+            </section>
+
+            <!-- About -->
+            <section id="settings-tab-about" class="settings-tab-body hidden">
+              <div class="about-head">
+                <div class="about-logo">🫧</div>
+                <div>
+                  <div class="about-name">DeepDive Workbench</div>
+                  <div class="about-version">Version <span id="about-version">…</span></div>
+                </div>
+              </div>
+              <div class="settings-detail-note">DeepDive 是一款专注于本地音视频流式切片与云端 Agent 协同学习的智能工作台。</div>
+              <div class="settings-detail-note">MIT License · Built on Electron, React, FastAPI, LiteLLM.</div>
+              <button type="button" class="settings-row" data-link="https://github.com/Eric-LLMs/DeepDive"><span class="settings-row-label">Visit GitHub Repository</span></button>
+            </section>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -96,6 +245,62 @@
           <div class="modal-actions">
             <button id="account-login-btn" type="button" class="primary">Sign in</button>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Profile modal (account details) -->
+    <div id="profile-overlay" class="overlay hidden">
+      <div class="modal modal-profile">
+        <div class="modal-header">
+          <h3>Profile</h3>
+          <button id="profile-close" type="button" class="modal-close" title="Close">×</button>
+        </div>
+        <div class="profile-head">
+          <span id="profile-avatar" class="user-avatar profile-avatar"></span>
+          <div class="profile-id">
+            <div id="profile-name" class="profile-name"></div>
+            <div id="profile-username" class="profile-username"></div>
+          </div>
+          <span id="profile-role" class="tier"></span>
+        </div>
+        <div class="profile-section">
+          <div class="profile-section-title">Plan &amp; Quota</div>
+          <div class="profile-stat">
+            <span class="profile-stat-label">Plan</span>
+            <span id="profile-plan" class="profile-stat-value"></span>
+          </div>
+          <div class="profile-stat">
+            <span class="profile-stat-label">Daily token limit</span>
+            <span id="profile-token-limit" class="profile-stat-value"></span>
+          </div>
+          <div class="profile-stat">
+            <span class="profile-stat-label">Daily request limit</span>
+            <span id="profile-request-limit" class="profile-stat-value"></span>
+          </div>
+          <div class="profile-stat">
+            <span class="profile-stat-label">RPM</span>
+            <span id="profile-rpm" class="profile-stat-value"></span>
+          </div>
+          <div class="profile-stat">
+            <span class="profile-stat-label">Default model</span>
+            <span id="profile-model" class="profile-stat-value"></span>
+          </div>
+        </div>
+        <div class="profile-section">
+          <div class="profile-section-title">Account</div>
+          <button type="button" class="settings-row disabled" disabled>
+            <span class="settings-row-label">Change Avatar</span>
+            <span class="soon">Soon</span>
+          </button>
+          <button type="button" class="settings-row disabled" disabled>
+            <span class="settings-row-label">Change Password</span>
+            <span class="soon">Soon</span>
+          </button>
+          <button type="button" class="settings-row disabled" disabled>
+            <span class="settings-row-label">Token Usage</span>
+            <span class="soon">Soon</span>
+          </button>
         </div>
       </div>
     </div>
