@@ -181,6 +181,12 @@ class TokenUpdateRequest(BaseModel):
     expires_at: datetime | None = None
 
 
+class GrantUpdateRequest(BaseModel):
+    """Flip the per-user LLM-key grant switch (ban / restore a key for a user)."""
+
+    is_active: bool
+
+
 class RoleUpdateRequest(BaseModel):
     role_name: str | None = None
     daily_request_limit: int | None = None

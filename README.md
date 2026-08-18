@@ -87,7 +87,7 @@ flowchart TB
 
 ### 👥 Multi-User, Roles & Billing
 - **Admin console** (`/admin`): a self-contained single-file SPA with four modules — **Providers** (credentials + model catalog + routing weights), **Roles**, **Users**, and **Tokens**. A default `admin`/`admin` credential is seeded into the DB on first boot; console login is stateless (a signed session token, never persisted), so it never pollutes the tokens table.
-- **Per-role LLM channels**: every role binds the provider channels it may use (`role_credentials`); each login pins one random active channel to the token, and chat routes through it per-request with failover. `access_tokens` keeps **one row per (user, channel)** — re-login rotates the secret in place instead of growing the table.
+- **Per-role LLM channels**: every role binds the provider channels it may use (`role_credentials`); each login pins one random active channel to the token, and chat routes through it per-request with failover.
 - **User accounts**: admins create username/password accounts; users (and the web/desktop console) log in to receive an opaque token. Roles (`regular` / `pro` / `vip` / `admin` / `anonymous`) carry per-role quota (daily/monthly requests, tokens, RPM, cost) and an optional default model.
 - **Server-managed config**: LLM provider keys, the model catalog, and the admin credential live in PostgreSQL (`app_settings`) — not `.env` or repo files — and are edited from the admin console.
 - **Pay-as-you-go billing**: per-model pricing (prompt/completion per 1k tokens), a cash wallet per user, and an append-only ledger with a `balance_after` snapshot. Chat usage is priced and debited atomically.

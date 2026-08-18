@@ -22,9 +22,9 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
-| Auth / RBAC | opaque `access_tokens` (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login |
-| Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover |
-| Admin console | single-file SPA at `/admin` with 4 modules (Providers / Roles / Users / Tokens): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions |
+| Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login |
+| Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover. The Tokens page disables a user's access to a key per (user, channel); a user with no usable key degrades to the anonymous tier (guest quota) instead of losing login |
+| Admin console | single-file SPA at `/admin` with 4 modules (Providers / Roles / Users / Tokens): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint) |
 | Billing | `llm_models` (per-1k pricing) + `user_wallets` + `wallet_transactions` + `llm_credentials` + `credential_models`; cost calc + atomic wallet deduct |
 | Settings in DB | `app_settings` key/value JSONB (admin credential + LLM provider config + tiers), written by the admin console |
 | Guest access | anonymous chat via the `anonymous` role's channels, with per-day Redis limit (`guest_daily_limit`), 429 → prompt login |
@@ -523,61 +523,199 @@ Hybrid recall is computed in code, not stored in schema:
 
 ### 12.3 Implemented auth, RBAC & billing schema
 
-The multi-user + billing surface that runs today (`migrations/0002_auth.sql` … `0005_roles_credentials.sql`):
+The multi-user + billing surface (`migrations/0002_auth.sql` … `0007_console_tokens_stateless.sql`, plus the
+planned `0008` that splits login credentials into `login_tokens`). Fields below mirror the migration DDL exactly;
+`TEXT` columns are plain `TEXT`, money is `NUMERIC`, time is `TIMESTAMPTZ`, JSON is `JSONB`.
 
-- **users** — `username` (unique where non-null), `password_hash` (stdlib pbkdf2), `display_name`,
-  `is_active`, `role_id` (FK → `user_roles`), `meta`, `created_at`. Legacy anonymous rows keep `username NULL`.
-- **user_roles** — `role_id` TEXT PK, quota limits (`daily_request_limit`, `monthly_request_limit`,
-  `daily_token_limit`, `rpm_limit`, `monthly_cost_limit`; `-1` = unlimited), `default_model`,
-  `models` (**legacy** allowed-model ids — the routing source is now `role_credentials`, the field is
-  kept only for compatibility display), `features`, `is_active`. Seeded: `regular` (50/day) /
-  `pro` / `vip` (unlimited) / `admin` / **`anonymous`** (guest tier).
-- **role_credentials** — N:M binding of **roles → LLM channels** (`role_id` ↔ `credential_id`,
-  both CASCADE, `is_active`, `created_at`). This is what decides which provider key a role may use:
-  VIP/pro bind the expensive channels, `regular` / `anonymous` the cheap ones.
-- **access_tokens** — opaque server-side tokens: `token_hash` (sha256 of the raw token shown once),
-  `role` (`admin` | `user`), `user_id`, optional `role_id` override, **`credential_id`** (the channel
-  randomly picked from the user's role at login and pinned for the token's lifetime), `expires_at`,
-  `last_used_at`, `is_active`. User tokens are **unique per (user, channel)**: re-login on the same
-  channel rotates the secret and bumps `last_used_at` in place instead of inserting a new row, so the
-  table stops growing with every login (partial unique indexes `access_tokens_user_credential_uniq`
-  for pinned channels + `access_tokens_user_no_cred_uniq` for the no-channel case).
-  **Admin console logins are stateless** — `/admin/login` returns a signed `cc_` session token (HMAC,
-  held in the browser) instead of minting a row, so console sessions never pollute `access_tokens`;
-  only Tokens-page API tokens (hashed `dd_`) are persisted. The admin Access Tokens table therefore
-  shows one row per (user, model) — fuzzy search by person name, a role dropdown filter, and clickable
-  Model / User cells opening the `llm_credentials` detail / the user detail drawer.
-- **app_settings** — `key` PK + `value` JSONB. Stores the admin credential, LLM provider config,
-  and tier overrides — moved out of `.env` / `data/config.json`.
-- **user_usage_counters** — `(user_id, period_type, period_start)` PK; atomic UPSERT counters for
-  O(1) quota enforcement (deliberately not Redis, not `COUNT` over logs).
-- **user_usage_logs** — append-only per-call audit (`model_name`, `tool`, token counts, `cost_usd`,
-  `role_id`, `token_id`).
-- **llm_models** — virtual model catalog with `prompt_price_per_1k` / `completion_price_per_1k`.
-- **llm_credentials** — provider channels (`base_url` + `api_key`); **one row = one "token"/key** the
-  admin manages, `is_active` is the per-channel availability switch. A channel's displayed price is
-  derived from its `credential_models` routes (single model) or a price range (multiple models).
-- **credential_models** — N:M routing (credential ↔ model) with `priority` / `weight` + per-key price
-  override; the source of each channel's model list and displayed price.
-- **user_wallets** — one row per user (`balance`, `currency`).
-- **wallet_transactions** — append-only ledger (`type`, `amount`, `balance_after` snapshot,
-  `idempotency_key`). Chat usage is priced via `compute_cost` and debited atomically
+- **users** — identity + credentials. Columns: `id` (UUID PK), `username` (TEXT, unique where
+  non-null — legacy anonymous rows keep it NULL), `password_hash` (TEXT, stdlib pbkdf2),
+  `display_name` (TEXT), `is_active` (BOOLEAN, default true), `role_id` (TEXT FK → `user_roles`
+  `ON DELETE RESTRICT`, default `'regular'`), `meta` (JSONB, default `{}`), `created_at`
+  (TIMESTAMPTZ, default now()), `updated_at` (TIMESTAMPTZ). The flat `tier` column existed in 0002
+  and was dropped by 0003 when roles landed.
+- **user_roles** — quota + model + feature permissions, the tier definition. Columns: `role_id`
+  (TEXT PK), `role_name` (TEXT), `daily_request_limit` (INT, default 50), `monthly_request_limit`
+  (INT, default 1500), `daily_token_limit` (BIGINT), `rpm_limit` (INT), `monthly_cost_limit`
+  (NUMERIC(12,6)) — each `-1` = unlimited — plus `default_model` (TEXT, empty = the active
+  provider's model), `models` (TEXT[], **legacy** allowed-model ids — the routing source is now
+  `role_credentials`, this field is kept only for compatibility display), `features` (JSONB, e.g.
+  `{"chat": true}`), `is_active` (BOOLEAN, default true), `created_at`. Seeded roles: `regular`
+  (50/day), `pro` (500/day), `vip` (−1/unlimited), `admin` (−1/unlimited) from 0003, and
+  **`anonymous`** (guest tier, 20/day) from 0005.
+- **role_credentials** — N:M binding **role → LLM channel**; this is what decides which provider
+  key a role may use (VIP/pro bind expensive channels, `regular` / `anonymous` the cheap ones).
+  Columns: `role_id` (TEXT FK → `user_roles` CASCADE), `credential_id` (UUID FK → `llm_credentials`
+  CASCADE), `is_active` (BOOLEAN, default true), `created_at`; PK `(role_id, credential_id)`, plus
+  an index on `credential_id`.
+- **login_tokens** — the **login/API credential** (split out of `access_tokens` by 0008).
+  Columns: `id` (UUID PK), `user_id` (UUID FK → `users` CASCADE; NULL = admin/API token),
+  `name` (TEXT, human label), `token_hash` (TEXT UNIQUE — sha256 of the raw `dd_` token, shown once
+  at mint and **never recoverable**; the admin console shows only a masked fingerprint), `role` (TEXT,
+  default `'user'`; `'admin'` or `'user'`), `role_id` (TEXT FK → `user_roles`
+  SET NULL, optional quota-role override), `credential_id` (UUID FK → `llm_credentials` SET NULL —
+  the channel **pinned for this login**; the session routes through it), `expires_at` (TIMESTAMPTZ),
+  `last_used_at` (TIMESTAMPTZ, refreshed on every authenticated request), `is_active` (BOOLEAN,
+  default true — **login-credential validity only**), `created_at`. `expires_at` is set at login to
+  `access_token_expire_minutes` (**default 7 days**, overridable via the `ACCESS_TOKEN_EXPIRE_MINUTES`
+  env var) and is **not extended by per-request use** — once it passes, requests get 401 and the
+  user must log in again. Rows are **unique per (user, pinned channel)**: a re-login on the same
+  channel rotates `token_hash` and bumps the timestamps in place instead of inserting a new row
+  (partial unique indexes `login_tokens_user_credential_uniq` on (user, credential), and
+  `login_tokens_user_no_cred_uniq` on (user) where no channel is pinned — moved from the 0006/0007
+  `access_tokens` indexes). **Admin console logins are stateless** — `/admin/login` returns a signed
+  `cc_` HMAC session token held in the browser and never writes a row; only Tokens-page API tokens
+  (hashed `dd_`) and user login tokens are persisted here.
+- **access_tokens** — the **per-user LLM-key permission record** (the Tokens page "which key may
+  this user use" matrix), no login-credential data. Columns: `id` (UUID PK), `user_id` (UUID FK →
+  `users` CASCADE), `credential_id` (UUID FK → `llm_credentials` SET NULL), `is_active` (BOOLEAN,
+  default true — **the key-grant switch**: off = this user is banned from this key), `created_at`.
+  Unique per (user, credential). A row is created **lazily** the first time a key is assigned to the
+  user (at login); the admin flips `is_active` to grant/revoke that key. `token_hash`, `expires_at`,
+  `last_used_at`, `role`, `role_id` live on `login_tokens` — nothing here ever blocks a login
+  (see §12.4 for the full business logic).
+- **app_settings** — server-managed key/value store, the source for data that used to live in
+  `.env` / `data/config.json`. Columns: `key` (TEXT PK), `value` (JSONB NOT NULL), `updated_at`.
+  Holds the admin credential, LLM provider config, and tier overrides.
+- **user_usage_counters** — O(1) quota accounting: atomic UPSERT per (user, period), deliberately
+  not Redis and not a `COUNT` over logs. Columns: `user_id` (UUID FK CASCADE), `period_type`
+  (TEXT, `'day'` | `'month'`), `period_start` (DATE), `request_count` (BIGINT), `token_count`
+  (BIGINT), `updated_at`; PK `(user_id, period_type, period_start)`.
+- **user_usage_logs** — append-only per-call audit. Columns: `id` (UUID PK), `user_id` (UUID FK SET
+  NULL), `token_id` (UUID FK → `login_tokens` SET NULL), `role_id` (TEXT, snapshot at call time),
+  `model_name` (TEXT), `tool` (TEXT), `prompt_tokens` / `completion_tokens` / `total_tokens` (INT,
+  default 0; total is denormalized for dashboards), `cost_usd` (NUMERIC(12,6)), `created_at`;
+  indexes on `(user_id, created_at)` and `(token_id, created_at)`.
+- **llm_credentials** — a provider channel; **one row = one "token"/key** the admin manages.
+  Columns: `id` (UUID PK), `name` (TEXT), `base_url` (TEXT), `api_key` (TEXT), `is_active` (BOOLEAN,
+  default true — the per-channel availability switch), `created_at`, `updated_at`. A channel's
+  displayed price is derived from its `credential_models` routes (single model) or a price range
+  (multiple models).
+- **llm_models** — virtual model catalog with PAYG pricing. Columns: `id` (UUID PK), `name` (TEXT
+  UNIQUE, the virtual model name referenced by roles), `description` (TEXT),
+  `prompt_price_per_1k` (NUMERIC(12,6)), `completion_price_per_1k` (NUMERIC(12,6)), `is_active`,
+  `created_at`.
+- **credential_models** — N:M routing (credential ↔ model): which provider model each credential
+  actually serves, with failover priority and load weight. Columns: `credential_id` (UUID FK
+  CASCADE), `model_id` (UUID FK CASCADE), `actual_model_name` (TEXT — the provider's model id for
+  this credential), `priority` (INT, lower = preferred), `weight` (INT, load-balance weight),
+  `prompt_price_per_1k` / `completion_price_per_1k` (NUMERIC(12,6), NULL = inherit `llm_models`
+  price), `is_active`; PK `(credential_id, model_id)`. The source of each channel's model list and
+  displayed price.
+- **user_wallets** — cash wallet, one row per user. Columns: `user_id` (UUID PK FK CASCADE),
+  `balance` (NUMERIC(14,6), default 0), `currency` (TEXT, default `'USD'`), `updated_at`.
+- **wallet_transactions** — append-only ledger; `balance_after` is a snapshot, never recomputed.
+  Columns: `id` (UUID PK), `user_id` (UUID FK CASCADE), `type` (TEXT: `'topup'` | `'llm_consume'` |
+  `'refund'` | `'adjustment'`), `amount` (NUMERIC(14,6), +credit / −debit), `balance_after`
+  (NUMERIC(14,6)), `description` (TEXT), `meta` (JSONB), `idempotency_key` (TEXT UNIQUE), `created_at`;
+  index on `(user_id, created_at)`. Chat usage is priced via `compute_cost` and debited atomically
   (`UPDATE … WHERE balance >= cost`), so insufficient funds never overdraw.
 
-**Credential-pinning flow (how a request picks its LLM channel):**
+### 12.4 Business logic — per-user LLM-key assignment & the disable (Tokens module)
 
-1. `POST /auth/login` — verify user → resolve `user.role_id` → active `role_credentials` →
-   active `llm_credentials`; pick **one randomly** and write it as `access_tokens.credential_id`
-   (guest requests resolve to the `anonymous` role instead, keeping the per-day Redis guest limit).
-2. Each chat request — `require_user` already loads the token row, so `credential_id` comes along
-   for free; the channel's `base_url` / `api_key` drive the main model call (endpoint resolved
-   per-request, the shared client is never mutated), and the model is the channel's preferred active
-   route, else `role.default_model`, else the global default.
-3. If the pinned channel was disabled by the admin, fall back to another active channel from the same
-   role (failover); an `admin` / legacy token without `credential_id` uses the legacy `/config`
+The Tokens page manages **per-user LLM-key access** — two tables, one concern each. `login_tokens`
+is the **login/API credential** (who can sign in); `access_tokens` is the **key-grant matrix**
+(which LLM keys this user may use). The admin flips `is_active` on an `access_tokens` (user, key)
+row to grant or revoke that key for that user — a key ban, nothing to do with login. The console
+presents the two concerns as separate tabs — *LLM Keys* (user / role / model / masked key + copy,
+model and user rows link to their detail) and *Login Credentials* (user / role / token fingerprint /
+expiry / last login / revoke / delete) — each with its own person search and role filter.
+
+**How a user is assigned an LLM key — the decision in two phases:**
+
+Phase 1 — *at login* (`_pick_credential`; the chosen channel is pinned as
+`login_tokens.credential_id` and rides along with the login token):
+
+```
+candidates = { role_credentials(role).is_active }     # role → channel bindings, switched on
+           ∩ { llm_credentials.is_active }            # the channel itself, switched on
+           − { channels with a disabled access_tokens  # per-user Tokens ban
+               row for this user }
+→ pick one at random and pin it; empty set → nothing pinned (credential_id NULL)
+```
+
+Phase 2 — *at chat* (`_resolve_chat_route`, per request):
+
+```
+1. pinned channel active AND not banned for the user  → use it directly
+2. pinned channel disabled or banned                  → fail over: re-pick from the same
+                                                        candidate set (Phase-1 set)
+3. no pin (credential_id NULL)                        → pick fresh from the same candidate set
+4. candidate set empty                                → anonymous tier: guest_daily_limit +
+                                                        anonymous-role keys / legacy route
+```
+
+The model served by the chosen channel is its preferred active route (`credential_models`,
+lowest `priority`), else the role's `default_model`, else the global default
+(`settings.llm_model`).
+
+**Where the pin lives** — `credential_id` is a column on the **`login_tokens` row** (the login
+credential), *not* on the chat `sessions` row. Every request presents the token (Bearer header);
+the backend loads that token's row and reads `credential_id` from it, so the pinned key rides
+along with the login, not with the conversation. A re-login may pin a different key, and
+`sessions` / `messages` never store which key served a message.
+
+**Login lifetime & re-pin** — a login token expires after `access_token_expire_minutes`
+(default 7 days); use does not extend it. Once it expires the token is dead (401) and the user
+logs in again, which re-runs Phase 1 and **re-pins a key** — the new random pick may be the same
+channel or a different one, and a key the admin disabled in the meantime is skipped. So: a key is
+pinned *per login*, and re-login after expiry is the moment a newly-banned key gets dropped.
+
+The rules that make this safe:
+
+- **Login is never blocked.** Disabling a key only stops that key from being *assigned*; the user
+  always signs in and receives a credential. Admin-console logins (`cc_` HMAC session tokens) are
+  stateless and never touch these tables at all.
+- **Key assignment skips banned keys.** At login `_pick_credential` lists the role's active
+  channels and drops every channel the user has a disabled `access_tokens` grant for; one remaining
+  channel is picked at random and pinned as `login_tokens.credential_id`. No usable key → nothing
+  pinned (`credential_id` NULL) — a plain login token, still issued.
+- **Chat never routes through a banned key.** A token pinned to a key whose `access_tokens` grant
+  was later disabled fails over to another active channel of the same role the user is allowed. A
+  token with no pin picks fresh from the role, again excluding banned keys.
+- **No usable key → anonymous tier.** A logged-in user with zero usable keys still chats, but as an
+  anonymous guest for that request: the Redis `guest_daily_limit` (default 10/day) is enforced, the
+  request routes through the `anonymous` role's keys (or the legacy `/config` client when that role
+  has none), and no usage/billing is recorded for it. This is the paywall — the anonymous tier is
+  the free, rate-limited base.
+- **Restoring access is a re-grant.** The admin re-enables the `access_tokens` row; the next login
+  re-pins the key, reusing and rotating the same `login_tokens` (user, channel) row in place (one
+  row per (user, channel), enforced by the partial unique indexes), so the table never grows with
+  logins.
+
+End-to-end flow for one chat request:
+
+1. `POST /auth/login` — verify user → resolve `user.role_id` → active `role_credentials` ∩ active
+   `llm_credentials`, **excluding channels the user has a disabled `access_tokens` grant for** →
+   pick one randomly and pin it as `login_tokens.credential_id`. Guests resolve to the `anonymous`
+   role instead (per-day Redis `guest_daily_limit`). If every candidate is disabled, nothing is
+   pinned — **login still succeeds**.
+2. Each chat request — `require_user` loads the `login_tokens` row, so `credential_id` comes along
+   for free; the channel's `base_url` / `api_key` drive the model call (resolved per-request; the
+   shared client is never mutated), and the model is the channel's preferred active route, else
+   `role.default_model`, else the global default.
+3. Pinned channel disabled (credential-level `is_active`, or a per-user Tokens ban on that key —
+   its `access_tokens` grant is off) → fail over to another active channel of the same role the user
+   is not banned from. An `admin` / legacy token without `credential_id` uses the legacy `/config`
    active provider.
-4. Billing stays model-catalog-based (`get_model_prices` by model name) — the channel selects *which*
-   model/key is used, the per-1k catalog price determines the cost.
+4. A logged-in user with **no usable key** (every key banned, or the role has no bindings) degrades
+   to the **anonymous tier** for this request: `guest_daily_limit` (Redis) + the `anonymous` role's
+   keys / legacy route, with no usage/billing recorded. Full access returns when the admin re-enables
+   a key.
+5. Billing stays model-catalog-based (`get_model_prices` by model name) — the channel selects *which*
+   model/key is used, the per-1k catalog price determines the cost. A degraded (anonymous-tier)
+   request is not billed.
+
+**When each table is written** — chat never writes either table; the writes are login-time,
+request-time, and admin-only:
+
+- `login_tokens` — written at **login** (insert on first login, or rotate `token_hash` + bump
+  `expires_at` / `last_used_at` / `is_active=true` in place on a re-login for the same channel), on
+  **every authenticated request** (refresh `last_used_at`), and by **admin** on the Tokens page
+  (revoke → `is_active=false`, rename, extend, or delete the row). Expiry / revoke here only stops
+  sign-in — it never touches key grants.
+- `access_tokens` — written at **login** (lazily insert the (user, key) grant the moment a key is
+  first assigned to the user) and by **admin** (flip `is_active` to grant/revoke the key; delete
+  the row). Nothing here ever blocks a login.
 
 ## 13. Multi-Tenancy and Deployment Strategy
 

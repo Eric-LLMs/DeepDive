@@ -57,6 +57,7 @@ from api.schemas import (
     TermImportRequest,
     TermUpdate,
     TTSRequest,
+    GrantUpdateRequest,
     TokenCreateRequest,
     TokenUpdateRequest,
     UserCreateRequest,
@@ -75,6 +76,7 @@ from core.infrastructure.billing import (
 from core.infrastructure.db import (
     AccessTokenModel,
     CredentialModelModel,
+    LoginTokenModel,
     LLMCredentialModel,
     LLMModelModel,
     RoleCredentialModel,
@@ -172,11 +174,11 @@ async def _mint_token(
     credential_id: UUID | None = None,
     expires_at: datetime | None = None,
 ) -> str:
-    """Create an access_tokens row and return the raw token (shown to the client once)."""
+    """Create a login_tokens row and return the raw token (shown to the client once)."""
     raw, token_hash = generate_token()
     async with SessionLocal() as session:
         session.add(
-            AccessTokenModel(
+            LoginTokenModel(
                 user_id=user_id,
                 name=name,
                 token_hash=token_hash,
@@ -198,24 +200,44 @@ async def _login_token(
     credential_id: UUID | None,
     expires_at: datetime,
 ) -> str:
-    """Return a user token for (user, channel), reusing the existing row when possible.
+    """Return a login credential for (user, channel), reusing the existing row when possible.
 
     One row per (user, pinned channel): a re-login on the same channel rotates the secret
-    and bumps the timestamps instead of inserting a new row, so ``access_tokens`` stops
-    growing with every login (enforced by a partial unique index in 0006).
+    and bumps the timestamps instead of inserting a new row, so ``login_tokens`` stops
+    growing with every login (enforced by the partial unique indexes moved from 0006/0007).
+
+    This always mints — a disabled key grant never blocks the login. ``_pick_credential``
+    has already excluded banned keys, so the channel passed here is always one the user may
+    use (or None); a banned key is simply not re-picked.
+
+    When a channel is pinned, its ``access_tokens`` grant row is created **lazily** the
+    first time: the per-user key-grant matrix is what the Tokens page toggles, and the ban
+    must be sticky (a re-login must not revive it, so an existing disabled grant is left
+    alone).
     """
+    if credential_id is not None:
+        grant = (
+            await session.execute(
+                select(AccessTokenModel).where(
+                    AccessTokenModel.user_id == user_id,
+                    AccessTokenModel.credential_id == credential_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if grant is None:
+            session.add(AccessTokenModel(user_id=user_id, credential_id=credential_id))
     existing = (
         await session.execute(
-            select(AccessTokenModel)
+            select(LoginTokenModel)
             .where(
-                AccessTokenModel.user_id == user_id,
+                LoginTokenModel.user_id == user_id,
                 (
-                    AccessTokenModel.credential_id.is_(None)
+                    LoginTokenModel.credential_id.is_(None)
                     if credential_id is None
-                    else AccessTokenModel.credential_id == credential_id
+                    else LoginTokenModel.credential_id == credential_id
                 ),
             )
-            .order_by(AccessTokenModel.created_at.desc())
+            .order_by(LoginTokenModel.created_at.desc())
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -229,7 +251,7 @@ async def _login_token(
         return raw
     raw, token_hash = generate_token()
     session.add(
-        AccessTokenModel(
+        LoginTokenModel(
             user_id=user_id,
             name=name,
             token_hash=token_hash,
@@ -243,12 +265,18 @@ async def _login_token(
     return raw
 
 
-async def _pick_credential(session, role_id: str) -> UUID | None:
+async def _pick_credential(
+    session, role_id: str, user_id: UUID | None = None
+) -> UUID | None:
     """Randomly pick one active LLM channel bound to a role (None if none is usable).
 
     Only bindings whose own ``is_active`` flag and the channel's ``is_active`` are both set
     qualify, so the admin can disable a channel either via its credential row or via the
     per-role binding without touching the other.
+
+    When ``user_id`` is given, channels the user has a *disabled ``access_tokens`` grant* for
+    are excluded — the Tokens page bans a user from a specific LLM key by flipping that grant's
+    ``is_active``, and the ban must be sticky (a re-login must not revive it).
     """
     rows = (
         await session.execute(
@@ -264,37 +292,76 @@ async def _pick_credential(session, role_id: str) -> UUID | None:
             )
         )
     ).scalars().all()
-    if not rows:
+    candidates = list(rows)
+    if user_id is not None and candidates:
+        banned = set(
+            (
+                await session.execute(
+                    select(AccessTokenModel.credential_id)
+                    .where(
+                        AccessTokenModel.user_id == user_id,
+                        AccessTokenModel.credential_id.is_not(None),
+                        AccessTokenModel.is_active.is_(False),
+                    )
+                )
+            ).scalars().all()
+        )
+        if banned:
+            candidates = [c for c in candidates if c not in banned]
+    if not candidates:
         return None
-    return random.choice(list(rows))
+    return random.choice(candidates)
+
+
+async def _user_banned_from(session, user_id: UUID | None, credential_id: UUID) -> bool:
+    """True if the user has a disabled ``access_tokens`` grant for this channel (a Tokens ban)."""
+    if user_id is None:
+        return False
+    row = (
+        await session.execute(
+            select(AccessTokenModel.id)
+            .where(
+                AccessTokenModel.user_id == user_id,
+                AccessTokenModel.credential_id == credential_id,
+                AccessTokenModel.is_active.is_(False),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return row is not None
 
 
 async def _resolve_chat_route(
-    session, token: AccessTokenModel | None, role_id: str
+    session, token: LoginTokenModel | None, role_id: str
 ) -> tuple[str, str, str]:
     """Resolve ``(base_url, api_key, model)`` for one chat request.
 
     ``token`` carries the channel pinned at login when present; ``role_id`` is the effective
     role (the user's role, or ``anonymous`` for guests).
 
-    - A pinned channel that is still active is used directly; ``model`` is the channel's
-      preferred active route, else the role's ``default_model``, else the global default.
-    - A pinned channel that was disabled fails over to another active channel of the same role.
+    - A pinned channel that is still active and not banned for the user is used directly;
+      ``model`` is the channel's preferred active route, else the role's ``default_model``,
+      else the global default.
+    - A pinned channel that was disabled (credential-level, or a user-level Tokens ban on
+      that key) fails over to another active channel of the same role the user is not banned
+      from.
     - No pinned channel (guest, or admin/legacy token) picks fresh from the role; if the role
       has none, empty strings signal "use the configured global client".
     """
+    user_id = token.user_id if token is not None else None
     credential_id = token.credential_id if token is not None else None
     if credential_id is not None:
-        credential = await session.get(LLMCredentialModel, credential_id)
-        if credential is not None and credential.is_active:
-            return await _channel_route(session, credential, role_id)
-        alt = await _pick_credential(session, role_id)
+        if not await _user_banned_from(session, user_id, credential_id):
+            credential = await session.get(LLMCredentialModel, credential_id)
+            if credential is not None and credential.is_active:
+                return await _channel_route(session, credential, role_id)
+        alt = await _pick_credential(session, role_id, user_id)
         if alt is not None and alt != credential_id:
             credential = await session.get(LLMCredentialModel, alt)
             if credential is not None:
                 return await _channel_route(session, credential, role_id)
         return "", "", ""
-    picked = await _pick_credential(session, role_id)
+    picked = await _pick_credential(session, role_id, user_id)
     if picked is not None:
         credential = await session.get(LLMCredentialModel, picked)
         if credential is not None:
@@ -343,8 +410,8 @@ async def admin_login(body: AdminLoginRequest) -> dict:
     """Verify the single admin account and return a stateless console session token.
 
     Console sessions are signed strings held in the browser's localStorage — nothing is
-    written to access_tokens, so console logins no longer accumulate duplicate rows.
-    Persisted tokens (hashed in access_tokens) are only minted via the Tokens page for
+    written to login_tokens, so console logins no longer accumulate duplicate rows.
+    Persisted tokens (hashed in login_tokens) are only minted via the Tokens page for
     external API use.
     """
     if not await verify_admin(body.username, body.password):
@@ -379,7 +446,7 @@ async def user_login(body: UserLoginRequest) -> dict:
     # user's role bindings (None → the legacy /config route at request time).
     async with SessionLocal() as session:
         role = await get_role(session, user["role_id"])
-        credential_id = await _pick_credential(session, user["role_id"])
+        credential_id = await _pick_credential(session, user["role_id"], user["user_id"])
         token = await _login_token(
             session,
             user_id=user["user_id"],
@@ -578,12 +645,13 @@ async def delete_role(role_id: str, _: AuthAdmin = Depends(require_admin)) -> di
     return {"status": "ok"}
 
 
-# ── Token management (admin-only) ──
-def _masked_token(t: AccessTokenModel) -> dict:
+# ── Token management (admin-only): login credentials + LLM-key grants ──
+def _masked_token(t: LoginTokenModel) -> dict:
     return {
         "id": str(t.id),
         "user_id": str(t.user_id) if t.user_id else None,
         "name": t.name,
+        "token_hash": t.token_hash,  # admin-only; masked in the UI, never reversible to the raw value
         "role": t.role,
         "role_id": t.role_id,
         "expires_at": t.expires_at.isoformat() if t.expires_at else None,
@@ -595,14 +663,14 @@ def _masked_token(t: AccessTokenModel) -> dict:
 
 @app.get("/admin/tokens")
 async def list_tokens(_: AuthAdmin = Depends(require_admin)) -> dict:
-    """List all access tokens (masked; the raw value is never returned again).
+    """List all login credentials (masked; the raw value is never returned again).
 
     Each row also carries its pinned ``credential_id`` + channel name so the admin table
     can show the model column and open the ``llm_credentials`` detail modal on click.
     """
     async with SessionLocal() as session:
         rows = (
-            await session.execute(select(AccessTokenModel).order_by(AccessTokenModel.created_at))
+            await session.execute(select(LoginTokenModel).order_by(LoginTokenModel.created_at))
         ).scalars().all()
         cred_names = {
             c.id: c.name
@@ -615,6 +683,58 @@ async def list_tokens(_: AuthAdmin = Depends(require_admin)) -> dict:
         d["credential_name"] = cred_names.get(t.credential_id)
         tokens.append(d)
     return {"tokens": tokens}
+
+
+@app.get("/admin/grants")
+async def list_grants(_: AuthAdmin = Depends(require_admin)) -> dict:
+    """List the per-user LLM-key grant matrix (``access_tokens``), user × key.
+
+    ``is_active`` is the key-grant switch the admin flips to ban / restore a key for a user —
+    it never affects login (login lives on ``login_tokens``).
+    """
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(select(AccessTokenModel).order_by(AccessTokenModel.created_at))
+        ).scalars().all()
+        users = {
+            u.id: u.username
+            for u in (await session.execute(select(UserModel))).scalars().all()
+        }
+        creds = {
+            c.id: c
+            for c in (await session.execute(select(LLMCredentialModel))).scalars().all()
+        }
+    grants = [
+        {
+            "id": str(g.id),
+            "user_id": str(g.user_id) if g.user_id else None,
+            "username": users.get(g.user_id) or "",
+            "credential_id": str(g.credential_id) if g.credential_id else None,
+            "credential_name": creds[g.credential_id].name if g.credential_id in creds else "",
+            "api_key": creds[g.credential_id].api_key if g.credential_id in creds else "",
+            "is_active": g.is_active,
+            "created_at": g.created_at.isoformat() if g.created_at else None,
+        }
+        for g in rows
+    ]
+    return {"grants": grants}
+
+
+@app.patch("/admin/grants/{grant_id}")
+async def update_grant(
+    grant_id: UUID, body: GrantUpdateRequest, _: AuthAdmin = Depends(require_admin)
+) -> dict:
+    """Grant / revoke a user's LLM key: flip the key-grant switch (never blocks login)."""
+    async with SessionLocal() as session:
+        g = (
+            await session.execute(select(AccessTokenModel).where(AccessTokenModel.id == grant_id))
+        ).scalar_one_or_none()
+        if g is None:
+            raise HTTPException(status_code=404, detail="Grant not found")
+        g.is_active = body.is_active
+        await session.commit()
+        await session.refresh(g)
+    return {"status": "ok", "is_active": g.is_active}
 
 
 @app.post("/admin/tokens")
@@ -648,10 +768,10 @@ async def create_token(body: TokenCreateRequest, _: AuthAdmin = Depends(require_
 async def update_token(
     token_id: UUID, body: TokenUpdateRequest, _: AuthAdmin = Depends(require_admin)
 ) -> dict:
-    """Rename / enable / disable / extend a token."""
+    """Rename / enable / disable / extend a login credential."""
     async with SessionLocal() as session:
         t = (
-            await session.execute(select(AccessTokenModel).where(AccessTokenModel.id == token_id))
+            await session.execute(select(LoginTokenModel).where(LoginTokenModel.id == token_id))
         ).scalar_one_or_none()
         if t is None:
             raise HTTPException(status_code=404, detail="Token not found")
@@ -668,10 +788,10 @@ async def update_token(
 
 @app.delete("/admin/tokens/{token_id}")
 async def delete_token(token_id: UUID, _: AuthAdmin = Depends(require_admin)) -> dict:
-    """Revoke a token (deletes the row)."""
+    """Revoke a login credential (deletes the row)."""
     async with SessionLocal() as session:
         t = (
-            await session.execute(select(AccessTokenModel).where(AccessTokenModel.id == token_id))
+            await session.execute(select(LoginTokenModel).where(LoginTokenModel.id == token_id))
         ).scalar_one_or_none()
         if t is None:
             raise HTTPException(status_code=404, detail="Token not found")
@@ -1189,8 +1309,42 @@ async def wallet_transactions(user_id: UUID, _: AuthAdmin = Depends(require_admi
 
 
 @app.get("/admin/users/{user_id}/usage")
-async def user_usage(user_id: UUID, _: AuthAdmin = Depends(require_admin)) -> dict:
-    """Aggregate a user's daily counters, recent usage logs, and wallet ledger."""
+async def user_usage(
+    user_id: UUID,
+    start: str | None = None,   # ISO date/datetime — logs from this moment (inclusive)
+    end: str | None = None,     # ISO date/datetime — logs until this moment (inclusive)
+    model: str | None = None,   # fuzzy match on model_name
+    limit: int = 20,            # logs per page
+    offset: int = 0,
+    _: AuthAdmin = Depends(require_admin),
+) -> dict:
+    """Aggregate a user's daily counters, usage logs, and wallet ledger.
+
+    Usage logs are **paginated and filterable server-side** (start/end date, fuzzy model
+    name) so the admin can page through the full history instead of a fixed latest-50.
+    """
+
+    def _dt(s: str | None, *, end_of_day: bool) -> datetime | None:
+        if not s:
+            return None
+        s = s.strip()
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        # Bare "YYYY-MM-DD" gets the day-boundary heuristic; full datetimes (which
+        # the admin console sends, already converted from local to UTC) are used as-is.
+        if end_of_day and len(s) == 10:
+            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return dt
+
+    start_dt = _dt(start, end_of_day=False)
+    end_dt = _dt(end, end_of_day=True)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
     async with SessionLocal() as session:
         user = await session.get(UserModel, user_id)
         if user is None:
@@ -1206,12 +1360,25 @@ async def user_usage(user_id: UUID, _: AuthAdmin = Depends(require_admin)) -> di
                 .limit(30)
             )
         ).scalars().all()
+        log_filters = [UserUsageLogModel.user_id == user_id]
+        if start_dt is not None:
+            log_filters.append(UserUsageLogModel.created_at >= start_dt)
+        if end_dt is not None:
+            log_filters.append(UserUsageLogModel.created_at <= end_dt)
+        if model:
+            log_filters.append(UserUsageLogModel.model_name.ilike(f"%{model}%"))
+        total = (
+            await session.execute(
+                select(func.count()).select_from(UserUsageLogModel).where(*log_filters)
+            )
+        ).scalar_one()
         logs = (
             await session.execute(
                 select(UserUsageLogModel)
-                .where(UserUsageLogModel.user_id == user_id)
+                .where(*log_filters)
                 .order_by(UserUsageLogModel.created_at.desc())
-                .limit(50)
+                .offset(offset)
+                .limit(limit)
             )
         ).scalars().all()
         txs = await list_transactions(session, user_id, limit=50)
@@ -1250,6 +1417,7 @@ async def user_usage(user_id: UUID, _: AuthAdmin = Depends(require_admin)) -> di
             }
             for t in txs
         ],
+        "total": total,
     }
 
 
@@ -1666,6 +1834,11 @@ async def chat(
     # their token at login (failing over to another active channel of the same role); a guest
     # uses the ``anonymous`` role's channels. A role with no usable channel falls back to the
     # legacy /config route (empty base_url/api_key → the configured global client).
+    #
+    # A logged-in user whose every LLM key is disabled on the Tokens page has *no* usable
+    # channel — they still log in fine, but degrade to the anonymous tier for this request:
+    # guest daily quota + anonymous routing (that's the "equivalent to an anonymous user"
+    # behavior; full access returns when the admin re-enables a key).
     async with SessionLocal() as session:
         if user is None:
             user_id = body.user_id or await ensure_user(SessionLocal)
@@ -1675,11 +1848,17 @@ async def chat(
             log_user = None
         else:
             user_id = user.user_id
-            await check_quota(session, user.user_id, user.role)
-            token = await session.get(AccessTokenModel, user.token_id)
+            token = await session.get(LoginTokenModel, user.token_id)
             role_id = user.role.role_id
             log_user = user
         base_url, api_key, model = await _resolve_chat_route(session, token, role_id)
+        if user is not None and not base_url and not api_key:
+            await _guest_quota(request.app.state.redis, user_id)
+            role_id = "anonymous"
+            log_user = None
+            base_url, api_key, model = await _resolve_chat_route(session, None, role_id)
+        elif user is not None:
+            await check_quota(session, user.user_id, user.role)
 
     session_id = body.session_id or await create_session(SessionLocal, user_id)
     session_memory = SessionMemoryStore(SessionLocal, _embedder(), llm, session_id, user_id)
@@ -1732,14 +1911,22 @@ async def get_job(job_id: UUID, queue: TaskQueue = Depends(get_task_queue)):
 @app.post("/chat/stream")
 async def chat_stream(
     body: ChatRequest,
+    request: Request,
     user: AuthUser = Depends(require_user),
 ):
-    """SSE streaming (role quota enforced; channel from the user's pinned token, else role)."""
+    """SSE streaming. A user with no usable LLM key degrades to the anonymous tier (guest quota)."""
     async with SessionLocal() as session:
-        await check_quota(session, user.user_id, user.role)
-        token = await session.get(AccessTokenModel, user.token_id)
+        token = await session.get(LoginTokenModel, user.token_id)
         base_url, api_key, model = await _resolve_chat_route(session, token, user.role.role_id)
-    await _log_usage(user, model, "chat_stream")
+        if not base_url and not api_key:
+            await _guest_quota(request.app.state.redis, user.user_id)
+            base_url, api_key, model = await _resolve_chat_route(session, None, "anonymous")
+            log_user = None
+        else:
+            await check_quota(session, user.user_id, user.role)
+            log_user = user
+    if log_user is not None:
+        await _log_usage(log_user, model, "chat_stream")
 
     async def gen():
         async for chunk in llm.complete_stream(

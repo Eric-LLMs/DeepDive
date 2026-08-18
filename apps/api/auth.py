@@ -1,6 +1,6 @@
-"""Opaque-token authentication: server-side access_tokens + role-based quota.
+"""Opaque-token authentication: server-side login_tokens + role-based quota.
 
-Two principal kinds are minted into the same ``access_tokens`` table:
+Two principal kinds are minted into the same ``login_tokens`` table:
 
 - ``admin`` tokens (``user_id`` NULL, unlimited) grant access to the ``/admin`` console
   and the protected ``/admin/*`` + ``/config`` routes.
@@ -26,7 +26,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, update
 
 from core.infrastructure.db import (
-    AccessTokenModel,
+    LoginTokenModel,
     SessionLocal,
     UserModel,
     UserRoleModel,
@@ -57,15 +57,15 @@ class AuthUser:
 @dataclass
 class AuthAdmin:
     username: str
-    token_id: UUID | None  # None for stateless console sessions (not stored in access_tokens)
+    token_id: UUID | None  # None for stateless console sessions (not stored in login_tokens)
 
 
-async def _lookup_token(token: str) -> AccessTokenModel:
-    """Resolve a raw bearer token to its active, unexpired row; raise 401 otherwise."""
+async def _lookup_token(token: str) -> LoginTokenModel:
+    """Resolve a raw bearer token to its active, unexpired login row; raise 401 otherwise."""
     async with SessionLocal() as session:
         row = (
             await session.execute(
-                select(AccessTokenModel).where(AccessTokenModel.token_hash == hash_token(token))
+                select(LoginTokenModel).where(LoginTokenModel.token_hash == hash_token(token))
             )
         ).scalar_one_or_none()
         if row is None or not row.is_active:
@@ -73,8 +73,8 @@ async def _lookup_token(token: str) -> AccessTokenModel:
         if row.expires_at is not None and row.expires_at < datetime.now(timezone.utc):
             raise HTTPException(status_code=401, detail="Token expired")
         await session.execute(
-            update(AccessTokenModel)
-            .where(AccessTokenModel.id == row.id)
+            update(LoginTokenModel)
+            .where(LoginTokenModel.id == row.id)
             .values(last_used_at=datetime.now(timezone.utc))
         )
         await session.commit()
@@ -176,7 +176,7 @@ async def require_admin(
 ) -> AuthAdmin:
     """FastAPI dependency: return the admin identity if the token has the admin role.
 
-    Accepts both persisted API tokens (``dd_``, hashed in access_tokens) and stateless
+    Accepts both persisted API tokens (``dd_``, hashed in login_tokens) and stateless
     console session tokens (``cc_``, signed with the console secret — never stored).
     """
     if credentials is None:

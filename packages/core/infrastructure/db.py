@@ -177,14 +177,16 @@ class UserRoleModel(Base):
     )
 
 
-class AccessTokenModel(Base):
-    """An opaque API/login token: sha256 hash stored, raw value returned to the client once.
+class LoginTokenModel(Base):
+    """An opaque login/API credential: sha256 hash stored, raw value returned once.
 
     ``role`` is the principal kind (``admin`` — unlimited, or ``user``); ``role_id`` is an
     optional quota-role override for user tokens (falls back to the owner's role when null).
+    ``credential_id`` is the LLM channel pinned to this login. ``is_active`` is the
+    login-credential validity only — key grants live in ``access_tokens``.
     """
 
-    __tablename__ = "access_tokens"
+    __tablename__ = "login_tokens"
 
     id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
@@ -203,6 +205,31 @@ class AccessTokenModel(Base):
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AccessTokenModel(Base):
+    """Per-user LLM-key grant: "this user may use this LLM key".
+
+    ``is_active`` off = the user is banned from that key (the Tokens-page key switch); it never
+    affects login — login-credential validity lives on ``login_tokens``. A row is created lazily
+    the first time the key is assigned to the user (at login).
+    """
+
+    __tablename__ = "access_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    credential_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("llm_credentials.id", ondelete="SET NULL")
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -238,7 +265,7 @@ class UserUsageLogModel(Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     token_id: Mapped[uuid.UUID | None] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("access_tokens.id", ondelete="SET NULL")
+        PG_UUID(as_uuid=True), ForeignKey("login_tokens.id", ondelete="SET NULL")
     )
     role_id: Mapped[str | None] = mapped_column(String)
     model_name: Mapped[str | None] = mapped_column(String)

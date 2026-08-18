@@ -109,6 +109,7 @@
       .btn.sm { padding: 4px 9px; font-size: 12px; }
       .icon-btn { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 15px; padding: 4px 6px; border-radius: 5px; }
       .icon-btn:hover { color: var(--text); background: var(--panel); }
+      .icon-btn .icon-label { font-size: 12px; margin-left: 2px; vertical-align: middle; }
       .row-actions { display: flex; gap: 6px; align-items: center; }
 
       /* ── tabs (raised 3D buttons) ── */
@@ -354,7 +355,7 @@
           </div>
           <div class="right">
             <div class="settings-wrap">
-              <button id="settings-btn" class="icon-btn" title="Theme & font size" type="button">⚙</button>
+              <button id="settings-btn" class="icon-btn" title="Theme & font size" type="button">⚙ <span class="icon-label">Settings</span></button>
               <div class="settings-backdrop hidden" id="settings-backdrop"></div>
               <div class="settings-pop hidden" id="settings-pop">
                 <div class="settings-title">Theme</div>
@@ -545,6 +546,12 @@
           if (!s) return "not set";
           if (s.length <= 8) return "•".repeat(s.length);
           return s.slice(0, 4) + "••••" + s.slice(-4);
+        }
+
+        function maskHash(h) {
+          if (!h) return "—";
+          if (h.length <= 12) return h;
+          return h.slice(0, 6) + "…" + h.slice(-4);
         }
 
         // ───────────────────────── api ─────────────────────────
@@ -1881,26 +1888,66 @@
             body.appendChild(wrap);
           }
 
-          // usage logs
-          const logs = usage.logs || [];
-          if (logs.length) {
-            body.appendChild(el("div", "section-title", "Recent usage logs (" + logs.length + ")"));
-            const { wrap, tbody } = table(["When", "Model", "Tool", "Tokens", "Cost"]);
-            for (const l of logs) {
-              const row = el("tr");
-              row.appendChild(td(el("span", "muted", fmtDate(l.created_at))));
-              row.appendChild(td(el("span", "code", l.model_name || "—")));
-              row.appendChild(td(l.tool || "—"));
-              row.appendChild(td(String(l.total_tokens ?? (l.prompt_tokens + " / " + l.completion_tokens))));
-              row.appendChild(td(fmtMoney(l.cost_usd)));
-              tbody.appendChild(row);
+          // usage logs — paginated + filterable (from-date, fuzzy model name)
+          body.appendChild(el("div", "section-title", "Usage logs"));
+          const lf = el("div", "filter-bar");
+          const startIn = textInput("", { type: "date" });
+          const endIn = textInput("", { type: "date" });
+          const modelIn = textInput("", { placeholder: "Model (fuzzy)…" });
+          const searchBtn = el("button", "btn sm primary", "Search");
+          lf.append(el("span", "muted", "From"), startIn, el("span", "muted", "To"), endIn, modelIn, searchBtn);
+          body.appendChild(lf);
+          const lres = el("div");
+          body.appendChild(lres);
+          const PER = 20;
+          let page = 0;
+          async function loadLogs() {
+            lres.innerHTML = '<div class="loading">Loading…</div>';
+            const q = new URLSearchParams({ limit: String(PER), offset: String(page * PER) });
+            // local "YYYY-MM-DD" → local midnight → UTC ISO.
+            // From = selected date 00:00:00; To = next-day 00:00:00 (half-open range).
+            if (startIn.value) q.set("start", new Date(startIn.value + "T00:00:00").toISOString());
+            if (endIn.value) {
+              const end = new Date(endIn.value + "T00:00:00");
+              end.setDate(end.getDate() + 1);
+              q.set("end", end.toISOString());
             }
-            body.appendChild(wrap);
+            const m = modelIn.value.trim();
+            if (m) q.set("model", m);
+            let d;
+            try { d = await apiFetch("/admin/users/" + user.id + "/usage?" + q); }
+            catch (e) { lres.innerHTML = ""; lres.appendChild(errBox(e)); return; }
+            const logs = d.logs || [];
+            const total = d.total || 0;
+            lres.innerHTML = "";
+            if (!logs.length) {
+              lres.appendChild(emptyState(total ? "No logs match." : "No usage logs yet."));
+            } else {
+              const { wrap, tbody } = table(["When", "Model", "Tool", "Tokens", "Cost"]);
+              for (const l of logs) {
+                const row = el("tr");
+                row.appendChild(td(el("span", "muted", fmtDate(l.created_at))));
+                row.appendChild(td(el("span", "code", l.model_name || "—")));
+                row.appendChild(td(l.tool || "—"));
+                row.appendChild(td(String(l.total_tokens ?? (l.prompt_tokens + " / " + l.completion_tokens))));
+                row.appendChild(td(fmtMoney(l.cost_usd)));
+                tbody.appendChild(row);
+              }
+              lres.appendChild(wrap);
+            }
+            const pages = Math.max(1, Math.ceil(total / PER));
+            const pg = el("div", "row-actions");
+            const prev = el("button", "btn sm ghost", "‹ Prev");
+            prev.disabled = page <= 0;
+            prev.onclick = () => { if (page > 0) { page--; loadLogs(); } };
+            const next = el("button", "btn sm ghost", "Next ›");
+            next.disabled = page + 1 >= pages;
+            next.onclick = () => { if (page + 1 < pages) { page++; loadLogs(); } };
+            pg.append(prev, el("span", "muted", "Page " + (page + 1) + " / " + pages + " · " + total + " records"), next);
+            lres.appendChild(pg);
           }
-
-          if (!counters.length && !txs.length && !logs.length) {
-            body.appendChild(emptyState("No usage yet."));
-          }
+          searchBtn.onclick = () => { page = 0; loadLogs(); };
+          loadLogs();
         }
 
         // ───────────────────────── TOKENS ─────────────────────────
@@ -1911,12 +1958,12 @@
           const head = el("div", "page-head");
           const t = el("div");
           t.appendChild(el("h2", "", "Tokens"));
-          t.appendChild(el("div", "sub", "Channel ↔ role ↔ user relationships, and API access tokens"));
+          t.appendChild(el("div", "sub", "LLM-key grants (which key a user may use) + login credentials (who can sign in) — the two are independent"));
           head.appendChild(t);
           content.appendChild(head);
 
           const tabs = el("div", "tabs");
-          for (const [key, label] of [["relations", "Channels & Relations"], ["access", "Access Tokens"]]) {
+          for (const [key, label] of [["relations", "Channels & Relations"], ["keys", "LLM Keys"], ["logins", "Login Credentials"]]) {
             const tab = el("div", "tab" + (tokenTab === key ? " active" : ""), label);
             tab.onclick = () => { tokenTab = key; renderTokensPage(); };
             tabs.appendChild(tab);
@@ -1926,7 +1973,8 @@
           const section = el("div");
           content.appendChild(section);
           if (tokenTab === "relations") await renderTokenRelations(section);
-          else await renderAccessTokens(section);
+          else if (tokenTab === "keys") await renderGrantsTab(section);
+          else await renderLoginsTab(section);
         }
 
         // ── Tab 1: channel ↔ role ↔ user relationship browser ──
@@ -2086,8 +2134,132 @@
           panel.appendChild(detail);
         }
 
-        // ── Tab 2: access tokens table (generate / revoke / delete) ──
-        async function renderAccessTokens(container) {
+        // ── Tab 2: LLM-key grants (which key a user may use; access_tokens) ──
+        async function renderGrantsTab(container) {
+          container.innerHTML = '<div class="loading">Loading…</div>';
+          let grants, users, roles, routes, wallets;
+          try {
+            [grants, users, roles, routes, wallets] = await Promise.all([
+              apiFetch("/admin/grants").then((d) => d.grants || []),
+              apiFetch("/admin/users").then((d) => d.users || []),
+              apiFetch("/admin/roles").then((d) => d.roles || []),
+              apiFetch("/admin/routes").then((d) => d.routes || []),
+              apiFetch("/admin/wallets").then((d) => d.wallets || []),
+            ]);
+          } catch (e) { container.innerHTML = ""; container.appendChild(errBox(e)); return; }
+          container.innerHTML = "";
+
+          const userOf = {}, userRoleOf = {}, displayOf = {}, userById = {}, balanceOf = {};
+          for (const u of users) {
+            userOf[u.id] = u.username;
+            userRoleOf[u.id] = u.role_id;
+            displayOf[u.id] = u.display_name;
+            userById[u.id] = u;
+          }
+          for (const w of wallets) balanceOf[w.user_id] = w.balance;
+          const roleNameOf = {};
+          for (const r of roles) roleNameOf[r.role_id] = r.role_name || r.role_id;
+          // Models each key channel serves (via routes) → chips in the Model column.
+          const modelsByCred = {};
+          for (const r of routes) {
+            (modelsByCred[r.credential_id] = modelsByCred[r.credential_id] || []).push(r.model_name || r.actual_model_name || "?");
+          }
+
+          const bar = el("div", "bar-row");
+          const title = el("div", "bar-title", "LLM key grants ");
+          title.appendChild(el("span", "count", "(" + grants.length + ")"));
+          bar.append(title);
+          container.appendChild(bar);
+
+          const help = el("div", "sub", "Per-user LLM-key grants (user × key). Flip a switch to cut / restore that user's access to that key — it never blocks login (with no usable key the user degrades to the anonymous tier).");
+          container.appendChild(help);
+
+          const search = textInput("", { placeholder: "Search by person…" });
+          const roleSel = select([{ value: "", label: "role: all" }, ...roles.map((r) => ({ value: r.role_id, label: r.role_name || r.role_id }))], "");
+          const filters = el("div", "filter-bar");
+          filters.append(search, roleSel);
+          container.appendChild(filters);
+
+          const wrapBox = el("div");
+          container.appendChild(wrapBox);
+          const render = () => {
+            wrapBox.innerHTML = "";
+            const q = search.value.trim().toLowerCase();
+            const rf = roleSel.value;
+            const list = grants.filter((g) => {
+              const rid = g.user_id ? userRoleOf[g.user_id] : "";
+              if (rf && rid !== rf) return false;
+              if (!q) return true;
+              const hay = [userOf[g.user_id] || "", displayOf[g.user_id] || ""].join(" ").toLowerCase();
+              return hay.includes(q);
+            });
+            if (!list.length) {
+              wrapBox.appendChild(emptyState(grants.length ? "No grants match." : "No grants yet. A (user, key) grant appears the first time that user is assigned the key at login."));
+              return;
+            }
+            const { wrap, tbody } = table(["User", "Role", "Model", "Key", "Active"]);
+            for (const g of list) {
+              const row = el("tr");
+              const user = g.user_id ? userById[g.user_id] : null;
+              const who = el("div");
+              const un = el("span", user ? "link" : "cell-main", user ? userOf[g.user_id] : (g.username || "—"));
+              if (user) un.onclick = () => userDetails(user, { roles, balance: balanceOf[g.user_id] });
+              who.appendChild(un);
+              if (user && user.display_name) who.appendChild(el("div", "cell-sub", user.display_name));
+              row.appendChild(td(who));
+              const rid = g.user_id ? (userRoleOf[g.user_id] || "regular") : "—";
+              row.appendChild(td(badge(roleNameOf[rid] || rid, rid === "admin" ? "danger" : roleKind(rid))));
+              const models = g.credential_id ? modelsByCred[g.credential_id] || [] : [];
+              const mCell = el("div");
+              if (models.length) {
+                for (const m of models.slice(0, 4)) {
+                  const chip = el("span", "mini-chip link", m);
+                  chip.onclick = () => credentialDetailModal(g.credential_id);
+                  mCell.appendChild(chip);
+                }
+                if (models.length > 4) mCell.appendChild(el("span", "mini-chip", "+" + (models.length - 4)));
+              } else {
+                mCell.appendChild(el("span", "muted", "—"));
+              }
+              row.appendChild(td(mCell));
+              const keyCell = el("div");
+              if (g.credential_id) {
+                const kbox = el("div");
+                kbox.appendChild(el("span", "cell-main code", g.api_key ? maskKey(g.api_key) : (g.credential_name || g.credential_id.slice(0, 8))));
+                if (g.credential_name) kbox.appendChild(el("div", "cell-sub", g.credential_name));
+                keyCell.appendChild(kbox);
+                if (g.api_key) {
+                  const cp = el("button", "btn sm ghost", "Copy");
+                  cp.onclick = async () => {
+                    if (await copyText(g.api_key)) toast("LLM key copied to clipboard");
+                    else toast("Copy failed — select manually", "err");
+                  };
+                  keyCell.appendChild(cp);
+                }
+              } else {
+                keyCell.appendChild(el("span", "muted", "—"));
+              }
+              row.appendChild(td(keyCell));
+              const tdSw = td();
+              tdSw.appendChild(switchToggle(g.is_active, async (on) => {
+                try {
+                  await apiFetch("/admin/grants/" + g.id, { method: "PATCH", body: JSON.stringify({ is_active: on }) });
+                  toast(on ? "Key granted" : "Key revoked for this user");
+                  renderTokensPage();
+                } catch (e) { toast(e.message, "err"); renderTokensPage(); }
+              }));
+              row.appendChild(tdSw);
+              tbody.appendChild(row);
+            }
+            wrapBox.appendChild(wrap);
+          };
+          search.addEventListener("input", render);
+          roleSel.addEventListener("change", render);
+          render();
+        }
+
+        // ── Tab 3: login credentials (who can sign in; login_tokens) ──
+        async function renderLoginsTab(container) {
           container.innerHTML = '<div class="loading">Loading…</div>';
           let tokens, users, roles, wallets;
           try {
@@ -2100,14 +2272,6 @@
           } catch (e) { container.innerHTML = ""; container.appendChild(errBox(e)); return; }
           container.innerHTML = "";
 
-          const bar = el("div", "bar-row");
-          const title = el("div", "bar-title", "Access tokens ");
-          title.appendChild(el("span", "count", "(" + tokens.length + ")"));
-          const add = el("button", "btn primary", "+ Generate token");
-          add.onclick = () => tokenForm({ users, roles });
-          bar.append(title, add);
-          container.appendChild(bar);
-
           const userOf = {}, userRoleOf = {}, displayOf = {}, userById = {}, balanceOf = {};
           for (const u of users) {
             userOf[u.id] = u.username;
@@ -2118,8 +2282,20 @@
           for (const w of wallets) balanceOf[w.user_id] = w.balance;
           // Effective role: per-token role_id override → the user's role → token kind.
           const effRole = (tk) => tk.role_id || (tk.user_id ? userRoleOf[tk.user_id] || "regular" : "admin");
+
+          const bar = el("div", "bar-row");
+          const title = el("div", "bar-title", "Login credentials ");
+          title.appendChild(el("span", "count", "(" + tokens.length + ")"));
+          const add = el("button", "btn primary", "+ Generate token");
+          add.onclick = () => tokenForm({ users, roles });
+          bar.append(title, add);
+          container.appendChild(bar);
+
+          const help = el("div", "sub", "Who can sign in. The Active switch revokes the login only — it never touches the LLM keys. The raw token value is shown once at generation; here you see each token's fingerprint (sha256 prefix, not reversible).");
+          container.appendChild(help);
+
           const search = textInput("", { placeholder: "Search by person or token name…" });
-          const roleSel = select([{ value: "", label: "role: all" }, ...roles.map((r) => ({ value: r.role_id, label: r.role_id }))], "");
+          const roleSel = select([{ value: "", label: "role: all" }, ...roles.map((r) => ({ value: r.role_id, label: r.role_name || r.role_id }))], "");
           const filters = el("div", "filter-bar");
           filters.append(search, roleSel);
           container.appendChild(filters);
@@ -2137,23 +2313,14 @@
               return hay.includes(q);
             });
             if (!list.length) {
-              wrapBox.appendChild(emptyState(tokens.length ? "No tokens match." : "No tokens yet."));
+              wrapBox.appendChild(emptyState(tokens.length ? "No logins match." : "No login credentials yet."));
               return;
             }
-            const { wrap, tbody } = table(["Model", "User", "Role", "Expires", "Last login", "Active", ""]);
+            const { wrap, tbody } = table(["User", "Role", "Token", "Expires", "Last login", "Active", ""]);
             for (const tk of list) {
               const row = el("tr");
-              // Model = the pinned channel; click opens the llm_credentials detail modal.
-              if (tk.credential_id) {
-                const nm = el("span", "link", tk.credential_name || tk.credential_id.slice(0, 8));
-                nm.onclick = () => credentialDetailModal(tk.credential_id);
-                row.appendChild(td(nm));
-              } else {
-                row.appendChild(td(el("span", "muted", "—")));
-              }
-              // User = the logged-in account; click opens the user detail drawer.
-              const who = el("div");
               const user = tk.user_id ? userById[tk.user_id] : null;
+              const who = el("div");
               if (user) {
                 const un = el("span", "link", userOf[tk.user_id]);
                 un.onclick = () => userDetails(user, { roles, balance: balanceOf[tk.user_id] });
@@ -2161,13 +2328,17 @@
               } else {
                 who.appendChild(el("span", "cell-main", "admin"));
               }
-              const sub = [];
-              if (tk.name && tk.name !== userOf[tk.user_id]) sub.push(tk.name);
-              if (tk.role_id) sub.push("role " + tk.role_id);
-              if (sub.length) who.appendChild(el("div", "cell-sub", sub.join(" · ")));
+              if (user && user.display_name && user.display_name !== userOf[tk.user_id]) who.appendChild(el("div", "cell-sub", user.display_name));
               row.appendChild(td(who));
               const rkind = effRole(tk);
               row.appendChild(td(badge(rkind, rkind === "admin" ? "danger" : roleKind(rkind))));
+              const tok = el("div");
+              tok.appendChild(el("span", "cell-main code", maskHash(tk.token_hash)));
+              const tsub = [];
+              if (tk.name) tsub.push(tk.name);
+              if (tk.role_id) tsub.push("role " + tk.role_id);
+              if (tsub.length) tok.appendChild(el("div", "cell-sub", tsub.join(" · ")));
+              row.appendChild(td(tok));
               if (expired(tk.expires_at)) row.appendChild(td(badge("expired", "danger")));
               else row.appendChild(td(el("span", "muted", tk.expires_at ? fmtDate(tk.expires_at) : "never")));
               row.appendChild(td(el("span", "muted", tk.last_used_at ? fmtDate(tk.last_used_at) : "—")));
@@ -2175,7 +2346,7 @@
               tdSw.appendChild(switchToggle(tk.is_active, async (on) => {
                 try {
                   await apiFetch("/admin/tokens/" + tk.id, { method: "PATCH", body: JSON.stringify({ is_active: on }) });
-                  toast(on ? "Token enabled" : "Token revoked");
+                  toast(on ? "Login enabled" : "Login revoked");
                   renderTokensPage();
                 } catch (e) { toast(e.message, "err"); renderTokensPage(); }
               }));
