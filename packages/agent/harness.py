@@ -10,7 +10,12 @@ class FakeLLM:
         self.calls: list[tuple[list[dict], list[dict] | None]] = []
 
     async def chat(
-        self, messages: list[dict], tools: list[dict] | None = None, model: str | None = None
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ) -> dict:
         self.calls.append((list(messages), tools))
         if not self.script:

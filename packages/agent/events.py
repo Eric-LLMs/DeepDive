@@ -14,13 +14,14 @@ All registrations are reversible: ``on``/``observe`` return a disposer callable.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
 WaterfallHandler = Callable[[Any, Callable[[], Awaitable[Any]]], Awaitable[Any]]
-Observer = Callable[[Any], Awaitable[None]]
+Observer = Callable[[Any], Awaitable[None] | None]
 
 
 class EventBus:
@@ -81,6 +82,8 @@ class EventBus:
 
     async def _safe(self, handler: Observer, payload: Any, name: str) -> None:
         try:
-            await handler(payload)
+            result = handler(payload)
+            if inspect.isawaitable(result):
+                await result
         except Exception:  # noqa: BLE001 - observers must not break the pipeline
             logger.exception("observer %s failed", name)

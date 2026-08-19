@@ -523,8 +523,9 @@ Hybrid recall is computed in code, not stored in schema:
 
 ### 12.3 Implemented auth, RBAC & billing schema
 
-The multi-user + billing surface (`migrations/0002_auth.sql` … `0007_console_tokens_stateless.sql`, plus the
-planned `0008` that splits login credentials into `login_tokens`). Fields below mirror the migration DDL exactly;
+The multi-user + billing surface (`migrations/0002_auth.sql` … `0008_login_tokens.sql`, where 0008 splits
+login credentials into `login_tokens` and leaves `access_tokens` as the per-user LLM-key grant matrix).
+Fields below mirror the migration DDL exactly;
 `TEXT` columns are plain `TEXT`, money is `NUMERIC`, time is `TIMESTAMPTZ`, JSON is `JSONB`.
 
 - **users** — identity + credentials. Columns: `id` (UUID PK), `username` (TEXT, unique where

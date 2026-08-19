@@ -25,7 +25,12 @@ from agent.tool_gateway import ToolGateway
 
 class AgentLLMPort(Protocol):
     async def chat(
-        self, messages: list[dict], tools: list[dict] | None = None, model: str | None = None
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ) -> dict:
         """Return {"content": str | None, "tool_calls": [{id, name, arguments}]}."""
         ...
