@@ -121,6 +121,7 @@ class ConfigUpdateRequest(BaseModel):
     llm_model: str | None = None
     web_search_provider: str | None = None
     web_search_api_key: str | None = None
+    web_search_engine_id: str | None = None
 
 
 class LLMProviderModel(BaseModel):
@@ -134,6 +135,30 @@ class LLMProviderModel(BaseModel):
     model: str = ""
 
 
+class ProbeModelsRequest(BaseModel):
+    """Probe payload for /config/probe-models — only the endpoint + key are used."""
+
+    base_url: str
+    api_key: str = ""
+
+
+class SMTPSettings(BaseModel):
+    """SMTP server config for account emails (password is masked on GET)."""
+
+    host: str = ""
+    port: int = 587
+    user: str = ""
+    password: str = ""          # empty string means "keep the existing stored password"
+    from_email: str = ""
+    use_tls: bool = True
+    use_ssl: bool = False
+    enabled: bool = True
+
+
+class TestEmailRequest(BaseModel):
+    to_email: str
+
+
 class ProvidersUpdateRequest(BaseModel):
     """Full provider-card list + active selection, written wholesale by the settings UI."""
 
@@ -141,6 +166,11 @@ class ProvidersUpdateRequest(BaseModel):
     active_provider: str = ""
     web_search_provider: str | None = None
     web_search_api_key: str | None = None
+    web_search_engine_id: str | None = None
+    smtp: SMTPSettings | None = None
+    # Generic tool-config namespace: tools.<tool_id>.<param>. Kept in lock-step with the
+    # legacy web_search_* / smtp keys (mirrored on save) so older read paths keep working.
+    tools: dict[str, dict] | None = None
 
 
 class AdminLoginRequest(BaseModel):
@@ -151,6 +181,39 @@ class AdminLoginRequest(BaseModel):
 class UserLoginRequest(BaseModel):
     username: str
     password: str
+
+
+class RegisterRequest(BaseModel):
+    """Self-service signup; the account is gated on email verification before login."""
+
+    username: str
+    email: str
+    password: str
+    display_name: str | None = None
+
+
+class ResendVerificationRequest(BaseModel):
+    email: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    password: str
+
+
+class ProfileUpdateRequest(BaseModel):
+    """Self-service profile edit. ``current_password`` + ``new_password`` only when changing it."""
+
+    display_name: str | None = None
+    username: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    current_password: str | None = None
+    new_password: str | None = None
 
 
 class UserCreateRequest(BaseModel):
@@ -165,6 +228,9 @@ class UserUpdateRequest(BaseModel):
     role_id: str | None = None
     is_active: bool | None = None
     password: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    email_verified: bool | None = None
 
 
 class TokenCreateRequest(BaseModel):
@@ -202,6 +268,7 @@ class RoleUpdateRequest(BaseModel):
 
 class ModelCreateRequest(BaseModel):
     name: str
+    provider_model_name: str | None = None
     description: str | None = None
     prompt_price_per_1k: float = 0.0
     completion_price_per_1k: float = 0.0
@@ -210,6 +277,7 @@ class ModelCreateRequest(BaseModel):
 
 class ModelUpdateRequest(BaseModel):
     name: str | None = None
+    provider_model_name: str | None = None
     description: str | None = None
     prompt_price_per_1k: float | None = None
     completion_price_per_1k: float | None = None
@@ -234,6 +302,15 @@ class WalletTopupRequest(BaseModel):
     user_id: UUID
     amount: float
     description: str = ""
+
+
+class ChatTestRequest(BaseModel):
+    """Simulate a PC-chat request for the chosen (user, role, channel) combo."""
+
+    user_id: UUID | None = None       # test account (None = treat as anonymous)
+    role_id: str | None = None        # override the role used for routing/model default
+    credential_id: UUID | None = None # pin a specific channel (None = auto-resolve)
+    message: str = "你好,请简单回复 OK"
 
 
 class RoleCreateRequest(BaseModel):
@@ -261,13 +338,15 @@ class RoleCredentialsUpdateRequest(BaseModel):
 class RouteUpsertRequest(BaseModel):
     """Upsert one credential↔model route (composite PK credential_id+model_id).
 
+    ``note`` is a free-text route purpose ("what this route is for"). The model actually
+    sent upstream is the catalog entry's ``provider_model_name``, not this note.
     ``prompt_price_per_1k`` / ``completion_price_per_1k`` override the catalog price
     for this channel when set; ``None`` means "inherit the catalog price".
     """
 
     credential_id: UUID
     model_id: UUID
-    actual_model_name: str
+    note: str | None = None
     priority: int = 0
     weight: int = 1
     prompt_price_per_1k: float | None = None

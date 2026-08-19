@@ -34,6 +34,10 @@ export interface Me {
   user_id: string;
   username: string;
   display_name: string | null;
+  email: string | null;
+  phone: string | null;
+  avatar: string | null;
+  email_verified: boolean;
   role_id: string;
   role_name: string;
   quota?: {

@@ -66,13 +66,15 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 async function proxy(target, request) {
-  const init = {
-    method: request.method,
-    headers: request.headers,
-  };
+  const init = { method: request.method, headers: request.headers };
   // net.fetch defaults to GET; forward the body for anything that has one.
   if (request.method !== "GET" && request.method !== "HEAD") {
-    init.body = await request.text();
+    // Stream the raw request body instead of reading it as text, so binary
+    // multipart payloads (avatar uploads) reach the backend byte-for-byte.
+    init.headers = new Headers(request.headers);
+    init.headers.delete("content-length");
+    init.body = request.body;
+    init.duplex = "half"; // required by net.fetch for streamed (non-string) bodies
   }
   return net
     .fetch(target, init)
@@ -406,6 +408,31 @@ function registerIpcHandlers() {
     const base64 = dataURL.replace(/^data:image\/png;base64,/, "");
     fs.writeFileSync(filePath, Buffer.from(base64, "base64"));
     return filePath;
+  });
+
+  // Pick an avatar image: open the OS file picker, read the bytes, and return a
+  // base64 string + mime so the renderer can POST it as multipart to /auth/me/avatar.
+  ipcMain.handle("pick-image", async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+      properties: ["openFile"],
+      filters: [
+        { name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (canceled || filePaths.length === 0) return null;
+    const filePath = filePaths[0];
+    try {
+      const buf = fs.readFileSync(filePath);
+      if (buf.length > 2 * 1024 * 1024) return { ok: false, error: "头像图片不能超过 2MB" };
+      const ext = path.extname(filePath).slice(1).toLowerCase();
+      const mime =
+        { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif" }[ext] ||
+        "application/octet-stream";
+      return { ok: true, name: path.basename(filePath), mime, base64: buf.toString("base64") };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
   });
 }
 

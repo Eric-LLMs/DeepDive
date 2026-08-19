@@ -147,6 +147,10 @@ class UserModel(Base):
     role_id: Mapped[str] = mapped_column(
         String, ForeignKey("user_roles.role_id"), default="regular"
     )
+    email: Mapped[str | None] = mapped_column(String)          # unique partial index
+    phone: Mapped[str | None] = mapped_column(String)
+    avatar: Mapped[str | None] = mapped_column(String)         # /avatars/<user_id>.<ext>
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -236,6 +240,26 @@ class AccessTokenModel(Base):
     )
 
 
+class VerificationTokenModel(Base):
+    """One-time email verification / password-reset token (hash stored, raw shown once)."""
+
+    __tablename__ = "verification_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    kind: Mapped[str] = mapped_column(String, nullable=False)  # 'verify' | 'reset'
+    token_hash: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class UserUsageCounterModel(Base):
     """O(1) quota accounting: one row per (user, period). Atomic UPSERT on each call."""
 
@@ -316,6 +340,7 @@ class LLMModelModel(Base):
         PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
     name: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    provider_model_name: Mapped[str | None] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
     prompt_price_per_1k: Mapped[Decimal] = mapped_column(
         Numeric(12, 6), default=Decimal("0")
@@ -330,7 +355,7 @@ class LLMModelModel(Base):
 
 
 class CredentialModelModel(Base):
-    """N:M routing between a credential and a model (provider id + per-key price override)."""
+    """N:M routing between a credential and a model (route note + per-key price override)."""
 
     __tablename__ = "credential_models"
 
@@ -344,7 +369,7 @@ class CredentialModelModel(Base):
         ForeignKey("llm_models.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    actual_model_name: Mapped[str] = mapped_column(String, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
     priority: Mapped[int] = mapped_column(Integer, default=0)
     weight: Mapped[int] = mapped_column(Integer, default=1)
     prompt_price_per_1k: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))

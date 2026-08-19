@@ -41,6 +41,9 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   saveScreenshot: (dataURL, defaultName) =>
     ipcRenderer.invoke("save-screenshot", { dataURL, defaultName }),
 
+  // Pick an avatar image; resolves to { ok, name, mime, base64 } | { ok, error } | null.
+  pickImage: () => ipcRenderer.invoke("pick-image"),
+
   // PDF annotations: read/write a sidecar <pdf>.annot.json next to the PDF.
   readAnnotations: (pdfPath) => ipcRenderer.invoke("read-annotations", pdfPath),
   saveAnnotations: (pdfPath, data) => ipcRenderer.invoke("save-annotations", { pdfPath, data }),

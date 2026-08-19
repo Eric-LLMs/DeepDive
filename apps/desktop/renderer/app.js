@@ -14,7 +14,11 @@
     roleId: null,
     roleName: null,
     quota: null,
+    email: null,
+    phone: null,
+    avatar: null,
     guestId: null,
+    degradedNoticeShown: false,
   };
   try { state.token = localStorage.getItem("deepdive_token"); } catch { /* ignore */ }
   try { state.guestId = localStorage.getItem("deepdive_guest_id"); } catch { /* ignore */ }
@@ -27,6 +31,9 @@
       state.displayName = cachedUser.displayName ?? null;
       state.roleId = cachedUser.roleId ?? null;
       state.roleName = cachedUser.roleName ?? null;
+      state.email = cachedUser.email ?? null;
+      state.phone = cachedUser.phone ?? null;
+      state.avatar = cachedUser.avatar ?? null;
     }
   } catch { /* ignore */ }
 
@@ -120,6 +127,10 @@
         state.guestId = data.user_id;
         try { localStorage.setItem("deepdive_guest_id", data.user_id); } catch { /* ignore */ }
       }
+      if (data.notice && !state.degradedNoticeShown) {
+        appendMsg("notice", data.notice);
+        state.degradedNoticeShown = true;
+      }
       appendMsg("assistant", data.answer);
       if (speakEnabled) speak(data.answer);
     } catch (err) {
@@ -210,6 +221,30 @@
   const feedbackCategory = document.getElementById("feedback-category");
   const feedbackText = document.getElementById("feedback-text");
   const feedbackLogs = document.getElementById("feedback-logs");
+  const registerOverlay = document.getElementById("register-overlay");
+  const registerStatus = document.getElementById("register-status");
+  const registerDebug = document.getElementById("register-debug");
+  const registerDebugInput = document.getElementById("register-debug-input");
+  const registerDebugCopy = document.getElementById("register-debug-copy");
+  const forgotOverlay = document.getElementById("forgot-overlay");
+  const forgotStatus = document.getElementById("forgot-status");
+  const forgotDebug = document.getElementById("forgot-debug");
+  const forgotDebugInput = document.getElementById("forgot-debug-input");
+  const forgotDebugCopy = document.getElementById("forgot-debug-copy");
+  const profileAvatarImg = document.getElementById("profile-avatar-img");
+  const profileAvatarLetter = document.getElementById("profile-avatar-letter");
+  const profileFieldDisplay = document.getElementById("profile-field-display");
+  const profileFieldUsername = document.getElementById("profile-field-username");
+  const profileFieldEmail = document.getElementById("profile-field-email");
+  const profileFieldPhone = document.getElementById("profile-field-phone");
+  const profileFieldCurpass = document.getElementById("profile-field-curpass");
+  const profileFieldNewpass = document.getElementById("profile-field-newpass");
+  const profileFieldNewpass2 = document.getElementById("profile-field-newpass2");
+  const profileEditStatus = document.getElementById("profile-edit-status");
+  const profileEditDebug = document.getElementById("profile-edit-debug");
+  const profileEditDebugInput = document.getElementById("profile-edit-debug-input");
+  const profileEditDebugCopy = document.getElementById("profile-edit-debug-copy");
+  const profileAvatarStatus = document.getElementById("profile-avatar-status");
 
   const TOKEN_KEY = "deepdive_token";
   const USER_KEY = "deepdive_user";
@@ -328,6 +363,27 @@
   function closeProfile() {
     profileOverlay.classList.add("hidden");
   }
+  function closeRegister() {
+    registerOverlay.classList.add("hidden");
+  }
+  function closeForgot() {
+    forgotOverlay.classList.add("hidden");
+  }
+  function showDebugLink(box, input, url) {
+    if (!url) { box.classList.add("hidden"); return; }
+    input.value = url;
+    box.classList.remove("hidden");
+  }
+  async function copyToClipboard(text, statusEl) {
+    try {
+      await navigator.clipboard.writeText(text);
+      statusEl.textContent = "链接已复制";
+      statusEl.className = "cfg-status ok";
+    } catch {
+      statusEl.textContent = "复制失败,请手动选择链接复制";
+      statusEl.className = "cfg-status err";
+    }
+  }
 
   function toggleUserMenu() {
     userMenu.classList.toggle("hidden");
@@ -354,12 +410,18 @@
         state.roleId = me.role_id;
         state.roleName = me.role_name;
         state.quota = me.quota || null;
+        state.email = me.email || null;
+        state.phone = me.phone || null;
+        state.avatar = me.avatar || null;
         try {
           localStorage.setItem(USER_KEY, JSON.stringify({
             username: me.username,
             displayName: me.display_name,
             roleId: me.role_id,
             roleName: me.role_name,
+            email: me.email,
+            phone: me.phone,
+            avatar: me.avatar,
           }));
         } catch { /* ignore */ }
         renderUserMenu();
@@ -369,8 +431,54 @@
     } catch { /* backend unreachable; keep cached info */ }
   }
 
+  function renderHeadAvatar() {
+    if (state.avatar) {
+      fetch("/api" + state.avatar, { headers: authHeaders() })
+        .then((r) => (r.ok ? r.blob() : Promise.reject(new Error("load failed"))))
+        .then((blob) => {
+          const url = URL.createObjectURL(blob);
+          profileAvatar.innerHTML = `<img src="${url}" class="avatar-img" alt="avatar" />`;
+        })
+        .catch(() => { profileAvatar.textContent = avatarLetter(); });
+    } else {
+      profileAvatar.innerHTML = "";
+      profileAvatar.textContent = avatarLetter();
+    }
+  }
+
+  let avatarObjectUrl = null;
+  function revokeAvatar() {
+    if (avatarObjectUrl) { URL.revokeObjectURL(avatarObjectUrl); avatarObjectUrl = null; }
+  }
+  // The edit-form avatar: fetch via the /api proxy → blob → object URL, so the
+  // CSP img-src restriction never applies and any image size works.
+  function renderAvatar() {
+    revokeAvatar();
+    profileAvatarStatus.textContent = "";
+    profileAvatarStatus.className = "cfg-status";
+    if (state.avatar) {
+      fetch("/api" + state.avatar, { headers: authHeaders() })
+        .then((r) => (r.ok ? r.blob() : Promise.reject(new Error("load failed"))))
+        .then((blob) => {
+          avatarObjectUrl = URL.createObjectURL(blob);
+          profileAvatarImg.src = avatarObjectUrl;
+          profileAvatarImg.classList.remove("hidden");
+          profileAvatarLetter.classList.add("hidden");
+        })
+        .catch(() => {
+          profileAvatarImg.classList.add("hidden");
+          profileAvatarLetter.classList.remove("hidden");
+          profileAvatarLetter.textContent = avatarLetter();
+        });
+    } else {
+      profileAvatarImg.classList.add("hidden");
+      profileAvatarLetter.classList.remove("hidden");
+      profileAvatarLetter.textContent = avatarLetter();
+    }
+  }
+
   function renderProfile() {
-    profileAvatar.textContent = avatarLetter();
+    renderHeadAvatar();
     profileName.textContent = state.displayName || state.username || "—";
     profileUsername.textContent = state.username ? "@" + state.username : "";
     profileRole.textContent = state.roleName || "";
@@ -386,6 +494,17 @@
 
   function openProfile() {
     renderProfile();
+    profileFieldDisplay.value = state.displayName || "";
+    profileFieldUsername.value = state.username || "";
+    profileFieldEmail.value = state.email || "";
+    profileFieldPhone.value = state.phone || "";
+    profileFieldCurpass.value = "";
+    profileFieldNewpass.value = "";
+    profileFieldNewpass2.value = "";
+    profileEditStatus.textContent = "";
+    profileEditStatus.className = "cfg-status";
+    profileEditDebug.classList.add("hidden");
+    renderAvatar();
     closeUserMenu();
     profileOverlay.classList.remove("hidden");
   }
@@ -498,7 +617,198 @@
     setAccountStatus("");
     accountPass.value = "";
     closeUserMenu();
+    closeRegister();
+    closeForgot();
     accountOverlay.classList.remove("hidden");
+  }
+
+  function openRegister() {
+    setAccountStatus("");
+    closeAccount();
+    closeForgot();
+    registerStatus.textContent = "";
+    registerStatus.className = "cfg-status";
+    registerDebug.classList.add("hidden");
+    registerOverlay.classList.remove("hidden");
+    document.getElementById("reg-username").focus();
+  }
+
+  function openForgot() {
+    setAccountStatus("");
+    closeAccount();
+    closeRegister();
+    forgotStatus.textContent = "";
+    forgotStatus.className = "cfg-status";
+    forgotDebug.classList.add("hidden");
+    forgotOverlay.classList.remove("hidden");
+    document.getElementById("forgot-email").focus();
+  }
+
+  async function register() {
+    const username = document.getElementById("reg-username").value.trim();
+    const email = document.getElementById("reg-email").value.trim();
+    const display = document.getElementById("reg-display").value.trim();
+    const password = document.getElementById("reg-password").value;
+    const password2 = document.getElementById("reg-password2").value;
+    registerStatus.textContent = "";
+    registerStatus.className = "cfg-status";
+    registerDebug.classList.add("hidden");
+    if (!username || !email || !password) {
+      registerStatus.textContent = "请填写用户名、邮箱和密码";
+      registerStatus.className = "cfg-status err";
+      return;
+    }
+    if (password !== password2) {
+      registerStatus.textContent = "两次输入的密码不一致";
+      registerStatus.className = "cfg-status err";
+      return;
+    }
+    const btn = document.getElementById("register-submit");
+    btn.disabled = true;
+    try {
+      const res = await fetch("/api/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, email, password, display_name: display || undefined }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `注册失败 (${res.status})`);
+      showDebugLink(registerDebug, registerDebugInput, data.debug_verify_url);
+      registerStatus.textContent = data.message || "注册成功,请查收邮件完成邮箱验证。";
+      registerStatus.className = "cfg-status ok";
+      document.getElementById("reg-password").value = "";
+      document.getElementById("reg-password2").value = "";
+      accountUser.value = username;
+    } catch (err) {
+      registerStatus.textContent = err.message;
+      registerStatus.className = "cfg-status err";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function forgotPassword() {
+    const email = document.getElementById("forgot-email").value.trim();
+    forgotStatus.textContent = "";
+    forgotStatus.className = "cfg-status";
+    forgotDebug.classList.add("hidden");
+    if (!email) {
+      forgotStatus.textContent = "请输入邮箱";
+      forgotStatus.className = "cfg-status err";
+      return;
+    }
+    const btn = document.getElementById("forgot-submit");
+    btn.disabled = true;
+    try {
+      const res = await fetch("/api/auth/forgot-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `请求失败 (${res.status})`);
+      showDebugLink(forgotDebug, forgotDebugInput, data.debug_verify_url);
+      forgotStatus.textContent = data.message || "如果该邮箱已注册,重置邮件将发送到您的邮箱。";
+      forgotStatus.className = "cfg-status ok";
+    } catch (err) {
+      forgotStatus.textContent = err.message;
+      forgotStatus.className = "cfg-status err";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function saveProfile() {
+    profileEditStatus.textContent = "";
+    profileEditStatus.className = "cfg-status";
+    profileEditDebug.classList.add("hidden");
+    const payload = {
+      display_name: profileFieldDisplay.value.trim() || null,
+      username: profileFieldUsername.value.trim() || null,
+      email: profileFieldEmail.value.trim() || null,
+      phone: profileFieldPhone.value.trim() || null,
+    };
+    const cur = profileFieldCurpass.value;
+    const nw = profileFieldNewpass.value;
+    const nw2 = profileFieldNewpass2.value;
+    if (cur || nw || nw2) {
+      if (!cur) {
+        profileEditStatus.textContent = "修改密码需要输入当前密码";
+        profileEditStatus.className = "cfg-status err";
+        return;
+      }
+      if (nw !== nw2) {
+        profileEditStatus.textContent = "两次输入的新密码不一致";
+        profileEditStatus.className = "cfg-status err";
+        return;
+      }
+      payload.current_password = cur;
+      payload.new_password = nw;
+    }
+    const btn = document.getElementById("profile-save");
+    btn.disabled = true;
+    try {
+      const res = await fetch("/api/auth/me", {
+        method: "PATCH",
+        headers: authHeaders(),
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `保存失败 (${res.status})`);
+      profileEditStatus.textContent = data.message || "资料已更新。";
+      profileEditStatus.className = "cfg-status ok";
+      profileFieldCurpass.value = profileFieldNewpass.value = profileFieldNewpass2.value = "";
+      if (data.debug_verify_url) showDebugLink(profileEditDebug, profileEditDebugInput, data.debug_verify_url);
+      refreshProfile();
+    } catch (err) {
+      profileEditStatus.textContent = err.message;
+      profileEditStatus.className = "cfg-status err";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function changeAvatar() {
+    if (!window.desktopAPI || !window.desktopAPI.pickImage) return;
+    const picked = await window.desktopAPI.pickImage();
+    if (!picked) return;
+    profileAvatarStatus.textContent = "";
+    profileAvatarStatus.className = "cfg-status";
+    if (!picked.ok) {
+      profileAvatarStatus.textContent = picked.error || "选择图片失败";
+      profileAvatarStatus.className = "cfg-status err";
+      return;
+    }
+    if (picked.mime === "application/octet-stream") {
+      profileAvatarStatus.textContent = "仅支持 PNG / JPG / WEBP / GIF 图片";
+      profileAvatarStatus.className = "cfg-status err";
+      return;
+    }
+    try {
+      const bytes = Uint8Array.from(atob(picked.base64), (c) => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: picked.mime });
+      const fd = new FormData();
+      fd.append("file", blob, picked.name || `avatar.${picked.mime.split("/")[1] || "png"}`);
+      const res = await fetch("/api/auth/me/avatar", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${state.token}` },
+        body: fd,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `上传失败 (${res.status})`);
+      state.avatar = data.avatar;
+      try {
+        const cached = JSON.parse(localStorage.getItem(USER_KEY) || "{}");
+        localStorage.setItem(USER_KEY, JSON.stringify({ ...cached, avatar: data.avatar }));
+      } catch { /* ignore */ }
+      profileAvatarStatus.textContent = "头像已更新";
+      profileAvatarStatus.className = "cfg-status ok";
+      renderAvatar();
+      renderHeadAvatar();
+    } catch (err) {
+      profileAvatarStatus.textContent = err.message;
+      profileAvatarStatus.className = "cfg-status err";
+    }
   }
 
   async function login() {
@@ -511,7 +821,10 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password }),
       });
-      if (!res.ok) throw new Error("Invalid username or password");
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || "Invalid username or password");
+      }
       const data = await res.json();
       state.token = data.access_token;
       state.username = data.username;
@@ -545,6 +858,7 @@
     state.roleName = null;
     state.quota = null;
     state.sessionId = null;
+    state.degradedNoticeShown = false;
     try { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(USER_KEY); } catch { /* ignore */ }
     closeProfile();
     renderUserMenu();
@@ -580,14 +894,46 @@
   profileOverlay.addEventListener("click", (e) => { if (e.target === profileOverlay) closeProfile(); });
   document.getElementById("account-close").addEventListener("click", closeAccount);
   accountOverlay.addEventListener("click", (e) => { if (e.target === accountOverlay) closeAccount(); });
+  document.getElementById("account-register-link").addEventListener("click", openRegister);
+  document.getElementById("account-forgot-link").addEventListener("click", openForgot);
+  document.getElementById("register-close").addEventListener("click", closeRegister);
+  document.getElementById("forgot-close").addEventListener("click", closeForgot);
+  registerOverlay.addEventListener("click", (e) => { if (e.target === registerOverlay) closeRegister(); });
+  forgotOverlay.addEventListener("click", (e) => { if (e.target === forgotOverlay) closeForgot(); });
+  document.getElementById("register-back").addEventListener("click", openAccount);
+  document.getElementById("forgot-back").addEventListener("click", openAccount);
+  document.getElementById("register-submit").addEventListener("click", register);
+  document.getElementById("forgot-submit").addEventListener("click", forgotPassword);
+  document.getElementById("register-debug-copy").addEventListener("click", () => copyToClipboard(registerDebugInput.value, registerStatus));
+  document.getElementById("forgot-debug-copy").addEventListener("click", () => copyToClipboard(forgotDebugInput.value, forgotStatus));
+  document.getElementById("reg-password").addEventListener("keydown", (e) => { if (e.key === "Enter") register(); });
+  document.getElementById("reg-password2").addEventListener("keydown", (e) => { if (e.key === "Enter") register(); });
+  document.getElementById("forgot-email").addEventListener("keydown", (e) => { if (e.key === "Enter") forgotPassword(); });
+  // Password visibility toggle: any .pw-eye button flips its target input password<->text.
+  document.addEventListener("click", (e) => {
+    const eye = e.target.closest(".pw-eye");
+    if (!eye) return;
+    const input = document.getElementById(eye.dataset.target);
+    if (!input) return;
+    const show = input.type === "password";
+    input.type = show ? "text" : "password";
+    eye.textContent = show ? "🙈" : "👁";
+    eye.title = show ? "隐藏密码" : "显示密码";
+    input.focus();
+  });
   document.addEventListener("click", (e) => {
     if (!userMenu.classList.contains("hidden") && !userMenu.contains(e.target)) closeUserMenu();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { closeAccount(); closeProfile(); closeUserMenu(); closeSettingsModal(); }
+    if (e.key === "Escape") { closeAccount(); closeProfile(); closeUserMenu(); closeSettingsModal(); closeRegister(); closeForgot(); }
   });
   document.getElementById("account-login-btn").addEventListener("click", login);
   accountPass.addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+  document.getElementById("profile-save").addEventListener("click", saveProfile);
+  document.getElementById("profile-avatar-change").addEventListener("click", changeAvatar);
+  document.getElementById("profile-edit-debug-copy").addEventListener("click", () => copyToClipboard(profileEditDebugInput.value, profileEditStatus));
+  profileFieldNewpass.addEventListener("keydown", (e) => { if (e.key === "Enter") saveProfile(); });
+  profileFieldNewpass2.addEventListener("keydown", (e) => { if (e.key === "Enter") saveProfile(); });
   themeOptions.forEach((row) => {
     row.addEventListener("click", () => applyTheme(row.dataset.theme));
   });

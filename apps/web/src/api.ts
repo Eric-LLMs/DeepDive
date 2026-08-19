@@ -26,11 +26,29 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (res.status === 401) clearToken();
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`${res.status} ${res.statusText}: ${body}`);
-  }
+  if (!res.ok) throw new Error(await errorMessage(res));
   return (await res.json()) as T;
+}
+
+// Variant for bodies the browser must encode itself (multipart FormData): no
+// Content-Type header, so fetch sets the correct multipart boundary.
+async function requestRaw<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(`${BASE}${path}`, { headers, ...init });
+  if (res.status === 401) clearToken();
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()) as T;
+}
+
+async function errorMessage(res: Response): Promise<string> {
+  try {
+    const body = await res.json();
+    if (body && typeof body.detail === "string") return body.detail;
+  } catch { /* not JSON */ }
+  const text = await res.text().catch(() => "");
+  return `${res.status} ${res.statusText}: ${text}`;
 }
 
 export interface LoginResponse {
@@ -41,6 +59,15 @@ export interface LoginResponse {
   role_name: string;
 }
 
+// Common response of the account-action endpoints (register / resend / forgot /
+// reset / PATCH me). debug_verify_url appears when SMTP is not configured.
+export interface AuthActionResponse {
+  status: string;
+  message: string;
+  debug_verify_url?: string;
+  email_error?: string;
+}
+
 export const api = {
   // Auth
   login: (username: string, password: string) =>
@@ -49,6 +76,35 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
   me: () => request<Me>("/auth/me"),
+  register: (username: string, email: string, password: string, displayName?: string) =>
+    request<AuthActionResponse>("/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username, email, password, display_name: displayName }),
+    }),
+  forgotPassword: (email: string) =>
+    request<AuthActionResponse>("/auth/forgot-password", {
+      method: "POST",
+      body: JSON.stringify({ email }),
+    }),
+  resetPassword: (token: string, password: string) =>
+    request<AuthActionResponse>("/auth/reset-password", {
+      method: "POST",
+      body: JSON.stringify({ token, password }),
+    }),
+  updateProfile: (patch: {
+    display_name?: string | null;
+    username?: string | null;
+    email?: string | null;
+    phone?: string | null;
+    current_password?: string;
+    new_password?: string;
+  }) =>
+    request<AuthActionResponse>("/auth/me", {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  uploadAvatar: (form: FormData) =>
+    requestRaw<{ avatar: string }>("/auth/me/avatar", { method: "POST", body: form }),
 
   // Domains
   listDomains: () => request<Domain[]>("/domains"),

@@ -236,15 +236,90 @@
             <input id="account-user" type="text" autocomplete="username" />
           </label>
           <label>Password
-            <input id="account-pass" type="password" autocomplete="current-password" />
+            <span class="pw-field">
+              <input id="account-pass" type="password" autocomplete="current-password" />
+              <button type="button" class="pw-eye" data-target="account-pass" title="显示密码">👁</button>
+            </span>
           </label>
           <label class="remember">
             <input id="account-remember" type="checkbox" checked /> Keep me signed in
           </label>
+          <div class="account-links">
+            <button id="account-register-link" type="button" class="linklike">Register</button>
+            <button id="account-forgot-link" type="button" class="linklike">Forgot password?</button>
+          </div>
           <p id="account-status" class="cfg-status"></p>
           <div class="modal-actions">
             <button id="account-login-btn" type="button" class="primary">Sign in</button>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Register modal (email-verified signup) -->
+    <div id="register-overlay" class="overlay hidden">
+      <div class="modal">
+        <div class="modal-header">
+          <h3>Create account</h3>
+          <button id="register-close" type="button" class="modal-close" title="Close">×</button>
+        </div>
+        <label>Username
+          <input id="reg-username" type="text" autocomplete="username" />
+        </label>
+        <label>Email
+          <input id="reg-email" type="email" autocomplete="email" />
+        </label>
+        <label>Display name (optional)
+          <input id="reg-display" type="text" autocomplete="name" />
+        </label>
+        <label>Password
+          <span class="pw-field">
+            <input id="reg-password" type="password" autocomplete="new-password" />
+            <button type="button" class="pw-eye" data-target="reg-password" title="显示密码">👁</button>
+          </span>
+        </label>
+        <label>Confirm password
+          <span class="pw-field">
+            <input id="reg-password2" type="password" autocomplete="new-password" />
+            <button type="button" class="pw-eye" data-target="reg-password2" title="显示密码">👁</button>
+          </span>
+        </label>
+        <div id="register-debug" class="register-debug hidden">
+          <div class="register-debug-label">开发者验证链接(SMTP 未配置,仅本机可用)</div>
+          <div class="register-debug-link">
+            <input id="register-debug-input" type="text" readonly />
+            <button id="register-debug-copy" type="button" class="ghost">Copy</button>
+          </div>
+        </div>
+        <p id="register-status" class="cfg-status"></p>
+        <div class="modal-actions">
+          <button id="register-back" type="button" class="ghost">Back to login</button>
+          <button id="register-submit" type="button" class="primary">Create account</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Forgot-password modal (email reset link) -->
+    <div id="forgot-overlay" class="overlay hidden">
+      <div class="modal">
+        <div class="modal-header">
+          <h3>Reset password</h3>
+          <button id="forgot-close" type="button" class="modal-close" title="Close">×</button>
+        </div>
+        <label>Email
+          <input id="forgot-email" type="email" autocomplete="email" />
+        </label>
+        <div id="forgot-debug" class="register-debug hidden">
+          <div class="register-debug-label">开发者重置链接(SMTP 未配置,仅本机可用)</div>
+          <div class="register-debug-link">
+            <input id="forgot-debug-input" type="text" readonly />
+            <button id="forgot-debug-copy" type="button" class="ghost">Copy</button>
+          </div>
+        </div>
+        <p id="forgot-status" class="cfg-status"></p>
+        <div class="modal-actions">
+          <button id="forgot-back" type="button" class="ghost">Back to login</button>
+          <button id="forgot-submit" type="button" class="primary">Send reset link</button>
         </div>
       </div>
     </div>
@@ -289,18 +364,58 @@
         </div>
         <div class="profile-section">
           <div class="profile-section-title">Account</div>
-          <button type="button" class="settings-row disabled" disabled>
-            <span class="settings-row-label">Change Avatar</span>
-            <span class="soon">Soon</span>
-          </button>
-          <button type="button" class="settings-row disabled" disabled>
-            <span class="settings-row-label">Change Password</span>
-            <span class="soon">Soon</span>
-          </button>
-          <button type="button" class="settings-row disabled" disabled>
-            <span class="settings-row-label">Token Usage</span>
-            <span class="soon">Soon</span>
-          </button>
+          <div class="profile-avatar-row">
+            <span class="profile-avatar-wrap">
+              <img id="profile-avatar-img" class="profile-avatar-img hidden" alt="avatar" />
+              <span id="profile-avatar-letter" class="user-avatar profile-avatar"></span>
+            </span>
+            <div class="profile-avatar-actions">
+              <button id="profile-avatar-change" type="button" class="ghost">Change avatar</button>
+              <div id="profile-avatar-status" class="cfg-status"></div>
+            </div>
+          </div>
+          <label>Display name
+            <input id="profile-field-display" type="text" autocomplete="name" />
+          </label>
+          <label>Username
+            <input id="profile-field-username" type="text" autocomplete="username" />
+          </label>
+          <label>Contact email
+            <input id="profile-field-email" type="email" autocomplete="email" />
+          </label>
+          <label>Phone
+            <input id="profile-field-phone" type="tel" autocomplete="tel" />
+          </label>
+          <div class="profile-sub">Change password</div>
+          <label>Current password
+            <span class="pw-field">
+              <input id="profile-field-curpass" type="password" autocomplete="current-password" />
+              <button type="button" class="pw-eye" data-target="profile-field-curpass" title="显示密码">👁</button>
+            </span>
+          </label>
+          <label>New password
+            <span class="pw-field">
+              <input id="profile-field-newpass" type="password" autocomplete="new-password" />
+              <button type="button" class="pw-eye" data-target="profile-field-newpass" title="显示密码">👁</button>
+            </span>
+          </label>
+          <label>Confirm new password
+            <span class="pw-field">
+              <input id="profile-field-newpass2" type="password" autocomplete="new-password" />
+              <button type="button" class="pw-eye" data-target="profile-field-newpass2" title="显示密码">👁</button>
+            </span>
+          </label>
+          <div id="profile-edit-debug" class="register-debug hidden">
+            <div class="register-debug-label">新邮箱验证链接(SMTP 未配置,仅本机可用)</div>
+            <div class="register-debug-link">
+              <input id="profile-edit-debug-input" type="text" readonly />
+              <button id="profile-edit-debug-copy" type="button" class="ghost">Copy</button>
+            </div>
+          </div>
+          <p id="profile-edit-status" class="cfg-status"></p>
+          <div class="modal-actions">
+            <button id="profile-save" type="button" class="primary">Save</button>
+          </div>
         </div>
       </div>
     </div>

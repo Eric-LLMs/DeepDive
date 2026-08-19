@@ -3,6 +3,7 @@
 Start: uvicorn api.main:app --reload
 """
 import json
+import logging
 import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -11,9 +12,9 @@ from uuid import UUID
 
 from arq import create_pool
 from arq.connections import RedisSettings
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
@@ -25,26 +26,31 @@ from api.auth import (
     require_user_optional,
     sign_console_token,
     verify_admin,
-    verify_user,
 )
 from api.deps import _embedder, get_agent, get_task_queue, get_vocab_service, llm
 from api.schemas import (
     AdminLoginRequest,
     BulkUpdateRequest,
     ChatRequest,
+    ChatTestRequest,
     CredentialCreateRequest,
     CredentialUpdateRequest,
     DomainCreate,
     ExplainRequest,
+    ForgotPasswordRequest,
     GenerateDefinitionRequest,
     ImageFetchRequest,
     ImportRequest,
-    LLMProviderModel,
     MatchCreate,
     MediaGenerateRequest,
     ModelCreateRequest,
     ModelUpdateRequest,
+    ProbeModelsRequest,
+    ProfileUpdateRequest,
     ProvidersUpdateRequest,
+    RegisterRequest,
+    ResendVerificationRequest,
+    ResetPasswordRequest,
     RoleCreateRequest,
     RoleCredentialsUpdateRequest,
     RoleUpdateRequest,
@@ -56,6 +62,7 @@ from api.schemas import (
     TermCreate,
     TermImportRequest,
     TermUpdate,
+    TestEmailRequest,
     TTSRequest,
     GrantUpdateRequest,
     TokenCreateRequest,
@@ -87,6 +94,7 @@ from core.infrastructure.db import (
     UserUsageCounterModel,
     UserUsageLogModel,
     UserWalletModel,
+    VerificationTokenModel,
     init_db,
 )
 from core.infrastructure.jobs import (
@@ -107,6 +115,7 @@ from core.infrastructure.memory import (
     list_sessions,
     load_session_messages,
 )
+from core.infrastructure.mailer import MailNotConfigured, send_email
 from core.infrastructure.security import (
     check_quota,
     ensure_admin_user,
@@ -115,14 +124,18 @@ from core.infrastructure.security import (
     get_role,
     get_setting,
     hash_password,
+    hash_token,
     list_roles,
     role_to_dict,
     set_setting,
+    verify_password,
 )
 from collections import defaultdict
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
@@ -157,6 +170,11 @@ for _dir in (settings.audio_cache_path, settings.image_cache_path):
     _dir.mkdir(parents=True, exist_ok=True)
 app.mount("/audio", StaticFiles(directory=Path(settings.audio_cache_path).resolve()), name="audio")
 app.mount("/images", StaticFiles(directory=Path(settings.image_cache_path).resolve()), name="images")
+
+# User avatar uploads (self-service profile).
+AVATAR_DIR = Path("data/avatars")
+AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/avatars", StaticFiles(directory=AVATAR_DIR.resolve()), name="avatars")
 
 
 @app.get("/health")
@@ -204,7 +222,7 @@ async def _login_token(
 
     One row per (user, pinned channel): a re-login on the same channel rotates the secret
     and bumps the timestamps instead of inserting a new row, so ``login_tokens`` stops
-    growing with every login (enforced by the partial unique indexes moved from 0006/0007).
+    growing with every login (enforced by the partial unique indexes on the table).
 
     This always mints — a disabled key grant never blocks the login. ``_pick_credential``
     has already excluded banned keys, so the channel passed here is always one the user may
@@ -333,14 +351,15 @@ async def _user_banned_from(session, user_id: UUID | None, credential_id: UUID) 
 
 async def _resolve_chat_route(
     session, token: LoginTokenModel | None, role_id: str
-) -> tuple[str, str, str]:
-    """Resolve ``(base_url, api_key, model)`` for one chat request.
+) -> tuple[str, str, str, str]:
+    """Resolve ``(base_url, api_key, provider_model, business_name)`` for one chat request.
 
     ``token`` carries the channel pinned at login when present; ``role_id`` is the effective
-    role (the user's role, or ``anonymous`` for guests).
+    role (the user's role, or ``anonymous`` for guests). ``provider_model`` is the real model
+    id sent upstream; ``business_name`` is the catalog display name used for billing/usage.
 
     - A pinned channel that is still active and not banned for the user is used directly;
-      ``model`` is the channel's preferred active route, else the role's ``default_model``,
+      the model is the channel's preferred active route, else the role's ``default_model``,
       else the global default.
     - A pinned channel that was disabled (credential-level, or a user-level Tokens ban on
       that key) fails over to another active channel of the same role the user is not banned
@@ -360,32 +379,85 @@ async def _resolve_chat_route(
             credential = await session.get(LLMCredentialModel, alt)
             if credential is not None:
                 return await _channel_route(session, credential, role_id)
-        return "", "", ""
+        business = await _fallback_model(session, role_id)
+        provider = await _provider_model_name(session, business) if business else ""
+        return "", "", provider, business
     picked = await _pick_credential(session, role_id, user_id)
     if picked is not None:
         credential = await session.get(LLMCredentialModel, picked)
         if credential is not None:
             return await _channel_route(session, credential, role_id)
-    return "", "", ""
+    return "", "", "", ""
+
+
+async def _provider_model_name(session, display_name: str) -> str:
+    """Map a catalog display name (or raw id) to the provider's real model id.
+
+    Prefers an exact display-name match, then falls back to the provider id, so a
+    ``default_model`` that is already a raw provider id round-trips unchanged and a
+    provider id shared by several catalog entries stays unambiguous. Unknown strings
+    pass through as-is (backwards compatibility with the legacy config).
+    """
+    if not display_name:
+        return ""
+    m = (
+        await session.execute(
+            select(LLMModelModel).where(LLMModelModel.name == display_name)
+        )
+    ).scalar_one_or_none()
+    if m is None:
+        m = (
+            await session.execute(
+                select(LLMModelModel).where(LLMModelModel.provider_model_name == display_name)
+            )
+        ).scalar_one_or_none()
+    if m is None or not m.provider_model_name:
+        return display_name
+    return m.provider_model_name
+
+
+async def _fallback_model(session, role_id: str | None = None) -> str:
+    """Catalog display name used as the global default when no channel route resolves.
+
+    Prefers the role's ``default_model`` (a catalog display name or raw provider id),
+    else the first active catalog model (created earliest wins, so the default never
+    depends on row order). Returns ``""`` when the catalog has no active model.
+    """
+    if role_id:
+        role = await get_role(session, role_id)
+        if role is not None and role.default_model:
+            return role.default_model
+    m = (
+        await session.execute(
+            select(LLMModelModel)
+            .where(LLMModelModel.is_active.is_(True))
+            .order_by(LLMModelModel.created_at)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return m.name if m is not None else ""
 
 
 async def _channel_route(
     session, credential: LLMCredentialModel, role_id: str | None
-) -> tuple[str, str, str]:
-    """Return ``(base_url, api_key, model)`` for a credential.
+) -> tuple[str, str, str, str]:
+    """Return ``(base_url, api_key, provider_model, business_name)`` for a credential.
 
-    The model is the credential's preferred active route (lowest priority), else the role's
-    ``default_model``, else the global default model.
+    The model is resolved to the role's ``default_model`` (a catalog display name) when set,
+    else the credential's preferred active route's catalog entry, else the legacy global
+    default. ``provider_model`` is that display name mapped to the provider's real id — the
+    name sent upstream; ``business_name`` is the catalog display name, used for billing and
+    usage stats. A route's ``note`` is a purpose label only.
     """
-    model = ""
+    business = ""
     if role_id:
         role = await get_role(session, role_id)
         if role is not None and role.default_model:
-            model = role.default_model
-    if not model:
-        route = (
+            business = role.default_model
+    if not business:
+        model_id = (
             await session.execute(
-                select(CredentialModelModel.actual_model_name)
+                select(CredentialModelModel.model_id)
                 .where(
                     CredentialModelModel.credential_id == credential.id,
                     CredentialModelModel.is_active.is_(True),
@@ -394,9 +466,14 @@ async def _channel_route(
                 .limit(1)
             )
         ).scalar_one_or_none()
-        if route:
-            model = route
-    return credential.base_url, credential.api_key, model or settings.llm_model
+        if model_id is not None:
+            catalog = await session.get(LLMModelModel, model_id)
+            if catalog is not None:
+                business = catalog.name
+    if not business:
+        business = await _fallback_model(session, role_id)
+    provider = await _provider_model_name(session, business)
+    return credential.base_url, credential.api_key, provider or business, business
 
 
 def _login_expiry() -> datetime:
@@ -438,42 +515,388 @@ async def admin_page() -> FileResponse:
 # ── User auth (desktop workbench login) ──
 @app.post("/auth/login")
 async def user_login(body: UserLoginRequest) -> dict:
-    """Verify a user's credentials and mint an opaque user token."""
-    user = await verify_user(body.username, body.password)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    # Pick the LLM channel this session will use: one random active channel from the
-    # user's role bindings (None → the legacy /config route at request time).
+    """Verify a user's credentials and mint an opaque user token.
+
+    Self-registered accounts must complete email verification before they can log in
+    (``email IS NOT NULL AND NOT email_verified`` → 403); admin-deactivated accounts are
+    rejected too, each with a distinct Chinese hint the clients can surface verbatim.
+    """
     async with SessionLocal() as session:
-        role = await get_role(session, user["role_id"])
-        credential_id = await _pick_credential(session, user["role_id"], user["user_id"])
+        row = (
+            await session.execute(select(UserModel).where(UserModel.username == body.username))
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+        if row.email and not row.email_verified:
+            raise HTTPException(
+                status_code=403,
+                detail="邮箱未验证,请先查收邮件完成验证。未收到?可在个人资料里重新发送。",
+            )
+        if not row.is_active:
+            raise HTTPException(status_code=403, detail="账号已被停用,请联系管理员。")
+        if not verify_password(body.password, row.password_hash):
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+        role = await get_role(session, row.role_id)
+        credential_id = await _pick_credential(session, row.role_id, row.id)
         token = await _login_token(
             session,
-            user_id=user["user_id"],
-            name=user["username"],
+            user_id=row.id,
+            name=row.username,
             credential_id=credential_id,
             expires_at=_login_expiry(),
         )
     return {
         "access_token": token,
-        "username": user["username"],
-        "display_name": user["display_name"],
-        "role_id": user["role_id"],
-        "role_name": role.role_name if role else user["role_id"],
+        "username": row.username,
+        "display_name": row.display_name,
+        "role_id": row.role_id,
+        "role_name": role.role_name if role else row.role_id,
     }
 
 
 @app.get("/auth/me")
 async def auth_me(user: AuthUser = Depends(require_user)) -> dict:
     """Return the authenticated user's profile + role quota (desktop account panel)."""
+    async with SessionLocal() as session:
+        row = (
+            await session.execute(select(UserModel).where(UserModel.id == user.user_id))
+        ).scalar_one_or_none()
+        role = await get_role(session, user.role.role_id)
     return {
         "user_id": str(user.user_id),
         "username": user.username,
         "display_name": user.display_name,
+        "email": row.email if row else None,
+        "phone": row.phone if row else None,
+        "avatar": row.avatar if row else None,
+        "email_verified": row.email_verified if row else False,
         "role_id": user.role.role_id,
-        "role_name": user.role.role_name,
+        "role_name": role.role_name if role else user.role.role_id,
         "quota": role_to_dict(user.role),
     }
+
+
+# ── Registration / email verification / password reset / profile ──
+
+def _html_page(title: str, body: str) -> HTMLResponse:
+    """Self-contained Chinese HTML page served by verify/reset email links."""
+    html = (
+        "<!doctype html><html lang='zh'><head><meta charset='utf-8'>"
+        f"<title>{title}</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<style>"
+        "body{font-family:-apple-system,'Segoe UI',Roboto,'Microsoft YaHei',sans-serif;"
+        "background:#f5f7fa;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
+        ".card{background:#fff;border:1px solid #e3e6ec;border-radius:12px;"
+        "box-shadow:0 8px 30px rgba(0,0,0,.06);padding:36px 40px;max-width:420px;width:100%;text-align:center}"
+        "h1{font-size:20px;margin:0 0 14px}p{color:#555;font-size:14px;line-height:1.7;margin:0 0 16px;word-break:break-all}"
+        "input{width:100%;box-sizing:border-box;padding:10px 12px;margin:4px 0 10px;"
+        "border:1px solid #d5dae2;border-radius:8px;font-size:14px}"
+        "button{width:100%;padding:10px 12px;border:0;border-radius:8px;background:#2f6fed;color:#fff;font-size:14px;cursor:pointer}"
+        "button:hover{background:#2457c8}.err{color:#c0392b;font-size:13px;margin:8px 0 0}.ok{color:#1e8449;font-size:13px}"
+        "</style></head><body><div class='card'>" + body + "</div></body></html>"
+    )
+    return HTMLResponse(content=html)
+
+
+async def _smtp_config() -> dict:
+    return (await _load_config()).get("smtp") or {}
+
+
+async def _issue_verification(session, user_id: UUID, kind: str, ttl_minutes: int) -> str:
+    """Mint a one-time verification/reset token row; returns the raw token (hash stored)."""
+    raw, token_hash_ = generate_token()
+    session.add(
+        VerificationTokenModel(
+            user_id=user_id,
+            kind=kind,
+            token_hash=token_hash_,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes),
+        )
+    )
+    await session.commit()
+    return raw
+
+
+async def _consume_verification(session, raw: str, kind: str) -> VerificationTokenModel | None:
+    """Validate (kind, unused, unexpired) a one-time token and mark it used; None otherwise."""
+    row = (
+        await session.execute(
+            select(VerificationTokenModel).where(
+                VerificationTokenModel.token_hash == hash_token(raw)
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None or row.kind != kind or row.used_at is not None:
+        return None
+    if row.expires_at is not None and row.expires_at < datetime.now(timezone.utc):
+        return None
+    row.used_at = datetime.now(timezone.utc)
+    return row
+
+
+async def _send_account_email(subject: str, to: str, base: str, raw_token: str, path: str) -> dict:
+    """Send an account email; on failure (or no SMTP) return the raw link as a dev fallback."""
+    smtp = await _smtp_config()
+    link = f"{base.rstrip('/')}/{path}?token={raw_token}"
+    html = (
+        "<p>您好,</p><p>请点击下方链接完成操作(链接 24 小时内有效,只能使用一次):</p>"
+        f'<p><a href="{link}" style="color:#2f6fed">{link}</a></p>'
+        "<p>如果不是您本人操作,请忽略此邮件。</p>"
+    )
+    try:
+        await send_email(smtp, to, subject, html)
+        return {}
+    except MailNotConfigured:
+        logger.warning("SMTP 未配置,邮件链接(仅开发用): %s", link)
+        return {"debug_verify_url": link}
+    except Exception as err:  # noqa: BLE001 — surface the failure instead of a 500
+        logger.error("发送邮件失败(%s): %s", to, err)
+        return {"debug_verify_url": link, "email_error": str(err)}
+
+
+@app.post("/auth/register")
+async def register(body: RegisterRequest, request: Request) -> dict:
+    """Self-service signup: create a regular account gated on email verification."""
+    username = body.username.strip()
+    email = body.email.strip().lower()
+    if not username or not email or not body.password:
+        raise HTTPException(status_code=400, detail="用户名、邮箱和密码不能为空")
+    if len(body.password) < 6:
+        raise HTTPException(status_code=400, detail="密码至少 6 位")
+    async with SessionLocal() as session:
+        dup = (
+            await session.execute(
+                select(UserModel).where(
+                    (UserModel.username == username) | (UserModel.email == email)
+                )
+            )
+        ).scalars().first()
+        if dup is not None:
+            raise HTTPException(status_code=409, detail="用户名或邮箱已被注册")
+        row = UserModel(
+            username=username,
+            email=email,
+            password_hash=hash_password(body.password),
+            display_name=body.display_name or None,
+            role_id="regular",
+            is_active=True,
+            email_verified=False,
+        )
+        session.add(row)
+        await session.flush()
+        raw = await _issue_verification(session, row.id, "verify", 1440)
+    base = str(request.base_url).rstrip("/")
+    dev = await _send_account_email("DeepDive 邮箱验证", email, base, raw, "auth/verify-email")
+    return {"status": "ok", "message": "注册成功,请查收邮件完成邮箱验证。", **dev}
+
+
+@app.get("/auth/verify-email")
+async def verify_email(token: str) -> HTMLResponse:
+    """Email-link landing: mark the account verified (one-time token)."""
+    async with SessionLocal() as session:
+        vrow = await _consume_verification(session, token, "verify")
+        if vrow is None:
+            return _html_page(
+                "验证失败",
+                "<h1>链接无效或已过期</h1><p>请重新注册,或在个人资料里重新发送验证邮件。</p>",
+            )
+        user = (
+            await session.execute(select(UserModel).where(UserModel.id == vrow.user_id))
+        ).scalar_one_or_none()
+        if user is None:
+            return _html_page("验证失败", "<h1>账号不存在</h1>")
+        user.email_verified = True
+        await session.commit()
+    return _html_page("验证成功", "<h1>✓ 邮箱已验证</h1><p>现在可以返回客户端登录了。</p>")
+
+
+@app.post("/auth/resend-verification")
+async def resend_verification(body: ResendVerificationRequest, request: Request) -> dict:
+    """Re-send the verification email (60 s Redis cooldown per address)."""
+    email = body.email.strip().lower()
+    key = f"verify:{email}"
+    redis = getattr(request.app.state, "redis", None)
+    if redis is not None and await redis.get(key):
+        raise HTTPException(status_code=429, detail="发送过于频繁,请稍后再试(60 秒)。")
+    async with SessionLocal() as session:
+        user = (
+            await session.execute(select(UserModel).where(UserModel.email == email))
+        ).scalar_one_or_none()
+        if user is None or user.email_verified:
+            return {"status": "ok", "message": "如果该邮箱已注册且未验证,验证邮件将重新发送。"}
+        raw = await _issue_verification(session, user.id, "verify", 1440)
+    if redis is not None:
+        await redis.setex(key, 60, "1")
+    base = str(request.base_url).rstrip("/")
+    dev = await _send_account_email("DeepDive 邮箱验证", email, base, raw, "auth/verify-email")
+    return {"status": "ok", "message": "验证邮件已重新发送,请查收。", **dev}
+
+
+@app.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest, request: Request) -> dict:
+    """Email a one-time password-reset link (does not reveal whether the email exists)."""
+    email = body.email.strip().lower()
+    async with SessionLocal() as session:
+        user = (
+            await session.execute(select(UserModel).where(UserModel.email == email))
+        ).scalar_one_or_none()
+        if user is None:
+            return {"status": "ok", "message": "如果该邮箱已注册,重置邮件将发送到您的邮箱。"}
+        raw = await _issue_verification(session, user.id, "reset", 60)
+    base = str(request.base_url).rstrip("/")
+    dev = await _send_account_email("DeepDive 密码重置", email, base, raw, "auth/reset-password")
+    return {"status": "ok", "message": "重置邮件已发送,请查收(1 小时内有效)。", **dev}
+
+
+@app.get("/auth/reset-password")
+async def reset_password_page(token: str) -> HTMLResponse:
+    """Browser landing for the reset link: a small form that POSTs JSON to /auth/reset-password."""
+    body = (
+        "<h1>重置密码</h1><p>请输入新密码(至少 6 位)。</p>"
+        '<form id="reset-form"><input type="hidden" id="reset-token" value="'
+        + token
+        + '">'
+        '<input type="password" id="reset-password" placeholder="新密码" minlength="6" autocomplete="new-password" required>'
+        '<input type="password" id="reset-password2" placeholder="确认新密码" required>'
+        '<button type="submit">重置密码</button>'
+        '<p class="err" id="reset-err"></p></form>'
+        "<script>"
+        "document.getElementById('reset-form').addEventListener('submit',async e=>{e.preventDefault();"
+        "const p=document.getElementById('reset-password').value,p2=document.getElementById('reset-password2').value,"
+        "err=document.getElementById('reset-err');"
+        "if(p!==p2){err.textContent='两次输入的密码不一致';return;}"
+        "const r=await fetch('/auth/reset-password',{method:'POST',"
+        "headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({token:document.getElementById('reset-token').value,password:p})});"
+        "const d=await r.json().catch(()=>({}));"
+        "if(r.ok){err.className='ok';err.textContent=d.message||'密码已重置,请用新密码登录。';}"
+        "else{err.className='err';err.textContent=d.detail||'重置失败,请重试。';}});"
+        "</script>"
+    )
+    return _html_page("重置密码", body)
+
+
+@app.post("/auth/reset-password")
+async def reset_password(body: ResetPasswordRequest) -> dict:
+    """Apply a new password from a valid reset token and revoke the user's login tokens."""
+    if len(body.password) < 6:
+        raise HTTPException(status_code=400, detail="密码至少 6 位")
+    async with SessionLocal() as session:
+        vrow = await _consume_verification(session, body.token, "reset")
+        if vrow is None:
+            raise HTTPException(status_code=400, detail="链接无效或已过期,请重新发起重置。")
+        user = (
+            await session.execute(select(UserModel).where(UserModel.id == vrow.user_id))
+        ).scalar_one_or_none()
+        if user is None:
+            raise HTTPException(status_code=400, detail="账号不存在")
+        user.password_hash = hash_password(body.password)
+        # Old password stops working immediately: revoke every login token for this user.
+        await session.execute(
+            update(LoginTokenModel)
+            .where(LoginTokenModel.user_id == user.id)
+            .values(is_active=False)
+        )
+        await session.commit()
+    return {"status": "ok", "message": "密码已重置,请用新密码登录。"}
+
+
+@app.patch("/auth/me")
+async def update_me(
+    request: Request,
+    body: ProfileUpdateRequest,
+    user: AuthUser = Depends(require_user),
+) -> dict:
+    """Self-service profile edit: display name / username / email / phone / password."""
+    if body.new_password and not body.current_password:
+        raise HTTPException(status_code=400, detail="修改密码需要输入当前密码")
+    email_changed = False
+    new_email = None
+    user_id = user.user_id
+    async with SessionLocal() as session:
+        row = (
+            await session.execute(select(UserModel).where(UserModel.id == user.user_id))
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        if body.username is not None:
+            username = body.username.strip()
+            if not username:
+                raise HTTPException(status_code=400, detail="用户名不能为空")
+            dup = (
+                await session.execute(
+                    select(UserModel).where(
+                        UserModel.username == username, UserModel.id != row.id
+                    )
+                )
+            ).scalar_one_or_none()
+            if dup is not None:
+                raise HTTPException(status_code=409, detail="用户名已被使用")
+            row.username = username
+        if body.display_name is not None:
+            row.display_name = body.display_name.strip() or None
+        if body.phone is not None:
+            row.phone = body.phone.strip() or None
+        if body.email is not None:
+            email = body.email.strip().lower()
+            if not email:
+                raise HTTPException(status_code=400, detail="邮箱不能为空")
+            if email != row.email:
+                dup = (
+                    await session.execute(
+                        select(UserModel).where(
+                            UserModel.email == email, UserModel.id != row.id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if dup is not None:
+                    raise HTTPException(status_code=409, detail="该邮箱已被其他账号使用")
+                row.email = email
+                row.email_verified = False
+                email_changed = True
+                new_email = email
+        if body.new_password:
+            if not verify_password(body.current_password or "", row.password_hash):
+                raise HTTPException(status_code=400, detail="当前密码不正确")
+            if len(body.new_password) < 6:
+                raise HTTPException(status_code=400, detail="新密码至少 6 位")
+            row.password_hash = hash_password(body.new_password)
+        await session.commit()
+    if email_changed:
+        async with SessionLocal() as session:
+            raw = await _issue_verification(session, user_id, "verify", 1440)
+        base = str(request.base_url).rstrip("/")
+        dev = await _send_account_email("DeepDive 邮箱验证", new_email, base, raw, "auth/verify-email")
+        return {"status": "ok", "message": "资料已更新,新邮箱需验证后才能再次登录。", **dev}
+    return {"status": "ok", "message": "资料已更新。"}
+
+
+@app.post("/auth/me/avatar")
+async def upload_avatar(
+    file: UploadFile = File(...), user: AuthUser = Depends(require_user)
+) -> dict:
+    """Accept an avatar image (PNG/JPG/WEBP/GIF ≤ 2 MB), store it, and record its URL."""
+    allowed = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+    ext = allowed.get((file.content_type or "").lower())
+    if ext is None:
+        raise HTTPException(status_code=400, detail="仅支持 PNG / JPG / WEBP / GIF 图片")
+    data = await file.read()
+    if len(data) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="头像图片不能超过 2MB")
+    if not data:
+        raise HTTPException(status_code=400, detail="文件为空")
+    fname = f"{user.user_id}.{ext}"
+    (AVATAR_DIR / fname).write_bytes(data)
+    avatar_url = f"/avatars/{fname}"
+    async with SessionLocal() as session:
+        row = (
+            await session.execute(select(UserModel).where(UserModel.id == user.user_id))
+        ).scalar_one_or_none()
+        if row is not None:
+            row.avatar = avatar_url
+            await session.commit()
+    return {"avatar": avatar_url}
 
 
 # ── User management (admin-only) ──
@@ -483,6 +906,10 @@ def _masked_user(u: UserModel) -> dict:
         "username": u.username,
         "display_name": u.display_name,
         "role_id": u.role_id,
+        "email": u.email,
+        "phone": u.phone,
+        "avatar": u.avatar,
+        "email_verified": u.email_verified,
         "is_active": u.is_active,
         "created_at": u.created_at.isoformat() if u.created_at else None,
     }
@@ -541,6 +968,12 @@ async def update_user(
             row.is_active = body.is_active
         if body.password:
             row.password_hash = hash_password(body.password)
+        if body.email is not None:
+            row.email = body.email.strip().lower() or None
+        if body.phone is not None:
+            row.phone = body.phone.strip() or None
+        if body.email_verified is not None:
+            row.email_verified = body.email_verified
         await session.commit()
         await session.refresh(row)
         return {"user": _masked_user(row)}
@@ -805,6 +1238,7 @@ def _masked_model(m: LLMModelModel) -> dict:
     return {
         "id": str(m.id),
         "name": m.name,
+        "provider_model_name": m.provider_model_name,
         "description": m.description,
         "prompt_price_per_1k": float(m.prompt_price_per_1k),
         "completion_price_per_1k": float(m.completion_price_per_1k),
@@ -834,6 +1268,7 @@ async def create_model(body: ModelCreateRequest, _: AuthAdmin = Depends(require_
             raise HTTPException(status_code=409, detail="Model name already exists")
         row = LLMModelModel(
             name=body.name,
+            provider_model_name=body.provider_model_name,
             description=body.description,
             prompt_price_per_1k=body.prompt_price_per_1k,
             completion_price_per_1k=body.completion_price_per_1k,
@@ -854,7 +1289,7 @@ async def update_model(
         m = await session.get(LLMModelModel, model_id)
         if m is None:
             raise HTTPException(status_code=404, detail="Model not found")
-        for field in ("name", "description", "prompt_price_per_1k", "completion_price_per_1k", "is_active"):
+        for field in ("name", "provider_model_name", "description", "prompt_price_per_1k", "completion_price_per_1k", "is_active"):
             value = getattr(body, field)
             if value is not None:
                 setattr(m, field, value)
@@ -905,7 +1340,7 @@ async def _credential_prices(session) -> dict[UUID, dict]:
             {
                 "model_id": str(model.id),
                 "model_name": model.name,
-                "actual_model_name": route.actual_model_name,
+                "provider_model_name": model.provider_model_name,
                 "prompt_price_per_1k": pp,
                 "completion_price_per_1k": cp,
                 "price_override": route.prompt_price_per_1k is not None or route.completion_price_per_1k is not None,
@@ -1022,6 +1457,93 @@ async def delete_credential(
         await session.delete(c)
         await session.commit()
     return {"status": "ok"}
+
+
+@app.post("/admin/test-chat")
+async def test_chat(body: ChatTestRequest, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """Simulate a PC-chat request for the chosen (user, role, channel) and call the LLM.
+
+    Mirrors the real ``/chat`` routing ladder (pinned channel → role channels → anonymous
+    degrade) so the admin sees exactly what a real chat would resolve to. It does NOT
+    consume quota or debit the wallet, and the api_key is never returned.
+    """
+    route: dict = {}
+    async with SessionLocal() as session:
+        user = None
+        token = None
+        role_id = body.role_id or "anonymous"
+        if body.user_id:
+            user = (
+                await session.execute(select(UserModel).where(UserModel.id == body.user_id))
+            ).scalar_one_or_none()
+            if user is None:
+                raise HTTPException(status_code=404, detail="User not found")
+            # A DB user row has no token_id column — the desktop client picks one of the
+            # user's LoginToken rows at login. Mirror that by taking the most-recently-used
+            # active token (the one a live PC chat would be carrying).
+            token = (
+                await session.execute(
+                    select(LoginTokenModel)
+                    .where(
+                        LoginTokenModel.user_id == user.id,
+                        LoginTokenModel.is_active.is_(True),
+                    )
+                    .order_by(LoginTokenModel.last_used_at.desc().nulls_last(), LoginTokenModel.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            role_id = body.role_id or user.role_id
+
+        degraded = False
+        if body.credential_id:
+            cred = await session.get(LLMCredentialModel, body.credential_id)
+            if cred is None:
+                raise HTTPException(status_code=404, detail="Credential not found")
+            if not cred.is_active:
+                return {"ok": False, "route": None, "error": "该渠道已被停用,请先启用。"}
+            base_url, api_key, model, business_name = await _channel_route(session, cred, role_id)
+        else:
+            base_url, api_key, model, business_name = await _resolve_chat_route(session, token, role_id)
+            if user is not None and not base_url and not api_key:
+                degraded = True
+                role_id = "anonymous"
+                base_url, api_key, model, business_name = await _resolve_chat_route(session, None, role_id)
+        prompt_price, completion_price = await get_model_prices(session, business_name)
+
+    route = {
+        "role_id": role_id,
+        "base_url": base_url,
+        "model": model,                              # real provider model id sent upstream
+        "business_name": business_name,              # catalog display name used for billing
+        "prompt_price_per_1k": str(prompt_price),
+        "completion_price_per_1k": str(completion_price),
+        "degraded_to_anonymous": degraded,
+    }
+    if not base_url and not api_key:
+        return {"ok": False, "route": route, "error": "解析不到可用渠道:该角色未绑定渠道,匿名档也无渠道。"}
+
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=30.0, max_retries=0)
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": body.message}],
+            temperature=0.3,
+        )
+        answer = (resp.choices[0].message.content or "").strip()
+        usage = resp.usage
+        return {
+            "ok": True,
+            "route": route,
+            "answer": answer,
+            "usage": {
+                "prompt_tokens": usage.prompt_tokens if usage else 0,
+                "completion_tokens": usage.completion_tokens if usage else 0,
+            },
+        }
+    except Exception as err:  # noqa: BLE001 - surface the provider's failure verbatim
+        return {"ok": False, "route": route, "error": str(err)}
 
 
 # ── Role ↔ channel bindings (admin-only; the routing source for per-role LLM keys) ──
@@ -1165,7 +1687,7 @@ def _masked_route(r: CredentialModelModel, credential_name: str, model_name: str
         "credential_name": credential_name,
         "model_id": str(r.model_id),
         "model_name": model_name,
-        "actual_model_name": r.actual_model_name,
+        "note": r.note,
         "priority": r.priority,
         "weight": r.weight,
         "prompt_price_per_1k": float(r.prompt_price_per_1k) if r.prompt_price_per_1k is not None else None,
@@ -1211,7 +1733,7 @@ async def upsert_route(body: RouteUpsertRequest, _: AuthAdmin = Depends(require_
             .values(
                 credential_id=body.credential_id,
                 model_id=body.model_id,
-                actual_model_name=body.actual_model_name,
+                note=body.note,
                 priority=body.priority,
                 weight=body.weight,
                 prompt_price_per_1k=body.prompt_price_per_1k,
@@ -1221,7 +1743,7 @@ async def upsert_route(body: RouteUpsertRequest, _: AuthAdmin = Depends(require_
             .on_conflict_do_update(
                 constraint="credential_models_pkey",
                 set_={
-                    "actual_model_name": body.actual_model_name,
+                    "note": body.note,
                     "priority": body.priority,
                     "weight": body.weight,
                     "prompt_price_per_1k": body.prompt_price_per_1k,
@@ -1439,38 +1961,78 @@ def _active_provider_from_cfg(cfg: dict) -> dict | None:
     return next((p for p in providers if p.get("id") == active_id), None)
 
 
+def _merge_tools_into_legacy(cfg: dict) -> None:
+    """Mirror the generic ``tools`` namespace onto the legacy flat ``web_search_*`` / ``smtp``
+    keys so existing read paths (settings mirror, mailer, chat routing) keep working.
+
+    Idempotent: safe to call on every load / save.
+    """
+    tools = cfg.get("tools") or {}
+    ws = tools.get("web_search") or {}
+    if ws.get("provider"):
+        cfg["web_search_provider"] = ws["provider"]
+    if ws.get("api_key"):
+        cfg["web_search_api_key"] = ws["api_key"]
+    if "engine_id" in ws:
+        cfg["web_search_engine_id"] = ws["engine_id"] or ""
+    if tools.get("smtp"):
+        smtp = dict(tools["smtp"])
+        smtp.setdefault("use_tls", True)
+        smtp.setdefault("use_ssl", False)
+        smtp.setdefault("enabled", True)
+        cfg["smtp"] = smtp
+
+
+def _tools_view(cfg: dict) -> dict:
+    """Build the ``tools`` view for /config GET, backfilling from the legacy keys so a
+    pre-tools config still shows its values in the Tools config page."""
+    tools = dict(cfg.get("tools") or {})
+    ws = dict(tools.get("web_search") or {})
+    ws.setdefault("provider", cfg.get("web_search_provider", ""))
+    if cfg.get("web_search_api_key"):
+        ws.setdefault("api_key", cfg["web_search_api_key"])
+    if cfg.get("web_search_engine_id") is not None:
+        ws.setdefault("engine_id", cfg["web_search_engine_id"])
+    tools["web_search"] = ws
+    if cfg.get("smtp"):
+        tools.setdefault("smtp", cfg["smtp"])
+    return tools
+
+
 def _apply_llm_settings(cfg: dict) -> None:
-    """Mirror flat LLM/web-search fields (falling back to the active provider) onto settings."""
+    """Mirror the active provider connection (base_url/api_key) + web-search onto settings.
+
+    The model is intentionally NOT taken from here: it is resolved from the Model Catalog at
+    chat time (see ``_fallback_model``), so the legacy config never carries a model id.
+    """
+    _merge_tools_into_legacy(cfg)
+    # Keep the generic tools namespace available at runtime: any code can read
+    # get_tool_config("<tool_id>").get("<param>") without hitting the DB per call.
+    settings.tool_configs = _tools_view(cfg)
     active = _active_provider_from_cfg(cfg)
     base_url = cfg.get("llm_base_url") or (active or {}).get("base_url", "")
     api_key = cfg.get("llm_api_key") or (active or {}).get("api_key", "")
-    model = cfg.get("llm_model") or (active or {}).get("model", "")
     if base_url:
         settings.llm_base_url = base_url
     if api_key:
         settings.llm_api_key = api_key
-    if model:
-        settings.llm_model = model
     if cfg.get("web_search_provider"):
         settings.web_search_provider = cfg["web_search_provider"]
     if cfg.get("web_search_api_key"):
         settings.web_search_api_key = cfg["web_search_api_key"]
+    if "web_search_engine_id" in cfg:
+        settings.web_search_engine_id = cfg["web_search_engine_id"] or ""
     llm.configure(settings.llm_api_key, settings.llm_base_url, settings.llm_model)
 
 
 def _default_config() -> dict:
-    """Starter provider card seeded on first boot so the admin has models to pick."""
+    """Starter provider card seeded on first boot.
+
+    No model is stored here — the chat model always comes from the Model Catalog
+    (``_fallback_model``), so the two sources can never drift.
+    """
     return {
-        "llm_providers": [
-            {
-                "id": "default",
-                "name": "Default",
-                "base_url": "",
-                "api_key": "",
-                "models": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"],
-                "model": "gpt-4o-mini",
-            }
-        ],
+        "llm_providers": [{"id": "default", "name": "Default", "base_url": "", "api_key": ""}],
         "llm_active_provider": "default",
     }
 
@@ -1516,8 +2078,19 @@ def _masked_provider(p: dict) -> dict:
         "name": p.get("name", ""),
         "base_url": p.get("base_url", ""),
         "api_key_set": bool(p.get("api_key")),
-        "models": p.get("models", []),
-        "model": p.get("model", ""),
+    }
+
+
+def _masked_smtp(smtp: dict) -> dict:
+    return {
+        "host": smtp.get("host", ""),
+        "port": smtp.get("port", 587),
+        "user": smtp.get("user", ""),
+        "password_set": bool(smtp.get("password")),
+        "from_email": smtp.get("from_email", ""),
+        "use_tls": smtp.get("use_tls", True),
+        "use_ssl": smtp.get("use_ssl", False),
+        "enabled": smtp.get("enabled", True),
     }
 
 
@@ -1529,53 +2102,105 @@ async def get_config(_: AuthAdmin = Depends(require_admin)) -> dict:
     active = cfg.get("llm_active_provider") or (providers[0]["id"] if providers else "")
     async with SessionLocal() as session:
         roles = await list_roles(session)
+        fallback_model = await _fallback_model(session, "anonymous")
     return {
         "providers": [_masked_provider(p) for p in providers],
         "active_provider": active,
         "web_search_provider": settings.web_search_provider,
         "web_search_api_key_set": bool(settings.web_search_api_key),
+        "web_search_engine_id": settings.web_search_engine_id,
+        "smtp": _masked_smtp(cfg.get("smtp") or {}),
+        "tools": _tools_view(cfg),
         "roles": [role_to_dict(r) for r in roles],
+        "fallback_model": fallback_model,
     }
 
 
 @app.post("/config")
 async def update_config(body: ProvidersUpdateRequest, _: AuthAdmin = Depends(require_admin)) -> dict:
-    """Persist the full provider-card list and apply the active card to the live client.
+    """Persist provider cards (only when supplied) + web-search settings.
 
-    A blank ``api_key`` on a card means "keep the previously stored key" for that id, so
-    the UI can round-trip masked keys without clearing them.
+    The provider list is written only when ``body.providers`` is non-empty, so a
+    web-search-only save from the Chat Test tab cannot wipe the stored cards. A blank
+    ``api_key`` on a card means "keep the previously stored key" for that id.
     """
     cfg = await _load_config()
     previous = {p["id"]: p for p in cfg.get("llm_providers", [])}
 
     providers: list[dict] = []
-    for p in body.providers:
-        data = p.model_dump()
-        if not data.get("api_key") and previous.get(data["id"]):
-            data["api_key"] = previous[data["id"]].get("api_key", "")
-        providers.append(data)
+    active_id = cfg.get("llm_active_provider") or ""
+    if body.providers:
+        for p in body.providers:
+            data = p.model_dump()
+            if not data.get("api_key") and previous.get(data["id"]):
+                data["api_key"] = previous[data["id"]].get("api_key", "")
+            data.pop("models", None)   # model id is resolved from the Catalog at chat time
+            data.pop("model", None)
+            providers.append(data)
+        active_id = body.active_provider or (providers[0]["id"] if providers else "")
+        active = next((p for p in providers if p["id"] == active_id), None)
 
-    active_id = body.active_provider or (providers[0]["id"] if providers else "")
-    active = next((p for p in providers if p["id"] == active_id), None)
+        cfg["llm_providers"] = providers
+        cfg["llm_active_provider"] = active_id
+        # Mirror the active card's connection to the flat settings keys so the live client
+        # picks them up without a restart. The model is deliberately not mirrored.
+        if active:
+            cfg["llm_base_url"] = active["base_url"]
+            cfg["llm_api_key"] = active["api_key"]
 
-    cfg["llm_providers"] = providers
-    cfg["llm_active_provider"] = active_id
     if body.web_search_provider:
         cfg["web_search_provider"] = body.web_search_provider
     if body.web_search_api_key:
         cfg["web_search_api_key"] = body.web_search_api_key
-
-    # Mirror the active card's fields to the flat settings keys so the live client picks
-    # them up without a restart.
-    if active:
-        cfg["llm_base_url"] = active["base_url"]
-        cfg["llm_api_key"] = active["api_key"]
-        cfg["llm_model"] = active["model"]
-
+    # engine id is not a secret: a provided value (even empty) overwrites the stored one
+    if body.web_search_engine_id is not None:
+        cfg["web_search_engine_id"] = body.web_search_engine_id
     if body.web_search_provider:
         settings.web_search_provider = body.web_search_provider
     if body.web_search_api_key:
         settings.web_search_api_key = body.web_search_api_key
+    if body.web_search_engine_id is not None:
+        settings.web_search_engine_id = body.web_search_engine_id
+
+    if body.smtp is not None:
+        cur = cfg.get("smtp") or {}
+        s = body.smtp.model_dump()
+        if not s.get("password"):   # empty password = keep the stored one
+            s["password"] = cur.get("password", "")
+        cfg["smtp"] = s
+
+    # Generic tools namespace: tools.<tool_id>.<param>. A blank secret keeps the stored value;
+    # results are mirrored onto the legacy web_search_* / smtp keys below.
+    if body.tools:
+        stored = dict(cfg.get("tools") or {})
+        for tool_id, params in body.tools.items():
+            if not isinstance(params, dict):
+                continue
+            # The UI submits the tool's full intended state, so the stored dict is
+            # REPLACED per tool (keys absent from the submission are dropped = deletion),
+            # except a blank secret, which keeps the previously stored value. On first
+            # migration the legacy flat keys seed the previous state so nothing is lost.
+            prev = stored.get(tool_id)
+            if not prev:
+                if tool_id == "smtp":
+                    prev = cfg.get("smtp") or {}
+                elif tool_id == "web_search":
+                    prev = {"provider": cfg.get("web_search_provider", "")}
+                    if cfg.get("web_search_api_key"):
+                        prev["api_key"] = cfg["web_search_api_key"]
+                    if cfg.get("web_search_engine_id") is not None:
+                        prev["engine_id"] = cfg["web_search_engine_id"]
+            prev = dict(prev or {})
+            merged = {}
+            for k, v in params.items():
+                if k in ("password", "api_key", "secret") and v == "":
+                    if k in prev:
+                        merged[k] = prev[k]
+                    continue
+                merged[k] = v
+            stored[tool_id] = merged
+        cfg["tools"] = stored
+        _merge_tools_into_legacy(cfg)
 
     await _save_config(cfg)
     _apply_llm_settings(cfg)
@@ -1584,15 +2209,52 @@ async def update_config(body: ProvidersUpdateRequest, _: AuthAdmin = Depends(req
         "status": "ok",
         "providers": [_masked_provider(p) for p in providers],
         "active_provider": active_id,
+        "smtp": _masked_smtp(cfg.get("smtp") or {}),
     }
 
 
+@app.post("/config/test-email")
+async def test_email(body: TestEmailRequest, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """Send a probe email through the configured SMTP (for the admin Settings card)."""
+    smtp = await _smtp_config()
+    try:
+        await send_email(
+            smtp,
+            body.to_email.strip(),
+            "DeepDive 测试邮件",
+            "<p>这是一封来自 DeepDive 的测试邮件,SMTP 配置正常。</p>",
+        )
+        return {"status": "ok", "message": "测试邮件已发送。"}
+    except MailNotConfigured:
+        raise HTTPException(status_code=400, detail="SMTP 未配置:请先在 Settings 里填写 SMTP 信息。")
+    except Exception as err:  # noqa: BLE001 — surface the smtplib error to the admin
+        raise HTTPException(status_code=400, detail=f"发送失败:{err}")
+
+
 @app.post("/config/probe-models")
-async def probe_models(body: LLMProviderModel, _: AuthAdmin = Depends(require_admin)) -> dict:
-    """List model ids from an OpenAI-compatible endpoint (for the settings UI's fetch)."""
+async def probe_models(body: ProbeModelsRequest, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """List model ids from an OpenAI-compatible endpoint (for the settings UI's connectivity test).
+
+    A blank ``api_key`` falls back to the stored key of the provider whose ``base_url``
+    matches, so the Live Chat card can test a configured (masked) key without retyping it.
+    """
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(base_url=body.base_url or None, api_key=body.api_key or "sk-placeholder")
+    api_key = body.api_key
+    if not api_key:
+        cfg = await _load_config()
+        want = (body.base_url or "").rstrip("/")
+        for p in cfg.get("llm_providers", []):
+            if p.get("base_url") and p["base_url"].rstrip("/") == want:
+                api_key = p.get("api_key", "")
+                break
+
+    client = AsyncOpenAI(
+        base_url=body.base_url or None,
+        api_key=api_key or "sk-placeholder",
+        timeout=15.0,    # fail a connectivity probe fast instead of the SDK's 10-minute read timeout
+        max_retries=0,   # the SDK retries timeouts 2x by default (3 x 15s = 45s); one attempt is enough
+    )
     try:
         models = await client.models.list()
     except Exception as err:  # noqa: BLE001 - surface the provider's failure verbatim
@@ -1774,8 +2436,12 @@ async def analyze_syntax(body: SyntaxAnalysisRequest, queue: TaskQueue = Depends
 
 
 # ── Chat (Agent) ──
-async def _guest_quota(redis, guest_id: UUID) -> None:
-    """Cap anonymous guest chat to ``guest_daily_limit`` requests per day (Redis counter)."""
+async def _guest_quota(redis, guest_id: UUID, detail: str | None = None) -> None:
+    """Cap anonymous guest chat to ``guest_daily_limit`` requests per day (Redis counter).
+
+    ``detail`` overrides the 429 message so a signed-in user who degraded to the anonymous
+    tier gets a top-up/upgrade prompt instead of the "sign in" one aimed at true guests.
+    """
     if settings.guest_daily_limit <= 0:
         return
     key = f"ratelimit:guest:{guest_id}:{datetime.now(timezone.utc).date().isoformat()}"
@@ -1787,7 +2453,7 @@ async def _guest_quota(redis, guest_id: UUID) -> None:
     if count > settings.guest_daily_limit:
         raise HTTPException(
             status_code=429,
-            detail="Guest limit reached — sign in to keep chatting.",
+            detail=detail or "Guest limit reached — sign in to keep chatting.",
         )
 
 
@@ -1839,6 +2505,7 @@ async def chat(
     # channel — they still log in fine, but degrade to the anonymous tier for this request:
     # guest daily quota + anonymous routing (that's the "equivalent to an anonymous user"
     # behavior; full access returns when the admin re-enables a key).
+    notice = None
     async with SessionLocal() as session:
         if user is None:
             user_id = body.user_id or await ensure_user(SessionLocal)
@@ -1851,14 +2518,31 @@ async def chat(
             token = await session.get(LoginTokenModel, user.token_id)
             role_id = user.role.role_id
             log_user = user
-        base_url, api_key, model = await _resolve_chat_route(session, token, role_id)
+        base_url, api_key, model, business_name = await _resolve_chat_route(session, token, role_id)
         if user is not None and not base_url and not api_key:
-            await _guest_quota(request.app.state.redis, user_id)
+            anon = await get_role(session, "anonymous")
+            anon_limit = anon.daily_request_limit if anon is not None else settings.guest_daily_limit
+            limit_txt = f"每天限 {anon_limit} 次" if anon_limit >= 0 else "按匿名用户限额"
+            await _guest_quota(
+                request.app.state.redis, user_id,
+                detail="你的额度已用完,且匿名额度也已用完。请充值或升级套餐后继续使用。",
+            )
             role_id = "anonymous"
             log_user = None
-            base_url, api_key, model = await _resolve_chat_route(session, None, role_id)
+            notice = (
+                f"你的渠道额度已用完,已按匿名用户身份继续使用({limit_txt})。"
+                "如需更多额度,请充值或升级套餐。"
+            )
+            base_url, api_key, model, business_name = await _resolve_chat_route(session, None, role_id)
         elif user is not None:
             await check_quota(session, user.user_id, user.role)
+        # The anonymous tier has no channel either: do NOT fall back to the legacy global
+        # connection — tell the user instead (the admin must bind a channel to the role).
+        if not base_url and not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
+            )
 
     session_id = body.session_id or await create_session(SessionLocal, user_id)
     session_memory = SessionMemoryStore(SessionLocal, _embedder(), llm, session_id, user_id)
@@ -1874,13 +2558,16 @@ async def chat(
     # close() (inside run) already flushed events; defer the expensive embed+summary work.
     await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
     if log_user is not None:
-        await _log_usage(log_user, model, "chat", result.usage)
-    return {
+        await _log_usage(log_user, business_name, "chat", result.usage)
+    resp = {
         "answer": result.final_answer,
         "messages": result.messages,
         "session_id": str(session_id),
         "user_id": str(user_id),
     }
+    if notice:
+        resp["notice"] = notice
+    return resp
 
 
 @app.get("/sessions")
@@ -1915,20 +2602,40 @@ async def chat_stream(
     user: AuthUser = Depends(require_user),
 ):
     """SSE streaming. A user with no usable LLM key degrades to the anonymous tier (guest quota)."""
+    notice = None
     async with SessionLocal() as session:
         token = await session.get(LoginTokenModel, user.token_id)
-        base_url, api_key, model = await _resolve_chat_route(session, token, user.role.role_id)
+        base_url, api_key, model, business_name = await _resolve_chat_route(session, token, user.role.role_id)
         if not base_url and not api_key:
-            await _guest_quota(request.app.state.redis, user.user_id)
-            base_url, api_key, model = await _resolve_chat_route(session, None, "anonymous")
+            anon = await get_role(session, "anonymous")
+            anon_limit = anon.daily_request_limit if anon is not None else settings.guest_daily_limit
+            limit_txt = f"每天限 {anon_limit} 次" if anon_limit >= 0 else "按匿名用户限额"
+            await _guest_quota(
+                request.app.state.redis, user.user_id,
+                detail="你的额度已用完,且匿名额度也已用完。请充值或升级套餐后继续使用。",
+            )
+            base_url, api_key, model, business_name = await _resolve_chat_route(session, None, "anonymous")
+            notice = (
+                f"你的渠道额度已用完,已按匿名用户身份继续使用({limit_txt})。"
+                "如需更多额度,请充值或升级套餐。"
+            )
             log_user = None
         else:
             await check_quota(session, user.user_id, user.role)
             log_user = user
+    # All keys + the anonymous tier are exhausted too — block, don't fall back to the
+    # legacy global connection; the user must top up / upgrade.
+    if not base_url and not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
+        )
     if log_user is not None:
-        await _log_usage(log_user, model, "chat_stream")
+        await _log_usage(log_user, business_name, "chat_stream")
 
     async def gen():
+        if notice:
+            yield {"notice": notice}
         async for chunk in llm.complete_stream(
             body.message, model=model, base_url=base_url or None, api_key=api_key or None
         ):

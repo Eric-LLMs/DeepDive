@@ -216,17 +216,17 @@ async def check_quota(
     if role.daily_request_limit >= 0 and day_requests > role.daily_request_limit:
         raise HTTPException(
             status_code=429,
-            detail=f"Daily request limit reached ({role.daily_request_limit}/day for {role.role_name})",
+            detail=f"今日请求次数已达上限({role.daily_request_limit} 次/天,角色 {role.role_name})。请充值或升级套餐后继续使用。",
         )
     if role.monthly_request_limit >= 0 and month_requests > role.monthly_request_limit:
         raise HTTPException(
             status_code=429,
-            detail=f"Monthly request limit reached ({role.monthly_request_limit}/month for {role.role_name})",
+            detail=f"本月请求次数已达上限({role.monthly_request_limit} 次/月,角色 {role.role_name})。请充值或升级套餐后继续使用。",
         )
     if role.daily_token_limit >= 0 and day_tokens > role.daily_token_limit:
         raise HTTPException(
             status_code=429,
-            detail=f"Daily token limit reached ({role.daily_token_limit}/day for {role.role_name})",
+            detail=f"今日 token 用量已达上限({role.daily_token_limit}/天,角色 {role.role_name})。请充值或升级套餐后继续使用。",
         )
 
 

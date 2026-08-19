@@ -47,10 +47,25 @@ def compute_cost(
 
 
 async def get_model_prices(session, model_name: str) -> tuple[Decimal, Decimal]:
-    """Return ``(prompt_price, completion_price)`` for a catalog model (0/0 if unknown)."""
+    """Return ``(prompt_price, completion_price)`` for a catalog model (0/0 if unknown).
+
+    Billing is keyed on the catalog display ``name`` — the business model name the usage
+    log records. A provider-model-id fallback covers legacy raw model strings; when
+    several catalog entries share one provider id, the active one created earliest wins
+    so the lookup never errors on ambiguous rows.
+    """
     model = (
         await session.execute(select(LLMModelModel).where(LLMModelModel.name == model_name))
     ).scalar_one_or_none()
+    if model is None:
+        model = (
+            await session.execute(
+                select(LLMModelModel)
+                .where(LLMModelModel.provider_model_name == model_name)
+                .order_by(LLMModelModel.is_active.desc(), LLMModelModel.created_at)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
     if model is None:
         return Decimal("0"), Decimal("0")
     return model.prompt_price_per_1k, model.completion_price_per_1k

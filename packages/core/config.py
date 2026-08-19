@@ -29,13 +29,13 @@ class Settings(BaseSettings):
     llm_model: str = "deepdive-chat"
 
     # ── TTS (Kokoro-FastAPI service, OpenAI-compatible /v1/audio/speech) ──
-    tts_base_url: str = "http://localhost:8880/v1"
+    tts_base_url: str = "http://localhost:18880/v1"
     tts_api_key: str = "not-needed"   # Kokoro-FastAPI ignores auth; the openai SDK needs a non-empty key
     tts_model: str = "kokoro"
     tts_voice: str = "am_michael"
 
     # ── Embedding (TEI service) ──
-    embedding_base_url: str = "http://localhost:8080"   # TEI /embed
+    embedding_base_url: str = "http://localhost:18080"   # TEI /embed
     embedding_model: str = "BAAI/bge-m3"
     embedding_dim: int = 1024
 
@@ -56,8 +56,16 @@ class Settings(BaseSettings):
     media_output_dir: Path = Path("data/media_output")
 
     # ── Web search (agent web_search tool) ──
-    web_search_provider: str = "tavily"   # "tavily" (needs key) | "duckduckgo" (no key)
+    # provider is free text: duckduckgo (no key) | tavily | bing | google (see web_search.py).
+    # These are mirrored from the generic tools namespace (cfg["tools"]["web_search"]) at
+    # startup / config save, so they stay the source of truth for the flat read path.
+    web_search_provider: str = "tavily"
     web_search_api_key: str = ""
+    web_search_engine_id: str = ""        # google Custom Search engine id (cx)
+
+    # Runtime mirror of the generic tools namespace (cfg["tools"]). Populated by apps.api at
+    # startup and on /config save; tool code reads its params via get_tool_config().
+    tool_configs: dict[str, dict] = {}
 
     # ── Agent ──
     workspace_dir: Path = Path(".")            # root for the agent's read_file/edit_file/bash
@@ -84,3 +92,13 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def get_tool_config(tool_id: str) -> dict:
+    """Runtime config dict for a tool: ``tools.<tool_id>.<param>``.
+
+    Tool code reads its params by name, e.g. ``get_tool_config("amap").get("api_key")``.
+    The namespace is mirrored into ``settings.tool_configs`` at startup and on config save,
+    so this is a pure in-process read (no DB round trip at call time).
+    """
+    return (settings.tool_configs or {}).get(tool_id, {})

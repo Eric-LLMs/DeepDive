@@ -5,9 +5,9 @@
 # runs inside the API process, so model updates don't require an API restart.
 #
 # Model services:
-#   - embedding   TEI serving BAAI/bge-m3            -> POST /embed   (port 8080)
+#   - embedding   TEI serving BAAI/bge-m3            -> POST /embed   (port 18080)
 #   - reranker    TEI serving BAAI/bge-reranker-v2-m3 -> POST /rerank (port 18081)
-#   - tts         Kokoro-FastAPI (OpenAI-compatible)  -> /v1/audio/speech (port 8880)
+#   - tts         Kokoro-FastAPI (OpenAI-compatible)  -> /v1/audio/speech (port 18880)
 #   - llm-gateway LiteLLM proxy (unified LLM routing / keys / cost)   (port 4000)
 
 services:
@@ -50,7 +50,7 @@ services:
     container_name: deepdive-embedding
     command: --model-id BAAI/bge-m3 --port 80 --max-batch-tokens 2048 --max-concurrent-requests 16
     ports:
-      - "8080:80"
+      - "18080:80"
     volumes:
       - embedding-cache:/data
     restart: unless-stopped
@@ -89,7 +89,7 @@ services:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
     container_name: deepdive-tts
     ports:
-      - "8880:8880"
+      - "18880:8880"
     volumes:
       - kokoro-cache:/root/.cache
     restart: unless-stopped
@@ -120,7 +120,8 @@ services:
       - ./deploy/litellm/config.yaml:/app/config.yaml:ro
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
+      # The litellm image ships no curl/wget — probe via its bundled python.
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status == 200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 5

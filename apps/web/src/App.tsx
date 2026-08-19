@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
-import { api, clearToken, getToken, setToken } from "./api";
+import { api, clearToken, getToken, setToken, type AuthActionResponse } from "./api";
 import MicRecorder from "./MicRecorder";
 import { useJob } from "./useJob";
 import type { Domain, Me, Sentence, Term } from "./types";
@@ -54,6 +54,7 @@ function applyFontSizePref(px: number) {
 export default function App() {
   const [auth, setAuth] = useState<AuthState>({ status: "loading" });
   const [page, setPage] = useState<Page>("home");
+  const [profileOpen, setProfileOpen] = useState(false);
 
   useEffect(() => {
     // SSO handoff from the desktop client: ?sso=<token>. Store it, then drop the
@@ -102,8 +103,15 @@ export default function App() {
       </main>
       <div className="topbar">
         <SettingsMenu />
-        <AccountChip user={auth.user} onLogout={logout} />
+        <AccountChip user={auth.user} onLogout={logout} onProfile={() => setProfileOpen(true)} />
       </div>
+      {profileOpen && (
+        <ProfileModal
+          user={auth.user}
+          onClose={() => setProfileOpen(false)}
+          onUpdated={(me) => setAuth({ status: "authed", user: me })}
+        />
+      )}
     </div>
   );
 }
@@ -172,11 +180,25 @@ function SettingsMenu() {
 }
 
 // ── Login (direct visits; the desktop client auto-signs-in via ?sso=) ──
+// Toggles between sign-in / create-account / forgot-password on one card.
 function LoginPage({ onLogin }: { onLogin: (me: Me) => void }) {
+  const [mode, setMode] = useState<"login" | "register" | "forgot">("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [regEmail, setRegEmail] = useState("");
+  const [regDisplay, setRegDisplay] = useState("");
+  const [forgotEmail, setForgotEmail] = useState("");
+  const [regDone, setRegDone] = useState<AuthActionResponse | null>(null);
+  const [forgotDone, setForgotDone] = useState<AuthActionResponse | null>(null);
+
+  const switchMode = (m: typeof mode) => {
+    setMode(m);
+    setError("");
+    setRegDone(null);
+    setForgotDone(null);
+  };
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -193,49 +215,257 @@ function LoginPage({ onLogin }: { onLogin: (me: Me) => void }) {
     }
   };
 
+  const submitRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    setRegDone(null);
+    try {
+      setRegDone(await api.register(username.trim(), regEmail.trim(), password, regDisplay.trim() || undefined));
+      setPassword("");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitForgot = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    setForgotDone(null);
+    try {
+      setForgotDone(await api.forgotPassword(forgotEmail.trim()));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const debugLink = (url: string, label: string) => (
+    <div className="debug-link">
+      <div className="muted" style={{ fontSize: 12 }}>{label}</div>
+      <input readOnly value={url} onFocus={(e) => e.currentTarget.select()} />
+    </div>
+  );
+
   return (
     <div className="login-wrap">
-      <form className="login-card" onSubmit={submit}>
+      <div className="login-card">
         <div className="login-logo">🧠 DeepDive</div>
-        <h2>Sign in to Web Console</h2>
-        <label className="field-label">Username</label>
-        <input
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          autoComplete="username"
-          autoFocus
-        />
-        <label className="field-label">Password</label>
-        <input
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          autoComplete="current-password"
-        />
-        {error && <p className="error">{error}</p>}
-        <button type="submit" className="primary" disabled={busy || !username || !password}>
-          {busy ? "Signing in…" : "Sign in"}
-        </button>
-        <p className="muted" style={{ margin: "12px 0 0", textAlign: "center", fontSize: 12 }}>
-          Tip: open Web Console from the desktop app to sign in automatically.
-        </p>
-      </form>
+
+        {mode === "login" && (
+          <form onSubmit={submit}>
+            <h2>Sign in to Web Console</h2>
+            <label className="field-label">Username</label>
+            <input value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" autoFocus />
+            <label className="field-label">Password</label>
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+            {error && <p className="error">{error}</p>}
+            <button type="submit" className="primary" disabled={busy || !username || !password}>
+              {busy ? "Signing in…" : "Sign in"}
+            </button>
+            <div className="account-links">
+              <button type="button" className="linklike" onClick={() => switchMode("register")}>Create account</button>
+              <button type="button" className="linklike" onClick={() => switchMode("forgot")}>Forgot password?</button>
+            </div>
+            <p className="muted" style={{ margin: "12px 0 0", textAlign: "center", fontSize: 12 }}>
+              Tip: open Web Console from the desktop app to sign in automatically.
+            </p>
+          </form>
+        )}
+
+        {mode === "register" && (
+          <form onSubmit={submitRegister}>
+            <h2>Create account</h2>
+            <p className="muted" style={{ fontSize: 12 }}>验证邮件会发送到你的邮箱,验证后才能登录。</p>
+            <label className="field-label">Username</label>
+            <input value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" autoFocus />
+            <label className="field-label">Email</label>
+            <input type="email" value={regEmail} onChange={(e) => setRegEmail(e.target.value)} autoComplete="email" />
+            <label className="field-label">Display name (optional)</label>
+            <input value={regDisplay} onChange={(e) => setRegDisplay(e.target.value)} autoComplete="name" />
+            <label className="field-label">Password</label>
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+            {error && <p className="error">{error}</p>}
+            {regDone && (
+              <div className="auth-done">
+                <p className="success">{regDone.message}</p>
+                {regDone.debug_verify_url && debugLink(regDone.debug_verify_url, "开发者验证链接(SMTP 未配置)")}
+              </div>
+            )}
+            <button type="submit" className="primary" disabled={busy || !username || !regEmail || !password}>
+              {busy ? "Creating…" : "Create account"}
+            </button>
+            <button type="button" className="linklike" onClick={() => switchMode("login")}>← Back to sign in</button>
+          </form>
+        )}
+
+        {mode === "forgot" && (
+          <form onSubmit={submitForgot}>
+            <h2>Reset password</h2>
+            <p className="muted" style={{ fontSize: 12 }}>输入注册邮箱,我们会发送一个重置链接。</p>
+            <label className="field-label">Email</label>
+            <input type="email" value={forgotEmail} onChange={(e) => setForgotEmail(e.target.value)} autoComplete="email" autoFocus />
+            {error && <p className="error">{error}</p>}
+            {forgotDone && (
+              <div className="auth-done">
+                <p className="success">{forgotDone.message}</p>
+                {forgotDone.debug_verify_url && debugLink(forgotDone.debug_verify_url, "开发者重置链接(SMTP 未配置)")}
+              </div>
+            )}
+            <button type="submit" className="primary" disabled={busy || !forgotEmail}>
+              {busy ? "Sending…" : "Send reset link"}
+            </button>
+            <button type="button" className="linklike" onClick={() => switchMode("login")}>← Back to sign in</button>
+          </form>
+        )}
+      </div>
     </div>
   );
 }
 
-// ── Top-right identity: avatar initial + username + role badge ──
-function AccountChip({ user, onLogout }: { user: Me; onLogout: () => void }) {
+// ── Top-right identity: avatar + username + role badge ──
+function AccountChip({ user, onLogout, onProfile }: { user: Me; onLogout: () => void; onProfile: () => void }) {
   const name = user.display_name || user.username;
   const initial = name ? name.trim()[0]?.toUpperCase() : "?";
   return (
     <div className="account-chip">
-      <span className="account-avatar">{initial}</span>
+      {user.avatar ? (
+        <img className="account-avatar avatar-img" src={user.avatar} alt="" referrerPolicy="no-referrer" />
+      ) : (
+        <span className="account-avatar">{initial}</span>
+      )}
       <span className="account-name" title={name}>{user.username}</span>
       <span className={"account-role tier" + (user.role_id === "admin" ? " vip" : "")}>
         {user.role_name}
       </span>
+      <button className="header-btn" onClick={onProfile} title="Edit profile">Profile</button>
       <button className="header-btn" onClick={onLogout} title="Sign out">Sign out</button>
+    </div>
+  );
+}
+
+// ── Profile modal: edit display name / username / email / phone / password / avatar ──
+function ProfileModal({ user, onClose, onUpdated }: { user: Me; onClose: () => void; onUpdated: (me: Me) => void }) {
+  const [me, setMe] = useState<Me>(user);
+  const [display, setDisplay] = useState(user.display_name || "");
+  const [username, setUsername] = useState(user.username);
+  const [email, setEmail] = useState(user.email || "");
+  const [phone, setPhone] = useState(user.phone || "");
+  const [curpass, setCurpass] = useState("");
+  const [newpass, setNewpass] = useState("");
+  const [newpass2, setNewpass2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<{ kind: "ok" | "err"; text: string; url?: string } | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    api.me().then(setMe).catch(() => {});
+  }, []);
+
+  const save = async () => {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const patch: Parameters<typeof api.updateProfile>[0] = {
+        display_name: display || null,
+        username: username || null,
+        email: email || null,
+        phone: phone || null,
+      };
+      if (curpass || newpass || newpass2) {
+        if (!curpass) {
+          setStatus({ kind: "err", text: "修改密码需要输入当前密码" });
+          setBusy(false);
+          return;
+        }
+        if (newpass !== newpass2) {
+          setStatus({ kind: "err", text: "两次输入的新密码不一致" });
+          setBusy(false);
+          return;
+        }
+        patch.current_password = curpass;
+        patch.new_password = newpass;
+      }
+      const res = await api.updateProfile(patch);
+      const updated = await api.me();
+      setMe(updated);
+      onUpdated(updated);
+      setCurpass("");
+      setNewpass("");
+      setNewpass2("");
+      setStatus({ kind: "ok", text: res.message, url: res.debug_verify_url });
+    } catch (err) {
+      setStatus({ kind: "err", text: String(err) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uploadAvatar = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setStatus(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      await api.uploadAvatar(fd);
+      const updated = await api.me();
+      setMe(updated);
+      onUpdated(updated);
+      setStatus({ kind: "ok", text: "头像已更新" });
+    } catch (err) {
+      setStatus({ kind: "err", text: String(err) });
+    }
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal profile-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="modal-close ghost" onClick={onClose}>✖ Close</button>
+        <h2 style={{ marginTop: 0 }}>Profile</h2>
+        <div className="profile-avatar-row">
+          {me.avatar ? (
+            <img className="profile-avatar" src={me.avatar} alt="avatar" referrerPolicy="no-referrer" />
+          ) : (
+            <span className="profile-avatar initial">{(me.display_name || me.username || "?").trim()[0]?.toUpperCase()}</span>
+          )}
+          <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={uploadAvatar} />
+        </div>
+        <label className="field-label">Display name</label>
+        <input value={display} onChange={(e) => setDisplay(e.target.value)} />
+        <label className="field-label">Username</label>
+        <input value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" />
+        <label className="field-label">
+          Contact email {me.email && !me.email_verified && <span className="error">(未验证)</span>}
+        </label>
+        <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" />
+        <label className="field-label">Phone</label>
+        <input type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} autoComplete="tel" />
+        <h3 style={{ margin: "18px 0 0" }}>Change password</h3>
+        <label className="field-label">Current password</label>
+        <input type="password" value={curpass} onChange={(e) => setCurpass(e.target.value)} autoComplete="current-password" />
+        <label className="field-label">New password</label>
+        <input type="password" value={newpass} onChange={(e) => setNewpass(e.target.value)} autoComplete="new-password" />
+        <label className="field-label">Confirm new password</label>
+        <input type="password" value={newpass2} onChange={(e) => setNewpass2(e.target.value)} autoComplete="new-password" />
+        {status && (
+          <div>
+            <p className={status.kind === "ok" ? "success" : "error"}>{status.text}</p>
+            {status.url && (
+              <div className="debug-link">
+                <div className="muted" style={{ fontSize: 12 }}>新邮箱验证链接(SMTP 未配置)</div>
+                <input readOnly value={status.url} onFocus={(e) => e.currentTarget.select()} />
+              </div>
+            )}
+          </div>
+        )}
+        <button className="primary" onClick={save} disabled={busy}>{busy ? "Saving…" : "Save"}</button>
+      </div>
     </div>
   );
 }

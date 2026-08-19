@@ -22,11 +22,11 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
-| Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login |
+| Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload) |
 | Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover. The Tokens page disables a user's access to a key per (user, channel); a user with no usable key degrades to the anonymous tier (guest quota) instead of losing login |
-| Admin console | single-file SPA at `/admin` with 4 modules (Providers / Roles / Users / Tokens): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint) |
+| Admin console | single-file SPA at `/admin` with 5 modules (Providers / Roles / Users / Tokens / **Tools config**): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint). The **Tools config** module edits the generic `tools` namespace (web-search provider, SMTP, free-form key/value params) with a one-click *Test email*; the Chat Test user picker is a fuzzy-autocomplete text box |
 | Billing | `llm_models` (per-1k pricing) + `user_wallets` + `wallet_transactions` + `llm_credentials` + `credential_models`; cost calc + atomic wallet deduct |
-| Settings in DB | `app_settings` key/value JSONB (admin credential + LLM provider config + tiers), written by the admin console |
+| Settings in DB | `app_settings` key/value JSONB (admin credential + LLM provider config + tiers + the generic `tools` namespace for web search / SMTP), written by the admin console |
 | Guest access | anonymous chat via the `anonymous` role's channels, with per-day Redis limit (`guest_daily_limit`), 429 → prompt login |
 
 ### Designed, not yet implemented
@@ -108,6 +108,7 @@ deepdive/
 │   │   └── plugins/              # plugin manager + built-in tool_audit
 │   ├── rag/                      # package `rag`: retrieval DAG + build_pipeline factory
 │   ├── core/                     # package `core`: config + domain/application/ports/infrastructure
+│   │   ├── infrastructure/mailer.py            # stdlib smtplib emailer (verification / reset / test)
 │   │   └── infrastructure/memory_retrieval.py  # PG tsvector + pgvector session-recall channels
 │   └── shared/proto/retrieval/   # generated protobuf/gRPC stubs (import name `retrieval.v1`)
 ├── data/
@@ -480,14 +481,16 @@ rewrite → multi-recall → RRF fusion → rerank
 > `create_all`). This document does not repeat the DDL; the migration files are the single source
 > of truth. Table names below are the implemented ones (`sessions`, `messages`, `jobs` …), not the
 > earlier design names (`conversations`, `job_logs` …). The current surface spans
-> `0001_init.sql` … `0007_console_tokens_stateless.sql`; each file is written as one idempotent unit
-> (final shape in a single pass, no repeated ALTERs).
+> `migrations/0001_init.sql` is the single consolidated base schema (the squash of the original
+> 0001–0008 files; every statement is idempotent). `migrations/0002_auth_profiles.sql` layers the
+> self-service account surface on top — the `users` profile/verification columns and the one-time
+> `verification_tokens` table. Both are applied in filename order by `init_db()`.
 
 The core learning + chat tables that run today (`migrations/0001_init.sql`):
 
 - **domains** — `id`, `name` (unique), `created_at`.
 - **materials** — `id`, `type` (`domain` | `video` | `document`), `title`, `source_url`, `meta` (JSONB), `created_at`.
-- **users** — `id`, `created_at`; the auth columns come from `0002_auth.sql` (see §12.3).
+- **users** — `id`, `created_at`; the auth columns are added by the consolidated schema (see §12.3).
 - **terms** — `id`, `domain_id` (FK → `domains`), `word`, `definition`, `frequency`, `star_level`, `audio_hash`, `image_paths` (JSONB), `is_active`.
 - **sentences** — `id`, `domain_id` (FK → `domains`), `origin_source`, `content_en` (unique), `content_cn`, `audio_hash`, `cn_explanation`, `embedding` (vector(1024)).
 - **chunks** — `id`, `material_id` (FK → `materials`), `seq`, `content_en`, `content_cn`, `meta` (JSONB), `embedding` (vector(1024)).
@@ -515,7 +518,7 @@ Hybrid recall is computed in code, not stored in schema:
 
 ### 12.2 Billing and Logs
 
-- **Implemented** — the billing surface in `migrations/0004_billing.sql` + `0005_roles_credentials.sql`:
+- **Implemented** — the billing surface (in the consolidated `migrations/0001_init.sql`):
   `llm_credentials`, `llm_models`, `credential_models`, `role_credentials`, `user_wallets`,
   `wallet_transactions` (documented in §12.3).
 - **Design-only (not created)** — `subscriptions`, `credit_ledger`, `audit_logs`, `ai_call_logs`,
@@ -523,8 +526,9 @@ Hybrid recall is computed in code, not stored in schema:
 
 ### 12.3 Implemented auth, RBAC & billing schema
 
-The multi-user + billing surface (`migrations/0002_auth.sql` … `0008_login_tokens.sql`, where 0008 splits
-login credentials into `login_tokens` and leaves `access_tokens` as the per-user LLM-key grant matrix).
+The multi-user + billing surface (all part of the consolidated `migrations/0001_init.sql`, with the
+self-service account tables/columns in `0002_auth_profiles.sql`): login credentials live in
+`login_tokens`, and `access_tokens` is the per-user LLM-key grant matrix.
 Fields below mirror the migration DDL exactly;
 `TEXT` columns are plain `TEXT`, money is `NUMERIC`, time is `TIMESTAMPTZ`, JSON is `JSONB`.
 
@@ -532,8 +536,15 @@ Fields below mirror the migration DDL exactly;
   non-null — legacy anonymous rows keep it NULL), `password_hash` (TEXT, stdlib pbkdf2),
   `display_name` (TEXT), `is_active` (BOOLEAN, default true), `role_id` (TEXT FK → `user_roles`
   `ON DELETE RESTRICT`, default `'regular'`), `meta` (JSONB, default `{}`), `created_at`
-  (TIMESTAMPTZ, default now()), `updated_at` (TIMESTAMPTZ). The flat `tier` column existed in 0002
-  and was dropped by 0003 when roles landed.
+  (TIMESTAMPTZ, default now()), `updated_at` (TIMESTAMPTZ). The flat `tier` column from the early
+  design was dropped in favour of `role_id`. Self-service profile/verification columns (from
+  `migrations/0002_auth_profiles.sql`): `email` (TEXT, unique where non-null), `phone` (TEXT),
+  `avatar` (TEXT — `/avatars/{user_id}.{ext}`, the uploaded file path served by a static mount),
+  `email_verified` (BOOLEAN, default false — a non-null email blocks sign-in until verified).
+- **verification_tokens** — one-time tokens for email verification (`kind='verify'`, TTL 24h) and
+  password reset (`kind='reset'`, TTL 1h), stored hashed (sha256) and shown once. Columns: `id`
+  (UUID PK), `user_id` (UUID FK → `users` CASCADE), `kind` (TEXT), `token_hash` (TEXT UNIQUE),
+  `expires_at` (TIMESTAMPTZ), `used_at` (TIMESTAMPTZ — single-use), `created_at` (TIMESTAMPTZ).
 - **user_roles** — quota + model + feature permissions, the tier definition. Columns: `role_id`
   (TEXT PK), `role_name` (TEXT), `daily_request_limit` (INT, default 50), `monthly_request_limit`
   (INT, default 1500), `daily_token_limit` (BIGINT), `rpm_limit` (INT), `monthly_cost_limit`
@@ -541,14 +552,14 @@ Fields below mirror the migration DDL exactly;
   provider's model), `models` (TEXT[], **legacy** allowed-model ids — the routing source is now
   `role_credentials`, this field is kept only for compatibility display), `features` (JSONB, e.g.
   `{"chat": true}`), `is_active` (BOOLEAN, default true), `created_at`. Seeded roles: `regular`
-  (50/day), `pro` (500/day), `vip` (−1/unlimited), `admin` (−1/unlimited) from 0003, and
-  **`anonymous`** (guest tier, 20/day) from 0005.
+  (50/day), `pro` (500/day), `vip` (−1/unlimited), `admin` (−1/unlimited), and **`anonymous`**
+  (guest tier, 20/day).
 - **role_credentials** — N:M binding **role → LLM channel**; this is what decides which provider
   key a role may use (VIP/pro bind expensive channels, `regular` / `anonymous` the cheap ones).
   Columns: `role_id` (TEXT FK → `user_roles` CASCADE), `credential_id` (UUID FK → `llm_credentials`
   CASCADE), `is_active` (BOOLEAN, default true), `created_at`; PK `(role_id, credential_id)`, plus
   an index on `credential_id`.
-- **login_tokens** — the **login/API credential** (split out of `access_tokens` by 0008).
+- **login_tokens** — the **login/API credential** (separate from the `access_tokens` key-grant matrix).
   Columns: `id` (UUID PK), `user_id` (UUID FK → `users` CASCADE; NULL = admin/API token),
   `name` (TEXT, human label), `token_hash` (TEXT UNIQUE — sha256 of the raw `dd_` token, shown once
   at mint and **never recoverable**; the admin console shows only a masked fingerprint), `role` (TEXT,
@@ -562,8 +573,8 @@ Fields below mirror the migration DDL exactly;
   user must log in again. Rows are **unique per (user, pinned channel)**: a re-login on the same
   channel rotates `token_hash` and bumps the timestamps in place instead of inserting a new row
   (partial unique indexes `login_tokens_user_credential_uniq` on (user, credential), and
-  `login_tokens_user_no_cred_uniq` on (user) where no channel is pinned — moved from the 0006/0007
-  `access_tokens` indexes). **Admin console logins are stateless** — `/admin/login` returns a signed
+  `login_tokens_user_no_cred_uniq` on (user) where no channel is pinned). **Admin console logins
+  are stateless** — `/admin/login` returns a signed
   `cc_` HMAC session token held in the browser and never writes a row; only Tokens-page API tokens
   (hashed `dd_`) and user login tokens are persisted here.
 - **access_tokens** — the **per-user LLM-key permission record** (the Tokens page "which key may
@@ -591,17 +602,19 @@ Fields below mirror the migration DDL exactly;
   default true — the per-channel availability switch), `created_at`, `updated_at`. A channel's
   displayed price is derived from its `credential_models` routes (single model) or a price range
   (multiple models).
-- **llm_models** — virtual model catalog with PAYG pricing. Columns: `id` (UUID PK), `name` (TEXT
-  UNIQUE, the virtual model name referenced by roles), `description` (TEXT),
+- **llm_models** — model catalog with PAYG pricing. `name` (TEXT UNIQUE) is the display name
+  referenced by roles; `provider_model_name` (TEXT) is the real model id sent upstream to the
+  provider platform. Columns: `id` (UUID PK), `name`, `provider_model_name`, `description` (TEXT),
   `prompt_price_per_1k` (NUMERIC(12,6)), `completion_price_per_1k` (NUMERIC(12,6)), `is_active`,
-  `created_at`.
-- **credential_models** — N:M routing (credential ↔ model): which provider model each credential
-  actually serves, with failover priority and load weight. Columns: `credential_id` (UUID FK
-  CASCADE), `model_id` (UUID FK CASCADE), `actual_model_name` (TEXT — the provider's model id for
-  this credential), `priority` (INT, lower = preferred), `weight` (INT, load-balance weight),
-  `prompt_price_per_1k` / `completion_price_per_1k` (NUMERIC(12,6), NULL = inherit `llm_models`
-  price), `is_active`; PK `(credential_id, model_id)`. The source of each channel's model list and
-  displayed price.
+  `created_at`. The chat path resolves a display name to `provider_model_name` before calling the
+  provider, and `get_model_prices` matches either so pricing stays correct.
+- **credential_models** — N:M routing (credential ↔ model): which credential serves which catalog
+  model, with failover priority, load weight, and a free-text `note` describing the route's
+  purpose (the upstream model id comes from the catalog entry, not the note). Columns:
+  `credential_id` (UUID FK CASCADE), `model_id` (UUID FK CASCADE), `note` (TEXT), `priority` (INT,
+  lower = preferred), `weight` (INT, load-balance weight), `prompt_price_per_1k` /
+  `completion_price_per_1k` (NUMERIC(12,6), NULL = inherit `llm_models` price), `is_active`; PK
+  `(credential_id, model_id)`. The source of each channel's model list and displayed price.
 - **user_wallets** — cash wallet, one row per user. Columns: `user_id` (UUID PK FK CASCADE),
   `balance` (NUMERIC(14,6), default 0), `currency` (TEXT, default `'USD'`), `updated_at`.
 - **wallet_transactions** — append-only ledger; `balance_after` is a snapshot, never recomputed.

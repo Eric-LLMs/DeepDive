@@ -12,7 +12,7 @@ The engine is a native function-calling **agent** — an `AgentKernel` compositi
 
 Model inference never runs inside the API: embedding (**BGE-M3** via TEI) and **TTS (Kokoro)** are separate Docker services, and retrieval can be extracted behind a capability seam into its own **gRPC service**. **LLM calls** go directly to the provider channel pinned to the session (managed in the admin console), with the LiteLLM gateway as the legacy fallback. Async enrichment (TTS, images, explanations, session finalize) runs on an arq **worker** off the request path.
 
-Also included: multi-user accounts with per-role quotas, **per-role LLM channels** (role ↔ credential bindings with one channel pinned per login), pay-as-you-go **billing** with atomic wallet deduction, a self-contained 4-module **admin console** (Providers / Roles / Users / Tokens), and a desktop workbench with a file tree, a multi-format media viewer, and one-click video screenshots.
+Also included: multi-user accounts with per-role quotas, **per-role LLM channels** (role ↔ credential bindings with one channel pinned per login), pay-as-you-go **billing** with atomic wallet deduction, a self-contained **admin console** (Providers / Roles / Users / Tokens / Tools config), **self-service accounts** (email-verified registration, password reset, editable profiles with avatars), and a desktop workbench with a file tree, a multi-format media viewer, and one-click video screenshots.
 
 ---
 
@@ -85,10 +85,26 @@ flowchart TB
 - **RAG Retrieval**: query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank.
 - **SSE Streaming**: Real-time token streaming to the frontend.
 
+### 🤖 AI-Powered Interactive Study
+- **Seamless Navigation**: Switch instantly between words using **"⬅️ Prev"** and **"Next ➡️"** buttons without closing the dialog.
+- **Hybrid Search Engine**: Combines PostgreSQL full-text search (exact keyword) and pgvector (semantic). If an exact sentence isn't found, it finds the most semantically similar sentence (e.g. searching "GQA" finds sentences about "Group Query Attention").
+- **Context-Aware Explanations**: Uses LLMs to translate sentences and explain *exactly* what a term means within that specific context.
+- **Auto-Fetch Definitions**: If a term lacks a definition, the system automatically calls the LLM in the background to fetch a precise English definition and Chinese translation.
+- **Visual Context for Professional Vocabulary**:
+  - **Multi-Dimensional Image Search**: Grasp complex or abstract terms instantly. The system automatically scrapes Google Images (with Bing as a seamless fallback) using a combined 3-tier strategy: *Term alone*, *Term + Definition*, and *Term + Contextual Sentence*.
+  - **Asynchronous Loading & Randomized Regeneration**: Images load via a non-blocking UI mechanism so you can study text while images fetch in the background. Click **Regenerate** to sample a new set from a broader candidate pool.
+  - **Local Image Caching**: Once saved, images are downloaded to a local cache and linked via relative paths for zero-latency loads and offline availability.
+- **Built-in Mic Widget**: Record your own voice directly in the browser and compare it with the generated TTS audio for pronunciation practice.
+- **Audio & Pronunciation**: Generate high-quality TTS audio for words and full sentences on the fly, with local audio caching to save API costs and speed up loading.
+- **Importance Rating**: Rate terms from 1 to 5 stars (⭐⭐⭐⭐⭐) to prioritize your learning.
+
 ### 👥 Multi-User, Roles & Billing
-- **Admin console** (`/admin`): a self-contained single-file SPA with four modules — **Providers** (credentials + model catalog + routing weights), **Roles**, **Users**, and **Tokens**. A default `admin`/`admin` credential is seeded into the DB on first boot; console login is stateless (a signed session token, never persisted), so it never pollutes the tokens table.
+- **Admin console** (`/admin`): a self-contained single-file SPA with five modules — **Providers** (credentials + model catalog + routing weights), **Roles**, **Users**, **Tokens**, and **Tools config** (web-search provider, SMTP, free-form key/value tool params, test email). A default `admin`/`admin` credential is seeded into the DB on first boot; console login is stateless (a signed session token, never persisted), so it never pollutes the tokens table.
 - **Per-role LLM channels**: every role binds the provider channels it may use (`role_credentials`); each login pins one random active channel to the token, and chat routes through it per-request with failover.
-- **User accounts**: admins create username/password accounts; users (and the web/desktop console) log in to receive an opaque token. Roles (`regular` / `pro` / `vip` / `admin` / `anonymous`) carry per-role quota (daily/monthly requests, tokens, RPM, cost) and an optional default model.
+- **LLM key management**: Tokens → LLM Keys manages the per-user key-grant matrix — which user may use which provider key; keys are shown masked (`sk-***`) with one-click copy, and a user's access to a key can be revoked or restored independently of their login.
+- **Self-service accounts**: users **register** themselves (username + email + password); an **email-verification** link gates the first sign-in, and **forgot-password** sends a one-time reset link. After signing in, users edit their profile (display name, username, contact email, phone, avatar) and change their password — all from the web and desktop clients. Admins can still create accounts directly.
+- **Email & SMTP**: verification / reset mail is sent over SMTP configured in the admin **Tools config** page. When SMTP is not configured, the one-time link is returned to the client instead and shown inline (dev mode), so registration still works locally.
+- **User accounts**: users (and the web/desktop console) log in to receive an opaque token. Roles (`regular` / `pro` / `vip` / `admin` / `anonymous`) carry per-role quota (daily/monthly requests, tokens, RPM, cost) and an optional default model.
 - **Server-managed config**: LLM provider keys, the model catalog, and the admin credential live in PostgreSQL (`app_settings`) — not `.env` or repo files — and are edited from the admin console.
 - **Pay-as-you-go billing**: per-model pricing (prompt/completion per 1k tokens), a cash wallet per user, and an append-only ledger with a `balance_after` snapshot. Chat usage is priced and debited atomically.
 - **Guest access**: anonymous users can chat without an account, capped per day (`guest_daily_limit`, default 10); exceeding the cap prompts them to sign in.
@@ -104,19 +120,6 @@ flowchart TB
 - **Advanced Filtering**: Filter your study list by specific domains or star levels.
 - **Real-time Search**: Instantly find terms in your current list with a responsive search bar.
 - **View Definitions**: Clean UI using a "📖 View" popover to see definitions without leaving the list.
-
-### 🤖 AI-Powered Interactive Study
-- **Seamless Navigation**: Switch instantly between words using **"⬅️ Prev"** and **"Next ➡️"** buttons without closing the dialog.
-- **Hybrid Search Engine**: Combines PostgreSQL full-text search (exact keyword) and pgvector (semantic). If an exact sentence isn't found, it finds the most semantically similar sentence (e.g. searching "GQA" finds sentences about "Group Query Attention").
-- **Context-Aware Explanations**: Uses LLMs to translate sentences and explain *exactly* what a term means within that specific context.
-- **Auto-Fetch Definitions**: If a term lacks a definition, the system automatically calls the LLM in the background to fetch a precise English definition and Chinese translation.
-- **Visual Context for Professional Vocabulary**:
-  - **Multi-Dimensional Image Search**: Grasp complex or abstract terms instantly. The system automatically scrapes Google Images (with Bing as a seamless fallback) using a combined 3-tier strategy: *Term alone*, *Term + Definition*, and *Term + Contextual Sentence*.
-  - **Asynchronous Loading & Randomized Regeneration**: Images load via a non-blocking UI mechanism so you can study text while images fetch in the background. Click **Regenerate** to sample a new set from a broader candidate pool.
-  - **Local Image Caching**: Once saved, images are downloaded to a local cache and linked via relative paths for zero-latency loads and offline availability.
-- **Built-in Mic Widget**: Record your own voice directly in the browser and compare it with the generated TTS audio for pronunciation practice.
-- **Audio & Pronunciation**: Generate high-quality TTS audio for words and full sentences on the fly, with local audio caching to save API costs and speed up loading.
-- **Importance Rating**: Rate terms from 1 to 5 stars (⭐⭐⭐⭐⭐) to prioritize your learning.
 
 ### 🛠️ Efficient Library Governance
 - **Efficient Toggles**: Instantly enable/disable terms with visual feedback.
@@ -251,8 +254,22 @@ infra + `uvicorn apps.api.main:app --port 8300` in the background if it is down 
 The file tree, viewer, and video screenshot work **without the backend**. Chat, "生成 PPT /
 生成书" (media generation), and the ⚙️ Settings panel need the backend running on
 `localhost:8300` — the Electron main process forwards `/api`, `/audio`, and `/images` to it.
-⚙️ Settings opens a dropdown list (Account / Theme / Help): sign in with an account created in
-the admin console, or chat anonymously as a guest (limited to `guest_daily_limit` per day).
+⚙️ Settings opens a dropdown list (Account / Theme / Help): the login dialog supports **registering a
+new account** and **password reset**; once signed in you can edit your profile and avatar from the
+Account menu. Guests can also chat anonymously (limited to `guest_daily_limit` per day).
+
+### One-click launchers (pick by environment)
+
+Both scripts print a `[n/N]` banner before each step so you can see where they are. Each step is
+skipped when its target is already up (backend, Docker, infra), so re-running is fast and safe.
+First run on a fresh machine also installs Docker and the Python/Node deps automatically.
+
+| Environment | Script | What it does |
+|---|---|---|
+| **Windows desktop** (local PC client) | `bash scripts/start_desktop.sh` | Auto-installs Docker Desktop if missing → starts **all** dependency services (postgres, redis, embedding, tts, llm-gateway, worker) → ensures the Python venv → starts the backend (boot seeds `admin`/`admin`) → opens the Electron workbench. |
+| **Linux server** (browser access) | `bash scripts/start_server.sh` | Auto-installs Docker Engine if missing → starts **all** dependency services (postgres, redis, embedding, tts, llm-gateway, worker) → ensures the Python venv → starts the backend (boot seeds `admin`/`admin`) → builds and serves the React web UI at `http://<server-ip>:5173`. |
+
+The default `admin` / `admin` account is seeded on first boot and ready to sign in from the start.
 
 ---
 
@@ -264,17 +281,20 @@ the admin console, or chat anonymously as a guest (limited to `guest_daily_limit
 | `REDIS_URL` | `redis://localhost:16379/0` | cache / queue |
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | `""` / `http://localhost:4000/v1` / `deepdive-chat` | legacy default client (LiteLLM gateway); active channels + keys live in the DB and are managed in the admin console |
 | `LLM_UPSTREAM_MODEL` / `LLM_UPSTREAM_BASE` / `LLM_UPSTREAM_KEY` | `openai/gpt-4o-mini` / `https://api.openai.com/v1` / `sk-xxx` | real upstream LLM (consumed by the gateway container) |
-| `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `http://localhost:8080` / `BAAI/bge-m3` / `1024` | TEI embedding service |
-| `TTS_BASE_URL` / `TTS_MODEL` / `TTS_VOICE` | `http://localhost:8880/v1` / `kokoro` / `am_michael` | Kokoro-FastAPI TTS service |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `http://localhost:18080` / `BAAI/bge-m3` / `1024` | TEI embedding service |
+| `TTS_BASE_URL` / `TTS_MODEL` / `TTS_VOICE` | `http://localhost:18880/v1` / `kokoro` / `am_michael` | Kokoro-FastAPI TTS service |
 | `RETRIEVAL_MODE` / `RETRIEVAL_GRPC_ADDR` | `in_process` / `localhost:15051` | capability seam: `in_process` or `grpc` |
 | `WORKSPACE_DIR` | `.` | agent filesystem-tool root (`read_file` / `edit_file` / `bash`; path escape rejected) |
 | `MEMORY_DIR` | `data/memory` | file memory directory (`MEMORY.md` index + one frontmatter `.md` per memory) |
 | `SKILLS_DIR` | `data/skills` | `SKILL.md` skills directory (lazy-loaded via the `skill` tool) |
 | `WORKER_CONCURRENCY` / `WORKER_JOB_TIMEOUT` | `10` / `300` | arq worker max concurrent jobs / per-job timeout (seconds) |
+| `WEB_SEARCH_PROVIDER` / `WEB_SEARCH_API_KEY` / `WEB_SEARCH_ENGINE_ID` | `tavily` / `""` / `""` | web-search provider (`duckduckgo` \| `tavily` \| `bing` \| `google`) + API key + google engine id; normally managed in admin → **Tools config**, these flat keys mirror that namespace |
 
 Model inference never runs inside the API process. LLM channels are managed in the admin
 console (Providers → Credentials); each is an OpenAI-compatible `base_url` + `api_key`, and a role
-bound to a channel routes chat straight to that provider (no code change). Swapping embedding/TTS
+bound to a channel routes chat straight to that provider (no code change). Web-search (provider +
+key + google engine id) and **SMTP** (host, credentials, TLS, enabled) are likewise configured in
+the admin console (**Tools config**) rather than `.env`. Swapping embedding/TTS
 models = change `--model-id` in `docker-compose.yml` and the matching `*_BASE_URL` / dim in `.env` —
 no business-code change. See [docs/architecture.md](docs/architecture.md) for the full topology.
 
