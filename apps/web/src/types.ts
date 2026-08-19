@@ -61,3 +61,50 @@ export interface JobInfo<T = unknown> {
 export interface JobId {
   job_id: string;
 }
+
+// Self-service usage report (mirrors GET /auth/usage from apps/api/main.py).
+export interface UsageCounter {
+  period_start: string;
+  request_count: number;
+  token_count: number;
+}
+export interface UsageLog {
+  id: string;
+  created_at: string | null;
+  credential_name: string;
+  model_name: string;
+  tool: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number | null;
+}
+export interface WalletTx {
+  id: string;
+  type: string;
+  amount: number;
+  balance_after: number;
+  description: string | null;
+  created_at: string | null;
+}
+export interface UsageReport {
+  balance: number;
+  currency: string;
+  counters: UsageCounter[];
+  logs: UsageLog[];
+  transactions: WalletTx[];
+  total: number;
+}
+
+// Model catalog entry (mirrors GET /auth/models from apps/api/main.py — same masked
+// shape as the admin /admin/models, but readable by any signed-in user).
+export interface Model {
+  id: string;
+  name: string;
+  provider_model_name: string | null;
+  description: string | null;
+  prompt_price_per_1k: number;
+  completion_price_per_1k: number;
+  is_active: boolean;
+  created_at: string | null;
+}

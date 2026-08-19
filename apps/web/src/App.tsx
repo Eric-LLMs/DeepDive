@@ -3,7 +3,7 @@ import * as XLSX from "xlsx";
 import { api, clearToken, getToken, setToken, type AuthActionResponse } from "./api";
 import MicRecorder from "./MicRecorder";
 import { useJob } from "./useJob";
-import type { Domain, Me, Sentence, Term } from "./types";
+import type { Domain, Me, Model, Sentence, Term, UsageReport } from "./types";
 
 type Page = "home" | "import" | "study" | "manage";
 
@@ -55,6 +55,7 @@ export default function App() {
   const [auth, setAuth] = useState<AuthState>({ status: "loading" });
   const [page, setPage] = useState<Page>("home");
   const [profileOpen, setProfileOpen] = useState(false);
+  const [tab, setTab] = useState<"learn" | "me">("learn");
 
   useEffect(() => {
     // SSO handoff from the desktop client: ?sso=<token>. Store it, then drop the
@@ -93,24 +94,42 @@ export default function App() {
   }
 
   return (
-    <div className="layout">
-      <Sidebar page={page} onNavigate={setPage} />
-      <main className="content">
-        {page === "home" && <Home />}
-        {page === "import" && <ImportData />}
-        {page === "study" && <StudyMode />}
-        {page === "manage" && <ManageVocabulary />}
-      </main>
-      <div className="topbar">
-        <SettingsMenu />
-        <AccountChip user={auth.user} onLogout={logout} onProfile={() => setProfileOpen(true)} />
+    <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh" }}>
+      <div className="tabs" style={{ padding: "10px 16px 0", marginBottom: 0, flexShrink: 0 }}>
+        <button className={tab === "learn" ? "tab active" : "tab"} onClick={() => setTab("learn")}>
+          Learning Platform
+        </button>
+        <button className={tab === "me" ? "tab active" : "tab"} onClick={() => setTab("me")}>
+          My Account
+        </button>
       </div>
-      {profileOpen && (
-        <ProfileModal
-          user={auth.user}
-          onClose={() => setProfileOpen(false)}
-          onUpdated={(me) => setAuth({ status: "authed", user: me })}
-        />
+      {tab === "learn" ? (
+        <div className="layout" style={{ flex: 1, minHeight: 0 }}>
+          <Sidebar page={page} onNavigate={setPage} />
+          <main className="content">
+            {page === "home" && <Home />}
+            {page === "import" && <ImportData />}
+            {page === "study" && <StudyMode />}
+            {page === "manage" && <ManageVocabulary />}
+          </main>
+          <div className="topbar">
+            <SettingsMenu />
+            <AccountChip user={auth.user} onLogout={logout} onProfile={() => setProfileOpen(true)} />
+          </div>
+          {profileOpen && (
+            <ProfileModal
+              user={auth.user}
+              onClose={() => setProfileOpen(false)}
+              onUpdated={(me) => setAuth({ status: "authed", user: me })}
+            />
+          )}
+        </div>
+      ) : (
+        <div className="layout" style={{ flex: 1, minHeight: 0 }}>
+          <main className="content" style={{ paddingTop: 32 }}>
+            <MyAccount user={auth.user} />
+          </main>
+        </div>
       )}
     </div>
   );
@@ -527,6 +546,209 @@ function Home() {
         <p className="success">✅ API Environment is properly configured and ready.</p>
       )}
       {status === "error" && <p className="error">⚠️ API environment is not reachable.</p>}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────
+// My Account (self-service: profile, balance, daily usage, logs, ledger).
+// English, admin-console style; clicking a model name in the usage log
+// opens the model detail modal (same shape as the admin modelDetailModal).
+// ─────────────────────────────────────────────────────────
+const ACCOUNT_PAGE = 20;
+
+function MyAccount({ user }: { user: Me }) {
+  const [data, setData] = useState<UsageReport | null>(null);
+  const [models, setModels] = useState<Model[]>([]);
+  const [error, setError] = useState("");
+  const [page, setPage] = useState(0);
+  const [detail, setDetail] = useState<Model | null>(null);
+
+  const load = async (offset: number) => {
+    setError("");
+    try {
+      const [d, m] = await Promise.all([api.usage({ limit: ACCOUNT_PAGE, offset }), api.models()]);
+      setData(d);
+      setModels(m.models);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  useEffect(() => {
+    load(0);
+  }, []);
+
+  const fmtMoney = (n: number | null | undefined) =>
+    n == null ? "—" : "$" + n.toFixed(6).replace(/\.?0+$/, "");
+  const fmtDate = (s: string | null) => (s ? new Date(s).toLocaleString() : "—");
+  const totalPages = data ? Math.max(1, Math.ceil(data.total / ACCOUNT_PAGE)) : 1;
+  const openModel = (name: string) => {
+    const m = models.find((x) => x.name === name);
+    if (m) setDetail(m);
+  };
+
+  if (error) {
+    return (
+      <div>
+        <h1 style={{ marginTop: 0 }}>My Account</h1>
+        <p className="error">{error}</p>
+      </div>
+    );
+  }
+  if (!data) return <p className="muted">Loading…</p>;
+
+  return (
+    <div>
+      <h1 style={{ marginTop: 0 }}>My Account</h1>
+
+      {/* Overview */}
+      <div className="panel" style={{ display: "flex", gap: 48, flexWrap: "wrap" }}>
+        <div>
+          <p className="muted" style={{ margin: "4px 0 0" }}>Wallet balance</p>
+          <p style={{ margin: 0, fontSize: 28, fontWeight: 700 }}>{fmtMoney(data.balance)} {data.currency}</p>
+        </div>
+        <div>
+          <p className="muted" style={{ margin: "4px 0 0" }}>Usage records</p>
+          <p style={{ margin: 0, fontSize: 28, fontWeight: 700 }}>{data.total.toLocaleString()}</p>
+        </div>
+      </div>
+
+      {/* Profile */}
+      <div className="panel" style={{ display: "flex", gap: 20, alignItems: "center" }}>
+        <div className="profile-avatar-row" style={{ margin: 0 }}>
+          {user.avatar ? (
+            <img className="profile-avatar" src={user.avatar} alt="avatar" referrerPolicy="no-referrer" />
+          ) : (
+            <span className="profile-avatar initial">{(user.display_name || user.username || "?").trim()[0]?.toUpperCase()}</span>
+          )}
+        </div>
+        <div>
+          <h3 style={{ margin: 0 }}>{user.display_name || user.username}</h3>
+          <p className="muted" style={{ margin: "4px 0" }}>
+            @{user.username} · {user.email || "—"}
+          </p>
+          <span className="badge">{user.role_name || user.role_id}</span>
+        </div>
+      </div>
+
+      {/* Daily usage */}
+      <div className="panel">
+        <h3>Daily Usage</h3>
+        {data.counters.length ? (
+          <table className="st-table">
+            <thead>
+              <tr><th>Date</th><th>Requests</th><th>Tokens</th></tr>
+            </thead>
+            <tbody>
+              {data.counters.map((c) => (
+                <tr key={c.period_start}>
+                  <td>{c.period_start.slice(0, 10)}</td>
+                  <td>{c.request_count}</td>
+                  <td>{c.token_count.toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="muted">No data</p>
+        )}
+      </div>
+
+      {/* Usage logs */}
+      <div className="panel">
+        <h3>Usage Logs</h3>
+        {data.logs.length ? (
+          <table className="st-table">
+            <thead>
+              <tr><th>Time</th><th>Model</th><th>Channel</th><th>Tool</th><th>Tokens</th><th>Cost</th></tr>
+            </thead>
+            <tbody>
+              {data.logs.map((l) => (
+                <tr key={l.id}>
+                  <td>{fmtDate(l.created_at)}</td>
+                  <td>
+                    {l.model_name ? (
+                      <button className="linklike" onClick={() => openModel(l.model_name)}>{l.model_name}</button>
+                    ) : "—"}
+                  </td>
+                  <td>{l.credential_name || "—"}</td>
+                  <td>{l.tool || "—"}</td>
+                  <td>{l.total_tokens.toLocaleString()}</td>
+                  <td>{fmtMoney(l.cost_usd)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="muted">No records</p>
+        )}
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 10 }}>
+          <button className="ghost" disabled={page <= 0} onClick={() => { const p = page - 1; setPage(p); load(p * ACCOUNT_PAGE); }}>
+            ‹ Prev
+          </button>
+          <span className="muted">
+            Page {page + 1} / {totalPages} · {data.total} total
+          </span>
+          <button className="ghost" disabled={page + 1 >= totalPages} onClick={() => { const p = page + 1; setPage(p); load(p * ACCOUNT_PAGE); }}>
+            Next ›
+          </button>
+        </div>
+      </div>
+
+      {/* Transactions */}
+      <div className="panel">
+        <h3>Transactions</h3>
+        {data.transactions.length ? (
+          <table className="st-table">
+            <thead>
+              <tr><th>Time</th><th>Type</th><th>Amount</th><th>Balance</th><th>Note</th></tr>
+            </thead>
+            <tbody>
+              {data.transactions.map((t) => (
+                <tr key={t.id}>
+                  <td>{fmtDate(t.created_at)}</td>
+                  <td>{t.type}</td>
+                  <td>{t.amount < 0 ? "−" : "+"}{fmtMoney(Math.abs(t.amount))}</td>
+                  <td>{fmtMoney(t.balance_after)}</td>
+                  <td>{t.description || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="muted">No records</p>
+        )}
+      </div>
+
+      {detail && <ModelDetailModal model={detail} onClose={() => setDetail(null)} />}
+    </div>
+  );
+}
+
+// Model catalog detail modal — mirrors the admin console's modelDetailModal.
+function ModelDetailModal({ model, onClose }: { model: Model; onClose: () => void }) {
+  const fmtMoney = (n: number) => "$" + n.toFixed(6).replace(/\.?0+$/, "");
+  const fmtDate = (s: string | null) => (s ? new Date(s).toLocaleString() : "—");
+  const row = (k: string, v: React.ReactNode) => (
+    <p style={{ display: "flex", justifyContent: "space-between", gap: 24, margin: "6px 0" }}>
+      <span className="muted">{k}</span>
+      <span style={{ fontWeight: 600, textAlign: "right" }}>{v}</span>
+    </p>
+  );
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 520 }}>
+        <button className="modal-close ghost" onClick={onClose}>✖ Close</button>
+        <h2 style={{ marginTop: 0 }}>{model.name}</h2>
+        <p className="muted">Model catalog entry</p>
+        {row("Display name (Channel model name)", model.name)}
+        {row("Provider model name", model.provider_model_name || "—")}
+        {row("Description", model.description || "—")}
+        {row("Prompt $/1k", fmtMoney(model.prompt_price_per_1k))}
+        {row("Completion $/1k", fmtMoney(model.completion_price_per_1k))}
+        {row("Status", model.is_active ? "active" : "inactive")}
+        {row("Created", fmtDate(model.created_at))}
+      </div>
     </div>
   );
 }

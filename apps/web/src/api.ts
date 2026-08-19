@@ -1,6 +1,6 @@
 // Thin fetch wrapper around the DeepDive REST API.
 // In dev, Vite proxies /api/* to http://localhost:8300 (see vite.config.ts).
-import type { Domain, JobId, JobInfo, Me, Sentence, Term } from "./types";
+import type { Domain, JobId, JobInfo, Me, Model, Sentence, Term, UsageReport } from "./types";
 
 const BASE = "/api";
 const TOKEN_KEY = "deepdive_token";
@@ -213,4 +213,14 @@ export const api = {
 
   // Jobs
   getJob: (jobId: string) => request<JobInfo>(`/jobs/${jobId}`),
+
+  // Self-service usage / wallet report (own data only; optional paging/filter params)
+  usage: (params?: Record<string, string | number>) =>
+    request<UsageReport>(
+      "/auth/usage" +
+        (params ? "?" + new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)])) : "")
+    ),
+
+  // Model catalog (for clicking a model name in the usage log to view its detail).
+  models: () => request<{ models: Model[] }>("/auth/models"),
 };

@@ -292,6 +292,9 @@ class UserUsageLogModel(Base):
         PG_UUID(as_uuid=True), ForeignKey("login_tokens.id", ondelete="SET NULL")
     )
     role_id: Mapped[str | None] = mapped_column(String)
+    credential_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("llm_credentials.id", ondelete="SET NULL")
+    )
     model_name: Mapped[str | None] = mapped_column(String)
     tool: Mapped[str | None] = mapped_column(String)
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)

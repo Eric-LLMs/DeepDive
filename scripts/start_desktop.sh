@@ -3,13 +3,14 @@
 # Safe to run every time: each step is skipped when its target is already up.
 #
 # Progress (a [n/N] banner is printed before every step):
-#   [1] Backend already up?             -> skip straight to the client
+#   [1] Backend already up?             -> skip straight to the web/desktop clients
 #   [2] Docker installed?               -> auto-install Docker Desktop (winget)
 #   [3] Docker daemon ready?            -> start Docker Desktop and wait
 #   [4] All dependency services up      -> postgres/redis/embedding/tts/litellm/worker
 #   [5] Python venv + pip deps ensured  -> create .venv, pip install -e ".[dev]"
 #   [6] Backend started + admin verified-> uvicorn boot seeds admin/admin
-#   [7] Electron client launched
+#   [7] React web UI served             -> vite dev server at :5173 (proxies /api)
+#   [8] Electron client launched
 #
 # If the backend cannot be brought up (e.g. a fresh Docker install needs a reboot),
 # the workbench still opens in offline mode: the file tree, viewer, and screenshots
@@ -25,9 +26,12 @@ PG_PORT=15432
 REDIS_PORT=16379
 PYTHON_BIN=".venv/Scripts/python.exe"
 DESKTOP_DIR="apps/desktop"
+WEB_DIR="apps/web"
 LOG_DIR="data"
 UVICORN_LOG="$LOG_DIR/uvicorn.log"
+WEB_LOG="$LOG_DIR/web.log"
 PID_FILE="$LOG_DIR/uvicorn.pid"
+WEB_PORT=5173
 COMPOSE_SERVICES="postgres redis embedding tts llm-gateway worker"
 
 # Make the Docker CLI resolvable even before the system PATH refreshes after install.
@@ -37,7 +41,7 @@ if [ -d "$DOCKER_BIN" ] && ! command -v docker >/dev/null 2>&1; then
 fi
 
 # ── progress helpers ───────────────────────────────────────────────────────────
-TOTAL=7
+TOTAL=8
 N=0
 step() { N=$((N + 1)); printf '\n[%d/%d] %s\n' "$N" "$TOTAL" "$1"; }
 ok()   { printf '      [OK] %s\n' "$1"; }
@@ -173,6 +177,37 @@ start_backend() {
   return 1
 }
 
+serve_web() {
+  # Start the React web UI (Vite dev server) and wait until :5173 actually answers.
+  if ! command -v npm >/dev/null 2>&1; then
+    warn "npm not found — skipping the web UI (API + desktop client still available)."
+    return 1
+  fi
+  if [ ! -d "$WEB_DIR/node_modules" ]; then
+    printf '      Installing web deps (npm install) ...\n'
+    ( cd "$WEB_DIR" && npm install ) || warn "npm install failed."
+  fi
+  if curl -fsS --max-time 3 "http://localhost:$WEB_PORT/" >/dev/null 2>&1; then
+    ok "Web UI already serving at http://localhost:$WEB_PORT."
+    return 0
+  fi
+  printf '      Starting Vite dev server ...\n'
+  ( cd "$WEB_DIR" && nohup npm run dev >"$REPO_ROOT/$WEB_LOG" 2>&1 & )
+  printf '      Waiting for the web UI'
+  for _ in $(seq 1 30); do
+    if curl -fsS --max-time 2 "http://localhost:$WEB_PORT/" >/dev/null 2>&1; then
+      echo
+      ok "Web UI serving at http://localhost:$WEB_PORT (log: $WEB_LOG)."
+      return 0
+    fi
+    printf '.'
+    sleep 1
+  done
+  echo
+  warn "Web UI did not become reachable. See $WEB_LOG."
+  return 1
+}
+
 # ── main flow ──────────────────────────────────────────────────────────────────
 echo "=============================================="
 echo "  DeepDive launcher (Windows desktop)"
@@ -181,7 +216,7 @@ echo "=============================================="
 step "Checking backend at $BACKEND_URL"
 if backend_up; then
   ok "Backend already running."
-  N=$((TOTAL - 1))   # steps 2-6 skipped — only the launch step remains
+  N=$((TOTAL - 2))   # steps 2-6 skipped — web + desktop launch remain
 else
   step "Checking Docker"
   ensure_docker || true
@@ -197,6 +232,9 @@ else
     verify_admin_login || true
   fi
 fi
+
+step "Serving the React web UI"
+serve_web || true
 
 step "Launching desktop workbench"
 if [ ! -d "$DESKTOP_DIR/node_modules" ]; then

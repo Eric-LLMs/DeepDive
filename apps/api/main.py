@@ -76,6 +76,7 @@ from core.config import settings
 from core.infrastructure.billing import (
     compute_cost,
     deduct,
+    get_balance,
     get_model_prices,
     list_transactions,
     topup,
@@ -351,16 +352,18 @@ async def _user_banned_from(session, user_id: UUID | None, credential_id: UUID) 
 
 async def _resolve_chat_route(
     session, token: LoginTokenModel | None, role_id: str
-) -> tuple[str, str, str, str]:
-    """Resolve ``(base_url, api_key, provider_model, business_name)`` for one chat request.
+) -> tuple[str, str, str, str, UUID | None]:
+    """Resolve ``(base_url, api_key, provider_model, business_name, credential_id)``.
 
     ``token`` carries the channel pinned at login when present; ``role_id`` is the effective
     role (the user's role, or ``anonymous`` for guests). ``provider_model`` is the real model
-    id sent upstream; ``business_name`` is the catalog display name used for billing/usage.
+    id sent upstream; ``business_name`` is the catalog display name used for billing/usage;
+    ``credential_id`` is the serving channel (None when no channel resolved — recorded on the
+    usage log so the admin can aggregate cost per channel).
 
     - A pinned channel that is still active and not banned for the user is used directly;
-      the model is the channel's preferred active route, else the role's ``default_model``,
-      else the global default.
+      the model is the role's ``default_model``, else the channel's preferred active route,
+      else the first active catalog model.
     - A pinned channel that was disabled (credential-level, or a user-level Tokens ban on
       that key) fails over to another active channel of the same role the user is not banned
       from.
@@ -381,13 +384,13 @@ async def _resolve_chat_route(
                 return await _channel_route(session, credential, role_id)
         business = await _fallback_model(session, role_id)
         provider = await _provider_model_name(session, business) if business else ""
-        return "", "", provider, business
+        return "", "", provider, business, None
     picked = await _pick_credential(session, role_id, user_id)
     if picked is not None:
         credential = await session.get(LLMCredentialModel, picked)
         if credential is not None:
             return await _channel_route(session, credential, role_id)
-    return "", "", "", ""
+    return "", "", "", "", None
 
 
 async def _provider_model_name(session, display_name: str) -> str:
@@ -440,14 +443,15 @@ async def _fallback_model(session, role_id: str | None = None) -> str:
 
 async def _channel_route(
     session, credential: LLMCredentialModel, role_id: str | None
-) -> tuple[str, str, str, str]:
-    """Return ``(base_url, api_key, provider_model, business_name)`` for a credential.
+) -> tuple[str, str, str, str, UUID | None]:
+    """Return ``(base_url, api_key, provider_model, business_name, credential_id)``.
 
     The model is resolved to the role's ``default_model`` (a catalog display name) when set,
-    else the credential's preferred active route's catalog entry, else the legacy global
-    default. ``provider_model`` is that display name mapped to the provider's real id — the
-    name sent upstream; ``business_name`` is the catalog display name, used for billing and
-    usage stats. A route's ``note`` is a purpose label only.
+    else the credential's preferred active route's catalog entry, else the first active
+    catalog model. ``provider_model`` is that display name mapped to the provider's real id —
+    the name sent upstream; ``business_name`` is the catalog display name, used for billing
+    and usage stats. ``credential_id`` is the serving channel (recorded on the usage log).
+    A route's ``note`` is a purpose label only.
     """
     business = ""
     if role_id:
@@ -473,7 +477,7 @@ async def _channel_route(
     if not business:
         business = await _fallback_model(session, role_id)
     provider = await _provider_model_name(session, business)
-    return credential.base_url, credential.api_key, provider or business, business
+    return credential.base_url, credential.api_key, provider or business, business, credential.id
 
 
 def _login_expiry() -> datetime:
@@ -574,6 +578,43 @@ async def auth_me(user: AuthUser = Depends(require_user)) -> dict:
         "role_name": role.role_name if role else user.role.role_id,
         "quota": role_to_dict(user.role),
     }
+
+
+@app.get("/auth/usage")
+async def auth_usage(
+    start: str | None = None,   # ISO date/datetime — logs from this moment (inclusive)
+    end: str | None = None,     # ISO date/datetime — logs until this moment (inclusive)
+    model: str | None = None,   # fuzzy match on model_name
+    limit: int = 20,            # logs per page
+    offset: int = 0,
+    user: AuthUser = Depends(require_user),
+) -> dict:
+    """Return the signed-in user's own balance, daily counters, usage logs, and ledger.
+
+    Mirrors the admin ``/admin/users/{id}/usage`` shape, but the user_id is always the
+    caller's own — a user can never query anyone else's data.
+    """
+    async with SessionLocal() as session:
+        balance = await get_balance(session, user.user_id)
+        wallet = await session.get(UserWalletModel, user.user_id)
+        report = await _usage_report(session, user.user_id, start, end, model, limit, offset)
+    report["balance"] = float(balance)
+    report["currency"] = wallet.currency if wallet else "USD"
+    return report
+
+
+@app.get("/auth/models")
+async def auth_models(user: AuthUser = Depends(require_user)) -> dict:
+    """Return the model catalog so a user can inspect any model they used in the UI.
+
+    Read-only, no sensitive data — reuses the same masked shape as the admin
+    ``/admin/models`` endpoint, so regular users see only display fields + prices.
+    """
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(select(LLMModelModel).order_by(LLMModelModel.created_at))
+        ).scalars().all()
+    return {"models": [_masked_model(m) for m in rows]}
 
 
 # ── Registration / email verification / password reset / profile ──
@@ -1501,13 +1542,13 @@ async def test_chat(body: ChatTestRequest, _: AuthAdmin = Depends(require_admin)
                 raise HTTPException(status_code=404, detail="Credential not found")
             if not cred.is_active:
                 return {"ok": False, "route": None, "error": "该渠道已被停用,请先启用。"}
-            base_url, api_key, model, business_name = await _channel_route(session, cred, role_id)
+            base_url, api_key, model, business_name, credential_id = await _channel_route(session, cred, role_id)
         else:
-            base_url, api_key, model, business_name = await _resolve_chat_route(session, token, role_id)
+            base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, token, role_id)
             if user is not None and not base_url and not api_key:
                 degraded = True
                 role_id = "anonymous"
-                base_url, api_key, model, business_name = await _resolve_chat_route(session, None, role_id)
+                base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, None, role_id)
         prompt_price, completion_price = await get_model_prices(session, business_name)
 
     route = {
@@ -1515,6 +1556,7 @@ async def test_chat(body: ChatTestRequest, _: AuthAdmin = Depends(require_admin)
         "base_url": base_url,
         "model": model,                              # real provider model id sent upstream
         "business_name": business_name,              # catalog display name used for billing
+        "credential_id": str(credential_id) if credential_id else None,
         "prompt_price_per_1k": str(prompt_price),
         "completion_price_per_1k": str(completion_price),
         "degraded_to_anonymous": degraded,
@@ -1830,20 +1872,15 @@ async def wallet_transactions(user_id: UUID, _: AuthAdmin = Depends(require_admi
     }
 
 
-@app.get("/admin/users/{user_id}/usage")
-async def user_usage(
-    user_id: UUID,
-    start: str | None = None,   # ISO date/datetime — logs from this moment (inclusive)
-    end: str | None = None,     # ISO date/datetime — logs until this moment (inclusive)
-    model: str | None = None,   # fuzzy match on model_name
-    limit: int = 20,            # logs per page
-    offset: int = 0,
-    _: AuthAdmin = Depends(require_admin),
+async def _usage_report(
+    session, user_id: UUID, start: str | None, end: str | None,
+    model: str | None, limit: int, offset: int,
 ) -> dict:
-    """Aggregate a user's daily counters, usage logs, and wallet ledger.
+    """Aggregate one user's daily counters, usage logs, and wallet ledger.
 
-    Usage logs are **paginated and filterable server-side** (start/end date, fuzzy model
-    name) so the admin can page through the full history instead of a fixed latest-50.
+    Shared by the admin ``/admin/users/{id}/usage`` and the self-service ``/auth/usage``
+    endpoints. Usage logs are paginated and filterable server-side (start/end date,
+    fuzzy model name).
     """
 
     def _dt(s: str | None, *, end_of_day: bool) -> datetime | None:
@@ -1867,43 +1904,45 @@ async def user_usage(
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
 
-    async with SessionLocal() as session:
-        user = await session.get(UserModel, user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found")
-        counters = (
-            await session.execute(
-                select(UserUsageCounterModel)
-                .where(
-                    UserUsageCounterModel.user_id == user_id,
-                    UserUsageCounterModel.period_type == "day",
-                )
-                .order_by(UserUsageCounterModel.period_start.desc())
-                .limit(30)
+    counters = (
+        await session.execute(
+            select(UserUsageCounterModel)
+            .where(
+                UserUsageCounterModel.user_id == user_id,
+                UserUsageCounterModel.period_type == "day",
             )
+            .order_by(UserUsageCounterModel.period_start.desc())
+            .limit(30)
+        )
+    ).scalars().all()
+    log_filters = [UserUsageLogModel.user_id == user_id]
+    if start_dt is not None:
+        log_filters.append(UserUsageLogModel.created_at >= start_dt)
+    if end_dt is not None:
+        log_filters.append(UserUsageLogModel.created_at <= end_dt)
+    if model:
+        log_filters.append(UserUsageLogModel.model_name.ilike(f"%{model}%"))
+    total = (
+        await session.execute(
+            select(func.count()).select_from(UserUsageLogModel).where(*log_filters)
+        )
+    ).scalar_one()
+    logs = (
+        await session.execute(
+            select(UserUsageLogModel)
+            .where(*log_filters)
+            .order_by(UserUsageLogModel.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).scalars().all()
+    txs = await list_transactions(session, user_id, limit=50)
+    cred_names = {
+        c.id: c.name
+        for c in (
+            await session.execute(select(LLMCredentialModel))
         ).scalars().all()
-        log_filters = [UserUsageLogModel.user_id == user_id]
-        if start_dt is not None:
-            log_filters.append(UserUsageLogModel.created_at >= start_dt)
-        if end_dt is not None:
-            log_filters.append(UserUsageLogModel.created_at <= end_dt)
-        if model:
-            log_filters.append(UserUsageLogModel.model_name.ilike(f"%{model}%"))
-        total = (
-            await session.execute(
-                select(func.count()).select_from(UserUsageLogModel).where(*log_filters)
-            )
-        ).scalar_one()
-        logs = (
-            await session.execute(
-                select(UserUsageLogModel)
-                .where(*log_filters)
-                .order_by(UserUsageLogModel.created_at.desc())
-                .offset(offset)
-                .limit(limit)
-            )
-        ).scalars().all()
-        txs = await list_transactions(session, user_id, limit=50)
+    }
     return {
         "counters": [
             {
@@ -1919,6 +1958,8 @@ async def user_usage(
                 "created_at": l.created_at.isoformat() if l.created_at else None,
                 "token_id": str(l.token_id) if l.token_id else None,
                 "role_id": l.role_id,
+                "credential_id": str(l.credential_id) if l.credential_id else None,
+                "credential_name": cred_names.get(l.credential_id, "") if l.credential_id else "",
                 "model_name": l.model_name,
                 "tool": l.tool,
                 "prompt_tokens": l.prompt_tokens,
@@ -1941,6 +1982,82 @@ async def user_usage(
         ],
         "total": total,
     }
+
+
+@app.get("/admin/users/{user_id}/usage")
+async def user_usage(
+    user_id: UUID,
+    start: str | None = None,   # ISO date/datetime — logs from this moment (inclusive)
+    end: str | None = None,     # ISO date/datetime — logs until this moment (inclusive)
+    model: str | None = None,   # fuzzy match on model_name
+    limit: int = 20,            # logs per page
+    offset: int = 0,
+    _: AuthAdmin = Depends(require_admin),
+) -> dict:
+    """Aggregate a user's daily counters, usage logs, and wallet ledger (admin)."""
+    async with SessionLocal() as session:
+        user = await session.get(UserModel, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        return await _usage_report(session, user_id, start, end, model, limit, offset)
+
+
+@app.get("/admin/usage/by-channel")
+async def usage_by_channel(
+    start: str | None = None,
+    end: str | None = None,
+    _: AuthAdmin = Depends(require_admin),
+) -> dict:
+    """Aggregate usage cost per channel (credential) for the given date range.
+
+    Billing is always the catalog model price; this groups the recorded rows by the serving
+    channel so the admin can see how much ran through each provider key.
+    """
+
+    def _dt(s: str | None, *, end_of_day: bool) -> datetime | None:
+        if not s:
+            return None
+        s = s.strip()
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if end_of_day and len(s) == 10:
+            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return dt
+
+    start_dt = _dt(start, end_of_day=False)
+    end_dt = _dt(end, end_of_day=True)
+    async with SessionLocal() as session:
+        stmt = select(
+            UserUsageLogModel.credential_id,
+            func.count().label("request_count"),
+            func.coalesce(func.sum(UserUsageLogModel.total_tokens), 0).label("total_tokens"),
+            func.coalesce(func.sum(UserUsageLogModel.cost_usd), 0).label("total_cost"),
+        ).group_by(UserUsageLogModel.credential_id)
+        if start_dt is not None:
+            stmt = stmt.where(UserUsageLogModel.created_at >= start_dt)
+        if end_dt is not None:
+            stmt = stmt.where(UserUsageLogModel.created_at <= end_dt)
+        rows = (await session.execute(stmt)).all()
+        cred_names = {
+            c.id: c.name
+            for c in (await session.execute(select(LLMCredentialModel))).scalars().all()
+        }
+    channels = [
+        {
+            "credential_id": str(cid) if cid else None,
+            "credential_name": cred_names.get(cid, "") if cid else "",
+            "request_count": int(count),
+            "total_tokens": int(total_tokens),
+            "total_cost": float(total_cost),
+        }
+        for cid, count, total_tokens, total_cost in rows
+    ]
+    channels.sort(key=lambda c: c["total_cost"], reverse=True)
+    return {"channels": channels}
 
 
 async def _load_config() -> dict:
@@ -2457,12 +2574,18 @@ async def _guest_quota(redis, guest_id: UUID, detail: str | None = None) -> None
         )
 
 
-async def _log_usage(user: AuthUser, model: str, tool: str, usage: dict | None = None) -> None:
+async def _log_usage(
+    user: AuthUser, model: str, tool: str, usage: dict | None = None,
+    credential_id: UUID | None = None,
+) -> None:
     """Record one usage-log row, pricing it against the catalog and debiting the wallet.
 
     Billing is best-effort: if the user has no funds, the deduction is skipped (the request
     still succeeds) and the usage row is written with the real cost. This keeps PAYG from
     hard-blocking a request while the admin reviews balances.
+
+    The cost is always the catalog model price; ``credential_id`` only records which channel
+    served the request so the admin can aggregate cost per channel.
     """
     usage = usage or {}
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
@@ -2478,6 +2601,7 @@ async def _log_usage(user: AuthUser, model: str, tool: str, usage: dict | None =
                 user_id=user.user_id,
                 token_id=user.token_id,
                 role_id=user.role.role_id,
+                credential_id=credential_id,
                 model_name=model,
                 tool=tool,
                 prompt_tokens=prompt_tokens,
@@ -2518,7 +2642,7 @@ async def chat(
             token = await session.get(LoginTokenModel, user.token_id)
             role_id = user.role.role_id
             log_user = user
-        base_url, api_key, model, business_name = await _resolve_chat_route(session, token, role_id)
+        base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, token, role_id)
         if user is not None and not base_url and not api_key:
             anon = await get_role(session, "anonymous")
             anon_limit = anon.daily_request_limit if anon is not None else settings.guest_daily_limit
@@ -2533,7 +2657,7 @@ async def chat(
                 f"你的渠道额度已用完,已按匿名用户身份继续使用({limit_txt})。"
                 "如需更多额度,请充值或升级套餐。"
             )
-            base_url, api_key, model, business_name = await _resolve_chat_route(session, None, role_id)
+            base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, None, role_id)
         elif user is not None:
             await check_quota(session, user.user_id, user.role)
         # The anonymous tier has no channel either: do NOT fall back to the legacy global
@@ -2558,7 +2682,7 @@ async def chat(
     # close() (inside run) already flushed events; defer the expensive embed+summary work.
     await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
     if log_user is not None:
-        await _log_usage(log_user, business_name, "chat", result.usage)
+        await _log_usage(log_user, business_name, "chat", result.usage, credential_id=credential_id)
     resp = {
         "answer": result.final_answer,
         "messages": result.messages,
@@ -2605,7 +2729,7 @@ async def chat_stream(
     notice = None
     async with SessionLocal() as session:
         token = await session.get(LoginTokenModel, user.token_id)
-        base_url, api_key, model, business_name = await _resolve_chat_route(session, token, user.role.role_id)
+        base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, token, user.role.role_id)
         if not base_url and not api_key:
             anon = await get_role(session, "anonymous")
             anon_limit = anon.daily_request_limit if anon is not None else settings.guest_daily_limit
@@ -2614,7 +2738,7 @@ async def chat_stream(
                 request.app.state.redis, user.user_id,
                 detail="你的额度已用完,且匿名额度也已用完。请充值或升级套餐后继续使用。",
             )
-            base_url, api_key, model, business_name = await _resolve_chat_route(session, None, "anonymous")
+            base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, None, "anonymous")
             notice = (
                 f"你的渠道额度已用完,已按匿名用户身份继续使用({limit_txt})。"
                 "如需更多额度,请充值或升级套餐。"
@@ -2631,7 +2755,7 @@ async def chat_stream(
             detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
         )
     if log_user is not None:
-        await _log_usage(log_user, business_name, "chat_stream")
+        await _log_usage(log_user, business_name, "chat_stream", credential_id=credential_id)
 
     async def gen():
         if notice:

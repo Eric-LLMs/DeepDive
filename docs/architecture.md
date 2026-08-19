@@ -594,12 +594,20 @@ Fields below mirror the migration DDL exactly;
   (BIGINT), `updated_at`; PK `(user_id, period_type, period_start)`.
 - **user_usage_logs** — append-only per-call audit. Columns: `id` (UUID PK), `user_id` (UUID FK SET
   NULL), `token_id` (UUID FK → `login_tokens` SET NULL), `role_id` (TEXT, snapshot at call time),
-  `model_name` (TEXT), `tool` (TEXT), `prompt_tokens` / `completion_tokens` / `total_tokens` (INT,
-  default 0; total is denormalized for dashboards), `cost_usd` (NUMERIC(12,6)), `created_at`;
-  indexes on `(user_id, created_at)` and `(token_id, created_at)`.
+  `model_name` (TEXT), `credential_id` (UUID FK → `llm_credentials` SET NULL, from
+  `migrations/0003_usage_channel.sql` — **the channel that served this request**; records which
+  provider key ran the call), `tool` (TEXT), `prompt_tokens` / `completion_tokens` / `total_tokens`
+  (INT, default 0; total is denormalized for dashboards), `cost_usd` (NUMERIC(12,6)), `created_at`;
+  indexes on `(user_id, created_at)` and `(token_id, created_at)` (plus `credential_id` from 0003).
+  **The `cost_usd` is always the catalog `llm_models` price** for the served model; `credential_id`
+  only records *which channel* served it, so the admin can aggregate cost per channel (see the
+  `GET /admin/usage/by-channel` aggregation). A request with no usable channel (anonymous/legacy
+  fallback) logs `credential_id` NULL.
 - **llm_credentials** — a provider channel; **one row = one "token"/key** the admin manages.
   Columns: `id` (UUID PK), `name` (TEXT), `base_url` (TEXT), `api_key` (TEXT), `is_active` (BOOLEAN,
-  default true — the per-channel availability switch), `created_at`, `updated_at`. A channel's
+  default true — the per-channel availability switch), `created_at`, `updated_at`. `name` is a
+  **human label only — it has no routing or pricing semantics**: routing pins the row by `id`, and
+  pricing never reads a channel name. A channel's
   displayed price is derived from its `credential_models` routes (single model) or a price range
   (multiple models).
 - **llm_models** — model catalog with PAYG pricing. `name` (TEXT UNIQUE) is the display name
@@ -614,7 +622,10 @@ Fields below mirror the migration DDL exactly;
   `credential_id` (UUID FK CASCADE), `model_id` (UUID FK CASCADE), `note` (TEXT), `priority` (INT,
   lower = preferred), `weight` (INT, load-balance weight), `prompt_price_per_1k` /
   `completion_price_per_1k` (NUMERIC(12,6), NULL = inherit `llm_models` price), `is_active`; PK
-  `(credential_id, model_id)`. The source of each channel's model list and displayed price.
+  `(credential_id, model_id)`. The source of each channel's model list and displayed price. The
+  per-route price overrides are **display-only** — the admin console shows them, but billing never
+  reads them: **user charging always uses the `llm_models` catalog price**, no matter which channel
+  serves the request.
 - **user_wallets** — cash wallet, one row per user. Columns: `user_id` (UUID PK FK CASCADE),
   `balance` (NUMERIC(14,6), default 0), `currency` (TEXT, default `'USD'`), `updated_at`.
 - **wallet_transactions** — append-only ledger; `balance_after` is a snapshot, never recomputed.
@@ -658,9 +669,11 @@ Phase 2 — *at chat* (`_resolve_chat_route`, per request):
                                                         anonymous-role keys / legacy route
 ```
 
-The model served by the chosen channel is its preferred active route (`credential_models`,
-lowest `priority`), else the role's `default_model`, else the global default
-(`settings.llm_model`).
+The model served by the chosen channel is resolved in this order: the **role's `default_model`**
+(if the role sets one and the channel can serve it), else the channel's **preferred active route**
+(`credential_models`, lowest `priority`), else the **first active model** in the catalog
+(`llm_models.is_active`). There is no `settings.llm_model` global default anymore — that setting
+only survives as the legacy `/config` client default.
 
 **Where the pin lives** — `credential_id` is a column on the **`login_tokens` row** (the login
 credential), *not* on the chat `sessions` row. Every request presents the token (Bearer header);
@@ -705,8 +718,10 @@ End-to-end flow for one chat request:
    pinned — **login still succeeds**.
 2. Each chat request — `require_user` loads the `login_tokens` row, so `credential_id` comes along
    for free; the channel's `base_url` / `api_key` drive the model call (resolved per-request; the
-   shared client is never mutated), and the model is the channel's preferred active route, else
-   `role.default_model`, else the global default.
+   shared client is never mutated), and the model is the **role's `default_model`** (if set and
+   served), else the channel's preferred active route, else the first active catalog model. The
+   usage log records the served **model + channel** (`credential_id`), and billing stays the catalog
+   model price — the admin aggregates cost per channel via `GET /admin/usage/by-channel`.
 3. Pinned channel disabled (credential-level `is_active`, or a per-user Tokens ban on that key —
    its `access_tokens` grant is off) → fail over to another active channel of the same role the user
    is not banned from. An `admin` / legacy token without `credential_id` uses the legacy `/config`

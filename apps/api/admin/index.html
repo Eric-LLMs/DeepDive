@@ -1939,7 +1939,9 @@
             for (const u of filtered) {
               const row = el("tr");
               const who = el("div");
-              who.appendChild(el("div", "cell-main", u.username || "—"));
+              const un = el("span", "link", u.username || "—");
+              un.onclick = () => userDetails(u, { roles, balance: balanceOf[u.id] });
+              who.appendChild(un);
               if (u.display_name) who.appendChild(el("div", "cell-sub", u.display_name));
               who.appendChild(el("div", "cell-sub", u.id.slice(0, 8) + "…"));
               row.appendChild(td(who));
@@ -2121,6 +2123,33 @@
             body.appendChild(wrap);
           }
 
+          // cost by channel — aggregate cost per serving credential (all time)
+          body.appendChild(el("div", "section-title", "Cost by channel"));
+          const bcBox = el("div");
+          bcBox.innerHTML = '<div class="loading">Loading…</div>';
+          body.appendChild(bcBox);
+          (async () => {
+            try {
+              const d = await apiFetch("/admin/usage/by-channel");
+              const chans = d.channels || [];
+              bcBox.innerHTML = "";
+              if (!chans.length) {
+                bcBox.appendChild(emptyState("No usage yet."));
+              } else {
+                const { wrap, tbody } = table(["Channel", "Requests", "Tokens", "Cost"]);
+                for (const c of chans) {
+                  const row = el("tr");
+                  row.appendChild(td(c.credential_name || el("span", "muted", "Unknown channel")));
+                  row.appendChild(td(String(c.request_count)));
+                  row.appendChild(td(String(c.total_tokens)));
+                  row.appendChild(td(fmtMoney(c.total_cost)));
+                  tbody.appendChild(row);
+                }
+                bcBox.appendChild(wrap);
+              }
+            } catch (e) { bcBox.innerHTML = ""; bcBox.appendChild(errBox(e)); }
+          })();
+
           // transactions
           const txs = usage.transactions || [];
           if (txs.length) {
@@ -2174,7 +2203,7 @@
             if (!logs.length) {
               lres.appendChild(emptyState(total ? "No logs match." : "No usage logs yet."));
             } else {
-              const { wrap, tbody } = table(["When", "Channel model name", "Tool", "Tokens", "Cost"]);
+              const { wrap, tbody } = table(["When", "Channel model name", "Channel", "Tool", "Tokens", "Cost"]);
               for (const l of logs) {
                 const row = el("tr");
                 row.appendChild(td(el("span", "muted", fmtDate(l.created_at))));
@@ -2196,6 +2225,7 @@
                   mCell.appendChild(el("span", "muted", "—"));
                 }
                 row.appendChild(mCell);
+                row.appendChild(td(l.credential_name ? el("span", "muted", l.credential_name) : el("span", "muted", "—")));
                 row.appendChild(td(l.tool || "—"));
                 row.appendChild(td(String(l.total_tokens ?? (l.prompt_tokens + " / " + l.completion_tokens))));
                 row.appendChild(td(fmtMoney(l.cost_usd)));
