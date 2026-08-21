@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 import { api, clearToken, getToken, setToken, type AuthActionResponse } from "./api";
+import CloudDrive from "./CloudDrive";
 import MicRecorder from "./MicRecorder";
 import { useJob } from "./useJob";
 import type { Domain, Me, Model, Sentence, Term, UsageReport } from "./types";
 
 type Page = "home" | "import" | "study" | "manage";
+type Tab = "learn" | "me" | "drive";
 
 type AuthState =
   | { status: "loading" }
@@ -55,7 +57,9 @@ export default function App() {
   const [auth, setAuth] = useState<AuthState>({ status: "loading" });
   const [page, setPage] = useState<Page>("home");
   const [profileOpen, setProfileOpen] = useState(false);
-  const [tab, setTab] = useState<"learn" | "me">("learn");
+  // The desktop client deep-links to the drive via ?sso=<token>#drive; the hash is
+  // preserved through the SSO handoff below so we land on the Cloud Drive tab.
+  const [tab, setTab] = useState<Tab>(() => (location.hash === "#drive" ? "drive" : "learn"));
 
   useEffect(() => {
     // SSO handoff from the desktop client: ?sso=<token>. Store it, then drop the
@@ -63,9 +67,21 @@ export default function App() {
     const sso = new URLSearchParams(location.search).get("sso");
     if (sso) {
       setToken(sso);
-      history.replaceState({}, "", location.pathname);
+      history.replaceState({}, "", location.pathname + location.hash);
     }
     (async () => {
+      // The desktop hands over its API token via ?sso=; exchange it for a stateless
+      // console session (cc_) so a later desktop re-login — which rotates the API
+      // token — does not invalidate this tab. Already-console tokens pass through.
+      if (getToken() && !getToken()!.startsWith("cc_")) {
+        try {
+          const session = await api.exchangeSession();
+          setToken(session.access_token);
+        } catch {
+          // Exchange may 401 (helper clears the token) or fail transiently; either way
+          // the /auth/me call below validates whatever remains.
+        }
+      }
       if (!getToken()) {
         setAuth({ status: "anon" });
         return;
@@ -99,6 +115,9 @@ export default function App() {
         <button className={tab === "learn" ? "tab active" : "tab"} onClick={() => setTab("learn")}>
           Learning Platform
         </button>
+        <button className={tab === "drive" ? "tab active" : "tab"} onClick={() => setTab("drive")}>
+          ☁️ Cloud Drive
+        </button>
         <button className={tab === "me" ? "tab active" : "tab"} onClick={() => setTab("me")}>
           My Account
         </button>
@@ -124,10 +143,16 @@ export default function App() {
             />
           )}
         </div>
-      ) : (
+      ) : tab === "me" ? (
         <div className="layout" style={{ flex: 1, minHeight: 0 }}>
           <main className="content" style={{ paddingTop: 32 }}>
             <MyAccount user={auth.user} />
+          </main>
+        </div>
+      ) : (
+        <div className="layout" style={{ flex: 1, minHeight: 0 }}>
+          <main className="content" style={{ paddingTop: 32 }}>
+            <CloudDrive />
           </main>
         </div>
       )}
@@ -165,7 +190,7 @@ function SettingsMenu() {
     <div className="settings-wrap">
       {open && <div className="settings-backdrop" onClick={() => setOpen(false)} />}
       <button className="header-btn header-menu" title="Settings" onClick={() => setOpen((o) => !o)}>
-        ⚙
+        ⚙ Settings
       </button>
       {open && (
         <div className="settings-pop">
@@ -224,7 +249,9 @@ function LoginPage({ onLogin }: { onLogin: (me: Me) => void }) {
     setBusy(true);
     setError("");
     try {
-      const res = await api.login(username.trim(), password);
+      // Stateless console session (cc_): survives desktop re-logins, unlike the dd_
+      // API token that /auth/login mints and the next login rotates away.
+      const res = await api.sessionLogin(username.trim(), password);
       setToken(res.access_token);
       onLogin(await api.me());
     } catch (err) {

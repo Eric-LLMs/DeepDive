@@ -14,6 +14,7 @@ class Domain(BaseModel):
 
     id: UUID | None = None
     name: str
+    user_id: UUID | None = None  # NULL = public/shared; otherwise private to the owner
     created_at: datetime | None = None
 
 
@@ -22,6 +23,7 @@ class Term(BaseModel):
 
     id: UUID | None = None
     domain_id: UUID
+    user_id: UUID | None = None  # NULL = public; mirrors the owning domain's owner
     word: str
     definition: str | None = None
     frequency: int = 1
@@ -36,6 +38,7 @@ class Sentence(BaseModel):
 
     id: UUID | None = None
     domain_id: UUID
+    user_id: UUID | None = None  # NULL = public; mirrors the owning domain's owner
     origin_source: str | None = None
     content_en: str
     content_cn: str | None = None
@@ -58,7 +61,7 @@ class Chunk(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID | None = None
-    material_id: UUID
+    asset_id: UUID
     seq: int
     content_en: str
     content_cn: str | None = None

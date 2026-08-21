@@ -6,11 +6,19 @@ from core.domain.models import Domain, Match, Sentence, Term
 
 
 class DomainRepository(Protocol):
-    async def add(self, name: str) -> Domain:
-        """Add a domain (returns the existing record on name conflict)."""
+    async def add(self, name: str, user_id: UUID | None = None) -> Domain:
+        """Add a domain (returns the existing record on a same-scope name conflict).
+
+        ``user_id`` None creates a public domain; a UUID creates a private one.
+        """
         ...
 
-    async def list_all(self) -> list[Domain]:
+    async def get(self, domain_id: UUID) -> Domain | None:
+        """Fetch a domain by id (None when missing)."""
+        ...
+
+    async def list_all(self, user_id: UUID | None = None) -> list[Domain]:
+        """List visible domains: public (NULL) plus the caller's own (when user_id given)."""
         ...
 
 
@@ -19,6 +27,9 @@ class TermRepository(Protocol):
         self, domain_id: UUID, word: str, definition: str = "", frequency: int = 1, star_level: int = 1
     ) -> Term:
         """Add a term (case-insensitive dedup within the same domain)."""
+        ...
+
+    async def get(self, term_id: UUID) -> Term | None:
         ...
 
     async def list_by_domain(self, domain_id: UUID, only_active: bool = False) -> list[Term]:
@@ -48,28 +59,36 @@ class TermRepository(Protocol):
 
 
 class SentenceRepository(Protocol):
-    async def add(self, domain_id: UUID, content_en: str) -> Sentence:
-        """Add a sentence (deduped by unique content_en)."""
+    async def add(self, domain_id: UUID, content_en: str, user_id: UUID | None = None) -> Sentence:
+        """Add a sentence (deduped by content_en within the caller's scope)."""
         ...
 
-    async def list_by_domain(self, domain_id: UUID) -> list[Sentence]:
+    async def get(self, sentence_id: UUID) -> Sentence | None:
         ...
 
-    async def bulk_add(self, domain_id: UUID, sentences: list[str]) -> tuple[int, int]:
-        """Bulk-add sentences (deduped by unique content_en); returns (added, skipped)."""
+    async def list_by_domain(self, domain_id: UUID, user_id: UUID | None = None) -> list[Sentence]:
+        ...
+
+    async def bulk_add(
+        self, domain_id: UUID, sentences: list[str], user_id: UUID | None = None
+    ) -> tuple[int, int]:
+        """Bulk-add sentences (deduped by content_en within scope); returns (added, skipped)."""
         ...
 
     async def update(self, sentence_id: UUID, content_cn: str | None = None, audio_hash: str | None = None) -> None:
         ...
 
-    async def search_by_text(self, domain_id: UUID, term_text: str) -> list[Sentence]:
+    async def search_by_text(
+        self, domain_id: UUID, term_text: str, user_id: UUID | None = None
+    ) -> list[Sentence]:
         ...
 
     async def set_embedding(self, sentence_id: UUID, embedding: list[float]) -> None:
         ...
 
     async def search_semantic(
-        self, domain_id: UUID, query_embedding: list[float], top_k: int = 10
+        self, domain_id: UUID, query_embedding: list[float], top_k: int = 10,
+        user_id: UUID | None = None,
     ) -> list[dict]:
         """Cosine-similarity search over sentence embeddings, returns [{...sentence, score}]."""
         ...

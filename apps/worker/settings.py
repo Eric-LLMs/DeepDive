@@ -41,6 +41,7 @@ class WorkerSettings:
         tasks.index_sentences,
         tasks.session_finalize,
         tasks.generate_media,
+        tasks.asset_ingest,
     ]
     on_startup = startup
     on_shutdown = shutdown

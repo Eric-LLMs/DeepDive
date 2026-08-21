@@ -34,16 +34,25 @@ SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=
 
 
 class Base(DeclarativeBase):
-    pass
+    # Eagerly fetch server-computed defaults (``server_default``/``onupdate`` like the
+    # ``updated_at = now()`` columns) via RETURNING, so committed instances keep their
+    # values and stay readable after the session closes instead of raising
+    # DetachedInstanceError. Inherited by every mapped subclass.
+    __mapper_args__ = {"eager_defaults": True}
 
 
 class DomainModel(Base):
+    """A vocabulary domain. ``user_id`` NULL = public/shared; otherwise private to the owner."""
+
     __tablename__ = "domains"
 
     id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    name: Mapped[str] = mapped_column(String, unique=True)
+    name: Mapped[str] = mapped_column(String)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -57,6 +66,9 @@ class TermModel(Base):
     )
     domain_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("domains.id", ondelete="CASCADE")
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
     )
     word: Mapped[str] = mapped_column(String, nullable=False)
     definition: Mapped[str | None] = mapped_column(Text)
@@ -76,8 +88,11 @@ class SentenceModel(Base):
     domain_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("domains.id", ondelete="CASCADE")
     )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
     origin_source: Mapped[str | None] = mapped_column(String)
-    content_en: Mapped[str] = mapped_column(Text, unique=True)
+    content_en: Mapped[str] = mapped_column(Text)
     content_cn: Mapped[str | None] = mapped_column(Text)
     audio_hash: Mapped[str | None] = mapped_column(String)
     cn_explanation: Mapped[str | None] = mapped_column(Text)
@@ -99,34 +114,209 @@ class MatchModel(Base):
     cn_explanation: Mapped[str | None] = mapped_column(Text)
 
 
-class MaterialModel(Base):
-    """Unified material: video / document / vocabulary domain are all one kind of learning material."""
+class GlobalObjectModel(Base):
+    """One physical file per unique SHA-256, shared across all users (dedup / instant upload)."""
 
-    __tablename__ = "materials"
+    __tablename__ = "global_objects"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
-    )
-    type: Mapped[str] = mapped_column(String, nullable=False)  # 'domain' | 'video' | 'document'
-    title: Mapped[str] = mapped_column(String, nullable=False)
-    source_url: Mapped[str | None] = mapped_column(String)
-    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+    sha256: Mapped[str] = mapped_column(String, primary_key=True)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    storage_key: Mapped[str] = mapped_column(String, nullable=False)
+    mime_type: Mapped[str | None] = mapped_column(String)
+    ref_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
 
 
+class WorkspaceModel(Base):
+    """User-owned group; membership (WorkspaceMemberModel) is the sharing mechanism."""
+
+    __tablename__ = "workspaces"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class WorkspaceMemberModel(Base):
+    __tablename__ = "workspace_members"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    role: Mapped[str] = mapped_column(String, nullable=False)  # 'owner' | 'editor' | 'viewer'
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class WorkspaceActivityModel(Base):
+    """Audit trail of drive mutations (file/folder/member/workspace changes).
+
+    Columns are denormalized and have NO foreign keys on purpose: an entry must survive
+    the deletion of the workspace, actor, or target it references. ``actor_username`` and
+    ``target_name`` are stored so entries stay readable and searchable after the rows they
+    describe are gone.
+    """
+
+    __tablename__ = "workspace_activity"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))  # NULL = My Drive
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))  # NULL = system
+    actor_username: Mapped[str | None] = mapped_column(String)
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    target_type: Mapped[str] = mapped_column(String, nullable=False)  # file | folder | member | workspace
+    target_id: Mapped[str | None] = mapped_column(String)
+    target_name: Mapped[str | None] = mapped_column(String)
+    detail: Mapped[str | None] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class FolderModel(Base):
+    """A folder within a workspace (or the personal drive when ``workspace_id`` NULL).
+
+    One row per folder path inside a scope; ``path`` is the full '/'-separated
+    relative path (e.g. ``"English/Vocab"``), so ancestors are implicit and no
+    parent FK is needed. ``user_id`` records the creator; in a shared workspace the
+    folder is visible to every member.
+    """
+
+    __tablename__ = "folders"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE")
+    )
+    path: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AssetModel(Base):
+    """A logical file owned by a user, pointing at a physical GlobalObjectModel.
+
+    ``file_status`` tracks upload/processing state; ``rag_status`` tracks the async
+    parse→chunk→embed pipeline. Deleting an asset only soft-deletes this row (and
+    decrements the object's ref_count); the physical bytes live until ref_count hits 0.
+    """
+
+    __tablename__ = "assets"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("workspaces.id")
+    )
+    object_sha256: Mapped[str | None] = mapped_column(
+        String, ForeignKey("global_objects.sha256")  # set once the upload completes
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    folder_path: Mapped[str | None] = mapped_column(String)
+    mime_type: Mapped[str | None] = mapped_column(String)
+    size: Mapped[int | None] = mapped_column(BigInteger)
+    file_status: Mapped[str] = mapped_column(String, nullable=False, default="uploading")
+    rag_status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AssetAclModel(Base):
+    """Asset-level sharing. ``grantee_user_id`` NULL = public link (anyone with access)."""
+
+    __tablename__ = "asset_acl"
+
+    asset_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("assets.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    grantee_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    permission: Mapped[str] = mapped_column(String, nullable=False)  # 'read' | 'write'
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class UploadSessionModel(Base):
+    """Chunked upload state: which chunks are received, so a client can resume."""
+
+    __tablename__ = "upload_sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    asset_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("assets.id", ondelete="CASCADE")
+    )
+    sha256: Mapped[str] = mapped_column(String, nullable=False)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chunk_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    num_chunks: Mapped[int] = mapped_column(Integer, nullable=False)
+    received_chunks: Mapped[list] = mapped_column(JSONB, default=list)  # bool array
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ChunkModel(Base):
-    """Unified text chunk (core abstraction: everything is a text chunk)."""
+    """RAG chunk belonging to an asset; denormalized user/workspace for filtered recall."""
 
     __tablename__ = "chunks"
 
     id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    material_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("materials.id", ondelete="CASCADE")
+    asset_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("assets.id", ondelete="CASCADE")
     )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
     content_en: Mapped[str] = mapped_column(Text, nullable=False)
     content_cn: Mapped[str | None] = mapped_column(Text)
@@ -507,6 +697,9 @@ class JobModel(Base):
         PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
     type: Mapped[str] = mapped_column(String, nullable=False)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
     status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
     result: Mapped[dict | None] = mapped_column(JSONB)

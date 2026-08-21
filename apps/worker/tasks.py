@@ -9,11 +9,18 @@ import asyncio
 from pathlib import Path
 from uuid import UUID
 
+from core.application.drive_service import READY
 from core.config import settings
 from core.infrastructure import media
+from core.infrastructure.drive_repositories import (
+    SqlAssetRepository,
+    SqlChunkRepository,
+)
+from core.infrastructure.ingest import extract_text, split_chunks
 from core.infrastructure.jobs import JobStore
 from core.infrastructure.memory import finalize_session
 from core.infrastructure.repositories import SqlSentenceRepository
+from core.infrastructure.storage import get_storage, object_key
 
 
 async def _run(ctx, job_id: str, work) -> dict:
@@ -134,3 +141,56 @@ async def generate_media(ctx, job_id: str, payload: dict) -> dict:
         return await asyncio.to_thread(_build_media, payload)
 
     return await _run(ctx, job_id, work())
+
+
+async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
+    """Parse, chunk, and embed a READY asset into the RAG corpus.
+
+    rag_status transitions: PARSING → CHUNKING → EMBEDDING → INDEXED (FAILED on error).
+    Chunks are fully rebuilt per asset (delete-by-asset + bulk insert), so re-ingesting
+    after a failure is idempotent.
+    """
+    asset_id = UUID(payload["asset_id"])
+    assets = SqlAssetRepository(ctx["session_factory"])
+
+    async def work() -> dict:
+        asset = await assets.get(asset_id)
+        if asset is None or asset.file_status != READY or not asset.object_sha256:
+            raise RuntimeError("asset not ready for ingest")
+        await assets.set_status(asset_id, rag_status="PARSING")
+
+        data = await get_storage().get(object_key(asset.object_sha256))
+        if data is None:
+            raise RuntimeError("object bytes missing from storage")
+
+        text = extract_text(data, asset.name)
+        await assets.set_status(asset_id, rag_status="CHUNKING")
+        chunks = split_chunks(text)
+
+        await assets.set_status(asset_id, rag_status="EMBEDDING")
+        embeddings: list[list[float]] = []
+        for i in range(0, len(chunks), settings.embed_batch_size):
+            batch = chunks[i : i + settings.embed_batch_size]
+            embeddings.extend(await ctx["embedder"].embed(batch))
+
+        chunks_repo = SqlChunkRepository(ctx["session_factory"])
+        await chunks_repo.delete_by_asset(asset_id)
+        await chunks_repo.bulk_insert(
+            asset_id,
+            asset.user_id,
+            asset.workspace_id,
+            [
+                (chunk, None, {"asset_id": str(asset_id), "seq": idx}, emb)
+                for idx, (chunk, emb) in enumerate(zip(chunks, embeddings))
+            ],
+        )
+        await assets.set_status(asset_id, rag_status="INDEXED")
+        return {"chunks": len(chunks)}
+
+    try:
+        return await _run(ctx, job_id, work())
+    except Exception:
+        # Keep the asset's rag_status in a terminal FAILED state so the UI can surface it
+        # even though the job row itself carries the failure detail.
+        await assets.set_status(asset_id, rag_status="FAILED")
+        raise

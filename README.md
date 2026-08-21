@@ -109,6 +109,16 @@ flowchart TB
 - **Pay-as-you-go billing**: per-model pricing (prompt/completion per 1k tokens), a cash wallet per user, and an append-only ledger with a `balance_after` snapshot. Chat usage is priced and debited atomically (always the catalog model price). Every usage log records the **serving channel** too, so the admin can aggregate cost per provider key.
 - **Guest access**: anonymous users can chat without an account, capped per day (`guest_daily_limit`, default 10); exceeding the cap prompts them to sign in.
 
+### ☁️ Cloud Drive (Personal & Shared File Storage)
+- **My Drive + shared workspaces**: every user gets a private **My Drive**, plus shared **workspaces** (owner / admin / editor / viewer roles) for team files. Files are stored in a per-user object store with **SHA-256 content-addressing**, so identical files deduplicate to a single physical blob (ref-counted, freed only when the last reference is purged).
+- **Instant upload & resumable chunks**: uploading an already-stored file short-circuits to **instant upload** (no bytes transferred); large files stream in **8 MB chunks** (`upload_sessions` tracks received chunks) with a progress bar and safe re-upload.
+- **First-class folders**: multi-level folders (`folders` rows with full `/`-paths) live side by side with files, and the file manager tree combines them. Create/rename/delete folders; renaming or deleting a folder rewrites the path prefix of every file and sub-folder beneath it.
+- **Move anywhere**: files move across workspaces / My Drive freely (drag-and-drop is the planned UX; the API + batch bar support it today).
+- **Fuzzy search with suggestions**: a client-side, case-insensitive fuzzy matcher (prefix > substring > folder-path > subsequence scoring) with a live suggestion dropdown; you can scope a search to a workspace or search all of My Drive.
+- **Trash & retention**: deleting a file moves it to the trash — bytes are kept (no ref-count release) until you **Restore**, **Delete permanently**, or **Empty Trash**. Trash auto-purges entries older than **30 days** (lazy sweep on list). Deleting a workspace trashes all its files and moves assets to My Drive trash.
+- **Sharing & permissions**: per-file ACLs — grant read/write to specific users or create a **public link** (shareable without an account). Visibility is computed with three channels (ownership, workspace membership, ACL) so owner/admin/editor/viewer each see exactly what they should.
+- **Member management & audit**: workspace owners/admin add/edit/remove members and grant the `admin` role (**only the owner** can grant admin/owner); every mutation is recorded in an append-only **activity log** (workspace members can read it; admin/owner manage it).
+
 ### 📥 Smart Data Ingestion
 - **Domain Management**: Organize your learning materials into isolated domains.
 - **Flexible Import**: Import vocabulary (with frequencies) and contextual sentences via CSV/Excel/TXT uploads or manual entry.
@@ -289,6 +299,12 @@ The default `admin` / `admin` account is seeded on first boot and ready to sign 
 | `SKILLS_DIR` | `data/skills` | `SKILL.md` skills directory (lazy-loaded via the `skill` tool) |
 | `WORKER_CONCURRENCY` / `WORKER_JOB_TIMEOUT` | `10` / `300` | arq worker max concurrent jobs / per-job timeout (seconds) |
 | `WEB_SEARCH_PROVIDER` / `WEB_SEARCH_API_KEY` / `WEB_SEARCH_ENGINE_ID` | `tavily` / `""` / `""` | web-search provider (`duckduckgo` \| `tavily` \| `bing` \| `google`) + API key + google engine id; normally managed in admin → **Tools config**, these flat keys mirror that namespace |
+| `OBJECT_STORE_ROOT` | `data/objects` | cloud-drive blob store root (SHA-256 content-addressed, ref-counted) |
+| `DRIVE_CHUNK_SIZE` | `8MB` | cloud-drive upload chunk size |
+| `DRIVE_MAX_CHUNKS` | `1024` | max chunks per upload session (cap on single-file size) |
+| `DRIVE_MAX_FILE_SIZE` | `0` (unlimited) | per-file size limit for the cloud drive (bytes; `0` = no limit) |
+| `INGEST_CHUNK_CHARS` / `INGEST_CHUNK_OVERLAP` | `1200` / `150` | text chunking window / overlap used when a cloud-drive file is ingested for RAG |
+| `EMBED_BATCH_SIZE` | `16` | embedding batch size for indexing cloud-drive files into pgvector |
 
 Model inference never runs inside the API process. LLM channels are managed in the admin
 console (Providers → Credentials); each is an OpenAI-compatible `base_url` + `api_key`, and a role

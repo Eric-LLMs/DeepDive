@@ -1,6 +1,7 @@
 """Keyword recall: tsvector full-text search (websearch_to_tsquery + ts_rank)."""
 from sqlalchemy import text
 
+from core.infrastructure.visibility import asset_visibility_sql
 from rag.recall.base import Recaller
 from rag.types import SearchHit
 
@@ -18,17 +19,24 @@ class KeywordRecaller(Recaller):
         top_k: int,
         filters: dict | None = None,
     ) -> list[SearchHit]:
-        where = "to_tsvector('english', content_en) @@ websearch_to_tsquery('english', :q)"
         params: dict = {"q": query, "limit": top_k}
-        if filters and filters.get("material_id"):
-            where += " AND material_id = :material_id"
-            params["material_id"] = filters["material_id"]
+        where = "to_tsvector('english', c.content_en) @@ websearch_to_tsquery('english', :q)"
+        # Tenant isolation: without a ``user_id`` filter the recall returns every asset's
+        # chunks (admin/global mode). With ``user_id`` present (possibly None for a guest)
+        # apply the owner / workspace / ACL visibility predicate, scoped to READY assets.
+        if filters and "user_id" in filters:
+            params["uid"] = filters["user_id"]
+            where += (
+                " AND a.file_status = 'READY'"
+                f" AND ({asset_visibility_sql(filters['user_id'], 'c')})"
+            )
 
         sql = f"""
-            SELECT id, content_en, meta,
-                   ts_rank(to_tsvector('english', content_en),
+            SELECT c.id, c.content_en, c.meta,
+                   ts_rank(to_tsvector('english', c.content_en),
                            websearch_to_tsquery('english', :q)) AS score
-            FROM chunks
+            FROM chunks c
+            JOIN assets a ON a.id = c.asset_id
             WHERE {where}
             ORDER BY score DESC
             LIMIT :limit

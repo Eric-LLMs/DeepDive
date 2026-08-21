@@ -22,6 +22,7 @@ from agent.memory.retrieval import RRFMemoryRetriever
 from agent.memory.service import MemoryService
 from agent.sandbox import Sandbox
 from api.tools import register_builtin_tools
+from core.application.drive_service import DriveService
 from core.application.services import VocabularyService
 from core.config import settings
 from core.infrastructure.db import SessionLocal
@@ -143,6 +144,15 @@ def get_vocab_service(session=Depends(get_session)) -> VocabularyService:
 
 def get_agent() -> AgentKernel:
     return _agent()
+
+
+@lru_cache
+def _drive_service() -> DriveService:
+    return DriveService(SessionLocal)
+
+
+def get_drive_service() -> DriveService:
+    return _drive_service()
 
 
 def get_task_queue(request: Request) -> TaskQueue:

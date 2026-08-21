@@ -581,6 +581,31 @@
     feedbackText.value = "";
   }
 
+  // Open the web console with a fresh stateless session token. SSO hands the desktop's
+  // API token to the browser, but that token is rotated out by the next login — exchange
+  // it for a signed cc_ console session first so the browser tab stays signed in.
+  async function openWebConsole(hash) {
+    closeUserMenu();
+    let session = state.token;
+    if (state.token) {
+      try {
+        const res = await fetch("/api/auth/session", {
+          method: "POST",
+          headers: authHeaders(),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.access_token) session = data.access_token;
+        }
+      } catch { /* keep the raw API token as a fallback */ }
+    }
+    openUrl(
+      session
+        ? `http://localhost:5173/?sso=${encodeURIComponent(session)}${hash}`
+        : `http://localhost:5173/${hash}`
+    );
+  }
+
   function handleUserAction(action) {
     switch (action) {
       case "profile":
@@ -588,16 +613,13 @@
         if (state.token) openProfile();
         else openAccount();
         break;
-      case "web-console": {
-        closeUserMenu();
-        // Single sign-on: hand the desktop session token to the web console so it
-        // auto-signs-in as the current PC user. Without a token it shows its login page.
-        const webUrl = state.token
-          ? `http://localhost:5173/?sso=${encodeURIComponent(state.token)}`
-          : "http://localhost:5173";
-        openUrl(webUrl);
+      case "web-console":
+        openWebConsole("");
         break;
-      }
+      case "cloud-drive":
+        // #drive selects the Cloud Drive tab once the console loads.
+        openWebConsole("#drive");
+        break;
       case "admin-console":
         closeUserMenu();
         if (state.roleId === "admin") openUrl("http://localhost:8300/admin");
@@ -609,7 +631,7 @@
         closeUserMenu();
         logout();
         break;
-      // cloud-drive / check-updates are disabled "Soon" items — no-op.
+      // check-updates is handled elsewhere; unknown actions are no-ops.
     }
   }
 
@@ -876,11 +898,6 @@
     } else {
       openAccount();
     }
-  });
-  const quickSettings = document.getElementById("quick-settings");
-  quickSettings.addEventListener("click", (e) => {
-    e.stopPropagation();
-    openSettingsModal();
   });
   userMenuItems.forEach((item) => {
     item.addEventListener("click", (e) => {

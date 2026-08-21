@@ -87,6 +87,15 @@ class Settings(BaseSettings):
     audio_cache_path: Path = Path("data/audio_cache")
     image_cache_path: Path = Path("data/image_cache")
 
+    # ── Cloud drive (per-user file store + shared RAG corpus) ──
+    object_store_root: Path = Path("data/objects")  # sharded physical object store
+    drive_chunk_size: int = 8 * 1024 * 1024         # default upload chunk size (bytes)
+    drive_max_chunks: int = 1024                    # max chunks per upload (8MB → 8GB)
+    drive_max_file_size: int = 0                    # max upload bytes, 0 = unlimited
+    ingest_chunk_chars: int = 1200                  # RAG chunk target length (chars)
+    ingest_chunk_overlap: int = 150                 # RAG chunk overlap (chars)
+    embed_batch_size: int = 16                      # embeddings per batch during ingest
+
     # ── Runtime config (legacy JSON file; imported into DB once on startup) ──
     config_path: Path = Path("data/config.json")
 

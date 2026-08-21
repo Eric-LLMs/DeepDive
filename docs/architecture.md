@@ -27,6 +27,7 @@
 | Admin console | single-file SPA at `/admin` with 5 modules (Providers / Roles / Users / Tokens / **Tools config**): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint). The **Tools config** module edits the generic `tools` namespace (web-search provider, SMTP, free-form key/value params) with a one-click *Test email*; the Chat Test user picker is a fuzzy-autocomplete text box |
 | Billing | `llm_models` (per-1k pricing) + `user_wallets` + `wallet_transactions` + `llm_credentials` + `credential_models`; cost calc + atomic wallet deduct |
 | Settings in DB | `app_settings` key/value JSONB (admin credential + LLM provider config + tiers + the generic `tools` namespace for web search / SMTP), written by the admin console |
+| Cloud drive | per-user My Drive + shared workspaces: `global_objects` (SHA-256 dedup, ref-counted physical store) + logical `assets` + first-class `folders` (per scope) + `workspace_members` roles + `asset_acl` sharing + chunked `upload_sessions` + RAG `chunks` + no-FK `workspace_activity` audit; trash with 30-day lazy retention; roles owner > admin > editor > viewer; full file manager in the web console (see §14) |
 | Guest access | anonymous chat via the `anonymous` role's channels, with per-day Redis limit (`guest_daily_limit`), 429 → prompt login |
 
 ### Designed, not yet implemented
@@ -755,3 +756,136 @@ request-time, and admin-only:
 | Read scaling | read replicas + pgBouncer connection pool |
 | Edge vs internal | external REST/SSE via Traefik ↔ internal gRPC |
 | Model scaling | separate model services (TEI/Kokoro/LiteLLM), independent scale-out |
+
+---
+
+## 14. Cloud Drive Module
+
+Every user gets a **My Drive** (personal scope) plus any number of **workspaces** (shared
+groups). A *file* is a logical **asset** that points at a physical, SHA-256-deduplicated
+**global object**; folders are first-class rows scoped to a workspace or the personal drive;
+the trash keeps soft-deleted assets for a retention window; and every mutation lands in a
+no-FK audit trail.
+
+Sources: `migrations/0004_drive_objects.sql`, `0006_folders.sql`, `0007_workspace_activity.sql`;
+`packages/core/application/drive_service.py` (service), `packages/core/infrastructure/drive_repositories.py`
+(SQL repos), `packages/core/infrastructure/visibility.py` (tenant predicate),
+`apps/api/routers/drive.py` (REST), `apps/web/src/CloudDrive.tsx` (file manager).
+
+### 14.1 Database
+
+| Table | Purpose |
+|------|------|
+| `global_objects` | One physical file per SHA-256 (primary key), shared across all users. `ref_count` = how many logical assets point at it; the bytes are freed when the count reaches 0. `storage_key` shards as `{root}/objects/{sha[0:2]}/{sha[2:4]}/{sha}`. |
+| `workspaces` | User-owned group (`owner_id`, `name`). Ownership is **not** a member row. |
+| `workspace_members` | `(workspace_id, user_id)` PK + `role` (`admin` / `editor` / `viewer`). Membership is the sharing mechanism. |
+| `folders` | One row per folder path inside a scope; `workspace_id` NULL = My Drive. `path` is the full `/`-separated relative path (`"English/Vocab"`), so ancestors are implicit — no parent FK. Uniqueness per scope via `folders_unique_ws` (partial) and `folders_unique_personal`. |
+| `assets` | Logical file: `user_id` (owner), nullable `workspace_id`, `object_sha256` → `global_objects`, `name`, `folder_path`, `file_status` (`uploading/processing/ready/deleted`), `rag_status` (`pending/parsing/chunking/embedding/indexed/failed`), `meta` JSONB, `deleted_at`. |
+| `asset_acl` | Asset-level sharing: `(asset_id, grantee_user_id)` PK; `grantee_user_id` NULL = public link (`asset_acl_public_uniq` unique partial index). `permission` = `read` / `write`. |
+| `upload_sessions` | Chunked-upload state: expected `sha256`, `size`, `chunk_size`, `num_chunks`, `received_chunks` (boolean array) → resumable uploads. |
+| `chunks` | RAG chunks rebuilt with denormalized `asset_id` / `user_id` / `workspace_id` for filtered recall; `embedding vector(1024)` with an HNSW index. |
+| `workspace_activity` | Audit trail: `workspace_id`, `actor_user_id` / `actor_username`, `action` (e.g. `file.create`, `member.add`), `target_type` / `target_id` / `target_name`, `detail`. **No foreign keys by design** — an entry survives the deletion of the workspace / user it references. |
+
+### 14.2 Core logic
+
+- **Upload lifecycle** — `init_upload` → `store_chunk` → `complete_upload` (plus `abort_upload`
+  and `chunk_status` for resume):
+  1. `init_upload` validates the SHA-256 / size and, for a workspace target, membership. If a
+     `global_objects` row already exists for the digest it **deduplicates** ("instant upload"):
+     `ref_count` is bumped and the asset is created `READY` immediately, no bytes are sent.
+     Otherwise an `upload_sessions` row is created with `chunk_size` (default 8 MB) and the
+     client uploads chunks.
+  2. `store_chunk` writes one chunk and flips its slot in `received_chunks`; `chunk_status`
+     returns the missing-chunk list so a client can resume after a drop.
+  3. `complete_upload` verifies every chunk is present, bumps `global_objects.ref_count`
+     (creating the physical object on first upload), marks the asset `READY`, and enqueues the
+     RAG ingest job.
+- **Physical dedup & ref-count** — deleting is a **soft delete**: the asset row keeps its
+  bytes, only `deleted_at` is set. `_purge_asset` decrements the object's `ref_count` and only
+  removes the physical bytes (and the `global_objects` row) when the count hits 0, so a
+  deduplicated file is freed exactly once. Order matters: the asset row is dropped *before* the
+  object row (FK `assets.object_sha256` → `global_objects`), with a CAS so a concurrent upload
+  that re-incremented is not clobbered.
+- **Folder semantics** — paths are full relative paths inside a scope; creating `English/Vocab`
+  also upserts the `English` ancestor. Rename / move are **prefix rewrites** on both
+  `folders.path` and `assets.folder_path` (`move_subtree`), so children follow automatically.
+- **Trash & retention** — `delete_asset` moves a file to the trash (soft delete only, no
+  ref-count change). Trash supports **restore** (to the original workspace, falling back to My
+  Drive if that workspace is gone or the user is no longer a member) and **purge** (hard delete
+  + ref-count drop). `list_trash` lazily **permanently deletes anything older than
+  `TRASH_RETENTION_DAYS` (30)** — no background sweeper.
+- **Workspace lifecycle** — deleting a workspace trashes every asset, nullifies their
+  `workspace_id` (so the `assets` FK does not block the drop), then removes the workspace row;
+  members and folders cascade. Trashed assets of a deleted workspace restore into My Drive.
+- **Audit trail** — every mutation calls `_log(...)` writing who / what / when / target. The
+  row has no FKs so it survives its subjects; the API lists it with actor/target fuzzy search,
+  date bounds, and pagination (admin / owner only).
+
+### 14.3 Permission management
+
+Three channels grant access to an asset (`asset_visible_expr` in
+`packages/core/infrastructure/visibility.py`, mirrored as raw SQL `asset_visibility_sql` for the
+RAG recallers):
+
+1. **Ownership** — `assets.user_id == me`.
+2. **Workspace visibility** — `assets.workspace_id` in the workspaces I own **or** am a member
+   of. The owner is *not* a `workspace_members` row, so the predicate unions owned workspaces
+   into the visible set — without this the owner would not see files uploaded by members.
+3. **Asset ACL** — a share row granting me, or a public link (`grantee_user_id IS NULL`).
+
+Workspace roles (**owner > admin > editor > viewer**), where owner is implicit in
+`workspaces.owner_id` and admin / editor / viewer are `workspace_members.role`:
+
+| Operation | viewer | editor | admin | owner |
+|---|---|---|---|---|
+| List / download / open | ✓ | ✓ | ✓ | ✓ |
+| Upload / edit / move / delete files; create / rename / delete folders | ✗ | ✓ | ✓ | ✓ |
+| Open the **Manage** page (Members + Activity Logs) | ✗ | ✗ | ✓ | ✓ |
+| Add, change role of, or remove **non-admin** members; view the log | ✗ | ✗ | ✓ | ✓ |
+| Assign the `admin` role; modify or remove an existing admin | ✗ | ✗ | ✗ | ✓ |
+| Rename / delete the **workspace** | ✗ | ✗ | ✗ | ✓ |
+
+My Drive and the Trash are personal: the user always has full access there. Write gating
+(`_can_write`) accepts owner / admin / editor or an ACL `write` grant; member-management and
+log endpoints use a *manager* gate (owner or admin) plus a role whitelist
+(`admin` / `editor` / `viewer`) and the owner-only rule for granting admin; workspace
+rename / delete stays owner-only. The frontend mirrors these rules and **disables** (grays
+out) buttons the current role may not press.
+
+### 14.4 REST surface
+
+The Vite dev proxy strips `/api`; the backend mounts the drive routers at the root.
+
+| Area | Endpoints |
+|------|-----------|
+| Workspaces | `GET/POST /workspaces`, `PATCH/DELETE /workspaces/{id}` (owner), `GET/POST /workspaces/{id}/members` (manager), `PATCH/DELETE /workspaces/{id}/members/{uid}` (manager; admin members owner-only), `GET /workspaces/{id}/activity` (manager) |
+| User lookup | `GET /users/search?q=` — resolve a username / user-id fragment to a UUID when adding members |
+| Files | `POST /files/init-upload`, `GET /files`, `GET /files/{id}`, `PUT /files/{id}/chunks/{i}`, `GET /files/{id}/chunks`, `POST /files/{id}/complete`, `POST /files/{id}/abort`, `GET /files/{id}/download`, `PATCH /files/{id}` (rename), `DELETE /files/{id}` (→ trash), `POST /files/{id}/move`, `POST /files/{id}/share`, `DELETE /files/{id}/share/{grantee}`, `GET /files/{id}/shares`, `GET /files/{id}/ingest-status` |
+| Folders | `GET/POST /folders`, `PATCH/DELETE /folders/{id}` |
+| Trash | `GET /trash`, `POST /trash/{id}/restore`, `DELETE /trash/{id}` (purge), `DELETE /trash` (empty) |
+
+### 14.5 Frontend
+
+`apps/web/src/CloudDrive.tsx` renders the file manager: a tree (**My Drive**, each workspace,
+and **🗑 Trash**), list and grid views with folder rows (double-click to enter), a file-name
+search with a scope dropdown (all files / a single workspace) and an autocomplete suggestion
+list, a chunked upload with progress, and modals for Move / Share / Rename / New folder /
+Manage. The **Manage** modal has two tabs — **Members** (role-aware dropdowns, add-by-name with
+autocomplete, remove) and **Activity Logs** (actor/target search, date range, pagination).
+Buttons are **disabled** (grayed) rather than hidden when the current user's role forbids the
+action, so the permission model stays visible without leaking state.
+
+### 14.6 Configuration
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `OBJECT_STORE_ROOT` | `data/objects` | root of the sharded physical object store |
+| `DRIVE_CHUNK_SIZE` | `8388608` (8 MB) | upload chunk size used by `init_upload` |
+| `DRIVE_MAX_CHUNKS` | `1024` | max chunks per upload (8 MB × 1024 ≈ 8 GB) |
+| `DRIVE_MAX_FILE_SIZE` | `0` (unlimited) | max upload bytes |
+| `INGEST_CHUNK_CHARS` | `1200` | RAG chunk target length (chars) |
+| `INGEST_CHUNK_OVERLAP` | `150` | RAG chunk overlap (chars) |
+| `EMBED_BATCH_SIZE` | `16` | embeddings per batch during ingest |
+
+Trash retention is a code constant — `TRASH_RETENTION_DAYS = 30` in `drive_service.py`,
+enforced lazily on `list_trash`.

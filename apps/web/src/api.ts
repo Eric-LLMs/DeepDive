@@ -1,6 +1,23 @@
 // Thin fetch wrapper around the DeepDive REST API.
 // In dev, Vite proxies /api/* to http://localhost:8300 (see vite.config.ts).
-import type { Domain, JobId, JobInfo, Me, Model, Sentence, Term, UsageReport } from "./types";
+import type {
+  Domain,
+  DriveFile,
+  DriveFolder,
+  InitUploadResult,
+  JobId,
+  JobInfo,
+  Me,
+  Model,
+  Sentence,
+  ShareEntry,
+  Term,
+  UsageReport,
+  Workspace,
+  WorkspaceActivity,
+  WorkspaceMember,
+  WorkspaceUser,
+} from "./types";
 
 const BASE = "/api";
 const TOKEN_KEY = "deepdive_token";
@@ -17,12 +34,14 @@ export function clearToken(): void {
   localStorage.removeItem(TOKEN_KEY);
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+function authHeaders(): Record<string, string> {
   const token = getToken();
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers,
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     ...init,
   });
   if (res.status === 401) clearToken();
@@ -30,16 +49,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
-// Variant for bodies the browser must encode itself (multipart FormData): no
-// Content-Type header, so fetch sets the correct multipart boundary.
+// Variant for bodies the browser must encode itself (multipart FormData / raw bytes):
+// no Content-Type header, so fetch sets the correct multipart boundary.
 async function requestRaw<T>(path: string, init?: RequestInit): Promise<T> {
-  const token = getToken();
-  const headers: Record<string, string> = {};
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(`${BASE}${path}`, { headers, ...init });
+  const res = await fetch(`${BASE}${path}`, { headers: authHeaders(), ...init });
   if (res.status === 401) clearToken();
   if (!res.ok) throw new Error(await errorMessage(res));
   return (await res.json()) as T;
+}
+
+// Download endpoint returns raw bytes (StreamingResponse), not JSON — fetch the blob
+// with the auth header so the caller can save or open it.
+async function downloadBlob(path: string): Promise<Blob> {
+  const res = await fetch(`${BASE}${path}`, { headers: authHeaders() });
+  if (res.status === 401) clearToken();
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return res.blob();
 }
 
 async function errorMessage(res: Response): Promise<string> {
@@ -70,11 +95,16 @@ export interface AuthActionResponse {
 
 export const api = {
   // Auth
-  login: (username: string, password: string) =>
-    request<LoginResponse>("/auth/login", {
+  // Stateless web-console sessions (cc_): unlike the /auth/login API token, which the
+  // next login rotates out, a console session survives desktop re-logins. The console
+  // signs in with sessionLogin and converts any hand-me-down API token (desktop SSO)
+  // into one on mount via exchangeSession.
+  sessionLogin: (username: string, password: string) =>
+    request<LoginResponse>("/auth/session-login", {
       method: "POST",
       body: JSON.stringify({ username, password }),
     }),
+  exchangeSession: () => request<LoginResponse>("/auth/session", { method: "POST" }),
   me: () => request<Me>("/auth/me"),
   register: (username: string, email: string, password: string, displayName?: string) =>
     request<AuthActionResponse>("/auth/register", {
@@ -223,4 +253,140 @@ export const api = {
 
   // Model catalog (for clicking a model name in the usage log to view its detail).
   models: () => request<{ models: Model[] }>("/auth/models"),
+
+  // ── Cloud drive: files ──
+  listFiles: () => request<{ files: DriveFile[] }>("/files"),
+  getFile: (assetId: string) => request<DriveFile>(`/files/${assetId}`),
+  initUpload: (body: {
+    sha256: string;
+    size: number;
+    name: string;
+    folder_path?: string | null;
+    mime_type?: string | null;
+    workspace_id?: string | null;
+  }) =>
+    request<InitUploadResult>("/files/init-upload", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  uploadChunk: (assetId: string, index: number, blob: Blob) =>
+    requestRaw<{ ok: boolean; index: number }>(`/files/${assetId}/chunks/${index}`, {
+      method: "PUT",
+      body: blob,
+    }),
+  chunkStatus: (assetId: string) =>
+    request<{ session_id: string; received: number[]; missing: number[]; chunk_size: number; num_chunks: number }>(
+      `/files/${assetId}/chunks`
+    ),
+  completeUpload: (assetId: string) =>
+    request<{ asset?: DriveFile | null; job_id?: string }>(`/files/${assetId}/complete`, {
+      method: "POST",
+    }),
+  abortUpload: (assetId: string) =>
+    request<{ aborted: boolean }>(`/files/${assetId}/abort`, { method: "POST" }),
+  deleteFile: (assetId: string) =>
+    request<{ deleted: boolean; physical_removed: boolean }>(`/files/${assetId}`, {
+      method: "DELETE",
+    }),
+  renameFile: (assetId: string, body: { name?: string; folder_path?: string | null }) =>
+    request<DriveFile>(`/files/${assetId}`, { method: "PATCH", body: JSON.stringify(body) }),
+  downloadFile: (assetId: string) => downloadBlob(`/files/${assetId}/download`),
+  ingestStatus: (assetId: string) =>
+    request<{ asset_id: string; file_status: string; rag_status: string }>(
+      `/files/${assetId}/ingest-status`
+    ),
+  moveFile: (assetId: string, body: { workspace_id?: string | null; folder_path: string | null }) =>
+    request<DriveFile>(`/files/${assetId}/move`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // ── Cloud drive: folders ──
+  listFolders: () => request<{ folders: DriveFolder[] }>("/folders"),
+  createFolder: (body: {
+    name: string;
+    parent_path?: string | null;
+    workspace_id?: string | null;
+  }) =>
+    request<DriveFolder>("/folders", { method: "POST", body: JSON.stringify(body) }),
+  renameFolder: (folderId: string, body: { name: string }) =>
+    request<DriveFolder>(`/folders/${folderId}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteFolder: (folderId: string) =>
+    request<{ deleted: boolean; folder_id: string }>(`/folders/${folderId}`, {
+      method: "DELETE",
+    }),
+
+  // ── Cloud drive: trash ──
+  listTrash: () => request<{ files: DriveFile[] }>("/trash"),
+  restoreTrash: (assetId: string) =>
+    request<DriveFile>(`/trash/${assetId}/restore`, { method: "POST" }),
+  purgeTrash: (assetId: string) =>
+    request<{ purged: boolean; physical_removed: boolean }>(`/trash/${assetId}`, {
+      method: "DELETE",
+    }),
+  emptyTrash: () => request<{ purged: number }>("/trash", { method: "DELETE" }),
+
+  // ── Cloud drive: sharing ──
+  shareFile: (assetId: string, body: { grantee_user_id?: string | null; permission: string }) =>
+    request<{ asset_id: string; grantee_user_id: string | null; permission: string }>(
+      `/files/${assetId}/share`,
+      { method: "POST", body: JSON.stringify(body) }
+    ),
+  unshareFile: (assetId: string, grantee: string) =>
+    request<{ removed: boolean }>(`/files/${assetId}/share/${grantee}`, { method: "DELETE" }),
+  listShares: (assetId: string) =>
+    request<{ shares: ShareEntry[] }>(`/files/${assetId}/shares`),
+
+  // ── Cloud drive: workspaces + members ──
+  listWorkspaces: () => request<{ workspaces: Workspace[] }>("/workspaces"),
+  createWorkspace: (name: string) =>
+    request<Workspace>("/workspaces", { method: "POST", body: JSON.stringify({ name }) }),
+  renameWorkspace: (workspaceId: string, name: string) =>
+    request<{ id: string; name: string }>(`/workspaces/${workspaceId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name }),
+    }),
+  deleteWorkspace: (workspaceId: string) =>
+    request<{ deleted: boolean; workspace_id: string }>(`/workspaces/${workspaceId}`, {
+      method: "DELETE",
+    }),
+  listWorkspaceMembers: (workspaceId: string) =>
+    request<{ members: WorkspaceMember[] }>(`/workspaces/${workspaceId}/members`),
+  addWorkspaceMember: (workspaceId: string, body: { user_id: string; role: string }) =>
+    request<{ user_id: string; role: string }>(`/workspaces/${workspaceId}/members`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateWorkspaceMember: (workspaceId: string, memberId: string, role: string) =>
+    request<{ user_id: string; role: string }>(`/workspaces/${workspaceId}/members/${memberId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ role }),
+    }),
+  removeWorkspaceMember: (workspaceId: string, memberId: string) =>
+    request<{ removed: boolean }>(`/workspaces/${workspaceId}/members/${memberId}`, { method: "DELETE" }),
+
+  // Resolve a username / user-id fragment to users so members can be added by name.
+  searchUsers: (q: string, limit = 10) =>
+    request<{ users: WorkspaceUser[] }>(
+      `/users/search?q=${encodeURIComponent(q)}&limit=${limit}`,
+    ),
+
+  // Page the workspace audit trail; filters: fuzzy q (actor/target), start/end dates.
+  listWorkspaceActivity: (
+    workspaceId: string,
+    params: { q?: string; start?: string; end?: string; limit?: number; offset?: number },
+  ) => {
+    const sp = new URLSearchParams();
+    if (params.q) sp.set("q", params.q);
+    if (params.start) sp.set("start", params.start);
+    if (params.end) sp.set("end", params.end);
+    sp.set("limit", String(params.limit ?? 20));
+    sp.set("offset", String(params.offset ?? 0));
+    return request<{ total: number; items: WorkspaceActivity[] }>(
+      `/workspaces/${workspaceId}/activity?${sp.toString()}`,
+    );
+  },
 };

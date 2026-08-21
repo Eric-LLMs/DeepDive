@@ -5,7 +5,8 @@ import httpx
 from sqlalchemy import select
 
 from core.config import settings
-from core.infrastructure.db import ChunkModel
+from core.infrastructure.db import AssetModel, ChunkModel
+from core.infrastructure.visibility import asset_visible_expr
 
 
 class TEIEmbedder:
@@ -39,7 +40,9 @@ class PgVectorStore:
             for id_, text, emb, m in zip(ids, texts, embeddings, meta):
                 obj = ChunkModel(
                     id=uuid.UUID(id_),
-                    material_id=uuid.UUID(m["material_id"]),
+                    asset_id=uuid.UUID(m["asset_id"]),
+                    user_id=uuid.UUID(m["user_id"]) if m.get("user_id") else None,
+                    workspace_id=uuid.UUID(m["workspace_id"]) if m.get("workspace_id") else None,
                     seq=m.get("seq", 0),
                     content_en=text,
                     content_cn=m.get("content_cn"),
@@ -64,8 +67,16 @@ class PgVectorStore:
                 .order_by(ChunkModel.embedding.cosine_distance(query_embedding))
                 .limit(top_k)
             )
-            if filters and filters.get("material_id"):
-                stmt = stmt.where(ChunkModel.material_id == filters["material_id"])
+            # Tenant isolation: same predicate as keyword recall — owner / workspace / ACL
+            # over READY assets. ``user_id`` None (guest) resolves to public-link assets.
+            if filters and "user_id" in filters:
+                stmt = (
+                    stmt.join(AssetModel, AssetModel.id == ChunkModel.asset_id)
+                    .where(
+                        AssetModel.file_status == "READY",
+                        asset_visible_expr(filters["user_id"]),
+                    )
+                )
             rows = (await session.execute(stmt)).all()
             return [
                 {"id": str(r.id), "text": r.content_en, "score": float(r.score), "meta": r.meta}

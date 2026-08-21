@@ -25,6 +25,7 @@ ANALYZE_SYNTAX = "analyze_syntax"
 INDEX_SENTENCES = "index_sentences"
 SESSION_FINALIZE = "session_finalize"
 GENERATE_MEDIA = "generate_media"
+ASSET_INGEST = "asset_ingest"
 
 # Job status values.
 QUEUED = "queued"
@@ -39,9 +40,11 @@ class JobStore:
     def __init__(self, session_factory) -> None:
         self.session_factory = session_factory
 
-    async def create(self, type_: str, payload: dict) -> JobModel:
+    async def create(
+        self, type_: str, payload: dict, user_id: uuid.UUID | None = None
+    ) -> JobModel:
         async with self.session_factory() as session:
-            job = JobModel(type=type_, status=QUEUED, payload=payload)
+            job = JobModel(type=type_, status=QUEUED, payload=payload, user_id=user_id)
             session.add(job)
             await session.commit()
             await session.refresh(job)
@@ -85,8 +88,10 @@ class TaskQueue:
         self.redis = redis
         self.job_store = job_store
 
-    async def enqueue(self, type_: str, payload: dict) -> uuid.UUID:
-        job = await self.job_store.create(type_, payload)
+    async def enqueue(
+        self, type_: str, payload: dict, user_id: uuid.UUID | None = None
+    ) -> uuid.UUID:
+        job = await self.job_store.create(type_, payload, user_id=user_id)
         # arq resolves `type_` against WorkerSettings.functions by name; job_id is passed
         # as a string so the worker can reconstruct the UUID regardless of serializer.
         await self.redis.enqueue_job(type_, str(job.id), payload)

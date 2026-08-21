@@ -108,3 +108,90 @@ export interface Model {
   is_active: boolean;
   created_at: string | null;
 }
+
+// ── Cloud drive (mirror the asset dicts from core.application.drive_service) ──
+export interface DriveFile {
+  id: string;
+  user_id: string;
+  workspace_id: string | null;
+  object_sha256: string | null;
+  name: string;
+  folder_path: string | null;
+  mime_type: string | null;
+  size: number;
+  file_status: string; // UPLOADING | PROCESSING | READY | DELETED
+  rag_status: string; // PENDING | PARSING | CHUNKING | EMBEDDING | INDEXED | FAILED
+  created_at: string | null;
+  updated_at: string | null;
+  deleted_at: string | null;
+}
+
+// First-class folder row (mirror core.application.drive_service._folder_dict).
+export interface DriveFolder {
+  id: string;
+  user_id: string;
+  workspace_id: string | null; // null = My Drive (personal)
+  name: string;
+  path: string; // full '/'-separated path within the workspace/personal scope
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface Workspace {
+  id: string;
+  name: string;
+  owner_id: string;
+  // The requesting user's role in this workspace: "owner" | "admin" | "editor" | "viewer".
+  // Drives which action buttons the web console enables.
+  role?: string;
+  owner_username?: string | null;
+  owner_display_name?: string | null;
+}
+
+// Workspace member row (mirrors GET /workspaces/{id}/members from apps/api/routers/drive.py).
+// The owner is NOT included — the frontend prepends the owner row from workspace.owner_id.
+export interface WorkspaceMember {
+  user_id: string;
+  role: string; // admin | editor | viewer
+  username: string | null;
+  display_name: string | null;
+}
+
+export interface ShareEntry {
+  grantee_user_id: string | null; // null = public link
+  permission: string; // read | write
+}
+
+// User found via GET /users/search (used to resolve a username to a UUID when adding
+// members — the /members endpoint requires a UUID, not a display name).
+export interface WorkspaceUser {
+  user_id: string;
+  username: string;
+  display_name: string | null;
+}
+
+// One row of the workspace audit trail (mirrors GET /workspaces/{id}/activity from
+// apps/api/routers/drive.py and core.application.drive_service._activity_dict).
+export interface WorkspaceActivity {
+  id: string;
+  workspace_id: string | null;
+  actor_user_id: string | null; // null = system (e.g. retention sweep)
+  actor_username: string | null;
+  action: string; // file.create / file.rename / member.add / workspace.delete ...
+  target_type: string; // file | folder | member | workspace
+  target_id: string | null;
+  target_name: string | null;
+  detail: string | null;
+  created_at: string | null;
+}
+
+export interface InitUploadResult {
+  status: "instant" | "uploading";
+  dedup?: boolean;
+  asset?: DriveFile;
+  asset_id?: string;
+  session_id?: string;
+  chunk_size?: number;
+  num_chunks?: number;
+  received?: number[];
+}

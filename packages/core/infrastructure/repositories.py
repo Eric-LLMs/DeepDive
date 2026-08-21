@@ -20,20 +20,40 @@ class SqlDomainRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def add(self, name: str) -> Domain:
+    async def add(self, name: str, user_id: UUID | None = None) -> Domain:
+        """Add a domain, deduped within its scope (public by name; private by (user_id, name))."""
+        cond = (
+            DomainModel.user_id.is_(None)
+            if user_id is None
+            else DomainModel.user_id == user_id
+        )
         row = (
-            await self.session.execute(select(DomainModel).where(DomainModel.name == name))
+            await self.session.execute(
+                select(DomainModel).where(DomainModel.name == name, cond)
+            )
         ).scalar_one_or_none()
         if row:
             return Domain.model_validate(row)
-        obj = DomainModel(name=name)
+        obj = DomainModel(name=name, user_id=user_id)
         self.session.add(obj)
         await self.session.commit()
         await self.session.refresh(obj)
         return Domain.model_validate(obj)
 
-    async def list_all(self) -> list[Domain]:
-        rows = (await self.session.execute(select(DomainModel))).scalars().all()
+    async def get(self, domain_id: UUID) -> Domain | None:
+        row = await self.session.get(DomainModel, domain_id)
+        return Domain.model_validate(row) if row else None
+
+    async def list_all(self, user_id: UUID | None = None) -> list[Domain]:
+        """Public domains plus the caller's own; a guest (None) sees public only."""
+        stmt = select(DomainModel)
+        if user_id is None:
+            stmt = stmt.where(DomainModel.user_id.is_(None))
+        else:
+            stmt = stmt.where(
+                DomainModel.user_id.is_(None) | (DomainModel.user_id == user_id)
+            )
+        rows = (await self.session.execute(stmt)).scalars().all()
         return [Domain.model_validate(r) for r in rows]
 
 
@@ -62,6 +82,10 @@ class SqlTermRepository:
         await self.session.commit()
         await self.session.refresh(obj)
         return Term.model_validate(obj)
+
+    async def get(self, term_id: UUID) -> Term | None:
+        row = await self.session.get(TermModel, term_id)
+        return Term.model_validate(row) if row else None
 
     async def list_by_domain(self, domain_id: UUID, only_active: bool = False) -> list[Term]:
         stmt = select(TermModel).where(TermModel.domain_id == domain_id)
@@ -150,38 +174,67 @@ class SqlSentenceRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def add(self, domain_id: UUID, content_en: str) -> Sentence:
+    @staticmethod
+    def _scope_cond(user_id: UUID | None):
+        """Sentences visible to the caller: public (NULL) or owned by them."""
+        if user_id is None:
+            return SentenceModel.user_id.is_(None)
+        return SentenceModel.user_id.is_(None) | (SentenceModel.user_id == user_id)
+
+    @staticmethod
+    def _dedup_cond(user_id: UUID | None):
+        """Dedup key matching the partial unique indexes (public / per-owner)."""
+        if user_id is None:
+            return SentenceModel.user_id.is_(None)
+        return SentenceModel.user_id == user_id
+
+    async def add(self, domain_id: UUID, content_en: str, user_id: UUID | None = None) -> Sentence:
         row = (
             await self.session.execute(
-                select(SentenceModel).where(SentenceModel.content_en == content_en)
+                select(SentenceModel).where(
+                    SentenceModel.content_en == content_en,
+                    self._dedup_cond(user_id),
+                )
             )
         ).scalar_one_or_none()
         if row:
             return Sentence.model_validate(row)
-        obj = SentenceModel(domain_id=domain_id, content_en=content_en)
+        obj = SentenceModel(domain_id=domain_id, content_en=content_en, user_id=user_id)
         self.session.add(obj)
         await self.session.commit()
         await self.session.refresh(obj)
         return Sentence.model_validate(obj)
 
-    async def list_by_domain(self, domain_id: UUID) -> list[Sentence]:
-        rows = (
-            await self.session.execute(select(SentenceModel).where(SentenceModel.domain_id == domain_id))
-        ).scalars().all()
+    async def get(self, sentence_id: UUID) -> Sentence | None:
+        row = await self.session.get(SentenceModel, sentence_id)
+        return Sentence.model_validate(row) if row else None
+
+    async def list_by_domain(self, domain_id: UUID, user_id: UUID | None = None) -> list[Sentence]:
+        stmt = select(SentenceModel).where(SentenceModel.domain_id == domain_id)
+        if user_id is not None:
+            stmt = stmt.where(self._scope_cond(user_id))
+        rows = (await self.session.execute(stmt)).scalars().all()
         return [Sentence.model_validate(r) for r in rows]
 
-    async def bulk_add(self, domain_id: UUID, sentences: list[str]) -> tuple[int, int]:
+    async def bulk_add(
+        self, domain_id: UUID, sentences: list[str], user_id: UUID | None = None
+    ) -> tuple[int, int]:
         added, skipped = 0, 0
         for content in sentences:
             exists = (
                 await self.session.execute(
-                    select(SentenceModel).where(SentenceModel.content_en == content)
+                    select(SentenceModel).where(
+                        SentenceModel.content_en == content,
+                        self._dedup_cond(user_id),
+                    )
                 )
             ).scalar_one_or_none()
             if exists:
                 skipped += 1
                 continue
-            self.session.add(SentenceModel(domain_id=domain_id, content_en=content))
+            self.session.add(
+                SentenceModel(domain_id=domain_id, content_en=content, user_id=user_id)
+            )
             added += 1
         await self.session.commit()
         return added, skipped
@@ -202,15 +255,16 @@ class SqlSentenceRepository:
             )
             await self.session.commit()
 
-    async def search_by_text(self, domain_id: UUID, term_text: str) -> list[Sentence]:
-        rows = (
-            await self.session.execute(
-                select(SentenceModel).where(
-                    SentenceModel.domain_id == domain_id,
-                    SentenceModel.content_en.ilike(f"%{term_text}%"),
-                )
-            )
-        ).scalars().all()
+    async def search_by_text(
+        self, domain_id: UUID, term_text: str, user_id: UUID | None = None
+    ) -> list[Sentence]:
+        stmt = select(SentenceModel).where(
+            SentenceModel.domain_id == domain_id,
+            SentenceModel.content_en.ilike(f"%{term_text}%"),
+        )
+        if user_id is not None:
+            stmt = stmt.where(self._scope_cond(user_id))
+        rows = (await self.session.execute(stmt)).scalars().all()
         return [Sentence.model_validate(r) for r in rows]
 
     async def set_embedding(self, sentence_id: UUID, embedding: list[float]) -> None:
@@ -222,22 +276,24 @@ class SqlSentenceRepository:
         await self.session.commit()
 
     async def search_semantic(
-        self, domain_id: UUID, query_embedding: list[float], top_k: int = 10
+        self, domain_id: UUID, query_embedding: list[float], top_k: int = 10,
+        user_id: UUID | None = None,
     ) -> list[dict]:
-        rows = (
-            await self.session.execute(
-                select(
-                    SentenceModel,
-                    (1 - SentenceModel.embedding.cosine_distance(query_embedding)).label("score"),
-                )
-                .where(
-                    SentenceModel.domain_id == domain_id,
-                    SentenceModel.embedding.is_not(None),
-                )
-                .order_by(SentenceModel.embedding.cosine_distance(query_embedding))
-                .limit(top_k)
+        stmt = (
+            select(
+                SentenceModel,
+                (1 - SentenceModel.embedding.cosine_distance(query_embedding)).label("score"),
             )
-        ).all()
+            .where(
+                SentenceModel.domain_id == domain_id,
+                SentenceModel.embedding.is_not(None),
+            )
+            .order_by(SentenceModel.embedding.cosine_distance(query_embedding))
+            .limit(top_k)
+        )
+        if user_id is not None:
+            stmt = stmt.where(self._scope_cond(user_id))
+        rows = (await self.session.execute(stmt)).all()
         result = []
         for sentence, score in rows:
             item = Sentence.model_validate(sentence).model_dump()

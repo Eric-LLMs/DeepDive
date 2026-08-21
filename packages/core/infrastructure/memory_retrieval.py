@@ -15,6 +15,7 @@ from agent.memory.retrieval import MemoryHit, VectorRetriever
 from sqlalchemy import func, select
 
 from core.infrastructure.db import MessageModel
+from core.infrastructure.request_context import get_request_user_id
 from core.infrastructure.vector import TEIEmbedder
 
 _FTS_CONFIG = "english"
@@ -40,6 +41,9 @@ class PgKeywordRecaller:
     async def search(self, query: str, top_k: int = 5) -> list[MemoryHit]:
         if not query.strip():
             return []
+        # The recaller is a process singleton; scope by the current request's user
+        # (falling back to a constructor-bound user when no request context is present).
+        user_id = get_request_user_id() or self._user_id
         tsquery = func.plainto_tsquery(self._fts_config, query)
         rank = func.ts_rank_cd(_tsvector(), tsquery).label("score")
         stmt = (
@@ -48,8 +52,8 @@ class PgKeywordRecaller:
             .order_by(rank.desc())
             .limit(top_k)
         )
-        if self._user_id is not None:
-            stmt = stmt.where(MessageModel.user_id == self._user_id)
+        if user_id is not None:
+            stmt = stmt.where(MessageModel.user_id == user_id)
         async with self._session_factory() as session:
             rows = (await session.execute(stmt)).all()
         return [
@@ -79,6 +83,7 @@ class PgVectorRecaller(VectorRetriever):
 
     async def search(self, query: str, top_k: int = 5) -> list[MemoryHit]:
         # Embedding service down → raise so RRFMemoryRetriever falls back to tsvector.
+        user_id = get_request_user_id() or self._user_id
         query_embedding = (await self._embedder.embed([query]))[0]
         score = (1 - MessageModel.embedding.cosine_distance(query_embedding)).label("score")
         stmt = (
@@ -87,8 +92,8 @@ class PgVectorRecaller(VectorRetriever):
             .order_by(MessageModel.embedding.cosine_distance(query_embedding))
             .limit(top_k)
         )
-        if self._user_id is not None:
-            stmt = stmt.where(MessageModel.user_id == self._user_id)
+        if user_id is not None:
+            stmt = stmt.where(MessageModel.user_id == user_id)
         async with self._session_factory() as session:
             rows = (await session.execute(stmt)).all()
         return [

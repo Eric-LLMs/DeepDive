@@ -14,11 +14,13 @@ from arq import create_pool
 from arq.connections import RedisSettings
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
 from api.auth import (
+    ADMIN_ROLE,
+    USER_ROLE,
     AuthAdmin,
     AuthUser,
     require_admin,
@@ -27,7 +29,19 @@ from api.auth import (
     sign_console_token,
     verify_admin,
 )
-from api.deps import _embedder, get_agent, get_task_queue, get_vocab_service, llm
+from api.deps import (
+    _embedder,
+    get_agent,
+    get_drive_service,
+    get_task_queue,
+    get_vocab_service,
+    llm,
+)
+from api.routers.drive import files as drive_files_router
+from api.routers.drive import folders as drive_folders_router
+from api.routers.drive import trash as drive_trash_router
+from api.routers.drive import users as drive_users_router
+from api.routers.drive import workspaces as drive_workspaces_router
 from api.schemas import (
     AdminLoginRequest,
     BulkUpdateRequest,
@@ -72,6 +86,8 @@ from api.schemas import (
     UserUpdateRequest,
     WalletTopupRequest,
 )
+from core.application.drive_service import DriveError
+from core.application.services import VocabError
 from core.config import settings
 from core.infrastructure.billing import (
     compute_cost,
@@ -117,6 +133,7 @@ from core.infrastructure.memory import (
     load_session_messages,
 )
 from core.infrastructure.mailer import MailNotConfigured, send_email
+from core.infrastructure.request_context import set_request_user
 from core.infrastructure.security import (
     check_quota,
     ensure_admin_user,
@@ -154,6 +171,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="DeepDive API", version="0.1.0", lifespan=lifespan)
 
+
+@app.exception_handler(VocabError)
+async def _vocab_error_handler(request: Request, exc: VocabError):
+    """Map vocabulary domain errors (403/404/etc.) to JSON responses."""
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
+@app.exception_handler(DriveError)
+async def _drive_error_handler(request: Request, exc: DriveError):
+    """Map cloud-drive domain errors (403/404/409/etc.) to JSON responses."""
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # open during dev; tighten for production
@@ -176,6 +206,13 @@ app.mount("/images", StaticFiles(directory=Path(settings.image_cache_path).resol
 AVATAR_DIR = Path("data/avatars")
 AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/avatars", StaticFiles(directory=AVATAR_DIR.resolve()), name="avatars")
+
+# Cloud drive: workspaces + file upload lifecycle / download / sharing / RAG status.
+app.include_router(drive_workspaces_router)
+app.include_router(drive_files_router)
+app.include_router(drive_folders_router)
+app.include_router(drive_trash_router)
+app.include_router(drive_users_router)
 
 
 @app.get("/health")
@@ -485,6 +522,25 @@ def _login_expiry() -> datetime:
     return datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_expire_minutes)
 
 
+async def _verify_user_login(session, username: str, password: str) -> UserModel:
+    """Validate a user's credentials + account state; raise 401/403 with client hints."""
+    row = (
+        await session.execute(select(UserModel).where(UserModel.username == username))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    if row.email and not row.email_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="邮箱未验证,请先查收邮件完成验证。未收到?可在个人资料里重新发送。",
+        )
+    if not row.is_active:
+        raise HTTPException(status_code=403, detail="账号已被停用,请联系管理员。")
+    if not verify_password(password, row.password_hash):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    return row
+
+
 # ── Admin console ──
 @app.post("/admin/login")
 async def admin_login(body: AdminLoginRequest) -> dict:
@@ -497,7 +553,7 @@ async def admin_login(body: AdminLoginRequest) -> dict:
     """
     if not await verify_admin(body.username, body.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = await sign_console_token(body.username, _login_expiry())
+    token = await sign_console_token(body.username, ADMIN_ROLE, _login_expiry())
     return {"access_token": token, "username": body.username}
 
 
@@ -519,27 +575,15 @@ async def admin_page() -> FileResponse:
 # ── User auth (desktop workbench login) ──
 @app.post("/auth/login")
 async def user_login(body: UserLoginRequest) -> dict:
-    """Verify a user's credentials and mint an opaque user token.
+    """Verify a user's credentials and mint an opaque API token (``dd_``).
 
-    Self-registered accounts must complete email verification before they can log in
-    (``email IS NOT NULL AND NOT email_verified`` → 403); admin-deactivated accounts are
-    rejected too, each with a distinct Chinese hint the clients can surface verbatim.
+    The token is one row in ``login_tokens`` per (user, channel); the next login for the
+    same channel rotates its secret, so it is meant for clients that log in fresh (the
+    desktop) or mint their own tokens. The web console uses ``/auth/session-login``
+    instead, whose stateless session survives re-logins.
     """
     async with SessionLocal() as session:
-        row = (
-            await session.execute(select(UserModel).where(UserModel.username == body.username))
-        ).scalar_one_or_none()
-        if row is None:
-            raise HTTPException(status_code=401, detail="用户名或密码错误")
-        if row.email and not row.email_verified:
-            raise HTTPException(
-                status_code=403,
-                detail="邮箱未验证,请先查收邮件完成验证。未收到?可在个人资料里重新发送。",
-            )
-        if not row.is_active:
-            raise HTTPException(status_code=403, detail="账号已被停用,请联系管理员。")
-        if not verify_password(body.password, row.password_hash):
-            raise HTTPException(status_code=401, detail="用户名或密码错误")
+        row = await _verify_user_login(session, body.username, body.password)
         role = await get_role(session, row.role_id)
         credential_id = await _pick_credential(session, row.role_id, row.id)
         token = await _login_token(
@@ -555,6 +599,44 @@ async def user_login(body: UserLoginRequest) -> dict:
         "display_name": row.display_name,
         "role_id": row.role_id,
         "role_name": role.role_name if role else row.role_id,
+    }
+
+
+@app.post("/auth/session-login")
+async def user_session_login(body: UserLoginRequest) -> dict:
+    """Verify credentials and mint a stateless web-console session token (``cc_``).
+
+    Console sessions are signed, self-contained strings held in the browser's
+    localStorage — nothing is written to login_tokens, so a desktop re-login (which
+    rotates the ``dd_`` API token) cannot invalidate the web console's session.
+    """
+    async with SessionLocal() as session:
+        row = await _verify_user_login(session, body.username, body.password)
+        role = await get_role(session, row.role_id)
+    token = await sign_console_token(body.username, USER_ROLE, _login_expiry())
+    return {
+        "access_token": token,
+        "username": row.username,
+        "display_name": row.display_name,
+        "role_id": row.role_id,
+        "role_name": role.role_name if role else row.role_id,
+    }
+
+
+@app.post("/auth/session")
+async def auth_session(user: AuthUser = Depends(require_user)) -> dict:
+    """Exchange the current API token for a stateless web-console session token.
+
+    The desktop hands the web console its API token via ``?sso=``; converting it here
+    keeps the browser session alive even if that API token is later rotated by a re-login.
+    """
+    token = await sign_console_token(user.username, USER_ROLE, _login_expiry())
+    return {
+        "access_token": token,
+        "username": user.username,
+        "display_name": user.display_name,
+        "role_id": user.role.role_id,
+        "role_name": user.role.role_name,
     }
 
 
@@ -2381,28 +2463,61 @@ async def probe_models(body: ProbeModelsRequest, _: AuthAdmin = Depends(require_
 
 
 # ── Vocabulary domain ──
+# Tenant isolation: logged-in users see public + their own; guests see public only.
+def _uid(user: AuthUser | None) -> UUID | None:
+    return user.user_id if user is not None else None
+
+
 @app.post("/domains")
-async def create_domain(body: DomainCreate, svc=Depends(get_vocab_service)):
-    return await svc.add_domain(body.name)
+async def create_domain(
+    body: DomainCreate,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.add_domain(body.name, _uid(user))
 
 
 @app.get("/domains")
-async def list_domains(svc=Depends(get_vocab_service)):
-    return await svc.list_domains()
+async def list_domains(
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.list_domains(_uid(user))
+
+
+@app.post("/domains/{domain_id}/clone")
+async def clone_domain(
+    domain_id: UUID,
+    user: AuthUser = Depends(require_user),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.clone_domain(user.user_id, domain_id)
 
 
 @app.post("/terms")
-async def create_term(body: TermCreate, svc=Depends(get_vocab_service)):
-    return await svc.add_term(body.domain_id, body.word, body.definition)
+async def create_term(
+    body: TermCreate,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.add_term(body.domain_id, body.word, body.definition, _uid(user))
 
 
 @app.get("/domains/{domain_id}/terms")
-async def list_terms(domain_id: UUID, svc=Depends(get_vocab_service)):
-    return await svc.list_terms(domain_id)
+async def list_terms(
+    domain_id: UUID,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.list_terms(domain_id, user_id=_uid(user))
 
 
 @app.post("/terms/update")
-async def update_term(body: TermUpdate, svc=Depends(get_vocab_service)):
+async def update_term(
+    body: TermUpdate,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
     await svc.update_term(
         body.term_id,
         body.definition,
@@ -2410,12 +2525,17 @@ async def update_term(body: TermUpdate, svc=Depends(get_vocab_service)):
         body.star_level,
         body.image_paths,
         body.is_active,
+        user_id=_uid(user),
     )
     return {"status": "ok"}
 
 
 @app.post("/terms/bulk-update")
-async def bulk_update_terms(body: BulkUpdateRequest, svc=Depends(get_vocab_service)):
+async def bulk_update_terms(
+    body: BulkUpdateRequest,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
     updates = [
         {
             "id": u.term_id,
@@ -2427,29 +2547,45 @@ async def bulk_update_terms(body: BulkUpdateRequest, svc=Depends(get_vocab_servi
         }
         for u in body.updates
     ]
-    await svc.bulk_update_terms(updates)
+    await svc.bulk_update_terms(updates, _uid(user))
     return {"status": "ok"}
 
 
 @app.post("/terms/import")
-async def import_terms(body: ImportRequest, svc=Depends(get_vocab_service)):
-    return await svc.import_terms(body.domain_id, body.text)
+async def import_terms(
+    body: ImportRequest,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.import_terms(body.domain_id, body.text, _uid(user))
 
 
 @app.post("/terms/import-structured")
-async def import_terms_structured(body: TermImportRequest, svc=Depends(get_vocab_service)):
+async def import_terms_structured(
+    body: TermImportRequest,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
     items = [(i.word, i.definition, i.frequency, i.star_level) for i in body.items]
-    return await svc.import_terms_structured(body.domain_id, items)
+    return await svc.import_terms_structured(body.domain_id, items, _uid(user))
 
 
 @app.post("/sentences/import")
-async def import_sentences(body: ImportRequest, svc=Depends(get_vocab_service)):
-    return await svc.import_sentences(body.domain_id, body.text)
+async def import_sentences(
+    body: ImportRequest,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.import_sentences(body.domain_id, body.text, _uid(user))
 
 
 @app.post("/sentences/import-structured")
-async def import_sentences_structured(body: SentenceImportRequest, svc=Depends(get_vocab_service)):
-    return await svc.import_sentences_structured(body.domain_id, body.items)
+async def import_sentences_structured(
+    body: SentenceImportRequest,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.import_sentences_structured(body.domain_id, body.items, _uid(user))
 
 
 @app.post("/image-fetch")
@@ -2483,47 +2619,83 @@ async def generate_media(body: MediaGenerateRequest, queue: TaskQueue = Depends(
 
 # ── Sentences ──
 @app.post("/sentences")
-async def create_sentence(body: SentenceCreate, svc=Depends(get_vocab_service)):
-    return await svc.add_sentence(body.domain_id, body.content_en)
+async def create_sentence(
+    body: SentenceCreate,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.add_sentence(body.domain_id, body.content_en, _uid(user))
 
 
 @app.post("/sentences/update")
-async def update_sentence(body: SentenceUpdate, svc=Depends(get_vocab_service)):
-    await svc.update_sentence(body.sentence_id, body.content_cn, body.audio_hash)
+async def update_sentence(
+    body: SentenceUpdate,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    await svc.update_sentence(body.sentence_id, body.content_cn, body.audio_hash, _uid(user))
     return {"status": "ok"}
 
 
 @app.get("/domains/{domain_id}/sentences")
-async def list_sentences(domain_id: UUID, svc=Depends(get_vocab_service)):
-    return await svc.list_sentences(domain_id)
+async def list_sentences(
+    domain_id: UUID,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.list_sentences(domain_id, _uid(user))
 
 
 @app.get("/domains/{domain_id}/sentences/search")
-async def search_sentences(domain_id: UUID, q: str, svc=Depends(get_vocab_service)):
-    return await svc.search_sentences(domain_id, q)
+async def search_sentences(
+    domain_id: UUID,
+    q: str,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.search_sentences(domain_id, q, _uid(user))
 
 
 @app.post("/domains/{domain_id}/sentences/index")
-async def index_sentences(domain_id: UUID, queue: TaskQueue = Depends(get_task_queue)):
+async def index_sentences(
+    domain_id: UUID,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+    queue: TaskQueue = Depends(get_task_queue),
+):
+    await svc.ensure_domain_access(_uid(user), domain_id)  # guard before enqueuing the job
     job_id = await queue.enqueue(INDEX_SENTENCES, {"domain_id": str(domain_id)})
     return {"job_id": str(job_id)}
 
 
 @app.get("/domains/{domain_id}/sentences/semantic")
-async def semantic_search(domain_id: UUID, q: str, svc=Depends(get_vocab_service)):
-    return await svc.search_sentences_semantic(domain_id, q)
+async def semantic_search(
+    domain_id: UUID,
+    q: str,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.search_sentences_semantic(domain_id, q, user_id=_uid(user))
 
 
 # ── Term ↔ sentence relations ──
 @app.post("/matches")
-async def link_term_to_sentence(body: MatchCreate, svc=Depends(get_vocab_service)):
-    await svc.link_term_to_sentence(body.term_id, body.sentence_id, body.explanation)
+async def link_term_to_sentence(
+    body: MatchCreate,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    await svc.link_term_to_sentence(body.term_id, body.sentence_id, body.explanation, _uid(user))
     return {"status": "ok"}
 
 
 @app.get("/terms/{term_id}/sentences")
-async def list_sentences_for_term(term_id: UUID, svc=Depends(get_vocab_service)):
-    return await svc.list_sentences_for_term(term_id)
+async def list_sentences_for_term(
+    term_id: UUID,
+    user: AuthUser | None = Depends(require_user_optional),
+    svc=Depends(get_vocab_service),
+):
+    return await svc.list_sentences_for_term(term_id, _uid(user))
 
 
 # ── TTS ──
@@ -2620,6 +2792,8 @@ async def chat(
     user: AuthUser | None = Depends(require_user_optional),
     queue: TaskQueue = Depends(get_task_queue),
 ):
+    # Scope RAG / memory recall to this request's user (guest → public-link assets only).
+    set_request_user(user.user_id if user is not None else None)
     # Resolve the LLM channel for this request: a logged-in user uses the channel pinned on
     # their token at login (failing over to another active channel of the same role); a guest
     # uses the ``anonymous`` role's channels. A role with no usable channel falls back to the
