@@ -74,3 +74,6 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Always importable regardless of how pytest is launched (`pytest` vs
+# `python -m pytest`): lets tests do `from tests._drive_fakes import ...`.
+pythonpath = ["."]
