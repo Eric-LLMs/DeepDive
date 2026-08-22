@@ -82,8 +82,20 @@ class Settings(BaseSettings):
     session_summary_enabled: bool = True       # generate an LLM summary on session close
     memory_recall_top_k: int = 5               # proactive recall count for the prompt memory section
     memory_note_max_chars: int = 4000          # memory_save content length cap (guardrail)
+    memory_recall_min_len: int = 4             # queries at/below this length always recall (elliptical)
+    memory_recall_trigger_words: list[str] = [  # lexical prefilter: these imply memory-seeking intent
+        "remember", "recall", "earlier", "before", "previously", "prior",
+        "last time", "we discussed", "we talked", "you told me",
+        "你记得", "记得", "上次", "之前", "以前", "说过", "你说过", "我们说过",
+    ]
     history_max_messages: int = 40             # chat history length that triggers compaction
     history_keep_messages: int = 20            # most-recent messages kept after compaction
+    prompt_max_chars: int = 120_000            # total window char budget that triggers compaction (~30k tokens)
+    prompt_message_max_chars: int = 8000       # per-message content cap when building the LLM request (snip)
+
+    # Project context (CLAUDE.md / AGENTS.md conventions injected into the prompt's PROJECT_CONTEXT zone).
+    project_context_files: list[str] = ["CLAUDE.md", "AGENTS.md"]
+    project_context_max_chars: int = 8000      # per-file read cap for the project convention file
 
     # ── Auth ──
     jwt_secret: str = "change-me"

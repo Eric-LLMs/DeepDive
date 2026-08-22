@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 
 from agent.decisions import ToolExecution, text_block
+from core.config import settings
 from agent.memory.base import MemoryStore
 from agent.memory.retrieval import MemoryHit, RRFMemoryRetriever
 from agent.memory.types import MEMORY_TYPES, Memory
@@ -86,6 +87,22 @@ class MemoryService:
         file_hits = await self.recall_file(query, limit=3)
         return session_hits + file_hits
 
+    def should_recall(self, query: str) -> bool:
+        """Cheap lexical prefilter deciding whether proactive recall runs this turn.
+
+        Recall is gated (OpenClaw Lane-2 style) so the expensive RRF query only fires on
+        turns that plausibly refer to prior context: a non-empty query that either is short
+        (elliptical, e.g. "上次呢" → refers to earlier context) or contains a trigger word
+        ("remember", "上次", "之前", ...). Every turn still gets the always-on
+        ``MEMORY.md`` brief (Lane-1), so this only skips the deep recall, never the context.
+        """
+        q = (query or "").strip().lower()
+        if not q:
+            return False
+        if len(q) <= settings.memory_recall_min_len:
+            return True
+        return any(t in q for t in settings.memory_recall_trigger_words)
+
     # ── write (guardrailed; the session stays READ-only, this memdir write is exempt) ──
     async def save(
         self,
@@ -94,16 +111,24 @@ class MemoryService:
         *,
         description: str = "",
         type_: str = "",
+        importance: int = 5,
+        supersedes: str = "",
         confirmed: bool = False,
     ) -> Memory:
         """Commit a note to the long-term file memory with guardrails.
 
+        ``importance`` (1–10) is folded into keyword recall so curated notes surface ahead
+        of incidental ones. ``supersedes`` implements supersede-in-place: when it names an
+        existing memory, that memory is marked ``superseded`` and dropped from the index and
+        recall, so a stale preference can never resurface alongside its replacement.
         ``confirmed`` is accepted for a future human-confirmation gate but no longer
         required: ``memory_save`` is READ-classified (it writes the local memdir only), so
         the agent can persist notes without weakening the sandbox's READ-only default.
         """
         if not _NAME_RE.fullmatch(name):
             raise ValueError(f"memory name must be kebab-case ([a-z][a-z0-9-]*), got {name!r}")
+        if not isinstance(importance, int) or not 1 <= importance <= 10:
+            raise ValueError(f"importance must be an integer 1-10, got {importance!r}")
         content = content.strip()
         if not content:
             raise ValueError("memory content must not be empty")
@@ -113,7 +138,15 @@ class MemoryService:
             )
         if type_ and type_ not in MEMORY_TYPES:
             raise ValueError(f"memory type must be one of {MEMORY_TYPES}, got {type_!r}")
-        await self._file_store.save(name, content, description=description, type_=type_)
+        if supersedes:
+            old = await self._file_store.load(supersedes)
+            if old is None:
+                raise ValueError(f"supersedes targets missing memory {supersedes!r}")
+            await self._file_store.mark_superseded(supersedes)
+        await self._file_store.save(
+            name, content, description=description, type_=type_,
+            importance=importance, supersedes=supersedes,
+        )
         saved = await self._file_store.load(name)
         if saved is None:  # pragma: no cover - just written, must exist
             raise RuntimeError(f"memory save reported success but {name!r} is not readable")
@@ -162,6 +195,8 @@ def memory_save_tool(service: MemoryService) -> ToolDefinition:
             args["content"],
             description=args.get("description", ""),
             type_=args.get("type", ""),
+            importance=args.get("importance", 5),
+            supersedes=args.get("supersedes", ""),
         )
         return {"saved": memory.name}
 
@@ -169,7 +204,10 @@ def memory_save_tool(service: MemoryService) -> ToolDefinition:
         name="memory_save",
         description=(
             "Save a note to long-term memory. The name must be kebab-case and the content "
-            "is length-capped; the write is confined to the local memory directory."
+            "is length-capped; the write is confined to the local memory directory. "
+            "For type='user', write an imperative directive ('Always …', 'Never …', "
+            "'Prefer …'). To replace an outdated memory in place, pass its name in "
+            "'supersedes' — the old value is marked superseded and never resurfaces."
         ),
         parameters={
             "type": "object",
@@ -180,6 +218,14 @@ def memory_save_tool(service: MemoryService) -> ToolDefinition:
                 "type": {
                     "type": "string",
                     "description": "user | feedback | project | reference",
+                },
+                "importance": {
+                    "type": "integer",
+                    "description": "Salience 1-10 (default 5); higher ranks higher in recall.",
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": "Name of an existing memory this one replaces (supersede in place).",
                 },
             },
             "required": ["name", "content"],

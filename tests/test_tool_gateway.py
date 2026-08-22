@@ -28,7 +28,9 @@ def runtime():
 
     rt = ToolRuntime()
     rt.register(_def("rag_search", "Search learning material chunks for a query."))
-    rt.register(_def("edit_file", "Edit a file inside the workspace."))
+    rt.register(
+        _def("edit_file", "Edit a file inside the workspace.", {"path": {"type": "string"}})
+    )
     return rt
 
 
@@ -59,8 +61,15 @@ async def test_tool_search_mounts_schema_for_next_step(runtime):
 
     after = {t["function"]["name"] for t in gateway.visible_schemas({})}
     assert "edit_file" in after  # now directly callable
-    schema = next(t["function"] for t in gateway.visible_schemas({}) if t["function"]["name"] == "edit_file")
-    assert "parameters" in schema  # full schema, not the blurb
+    # The cached tools array only carries a stable defer_loading stub (empty parameter shape),
+    # so mounting does not churn the provider's prefix cache.
+    stub = next(
+        t["function"] for t in gateway.visible_schemas({}) if t["function"]["name"] == "edit_file"
+    )
+    assert stub["parameters"] == {"type": "object", "properties": {}}
+    # The full parameter schema rides in the tool_search result (below the cache boundary).
+    assert result[0]["parameters"] == runtime.get("edit_file").schema()["parameters"]
+    assert result[0]["parameters"]["properties"] == {"path": {"type": "string"}}
 
 
 async def test_core_tools_always_visible(runtime):

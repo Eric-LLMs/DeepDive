@@ -7,23 +7,48 @@ audit ``compaction`` event.
 from types import SimpleNamespace
 from uuid import uuid4
 
+from core.config import settings
 from core.infrastructure.memory import compact_history
 
 
-class _Scalar:
+class _Scalars:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows if isinstance(self._rows, list) else []
+
+
+class _Result:
     def __init__(self, value):
         self._value = value
 
     def scalar_one_or_none(self):
         return self._value
 
+    def scalars(self):
+        return _Scalars(self._value)
+
+
+class _EventRow:
+    def __init__(self, payload):
+        self.payload = payload
+
 
 class _FakeSession:
-    def __init__(self, summary):
+    """Routes queries by entity: SessionModel → scalar summary, SessionEventModel → event rows."""
+
+    def __init__(self, summary, events=None):
         self._summary = summary
+        self._events = events or []
 
     async def execute(self, stmt):
-        return _Scalar(SimpleNamespace(summary=self._summary) if self._summary is not None else None)
+        from core.infrastructure.db import SessionEventModel
+
+        entities = [d.get("entity") for d in stmt.column_descriptions]
+        if SessionEventModel in entities:
+            return _Result(self._events)
+        return _Result(SimpleNamespace(summary=self._summary) if self._summary is not None else None)
 
     async def __aenter__(self):
         return self
@@ -32,8 +57,8 @@ class _FakeSession:
         return False
 
 
-def _factory(summary):
-    return lambda: _FakeSession(summary)
+def _factory(summary, events=None):
+    return lambda: _FakeSession(summary, events)
 
 
 class _Events:
@@ -88,7 +113,9 @@ async def test_long_history_reuses_existing_session_summary():
     assert out[0] == {"role": "system", "content": "## Conversation summary\nprior summary"}
     assert [m["content"] for m in out[1:]] == [f"msg {i}" for i in range(25, 45)]
     assert llm.calls == []  # summary already exists → no LLM call
-    assert events.events == [("compaction", {"dropped": 25, "had_summary": True})]
+    assert events.events == [
+        ("compaction", {"dropped": 25, "had_summary": True, "summary": "prior summary"})
+    ]
 
 
 async def test_long_history_summarizes_overflow_synchronously():
@@ -103,7 +130,9 @@ async def test_long_history_summarizes_overflow_synchronously():
 
     assert out[0] == {"role": "system", "content": "## Conversation summary\nFAKE SUMMARY"}
     assert llm.calls == [("m", "http://chan", "k")]  # routes through the chat channel
-    assert events.events == [("compaction", {"dropped": 25, "had_summary": True})]
+    assert events.events == [
+        ("compaction", {"dropped": 25, "had_summary": True, "summary": "FAKE SUMMARY"})
+    ]
 
 
 async def test_summary_failure_still_drops_overflow_without_breaking():
@@ -119,3 +148,71 @@ async def test_summary_failure_still_drops_overflow_without_breaking():
     assert out[0] == {"role": "assistant", "content": "msg 25"}  # tail head, no summary injected
     assert len(out) == 20
     assert events.events == [("compaction", {"dropped": 25, "had_summary": False})]
+
+
+async def test_second_compaction_injects_two_tier_recap():
+    """Prior compaction summaries (L2) render coarse ahead of the current summary (L1)."""
+    llm = _Llm()
+    events = _Events()
+    history = _history(45)
+
+    out = await compact_history(
+        history,
+        session_factory=_factory(None, events=[_EventRow({"summary": "earlier window recap"})]),
+        session_id=uuid4(),
+        session_memory=events,
+        llm=llm,
+    )
+
+    assert out[0] == {
+        "role": "system",
+        "content": (
+            "## Earlier conversation (coarse)\n"
+            "earlier window recap\n\n"
+            "## Conversation summary\nFAKE SUMMARY"
+        ),
+    }
+    # the current window's summary is persisted so the next compaction sees it as L2
+    assert events.events == [
+        ("compaction", {"dropped": 25, "had_summary": True, "summary": "FAKE SUMMARY"})
+    ]
+
+
+async def test_char_budget_triggers_compaction_under_the_message_cap(monkeypatch):
+    """A window below the message count but over the char budget still compacts (token-aware)."""
+    monkeypatch.setattr(settings, "prompt_max_chars", 1_000)
+    llm = _Llm()
+    events = _Events()
+    # 30 messages (max=40) × ~310 chars each ≫ the 1000-char budget → compact
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i:03d} " + "z" * 300}
+        for i in range(30)
+    ]
+
+    out = await compact_history(
+        history, session_factory=_factory(None), session_id=uuid4(),
+        session_memory=events, llm=llm,
+    )
+
+    assert out[0] == {"role": "system", "content": "## Conversation summary\nFAKE SUMMARY"}
+    assert [m["content"] for m in out[1:]] == [h["content"] for h in history[10:]]
+    assert events.events == [
+        ("compaction", {"dropped": 10, "had_summary": True, "summary": "FAKE SUMMARY"})
+    ]
+
+
+async def test_under_keep_messages_passes_through_even_when_large(monkeypatch):
+    """Within the kept tail there is nothing to drop; oversized singles are left to the snip."""
+    monkeypatch.setattr(settings, "prompt_max_chars", 100)
+    llm = _Llm()
+    events = _Events()
+    history = [{"role": "user", "content": "x" * 5000}]  # one huge message, count 1 ≤ keep 20
+
+    out = await compact_history(
+        history, session_factory=_factory(None), session_id=uuid4(),
+        session_memory=events, llm=llm,
+    )
+
+    assert out is history
+    assert events.events == []
+    assert llm.calls == []

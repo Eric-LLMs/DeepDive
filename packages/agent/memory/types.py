@@ -19,6 +19,9 @@ class Memory:
     content: str
     description: str = ""
     type: str = ""
+    importance: int = 5
+    status: str = "active"
+    supersedes: str = ""
     path: str | None = None
     mtime_ms: float = 0.0
 

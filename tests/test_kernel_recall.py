@@ -11,15 +11,19 @@ from agent.memory.retrieval import MemoryHit
 
 
 class _StubMemory:
-    def __init__(self, hits=None):
+    def __init__(self, hits=None, *, should_recall=True):
         self.hits = hits or []
         self.queries = []
+        self._should_recall = should_recall
 
     def begin_session(self):
         pass
 
     def session_brief(self):
         return ""
+
+    def should_recall(self, query):
+        return self._should_recall
 
     async def recall_all(self, query, top_k):
         self.queries.append(query)
@@ -63,6 +67,14 @@ async def test_proactive_recall_renders_nothing_when_no_hits():
     kernel = _kernel(_StubMemory())
 
     assert await kernel._memory_recall_section({"user_msg": "hi"}) == ""
+
+
+async def test_proactive_recall_skips_when_gate_says_no():
+    mem = _StubMemory([MemoryHit(key="k", content="note")], should_recall=False)
+    kernel = _kernel(mem)
+
+    assert await kernel._memory_recall_section({"user_msg": "explain the code"}) == ""
+    assert mem.queries == []  # no deep recall ran on a non-memory-seeking turn
 
 
 async def test_run_resets_recall_cache_for_next_turn():

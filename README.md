@@ -67,6 +67,130 @@ flowchart TB
     tools --> sandbox[Sandbox<br/>READ / WRITE / NETWORK]
 ```
 
+**Memory — two independent tracks, orchestrated by `MemoryService`** (writes go to the local
+memdir, recall reads the database; the tracks never cross):
+
+![Memory architecture — two independent tracks](./docs/images/memory-architecture.png)
+
+<details>
+<summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
+
+```mermaid
+flowchart TB
+    %% Invariants: thinking never persisted · messages never deleted by compaction/retention ·
+    %% memory_save writes the memdir only (never PG) · vector-channel failure → tsvector-only (never silent empty) ·
+    %% superseding marks a memory, never deletes it (audit file kept) · cosmetic failures never block the main flow
+
+    P[prompt memory section]
+
+    subgraph trackA["Track A · local file memory — agent-writable, never the DB"]
+        FILES[MEMORY.md index<br/>one frontmatter .md per memory<br/>type: user · feedback · project · reference<br/>superseded entries unindexed · files kept as audit]
+        WRITE[memory_save · guardrailed write<br/>kebab-case · ≤4000 chars · type whitelist · write-then-readback<br/>importance 1-10 · supersede-in-place via status]
+        SEARCH[memory_search · keyword × importance<br/>name ×3 · desc ×2 · body ×1<br/>superseded entries excluded]
+        BRIEF[begin_session → MEMORY.md head<br/>first 200 lines as session brief · Lane-1 always on]
+        WRITE --> FILES
+        SEARCH --> FILES
+        BRIEF --> P
+    end
+
+    subgraph trackB["Track B · session memory — PostgreSQL, system-written · agent read-only"]
+        MSGS[(messages<br/>text · pgvector · tsvector · created_at)]
+        SESS[(sessions<br/>title · summary · closed_at)]
+        EVTS[(session_events<br/>audit log · JSONB payload<br/>compaction summaries persist here)]
+        KW[tsvector keyword recall<br/>to_tsvector english<br/>fts_config swappable for CJK]
+        VEC[pgvector semantic recall]
+        RRF[RRF fusion + recency decay<br/>30-day half-life · 1.0× recent<br/>0.68× at 30d · 0.55× at 90d]
+        COMPACT[compact_history · hierarchical recap<br/>over 40 msgs → keep latest 20<br/>L2 prior-window summaries coarse<br/>L1 current summary · failure still truncates]
+        FINAL[worker finalize<br/>backfill embeddings · summary · auto-title<br/>failure-robust · cosmetic failures never block]
+        SWEEP[retention cron · 04:17 daily<br/>purge session_events > 30d<br/>audit log only · L2 recap fades · messages kept]
+        MSGS --> KW
+        MSGS --> VEC
+        KW --> RRF
+        VEC --> RRF
+        MSGS --> COMPACT
+        MSGS --> FINAL
+        COMPACT --> P
+        COMPACT --> EVTS
+        EVTS --> SWEEP
+        FINAL --> SESS
+    end
+
+    USER[user message]
+    GATE[trigger gate · should_recall<br/>memory-seeking phrases or short elliptical<br/>else only the Lane-1 brief]
+    USER --> GATE
+    GATE -- seeking --> RRF
+    GATE -- neutral --> P
+    RRF --> P
+    P --> AGENT[ReactLoopAgent step loop]
+```
+
+</details>
+
+> **Memory invariants** — thinking is never persisted; `messages` are never deleted by compaction
+> or retention; `memory_save` writes the memdir only (never the DB); a vector-channel failure
+> degrades to tsvector-only (never a silent empty); superseding marks a memory `superseded` and
+> keeps the file as an audit trail — it is never deleted; the recall gate skips only the deep
+> recall on non-memory-seeking turns (the Lane-1 brief always injects); cosmetic failures
+> (summary / title / compaction) never block the main flow.
+
+**Prompt — cache-boundary assembly, compression, and deferred tool stubs** (architecture, design
+features, and per-step process logic):
+
+![Prompt architecture — cache-boundary assembly](./docs/images/prompt-architecture.png)
+
+<details>
+<summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
+
+```mermaid
+flowchart TB
+    %% Prompt module: cache-boundary assembly + compression + deferred tool stubs.
+    %% Invariants: the CACHE_BOUNDARY separator is internal-only and never rendered; the stable
+    %% head (STATIC_PREFIX + PROJECT_CONTEXT) is byte-identical so the provider prefix cache is
+    %% reused; only the DYNAMIC_SUFFIX re-renders per step and is skipped when unchanged; the
+    %% per-message snip trims the request snapshot only, keeping the persistence copy raw; mounted
+    %% tools appear as stable defer_loading stubs, with the full schema riding in the tool_search
+    %% result.
+
+    subgraph input["Input"]
+        HIST["chat history + new user message"]
+        AUTO["compact_history · token-aware char budget<br/>over prompt_max_chars → keep latest 20<br/>inject L1 current + L2 coarse recap"]
+        HIST --> AUTO
+    end
+
+    subgraph zones["Design · cache-boundary zones"]
+        SP["STATIC_PREFIX · byte-identical across requests<br/>SOUL.md identity + compact tool catalog<br/>+ compressed skill catalog"]
+        PC["PROJECT_CONTEXT · stable per project<br/>CLAUDE.md / AGENTS.md via read_project_context<br/>capped at 8k chars · empty → zone dropped"]
+        DS["DYNAMIC_SUFFIX · re-rendered per step<br/>memory brief · Lane-1 always on<br/>recalled memory · gated by should_recall<br/>+ agent.inject content"]
+        SP --> HEAD["stable head"]
+        PC --> HEAD
+    end
+
+    subgraph render["render_prompt"]
+        HEAD --> RENDER
+        DS --> RENDER
+        RENDER["zones joined by blank lines<br/>CACHE_BOUNDARY is internal-only · never sent"]
+        RENDER --> KEY["snapshot_key · sha256 of static + project<br/>16 hex · cache identity measurable"]
+    end
+
+    subgraph perstep["Process · per step"]
+        RENDER --> SNIP["per-message snip · prompt_message_max_chars<br/>request snapshot trimmed · persistence keeps full text"]
+        AUTO --> SNIP
+        SNIP --> REQ["LLM request · system + snipped messages"]
+        REQ --> REFRESH["refresh_dynamic · recompute only DYNAMIC_SUFFIX<br/>unchanged → system not re-sent · head reused"]
+        REQ --> TOOLS["visible tools · core full schemas<br/>+ defer_loading stubs · name + description · empty params<br/>full schema via the tool_search result"]
+        REFRESH --> REQ
+    end
+```
+
+</details>
+
+> **Prompt invariants** — the `CACHE_BOUNDARY` separator is internal-only and never rendered to the
+> model; the stable head (STATIC_PREFIX + PROJECT_CONTEXT) is byte-identical across requests so the
+> provider prefix cache is reused; only the DYNAMIC_SUFFIX re-renders per step and is skipped when
+> unchanged; the per-message snip trims the request snapshot only, keeping the persistence copy raw;
+> mounted tools appear as stable defer_loading stubs, with the full schema riding in the tool_search
+> result.
+
 > [docs/architecture.md](docs/architecture.md) is the single source of truth for the full design —
 > tech stack, repository layout, agent-kernel internals, tool runtime, data model, and deployment
 > topology (including what is implemented today vs. designed-only).
@@ -77,8 +201,8 @@ flowchart TB
 
 ### 💬 AI Chat Assistant
 - **Agentic Kernel** (`AgentKernel`): a composition root wiring a cache-boundary prompt assembler, deferred tool loading, dual-track memory, a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop.
-- **Cache-Boundary Prompt**: the system prompt is partitioned into three zones — a byte-stable static prefix (SOUL.md + compact tool/skill catalog), project context, and a per-step dynamic suffix — separated by a fixed `<CACHE_BOUNDARY/>` marker, so the provider's prefix cache reuses the stable head across steps. `snapshot_key()` makes the cache identity measurable.
-- **Deferred Tool Loading**: the prompt carries only a compact `name + blurb` catalog plus the resident `tool_search` meta-tool; full tool schemas are mounted on demand into the visible tool set, keeping the prompt small at any tool count.
+- **Cache-Boundary Prompt**: the system prompt is partitioned into three zones — a byte-stable static prefix (SOUL.md + compact tool/skill catalog), project context, and a per-step dynamic suffix — so the provider's prefix cache reuses the stable head across steps. Project conventions are loaded from the workspace's `CLAUDE.md` / `AGENTS.md` into their own stable zone; `snapshot_key()` makes the cache identity measurable.
+- **Deferred Tool Loading**: the prompt carries only a compact `name + blurb` catalog plus the resident `tool_search` meta-tool; matched tools appear in the visible set as stable `name + description` stubs (defer_loading style) so the cached tools array never churns, and each tool's full schema is returned in the `tool_search` result. The prompt window is also bounded by a per-message snip plus a token-aware autocompact that fires on a character budget.
 - **Dual-Track Memory**: session recall fuses PostgreSQL tsvector (keyword) + pgvector (semantic) via RRF, recency-weighted so newer messages win near-ties; when the embedding service is offline it degrades to tsvector-only — never a silent empty. `memory_search` / `memory_save` are tools; `memory_save` writes guardrailed notes (kebab-case key, length-capped content, closed type taxonomy) to the local memory directory while the session stays read-only. Proactive recall injects top hits for your question into the prompt, and long conversations are auto-compacted into an LLM summary (bounded token window).
 - **Skill Catalog**: skills (SKILL.md) are advertised as a one-line compressed index; the full instructions are lazy-loaded through the `skill` meta-tool.
 - **Read-Only Sandbox**: every tool call is gated by session permissions (READ / WRITE / NETWORK); file tools are rooted at the workspace dir and path escape is rejected. Writes and network access need an explicit grant or human approval.

@@ -205,6 +205,30 @@ async def get_session_summary(session_factory, session_id: UUID) -> str | None:
         return sess.summary if sess is not None else None
 
 
+# Hierarchical compaction recap: each compaction persists its summary in a ``compaction``
+# session event, so the next one can inject a two-tier recap — coarse prior-window summaries
+# (L2) plus the current window's summary (L1) — ahead of the kept raw tail (L0). Bounds keep
+# the injected system message flat regardless of how many compactions a session has seen.
+RECAP_PER_WINDOW_CHARS = 200
+RECAP_MAX_WINDOWS = 5
+
+
+async def _get_compaction_summaries(session_factory, session_id: UUID) -> list[str]:
+    """Return prior compaction summaries (oldest first) persisted for this session."""
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(SessionEventModel)
+                .where(
+                    SessionEventModel.session_id == session_id,
+                    SessionEventModel.type == "compaction",
+                )
+                .order_by(SessionEventModel.seq)
+            )
+        ).scalars().all()
+    return [s for row in rows if (s := (row.payload or {}).get("summary"))]
+
+
 async def compact_history(
     history: list[dict],
     *,
@@ -218,18 +242,29 @@ async def compact_history(
 ) -> list[dict]:
     """Bound the agent's history window: truncate long histories, compress the overflow.
 
-    When ``history`` exceeds ``settings.history_max_messages`` messages, keep only the most
-    recent ``settings.history_keep_messages`` and fold the dropped prefix into a conversation
-    summary — the existing session summary when one is present, otherwise a synchronous LLM
-    summary of the overflow (same prompt as ``finalize_session``). The summary is injected as
-    a leading system message so the agent keeps cross-turn context while the token window
-    stays flat. A ``compaction`` event is recorded on ``session_memory`` for auditability.
+    Compaction triggers on either dimension — when ``history`` exceeds
+    ``settings.history_max_messages`` messages, or when the message count sits between
+    ``history_keep_messages`` and the max while the total character budget
+    ``settings.prompt_max_chars`` (a token-aware watermark) is exceeded. In both cases keep only
+    the most recent ``settings.history_keep_messages`` and fold the dropped prefix into a
+    conversation summary — the existing session summary when one is present, otherwise a
+    synchronous LLM summary of the overflow (same prompt as ``finalize_session``). Histories
+    at or below ``history_keep_messages`` always pass through (nothing to drop; oversized
+    individual messages are bounded by the per-message snip in the loop). The injected recap is
+    hierarchical: coarse summaries of prior compaction windows (L2) plus the current window's
+    summary (L1), injected as a leading system message while the token window stays flat. Each
+    compaction's summary is persisted in the ``compaction`` event payload, feeding the next
+    recap. A ``compaction`` event is recorded on ``session_memory`` for auditability.
 
     If the summary call fails, the overflow is still dropped (deterministic degradation: a
     bounded window is preferable to an unbounded request the provider rejects).
     """
+    if len(history) <= settings.history_keep_messages:
+        return history  # inside the kept tail: nothing to drop (per-message snip bounds big singles)
     if len(history) <= settings.history_max_messages:
-        return history
+        total_chars = sum(len(str(m.get("content") or "")) for m in history)
+        if total_chars <= settings.prompt_max_chars:
+            return history
     overflow = history[: len(history) - settings.history_keep_messages]
     tail = history[len(history) - settings.history_keep_messages :]
 
@@ -245,12 +280,24 @@ async def compact_history(
         except Exception:  # noqa: BLE001 - compaction must not break the chat request
             summary = None
 
-    session_memory.record_event(
-        "compaction", {"dropped": len(overflow), "had_summary": bool(summary)}
-    )
+    payload = {"dropped": len(overflow), "had_summary": bool(summary)}
     if summary:
-        return [{"role": "system", "content": f"## Conversation summary\n{summary}"}] + tail
-    return tail
+        payload["summary"] = summary
+    session_memory.record_event("compaction", payload)
+    if not summary:
+        return tail
+
+    prior = await _get_compaction_summaries(session_factory, session_id)
+    coarse = "\n".join(s[:RECAP_PER_WINDOW_CHARS] for s in prior[-RECAP_MAX_WINDOWS:])
+    if coarse:
+        recap = (
+            "## Earlier conversation (coarse)\n"
+            f"{coarse}\n\n"
+            f"## Conversation summary\n{summary}"
+        )
+    else:
+        recap = f"## Conversation summary\n{summary}"
+    return [{"role": "system", "content": recap}] + tail
 
 
 async def load_session_messages(session_factory, session_id: UUID) -> list[dict]:

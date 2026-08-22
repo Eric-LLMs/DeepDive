@@ -8,6 +8,8 @@ Standard prompt layout (aligned with the cache-boundary spec):
 
 - ``STATIC_PREFIX`` — SOUL.md identity + the compact tool catalog + the compressed skill
   catalog (byte-identical across requests → the provider reuses its prefix cache).
+- ``PROJECT_CONTEXT`` — CLAUDE.md / AGENTS.md project conventions (stable per project; empty
+  when none are present, in which case the zone renders nothing).
 - ``DYNAMIC_SUFFIX`` — the session memory brief (loaded once per run via ``begin_session``)
   plus any ``agent.inject()`` content; only this segment is re-rendered per step.
 
@@ -29,6 +31,7 @@ from agent.system_prompt import (
     HARNESS_IDENTITY_ORDER,
     MEMORY_ORDER,
     PERSONA_ORDER,
+    PROJECT_CONTEXT_ORDER,
     SKILLS_ORDER,
     CacheBoundaryAssembler,
     PromptZone,
@@ -52,6 +55,7 @@ class AgentKernel:
         runtime: ToolRuntime,
         *,
         soul: str = "",
+        project_context: str = "",
         memory: MemoryService | None = None,
         skills: SkillRegistry | None = None,
         sandbox: Sandbox | None = None,
@@ -70,7 +74,7 @@ class AgentKernel:
 
         self._register_core_tools()
         self._install_guard()
-        self._assemble_sections(soul=soul)
+        self._assemble_sections(soul=soul, project_context=project_context)
 
         self.loop = ReactLoopAgent(
             llm=llm,
@@ -94,9 +98,19 @@ class AgentKernel:
         """PreToolUse gate: sandbox denies high-risk tools the session lacks permission for."""
         self.runtime.guard(self.sandbox.guard())
 
-    def _assemble_sections(self, *, soul: str) -> None:
+    def _assemble_sections(self, *, soul: str, project_context: str = "") -> None:
         if soul:
             self.assembler.section("soul", PERSONA_ORDER, soul, zone=PromptZone.STATIC_PREFIX)
+
+        # Project conventions (CLAUDE.md / AGENTS.md) sit in their own stable zone; they become
+        # part of the snapshot_key identity so project rules are part of the prefix-cache contract.
+        if project_context:
+            self.assembler.section(
+                "project_context",
+                PROJECT_CONTEXT_ORDER,
+                project_context,
+                zone=PromptZone.PROJECT_CONTEXT,
+            )
 
         def tool_index(context: dict) -> str:
             index = self._catalog.render_index()
@@ -140,14 +154,20 @@ class AgentKernel:
 
         Computed once per run (cached in ``self._recall_hits``, reset in :meth:`run`), so
         per-step ``refresh_dynamic`` reuses it instead of hitting the recall channels again.
+        Recall is gated by ``MemoryService.should_recall`` (OpenClaw Lane-2 style): the
+        expensive RRF query only runs on memory-seeking turns; every turn still gets the
+        always-on Lane-1 ``MEMORY.md`` brief.
         """
         if self.memory is None:
             return ""
         if self._recall_hits is None:
             query = (context.get("user_msg") or "").strip()
-            self._recall_hits = (
-                await self.memory.recall_all(query, self.config.recall_top_k) if query else []
-            )
+            if query and self.memory.should_recall(query):
+                self._recall_hits = await self.memory.recall_all(
+                    query, self.config.recall_top_k
+                )
+            else:
+                self._recall_hits = []
         if not self._recall_hits:
             return ""
         lines = "\n".join(f"- {h.content}" for h in self._recall_hits)

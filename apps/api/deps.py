@@ -20,6 +20,7 @@ from agent.fs_tools import register_fs_tools
 from agent.kernel import AgentKernel, KernelConfig
 from agent.memory.retrieval import RRFMemoryRetriever
 from agent.memory.service import MemoryService
+from agent.project_context import read_project_context
 from agent.sandbox import Sandbox
 from api.tools import register_builtin_tools
 from core.application.drive_service import DriveService
@@ -105,6 +106,11 @@ def _agent() -> AgentKernel:
         llm,
         runtime,
         soul=soul,
+        project_context=read_project_context(
+            settings.workspace_dir,
+            files=settings.project_context_files,
+            max_chars=settings.project_context_max_chars,
+        ),
         memory=memory,
         skills=skills,
         sandbox=sandbox,

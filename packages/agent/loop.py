@@ -21,6 +21,7 @@ from agent.runtime import ToolRuntime
 from agent.sessions import SessionLog
 from agent.system_prompt import CacheBoundaryAssembler, PromptAssembly, SystemPrompt, render_prompt
 from agent.tool_gateway import ToolGateway
+from core.config import settings
 
 
 class AgentLLMPort(Protocol):
@@ -225,7 +226,7 @@ class ReactLoopAgent:
                 tools = self._step_tools(context, assembly)
 
                 # One streamed LLM call: forward reasoning/answer deltas as they arrive.
-                request = [{"role": "system", "content": system}] + messages
+                request = [{"role": "system", "content": system}] + self._snip_messages(messages)
                 content = ""
                 tool_calls: list[dict] = []
                 step_usage: dict[str, int] | None = None
@@ -309,7 +310,7 @@ class ReactLoopAgent:
         Returns ``(finished, usage)`` where ``usage`` is the token counts from this step's
         LLM call (``None`` when the port reported none).
         """
-        request = [{"role": "system", "content": system}] + messages
+        request = [{"role": "system", "content": system}] + self._snip_messages(messages)
         resp = await self.llm.chat(request, tools=tools, model=model, base_url=base_url, api_key=api_key)
         tool_calls = resp.get("tool_calls") or []
         usage = resp.get("usage")
@@ -387,6 +388,29 @@ class ReactLoopAgent:
     async def _persist_message(self, session_memory: Any | None, role: str, text: str) -> None:
         if session_memory is not None and text:
             await session_memory.append_message(role, text)
+
+    @staticmethod
+    def _snip(content: str) -> str:
+        """Cap a single message's content for the request (the persistence copy stays raw)."""
+        cap = settings.prompt_message_max_chars
+        if cap > 0 and len(content) > cap:
+            return content[: cap - 1].rstrip() + "…(truncated)"
+        return content
+
+    @classmethod
+    def _snip_messages(cls, messages: list[dict]) -> list[dict]:
+        """Shallow copies of messages with str ``content`` capped for the request.
+
+        Only the request snapshot is trimmed; ``messages`` (the source of truth for persistence
+        and history) keeps full content, so oversized tool outputs never bloat the LLM request
+        but are still stored verbatim.
+        """
+        return [
+            {**m, "content": cls._snip(m["content"])}
+            if isinstance(m.get("content"), str)
+            else m
+            for m in messages
+        ]
 
     @staticmethod
     def _tool_content(result: ToolExecutionResult) -> str:

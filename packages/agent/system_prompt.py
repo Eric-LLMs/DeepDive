@@ -25,6 +25,7 @@ from enum import Enum
 # Order conventions (matching Cordis's system-prompt ordering).
 PERSONA_ORDER = 0
 HARNESS_IDENTITY_ORDER = -100
+PROJECT_CONTEXT_ORDER = -90
 TOOL_GUIDANCE_ORDER = 100
 MEMORY_ORDER = 200
 SKILLS_ORDER = 250
@@ -47,7 +48,9 @@ class PromptZone(Enum):
     DYNAMIC_SUFFIX = "dynamic_suffix"
 
 
-# Fixed token-position marker between the stable head and the dynamic suffix.
+# Internal-only separator marking the split between the stable head and the dynamic suffix.
+# Kept as a constant for the zone partition's identity, but never rendered into the prompt —
+# ``_render_zoned`` joins the zones with plain newlines so the literal never reaches the model.
 CACHE_BOUNDARY = "\n\n<CACHE_BOUNDARY/>\n\n"
 
 
@@ -277,23 +280,30 @@ def _interpolate(assembly: PromptAssembly, text: str) -> str:
 
 
 def _render_zoned(assembly: PromptAssembly) -> str:
-    """Join the stable head and the dynamic suffix around the cache boundary marker."""
+    """Join the stable head and the dynamic suffix with plain newlines.
+
+    The ``CACHE_BOUNDARY`` marker is an internal-only separator for the zone partition; it is
+    deliberately not rendered — the model should never see it. The stable head and the dynamic
+    suffix are joined with ``"\\n\\n"`` so the token-position split still holds for the provider's
+    prefix cache without leaking a markup literal into the prompt.
+    """
     stable = "\n\n".join(p for p in (assembly.static_prefix, assembly.project_context) if p)
     stable = _interpolate(assembly, stable)
     dynamic = _interpolate(assembly, assembly.dynamic_suffix)
     if not dynamic:
         return stable
     if stable:
-        return stable + CACHE_BOUNDARY + dynamic
+        return stable + "\n\n" + dynamic
     return dynamic
 
 
 def render_prompt(assembly: PromptAssembly) -> str:
     """Render the assembled sections into the final system prompt.
 
-    Zone-partitioned assemblies (from :class:`CacheBoundaryAssembler`) join static +
-    project with a fixed cache-boundary marker before the dynamic suffix; legacy
-    assemblies fall back to the flat join. ``{{name}}`` variables interpolate everywhere.
+    Zone-partitioned assemblies (from :class:`CacheBoundaryAssembler`) join static + project
+    with the dynamic suffix via plain newlines (the ``CACHE_BOUNDARY`` marker is an internal
+    separator only and never appears in the output); legacy assemblies fall back to the flat
+    join. ``{{name}}`` variables interpolate everywhere.
     """
     if assembly.static_prefix or assembly.project_context or assembly.dynamic_suffix:
         return _render_zoned(assembly)

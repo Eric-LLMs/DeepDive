@@ -19,7 +19,7 @@
 | Retrieval | RAG pipeline (rewrite → recall → RRF → rerank); `in_process` default, gRPC service available |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
 | Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs` |
-| Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + proactive recall + RRF recency weighting + history compaction (sync LLM summary at `/chat`) + 30-day audit-event retention |
+| Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
 | Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload) |
@@ -166,9 +166,10 @@ kernel wires five pieces around a **`ReactLoopAgent`** step loop:
 - a **cache-boundary prompt** (`CacheBoundaryAssembler`) — three zones whose stable head is
   byte-identical across requests so the provider reuses its prefix cache;
 - **deferred tool loading** (`ToolGateway`) — the prompt carries a compact catalog + the
-  `tool_search` meta-tool; full schemas are mounted on demand;
+  `tool_search` meta-tool; matched tools mount into the visible array as stable `name +
+  description` stubs (defer_loading style), full schemas riding in the search result;
 - **dual-track memory** (`MemoryService`) — PG tsvector + pgvector recall fused by RRF, exposed
-  as `memory_search` / `memory_save` tools (writes need human confirmation);
+  as `memory_search` / `memory_save` tools (guardrailed, READ-classified);
 - a **skill catalog** — SKILL.md skills advertised as a one-line index, body lazy-loaded via the
   `skill` meta-tool;
 - a **read-only sandbox** (`Sandbox`) — a monotonic permission gate (READ / WRITE / NETWORK) that
@@ -221,7 +222,12 @@ persisted**, keeping the recall corpus clean.
 
 When built through `AgentKernel`, each step's model-visible tool array comes from
 `ToolGateway.visible_schemas(context)` (core resident tools + whatever `tool_search` has mounted +
-any scope allowlist, minus the denylist). The prompt's dynamic suffix is re-rendered per step via
+any scope allowlist, minus the denylist). Stable tools (core + allowlisted) carry full schemas;
+mounted tools appear as **deferred-loading stubs** (name + rich description, empty parameter
+shape) so the cached array stays small and byte-stable across steps — the full parameter schema
+reaches the model through the `tool_search` result instead. Each LLM call also applies a
+**per-message snip** (`settings.prompt_message_max_chars`) to the request snapshot only; the
+persistence copy keeps full content. The prompt's dynamic suffix is re-rendered per step via
 `CacheBoundaryAssembler.refresh_dynamic(context)`; if it is unchanged from the previous step the
 system message is not resent, and the byte-stable static head is reused as-is.
 
@@ -233,7 +239,7 @@ Sections register with an `order` plus a `zone` and merge ascending within it. T
 | zone | content | stability |
 |---|---|---|
 | `PromptZone.STATIC_PREFIX` | SOUL.md identity (`data/soul.md`) + compact tool catalog + compressed skill catalog | byte-identical across requests → the provider reuses its prefix cache |
-| `PromptZone.PROJECT_CONTEXT` | CLAUDE.md / AGENTS.md project rules | stable per project |
+| `PromptZone.PROJECT_CONTEXT` | the first existing `CLAUDE.md` / `AGENTS.md` under `settings.workspace_dir` (read by `read_project_context`, capped at `settings.project_context_max_chars`) | stable per project; empty when absent |
 | `PromptZone.DYNAMIC_SUFFIX` | per-step session memory brief + any `inject()` content | re-rendered every step |
 
 `assemble()` returns a `PromptAssembly {static_prefix, project_context, dynamic_suffix, tools,
@@ -244,20 +250,48 @@ variables}`; the static/project render is cached, and only the dynamic suffix is
   (aligned with `agent.inject()`); cleared on the next `begin_session()`.
 - `snapshot_key()` — `sha256(static + project)[:16]`; the observable identity of the stable head,
   making prefix-cache hit rate measurable.
-- `render_prompt(assembly)` — joins the zones with a fixed `CACHE_BOUNDARY` marker
-  (`"\n\n<CACHE_BOUNDARY/>\n\n"`) between the stable head and the dynamic suffix.
+- `render_prompt(assembly)` — joins the stable head and the dynamic suffix with plain newlines.
+  The `CACHE_BOUNDARY` marker (`"\n\n<CACHE_BOUNDARY/>\n\n"`) is an **internal-only separator**:
+  it marks the token-position split for the prefix cache but is deliberately **never rendered**
+  into the prompt, so the model never sees the literal.
 
 A section's text may be static or an async callable over the assemble context (used for on-demand
 memory/skill retrieval). `{{name}}` placeholders interpolate from registered variables. The legacy
 flat `SystemPrompt` (no zones, no boundary) still renders for backward compatibility.
+
+The **project context loader** (`agent/project_context.py::read_project_context`) reads the first
+existing convention file (`CLAUDE.md` preferred over `AGENTS.md`) under the agent's workspace and
+caps it at `settings.project_context_max_chars`; the kernel registers it into
+`PromptZone.PROJECT_CONTEXT`, so project rules become part of `snapshot_key`'s cache identity and
+reach the model on every turn. When no convention file exists the zone renders nothing, keeping the
+prompt byte-identical to the no-context case.
+
+The **compression pipeline** bounds the prompt at two levels: per-message **snip** — the loop caps
+each message's content to `settings.prompt_message_max_chars` when building the LLM request (the
+persistence copy stays raw); and **token-aware autocompact** — `compact_history` also fires on a
+total-window character budget (`settings.prompt_max_chars`), so a few oversized messages trigger
+compaction even below the message-count threshold.
+
+The README's *Prompt* diagram ([images/prompt-architecture.png](../docs/images/prompt-architecture.png))
+visualizes the same contract end to end — input compaction, the three cache-boundary zones feeding
+a stable head, `render_prompt` producing the snapshot key, and the per-step process (snip → LLM
+request → `refresh_dynamic` / visible-tool stubs).
 
 ### 5.4 Memory, skills, sessions
 
 - **Memory** — dual-track, orchestrated by `MemoryService`:
   - **Long-term file memory** — `MemoryStore` protocol (`load`/`save`/`list`/`search`) +
     `FileMemoryStore` (claude-code memdir style: `MEMORY.md` index + one frontmatter `.md` per
-    memory, description-weighted keyword recall). `Memory` records carry a `type` in
-    {`user`,`feedback`,`project`,`reference`} and a staleness caveat via `age_days`.
+    memory). `Memory` records carry a `type` in {`user`,`feedback`,`project`,`reference`},
+    a **staleness caveat** via `age_days`, an **`importance`** score (1–10, default 5), and a
+    **`status`** (`active` | `superseded`) with **`supersedes`** linking a replacement to its
+    predecessor. Keyword recall is **importance-weighted** (`points × importance`), so curated
+    high-salience notes surface ahead of incidental ones. `user`-type memories are the directive
+    user model (write imperative `Always …` / `Never …` / `Prefer …` lines); saving with
+    `supersedes` marks the old memory `status: superseded`, drops it from the index and recall,
+    and keeps the file on disk as an audit trail — new values **supersede in place**, so a stale
+    preference never resurface alongside its replacement. Files written before these fields
+    existed parse with defaults.
   - **Session memory** — PostgreSQL-backed recall (`core/infrastructure/memory_retrieval.py`):
     `PgKeywordRecaller` (tsvector `to_tsvector('english', text)`, deterministic, no vectors —
     `fts_config` is a constructor param so zhparser/jieba can be swapped in for CJK) +
@@ -268,10 +302,15 @@ flat `SystemPrompt` (no zones, no boundary) still renders for backward compatibi
     toward newer messages, so RRF structures the base ranking and recency breaks ties.
   - **Memory as tools** — `memory_search` (RRF-fused recall) and `memory_save` (guardrailed
     note-writing: kebab-case key, non-empty content capped at `MEMORY_NOTE_MAX_CHARS`, `type`
-    restricted to the closed taxonomy; READ-classified so it writes only the local memdir without
-    weakening the session's READ-only posture). At `begin_session()` the `MEMORY.md` head is
-    loaded as the dynamic-suffix session brief, and **proactive recall** injects the top
+    restricted to the closed taxonomy, `importance` clamped to 1–10, optional `supersedes`;
+    READ-classified so it writes only the local memdir without weakening the session's READ-only
+    posture). At `begin_session()` the `MEMORY.md` head is loaded as the dynamic-suffix session
+    brief (Lane-1, always on), and **proactive recall** (Lane-2) injects the top
     `MEMORY_RECALL_TOP_K` hits for the user's message into the suffix (computed once per run).
+    Lane-2 is **gate-controlled**: `MemoryService.should_recall` is a cheap lexical prefilter
+    (memory-seeking trigger words in `MEMORY_RECALL_TRIGGER_WORDS`, or queries at/below
+    `MEMORY_RECALL_MIN_LEN` chars that are elliptical) — the expensive RRF query only runs on
+    memory-seeking turns; every turn still gets the always-on Lane-1 brief.
 - **Skills** — `Skill` (Markdown instructions + frontmatter + keywords) registered in a
   `SkillRegistry` (`register` / `relevant(query)` keyword scoring / `from_dir` for `*.skill.md`).
   `SkillCatalog.render()` emits a compressed one-line directory (name + truncated description,
@@ -283,9 +322,15 @@ flat `SystemPrompt` (no zones, no boundary) still renders for backward compatibi
   `HISTORY_MAX_MESSAGES` are truncated to the recent `HISTORY_KEEP_MESSAGES`, the dropped prefix
   is folded into a conversation summary (reusing the session summary when one exists, otherwise a
   synchronous LLM summary via the same prompt as `finalize_session`), injected as a leading
-  system message, and recorded as a `compaction` session event. If the summary call fails the
-  overflow is still dropped — a bounded window is preferred to an unbounded request. A fresh
-  session is also **auto-titled** at creation from the first user message
+  system message, and recorded as a `compaction` session event whose payload **persists the
+  summary**. The injected recap is **hierarchical**: coarse summaries of prior compaction windows
+  (each truncated, up to the latest 5) render as `## Earlier conversation (coarse)` ahead of the
+  current window's `## Conversation summary` — L0 raw messages are never deleted, L1 is the
+  latest window, L2 is the coarse prior-window recap, and L3 is the cross-session file memory —
+  so distant turns are remembered in broad strokes while the token window stays flat. If the
+  summary call fails the overflow is still dropped — a bounded window is preferred to an
+  unbounded request. A fresh session is also **auto-titled** at creation from the first user
+  message
   (`create_session`, `sessions.title`, 40-char cap). `GET /sessions?q=` filters a user's sessions
   by **content** — a case-insensitive `ILIKE` over title, summary, and message text
   (`list_sessions` outer-joins `messages` and de-dups) — and each result carries a `snippet`
@@ -367,9 +412,12 @@ DeepDive uses a small `EventBus` + `SessionLog` (append-only session events) and
 - `ToolVisibilityPolicy` — per-request scope: `allow(name)` / `deny(name)` / `present_as(mode,
   names)`, each returning a disposer for rollback; `deny` beats both `allow` and a mounted tool.
 - `ToolGateway` — `core_schemas()` (resident tools: `tool_search` / `skill` / `memory_search` /
-  `memory_save`) + `visible_schemas(context)` = core ∪ mounted ∪ scope-allowlist − denylist;
-  `mount(name)` pulls a tool's full schema into the visible set after the model asked for it via
-  `tool_search`. The mounted set resets per session (`reset_session`).
+  `memory_save`) + `visible_schemas(context)` = core ∪ mounted ∪ scope-allowlist − denylist.
+  Stable tools (core + allowlisted) carry full schemas; a `mount(name)` after `tool_search` adds a
+  tool as a **defer_loading stub** — name + rich description with an empty parameter shape — so the
+  cached tools array stays small and byte-stable, and the full schema reaches the model through the
+  `tool_search` result (`schema_of(name)` → `parameters`). The mounted set resets per session
+  (`reset_session`).
 
 **`sandbox.py`** — `Sandbox` holds `SandboxRule(permission, decision)` and exposes a monotonic
 `guard()` (deny-only) used as the runtime's pre-execute gate: it computes the session's permitted
@@ -456,6 +504,9 @@ immediately; the frontend polls `GET /jobs/{id}` until the worker marks the job
 (`queued → running → succeeded | failed`); Redis only carries the work to the worker (arq).
 Chat sessions finalize the same way: the gateway flushes session events synchronously on
 `close()`, then enqueues `session_finalize` to backfill message embeddings and write the summary.
+Finalize is **failure-robust**: the summary and auto-title are cosmetic — if either LLM call
+fails, finalize still closes the session and persists embeddings (a `logger.warning` is the only
+signal), so a dead provider can never strand a session in an open/unsaved state.
 A daily retention cron (`prune_session_events`, registered in `WorkerSettings.cron_jobs`) sweeps
 `session_events` older than `SESSION_EVENTS_RETENTION_DAYS` (30); only the audit log is purged —
 `messages` (the recall corpus) and `sessions` (summaries) are deliberately kept.
@@ -505,11 +556,13 @@ rewrite → multi-recall → RRF fusion → rerank
 | Observe results without blocking | `EventBus.observe("tools/result", ...)` (serial) / `emit` (fire-and-forget) |
 | Swap retrieval provider | `Context.provide("retrieval", …)` + `settings.retrieval_mode` |
 | Session extension points | `agent/session-start` / `agent/session-end` observers in the loop |
-| Stable prompt head for prefix cache | `CacheBoundaryAssembler` zones + `CACHE_BOUNDARY` marker + `snapshot_key()` |
-| Load a tool schema on demand | `tool_search` meta-tool → `ToolGateway.mount(name)` |
+| Stable prompt head for prefix cache | `CacheBoundaryAssembler` zones (internal `CACHE_BOUNDARY` separator, never rendered) + `snapshot_key()` |
+| Load a tool schema on demand | `tool_search` meta-tool → `ToolGateway.mount(name)` (defer_loading stub) + `schema_of(name)` in the result |
+| Inject project conventions | `read_project_context` → `PromptZone.PROJECT_CONTEXT` (CLAUDE.md / AGENTS.md, capped) |
+| Bound the prompt window | per-message snip (`prompt_message_max_chars`) + char-budget autocompact (`prompt_max_chars`) |
 | Scope tool visibility per request | `ToolVisibilityPolicy` `allow` / `deny` / `present_as` (disposers) |
 | Gate a tool by session permission | `Sandbox.guard()` + `ToolPermission` (`classify_permissions`) |
-| Recall / write memory as a tool | `memory_search` / `memory_save` (the latter requires `confirmed=True`) |
+| Recall / write memory as a tool | `memory_search` / `memory_save` (guardrailed, READ-classified; importance + supersede) |
 | Lazy-load a skill body | `skill` meta-tool over `SkillCatalog.render()` compressed index |
 
 ## 12. Data Model
@@ -971,3 +1024,113 @@ sign-in / profile need the FastAPI gateway on `localhost:8300`.
     and profile/avatar editing are modal dialogs against `/auth/*`.
   - **Settings** — a modal with five tabs: **Appearance** (theme), **Window & Display** (font
     size), **Updates** (GitHub release check), **Help & Feedback**, and **About**.
+
+## 16. Prompt Module
+
+This chapter gives a single, systematic overview of the prompt module — the three concerns the
+kernel wires into every LLM request: **cache-boundary assembly** (a byte-stable head the provider
+reuses in its prefix cache), **compression** (a bounded, token-aware window), and **deferred tool
+loading** (a stable tool set whose full schemas ride below the cache boundary). The detail lives
+in the component sections — §5.3 (assembler internals), §5.2 (loop integration), §6.5 (stub
+permissions & sandbox) — and the README's *Prompt* diagram visualizes the whole flow end to end.
+
+### 16.1 Goals
+
+1. **Prefix-cache reuse** — the stable part of the system prompt is byte-identical across
+   requests and steps, so providers hit their KV-cache prefix instead of re-processing the head.
+2. **A bounded prompt window** — history is capped on both message count and total characters,
+   and individual oversized messages are trimmed before they reach the request.
+3. **A stable tool set** — the model-visible `tools` array never churns; new tools appear as
+   stable stubs, never as freshly-injected full schemas.
+4. **Measurable cache identity** — `snapshot_key()` exposes the stable head's hash so cache
+   effectiveness is observable rather than assumed.
+
+### 16.2 Three-zone cache-boundary assembly
+
+`CacheBoundaryAssembler` (a `SystemPrompt` subclass) partitions sections into three `PromptZone`s,
+merged ascending by `order` within each zone:
+
+| zone | content | stability |
+|---|---|---|
+| `STATIC_PREFIX` | SOUL.md identity (`soul` section, `PERSONA_ORDER=0`) + compact tool catalog + compressed skill catalog (`HARNESS_IDENTITY_ORDER=-100` / `SKILLS_ORDER=250`) | byte-identical across requests → prefix-cache reuse |
+| `PROJECT_CONTEXT` | workspace `CLAUDE.md` / `AGENTS.md` conventions (`PROJECT_CONTEXT_ORDER=-90`) | stable per project; renders nothing when absent |
+| `DYNAMIC_SUFFIX` | session memory brief + proactive recall (`MEMORY_ORDER=200` / `+10`) + `inject()` content | re-rendered per step |
+
+`assemble()` resolves the static and project zones once and caches them
+(`_cached_static` / `_cached_project`), then renders the dynamic suffix. `refresh_dynamic(context)`
+recomputes only the dynamic suffix on each loop step — its sections (memory brief, recall) plus any
+injected content — so an unchanged suffix means the system message is not re-sent and the cached
+head is reused. Recalled memory is gated by `MemoryService.should_recall` (Lane-2); the Lane-1
+memory brief always injects.
+
+### 16.3 Rendering and cache identity
+
+`assemble()` returns a `PromptAssembly {static_prefix, project_context, dynamic_suffix, tools,
+variables}`; `render_prompt(assembly)` joins the stable head (`static_prefix + project_context`)
+and the dynamic suffix with plain `"\n\n"`. The `CACHE_BOUNDARY` constant (`"\n\n<CACHE_BOUNDARY/>\n\n"`)
+is an **internal-only** separator: it documents the token-position split between head and suffix
+but is deliberately **never rendered** — the model never sees the literal. `snapshot_key()` returns
+`sha256(static + "\n\n" + project)[:16]`, the observable identity of the stable head, so the
+project-context zone is part of the prefix-cache contract.
+
+### 16.4 Project context loader
+
+`agent/project_context.py::read_project_context(workspace, *, files, max_chars)` reads the first
+existing convention file in order (`CLAUDE.md` preferred over `AGENTS.md`, Claude Code precedence)
+under the agent's workspace, caps it at `settings.project_context_max_chars` (appending a
+`…(truncated)` marker), and returns `""` when none exists. The kernel registers a non-empty result
+into `PromptZone.PROJECT_CONTEXT`; an empty zone renders nothing, keeping the prompt byte-identical
+to the no-context case. The loader runs in `apps/api/deps.py` and feeds the value into the kernel,
+so project rules reach the model on every turn and feed `snapshot_key()`.
+
+### 16.5 Compression pipeline
+
+The prompt window is bounded at two levels:
+
+- **Per-message snip** — the loop (`_snip` / `_snip_messages`) caps each message's content at
+  `settings.prompt_message_max_chars` when building the LLM request. It trims **only the request
+  snapshot** (a shallow copy); the `messages` list the persistence layer keeps stays raw.
+- **Token-aware autocompact** — `compact_history` fires when the message count exceeds
+  `settings.history_max_messages`, **or** when it sits between `history_keep_messages` and the max
+  while the total character budget `settings.prompt_max_chars` is exceeded. It keeps the latest
+  `history_keep_messages` and folds the overflow into a hierarchical recap (L2 prior-window coarse
+  summaries + L1 current summary, injected as a leading system message). Histories at or below
+  `history_keep_messages` always pass through — nothing to drop, and oversized singles are handled
+  by the snip. If the summary call fails the overflow is still dropped (bounded window beats an
+  unbounded request).
+
+### 16.6 Deferred tool loading (defer_loading stubs)
+
+`ToolGateway.visible_schemas(context)` computes the model-visible tool set as
+`core ∪ mounted ∪ scope-allowlist − denylist`, in deterministic registration order. Stable tools
+(core + scope-allowlisted) carry **full schemas**; deferred tools mounted mid-run appear as stable
+`defer_loading` stubs — `{name, description (≤ STUB_DESC_MAX=400), parameters: {properties: {}}}` —
+so the cached `tools` array stays byte-stable across steps. A stub's full schema reaches the model
+through the `tool_search` **result message** (below the cache boundary): the builtin `tool_search`
+scores the catalog (name hits beat blurb hits), `mount()`s each match into the visible set, and
+returns `parameters` from `gateway.schema_of(name)`. Execution is unaffected: `_dispatch` resolves
+the tool by name from the runtime, so calling a stub runs the real tool, still behind the `Sandbox`
+permission guard (a READ-only session cannot gain write tools by mounting them).
+
+### 16.7 Per-step process
+
+1. **Session start** — `kernel.run` begins the memory session; `ReactLoopAgent.run` then calls
+   `assembler.begin_session()` (clearing prior `inject()` content) and `gateway.reset_session()`
+   (clearing the mounted tool set).
+2. **Assemble** — the three zones render; the static/project head is cached once.
+3. **Compact** — `compact_history` bounds the history window by count and character budget.
+4. **Snip** — the request snapshot is built as `system + snipped messages`; persistence keeps full text.
+5. **Call** — the LLM sees `render_prompt(assembly)` plus the visible tools (full core schemas +
+   stubs); a tool result may trigger `tool_search` → mount → richer visible set next step.
+6. **Refresh** — `refresh_dynamic(context)` recomputes only the suffix; an unchanged suffix means
+   the system message is not re-sent and the head is reused.
+7. **Stream** — `run_stream` follows the same pipeline (assemble → snip → call → refresh) per step.
+
+### 16.8 Configuration
+
+| setting | default | role |
+|---|---|---|
+| `prompt_max_chars` | `120_000` | total-window character budget for token-aware autocompact |
+| `prompt_message_max_chars` | `8_000` | per-message snip cap on the request snapshot |
+| `project_context_files` | `["CLAUDE.md", "AGENTS.md"]` | convention files tried in order |
+| `project_context_max_chars` | `8_000` | cap on the project-context zone, with truncation marker |

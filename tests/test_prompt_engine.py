@@ -1,7 +1,8 @@
 """Tests for the cache-boundary prompt engine (PromptZone + CacheBoundaryAssembler).
 
 Verifies the three-zone partition, byte-identical stable head across assembles, durable
-``inject()`` across steps, and the fixed cache-boundary marker position.
+``inject()`` across steps, and that the internal ``CACHE_BOUNDARY`` separator never leaks
+into the rendered prompt.
 """
 
 from agent.system_prompt import (
@@ -35,9 +36,8 @@ async def test_static_head_byte_identical_across_assembles():
     second = await asm.assemble({})
     key2 = asm.snapshot_key()
 
-    head1 = render_prompt(first).split(CACHE_BOUNDARY)[0]
-    head2 = render_prompt(second).split(CACHE_BOUNDARY)[0]
-    assert head1 == head2
+    assert render_prompt(first) == "You are DeepDive.\n\nUse tools."
+    assert render_prompt(first) == render_prompt(second)  # stable head is byte-identical
     assert key1 == key2
     assert len(key1) == 16  # sha256 hex, truncated for the prefix-cache identity
 
@@ -48,14 +48,15 @@ async def test_only_dynamic_changes_per_step():
     asm.section("memory", 20, lambda ctx: ctx.get("recall", ""), zone=PromptZone.DYNAMIC_SUFFIX)
 
     first = await asm.assemble({"recall": "alpha"})
-    stable_head = render_prompt(first).split(CACHE_BOUNDARY)[0]
+    assert first.static_prefix == "identity"  # stable head, independent of the dynamic suffix
+    assert render_prompt(first) == "identity\n\nalpha"
 
     second = await asm.refresh_dynamic({"recall": "beta"})
     third = await asm.refresh_dynamic({"recall": "beta"})
 
     assert second == "beta"
     assert third == "beta"  # unchanged → loop skips re-sending the system prompt
-    assert render_prompt(first).split(CACHE_BOUNDARY)[0] == stable_head
+    assert first.static_prefix == "identity"  # head unchanged; only the suffix would differ
 
 
 async def test_inject_survives_across_steps_and_clears_on_new_session():
@@ -75,16 +76,17 @@ async def test_inject_survives_across_steps_and_clears_on_new_session():
     assert await asm.refresh_dynamic({}) == ""
 
 
-async def test_boundary_marker_sits_once_between_stable_and_dynamic():
+async def test_rendered_prompt_contains_no_boundary_marker():
     asm = CacheBoundaryAssembler()
     asm.section("soul", 0, "identity", zone=PromptZone.STATIC_PREFIX)
     asm.section("memory", 20, "dynamic", zone=PromptZone.DYNAMIC_SUFFIX)
 
     text = render_prompt(await asm.assemble({}))
 
-    assert text.count(CACHE_BOUNDARY) == 1
-    assert text.index(CACHE_BOUNDARY) > text.index("identity")
-    assert text.index(CACHE_BOUNDARY) < text.index("dynamic")
+    # the marker is an internal separator only; the model must never see it
+    assert CACHE_BOUNDARY not in text
+    assert text.index("identity") < text.index("dynamic")  # stable head precedes the suffix
+    assert text == "identity\n\ndynamic"
 
 
 async def test_legacy_flat_assembly_still_renders():

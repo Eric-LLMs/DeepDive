@@ -3,8 +3,10 @@
 With hundreds of registered tools, exposing every full schema each request bloats the
 prompt and churns the provider's prefix cache. Instead the model always sees a compact
 ``name + blurb`` catalog plus a handful of core resident tools, and calls ``tool_search``
-to pull the full schemas it needs — those are mounted into the model-visible ``tools``
-array for the following steps (out-of-band in the OpenAI function-calling request).
+to pull the tools it needs — those are mounted into the model-visible ``tools`` array as
+stable ``name + description`` stubs (defer_loading style), keeping the cached array small
+and byte-stable, while each tool's full schema reaches the model through the ``tool_search``
+result (below the cache boundary).
 """
 from __future__ import annotations
 
@@ -20,6 +22,11 @@ from agent.tools import ToolDefinition, ToolOutput, define_tool
 def _blurb(tool: ToolDefinition, max_chars: int = 120) -> str:
     desc = tool.description.replace("\n", " ").strip()
     return desc if len(desc) <= max_chars else desc[: max_chars - 1].rstrip() + "…"
+
+
+# Deferred-loading stub description cap. A stub's description is longer than the compact catalog
+# blurb so the model can form arguments; the full schema still arrives via the tool_search result.
+STUB_DESC_MAX = 400
 
 
 @dataclass(frozen=True)
@@ -189,19 +196,40 @@ class ToolGateway:
         return self._schemas_of(self._core)
 
     def visible_schemas(self, context: dict | None = None) -> list[dict]:
-        """core ∪ mounted ∪ scope-allowlist, minus denylist, in deterministic order."""
+        """core ∪ mounted ∪ scope-allowlist, minus denylist, in deterministic order.
+
+        Stable tools (core + scope-allowlisted) carry full schemas; deferred tools that were
+        mounted mid-run appear as stable ``name + description`` stubs with an empty parameter
+        shape. Once mounted, a stub never changes across steps, so the provider's prefix cache
+        stays warm — the full schema reaches the model through the ``tool_search`` result instead
+        of being injected into the cached tools array.
+        """
         context = context or {}
         names = set(self._core) | self._mounted | self.policy.allowlist(context)
         names -= self.policy.denylist(context)
-        ordered = [n for n in self._runtime_order() if n in names]
-        return self._schemas_of(ordered)
+        full = set(self._core) | self.policy.allowlist(context)
+        out: list[dict] = []
+        for name in self._runtime_order():
+            if name not in names:
+                continue
+            out.append(self._schemas_of([name])[0] if name in full else self._stub_schema(name))
+        return out
 
     def mount(self, name: str) -> bool:
-        """Lazily expose a tool's full schema (after the model asked for it)."""
+        """Lazily expose a tool after the model asked for it (via ``tool_search``).
+
+        Adds the tool as a deferred-loading stub to the visible set; the model can call it
+        directly next step, and the full schema travels in the ``tool_search`` result.
+        """
         if self._runtime.get(name) is None:
             return False
         self._mounted.add(name)
         return True
+
+    def schema_of(self, name: str) -> dict | None:
+        """The full tool schema (for the ``tool_search`` result), or ``None`` when unknown."""
+        tool = self._runtime.get(name)
+        return tool.schema() if tool is not None else None
 
     # ── internals ──
     def _schemas_of(self, names: Iterable[str]) -> list[dict]:
@@ -211,6 +239,19 @@ class ToolGateway:
             if tool is not None:
                 out.append({"type": "function", "function": tool.schema()})
         return out
+
+    def _stub_schema(self, name: str) -> dict:
+        """A deferred-loading stub: name + rich description, empty parameter shape."""
+        tool = self._runtime.get(name)
+        desc = _blurb(tool, STUB_DESC_MAX) if tool is not None else name
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
 
     def _runtime_order(self) -> list[str]:
         return [tool.name for tool in self._runtime.all()]
@@ -228,16 +269,24 @@ def tool_search_tool(catalog: ToolCatalog, gateway: ToolGateway) -> ToolDefiniti
         for hit in hits:
             gateway.mount(hit.name)
         return [
-            {"name": hit.name, "description": hit.blurb, "permissions": list(hit.permissions)}
+            {
+                "name": hit.name,
+                "description": hit.blurb,
+                "permissions": list(hit.permissions),
+                # the full parameter schema rides in the result message (below the cache
+                # boundary), so the cached tools array only ever carries stable stubs
+                "parameters": (gateway.schema_of(hit.name) or {}).get("parameters", {}),
+            }
             for hit in hits
         ]
 
     return define_tool(
         name="tool_search",
         description=(
-            "Search the tool catalog for tools relevant to your goal. The matches' full "
-            "schemas are loaded for subsequent steps, so you can call them directly. "
-            "Use this instead of guessing a tool's name or arguments."
+            "Search the tool catalog for tools relevant to your goal. Each match becomes "
+            "directly callable and its result includes the full parameter schema, so you can "
+            "call it with correct arguments on a later step. Use this instead of guessing a "
+            "tool's name or arguments."
         ),
         parameters={
             "type": "object",
