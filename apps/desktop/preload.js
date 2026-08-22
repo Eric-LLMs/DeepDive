@@ -10,6 +10,28 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   // Recursively list a directory into a file tree (bounded depth, filtered).
   readTree: (dir) => ipcRenderer.invoke("read-tree", dir),
 
+  // Pick a single file (for the File menu's "Add File to Workspace").
+  pickFile: () => ipcRenderer.invoke("pick-file"),
+
+  // Copy a file into the workspace folder (collision-safe): { ok, name, path } | { ok, error }.
+  copyIntoWorkspace: (src, destDir) => ipcRenderer.invoke("copy-into-workspace", { src, destDir }),
+
+  // Delete a file inside the open workspace: { ok, name } | { ok, error }.
+  deleteFile: (filePath, workspaceDir) =>
+    ipcRenderer.invoke("delete-file", { filePath, workspaceDir }),
+
+  // File menu → renderer: "Add File to Workspace" was clicked.
+  onAddFileToWorkspace: (cb) => { ipcRenderer.on("menu-add-file", () => cb()); },
+
+  // Help menu → renderer: open a specific settings tab ("help" | "about").
+  onOpenSettings: (cb) => { ipcRenderer.on("menu-settings", (_e, tab) => cb(tab)); },
+
+  // File menu → renderer: "Open Workspace" was clicked.
+  onOpenWorkspace: (cb) => { ipcRenderer.on("menu-open-workspace", () => cb()); },
+
+  // Tell the main process the open workspace's folder name (shown in the File menu).
+  setWorkspaceLabel: (name) => ipcRenderer.send("update-workspace-label", name),
+
   // Open a path with the OS default application.
   openExternal: (path) => ipcRenderer.invoke("open-external", path),
 
@@ -35,7 +57,8 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   findSubtitle: (videoPath) => ipcRenderer.invoke("find-subtitle", videoPath),
 
   // Open a file picker to choose a subtitle file manually; resolves to a path or null.
-  pickSubtitle: () => ipcRenderer.invoke("pick-subtitle"),
+  // startDir (optional) opens the dialog in that folder by default.
+  pickSubtitle: (startDir) => ipcRenderer.invoke("pick-subtitle", startDir),
 
   // Save a PNG screenshot (data URL) to a user-chosen location.
   saveScreenshot: (dataURL, defaultName) =>

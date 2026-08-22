@@ -300,7 +300,7 @@ function LoginPage({ onLogin }: { onLogin: (me: Me) => void }) {
   return (
     <div className="login-wrap">
       <div className="login-card">
-        <div className="login-logo">🧠 DeepDive</div>
+        <div className="login-logo"><img src="/deepdive.png" className="brand-logo" alt="DeepDive" /> DeepDive</div>
 
         {mode === "login" && (
           <form onSubmit={submit}>
@@ -525,7 +525,7 @@ function Sidebar({ page, onNavigate }: { page: Page; onNavigate: (p: Page) => vo
   ];
   return (
     <aside className="sidebar">
-      <div className="sidebar-brand">🧠 DeepDive</div>
+      <div className="sidebar-brand"><img src="/deepdive.png" className="brand-logo" alt="DeepDive" /> DeepDive</div>
       <hr />
       <nav>
         {items.map((it) => (
@@ -554,7 +554,7 @@ function Home() {
 
   return (
     <div>
-      <h1 style={{ marginTop: 0 }}>🧠 DeepDive Learning Assistant</h1>
+      <h1 style={{ marginTop: 0, display: "flex", alignItems: "center", gap: 8 }}><img src="/deepdive.png" className="brand-logo brand-logo-lg" alt="DeepDive" /> DeepDive Learning Assistant</h1>
       <h3 style={{ marginTop: 0 }}>Welcome to DeepDive</h3>
       <p className="muted">
         A domain-specific English learning tool tailored for your specific needs.

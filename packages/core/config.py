@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # ── Worker / jobs ──
     worker_concurrency: int = 10         # arq max concurrent jobs
     worker_job_timeout: int = 300        # arq per-job timeout (seconds)
+    # Audit-event retention: a daily cron purges session_events older than this many days.
+    # Only the audit log is swept; messages (the recall corpus) and sessions (summaries) stay.
+    session_events_retention_days: int = 30
+    retention_cron: str = "17 4 * * *"   # arq cron schedule for the purge (daily 04:17 local)
 
     # ── LLM (via LiteLLM gateway; the gateway routes the virtual model name) ──
     llm_api_key: str = ""
@@ -33,6 +37,9 @@ class Settings(BaseSettings):
     tts_api_key: str = "not-needed"   # Kokoro-FastAPI ignores auth; the openai SDK needs a non-empty key
     tts_model: str = "kokoro"
     tts_voice: str = "am_michael"
+    # Chinese voice (Kokoro zh pack, e.g. zm_yunxi / zf_xiaoni). Selected automatically
+    # when the input text contains CJK characters; the English voice is used otherwise.
+    tts_voice_zh: str = "zm_yunxi"
 
     # ── Embedding (TEI service) ──
     embedding_base_url: str = "http://localhost:18080"   # TEI /embed
@@ -73,7 +80,10 @@ class Settings(BaseSettings):
     skills_dir: Path = Path("data/skills")     # *.skill.md skills directory
     plugins_dir: Path = Path("data/plugins")   # third-party plugin directory (*/plugin.py)
     session_summary_enabled: bool = True       # generate an LLM summary on session close
-    memory_recall_top_k: int = 5               # vector recall count for the prompt memory section
+    memory_recall_top_k: int = 5               # proactive recall count for the prompt memory section
+    memory_note_max_chars: int = 4000          # memory_save content length cap (guardrail)
+    history_max_messages: int = 40             # chat history length that triggers compaction
+    history_keep_messages: int = 20            # most-recent messages kept after compaction
 
     # ── Auth ──
     jwt_secret: str = "change-me"

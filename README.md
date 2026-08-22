@@ -79,7 +79,7 @@ flowchart TB
 - **Agentic Kernel** (`AgentKernel`): a composition root wiring a cache-boundary prompt assembler, deferred tool loading, dual-track memory, a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop.
 - **Cache-Boundary Prompt**: the system prompt is partitioned into three zones — a byte-stable static prefix (SOUL.md + compact tool/skill catalog), project context, and a per-step dynamic suffix — separated by a fixed `<CACHE_BOUNDARY/>` marker, so the provider's prefix cache reuses the stable head across steps. `snapshot_key()` makes the cache identity measurable.
 - **Deferred Tool Loading**: the prompt carries only a compact `name + blurb` catalog plus the resident `tool_search` meta-tool; full tool schemas are mounted on demand into the visible tool set, keeping the prompt small at any tool count.
-- **Dual-Track Memory**: session recall fuses PostgreSQL tsvector (keyword) + pgvector (semantic) via RRF; when the embedding service is offline it degrades to tsvector-only — never a silent empty. `memory_search` / `memory_save` are tools; `memory_save` writes only with human confirmation.
+- **Dual-Track Memory**: session recall fuses PostgreSQL tsvector (keyword) + pgvector (semantic) via RRF, recency-weighted so newer messages win near-ties; when the embedding service is offline it degrades to tsvector-only — never a silent empty. `memory_search` / `memory_save` are tools; `memory_save` writes guardrailed notes (kebab-case key, length-capped content, closed type taxonomy) to the local memory directory while the session stays read-only. Proactive recall injects top hits for your question into the prompt, and long conversations are auto-compacted into an LLM summary (bounded token window).
 - **Skill Catalog**: skills (SKILL.md) are advertised as a one-line compressed index; the full instructions are lazy-loaded through the `skill` meta-tool.
 - **Read-Only Sandbox**: every tool call is gated by session permissions (READ / WRITE / NETWORK); file tools are rooted at the workspace dir and path escape is rejected. Writes and network access need an explicit grant or human approval.
 - **RAG Retrieval**: query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank.
@@ -138,6 +138,14 @@ flowchart TB
 - **Transactional Page Commits**: Commit all modifications on a single page with one click for high-speed bulk updates while maintaining data integrity.
 - **Global Operation Flow**: Perform global sorting across the entire database and save changes page-by-page.
 - **Self-Healing Logic**: Automatically deduplicates duplicate matches to keep the UI stable.
+
+### 🖥️ Desktop Workbench (Electron)
+- **Workspace file tree**: open any local folder as your workspace (the last one is restored on the next launch); add files from anywhere, delete with one click, and fuzzy-search the tree.
+- **Sessions search**: search your chat history by content — matching snippets are highlighted in the results.
+- **Multi-format viewer**: video (with subtitles), audio, images, PDF (with annotations), and text/code; Office files open in your OS default app. One-click video **screenshots** and **Generate PPT / Generate Book**.
+- **Subtitles**: a sibling `.srt`/`.vtt`/`.lrc` is auto-detected, or pick one manually; enable/disable and style it (size, color, background, position), and your settings are remembered.
+- **Streaming chat**: answers stream in with a collapsible **💭 thinking** panel; dock the chat to the bottom or side, or float it as a window.
+- **Native menus & settings**: everything you'd expect — open/switch workspaces, zoom & font size, fullscreen, Help & Feedback, About. ⚙️ Settings covers theme, display, updates, help, and about.
 
 ---
 
@@ -225,7 +233,7 @@ Then set `RETRIEVAL_MODE=grpc` in `.env` and restart the API:
 RETRIEVAL_MODE=grpc uvicorn apps.api.main:app --reload
 ```
 
-The `rag_search` tool now calls the retrieval service over gRPC instead of the in-process RAG pipeline — no tool code changes (the capability seam does the swap).
+With `RETRIEVAL_MODE=grpc` the `rag_search` tool routes through the retrieval service over gRPC — the capability seam swaps the provider, so no tool code changes.
 
 ### 10. Run the tests
 
@@ -246,8 +254,9 @@ Open http://localhost:5173. The Vite dev server proxies `/api`, `/audio`, and `/
 ### 12. Run the desktop workbench (Electron, optional)
 
 The desktop app is a standalone **learning workbench** with its own renderer (not the React web UI):
-a local folder tree, a multi-format viewer (video/audio/image/PDF/text with OS-default
-fallback for Office files), one-click video screenshots, and a chat pane.
+open a local folder as your workspace, browse a multi-format viewer (video with subtitles, audio,
+images, PDF with annotations, text/code, Office files), take video screenshots, and chat with
+streamed answers and a collapsible thinking panel.
 
 ```bash
 bash scripts/start_desktop.sh    # one-click: infra (postgres/redis) + backend + workbench
@@ -261,12 +270,13 @@ npm start                        # opens the workbench window
 infra + `uvicorn apps.api.main:app --port 8300` in the background if it is down (pid in
 `data/uvicorn.pid`), then opens the Electron window.
 
-The file tree, viewer, and video screenshot work **without the backend**. Chat, "生成 PPT /
-生成书" (media generation), and the ⚙️ Settings panel need the backend running on
-`localhost:8300` — the Electron main process forwards `/api`, `/audio`, and `/images` to it.
-⚙️ Settings opens a dropdown list (Account / Theme / Help): the login dialog supports **registering a
-new account** and **password reset**; once signed in you can edit your profile and avatar from the
-Account menu. Guests can also chat anonymously (limited to `guest_daily_limit` per day).
+The file tree, viewer, video screenshots, and subtitles work **without the backend**. Chat
+(streaming), session history & search, "生成 PPT / 生成书" (media generation), and sign-in / profile
+need the backend running on `localhost:8300` — the Electron main process forwards `/api`, `/audio`,
+and `/images` to it. ⚙️ Settings covers **theme**, **font size**, **update checks**, **help**, and
+**about**. The login dialog supports **registering a new account** and **password reset**; once
+signed in you can edit your profile and avatar. Guests can also chat anonymously (limited to
+`guest_daily_limit` per day).
 
 ### One-click launchers (pick by environment)
 
@@ -292,11 +302,15 @@ The default `admin` / `admin` account is seeded on first boot and ready to sign 
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | `""` / `http://localhost:4000/v1` / `deepdive-chat` | legacy default client (LiteLLM gateway); active channels + keys live in the DB and are managed in the admin console |
 | `LLM_UPSTREAM_MODEL` / `LLM_UPSTREAM_BASE` / `LLM_UPSTREAM_KEY` | `openai/gpt-4o-mini` / `https://api.openai.com/v1` / `sk-xxx` | real upstream LLM (consumed by the gateway container) |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `http://localhost:18080` / `BAAI/bge-m3` / `1024` | TEI embedding service |
-| `TTS_BASE_URL` / `TTS_MODEL` / `TTS_VOICE` | `http://localhost:18880/v1` / `kokoro` / `am_michael` | Kokoro-FastAPI TTS service |
+| `TTS_BASE_URL` / `TTS_MODEL` / `TTS_VOICE` / `TTS_VOICE_ZH` | `http://localhost:18880/v1` / `kokoro` / `am_michael` / `zm_yunxi` | Kokoro-FastAPI TTS service (auto-switches to the Chinese voice for CJK text) |
 | `RETRIEVAL_MODE` / `RETRIEVAL_GRPC_ADDR` | `in_process` / `localhost:15051` | capability seam: `in_process` or `grpc` |
 | `WORKSPACE_DIR` | `.` | agent filesystem-tool root (`read_file` / `edit_file` / `bash`; path escape rejected) |
 | `MEMORY_DIR` | `data/memory` | file memory directory (`MEMORY.md` index + one frontmatter `.md` per memory) |
 | `SKILLS_DIR` | `data/skills` | `SKILL.md` skills directory (lazy-loaded via the `skill` tool) |
+| `MEMORY_NOTE_MAX_CHARS` | `4000` | `memory_save` content length cap (guardrail) |
+| `MEMORY_RECALL_TOP_K` | `5` | proactive recall hits injected into the prompt memory section |
+| `HISTORY_MAX_MESSAGES` / `HISTORY_KEEP_MESSAGES` | `40` / `20` | chat history length that triggers compaction / most-recent messages kept after compaction |
+| `SESSION_EVENTS_RETENTION_DAYS` / `RETENTION_CRON` | `30` / `17 4 * * *` | daily worker cron purges `session_events` (audit log) older than this many days / its 5-field cron schedule |
 | `WORKER_CONCURRENCY` / `WORKER_JOB_TIMEOUT` | `10` / `300` | arq worker max concurrent jobs / per-job timeout (seconds) |
 | `WEB_SEARCH_PROVIDER` / `WEB_SEARCH_API_KEY` / `WEB_SEARCH_ENGINE_ID` | `tavily` / `""` / `""` | web-search provider (`duckduckgo` \| `tavily` \| `bing` \| `google`) + API key + google engine id; normally managed in admin → **Tools config**, these flat keys mirror that namespace |
 | `OBJECT_STORE_ROOT` | `data/objects` | cloud-drive blob store root (SHA-256 content-addressed, ref-counted) |

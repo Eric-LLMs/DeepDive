@@ -255,6 +255,54 @@ function registerIpcHandlers() {
     return canceled || filePaths.length === 0 ? null : filePaths[0];
   });
 
+  ipcMain.handle("pick-file", async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ["openFile"] });
+    return canceled || filePaths.length === 0 ? null : filePaths[0];
+  });
+
+  // Copy a file into a workspace folder, resolving name collisions with " (n)".
+  ipcMain.handle("copy-into-workspace", (_event, { src, destDir }) => {
+    if (!src || !destDir) return { ok: false, error: "No file or workspace folder selected." };
+    try {
+      if (!fs.existsSync(destDir) || !fs.statSync(destDir).isDirectory()) {
+        return { ok: false, error: "The workspace folder no longer exists; reopen it." };
+      }
+      let name = path.basename(src);
+      let target = path.join(destDir, name);
+      const ext = path.extname(name);
+      const stem = path.basename(name, ext);
+      let n = 1;
+      while (fs.existsSync(target)) {
+        target = path.join(destDir, `${stem} (${n})${ext}`);
+        n += 1;
+      }
+      fs.copyFileSync(src, target);
+      return { ok: true, name: path.basename(target), path: target };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Delete a file inside the open workspace. Files only (never directories), and only
+  // paths that resolve inside the workspace folder — a stray path is refused.
+  ipcMain.handle("delete-file", (_event, { filePath, workspaceDir }) => {
+    if (!filePath || !workspaceDir) return { ok: false, error: "No file or workspace folder selected." };
+    try {
+      const root = path.resolve(workspaceDir);
+      const target = path.resolve(filePath);
+      if (target !== root && !target.startsWith(root + path.sep)) {
+        return { ok: false, error: "Refusing to delete a path outside the workspace." };
+      }
+      if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
+        return { ok: false, error: "Not a file (or it no longer exists)." };
+      }
+      fs.unlinkSync(target);
+      return { ok: true, name: path.basename(target) };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
   ipcMain.handle("read-tree", (_event, dir) => readTree(dir));
 
   ipcMain.handle("open-external", (_event, filePath) => shell.openPath(filePath));
@@ -265,6 +313,13 @@ function registerIpcHandlers() {
 
   ipcMain.handle("set-pref", (_event, key, value) => {
     writePrefs({ [key]: value });
+  });
+
+  // Reflect the open workspace's folder name in the File menu label ("" resets it).
+  ipcMain.on("update-workspace-label", (_event, name) => {
+    if (openWorkspaceMenuItem) {
+      openWorkspaceMenuItem.label = name ? `Open Workspace: ${name}` : "Open Workspace…";
+    }
   });
 
   // Check for a newer release on GitHub by comparing the latest tag to the
@@ -309,8 +364,11 @@ function registerIpcHandlers() {
     return null;
   });
 
-  ipcMain.handle("pick-subtitle", async () => {
+  ipcMain.handle("pick-subtitle", async (_event, startDir) => {
     const { canceled, filePaths } = await dialog.showOpenDialog({
+      // Open the dialog in the video's folder by default so a matching subtitle is
+      // right next to the player.
+      defaultPath: startDir || undefined,
       properties: ["openFile"],
       filters: [
         { name: "Subtitle files", extensions: ["srt", "vtt", "lrc"] },
@@ -436,11 +494,29 @@ function registerIpcHandlers() {
   });
 }
 
+let openWorkspaceMenuItem = null;
+
 function setupMenu() {
   const menu = Menu.buildFromTemplate([
     {
       label: "File",
-      submenu: [{ role: "quit" }],
+      submenu: [
+        {
+          id: "open-workspace",
+          label: "Open Workspace…",
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+            if (win) win.webContents.send("menu-open-workspace");
+          },
+        },
+        {
+          label: "Add File to Workspace",
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+            if (win) win.webContents.send("menu-add-file");
+          },
+        },
+      ],
     },
     {
       label: "Edit",
@@ -452,14 +528,38 @@ function setupMenu() {
     {
       label: "View",
       submenu: [
-        { role: "reload" }, { role: "toggleDevTools" }, { type: "separator" },
+        { role: "reload" }, { type: "separator" },
         { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" },
+        {
+          label: "Font Size…",
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+            if (win) win.webContents.send("menu-settings", "window");
+          },
+        },
+        { type: "separator" },
         { role: "togglefullscreen" },
+        { role: "toggleDevTools" },
       ],
     },
     {
       label: "Help",
       submenu: [
+        {
+          label: "Help & Feedback",
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+            if (win) win.webContents.send("menu-settings", "help");
+          },
+        },
+        {
+          label: "About",
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+            if (win) win.webContents.send("menu-settings", "about");
+          },
+        },
+        { type: "separator" },
         {
           label: "DeepDive on GitHub",
           click: () => shell.openExternal("https://github.com/Eric-LLMs/DeepDive"),
@@ -468,6 +568,7 @@ function setupMenu() {
     },
   ]);
   Menu.setApplicationMenu(menu);
+  openWorkspaceMenuItem = menu.getMenuItemById("open-workspace");
 }
 
 function createWindow() {
@@ -478,6 +579,7 @@ function createWindow() {
     height: remember && saved.height ? saved.height : 820,
     x: remember && Number.isInteger(saved.x) ? saved.x : undefined,
     y: remember && Number.isInteger(saved.y) ? saved.y : undefined,
+    icon: path.join(__dirname, "deepdive.ico"),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -506,6 +608,9 @@ app.whenReady().then(() => {
   if (!fs.existsSync(path.join(RENDERER_DIR, "index.html"))) {
     console.error(`Renderer not found at ${RENDERER_DIR}.`);
   }
+  // Windows taskbar grouping + icon: bind the app to its own AppUserModelID so
+  // the taskbar shows deepdive.ico instead of the generic Electron icon.
+  app.setAppUserModelId("com.deepdive.desktop");
   protocol.handle("app", handleAppRequest);
   protocol.handle("local", handleLocalRequest);
   registerIpcHandlers();

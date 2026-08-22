@@ -18,8 +18,8 @@
 | Agent runtime | `AgentKernel` composition root: cache-boundary `CacheBoundaryAssembler` (3 zones + `snapshot_key`) + deferred-tool `ToolGateway` + dual-track `MemoryService` (PG tsvector/pgvector RRF) + skill catalog + READ-only `Sandbox`, over `ReactLoopAgent` step loop + plugin `ToolRuntime` |
 | Retrieval | RAG pipeline (rewrite → recall → RRF → rerank); `in_process` default, gRPC service available |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
-| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}` |
-| Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize |
+| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs` |
+| Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + proactive recall + RRF recency weighting + history compaction (sync LLM summary at `/chat`) + 30-day audit-event retention |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
 | Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload) |
@@ -175,8 +175,9 @@ kernel wires five pieces around a **`ReactLoopAgent`** step loop:
   denies anything the session lacks permission for.
 
 Beneath the kernel, a Cordis-style **DI state machine** wires plugins into a shared `Context`,
-and the append-only session log is an optional collaborator. `AgentKernel.run(...)` mirrors the
-`ReactLoopAgent.run` signature, so the API's `/chat` handler is unchanged.
+and the append-only session log is an optional collaborator. `AgentKernel.run(...)` and
+`AgentKernel.run_stream(...)` mirror the `ReactLoopAgent` signatures, so the API's `/chat` and
+`/chat/stream` handlers stay thin.
 
 ### 5.1 DI state machine — `Context` / `Fiber`
 
@@ -200,6 +201,23 @@ final answer or `max_steps`, closing with `agent/session-end`. Each step is one 
 batched in parallel (`asyncio.gather`, capped by `max_parallel_tool_calls`); the rest run as
 serial barriers. A tool whose execution `concludes_turn` stops the loop early. Returns
 `AgentResult {messages, final_answer}`.
+
+`run_stream(...)` is the streaming twin: the same pipeline (prompt assembly, tool dispatch,
+session-start/session-end hooks, persistent session memory) with the LLM call streamed. It yields
+per-step events so a client renders the model's reasoning and answer incrementally —
+`{"type": "thinking", "data"}` reasoning fragments and `{"type": "content", "data"}` answer
+fragments as they arrive, `{"type": "tool", "data"}` before each tool dispatch, a
+`step-answer` boundary after a step's final answer, and a terminal
+`{"type": "done", "data": {answer, messages, usage}}`. If the generator is abandoned (client
+disconnect) the `finally` block still closes the session memory, so nothing leaks.
+
+The API's `POST /chat/stream` (SSE, `EventSourceResponse`) consumes `run_stream` through the
+**same auth / quota / session / history path as `/chat`** — anonymous guest fallback and quota
+checks, session creation (`create_session`), `compact_history`, deferred `session_finalize`
+enqueue, and usage logging. It also resolves the turn's `user_message_id` / `assistant_message_id`
+so the client can act on a single message, and it emits a `notice` event when a user with no
+usable LLM key is degraded to the anonymous tier. Reasoning (`thinking`) is streamed but **never
+persisted**, keeping the recall corpus clean.
 
 When built through `AgentKernel`, each step's model-visible tool array comes from
 `ToolGateway.visible_schemas(context)` (core resident tools + whatever `tool_search` has mounted +
@@ -245,10 +263,15 @@ flat `SystemPrompt` (no zones, no boundary) still renders for backward compatibi
     `fts_config` is a constructor param so zhparser/jieba can be swapped in for CJK) +
     `PgVectorRecaller` (pgvector cosine over `messages.embedding`). `RRFMemoryRetriever` fuses the
     two via `rag.rank.rrf.rrf_fusion`; a vector-channel failure degrades to tsvector-only —
-    **never a silent empty**.
-  - **Memory as tools** — `memory_search` (RRF-fused recall) and `memory_save` (writes require
-    `confirmed=True`, a human-confirmation gate). At `begin_session()` the `MEMORY.md` head is
-    loaded as the dynamic-suffix session brief.
+    **never a silent empty**. The fused result is **recency-weighted**: an exponential decay over
+    `messages.created_at` (recent ≈ 1.0×, 30 days ≈ 0.68×, 90 days ≈ 0.55×) re-sorts near-ties
+    toward newer messages, so RRF structures the base ranking and recency breaks ties.
+  - **Memory as tools** — `memory_search` (RRF-fused recall) and `memory_save` (guardrailed
+    note-writing: kebab-case key, non-empty content capped at `MEMORY_NOTE_MAX_CHARS`, `type`
+    restricted to the closed taxonomy; READ-classified so it writes only the local memdir without
+    weakening the session's READ-only posture). At `begin_session()` the `MEMORY.md` head is
+    loaded as the dynamic-suffix session brief, and **proactive recall** injects the top
+    `MEMORY_RECALL_TOP_K` hits for the user's message into the suffix (computed once per run).
 - **Skills** — `Skill` (Markdown instructions + frontmatter + keywords) registered in a
   `SkillRegistry` (`register` / `relevant(query)` keyword scoring / `from_dir` for `*.skill.md`).
   `SkillCatalog.render()` emits a compressed one-line directory (name + truncated description,
@@ -256,7 +279,18 @@ flat `SystemPrompt` (no zones, no boundary) still renders for backward compatibi
   lazy-loads the full SKILL.md body on demand and reports `allowed_tools`.
 - **Sessions** — `SessionLog` is an append-only event stream
   (`session-start` / `session-end` / `llm-call` / `tool-call` / `tool-result`), serializable to
-  JSONL for audit.
+  JSONL for audit. Long conversations are **compacted** at the `/chat` boundary: histories over
+  `HISTORY_MAX_MESSAGES` are truncated to the recent `HISTORY_KEEP_MESSAGES`, the dropped prefix
+  is folded into a conversation summary (reusing the session summary when one exists, otherwise a
+  synchronous LLM summary via the same prompt as `finalize_session`), injected as a leading
+  system message, and recorded as a `compaction` session event. If the summary call fails the
+  overflow is still dropped — a bounded window is preferred to an unbounded request. A fresh
+  session is also **auto-titled** at creation from the first user message
+  (`create_session`, `sessions.title`, 40-char cap). `GET /sessions?q=` filters a user's sessions
+  by **content** — a case-insensitive `ILIKE` over title, summary, and message text
+  (`list_sessions` outer-joins `messages` and de-dups) — and each result carries a `snippet`
+  (the earliest matching message, truncated to 500 chars) so the client can show exactly where the
+  match landed even when it is not in the title.
 
 ## 6. Tool Runtime
 
@@ -422,6 +456,9 @@ immediately; the frontend polls `GET /jobs/{id}` until the worker marks the job
 (`queued → running → succeeded | failed`); Redis only carries the work to the worker (arq).
 Chat sessions finalize the same way: the gateway flushes session events synchronously on
 `close()`, then enqueues `session_finalize` to backfill message embeddings and write the summary.
+A daily retention cron (`prune_session_events`, registered in `WorkerSettings.cron_jobs`) sweeps
+`session_events` older than `SESSION_EVENTS_RETENTION_DAYS` (30); only the audit log is purged —
+`messages` (the recall corpus) and `sessions` (summaries) are deliberately kept.
 
 ## 9. Retrieval Service (gRPC)
 
@@ -481,11 +518,12 @@ rewrite → multi-recall → RRF fusion → rerank
 > order by `init_db()` via asyncpg and tracked in the `schema_migrations` table (no Alembic, no
 > `create_all`). This document does not repeat the DDL; the migration files are the single source
 > of truth. Table names below are the implemented ones (`sessions`, `messages`, `jobs` …), not the
-> earlier design names (`conversations`, `job_logs` …). The current surface spans
-> `migrations/0001_init.sql` is the single consolidated base schema (the squash of the original
-> 0001–0008 files; every statement is idempotent). `migrations/0002_auth_profiles.sql` layers the
-> self-service account surface on top — the `users` profile/verification columns and the one-time
-> `verification_tokens` table. Both are applied in filename order by `init_db()`.
+> earlier design names (`conversations`, `job_logs` …). `migrations/0001_init.sql` is the single
+> consolidated base schema (the squash of the original 0001–0008 development migrations; every
+> statement is idempotent). On top of it, the incremental migrations `0002_auth_profiles.sql` …
+> `0009_session_title.sql` layer later changes (self-service accounts + `verification_tokens`,
+> usage-log channel, cloud-drive objects, vocabulary isolation, folders, workspace activity,
+> memory-retention index, session title). All are applied in filename order by `init_db()`.
 
 The core learning + chat tables that run today (`migrations/0001_init.sql`):
 
@@ -495,7 +533,11 @@ The core learning + chat tables that run today (`migrations/0001_init.sql`):
 - **terms** — `id`, `domain_id` (FK → `domains`), `word`, `definition`, `frequency`, `star_level`, `audio_hash`, `image_paths` (JSONB), `is_active`.
 - **sentences** — `id`, `domain_id` (FK → `domains`), `origin_source`, `content_en` (unique), `content_cn`, `audio_hash`, `cn_explanation`, `embedding` (vector(1024)).
 - **chunks** — `id`, `material_id` (FK → `materials`), `seq`, `content_en`, `content_cn`, `meta` (JSONB), `embedding` (vector(1024)).
-- **sessions** — `id`, `user_id` (FK → `users`), `created_at`, `closed_at`, `summary`.
+- **sessions** — `id`, `user_id` (FK → `users`), `title`, `created_at`, `closed_at`, `summary`.
+  `title` (`0009_session_title.sql`) is auto-set at creation from the first user message —
+  whitespace-normalized and capped at 40 chars — so the sidebar shows a readable name while the
+  deferred finalize job is still running; `PUT /sessions/{id}` can rename it and an empty title
+  resets it to `NULL` so auto-naming kicks in again.
 - **messages** — `id`, `user_id`, `session_id` (FK → `sessions`), `role` (`user` | `assistant` | `tool`), `text`, `embedding` (vector(1024)), `created_at`.
 - **session_events** — `id`, `session_id` (FK → `sessions`), `seq`, `type`, `timestamp`, `payload` (JSONB).
 - **matches** — `id`, `term_id` (FK → `terms`), `sentence_id` (FK → `sentences`), `cn_explanation`.
@@ -515,7 +557,8 @@ Hybrid recall is computed in code, not stored in schema:
 - **Semantic (pgvector)** — cosine search over the `embedding vector(1024)` columns.
 - **Indexes** — the migrations currently define no explicit FTS / vector index; the design
   proposes a GIN index on a generated `fts` column and an ivfflat (or HNSW for large data) index
-  on `embedding`.
+  on `embedding`. `0008_memory_retention.sql` adds a plain B-tree index on
+  `session_events(timestamp)` so the daily audit-event sweep's range DELETE stays fast.
 
 ### 12.2 Billing and Logs
 
@@ -889,3 +932,42 @@ action, so the permission model stays visible without leaking state.
 
 Trash retention is a code constant — `TRASH_RETENTION_DAYS = 30` in `drive_service.py`,
 enforced lazily on `list_trash`.
+
+## 15. Desktop Workbench (Electron)
+
+The desktop app (`apps/desktop/`) is a standalone learning workbench with its **own vanilla-JS
+renderer** (not the React web UI). It is deliberately decoupled from the backend: the file tree,
+viewer, screenshots, and subtitles work offline; only chat, sessions, media generation, and
+sign-in / profile need the FastAPI gateway on `localhost:8300`.
+
+- **Main process** (`main.js`) — `contextIsolation: true` / `nodeIntegration: false` with a
+  preload `contextBridge` (`window.desktopAPI`). It owns the app menu (**File** = Open
+  Workspace… / Add File to Workspace; **View** = reload, zoom, Font Size… → Window & Display
+  settings, fullscreen, DevTools; **Help** = Help & Feedback / About / DeepDive on GitHub), a
+  custom `local://` protocol that streams local media/documents to the renderer, and an IPC
+  surface: folder/file pickers, recursive `read-tree`, copy-into-workspace and delete-file
+  (workspace-rooted, files only), text reads, PDF annotation sidecars
+  (`read/save/embed-annotations`), video screenshot saving, subtitle pick/find, version/update
+  check, and window prefs. When the backend runs, the main process forwards `/api`, `/audio`,
+  and `/images` to it.
+- **Renderer** (`renderer/`) — an SPA served from `app://bundle/`:
+  - **Sidebar** — a **Files** tab (workspace tree with client-side fuzzy search; hover 🗑 deletes
+    a file after confirmation) and a **Sessions** tab (server-side content search via
+    `GET /sessions?q=` with the matching snippet highlighted). The last workspace folder is
+    persisted in `localStorage` and re-opened on launch.
+  - **Viewer** (`viewer.js`) — dispatches by extension: video, audio, image, PDF (pdf.js with a
+    sidecar-annotation overlay), text/code, slides (LibreOffice → PDF), and Office files (OS
+    default app).
+  - **Video subtitles** — auto-detects a sibling `.srt`/`.vtt`/`.lrc` via `find-subtitle`, or
+    loads a user-picked file (**Add Subtitle**, picker defaulting to the video's folder). A
+    **Subtitles** dropdown lists **Enable / Disable / Add / Subtitle Settings**; the style panel
+    (size, color, background, position) is persisted to `localStorage`
+    (`deepdive_subtitle_style`) and restored on the next launch.
+  - **Chat** (`app.js`) — consumes the SSE `POST /chat/stream` endpoint
+    (`EventSourceResponse`) with a collapsible **💭 thinking** block and incremental answer
+    rendering; the pane docks bottom/right or floats as a draggable window. Splitter and
+    floating-window drags use **pointer events + `setPointerCapture`**, so drag tracking continues
+    even when the pointer passes over the `<video>` element. Sign-in / register / password-reset
+    and profile/avatar editing are modal dialogs against `/auth/*`.
+  - **Settings** — a modal with five tabs: **Appearance** (theme), **Window & Display** (font
+    size), **Updates** (GitHub release check), **Help & Feedback**, and **About**.

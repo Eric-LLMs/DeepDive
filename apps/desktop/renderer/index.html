@@ -17,8 +17,21 @@
           <button id="tab-files" class="active" type="button">Files</button>
           <button id="tab-sessions" type="button">Sessions</button>
         </div>
+        <div class="search-wrap">
+          <input id="file-search" type="text" class="sidebar-search" placeholder="Search files…" autocomplete="off" />
+          <button id="file-search-clear" type="button" class="search-clear" title="Clear search" aria-label="Clear search">✕</button>
+        </div>
         <div id="tree" class="tree"></div>
-        <div id="sessions" class="sessions hidden"></div>
+        <div id="sessions" class="sessions hidden">
+          <div class="search-wrap">
+            <input id="session-search" type="text" class="sidebar-search" placeholder="Search sessions…" autocomplete="off" />
+            <button id="session-search-clear" type="button" class="search-clear" title="Clear search" aria-label="Clear search">✕</button>
+          </div>
+          <div class="sessions-toolbar">
+            <button id="new-chat" type="button" title="Start a new chat session">＋ New chat</button>
+          </div>
+          <div id="sessions-list"></div>
+        </div>
         <div id="sidebar-footer">
           <button id="user-menu-trigger" type="button" title="Account menu">
             <span id="user-avatar" class="user-avatar">👤</span>
@@ -36,8 +49,9 @@
         </section>
 
         <section id="chat">
+          <div id="chat-resize"></div>
           <div id="chat-header">
-            <span>Chat</span>
+            <span id="chat-title">Chat</span>
             <div class="chat-header-actions">
               <button id="chat-mic" type="button" title="Voice input (talk to the assistant)">🎤</button>
               <button id="chat-speak" type="button" title="Speak replies aloud">🔊</button>
@@ -133,9 +147,15 @@
               <div class="settings-section">
                 <div class="settings-section-title">Font Size</div>
                 <select id="pref-font-size" class="settings-select">
-                  <option value="13">13px · Small</option>
+                  <option value="11">11px · Extra Small</option>
+                  <option value="12">12px · Small</option>
+                  <option value="13">13px · Compact</option>
                   <option value="14">14px · Standard</option>
+                  <option value="15">15px · Medium</option>
                   <option value="16">16px · Large</option>
+                  <option value="18">18px · Larger</option>
+                  <option value="20">20px · Extra Large</option>
+                  <option value="24">24px · Maximum</option>
                 </select>
               </div>
               <div class="settings-section">

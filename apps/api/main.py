@@ -12,7 +12,7 @@ from uuid import UUID
 
 from arq import create_pool
 from arq.connections import RedisSettings
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -77,6 +77,7 @@ from api.schemas import (
     TermImportRequest,
     TermUpdate,
     TestEmailRequest,
+    SessionRenameRequest,
     TTSRequest,
     GrantUpdateRequest,
     TokenCreateRequest,
@@ -103,6 +104,7 @@ from core.infrastructure.db import (
     LoginTokenModel,
     LLMCredentialModel,
     LLMModelModel,
+    MessageModel,
     RoleCredentialModel,
     SessionLocal,
     SessionModel,
@@ -127,13 +129,15 @@ from core.infrastructure.jobs import (
 )
 from core.infrastructure.memory import (
     SessionMemoryStore,
+    compact_history,
     create_session,
     ensure_user,
     list_sessions,
-    load_session_messages,
+    load_session_detail,
 )
 from core.infrastructure.mailer import MailNotConfigured, send_email
 from core.infrastructure.request_context import set_request_user
+from core.infrastructure.tts import TTSClient
 from core.infrastructure.security import (
     check_quota,
     ensure_admin_user,
@@ -2705,6 +2709,30 @@ async def synthesize_audio(body: TTSRequest, queue: TaskQueue = Depends(get_task
     return {"job_id": str(job_id)}
 
 
+@app.post("/tts/stream")
+async def synthesize_audio_stream(body: TTSRequest):
+    """Stream TTS audio sentence-by-sentence as SSE.
+
+    Each ``segment`` event carries the ``/audio/<file>`` URL of one cached WAV (synthesized
+    directly in the API process — the TTS container is reachable over localhost), so the
+    client can start playing the first sentence while the rest are still being generated.
+    """
+
+    async def gen():
+        client = TTSClient()
+        idx = 0
+        try:
+            async for path in client.synthesize_segments(body.text):
+                yield {"data": json.dumps({"type": "segment", "index": idx, "url": "/audio/" + Path(path).name}, ensure_ascii=False)}
+                idx += 1
+        except Exception as exc:  # noqa: BLE001 - report the failure to the client, then end the stream
+            yield {"data": json.dumps({"type": "error", "detail": str(exc)}, ensure_ascii=False)}
+            return
+        yield {"data": json.dumps({"type": "done", "count": idx}, ensure_ascii=False)}
+
+    return EventSourceResponse(gen())
+
+
 # ── AI capabilities ──
 @app.post("/explain")
 async def explain(body: ExplainRequest, queue: TaskQueue = Depends(get_task_queue)):
@@ -2842,9 +2870,19 @@ async def chat(
                 detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
             )
 
-    session_id = body.session_id or await create_session(SessionLocal, user_id)
+    session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
     session_memory = SessionMemoryStore(SessionLocal, _embedder(), llm, session_id, user_id)
     history = body.history or await session_memory.load_messages()
+    history = await compact_history(
+        history,
+        session_factory=SessionLocal,
+        session_id=session_id,
+        session_memory=session_memory,
+        llm=llm,
+        model=model,
+        base_url=base_url or None,
+        api_key=api_key or None,
+    )
     result = await get_agent().run(
         body.message,
         history,
@@ -2857,11 +2895,30 @@ async def chat(
     await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
     if log_user is not None:
         await _log_usage(log_user, business_name, "chat", result.usage, credential_id=credential_id)
+    # Resolve this turn's user-message / assistant-answer ids so the client can delete a
+    # single message. Scan ascending for the last row matching each text (texts may repeat,
+    # but this turn's rows are always the newest).
+    user_message_id = assistant_message_id = None
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(MessageModel.id, MessageModel.role, MessageModel.text)
+                .where(MessageModel.session_id == session_id)
+                .order_by(MessageModel.created_at)
+            )
+        ).all()
+        for m_id, role, text in rows:
+            if role == "user" and text == body.message:
+                user_message_id = str(m_id)
+            elif role == "assistant" and text == result.final_answer:
+                assistant_message_id = str(m_id)
     resp = {
         "answer": result.final_answer,
         "messages": result.messages,
         "session_id": str(session_id),
         "user_id": str(user_id),
+        "user_message_id": user_message_id,
+        "assistant_message_id": assistant_message_id,
     }
     if notice:
         resp["notice"] = notice
@@ -2869,22 +2926,78 @@ async def chat(
 
 
 @app.get("/sessions")
-async def get_sessions(user: AuthUser = Depends(require_user)) -> dict:
-    """List the authenticated user's chat sessions (newest first)."""
-    return {"sessions": await list_sessions(SessionLocal, user.user_id)}
+async def get_sessions(user: AuthUser = Depends(require_user), q: str | None = None) -> dict:
+    """List the authenticated user's chat sessions (newest first).
+
+    ``?q=`` filters by title / summary / message content (case-insensitive substring).
+    """
+    q = (q or "").strip()
+    return {"sessions": await list_sessions(SessionLocal, user.user_id, q or None)}
 
 
 @app.get("/sessions/{session_id}")
 async def get_session_messages(session_id: UUID, user: AuthUser = Depends(require_user)):
-    """Return a session's message history (resume) if it belongs to the current user."""
+    """Return a session's title + messages (with ids) if it belongs to the current user."""
     async with SessionLocal() as session:
         sess = (
             await session.execute(select(SessionModel).where(SessionModel.id == session_id))
         ).scalar_one_or_none()
     if sess is None or sess.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="session not found")
-    messages = await load_session_messages(SessionLocal, session_id)
-    return {"session_id": str(session_id), "messages": messages}
+    detail = await load_session_detail(SessionLocal, session_id)
+    return {"session_id": str(session_id), "title": detail["title"], "messages": detail["messages"]}
+
+
+@app.patch("/sessions/{session_id}")
+async def rename_session(
+    session_id: UUID, body: SessionRenameRequest, user: AuthUser = Depends(require_user)
+):
+    """Rename a session. An empty title resets it to ``NULL`` so auto-naming kicks in again."""
+    async with SessionLocal() as session:
+        sess = (
+            await session.execute(select(SessionModel).where(SessionModel.id == session_id))
+        ).scalar_one_or_none()
+        if sess is None or sess.user_id != user.user_id:
+            raise HTTPException(status_code=404, detail="session not found")
+        title = (body.title or "").strip()
+        sess.title = title or None
+        await session.commit()
+        return {"title": sess.title}
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: UUID, user: AuthUser = Depends(require_user)):
+    """Delete a session (cascade removes its messages + events) if it belongs to the user."""
+    async with SessionLocal() as session:
+        sess = (
+            await session.execute(select(SessionModel).where(SessionModel.id == session_id))
+        ).scalar_one_or_none()
+        if sess is None or sess.user_id != user.user_id:
+            raise HTTPException(status_code=404, detail="session not found")
+        await session.delete(sess)
+        await session.commit()
+    return Response(status_code=204)
+
+
+@app.delete("/sessions/{session_id}/messages/{message_id}")
+async def delete_session_message(
+    session_id: UUID, message_id: UUID, user: AuthUser = Depends(require_user)
+):
+    """Delete a single message (no truncation) if its session belongs to the user."""
+    async with SessionLocal() as session:
+        sess = (
+            await session.execute(select(SessionModel).where(SessionModel.id == session_id))
+        ).scalar_one_or_none()
+        if sess is None or sess.user_id != user.user_id:
+            raise HTTPException(status_code=404, detail="session not found")
+        message = (
+            await session.execute(select(MessageModel).where(MessageModel.id == message_id))
+        ).scalar_one_or_none()
+        if message is None or message.session_id != session_id:
+            raise HTTPException(status_code=404, detail="message not found")
+        await session.delete(message)
+        await session.commit()
+    return Response(status_code=204)
 
 
 @app.get("/jobs/{job_id}")
@@ -2897,30 +3010,48 @@ async def get_job(job_id: UUID, queue: TaskQueue = Depends(get_task_queue)):
 async def chat_stream(
     body: ChatRequest,
     request: Request,
-    user: AuthUser = Depends(require_user),
+    user: AuthUser | None = Depends(require_user_optional),
+    queue: TaskQueue = Depends(get_task_queue),
 ):
-    """SSE streaming. A user with no usable LLM key degrades to the anonymous tier (guest quota)."""
+    """SSE streaming chat over the full agent path (tools + session persistence + quota).
+
+    Emits ``{"type": "thinking"|"content"|"tool", "data": ...}`` deltas as the model reasons
+    and answers, then a final ``{"type": "done", "data": {answer, session_id, user_id,
+    user_message_id, assistant_message_id, notice}}`` event. A user with no usable LLM key
+    degrades to the anonymous tier (guest quota), matching ``/chat``.
+    """
+    set_request_user(user.user_id if user is not None else None)
     notice = None
     async with SessionLocal() as session:
-        token = await session.get(LoginTokenModel, user.token_id)
-        base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, token, user.role.role_id)
-        if not base_url and not api_key:
+        if user is None:
+            user_id = body.user_id or await ensure_user(SessionLocal)
+            await _guest_quota(request.app.state.redis, user_id)
+            token = None
+            role_id = "anonymous"
+            log_user = None
+        else:
+            user_id = user.user_id
+            token = await session.get(LoginTokenModel, user.token_id)
+            role_id = user.role.role_id
+            log_user = user
+        base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, token, role_id)
+        if user is not None and not base_url and not api_key:
             anon = await get_role(session, "anonymous")
             anon_limit = anon.daily_request_limit if anon is not None else settings.guest_daily_limit
             limit_txt = f"每天限 {anon_limit} 次" if anon_limit >= 0 else "按匿名用户限额"
             await _guest_quota(
-                request.app.state.redis, user.user_id,
+                request.app.state.redis, user_id,
                 detail="你的额度已用完,且匿名额度也已用完。请充值或升级套餐后继续使用。",
             )
-            base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, None, "anonymous")
+            role_id = "anonymous"
+            log_user = None
             notice = (
                 f"你的渠道额度已用完,已按匿名用户身份继续使用({limit_txt})。"
                 "如需更多额度,请充值或升级套餐。"
             )
-            log_user = None
-        else:
+            base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, None, role_id)
+        elif user is not None:
             await check_quota(session, user.user_id, user.role)
-            log_user = user
     # All keys + the anonymous tier are exhausted too — block, don't fall back to the
     # legacy global connection; the user must top up / upgrade.
     if not base_url and not api_key:
@@ -2928,15 +3059,70 @@ async def chat_stream(
             status_code=503,
             detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
         )
-    if log_user is not None:
-        await _log_usage(log_user, business_name, "chat_stream", credential_id=credential_id)
+
+    session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
+    session_memory = SessionMemoryStore(SessionLocal, _embedder(), llm, session_id, user_id)
+    history = body.history or await session_memory.load_messages()
+    history = await compact_history(
+        history,
+        session_factory=SessionLocal,
+        session_id=session_id,
+        session_memory=session_memory,
+        llm=llm,
+        model=model,
+        base_url=base_url or None,
+        api_key=api_key or None,
+    )
 
     async def gen():
-        if notice:
-            yield {"notice": notice}
-        async for chunk in llm.complete_stream(
-            body.message, model=model, base_url=base_url or None, api_key=api_key or None
+        final = None
+        async for evt in get_agent().run_stream(
+            body.message,
+            history,
+            session_memory=session_memory,
+            model=model,
+            base_url=base_url or None,
+            api_key=api_key or None,
         ):
-            yield {"data": chunk}
+            if evt["type"] == "done":
+                final = evt["data"]
+            else:
+                yield {"data": json.dumps(evt, ensure_ascii=False)}
+
+        # Defer the expensive embed+summary work exactly like /chat; log usage now that the
+        # turn's token counts are known.
+        await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
+        if log_user is not None:
+            await _log_usage(
+                log_user, business_name, "chat_stream",
+                final["usage"] if final else None, credential_id=credential_id,
+            )
+        # Resolve this turn's user/assistant message ids (same scan as /chat: ascending,
+        # last row matching each text) so the client can delete a single message.
+        answer = (final or {}).get("answer", "")
+        user_message_id = assistant_message_id = None
+        async with SessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(MessageModel.id, MessageModel.role, MessageModel.text)
+                    .where(MessageModel.session_id == session_id)
+                    .order_by(MessageModel.created_at)
+                )
+            ).all()
+            for m_id, role, text in rows:
+                if role == "user" and text == body.message:
+                    user_message_id = str(m_id)
+                elif role == "assistant" and answer and text == answer:
+                    assistant_message_id = str(m_id)
+        done = {
+            "answer": answer,
+            "session_id": str(session_id),
+            "user_id": str(user_id),
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+        }
+        if notice:
+            done["notice"] = notice
+        yield {"data": json.dumps({"type": "done", "data": done}, ensure_ascii=False)}
 
     return EventSourceResponse(gen())

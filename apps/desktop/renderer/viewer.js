@@ -18,7 +18,8 @@ const Viewer = (() => {
   const MAX_ZOOM = 5;
   const ZOOM_STEP = 1.25;
 
-  // Subtitle presentation settings (adjusted from the video toolbar).
+  // Subtitle presentation settings (adjusted from the video toolbar). Persisted to
+  // localStorage so the last style is restored on the next launch.
   const subStyle = {
     enabled: true,
     fontSize: 15,
@@ -26,6 +27,24 @@ const Viewer = (() => {
     bg: true,
     position: "bottom", // "top" | "middle" | "bottom"
   };
+  const SUBSTYLE_KEY = "deepdive_subtitle_style";
+  function saveSubStyle() {
+    try { localStorage.setItem(SUBSTYLE_KEY, JSON.stringify(subStyle)); } catch { /* ignore */ }
+  }
+  function loadSubStyle() {
+    try {
+      const raw = localStorage.getItem(SUBSTYLE_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (!saved || typeof saved !== "object") return;
+      if (typeof saved.enabled === "boolean") subStyle.enabled = saved.enabled;
+      if (typeof saved.fontSize === "number") subStyle.fontSize = Math.min(40, Math.max(10, saved.fontSize));
+      if (typeof saved.color === "string") subStyle.color = saved.color;
+      if (typeof saved.bg === "boolean") subStyle.bg = saved.bg;
+      if (["top", "middle", "bottom"].includes(saved.position)) subStyle.position = saved.position;
+    } catch { /* ignore */ }
+  }
+  loadSubStyle();
 
   // PDF annotation state (persisted to a sidecar <pdf>.annot.json next to the PDF).
   const annot = { tool: "none", color: "#ffd54a", width: 3 }; // "none" | "draw" | "erase" | "note"
@@ -41,6 +60,13 @@ const Viewer = (() => {
   function baseName(name) {
     const i = name.lastIndexOf(".");
     return i < 0 ? name : name.slice(0, i);
+  }
+
+  // Parent directory of an absolute path (handles both "/" and "\" separators).
+  function dirOf(pathStr) {
+    const parts = pathStr.replace(/\\/g, "/").split("/");
+    parts.pop();
+    return parts.join("/");
   }
 
   // local://file/?path=<abs> — the renderer can't touch the raw filesystem, so media
@@ -259,7 +285,7 @@ const Viewer = (() => {
   }
 
   // Inline control panel for subtitle style (size / color / background / position).
-  function buildSubtitleControls(overlay, onChoose) {
+  function buildSubtitleControls(overlay) {
     const panel = document.createElement("div");
     panel.className = "subtitle-controls";
 
@@ -271,24 +297,19 @@ const Viewer = (() => {
       return b;
     }
 
-    const toggle = btn(subStyle.enabled ? "On" : "Off", () => {
-      subStyle.enabled = !subStyle.enabled;
-      toggle.textContent = subStyle.enabled ? "On" : "Off";
-      toggle.classList.toggle("active", subStyle.enabled);
-      setSubtitleText(overlay, overlay._text || "");
-    }, subStyle.enabled);
-
     const sizeLabel = document.createElement("span");
     sizeLabel.textContent = `${subStyle.fontSize}px`;
     const sizeDown = btn("A−", () => {
       subStyle.fontSize = Math.max(10, subStyle.fontSize - 2);
       sizeLabel.textContent = `${subStyle.fontSize}px`;
       applySubtitleStyle(overlay);
+      saveSubStyle();
     });
     const sizeUp = btn("A+", () => {
       subStyle.fontSize = Math.min(40, subStyle.fontSize + 2);
       sizeLabel.textContent = `${subStyle.fontSize}px`;
       applySubtitleStyle(overlay);
+      saveSubStyle();
     });
 
     const colors = ["#ffffff", "#ffd54a", "#7ecb7e", "#7dd3fc", "#ff9a9a"];
@@ -301,6 +322,7 @@ const Viewer = (() => {
       sw.onclick = () => {
         subStyle.color = c;
         applySubtitleStyle(overlay);
+        saveSubStyle();
         colorRow.querySelectorAll(".swatch").forEach((s) => s.classList.toggle("active", s === sw));
       };
       if (c === subStyle.color) sw.classList.add("active");
@@ -311,6 +333,7 @@ const Viewer = (() => {
       subStyle.bg = !subStyle.bg;
       bg.classList.toggle("active", subStyle.bg);
       applySubtitleStyle(overlay);
+      saveSubStyle();
     }, subStyle.bg);
 
     const posRow = document.createElement("span");
@@ -320,13 +343,18 @@ const Viewer = (() => {
       const b = btn(p, () => {
         subStyle.position = key;
         applySubtitleStyle(overlay);
+        saveSubStyle();
         posRow.querySelectorAll("button").forEach((x) => x.classList.toggle("active", x === b));
       }, subStyle.position === key);
       posRow.appendChild(b);
     }
 
-    const choose = btn("Choose File", onChoose);
-    panel.append(toggle, sizeDown, sizeLabel, sizeUp, colorRow, bg, posRow, choose);
+    const closeBtn = btn("✕", () => {
+      panel.style.display = "none";
+    });
+    closeBtn.title = "Close subtitle settings";
+    closeBtn.style.marginLeft = "auto";
+    panel.append(sizeDown, sizeLabel, sizeUp, colorRow, bg, posRow, closeBtn);
     return panel;
   }
 
@@ -335,9 +363,15 @@ const Viewer = (() => {
     const bar = makeToolbar(name, filePath);
     el.appendChild(bar);
 
+    // "Subtitles" dropdown list: Add Subtitle (pick a file) / Subtitle Settings (style panel).
+    const subWrap = document.createElement("span");
+    subWrap.className = "tools-wrap";
     const subBtn = document.createElement("button");
     subBtn.textContent = "Subtitles";
-    bar.insertBefore(subBtn, bar.lastChild);
+    const subMenu = document.createElement("div");
+    subMenu.className = "tools-menu hidden";
+    subWrap.append(subBtn, subMenu);
+    bar.insertBefore(subWrap, bar.lastChild);
 
     // "Tools" dropdown: Screenshot / Generate PPT / Generate Book.
     const toolsWrap = document.createElement("span");
@@ -371,11 +405,37 @@ const Viewer = (() => {
     wrap.appendChild(overlay);
     body.appendChild(wrap);
 
-    const controls = buildSubtitleControls(overlay, chooseSubtitle);
+    const controls = buildSubtitleControls(overlay);
     controls.style.display = "none";
-    subBtn.onclick = () => {
+
+    function subMenuItem(label, onClick) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.onclick = () => {
+        subMenu.classList.add("hidden");
+        onClick();
+      };
+      subMenu.appendChild(b);
+    }
+    subMenuItem("Enable Subtitles", () => {
+      subStyle.enabled = true;
+      setSubtitleText(overlay, overlay._text || "");
+      saveSubStyle();
+    });
+    subMenuItem("Disable Subtitles", () => {
+      subStyle.enabled = false;
+      setSubtitleText(overlay, overlay._text || "");
+      saveSubStyle();
+    });
+    subMenuItem("Add Subtitle", chooseSubtitle);
+    subMenuItem("Subtitle Settings", () => {
       controls.style.display = controls.style.display === "none" ? "flex" : "none";
+    });
+    subBtn.onclick = (e) => {
+      e.stopPropagation();
+      subMenu.classList.toggle("hidden");
     };
+    document.addEventListener("click", () => subMenu.classList.add("hidden"));
 
     el.appendChild(controls);
     el.appendChild(body);
@@ -408,7 +468,8 @@ const Viewer = (() => {
     }
 
     function chooseSubtitle() {
-      window.desktopAPI.pickSubtitle().then((picked) => {
+      // Open the picker in the video's folder by default (subtitle usually sits next to it).
+      window.desktopAPI.pickSubtitle(dirOf(filePath)).then((picked) => {
         if (picked) loadSubtitleFrom(picked);
       });
     }

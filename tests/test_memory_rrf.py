@@ -1,12 +1,23 @@
 """Tests for memory recall: BM25 keyword + vector fusion by RRF, with deterministic fallback.
 
-Verifies that the RRF retriever fuses the keyword and vector channels, and that a failing
+Verifies that the RRF retriever fuses the keyword and vector channels, that a failing
 vector channel (embedding service offline) degrades to the keyword result — never an empty
-list.
+list — and that recency weighting re-ranks near-ties toward newer messages.
 """
+import time
 
 from agent.memory.retrieval import KeywordIndex, MemoryHit, RRFMemoryRetriever
 from agent.memory.types import Memory
+
+
+class FakeChannel:
+    """A scripted recall channel returning fixed hits (with optional created_at meta)."""
+
+    def __init__(self, hits: list[MemoryHit]) -> None:
+        self._hits = hits
+
+    async def search(self, query: str, top_k: int = 5) -> list[MemoryHit]:
+        return self._hits[:top_k]
 
 
 class FakeStore:
@@ -99,3 +110,36 @@ async def test_rrf_without_vector_uses_keyword_only():
 
     hits = await retriever.search("jenkins", top_k=1)
     assert hits[0].key == "deploy"
+
+
+def _hit(key: str, content: str, created_at: float | None) -> MemoryHit:
+    return MemoryHit(
+        key=key, content=content, score=0.9, source="vector", meta={"created_at": created_at}
+    )
+
+
+async def test_recency_weighting_reranks_near_ties_toward_newer_messages():
+    now = time.time()
+    old = now - 90 * 86_400        # 90 days old → recency factor ≈ 0.55
+    recent = now - 60              # a minute ago → recency factor ≈ 1.0
+    # Both channels rank [old, new]; RRF would put "old" first (rank 1 in both).
+    keyword = FakeChannel([_hit("old", "stable topic alpha", old), _hit("new", "stable topic beta", recent)])
+    vector = FakeChannel([_hit("old", "stable topic alpha", old), _hit("new", "stable topic beta", recent)])
+    retriever = RRFMemoryRetriever(keyword=keyword, vector=vector)
+
+    hits = await retriever.search("stable topic", top_k=2)
+
+    assert hits[0].key == "new"  # the recent message wins the near-tie
+    assert hits[0].source == "rrf"
+    assert hits[1].key == "old"
+
+
+async def test_missing_created_at_leaves_rrf_order_unchanged():
+    # Both channels rank [old, new] identically with no created_at → no recency signal.
+    keyword = FakeChannel([_hit("old", "alpha", None), _hit("new", "beta", None)])
+    vector = FakeChannel([_hit("old", "alpha", None), _hit("new", "beta", None)])
+    retriever = RRFMemoryRetriever(keyword=keyword, vector=vector)
+
+    hits = await retriever.search("alpha beta", top_k=2)
+
+    assert hits[0].key == "old"  # pure RRF order preserved

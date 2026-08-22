@@ -2,9 +2,18 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from agent import Context, ToolExecution, ToolOutput, ToolRuntime, define_tool, text_block
 from core.infrastructure.request_context import get_request_user_id
+
+logger = logging.getLogger(__name__)
+
+# Returned as a *successful* tool result when the retrieval stack is down (e.g. the
+# embedding service returns 503). A normal result lets the model answer from knowledge
+# in this round; a raised error would surface as a tool error and burn another round
+# on a pointless retry.
+_UNAVAILABLE = [{"notice": "学习资料库检索服务暂时不可用,请直接基于你的知识回答,不要重试检索。"}]
 
 
 def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
@@ -13,9 +22,13 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
         # Tenant isolation: bind the current request's user so retrieval only sees their
         # assets (owner / workspace / ACL). A guest (None) sees public-link assets only.
         filters = {"user_id": get_request_user_id()}
-        return await retriever.retrieve(
-            args.get("query", ""), args.get("top_k", 5), filters
-        )
+        try:
+            return await retriever.retrieve(
+                args.get("query", ""), args.get("top_k", 5), filters
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade to knowledge-only, don't retry
+            logger.warning("rag_search degraded (retrieval unavailable): %s", exc)
+            return _UNAVAILABLE
 
     runtime.register(
         define_tool(

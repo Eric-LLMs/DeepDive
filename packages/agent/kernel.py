@@ -42,6 +42,7 @@ class KernelConfig:
 
     max_steps: int = 5
     max_parallel_tool_calls: int = 10
+    recall_top_k: int = 5   # proactive recall: hits injected into the prompt memory section
 
 
 class AgentKernel:
@@ -65,6 +66,7 @@ class AgentKernel:
         self.assembler = CacheBoundaryAssembler()
         self.gateway = gateway or ToolGateway(runtime)
         self._catalog = self.gateway.catalog
+        self._recall_hits: list | None = None
 
         self._register_core_tools()
         self._install_guard()
@@ -121,11 +123,35 @@ class AgentKernel:
                 self._memory_brief,
                 zone=PromptZone.DYNAMIC_SUFFIX,
             )
+            self.assembler.section(
+                "memory_recall",
+                MEMORY_ORDER + 10,
+                self._memory_recall_section,
+                zone=PromptZone.DYNAMIC_SUFFIX,
+            )
 
     def _memory_brief(self, context: dict) -> str:
         """The session's short-term memory brief (MEMORY.md head, loaded per run)."""
         brief = self.memory.session_brief() if self.memory is not None else ""
         return f"## Session memory brief\n{brief}" if brief else ""
+
+    async def _memory_recall_section(self, context: dict) -> str:
+        """Proactive recall: top hits for the user's message, injected into the suffix.
+
+        Computed once per run (cached in ``self._recall_hits``, reset in :meth:`run`), so
+        per-step ``refresh_dynamic`` reuses it instead of hitting the recall channels again.
+        """
+        if self.memory is None:
+            return ""
+        if self._recall_hits is None:
+            query = (context.get("user_msg") or "").strip()
+            self._recall_hits = (
+                await self.memory.recall_all(query, self.config.recall_top_k) if query else []
+            )
+        if not self._recall_hits:
+            return ""
+        lines = "\n".join(f"- {h.content}" for h in self._recall_hits)
+        return f"## Recalled memory\n{lines}"
 
     # ── public API (same signature as ReactLoopAgent.run) ──
     async def run(
@@ -145,6 +171,7 @@ class AgentKernel:
         """
         if self.memory is not None:
             self.memory.begin_session()
+        self._recall_hits = None  # proactive recall is computed once per run, lazily
         return await self.loop.run(
             user_msg,
             history=history,
@@ -154,3 +181,28 @@ class AgentKernel:
             base_url=base_url,
             api_key=api_key,
         )
+
+    async def run_stream(
+        self,
+        user_msg: str,
+        history: list[dict] | None = None,
+        memory_keys: list[str] | None = None,
+        session_memory: Any | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ):
+        """Streaming variant of :meth:`run` (same signature; see :meth:`ReactLoopAgent.run_stream`)."""
+        if self.memory is not None:
+            self.memory.begin_session()
+        self._recall_hits = None
+        async for evt in self.loop.run_stream(
+            user_msg,
+            history=history,
+            memory_keys=memory_keys,
+            session_memory=session_memory,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+        ):
+            yield evt

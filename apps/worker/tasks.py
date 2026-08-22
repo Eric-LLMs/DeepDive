@@ -6,12 +6,14 @@ enrichment work the gateway used to do in-process. arq calls every task as
 task drives its own status transitions via :class:`JobStore`.
 """
 import asyncio
+import time
 from pathlib import Path
 from uuid import UUID
 
 from core.application.drive_service import READY
 from core.config import settings
 from core.infrastructure import media
+from core.infrastructure.db import SessionEventModel
 from core.infrastructure.drive_repositories import (
     SqlAssetRepository,
     SqlChunkRepository,
@@ -107,6 +109,22 @@ async def session_finalize(ctx, job_id: str, payload: dict) -> dict:
         )
 
     return await _run(ctx, job_id, work())
+
+
+async def prune_session_events(ctx) -> dict:
+    """Daily retention: delete session_events older than the retention window.
+
+    arq cron jobs run as ``(ctx)`` (no job_id/payload) and are not user-facing, so no
+    ``jobs`` row is created. Only the audit log is swept; messages (the recall corpus) and
+    sessions (summaries) are deliberately kept.
+    """
+    cutoff = time.time() - settings.session_events_retention_days * 86400
+    async with ctx["session_factory"]() as session:
+        result = await session.execute(
+            SessionEventModel.__table__.delete().where(SessionEventModel.timestamp < cutoff)
+        )
+        await session.commit()
+        return {"deleted": result.rowcount}
 
 
 def _build_media(payload: dict) -> dict:

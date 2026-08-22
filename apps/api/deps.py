@@ -17,7 +17,7 @@ from agent import (
     register_builtin_plugins,
 )
 from agent.fs_tools import register_fs_tools
-from agent.kernel import AgentKernel
+from agent.kernel import AgentKernel, KernelConfig
 from agent.memory.retrieval import RRFMemoryRetriever
 from agent.memory.service import MemoryService
 from agent.sandbox import Sandbox
@@ -95,6 +95,7 @@ def _agent() -> AgentKernel:
         file_store=file_memory,
         retriever=retriever,
         memory_md_path=settings.memory_dir / "MEMORY.md",
+        note_max_chars=settings.memory_note_max_chars,
     )
 
     soul = _read_soul()
@@ -107,6 +108,7 @@ def _agent() -> AgentKernel:
         memory=memory,
         skills=skills,
         sandbox=sandbox,
+        config=KernelConfig(recall_top_k=settings.memory_recall_top_k),
     )
 
     manager = PluginManager(runtime, skills, ctx)

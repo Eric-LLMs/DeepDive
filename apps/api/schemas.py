@@ -88,6 +88,10 @@ class TTSRequest(BaseModel):
     text: str
 
 
+class SessionRenameRequest(BaseModel):
+    title: str | None = None
+
+
 class GenerateDefinitionRequest(BaseModel):
     term: str
 

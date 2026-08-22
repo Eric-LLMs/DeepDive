@@ -647,6 +647,8 @@ class SessionModel(Base):
     )
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     summary: Mapped[str | None] = mapped_column(Text)
+    # Short auto-generated title (LLM from the first user message); None until finalized.
+    title: Mapped[str | None] = mapped_column(Text)
 
 
 class MessageModel(Base):

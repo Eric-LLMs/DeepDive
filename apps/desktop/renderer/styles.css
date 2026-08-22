@@ -74,7 +74,8 @@ body {
 #app.collapsed #tree,
 #app.collapsed #sidebar-tabs,
 #app.collapsed #sessions,
-#app.collapsed #sidebar-footer { display: none; }
+#app.collapsed #sidebar-footer,
+#app.collapsed .search-wrap { display: none; }
 
 #pick-folder {
   flex: 1;
@@ -157,6 +158,9 @@ body {
 .tree-node.file { color: var(--fg); }
 .tree-children { padding-left: 14px; }
 .tree-toggle { display: inline-block; width: 14px; color: var(--fg-dim); }
+.tree-del { display: none; float: right; font-size: 11px; opacity: 0.6; cursor: pointer; padding: 0 2px; }
+.tree-del:hover { opacity: 1; }
+.tree-node.file:hover .tree-del { display: inline; }
 
 /* ── Sidebar tabs (Files / Sessions) ── */
 #sidebar-tabs { display: flex; border-bottom: 1px solid var(--border); }
@@ -172,8 +176,59 @@ body {
 }
 #sidebar-tabs button.active { color: var(--fg); border-bottom-color: var(--accent); }
 
-.sessions { flex: 1; overflow: auto; padding: 6px; }
+/* Sidebar search box (first row of the Files / Sessions tabs). */
+.search-wrap {
+  position: relative;
+  flex-shrink: 0;
+  margin: 6px 6px 0;
+}
+.sidebar-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 26px 6px 8px;
+  background: var(--bg-soft-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.sidebar-search::placeholder { color: var(--fg-dim); }
+.sidebar-search:focus { outline: none; border-color: var(--accent); }
+.search-clear {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  transform: translateY(-50%);
+  display: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  line-height: 1;
+  background: none;
+  border: none;
+  border-radius: 50%;
+  color: var(--fg-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.search-clear:hover { color: var(--fg); background: var(--bg-soft-2); }
+.search-clear.visible { display: block; }
+
+.sessions { flex: 1; display: flex; flex-direction: column; overflow: hidden; padding: 6px; }
 .sessions.hidden { display: none; }
+.sessions-toolbar { flex-shrink: 0; padding: 0 2px 6px; }
+.sessions-toolbar button {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg-soft-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.sessions-toolbar button:hover { border-color: var(--accent); color: var(--accent); }
+#sessions-list { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 4px; }
 .session-item {
   padding: 8px 10px;
   border-radius: 6px;
@@ -181,16 +236,55 @@ body {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  position: relative;
 }
 .session-item:hover { background: var(--bg-soft-2); }
+.session-item .session-row { display: flex; align-items: center; gap: 6px; }
 .session-item .session-summary {
   font-size: 12px;
   color: var(--fg);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1;
 }
 .session-item .session-time { font-size: 11px; color: var(--fg-dim); }
+.session-item .session-snippet {
+  font-size: 11px;
+  color: var(--fg-dim);
+  line-height: 1.4;
+  overflow: hidden;
+}
+.session-item mark {
+  background: rgba(0, 120, 255, 0.3);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.session-item .session-del,
+.session-item .session-edit {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: var(--fg-dim);
+}
+.session-item .session-del:hover { color: #ff6b6b; background: rgba(255, 80, 80, 0.12); }
+.session-item .session-edit:hover { color: var(--accent); background: var(--bg-soft-2); }
+.session-rename-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  padding: 2px 4px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+}
 
 /* ── Main (viewer + chat) ── */
 #main {
@@ -465,6 +559,8 @@ pre.text-viewer {
 .fallback .name { color: var(--fg); font-weight: 600; margin-bottom: 12px; word-break: break-all; }
 
 /* ── Chat ── */
+/* ``position: relative`` anchors the edge-resize handle (#chat-resize); the docked chat is
+   resized by dragging that boundary (top edge for bottom-dock, left edge for right-dock). */
 #chat {
   height: 240px;
   flex-shrink: 0;
@@ -472,15 +568,59 @@ pre.text-viewer {
   background: var(--bg-soft);
   display: flex;
   flex-direction: column;
+  position: relative;
 }
 
 #chat-log { flex: 1; overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
 
-.msg { max-width: 80%; padding: 8px 12px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; }
-.msg.user { align-self: flex-end; background: var(--accent); color: #fff; }
-.msg.assistant { align-self: flex-start; background: var(--bg-soft-2); }
-.msg.error { align-self: flex-start; background: #5a2a2a; color: #ffb3b3; }
-.msg.notice { align-self: center; max-width: 90%; background: #3a3320; color: #ffd966; font-size: 12px; text-align: center; }
+.msg { max-width: 80%; display: flex; flex-direction: column; gap: 2px; }
+.msg.user { align-self: flex-end; align-items: flex-end; }
+.msg.assistant { align-self: flex-start; align-items: flex-start; }
+.msg.error { align-self: flex-start; max-width: 80%; background: #5a2a2a; color: #ffb3b3; border-radius: 10px; padding: 8px 12px; white-space: pre-wrap; word-break: break-word; }
+.msg.notice { align-self: center; max-width: 90%; background: #3a3320; color: #ffd966; font-size: 12px; text-align: center; border-radius: 10px; padding: 8px 12px; }
+.msg-bubble { padding: 8px 12px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; max-width: 100%; }
+.msg.user .msg-bubble { background: var(--accent); color: #fff; }
+.msg.assistant .msg-bubble { background: var(--bg-soft-2); }
+.msg-actions { display: flex; gap: 2px; opacity: 0.85; }
+.msg-actions button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: var(--fg-dim);
+}
+.msg-actions button:hover { color: var(--accent); background: var(--bg-soft-2); }
+.msg-actions button[data-a="delete"]:hover { color: #ff6b6b; background: rgba(255, 80, 80, 0.12); }
+/* A 🔊 button that is currently reading is highlighted; clicking it again stops the read. */
+.msg-actions button.active,
+.msg-actions button.active:hover { color: #fff; background: var(--accent); }
+
+.msg-thinking {
+  align-self: flex-start;
+  max-width: 80%;
+  font-size: 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-soft);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.msg-thinking summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-weight: 600;
+  user-select: none;
+  outline: none;
+}
+.msg-thinking .thinking-text {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg-dim);
+  line-height: 1.5;
+}
 
 #chat-form { display: flex; gap: 8px; padding: 10px; border-top: 1px solid var(--border); }
 
@@ -517,6 +657,28 @@ pre.text-viewer {
   font-size: 12px;
   color: var(--fg-dim);
 }
+#chat-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin-left: -4px;
+}
+#chat-title:hover { background: var(--bg-soft-2); color: var(--fg); }
+.chat-title-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  padding: 2px 4px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+}
 #chat-header button {
   padding: 3px 8px;
   background: var(--bg-soft-2);
@@ -530,14 +692,22 @@ pre.text-viewer {
 #chat-header button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 .chat-header-actions { display: flex; gap: 4px; align-items: center; }
 
-/* Floating chat window (draggable overlay). */
+/* Floating chat window (draggable overlay, resizable via the bottom-right corner).
+   ``resize: both`` needs ``overflow`` other than ``visible``; the message list scrolls
+   inside #chat-log, so hiding overflow on the container doesn't clip anything. */
 #chat.floating {
   position: fixed;
   top: 80px;
   left: 340px;
   width: 360px;
   height: 440px;
+  min-width: 240px;
+  min-height: 180px;
+  max-width: 90vw;
+  max-height: 85vh;
   z-index: 60;
+  resize: both;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 10px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
@@ -555,6 +725,34 @@ pre.text-viewer {
   border-top: 0;
 }
 
+/* Docked chat edge-resize handle: a thin strip straddling the chat boundary. Drag it to
+   resize — bottom-docked changes height (top edge), right-docked changes width (left edge).
+   Hidden while floating (the floating window is dragged by its header and resized via its
+   CSS corner handle). */
+#chat-resize {
+  display: none;
+  position: absolute;
+  z-index: 20;
+}
+#chat:not(.floating) #chat-resize {
+  display: block;
+  top: -4px;
+  left: 0;
+  right: 0;
+  height: 8px;
+  cursor: ns-resize;
+}
+#app.chat-right #chat:not(.floating) #chat-resize {
+  top: 0;
+  right: auto;
+  bottom: 0;
+  left: -4px;
+  width: 8px;
+  height: auto;
+  cursor: ew-resize;
+}
+#chat-resize:hover { background: var(--accent); opacity: 0.35; }
+
 /* Sidebar resize handle. */
 .splitter {
   width: 4px;
@@ -566,6 +764,9 @@ pre.text-viewer {
 .splitter:hover, body.resizing .splitter { background: var(--accent); }
 body.resizing { user-select: none; cursor: col-resize; }
 body.resizing #sidebar { transition: none; }
+/* Override the splitter cursor while dragging the docked-chat edge (see #chat-resize). */
+body.resizing-ns { cursor: ns-resize; }
+body.resizing-ew { cursor: ew-resize; }
 
 /* ── Settings modal ── */
 .overlay {

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -22,6 +23,22 @@ _TOKEN_RE = re.compile(r"[a-z0-9\u4e00-\u9fff]+")
 K1 = 1.2  # BM25 term-frequency saturation
 B = 0.75  # BM25 length normalisation
 DEFAULT_K = 60  # RRF constant
+RECENCY_HALF_LIFE_DAYS = 30.0  # exponential decay half-life for the recency weight
+
+
+def _recency_factor(meta: dict | None) -> float:
+    """A 0.5–1.0 recency multiplier from a hit's epoch ``created_at`` (missing → 1.0).
+
+    Recent messages score ≈ 1.0×; 30 days old ≈ 0.68×; 90 days old ≈ 0.55×. File-memory
+    hits (no ``created_at``) are untouched.
+    """
+    if not meta:
+        return 1.0
+    created = meta.get("created_at")
+    if created is None:
+        return 1.0
+    age_days = max(0.0, (time.time() - created) / 86_400.0)
+    return 0.5 + 0.5 * math.exp(-age_days / RECENCY_HALF_LIFE_DAYS)
 
 
 def _tokenize(text: str) -> list[str]:
@@ -159,22 +176,26 @@ class RRFMemoryRetriever:
             return keyword_hits[:top_k]
 
         kw_rank = [
-            SearchHit(id=h.key, text=h.content, score=h.score, source="keyword")
+            SearchHit(id=h.key, text=h.content, score=h.score, source="keyword", meta=h.meta)
             for h in keyword_hits
         ]
         vec_rank = [
-            SearchHit(id=h.key, text=h.content, score=h.score, source="vector")
+            SearchHit(id=h.key, text=h.content, score=h.score, source="vector", meta=h.meta)
             for h in vector_hits
         ]
         fused = rrf_fusion([kw_rank, vec_rank], k=self._k)
-        return [
+        # Recency weighting: RRF structures the base ranking, then a soft exponential decay
+        # boosts recent messages on near-ties (recent ≈ 1.0×, 30 days ≈ 0.68×, 90 days ≈ 0.55×).
+        ranked = [
             MemoryHit(
                 key=h.id,
                 content=h.text,
                 description="",
-                score=h.score,
+                score=h.score * _recency_factor(h.meta),
                 source="rrf",
                 meta=h.meta,
             )
-            for h in fused[:top_k]
+            for h in fused
         ]
+        ranked.sort(key=lambda m: m.score, reverse=True)
+        return ranked[:top_k]

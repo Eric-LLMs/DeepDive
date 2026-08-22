@@ -17,9 +17,13 @@ class TEIEmbedder:
     require an API restart.
     """
 
-    def __init__(self, base_url: str | None = None) -> None:
+    def __init__(self, base_url: str | None = None, timeout: float = 5.0) -> None:
         self.base_url = base_url or settings.embedding_base_url
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=120.0)
+        # Local TEI container answers in well under a second for a short query; fail fast
+        # instead of stalling a chat turn when the embedding service is down (503/hang).
+        # Batch embed (session finalize, sentence indexing) runs in the worker and passes a
+        # longer timeout — a batch of long messages can exceed the fast-fail budget.
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         resp = await self._client.post("/embed", json={"inputs": texts, "normalize": True})

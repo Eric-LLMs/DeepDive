@@ -25,6 +25,19 @@ def _tsvector():
     return func.to_tsvector(_FTS_CONFIG, MessageModel.text)
 
 
+def _hit_meta(message) -> dict:
+    """Recall-hit metadata: role, session, and the message's epoch created_at.
+
+    ``created_at`` feeds the recency weighting in :class:`RRFMemoryRetriever` (recent
+    messages rank slightly higher on near-ties); epoch seconds keeps it JSON-serializable.
+    """
+    return {
+        "role": message.role,
+        "session_id": str(message.session_id),
+        "created_at": message.created_at.timestamp() if message.created_at else None,
+    }
+
+
 class PgKeywordRecaller:
     """tsvector full-text keyword recall over a user's messages (deterministic, no vectors)."""
 
@@ -62,7 +75,7 @@ class PgKeywordRecaller:
                 content=message.text,
                 score=float(score),
                 source="keyword",
-                meta={"role": message.role, "session_id": str(message.session_id)},
+                meta=_hit_meta(message),
             )
             for message, score in rows
         ]
@@ -102,7 +115,7 @@ class PgVectorRecaller(VectorRetriever):
                 content=message.text,
                 score=float(score),
                 source="vector",
-                meta={"role": message.role, "session_id": str(message.session_id)},
+                meta=_hit_meta(message),
             )
             for message, score in rows
         ]

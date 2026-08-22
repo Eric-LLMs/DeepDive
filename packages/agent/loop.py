@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, AsyncIterator, Protocol
 
 from agent.decisions import ToolExecution, ToolExecutionResult
 from agent.runtime import ToolRuntime
@@ -33,6 +33,23 @@ class AgentLLMPort(Protocol):
         api_key: str | None = None,
     ) -> dict:
         """Return {"content": str | None, "tool_calls": [{id, name, arguments}]}."""
+        ...
+
+    async def chat_stream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> AsyncIterator[dict]:
+        """Optional streaming variant of :meth:`chat`.
+
+        Yields event dicts ``{"type": "thinking"|"content", "data": <delta>}`` per chunk,
+        then a final ``{"type": "tool_calls", "data": [{id, name, arguments}]}`` event. The
+        agent loop's :meth:`ReactLoopAgent.run_stream` consumes these; a port that only
+        implements ``chat`` still works for the non-streaming :meth:`run`.
+        """
         ...
 
 
@@ -149,6 +166,118 @@ class ReactLoopAgent:
             self._session_memory = None
 
         return AgentResult(messages=messages, final_answer=self._final(messages), usage=usage)
+
+    async def run_stream(
+        self,
+        user_msg: str,
+        history: list[dict] | None = None,
+        memory_keys: list[str] | None = None,
+        session_memory: Any | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> AsyncIterator[dict]:
+        """Streaming variant of :meth:`run`.
+
+        Yields per-step events so a client can render the model's reasoning (``thinking``)
+        and answer (``content``) incrementally instead of waiting for the full turn:
+        - ``{"type": "thinking", "data": <delta>}`` — a reasoning fragment;
+        - ``{"type": "content", "data": <delta>}`` — an answer fragment;
+        - ``{"type": "tool", "data": {"name": <tool id>}}`` — a tool is about to be dispatched;
+        - ``{"type": "step-answer", "data": <full step content>}`` — end of one step's answer;
+        - ``{"type": "done", "data": {"answer", "messages", "usage"}}`` — the turn result.
+
+        The pipeline is identical to :meth:`run` (tool dispatch, session hooks, persistent
+        session memory); only the LLM call is streamed. If the generator is abandoned
+        (client disconnect) the ``finally`` block still closes the session memory.
+        """
+        self._session_memory = session_memory
+        context = {
+            "user_msg": user_msg,
+            "history": history,
+            "memory_keys": memory_keys,
+            "session_memory": session_memory,
+        }
+        if isinstance(self.system_prompt, CacheBoundaryAssembler):
+            self.system_prompt.begin_session()
+        if self.gateway is not None:
+            self.gateway.reset_session()
+
+        assembly = await self.system_prompt.assemble(context)
+        system = render_prompt(assembly)
+
+        await self.events.serial("agent/session-start", {"user_msg": user_msg})
+        self._log("session-start", user_msg=user_msg, snapshot_key=self._snapshot_key())
+
+        messages = (history or []) + [{"role": "user", "content": user_msg}]
+        await self._persist_message(session_memory, "user", user_msg)
+
+        usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        try:
+            for _ in range(self.max_steps):
+                await self.events.serial("agent/step-start", {})
+                self._log("step-start")
+                if isinstance(self.system_prompt, CacheBoundaryAssembler):
+                    dynamic = await self.system_prompt.refresh_dynamic(context)
+                    if dynamic != assembly.dynamic_suffix:
+                        assembly.dynamic_suffix = dynamic
+                        system = render_prompt(assembly)
+                tools = self._step_tools(context, assembly)
+
+                # One streamed LLM call: forward reasoning/answer deltas as they arrive.
+                request = [{"role": "system", "content": system}] + messages
+                content = ""
+                tool_calls: list[dict] = []
+                step_usage: dict[str, int] | None = None
+                async for evt in self.llm.chat_stream(
+                    request, tools=tools, model=model, base_url=base_url, api_key=api_key
+                ):
+                    kind = evt.get("type")
+                    if kind == "thinking" and evt.get("data"):
+                        yield {"type": "thinking", "data": evt["data"]}
+                    elif kind == "content" and evt.get("data"):
+                        content += evt["data"]
+                        yield {"type": "content", "data": evt["data"]}
+                    elif kind == "tool_calls":
+                        tool_calls = evt.get("data") or []
+                    elif kind == "usage":
+                        step_usage = evt.get("data")
+                usage = _sum_usage(usage, step_usage)
+                self._log("llm-call", tool_calls=len(tool_calls))
+
+                assistant: dict = {"role": "assistant", "content": content or None}
+                if tool_calls:
+                    assistant["tool_calls"] = tool_calls
+                messages.append(assistant)
+                if content:
+                    await self._persist_message(session_memory, "assistant", content)
+                    yield {"type": "step-answer", "data": content}
+
+                await self.events.serial("agent/step-end", {})
+                self._log("step-end")
+
+                if not tool_calls:
+                    break
+                for tc in tool_calls:
+                    yield {"type": "tool", "data": {"name": tc["name"]}}
+                concludes = await self._execute_tool_calls(tool_calls, messages, session_memory)
+                if concludes:
+                    break
+        finally:
+            await self.events.serial("agent/session-end", {"messages": messages})
+            self._log("session-end")
+            if session_memory is not None:
+                await session_memory.close()
+            self._session_memory = None
+
+        yield {
+            "type": "done",
+            "data": {
+                "answer": self._final(messages),
+                "messages": messages,
+                "usage": usage,
+            },
+        }
 
     def _runtime_schemas(self) -> list[dict]:
         return [{"type": "function", "function": s} for s in self.runtime.schemas()]
