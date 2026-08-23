@@ -1,4 +1,4 @@
-# 🧠 DeepDive
+# <img src="docs/images/deepdive-logo.png" alt="DeepDive" width="40" valign="bottom" /> DeepDive
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
@@ -6,11 +6,17 @@
 [![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**DeepDive** is an AI-powered learning workbench — a monorepo spanning a FastAPI backend, a React web UI, and an Electron desktop workbench. It unifies **vocabulary learning**, **video/document learning**, and an **AI chat assistant** around a single abstraction: *everything is a text chunk*.
+**DeepDive** is an **AI-powered learning workbench** for researchers, students, and lifelong learners — a **1-on-1 AI tutor** that walks you through anything you read or watch, from first skim to final review.
 
-The engine is a native function-calling **agent** — an `AgentKernel` composition root that wires a cache-boundary prompt (a byte-stable static head so the provider reuses its prefix cache), deferred tool loading, dual-track memory (PostgreSQL tsvector + pgvector fused by RRF), a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop. A **hybrid search engine** finds context even when exact keywords are missing, and a **RAG pipeline** (rewrite → recall → RRF → rerank) grounds every chat answer.
+- **1-on-1 AI Tutoring**: Load a paper, book, lecture, or video and ask about anything — get explanations, related sources, and discussion until it clicks, even as the video plays.
+- **Knowledge Synthesis**: Skim a 600-page book in minutes — get a structured summary or slide deck before you commit to reading it.
+- **Note-Taking That Sticks**: The tutor records and organizes your insights as you study, ready when you review.
+- **Learn Together**: Share files from the built-in cloud drive in shared workspaces and study the same material as a group.
+- **One Place, All Forms**: A fast web app, a desktop workbench that works offline, and a fully self-hosted AI engine — your materials stay yours.
 
-Model inference never runs inside the API: embedding (**BGE-M3** via TEI) and **TTS (Kokoro)** are separate Docker services, and retrieval can be extracted behind a capability seam into its own **gRPC service**. **LLM calls** go directly to the provider channel pinned to the session (managed in the admin console), with the LiteLLM gateway as the legacy fallback. Async enrichment (TTS, images, explanations, session finalize) runs on an arq **worker** off the request path.
+The engine is a native function-calling **agent** — an `AgentKernel` composition root that wires a cache-boundary prompt (a byte-stable static head so the provider reuses its prefix cache), deferred tool loading, dual-track memory (PostgreSQL tsvector + [pgvector](https://github.com/pgvector/pgvector) fused by RRF), a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop. A **hybrid search engine** finds context even when exact keywords are missing, and a **RAG pipeline** (rewrite → recall → RRF → rerank) grounds every chat answer.
+
+Model inference never runs inside the API: embedding (**[BGE-M3](https://huggingface.co/BAAI/bge-m3)** via [TEI](https://github.com/huggingface/text-embeddings-inference)) and **TTS ([Kokoro](https://github.com/hexgrad/kokoro))** are separate Docker services, and retrieval can be extracted behind a capability seam into its own **gRPC service**. **LLM calls** go directly to the provider channel pinned to the session (managed in the admin console), with the [LiteLLM](https://github.com/BerriAI/litellm) gateway as the legacy fallback. Async enrichment (TTS, images, explanations, session finalize) runs on an [arq](https://arq-docs.helpmanual.io/) **worker** off the request path.
 
 Also included: multi-user accounts with per-role quotas, **per-role LLM channels** (role ↔ credential bindings with one channel pinned per login), pay-as-you-go **billing** with atomic wallet deduction, a self-contained **admin console** (Providers / Roles / Users / Tokens / Tools config), **self-service accounts** (email-verified registration, password reset, editable profiles with avatars), and a desktop workbench with a file tree, a multi-format media viewer, and one-click video screenshots.
 
