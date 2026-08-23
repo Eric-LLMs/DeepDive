@@ -136,6 +136,11 @@ flowchart TB
 **Prompt — cache-boundary assembly, compression, and deferred tool stubs** (architecture, design
 features, and per-step process logic):
 
+![Prompt — cache-boundary assembly, compression, and deferred tool stubs](./docs/images/prompt-architecture.png)
+
+<details>
+<summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
+
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 500, "nodeSpacing": 40, "rankSpacing": 50}}}%%
 flowchart TB
@@ -178,6 +183,8 @@ flowchart TB
         RENDER --> REQ
     end
 ```
+
+</details>
 
 > **Prompt invariants** — the `CACHE_BOUNDARY` separator is internal-only and never rendered to the
 > model; the stable head (STATIC_PREFIX + PROJECT_CONTEXT) is byte-identical across requests so the
