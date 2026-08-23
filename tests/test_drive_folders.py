@@ -36,13 +36,14 @@ async def test_create_and_list_personal_folder(tmp_path):
     assert listed == {"Vocab", "Vocab/Unit1"}
 
 
-async def test_create_folder_conflict(tmp_path):
+async def test_create_folder_conflict_auto_suffixes(tmp_path):
+    """Collision-safe naming: a duplicate folder auto-renames to stem(n) instead of failing."""
     svc = make_drive(tmp_path)
     a = uuid4()
     await svc.create_folder(a, None, None, "Vocab")
-    with pytest.raises(DriveError) as e:
-        await svc.create_folder(a, None, None, "Vocab")
-    assert e.value.status_code == 409
+    dup = await svc.create_folder(a, None, None, "Vocab")
+    assert dup["name"] == "Vocab(1)"
+    assert dup["path"] == "Vocab(1)"
 
 
 async def test_create_folder_rejects_bad_names_and_paths(tmp_path):

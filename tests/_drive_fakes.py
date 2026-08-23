@@ -90,6 +90,27 @@ class FakeAssets:
             if o.workspace_id == workspace_id and o.deleted_at is None
         ]
 
+    async def get_by_path(self, user_id, workspace_id, folder_path, name):
+        """Mirror SqlAssetRepository.get_by_path: exact name under folder_path; None/"" means
+        the scope's root; active rows only; personal scope matches the user's own rows,
+        workspace scope matches any row in the workspace."""
+        for o in self.rows.values():
+            if o.workspace_id != workspace_id:
+                continue
+            if workspace_id is None and o.user_id != user_id:
+                continue
+            if o.deleted_at is not None:
+                continue
+            if folder_path in (None, ""):
+                if o.folder_path is not None:
+                    continue
+            elif o.folder_path != folder_path:
+                continue
+            if o.name != name:
+                continue
+            return o
+        return None
+
     async def soft_delete(self, asset_id):
         obj = self.rows.get(asset_id)
         if obj is None or obj.deleted_at is not None:
@@ -115,6 +136,17 @@ class FakeAssets:
         obj.object_sha256 = object_sha256
         return obj
 
+    async def set_content_meta(self, asset_id, object_sha256, size, mime_type):
+        """Mirror SqlAssetRepository.set_content_meta: repoint to a new physical object."""
+        obj = self.rows.get(asset_id)
+        if obj is None:
+            return None
+        obj.object_sha256 = object_sha256
+        obj.size = size
+        if mime_type is not None:
+            obj.mime_type = mime_type
+        return obj
+
     async def update(self, asset_id, *, name=None, folder_path=None):
         obj = self.rows.get(asset_id)
         if obj is None:
@@ -133,9 +165,11 @@ class FakeAssets:
         obj.folder_path = folder_path
         return obj
 
-    async def move_subtree(self, workspace_id, old_path, new_path):
+    async def move_subtree(self, user_id, workspace_id, old_path, new_path):
         for o in self.rows.values():
             if o.workspace_id != workspace_id:
+                continue
+            if workspace_id is None and o.user_id != user_id:
                 continue
             if o.folder_path is None:
                 continue
@@ -144,9 +178,11 @@ class FakeAssets:
             elif o.folder_path.startswith(old_path + "/"):
                 o.folder_path = new_path + o.folder_path[len(old_path):]
 
-    async def trash_subtree(self, workspace_id, path):
+    async def trash_subtree(self, user_id, workspace_id, path):
         for o in self.rows.values():
             if o.workspace_id != workspace_id or o.deleted_at is not None:
+                continue
+            if workspace_id is None and o.user_id != user_id:
                 continue
             if o.folder_path is None:
                 continue
@@ -357,18 +393,34 @@ class FakeFolders:
             if f.user_id == user_id or f.workspace_id in visible_ws
         ]
 
-    async def move_subtree(self, workspace_id, old_path, new_path):
+    async def move_subtree(self, user_id, workspace_id, old_path, new_path):
         for f in self.rows.values():
             if f.workspace_id != workspace_id:
+                continue
+            if workspace_id is None and f.user_id != user_id:
                 continue
             if f.path == old_path:
                 f.path = new_path
             elif f.path.startswith(old_path + "/"):
                 f.path = new_path + f.path[len(old_path):]
 
-    async def delete_subtree(self, workspace_id, path):
+    async def get_by_path(self, user_id, workspace_id, path):
+        """Mirror SqlFoldersRepository.get_by_path: exact path; personal (My Drive) rows
+        belong to ``user_id`` alone, workspace rows are shared by members."""
+        for f in self.rows.values():
+            if f.workspace_id != workspace_id:
+                continue
+            if workspace_id is None and f.user_id != user_id:
+                continue
+            if f.path == path:
+                return f
+        return None
+
+    async def delete_subtree(self, user_id, workspace_id, path):
         for fid, f in list(self.rows.items()):
             if f.workspace_id != workspace_id:
+                continue
+            if workspace_id is None and f.user_id != user_id:
                 continue
             if f.path == path or f.path.startswith(path + "/"):
                 del self.rows[fid]
