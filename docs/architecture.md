@@ -272,10 +272,10 @@ persistence copy stays raw); and **token-aware autocompact** — `compact_histor
 total-window character budget (`settings.prompt_max_chars`), so a few oversized messages trigger
 compaction even below the message-count threshold.
 
-The README's *Prompt* diagram ([images/prompt-architecture.png](../docs/images/prompt-architecture.png))
-visualizes the same contract end to end — input compaction, the three cache-boundary zones feeding
-a stable head, `render_prompt` producing the snapshot key, and the per-step process (snip → LLM
-request → `refresh_dynamic` / visible-tool stubs).
+The README's *Prompt* diagram ([mermaid source](../README.md)) visualizes the same contract end to
+end — input compaction, the three cache-boundary zones feeding a stable head, `render_prompt`
+producing the snapshot key, and the per-step process (snip → LLM request → `refresh_dynamic` /
+visible-tool stubs).
 
 ### 5.4 Memory, skills, sessions
 

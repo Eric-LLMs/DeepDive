@@ -102,7 +102,7 @@ flowchart TB
         RRF[RRF fusion + recency decay<br/>30-day half-life · 1.0× recent<br/>0.68× at 30d · 0.55× at 90d]
         COMPACT[compact_history · hierarchical recap<br/>over 40 msgs → keep latest 20<br/>L2 prior-window summaries coarse<br/>L1 current summary · failure still truncates]
         FINAL[worker finalize<br/>backfill embeddings · summary · auto-title<br/>failure-robust · cosmetic failures never block]
-        SWEEP[retention cron · 04:17 daily<br/>purge session_events > 30d<br/>audit log only · L2 recap fades · messages kept]
+        SWEEP[retention cron · scheduled daily<br/>purge session_events > 30d<br/>audit log only · L2 recap fades · messages kept]
         MSGS --> KW
         MSGS --> VEC
         KW --> RRF
@@ -136,12 +136,8 @@ flowchart TB
 **Prompt — cache-boundary assembly, compression, and deferred tool stubs** (architecture, design
 features, and per-step process logic):
 
-![Prompt architecture — cache-boundary assembly](./docs/images/prompt-architecture.png)
-
-<details>
-<summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
-
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 500, "nodeSpacing": 40, "rankSpacing": 50}}}%%
 flowchart TB
     %% Prompt module: cache-boundary assembly + compression + deferred tool stubs.
     %% Invariants: the CACHE_BOUNDARY separator is internal-only and never rendered; the stable
@@ -173,7 +169,7 @@ flowchart TB
     end
 
     subgraph perstep["Process · per step"]
-        RENDER --> SNIP["per-message snip · prompt_message_max_chars<br/>request snapshot trimmed · persistence keeps full text"]
+        SNIP["per-message snip · prompt_message_max_chars<br/>request snapshot trimmed · persistence keeps full text"]
         AUTO --> SNIP
         SNIP --> REQ["LLM request · system + snipped messages"]
         REQ --> REFRESH["refresh_dynamic · recompute only DYNAMIC_SUFFIX<br/>unchanged → system not re-sent · head reused"]
@@ -181,8 +177,6 @@ flowchart TB
         REFRESH --> REQ
     end
 ```
-
-</details>
 
 > **Prompt invariants** — the `CACHE_BOUNDARY` separator is internal-only and never rendered to the
 > model; the stable head (STATIC_PREFIX + PROJECT_CONTEXT) is byte-identical across requests so the
