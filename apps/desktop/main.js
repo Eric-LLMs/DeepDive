@@ -8,10 +8,10 @@ const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, Menu } = requ
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const { execFile } = require("child_process");
 const { Readable } = require("stream");
 const { pathToFileURL } = require("url");
 const { PDFDocument, rgb } = require("pdf-lib");
+const WordExtractor = require("word-extractor"); // legacy binary .doc text extraction
 
 function hexToRgb(hex) {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
@@ -213,49 +213,6 @@ function readTree(dir, depth = 0) {
   return result;
 }
 
-// Locate a LibreOffice `soffice` binary (on PATH or common Windows install dirs).
-function findSoffice() {
-  const candidates = [
-    "soffice",
-    "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-    "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
-  ];
-  for (const c of candidates) {
-    if (c === "soffice" || fs.existsSync(c)) return c;
-  }
-  return null;
-}
-
-// Convert a PowerPoint file (.ppt/.pptx) to PDF via LibreOffice headless, writing
-// the result into a fresh temp dir. Resolves to { ok, pdfPath } or { ok, error }.
-function convertSlidesToPdf(filePath) {
-  return new Promise((resolve) => {
-    const soffice = findSoffice();
-    if (!soffice) {
-      return resolve({
-        ok: false,
-        error: "LibreOffice (soffice) not found. Install LibreOffice or add soffice to PATH.",
-      });
-    }
-    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "deepdive-ppt-"));
-    const base = path.basename(filePath, path.extname(filePath)) + ".pdf";
-    execFile(
-      soffice,
-      ["--headless", "--convert-to", "pdf", "--outdir", outDir, filePath],
-      { timeout: 120000 },
-      (err) => {
-        if (err) return resolve({ ok: false, error: err.message });
-        const pdfPath = path.join(outDir, base);
-        resolve(
-          fs.existsSync(pdfPath)
-            ? { ok: true, pdfPath }
-            : { ok: false, error: "Conversion produced no PDF file." }
-        );
-      }
-    );
-  });
-}
-
 function registerIpcHandlers() {
   ipcMain.handle("pick-folder", async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ["openDirectory"] });
@@ -267,7 +224,7 @@ function registerIpcHandlers() {
     return canceled || filePaths.length === 0 ? null : filePaths[0];
   });
 
-  // Copy a file into a workspace folder, resolving name collisions with " (n)".
+  // Copy a file into a workspace folder, resolving name collisions with "(n)".
   ipcMain.handle("copy-into-workspace", (_event, { src, destDir }) => {
     if (!src || !destDir) return { ok: false, error: "No file or workspace folder selected." };
     try {
@@ -280,7 +237,7 @@ function registerIpcHandlers() {
       const stem = path.basename(name, ext);
       let n = 1;
       while (fs.existsSync(target)) {
-        target = path.join(destDir, `${stem} (${n})${ext}`);
+        target = path.join(destDir, `${stem}(${n})${ext}`);
         n += 1;
       }
       fs.copyFileSync(src, target);
@@ -390,7 +347,7 @@ function registerIpcHandlers() {
     }
   });
 
-  // Create a text file inside the workspace, resolving name collisions with " (n)".
+  // Create a text file inside the workspace, resolving name collisions with "(n)".
   ipcMain.handle("create-text-file", (_event, { workspaceDir, parentDir, name, content }) => {
     if (!workspaceDir || !parentDir || !name) return { ok: false, error: "No file or workspace folder selected." };
     const clean = String(name).trim();
@@ -406,7 +363,7 @@ function registerIpcHandlers() {
       let target = path.join(parent, clean);
       let n = 1;
       while (fs.existsSync(target)) {
-        target = path.join(parent, `${stem} (${n})${ext}`);
+        target = path.join(parent, `${stem}(${n})${ext}`);
         n += 1;
       }
       fs.writeFileSync(target, String(content ?? ""), "utf8");
@@ -494,7 +451,89 @@ function registerIpcHandlers() {
     }
   });
 
-  ipcMain.handle("convert-slides", (_event, filePath) => convertSlidesToPdf(filePath));
+  // Read a file as raw bytes (Office documents are ZIPs, so the renderer needs the
+  // binary content, not UTF-8 text). The Buffer is delivered to the renderer as a
+  // Uint8Array via structured clone.
+  ipcMain.handle("read-file-bytes", (_event, filePath) => {
+    try {
+      return { ok: true, data: fs.readFileSync(filePath) };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Pull embedded raster images (PNG/JPEG/GIF/BMP) out of a .doc's raw bytes so the
+  // preview can show them. Best-effort: images are extracted in file order, deduped by
+  // content, and rendered without Word's exact layout. WMF/EMF vectors and spurious byte
+  // patterns are skipped (weak signatures like BMP are size-validated).
+  function extractEmbeddedImages(buf) {
+    const crypto = require("crypto");
+    const out = [];
+    const seen = new Set();
+    const push = (start, end, mime) => {
+      if (end <= start || end - start < 16) return;
+      const blob = buf.subarray(start, end);
+      const h = crypto.createHash("sha1").update(blob).digest("hex");
+      if (seen.has(h)) return;
+      seen.add(h);
+      out.push({ mime, b64: blob.toString("base64") });
+    };
+    const IEND = Buffer.from([0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
+    const sigs = {
+      png: [0x89, 0x50, 0x4e, 0x47],
+      jpg: [0xff, 0xd8, 0xff],
+      gif: [0x47, 0x49, 0x46, 0x38],
+      bmp: [0x42, 0x4d],
+    };
+    const matches = (i, s) => { for (let j = 0; j < s.length; j++) if (buf[i + j] !== s[j]) return false; return true; };
+    let i = 0;
+    while (i < buf.length - 8) {
+      if (matches(i, sigs.png)) {
+        const ie = buf.indexOf(IEND, i + 8);
+        const end = ie > 0 ? ie + 8 : i + 8;
+        push(i, end, "image/png");
+        i = end;
+      } else if (matches(i, sigs.jpg)) {
+        let e = i + 4;
+        while (e < buf.length - 1 && !(buf[e] === 0xff && buf[e + 1] === 0xd9)) e++;
+        const end = e < buf.length - 1 ? e + 2 : i + 4;
+        push(i, end, "image/jpeg");
+        i = end;
+      } else if (matches(i, sigs.gif)) {
+        let e = i + 10;
+        while (e < buf.length && buf[e] !== 0x3b) e++;
+        const end = e < buf.length ? e + 1 : i + 10;
+        push(i, end, "image/gif");
+        i = end;
+      } else if (matches(i, sigs.bmp)) {
+        const size = buf.readUInt32LE(i + 2);
+        if (size >= 54 && i + size <= buf.length) push(i, i + size, "image/bmp");
+        i += 4;
+      } else {
+        i += 1;
+      }
+    }
+    return out;
+  }
+
+  // Extract the text of a legacy binary Word (.doc) document with word-extractor (pure
+  // JS, runs in the main process), plus any embedded raster images so the preview isn't
+  // blind for image-heavy documents. Layout/positioning aren't preserved. Any parse
+  // failure falls back to the system default app in the renderer.
+  ipcMain.handle("word-extract", async (_event, filePath) => {
+    try {
+      const extractor = new WordExtractor();
+      const doc = await extractor.extract(filePath);
+      const text = doc.getBody();
+      const images = extractEmbeddedImages(fs.readFileSync(filePath));
+      if ((!text || !text.trim()) && images.length === 0) {
+        return { ok: false, error: "The document contains no extractable text or images." };
+      }
+      return { ok: true, content: text || "", images };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
 
   ipcMain.handle("find-subtitle", (_event, videoPath) => {
     const dir = path.dirname(videoPath);

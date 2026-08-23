@@ -705,16 +705,20 @@ class DriveService:
     async def _unique_name(
         self, user_id: UUID, workspace_id: UUID | None, parent_path: str | None, name: str
     ) -> str:
-        """Return ``name``, or the first ``name (n)`` that no folder/file at that spot uses.
+        """Return ``name``, or the first collision-free ``stem(n)ext`` variant.
 
-        Mirrors desktop copy semantics ("untitled.txt" → "untitled (1).txt") so creating,
-        moving or renaming into a busy directory never fails — the requested name wins and
-        duplicates get a numeric suffix. The caller surfaces the final name to the user.
+        The numeric suffix is inserted BEFORE the file extension ("a.docx" → "a(1).docx",
+        never "a.docx (1)"), matching desktop upload/copy semantics. Folders (no extension)
+        become "docs" → "docs(1)". The caller surfaces the final name to the user.
         """
         if not await self._name_taken(user_id, workspace_id, parent_path, name):
             return name
+        idx = name.rfind(".")
         for n in range(1, 1000):
-            candidate = f"{name} ({n})"
+            if idx > 0:  # don't split hidden files like ".gitignore"
+                candidate = f"{name[:idx]}({n}){name[idx:]}"
+            else:
+                candidate = f"{name}({n})"
             if not await self._name_taken(user_id, workspace_id, parent_path, candidate):
                 return candidate
         raise DriveError("could not find a free name in that folder", 409)

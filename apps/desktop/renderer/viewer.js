@@ -7,12 +7,19 @@ const Viewer = (() => {
   const AUDIO_EXT = new Set(["mp3", "wav", "m4a", "flac", "ogg"]);
   const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"]);
   const TEXT_EXT = new Set([
-    "txt", "md", "json", "csv", "log", "yaml", "yml", "toml", "ini", "conf",
+    "txt", "md", "json", "log", "yaml", "yml", "toml", "ini", "conf",
     "py", "js", "ts", "jsx", "tsx", "html", "css", "sh", "sql", "java", "c",
     "cpp", "h", "rs", "go", "xml",
   ]);
-  const SLIDES_EXT = new Set(["ppt", "pptx"]);
-  const OFFICE_EXT = new Set(["docx", "xlsx", "doc", "xls"]);
+  // Office formats previewed in-window with pure-JS renderers (vendored bundles).
+  // The PowerPoint family (.pptx/.ppsx/.potx/…) is all the same OOXML zip, so one
+  // renderer covers them. Legacy binary .doc is extracted to plain text in the main
+  // process (word-extractor); .ppt has no reliable JS parser and falls back to the
+  // system default app via kindFor → "unknown".
+  const DOCX_EXT = new Set(["docx"]);
+  const DOC_EXT = new Set(["doc"]);
+  const SHEET_EXT = new Set(["xlsx", "xls", "csv", "tsv"]);
+  const PPTX_EXT = new Set(["pptx", "ppsx", "potx", "pptm", "ppsm", "potm"]);
 
   const MIN_ZOOM = 0.25;
   const MAX_ZOOM = 5;
@@ -53,8 +60,11 @@ const Viewer = (() => {
   let liveStroke = null; // the stroke currently being drawn (not yet committed)
 
   function extOf(name) {
-    const i = name.lastIndexOf(".");
-    return i < 0 ? "" : name.slice(i + 1).toLowerCase();
+    // A Windows copy may leave a collision suffix after the extension, e.g.
+    // "notes.docx (1)" — strip it so the real extension still matches.
+    const clean = String(name).replace(/\s*\(\d+\)\s*$/, "");
+    const i = clean.lastIndexOf(".");
+    return i < 0 ? "" : clean.slice(i + 1).toLowerCase();
   }
 
   function baseName(name) {
@@ -161,8 +171,10 @@ const Viewer = (() => {
     if (IMAGE_EXT.has(ext)) return "image";
     if (ext === "pdf") return "pdf";
     if (TEXT_EXT.has(ext)) return "text";
-    if (SLIDES_EXT.has(ext)) return "slides";
-    if (OFFICE_EXT.has(ext)) return "office";
+    if (DOCX_EXT.has(ext)) return "docx";
+    if (DOC_EXT.has(ext)) return "doc";
+    if (SHEET_EXT.has(ext)) return "sheet";
+    if (PPTX_EXT.has(ext)) return "pptx";
     return "unknown";
   }
 
@@ -174,6 +186,21 @@ const Viewer = (() => {
     const el = viewerEl();
     el.innerHTML = "";
     return el;
+  }
+
+  // Close the current document: wipe the viewer and restore the empty state.
+  function close() {
+    if (!state.path) return;
+    const el = clear();
+    state.path = null;
+    state.name = null;
+    state.kind = null;
+    state.openPath = null;
+    const empty = document.createElement("div");
+    empty.id = "viewer-empty";
+    empty.className = "empty";
+    empty.textContent = "Select a file on the left to begin";
+    el.appendChild(empty);
   }
 
   function toast(message) {
@@ -253,6 +280,12 @@ const Viewer = (() => {
     openBtn.textContent = "Open in OS";
     openBtn.onclick = () => window.desktopAPI.openExternal(filePath);
     bar.appendChild(openBtn);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "✕";
+    closeBtn.title = "Close document (Esc)";
+    closeBtn.onclick = close;
+    bar.appendChild(closeBtn);
     return bar;
   }
 
@@ -919,24 +952,156 @@ const Viewer = (() => {
     }
   }
 
-  // PowerPoint: convert to PDF via the main process (LibreOffice), then show it with
-  // the PDF renderer. state.openPath keeps the original file for "Open in OS" and the
-  // kind is switched to "pdf" so zoom re-renders without re-converting.
-  async function renderSlides(filePath, name) {
-    const el = clear();
-    const status = document.createElement("div");
-    status.className = "fallback";
-    status.textContent = "Converting to PDF… (slower the first time)";
-    el.appendChild(status);
-
-    const res = await window.desktopAPI.convertSlides(filePath);
-    if (!res.ok) {
-      renderFallback(filePath, name, `Conversion failed: ${res.error}`);
-      return;
+  // Load a file's bytes (Uint8Array) via IPC for the binary Office viewers.
+  async function readBytes(filePath) {
+    const res = await window.desktopAPI.readFileBytes(filePath);
+    if (!res.ok) throw new Error(res.error || "Failed to read file.");
+    if (!res.data || res.data.byteLength === 0) {
+      throw new Error("This file is empty (0 bytes) — it may have failed to upload.");
     }
-    state.path = res.pdfPath;
-    state.kind = "pdf";
-    dispatch("pdf", res.pdfPath, name);
+    return res.data;
+  }
+
+  // Strip anything dangerous from HTML produced by mammoth (a docx can embed links and
+  // raw HTML). Blocks script/iframe/object/etc., drops on* handlers, and allows only safe
+  // link schemes (data: URLs are kept for images mammoth inlines, blocked otherwise).
+  function sanitizeHtml(html) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const FORBIDDEN = new Set(["script", "iframe", "object", "embed", "base", "link", "meta", "form", "style"]);
+    doc.querySelectorAll("*").forEach((n) => {
+      if (FORBIDDEN.has(n.tagName.toLowerCase())) { n.remove(); return; }
+      [...n.attributes].forEach((a) => {
+        const name = a.name.toLowerCase();
+        if (name.startsWith("on")) { n.removeAttribute(a.name); return; }
+        if (name === "href" || name === "src") {
+          const v = a.value.trim();
+          if (/^(javascript:|vbscript:)/i.test(v)) n.removeAttribute(a.name);
+          else if (name === "href" && /^data:/i.test(v)) n.removeAttribute(a.name);
+          else if (name === "src" && /^data:/i.test(v) && !/^data:image\//i.test(v)) n.removeAttribute(a.name);
+        }
+      });
+    });
+    return doc.body.innerHTML;
+  }
+
+  // Word (.docx): render with the vendored mammoth (docx → HTML), sanitized before display.
+  async function renderDocx(filePath, name) {
+    const el = clear();
+    el.appendChild(makeToolbar(name, filePath, { fullscreen: true }));
+    const body = document.createElement("div");
+    body.className = "docx-viewer";
+    el.appendChild(body);
+    try {
+      const data = await readBytes(filePath);
+      if (typeof mammoth === "undefined") throw new Error("mammoth not loaded.");
+      const ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      const result = await mammoth.convertToHtml({ arrayBuffer: ab, includeRawHtml: false });
+      body.innerHTML = sanitizeHtml(result.value);
+    } catch (err) {
+      body.innerHTML = "";
+      renderFallback(filePath, name, `Preview failed: ${err.message}`);
+    }
+  }
+
+  // Legacy binary Word (.doc): extract text + embedded images with word-extractor in the
+  // main process. Formatting/layout don't survive — paragraphs are shown one per line and
+  // raster images (PNG/JPEG/GIF/BMP) render below them, best-effort and unpositioned.
+  // Unparseable .doc files fall back to the OS default app.
+  async function renderDoc(filePath, name) {
+    const el = clear();
+    el.appendChild(makeToolbar(name, filePath, { fullscreen: true }));
+    const body = document.createElement("div");
+    body.className = "docx-viewer";
+    el.appendChild(body);
+    try {
+      const res = await window.desktopAPI.extractWordText(filePath);
+      if (!res.ok) throw new Error(res.error || "Failed to extract text.");
+      const frag = document.createDocumentFragment();
+      for (const line of String(res.content || "").split(/\r?\n/)) {
+        const t = line.replace(/\t/g, "    ").trim();
+        if (!t) continue;
+        const p = document.createElement("p");
+        p.textContent = t;
+        frag.append(p);
+      }
+      if (!frag.childNodes.length && !(res.images && res.images.length)) {
+        throw new Error("The document contains no extractable text or images.");
+      }
+      if (res.images && res.images.length) {
+        const note = document.createElement("p");
+        note.className = "doc-extract-note";
+        note.textContent =
+          `${res.images.length} embedded image(s) below — best-effort, not positioned as in Word.`;
+        frag.append(note);
+        for (const im of res.images) {
+          const img = document.createElement("img");
+          img.className = "doc-extract-img";
+          img.src = `data:${im.mime};base64,${im.b64}`;
+          frag.append(img);
+        }
+      }
+      body.appendChild(frag);
+    } catch (err) {
+      body.innerHTML = "";
+      renderFallback(filePath, name, `Preview failed: ${err.message}`);
+    }
+  }
+
+  // Excel (.xlsx/.xls) and delimited text (.csv/.tsv): parse with vendored SheetJS, render
+  // each sheet as a table with tabs. CSV/TSV are decoded to a string first so SheetJS
+  // auto-detects the delimiter (comma / tab) instead of treating the bytes as a zip.
+  async function renderSheet(filePath, name) {
+    const el = clear();
+    el.appendChild(makeToolbar(name, filePath, { fullscreen: true }));
+    const body = document.createElement("div");
+    body.className = "sheet-viewer";
+    el.appendChild(body);
+    try {
+      const data = await readBytes(filePath);
+      if (typeof XLSX === "undefined") throw new Error("SheetJS (xlsx) not loaded.");
+      const ext = extOf(name);
+      const wb = ext === "csv" || ext === "tsv"
+        ? XLSX.read(new TextDecoder("utf-8").decode(data), { type: "string" })
+        : XLSX.read(data, { type: "array" });
+      if (!wb.SheetNames.length) throw new Error("No sheets in workbook.");
+      const tabs = document.createElement("div");
+      tabs.className = "sheet-tabs";
+      const panels = document.createElement("div");
+      panels.className = "sheet-panels";
+      wb.SheetNames.forEach((sname, i) => {
+        const tab = document.createElement("button");
+        tab.textContent = sname;
+        tab.className = i === 0 ? "active" : "";
+        tab.onclick = () => {
+          tabs.querySelectorAll("button").forEach((b) => b.classList.remove("active"));
+          tab.classList.add("active");
+          panels.innerHTML = XLSX.utils.sheet_to_html(wb.Sheets[sname]);
+        };
+        tabs.appendChild(tab);
+      });
+      body.append(tabs, panels);
+      panels.innerHTML = XLSX.utils.sheet_to_html(wb.Sheets[wb.SheetNames[0]]);
+    } catch (err) {
+      body.innerHTML = "";
+      renderFallback(filePath, name, `Preview failed: ${err.message}`);
+    }
+  }
+
+  // PowerPoint (.pptx): parse the ZIP with JSZip and lay out slides via PptxViewer.
+  async function renderPptx(filePath, name) {
+    const el = clear();
+    el.appendChild(makeToolbar(name, filePath, { fullscreen: true }));
+    const body = document.createElement("div");
+    body.className = "pptx-wrap";
+    el.appendChild(body);
+    try {
+      const data = await readBytes(filePath);
+      const ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      await PptxViewer.render(ab, body);
+    } catch (err) {
+      body.innerHTML = "";
+      renderFallback(filePath, name, `Preview failed: ${err.message}`);
+    }
   }
 
   async function renderText(filePath, name) {
@@ -977,9 +1142,11 @@ const Viewer = (() => {
       case "audio": return renderAudio(filePath, name);
       case "image": return renderImage(filePath, name);
       case "pdf": return renderPdf(filePath, name);
-      case "slides": return renderSlides(filePath, name);
+      case "docx": return renderDocx(filePath, name);
+      case "doc": return renderDoc(filePath, name);
+      case "sheet": return renderSheet(filePath, name);
+      case "pptx": return renderPptx(filePath, name);
       case "text": return renderText(filePath, name);
-      case "office": return renderFallback(filePath, name, "Open Office documents in the system app.");
       default: return renderFallback(filePath, name, null);
     }
   }
@@ -1006,5 +1173,16 @@ const Viewer = (() => {
     });
   });
 
-  return { render, kindFor, localUrl, toast };
+  // Esc closes the current document — unless we're typing in a field, fullscreen
+  // (Esc is the native exit), or a modal overlay is open.
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || !state.path) return;
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    if (document.fullscreenElement) return;
+    if (document.querySelector(".overlay:not(.hidden)")) return;
+    close();
+  });
+
+  return { render, kindFor, localUrl, toast, close };
 })();

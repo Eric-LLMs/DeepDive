@@ -308,7 +308,7 @@
   function dragPayload(e) {
     try { return JSON.parse(e.dataTransfer.getData("text/plain") || "null"); } catch { return null; }
   }
-  // The server auto-suffixes busy names ("docs" → "docs (1)"). Surface that to the user.
+  // The server auto-suffixes busy names ("docs" → "docs(1)"). Surface that to the user.
   function renameHint(requested, final) {
     if (requested && final && requested !== final) {
       Viewer.toast(`"${requested}" already exists — used "${final}" instead.`);
@@ -399,9 +399,13 @@
   });
 
   function isTextFile(f) {
+    const name = f.name || "";
+    // .csv/.tsv are delimited tables — they open in the SheetJS table viewer, not the
+    // note editor, even if the server stored them with a text/* mime type.
+    if (/\.(csv|tsv)$/i.test(name)) return false;
     const mime = String(f.mime_type || "").toLowerCase();
     if (mime.startsWith("text/")) return true;
-    return /\.(txt|md|markdown|text|log|json|csv|yaml|yml|toml|ini|xml|html|py|js|ts|jsx|tsx|c|h|cpp|hpp|java|go|rs|sh|bat|sql)$/i.test(f.name || "");
+    return /\.(txt|md|markdown|text|log|json|yaml|yml|toml|ini|xml|html|py|js|ts|jsx|tsx|c|h|cpp|hpp|java|go|rs|sh|bat|sql)$/i.test(name);
   }
 
   function fmtSize(n) {

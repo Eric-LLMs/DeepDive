@@ -68,8 +68,13 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   // Read a small text file as a UTF-8 string (for text/code preview).
   readText: (path) => ipcRenderer.invoke("read-text", path),
 
-  // Convert a PowerPoint file to PDF (LibreOffice headless); { ok, pdfPath } | { ok, error }.
-  convertSlides: (path) => ipcRenderer.invoke("convert-slides", path),
+  // Read a file as raw bytes (Uint8Array) — Office documents are ZIPs, so the in-window
+  // viewers (docx/xlsx/pptx) parse the binary directly.
+  readFileBytes: (path) => ipcRenderer.invoke("read-file-bytes", path),
+
+  // Extract text + embedded images of a legacy binary Word (.doc):
+  // { ok, content, images: [{ mime, b64 }] } | { ok, error }.
+  extractWordText: (path) => ipcRenderer.invoke("word-extract", path),
 
   // Find a sibling subtitle file (.srt/.vtt/.lrc) for a video, or null.
   findSubtitle: (videoPath) => ipcRenderer.invoke("find-subtitle", videoPath),

@@ -574,6 +574,61 @@ pre.text-viewer {
 }
 .fallback .name { color: var(--fg); font-weight: 600; margin-bottom: 12px; word-break: break-all; }
 
+/* ── Office viewers (docx / xlsx / pptx) ── */
+
+/* Word: mammoth emits semantic HTML; render on a white "page". */
+.docx-viewer {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 24px 32px;
+  background: #fff;
+  color: #1a1a1a;
+  line-height: 1.6;
+}
+.docx-viewer h1, .docx-viewer h2, .docx-viewer h3, .docx-viewer h4 { margin: 0.8em 0 0.4em; line-height: 1.3; }
+.docx-viewer h1 { font-size: 1.7em; }
+.docx-viewer h2 { font-size: 1.4em; }
+.docx-viewer h3 { font-size: 1.15em; }
+.docx-viewer p { margin: 0.5em 0; }
+.docx-viewer ul, .docx-viewer ol { padding-left: 1.6em; margin: 0.5em 0; }
+.docx-viewer li { margin: 0.2em 0; }
+.docx-viewer table { border-collapse: collapse; margin: 0.6em 0; }
+.docx-viewer td, .docx-viewer th { border: 1px solid #999; padding: 4px 8px; }
+.docx-viewer blockquote { border-left: 3px solid #ccc; margin: 0.5em 0; padding-left: 12px; color: #444; }
+.docx-viewer a { color: #1a5fb4; }
+.docx-viewer img { max-width: 100%; height: auto; }
+.docx-viewer code, .docx-viewer pre { background: #f4f4f4; }
+.docx-viewer code { padding: 1px 4px; border-radius: 3px; }
+.docx-viewer pre { padding: 8px 10px; border-radius: 6px; overflow: auto; }
+.docx-viewer .doc-extract-note { color: #666; font-style: italic; font-size: 13px; margin: 12px 0 4px; }
+.docx-viewer .doc-extract-img { max-width: 100%; height: auto; margin: 8px 0; border: 1px solid #ddd; display: block; }
+
+/* Excel: sheet tabs + a scrollable table. */
+.sheet-viewer { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.sheet-tabs { display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--bg-soft); overflow-x: auto; }
+.sheet-tabs button {
+  padding: 4px 12px; background: var(--bg-soft-2); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 5px; cursor: pointer; font-size: 12px; white-space: nowrap;
+}
+.sheet-tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.sheet-panels { flex: 1; min-height: 0; overflow: auto; padding: 8px; }
+.sheet-panels table { border-collapse: collapse; font-size: 13px; }
+.sheet-panels td, .sheet-panels th { border: 1px solid var(--border); padding: 4px 8px; }
+.sheet-panels td { white-space: nowrap; }
+
+/* PowerPoint: slide deck with prev/next navigation. */
+.pptx-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #2a2a2a; }
+.pptx-nav { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 8px; }
+.pptx-nav button { padding: 5px 12px; background: var(--bg-soft-2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 12px; }
+.pptx-nav button:disabled { opacity: 0.4; cursor: default; }
+.pptx-nav-label { color: var(--fg-dim); font-size: 12px; }
+.pptx-stage { position: relative; flex: 1; min-height: 0; overflow: auto; background: #1e1e1e; }
+.pptx-slide { position: absolute; left: 0; top: 0; transform-origin: top left; box-shadow: 0 0 12px rgba(0,0,0,0.5); background: #fff; }
+.pptx-shape { position: absolute; overflow: hidden; }
+.pptx-para { margin: 0; }
+.pptx-img { position: absolute; object-fit: contain; }
+
 /* ── Chat ── */
 /* ``position: relative`` anchors the edge-resize handle (#chat-resize); the docked chat is
    resized by dragging that boundary (top edge for bottom-dock, left edge for right-dock). */
