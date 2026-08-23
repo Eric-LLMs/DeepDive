@@ -921,7 +921,8 @@ Sources: `migrations/0004_drive_objects.sql`, `0006_folders.sql`, `0007_workspac
   mutating op — `init_upload`, `create_folder`, `rename_file`, `rename_folder`, `move_file`,
   `move_folder` — runs the target name through `_unique_name`, which calls `_name_taken` against
   both the `folders` row and the `assets` row at `parent_path/name` and returns the first free
-  `name`, `name (1)`, `name (2)`, …. Creating/moving/renaming into a busy directory therefore
+  `stem(n)ext` variant (`a.docx` → `a(1).docx`, folders → `docs(1)`). Creating/moving/renaming
+  into a busy directory therefore
   **never fails**; the caller surfaces the final name to the user. Personal (My Drive, workspace
   NULL) rows are scoped to `user_id`, so another user's same-named folder is not a clash.
 - **Personal-scope isolation** — folder and asset subtree ops that used to take only
@@ -1036,7 +1037,7 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
   custom `local://` protocol that streams local media/documents to the renderer, and an IPC
   surface: folder/file pickers, recursive `read-tree`, copy-into-workspace, delete-file and
   **delete-folder** (both workspace-rooted; folder delete is recursive and refuses the root),
-  **create-folder** / **create-text-file** (collision-safe `name (n)` naming, path-escape
+  **create-folder** / **create-text-file** (collision-safe `stem(n)ext` naming, path-escape
   rejected), **move-path** (drag-and-drop), **cloud-cache**, text reads, PDF annotation
   sidecars (`read/save/embed-annotations`), video screenshot saving, subtitle pick/find,
   version/update check, and window prefs. **cloud-cache** streams `GET /files/{id}/download`
@@ -1072,8 +1073,23 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     discard. Because the server is the source of truth, a note saved here shows up in the web
     console (and vice versa) on refresh.
   - **Viewer** (`viewer.js`) — dispatches by extension: video, audio, image, PDF (pdf.js with a
-    sidecar-annotation overlay), text/code, slides (LibreOffice → PDF), and Office files (OS
-    default app).
+    sidecar-annotation overlay), text/code, and Office documents previewed **in-window with
+    pure-JS renderers** (no LibreOffice / OS app required): `.docx` via the vendored
+    **mammoth** browser bundle (`mammoth.convertToHtml({ arrayBuffer })`, output run through a
+    DOM sanitizer that drops `script`/`iframe`/`object`, `on*` handlers, and non-`image/*`
+    `data:` / `javascript:` URLs); `.xlsx`/`.xls` and the delimited-text tables `.csv`/`.tsv`
+    (decoded to UTF-8 so SheetJS auto-detects the delimiter) via vendored **SheetJS**
+    (`XLSX.read` + `sheet_to_html`, one tab per sheet); PowerPoint via vendored **JSZip** +
+    `pptxview.js` (a small DrawingML parser that reads `ppt/slides/slideN.xml`, lays out text
+    shapes and `p:pic` images at absolute EMU-derived positions, and renders a prev/next slide
+    deck). The whole PowerPoint family is the same OOXML zip, so `.pptx`/`.ppsx`/`.potx`/
+    `.pptm`/`.ppsm`/`.potm` all route through it. Office bytes are read through the `read-file-bytes` IPC (Buffer → Uint8Array). Legacy binary `.doc` is extracted in the main process via **word-extractor** (`word-extract` IPC): its text is
+    shown as paragraphs plus any embedded raster images (PNG/JPEG/GIF/BMP pulled from the raw
+    bytes, deduped, rendered unpositioned — layout isn't preserved); unparseable `.doc` files
+    and `.ppt` fall back to the OS default app. The toolbar carries a **✕** close button and **Esc** also dismisses the current
+    document (both guarded so they never fire while typing in a field, in fullscreen, or with a
+    modal overlay open); closing wipes `#viewer` and restores its empty "Select a file…" state,
+    which also resets `state.path/kind/openPath`.
   - **Video subtitles** — auto-detects a sibling `.srt`/`.vtt`/`.lrc` via `find-subtitle`, or
     loads a user-picked file (**Add Subtitle**, picker defaulting to the video's folder). A
     **Subtitles** dropdown lists **Enable / Disable / Add / Subtitle Settings**; the style panel

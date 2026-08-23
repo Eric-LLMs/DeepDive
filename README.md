@@ -219,7 +219,7 @@ flowchart TB
 - **Bookmarks**: mark pages, sections, or words to revisit — jump back to any saved spot anytime.
 - **Learning notes**: capture and organize your notes alongside the material as you study, ready when you review.
 - **Sessions search**: search your chat history by content — matching snippets are highlighted in the results.
-- **Multi-format viewer**: video (with subtitles), audio, images, PDF (with annotations), and text/code; Office files open in your OS default app. One-click video **screenshots** and **Generate PPT / Generate Book**.
+- **Multi-format viewer**: video (with subtitles), audio, images, PDF (with annotations), and text/code. Word/Excel/PowerPoint (`.docx`/`.xlsx`/`.xls`/`.pptx`) preview **in-window** with pure-JS renderers — **mammoth** (Word), **SheetJS** (Excel), **JSZip** slide deck (PowerPoint) — no external apps required; older binary formats (`.doc`/`.ppt`) fall back to your OS default app. One-click video **screenshots** and **Generate PPT / Generate Book**. A toolbar **✕** (or **Esc**) dismisses the current document back to the empty state.
 - **Subtitles**: a sibling `.srt`/`.vtt`/`.lrc` is auto-detected, or pick one manually; enable/disable and style it (size, color, background, position), and your settings are remembered.
 - **Streaming chat**: answers stream in with a collapsible **💭 thinking** panel; dock the chat to the bottom or side, or float it as a window. Messages render **Markdown + math** (`$...$` / `$$...$$` formulas via KaTeX), and every bubble has **Copy / Read / Delete / Edit** actions — **Edit** (on a user question) re-asks it, dropping that turn and everything after before streaming a fresh answer; sessions can be **renamed** (click the title) or **deleted** from the sidebar.
 - **Native menus & settings**: everything you'd expect — open/switch workspaces, zoom & font size, fullscreen, Help & Feedback, About. ⚙️ Settings covers theme, display, updates, help, and about.
@@ -252,7 +252,7 @@ flowchart TB
 - **Instant upload & resumable chunks**: uploading an already-stored file short-circuits to **instant upload** (no bytes transferred); large files stream in **8 MB chunks** (`upload_sessions` tracks received chunks) with a progress bar and safe re-upload.
 - **Notes & Markdown editing**: text files (`.md`, `.txt`, code, data) open in an in-page **note editor** — a **✏ Edit / 👁 Preview** toggle renders Markdown live, and **💾 Save** (`Ctrl+S`) rewrites the file in place (the bytes are re-deduplicated and RAG indexing re-runs). Rendering is XSS-safe: raw HTML is escaped and `javascript:`-style links are blocked.
 - **First-class folders**: multi-level folders (`folders` rows with full `/`-paths) live side by side with files, and the file manager tree combines them. Create/rename/move/delete folders; renaming or deleting a folder rewrites the path prefix of every file and sub-folder beneath it.
-- **Context menu & collision-safe naming**: right-click a file or folder for **📄 New text file**, **📁 New folder**, **📤 Upload**, and **🗑 Delete** (deleting a folder trashes its files first). Files and folders share one namespace per directory, so creating/moving/renaming into a busy spot auto-appends `(1)`, `(2)`, … (`docs` → `docs (1)`) instead of failing.
+- **Context menu & collision-safe naming**: right-click a file or folder for **📄 New text file**, **📁 New folder**, **📤 Upload**, and **🗑 Delete** (deleting a folder trashes its files first). Files and folders share one namespace per directory, so creating/moving/renaming into a busy spot auto-suffixes `(1)`, `(2)`, … before the extension (`docs` → `docs(1)`, `a.docx` → `a(1).docx`) instead of failing.
 - **Move anywhere**: files move across workspaces / My Drive freely (drag-and-drop is the planned UX; the API + batch bar support it today).
 - **Fuzzy search with suggestions**: a client-side, case-insensitive fuzzy matcher (prefix > substring > folder-path > subsequence scoring) with a live suggestion dropdown; you can scope a search to a workspace or search all of My Drive.
 - **Trash & retention**: deleting a file moves it to the trash — bytes are kept (no ref-count release) until you **Restore**, **Delete permanently**, or **Empty Trash**. Trash auto-purges entries older than **30 days** (lazy sweep on list). Deleting a workspace trashes all its files and moves assets to My Drive trash.
@@ -398,7 +398,7 @@ Open http://localhost:5173. The Vite dev server proxies `/api`, `/audio`, and `/
 
 The desktop app is a standalone **learning workbench** with its own renderer (not the React web UI):
 open a local folder as your workspace, browse a multi-format viewer (video with subtitles, audio,
-images, PDF with annotations, text/code, Office files), take video screenshots, and chat with
+images, PDF with annotations, text/code, Office documents rendered in-window), take video screenshots, and chat with
 streamed answers and a collapsible thinking panel.
 
 ```bash
@@ -483,7 +483,7 @@ drive** holds your files, and the **admin console** is for operators.
 
 A standalone local workbench — the file tree, multi-format viewer, video screenshots, and subtitles work **without the backend**:
 
-- **Open Workspace** to browse any local folder; the viewer plays video (with subtitles), audio, images, PDF (with annotations), and text/code, and opens Office files in your OS default app.
+- **Open Workspace** to browse any local folder; the viewer plays video (with subtitles), audio, images, PDF (with annotations), and text/code, and previews Word/Excel/PowerPoint in-window with pure-JS renderers (`.docx`/`.xlsx`/`.xls`/`.csv`/`.tsv`/`.pptx`, plus `.doc` as extracted text and images) — only `.ppt` opens in the OS app.
 - Switch the sidebar source from **💻 Local** to **☁️ Cloud** to browse your My Drive — open and edit text notes in the built-in Markdown editor (✏ / 👁 Preview / 💾 Save, `Ctrl+S`), or watch PDFs, video, images, and audio stream through the in-window viewer. Changes are saved straight to the server and show up in the web console.
 - Take one-click video **screenshots** and **Generate PPT / Generate Book** from the current material.
 - **Chat** streams answers with a collapsible **💭 thinking** panel (dock to bottom/side or float as a window); session history and search live in the sidebar. Bubbles render **Markdown + KaTeX math**; hover a bubble for **Copy / Read / Delete / Edit** — editing a question re-asks it (the turn and everything after are removed, then a fresh answer streams in). Click a session's title to **rename** it, or **delete** it from the sidebar.
@@ -508,7 +508,7 @@ Chat, session history & search, media generation, sign-in, and the **☁️ Clou
 
 - **My Drive + workspaces**: every account gets a private **My Drive**; click **＋ New workspace** in the folder tree to create a shared workspace, and manage its members (owner / admin / editor / viewer) from **⚙ Manage**.
 - **Upload & folders**: **⬆ Upload** streams files in chunks (already-stored content uploads instantly, deduplicated by SHA-256); **＋ New folder** builds multi-level paths like `English/Vocab`. Files larger than 256 MB go through the desktop client.
-- **Notes**: click any text file to open it in the built-in note editor — toggle **👁 Preview** for rendered Markdown and hit **💾 Save** (or `Ctrl+S`) to write it back and re-index. Right-click in the file area for **📄 New text file** / **📁 New folder** / **📤 Upload** / **🗑 Delete**; a name already used in that folder is auto-renamed (`name (1)`).
+- **Notes**: click any text file to open it in the built-in note editor — toggle **👁 Preview** for rendered Markdown and hit **💾 Save** (or `Ctrl+S`) to write it back and re-index. Right-click in the file area for **📄 New text file** / **📁 New folder** / **📤 Upload** / **🗑 Delete**; a name already used in that folder is auto-renamed before the extension (`a.txt` → `a(1).txt`).
 - **Manage files**: toggle **✏ Edit** to multi-select, then download, open, share, rename, move (across workspaces / folders), or delete.
 - **Share**: **🔗 Share** grants read/write to a specific user or creates a public link.
 - **Search**: the search box fuzzy-matches file names and folder paths, scoped to a workspace or all of My Drive; jump straight to a result's folder.
