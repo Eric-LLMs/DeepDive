@@ -175,7 +175,7 @@ flowchart TB
         REQ --> REFRESH["refresh_dynamic · recompute only DYNAMIC_SUFFIX<br/>unchanged → system not re-sent · head reused"]
         REQ --> TOOLS["visible tools · core full schemas<br/>+ defer_loading stubs · name + description · empty params<br/>full schema via the tool_search result"]
         REFRESH --> REQ
-        RENDER --> SNIP
+        RENDER --> REQ
     end
 ```
 
