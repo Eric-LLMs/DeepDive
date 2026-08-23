@@ -8,7 +8,7 @@ on-demand retrieval. ``{{name}}`` placeholders are interpolated from registered 
 
 The ``CacheBoundaryAssembler`` subclass adds a cache-boundary partition: ``STATIC_PREFIX``
 (SOUL.md identity + core tool guidance, byte-identical across requests/steps) and
-``PROJECT_CONTEXT`` (CLAUDE.md / AGENTS.md, stable within a project) render once and sit
+``PROJECT_CONTEXT`` (DEEPDIVE.md, stable within a project) render once and sit
 above a fixed boundary marker, while only the ``DYNAMIC_SUFFIX`` (memory/skills/injected
 runtime state) is re-rendered per step — so LLM providers can hit their prefix cache on the
 stable head and the request stays small.
@@ -38,7 +38,7 @@ class PromptZone(Enum):
 
     - ``STATIC_PREFIX``: byte-identical across requests/steps (SOUL.md identity + core
       tool guidance). Sits above the cache boundary; the provider reuses its KV cache here.
-    - ``PROJECT_CONTEXT``: stable within a project (CLAUDE.md / AGENTS.md conventions).
+    - ``PROJECT_CONTEXT``: stable within a project (DEEPDIVE.md conventions).
     - ``DYNAMIC_SUFFIX``: changes every step (memory recall, skill directory, sandbox
       state, injected runtime context). Sits below the cache boundary.
     """

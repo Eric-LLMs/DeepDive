@@ -1,11 +1,11 @@
-"""Project context loader: CLAUDE.md / AGENTS.md conventions for the PROJECT_CONTEXT zone.
+"""Project context loader: DEEPDIVE.md conventions for the PROJECT_CONTEXT zone.
 
 The cache-boundary prompt reserves a ``PromptZone.PROJECT_CONTEXT`` partition for project
-conventions (Claude Code's ``CLAUDE.md``, OpenClaw's ``AGENTS.md``). :func:`read_project_context`
-reads the first existing convention file under the agent's workspace and returns it capped at a
-character budget, so project rules reach the model while the zone stays stable per project and
-bounded in size. When no convention file exists it returns ``""`` — the assembler drops the empty
-zone, so the rendered prompt is byte-identical to the no-project-context case.
+conventions. :func:`read_project_context` reads the first existing convention file under the
+agent's workspace and returns it capped at a character budget, so project rules reach the model
+while the zone stays stable per project and bounded in size. When no convention file exists it
+returns ``""`` — the assembler drops the empty zone, so the rendered prompt is byte-identical to
+the no-project-context case.
 """
 from __future__ import annotations
 
@@ -26,11 +26,11 @@ def read_project_context(
 ) -> str:
     """Return the first existing convention file's contents under ``workspace``.
 
-    Files are tried in order (``CLAUDE.md`` before ``AGENTS.md``, Claude Code precedence), so a
-    repo with both conventions only feeds the primary one to the model. Reads are capped at
-    ``max_chars``; a missing file or an empty workspace yields ``""``.
+    Files are tried in order, so a repo with several conventions only feeds the primary one to
+    the model. Reads are capped at ``max_chars``; a missing file or an empty workspace yields
+    ``""``.
     """
-    for name in files or ["CLAUDE.md", "AGENTS.md"]:
+    for name in files or ["DEEPDIVE.md"]:
         path = (workspace / name).resolve()
         try:
             if path.is_file():

@@ -239,7 +239,7 @@ Sections register with an `order` plus a `zone` and merge ascending within it. T
 | zone | content | stability |
 |---|---|---|
 | `PromptZone.STATIC_PREFIX` | SOUL.md identity (`data/soul.md`) + compact tool catalog + compressed skill catalog | byte-identical across requests → the provider reuses its prefix cache |
-| `PromptZone.PROJECT_CONTEXT` | the first existing `CLAUDE.md` / `AGENTS.md` under `settings.workspace_dir` (read by `read_project_context`, capped at `settings.project_context_max_chars`) | stable per project; empty when absent |
+| `PromptZone.PROJECT_CONTEXT` | the first existing `DEEPDIVE.md` under `settings.workspace_dir` (read by `read_project_context`, capped at `settings.project_context_max_chars`) | stable per project; empty when absent |
 | `PromptZone.DYNAMIC_SUFFIX` | per-step session memory brief + any `inject()` content | re-rendered every step |
 
 `assemble()` returns a `PromptAssembly {static_prefix, project_context, dynamic_suffix, tools,
@@ -260,7 +260,7 @@ memory/skill retrieval). `{{name}}` placeholders interpolate from registered var
 flat `SystemPrompt` (no zones, no boundary) still renders for backward compatibility.
 
 The **project context loader** (`agent/project_context.py::read_project_context`) reads the first
-existing convention file (`CLAUDE.md` preferred over `AGENTS.md`) under the agent's workspace and
+existing convention file (`DEEPDIVE.md`) under the agent's workspace and
 caps it at `settings.project_context_max_chars`; the kernel registers it into
 `PromptZone.PROJECT_CONTEXT`, so project rules become part of `snapshot_key`'s cache identity and
 reach the model on every turn. When no convention file exists the zone renders nothing, keeping the
@@ -558,7 +558,7 @@ rewrite → multi-recall → RRF fusion → rerank
 | Session extension points | `agent/session-start` / `agent/session-end` observers in the loop |
 | Stable prompt head for prefix cache | `CacheBoundaryAssembler` zones (internal `CACHE_BOUNDARY` separator, never rendered) + `snapshot_key()` |
 | Load a tool schema on demand | `tool_search` meta-tool → `ToolGateway.mount(name)` (defer_loading stub) + `schema_of(name)` in the result |
-| Inject project conventions | `read_project_context` → `PromptZone.PROJECT_CONTEXT` (CLAUDE.md / AGENTS.md, capped) |
+| Inject project conventions | `read_project_context` → `PromptZone.PROJECT_CONTEXT` (DEEPDIVE.md, capped) |
 | Bound the prompt window | per-message snip (`prompt_message_max_chars`) + char-budget autocompact (`prompt_max_chars`) |
 | Scope tool visibility per request | `ToolVisibilityPolicy` `allow` / `deny` / `present_as` (disposers) |
 | Gate a tool by session permission | `Sandbox.guard()` + `ToolPermission` (`classify_permissions`) |
@@ -1053,7 +1053,7 @@ merged ascending by `order` within each zone:
 | zone | content | stability |
 |---|---|---|
 | `STATIC_PREFIX` | SOUL.md identity (`soul` section, `PERSONA_ORDER=0`) + compact tool catalog + compressed skill catalog (`HARNESS_IDENTITY_ORDER=-100` / `SKILLS_ORDER=250`) | byte-identical across requests → prefix-cache reuse |
-| `PROJECT_CONTEXT` | workspace `CLAUDE.md` / `AGENTS.md` conventions (`PROJECT_CONTEXT_ORDER=-90`) | stable per project; renders nothing when absent |
+| `PROJECT_CONTEXT` | workspace `DEEPDIVE.md` conventions (`PROJECT_CONTEXT_ORDER=-90`) | stable per project; renders nothing when absent |
 | `DYNAMIC_SUFFIX` | session memory brief + proactive recall (`MEMORY_ORDER=200` / `+10`) + `inject()` content | re-rendered per step |
 
 `assemble()` resolves the static and project zones once and caches them
@@ -1076,8 +1076,8 @@ project-context zone is part of the prefix-cache contract.
 ### 16.4 Project context loader
 
 `agent/project_context.py::read_project_context(workspace, *, files, max_chars)` reads the first
-existing convention file in order (`CLAUDE.md` preferred over `AGENTS.md`, Claude Code precedence)
-under the agent's workspace, caps it at `settings.project_context_max_chars` (appending a
+existing convention file (`DEEPDIVE.md` by default) under the agent's workspace, caps it at
+`settings.project_context_max_chars` (appending a
 `…(truncated)` marker), and returns `""` when none exists. The kernel registers a non-empty result
 into `PromptZone.PROJECT_CONTEXT`; an empty zone renders nothing, keeping the prompt byte-identical
 to the no-context case. The loader runs in `apps/api/deps.py` and feeds the value into the kernel,
@@ -1132,5 +1132,5 @@ permission guard (a READ-only session cannot gain write tools by mounting them).
 |---|---|---|
 | `prompt_max_chars` | `120_000` | total-window character budget for token-aware autocompact |
 | `prompt_message_max_chars` | `8_000` | per-message snip cap on the request snapshot |
-| `project_context_files` | `["CLAUDE.md", "AGENTS.md"]` | convention files tried in order |
+| `project_context_files` | `["DEEPDIVE.md"]` | convention files tried in order |
 | `project_context_max_chars` | `8_000` | cap on the project-context zone, with truncation marker |

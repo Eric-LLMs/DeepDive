@@ -93,8 +93,8 @@ class Settings(BaseSettings):
     prompt_max_chars: int = 120_000            # total window char budget that triggers compaction (~30k tokens)
     prompt_message_max_chars: int = 8000       # per-message content cap when building the LLM request (snip)
 
-    # Project context (CLAUDE.md / AGENTS.md conventions injected into the prompt's PROJECT_CONTEXT zone).
-    project_context_files: list[str] = ["CLAUDE.md", "AGENTS.md"]
+    # Project context (DEEPDIVE.md conventions injected into the prompt's PROJECT_CONTEXT zone).
+    project_context_files: list[str] = ["DEEPDIVE.md"]
     project_context_max_chars: int = 8000      # per-file read cap for the project convention file
 
     # ── Auth ──

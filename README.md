@@ -159,7 +159,7 @@ flowchart TB
 
     subgraph zones["Design · cache-boundary zones"]
         SP["STATIC_PREFIX · byte-identical across requests<br/>SOUL.md identity + compact tool catalog<br/>+ compressed skill catalog"]
-        PC["PROJECT_CONTEXT · stable per project<br/>CLAUDE.md / AGENTS.md via read_project_context<br/>capped at 8k chars · empty → zone dropped"]
+        PC["PROJECT_CONTEXT · stable per project<br/>DEEPDIVE.md via read_project_context<br/>capped at 8k chars · empty → zone dropped"]
         DS["DYNAMIC_SUFFIX · re-rendered per step<br/>memory brief · Lane-1 always on<br/>recalled memory · gated by should_recall<br/>+ agent.inject content"]
         SP --> HEAD["stable head"]
         PC --> HEAD
@@ -201,7 +201,7 @@ flowchart TB
 
 ### 💬 AI Chat Assistant
 - **Agentic Kernel** (`AgentKernel`): a composition root wiring a cache-boundary prompt assembler, deferred tool loading, dual-track memory, a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop.
-- **Cache-Boundary Prompt**: the system prompt is partitioned into three zones — a byte-stable static prefix (SOUL.md + compact tool/skill catalog), project context, and a per-step dynamic suffix — so the provider's prefix cache reuses the stable head across steps. Project conventions are loaded from the workspace's `CLAUDE.md` / `AGENTS.md` into their own stable zone; `snapshot_key()` makes the cache identity measurable.
+- **Cache-Boundary Prompt**: the system prompt is partitioned into three zones — a byte-stable static prefix (SOUL.md + compact tool/skill catalog), project context, and a per-step dynamic suffix — so the provider's prefix cache reuses the stable head across steps. Project conventions are loaded from the workspace's `DEEPDIVE.md` into their own stable zone; `snapshot_key()` makes the cache identity measurable.
 - **Deferred Tool Loading**: the prompt carries only a compact `name + blurb` catalog plus the resident `tool_search` meta-tool; matched tools appear in the visible set as stable `name + description` stubs (defer_loading style) so the cached tools array never churns, and each tool's full schema is returned in the `tool_search` result. The prompt window is also bounded by a per-message snip plus a token-aware autocompact that fires on a character budget.
 - **Dual-Track Memory**: session recall fuses PostgreSQL tsvector (keyword) + pgvector (semantic) via RRF, recency-weighted so newer messages win near-ties; when the embedding service is offline it degrades to tsvector-only — never a silent empty. `memory_search` / `memory_save` are tools; `memory_save` writes guardrailed notes (kebab-case key, length-capped content, closed type taxonomy) to the local memory directory while the session stays read-only. Proactive recall injects top hits for your question into the prompt, and long conversations are auto-compacted into an LLM summary (bounded token window).
 - **Skill Catalog**: skills (SKILL.md) are advertised as a one-line compressed index; the full instructions are lazy-loaded through the `skill` meta-tool.

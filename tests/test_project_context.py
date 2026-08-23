@@ -1,9 +1,9 @@
 """Tests for the project-context loader and its wiring into the kernel.
 
-Covers: reading the first existing convention file (CLAUDE.md preferred over AGENTS.md), the
-character cap with a truncation marker, the empty-workspace fallback, and that a non-empty
-``project_context`` renders into the system prompt and feeds ``snapshot_key`` while an absent
-one renders nothing.
+Covers: reading the first existing convention file (``DEEPDIVE.md`` by default, or an explicit
+``files`` list), the character cap with a truncation marker, the empty-workspace fallback, and
+that a non-empty ``project_context`` renders into the system prompt and feeds ``snapshot_key``
+while an absent one renders nothing.
 """
 from agent import FakeLLM, ToolRuntime, assistant
 from agent.kernel import AgentKernel
@@ -11,17 +11,18 @@ from agent.project_context import read_project_context
 from agent.system_prompt import render_prompt
 
 
-def test_reads_claude_md_preferring_it_over_agents_md(tmp_path):
-    (tmp_path / "CLAUDE.md").write_text("project rules here", encoding="utf-8")
-    (tmp_path / "AGENTS.md").write_text("agent rules here", encoding="utf-8")
+def test_reads_deepdive_md(tmp_path):
+    (tmp_path / "DEEPDIVE.md").write_text("project rules here", encoding="utf-8")
 
     assert read_project_context(tmp_path) == "project rules here"
 
 
-def test_falls_back_to_agents_md(tmp_path):
-    (tmp_path / "AGENTS.md").write_text("agent rules here", encoding="utf-8")
+def test_prefers_first_existing_file_when_files_given(tmp_path):
+    (tmp_path / "A.md").write_text("first rules", encoding="utf-8")
+    (tmp_path / "B.md").write_text("second rules", encoding="utf-8")
 
-    assert read_project_context(tmp_path) == "agent rules here"
+    assert read_project_context(tmp_path, files=["A.md", "B.md"]) == "first rules"
+    assert read_project_context(tmp_path, files=["B.md", "A.md"]) == "second rules"
 
 
 def test_empty_workspace_returns_empty(tmp_path):
@@ -29,7 +30,7 @@ def test_empty_workspace_returns_empty(tmp_path):
 
 
 def test_caps_oversized_file_with_truncation_marker(tmp_path):
-    (tmp_path / "CLAUDE.md").write_text("x" * 500, encoding="utf-8")
+    (tmp_path / "DEEPDIVE.md").write_text("x" * 500, encoding="utf-8")
 
     text = read_project_context(tmp_path, max_chars=100)
 
