@@ -999,7 +999,19 @@ and a **note editor** opens any text file in place — a `textarea` (✏ Edit) w
 toggle that renders Markdown through the XSS-safe `renderMarkdown` (`markdown-it` with
 `html:false` + a `validateLink` that blocks `javascript:`/`data:` schemes), **💾 Save**
 (`Ctrl+S`, disabled while clean), and a dirty-confirm on close. Saving calls
-`PUT /files/{id}/content` and refreshes the row in place; binary files still open in a new tab.
+`PUT /files/{id}/content` and refreshes the row in place. Office documents preview
+**in-window** instead of downloading: `apps/web/src/FilePreview.tsx` fetches the bytes via
+`GET /files/{id}/download` and renders them with the same pure-JS renderers as the desktop —
+`.docx` through the vendored **mammoth** browser bundle (`window.mammoth`, loaded as a classic
+script in `index.html`, output run through the same DOM sanitizer), `.xlsx`/`.xls` and the
+delimited tables `.csv`/`.tsv` (decoded to UTF-8 so SheetJS auto-detects the delimiter) through
+the npm **`xlsx`** dep (`XLSX.read` + `sheet_to_html`, one tab per sheet), and the PowerPoint
+family (`.pptx`/`.ppsx`/`.potx`/…) through the vendored **JSZip** global with the DrawingML
+slide-deck layout ported from `apps/desktop/renderer/pptxview.js`. `officeKindOf(name)` routes
+by extension; `.csv`/`.tsv` are excluded from the note editor so they open as tables. `.doc` and
+`.ppt` have no browser parser, so they show a **can't-preview** panel — nothing downloads on
+click, only the **⬇ Download** (or **↗ Open in new tab**) buttons fetch the bytes. Remaining
+binary files (images, PDF, video, audio) still open in a new tab.
 A **New text file** modal creates a `.txt` note through the normal chunked-upload flow (the
 usual instant-upload dedup applies if the same content is already stored). `App.tsx` opens on the **Cloud Drive** tab by
 default with a global topbar (Settings + account chip). The **Manage** modal has two tabs —
