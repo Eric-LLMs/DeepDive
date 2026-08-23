@@ -999,9 +999,10 @@ and a **note editor** opens any text file in place — a `textarea` (✏ Edit) w
 toggle that renders Markdown through the XSS-safe `renderMarkdown` (`markdown-it` with
 `html:false` + a `validateLink` that blocks `javascript:`/`data:` schemes), **💾 Save**
 (`Ctrl+S`, disabled while clean), and a dirty-confirm on close. Saving calls
-`PUT /files/{id}/content` and refreshes the row in place. Office documents preview
-**in-window** instead of downloading: `apps/web/src/FilePreview.tsx` fetches the bytes via
-`GET /files/{id}/download` and renders them with the same pure-JS renderers as the desktop —
+`PUT /files/{id}/content` and refreshes the row in place. In the **web console** Office documents
+preview **in the browser page** instead of downloading: `apps/web/src/FilePreview.tsx` fetches the
+bytes via `GET /files/{id}/download` and renders them with the same pure-JS renderers the desktop
+app uses —
 `.docx` through the vendored **mammoth** browser bundle (`window.mammoth`, loaded as a classic
 script in `index.html`, output run through the same DOM sanitizer), `.xlsx`/`.xls` and the
 delimited tables `.csv`/`.tsv` (decoded to UTF-8 so SheetJS auto-detects the delimiter) through
