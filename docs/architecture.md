@@ -27,7 +27,7 @@
 | Admin console | single-file SPA at `/admin` with 5 modules (Providers / Roles / Users / Tokens / **Tools config**): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint). The **Tools config** module edits the generic `tools` namespace (web-search provider, SMTP, free-form key/value params) with a one-click *Test email*; the Chat Test user picker is a fuzzy-autocomplete text box |
 | Billing | `llm_models` (per-1k pricing) + `user_wallets` + `wallet_transactions` + `llm_credentials` + `credential_models`; cost calc + atomic wallet deduct |
 | Settings in DB | `app_settings` key/value JSONB (admin credential + LLM provider config + tiers + the generic `tools` namespace for web search / SMTP), written by the admin console |
-| Cloud drive | per-user My Drive + shared workspaces: `global_objects` (SHA-256 dedup, ref-counted physical store) + logical `assets` + first-class `folders` (per scope) + `workspace_members` roles + `asset_acl` sharing + chunked `upload_sessions` + RAG `chunks` + no-FK `workspace_activity` audit; trash with 30-day lazy retention; roles owner > admin > editor > viewer; full file manager in the web console (see §14) |
+| Cloud drive | per-user My Drive + shared workspaces: `global_objects` (SHA-256 dedup, ref-counted physical store) + logical `assets` + first-class `folders` (per scope) + `workspace_members` roles + `asset_acl` sharing + chunked `upload_sessions` + RAG `chunks` + no-FK `workspace_activity` audit; trash with 30-day lazy retention; roles owner > admin > editor > viewer; **text-note editing** (`GET/PUT /files/{id}/content` — read/in-place overwrite with re-dedup + RAG re-index), **collision-safe naming** (`name (1)` auto-suffix across files+folders), and **personal-scope `user_id` filtering** on every My Drive folder/asset operation; full file manager with an in-page Markdown note editor in the web console (see §14) |
 | Guest access | anonymous chat via the `anonymous` role's channels, with per-day Redis limit (`guest_daily_limit`), 429 → prompt login |
 
 ### Designed, not yet implemented
@@ -589,7 +589,7 @@ The core learning + chat tables that run today (`migrations/0001_init.sql`):
 - **sessions** — `id`, `user_id` (FK → `users`), `title`, `created_at`, `closed_at`, `summary`.
   `title` (`0009_session_title.sql`) is auto-set at creation from the first user message —
   whitespace-normalized and capped at 40 chars — so the sidebar shows a readable name while the
-  deferred finalize job is still running; `PUT /sessions/{id}` can rename it and an empty title
+  deferred finalize job is still running; `PATCH /sessions/{id}` can rename it and an empty title
   resets it to `NULL` so auto-naming kicks in again.
 - **messages** — `id`, `user_id`, `session_id` (FK → `sessions`), `role` (`user` | `assistant` | `tool`), `text`, `embedding` (vector(1024)), `created_at`.
 - **session_events** — `id`, `session_id` (FK → `sessions`), `seq`, `type`, `timestamp`, `payload` (JSONB).
@@ -902,6 +902,33 @@ Sources: `migrations/0004_drive_objects.sql`, `0006_folders.sql`, `0007_workspac
   deduplicated file is freed exactly once. Order matters: the asset row is dropped *before* the
   object row (FK `assets.object_sha256` → `global_objects`), with a CAS so a concurrent upload
   that re-incremented is not clobbered.
+- **Text notes (read / in-place update)** — text files (`.md`, `.txt`, code, data) can be read
+  and rewritten without a re-upload. A text guard accepts a `text/*` MIME or a name matching
+  `_TEXT_EXT_RE` (`.txt .md .markdown .text .log .json .csv .yaml .yml .toml .ini .xml .html .py
+  .js .ts .jsx .tsx .c .h .cpp .hpp .java .go .rs .sh .bat .sql`); anything else is refused with
+  415. `read_text` mirrors `download` (must be `READY` with bytes present) and returns the object
+  decoded as UTF-8 (`errors="replace"`). `update_content` performs an **in-place overwrite**:
+  `content` is UTF-8 encoded, SHA-256 digested, stored via `storage.put` +
+  `objects.upsert_and_increment` (identical to `complete_upload`'s byte-store half), then
+  `set_content_meta` **repoints the asset** to the new digest (object_sha256 / size / mime).
+  The old object is retired in FK order — repoint first, then `decrement`, then
+  `delete_if_zero` + `storage.delete` when its ref_count hits 0 — so a deduplicated note that
+  other files share is never freed prematurely. The asset is marked `READY` / `RAG_PENDING` and
+  the router re-enqueues `ASSET_INGEST`, which deletes and rebuilds the RAG chunks for the new
+  text. A content-identical PUT is a no-op (same digest → log + return).
+- **Collision-safe naming** — files and folders share **one namespace per directory** (the tree
+  merges them), so a folder `docs` and a file `docs` in the same parent are ambiguous. Every
+  mutating op — `init_upload`, `create_folder`, `rename_file`, `rename_folder`, `move_file`,
+  `move_folder` — runs the target name through `_unique_name`, which calls `_name_taken` against
+  both the `folders` row and the `assets` row at `parent_path/name` and returns the first free
+  `name`, `name (1)`, `name (2)`, …. Creating/moving/renaming into a busy directory therefore
+  **never fails**; the caller surfaces the final name to the user. Personal (My Drive, workspace
+  NULL) rows are scoped to `user_id`, so another user's same-named folder is not a clash.
+- **Personal-scope isolation** — folder and asset subtree ops that used to take only
+  `workspace_id` now take `user_id` too (`move_subtree`, `trash_subtree`, `delete_subtree`,
+  `create`, `get_by_path` in both repos). A workspace scope still matches any member's rows; a
+  personal (workspace NULL = My Drive) scope additionally restricts to `user_id = :me`, so one
+  user's operations can never touch another user's same-named My Drive rows.
 - **Folder semantics** — paths are full relative paths inside a scope; creating `English/Vocab`
   also upserts the `English` ancestor. Rename / move are **prefix rewrites** on both
   `folders.path` and `assets.folder_path` (`move_subtree`), so children follow automatically.
@@ -956,8 +983,8 @@ The Vite dev proxy strips `/api`; the backend mounts the drive routers at the ro
 |------|-----------|
 | Workspaces | `GET/POST /workspaces`, `PATCH/DELETE /workspaces/{id}` (owner), `GET/POST /workspaces/{id}/members` (manager), `PATCH/DELETE /workspaces/{id}/members/{uid}` (manager; admin members owner-only), `GET /workspaces/{id}/activity` (manager) |
 | User lookup | `GET /users/search?q=` — resolve a username / user-id fragment to a UUID when adding members |
-| Files | `POST /files/init-upload`, `GET /files`, `GET /files/{id}`, `PUT /files/{id}/chunks/{i}`, `GET /files/{id}/chunks`, `POST /files/{id}/complete`, `POST /files/{id}/abort`, `GET /files/{id}/download`, `PATCH /files/{id}` (rename), `DELETE /files/{id}` (→ trash), `POST /files/{id}/move`, `POST /files/{id}/share`, `DELETE /files/{id}/share/{grantee}`, `GET /files/{id}/shares`, `GET /files/{id}/ingest-status` |
-| Folders | `GET/POST /folders`, `PATCH/DELETE /folders/{id}` |
+| Files | `POST /files/init-upload`, `GET /files`, `GET /files/{id}`, `PUT /files/{id}/chunks/{i}`, `GET /files/{id}/chunks`, `POST /files/{id}/complete`, `POST /files/{id}/abort`, `GET /files/{id}/download`, `GET /files/{id}/content` (read a text note), `PUT /files/{id}/content` (overwrite a text note; re-enqueues `ASSET_INGEST`), `PATCH /files/{id}` (rename), `DELETE /files/{id}` (→ trash), `POST /files/{id}/move`, `POST /files/{id}/share`, `DELETE /files/{id}/share/{grantee}`, `GET /files/{id}/shares`, `GET /files/{id}/ingest-status` |
+| Folders | `GET/POST /folders`, `PATCH/DELETE /folders/{id}`, `POST /folders/{id}/move` (move a subtree to a new parent, cycle-refused) |
 | Trash | `GET /trash`, `POST /trash/{id}/restore`, `DELETE /trash/{id}` (purge), `DELETE /trash` (empty) |
 
 ### 14.5 Frontend
@@ -966,10 +993,19 @@ The Vite dev proxy strips `/api`; the backend mounts the drive routers at the ro
 and **🗑 Trash**), list and grid views with folder rows (double-click to enter), a file-name
 search with a scope dropdown (all files / a single workspace) and an autocomplete suggestion
 list, a chunked upload with progress, and modals for Move / Share / Rename / New folder /
-Manage. The **Manage** modal has two tabs — **Members** (role-aware dropdowns, add-by-name with
-autocomplete, remove) and **Activity Logs** (actor/target search, date range, pagination).
-Buttons are **disabled** (grayed) rather than hidden when the current user's role forbids the
-action, so the permission model stays visible without leaking state.
+Manage. A **right-click context menu** offers New text file / New folder / Upload / Delete,
+and a **note editor** opens any text file in place — a `textarea` (✏ Edit) with a **👁 Preview**
+toggle that renders Markdown through the XSS-safe `renderMarkdown` (`markdown-it` with
+`html:false` + a `validateLink` that blocks `javascript:`/`data:` schemes), **💾 Save**
+(`Ctrl+S`, disabled while clean), and a dirty-confirm on close. Saving calls
+`PUT /files/{id}/content` and refreshes the row in place; binary files still open in a new tab.
+A **New text file** modal creates a `.txt` note through the normal chunked-upload flow (the
+usual instant-upload dedup applies if the same content is already stored). `App.tsx` opens on the **Cloud Drive** tab by
+default with a global topbar (Settings + account chip). The **Manage** modal has two tabs —
+**Members** (role-aware dropdowns, add-by-name with autocomplete, remove) and **Activity Logs**
+(actor/target search, date range, pagination). Buttons are **disabled** (grayed) rather than
+hidden when the current user's role forbids the action, so the permission model stays visible
+without leaking state.
 
 ### 14.6 Configuration
 
@@ -990,24 +1026,51 @@ enforced lazily on `list_trash`.
 
 The desktop app (`apps/desktop/`) is a standalone learning workbench with its **own vanilla-JS
 renderer** (not the React web UI). It is deliberately decoupled from the backend: the file tree,
-viewer, screenshots, and subtitles work offline; only chat, sessions, media generation, and
-sign-in / profile need the FastAPI gateway on `localhost:8300`.
+viewer, screenshots, and subtitles work offline; chat, sessions, media generation, sign-in /
+profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost:8300`.
 
 - **Main process** (`main.js`) — `contextIsolation: true` / `nodeIntegration: false` with a
   preload `contextBridge` (`window.desktopAPI`). It owns the app menu (**File** = Open
   Workspace… / Add File to Workspace; **View** = reload, zoom, Font Size… → Window & Display
   settings, fullscreen, DevTools; **Help** = Help & Feedback / About / DeepDive on GitHub), a
   custom `local://` protocol that streams local media/documents to the renderer, and an IPC
-  surface: folder/file pickers, recursive `read-tree`, copy-into-workspace and delete-file
-  (workspace-rooted, files only), text reads, PDF annotation sidecars
-  (`read/save/embed-annotations`), video screenshot saving, subtitle pick/find, version/update
-  check, and window prefs. When the backend runs, the main process forwards `/api`, `/audio`,
-  and `/images` to it.
+  surface: folder/file pickers, recursive `read-tree`, copy-into-workspace, delete-file and
+  **delete-folder** (both workspace-rooted; folder delete is recursive and refuses the root),
+  **create-folder** / **create-text-file** (collision-safe `name (n)` naming, path-escape
+  rejected), **move-path** (drag-and-drop), **cloud-cache**, text reads, PDF annotation
+  sidecars (`read/save/embed-annotations`), video screenshot saving, subtitle pick/find,
+  version/update check, and window prefs. **cloud-cache** streams `GET /files/{id}/download`
+  with the session Bearer token into `temp/deepdive-cloud/{assetId}.{ext}` — the extension is
+  whitelisted (`[a-z0-9]{1,10}`) so a hostile file name can't escape the cache directory, and
+  the path is stable per asset so annotation sidecars survive re-opens. When the backend runs,
+  the main process forwards `/api`, `/audio`, and `/images` to it (a zero-length request body is
+  sent as an explicit `""` rather than a streamed body, which Chromium would abort).
 - **Renderer** (`renderer/`) — an SPA served from `app://bundle/`:
-  - **Sidebar** — a **Files** tab (workspace tree with client-side fuzzy search; hover 🗑 deletes
-    a file after confirmation) and a **Sessions** tab (server-side content search via
-    `GET /sessions?q=` with the matching snippet highlighted). The last workspace folder is
-    persisted in `localStorage` and re-opened on launch.
+  - **Sidebar** — a **Files** tab and a **Sessions** tab (server-side content search via
+    `GET /sessions?q=` with the matching snippet highlighted). A **source switcher**
+    (`workspace-source`: **💻 Local** / **☁️ Cloud**) picks which tree fills the sidebar. The
+    local tree keeps the client-side fuzzy search and adds a **live suggestion dropdown**
+    (`fuzzyScore` prefix > substring > path > subsequence scoring over the flattened tree; Enter
+    opens the hit, arrows navigate, a hit expands its ancestor chain to reveal) plus a
+    right-click context menu — New folder, New text file, Delete file / Delete folder (permanent,
+    workspace-bounded). The last workspace folder is persisted in `localStorage` and re-opened on
+    launch.
+  - **My Drive panel** (`clouddrive.js`) — the **☁️ Cloud** source renders a minimal cloud
+    browser over the same `/api/*` the web console uses (Bearer token from
+    `localStorage["deepdive_token"]`): folder breadcrumbs + file rows, a **fuzzy search with
+    suggestions** (same `fuzzyScore`, jump-to-result), and New folder / New text file buttons
+    (New text file runs the full chunked-upload flow with `crypto.subtle` hashing, reusing the
+    usual instant-upload dedup when the content is already stored). Clicking a `.md`/`.txt`/code row opens the in-window
+    **note editor** (`#note-editor`); any other file is cached via `cloud-cache` and rendered by
+    the existing `Viewer.render` on the temp path, so PDFs, images, video, and audio play in
+    window. A right-click menu offers upload / delete / new text / new folder (deleting a folder
+    issues `DELETE /folders/{id}`).
+  - **Note editor** — an overlay with a **✏ Edit / 👁 Preview** toggle and **💾 Save**
+    (`Ctrl+S`). Edit mode is a monospace `textarea`; Preview renders the draft through the
+    vendored `markdown-it` + `katex` chat renderer (`renderMarkdown`, XSS-safe `validateLink`).
+    Save calls `PUT /files/{id}/content` and closes the dirty flag; a dirty close asks to
+    discard. Because the server is the source of truth, a note saved here shows up in the web
+    console (and vice versa) on refresh.
   - **Viewer** (`viewer.js`) — dispatches by extension: video, audio, image, PDF (pdf.js with a
     sidecar-annotation overlay), text/code, slides (LibreOffice → PDF), and Office files (OS
     default app).
@@ -1022,6 +1085,20 @@ sign-in / profile need the FastAPI gateway on `localhost:8300`.
     floating-window drags use **pointer events + `setPointerCapture`**, so drag tracking continues
     even when the pointer passes over the `<video>` element. Sign-in / register / password-reset
     and profile/avatar editing are modal dialogs against `/auth/*`.
+  - **Chat bubbles & message management** — every user/assistant bubble renders through the
+    vendored `markdown-it` (`renderMarkdown`, `html:false` + XSS-safe `validateLink`) with a
+    **KaTeX math plugin** (`$...$` inline, `$$...$$` display — block rule registered before
+    `lheading`, inline rule after `escape`; `throwOnError:false` degrades an unparseable formula
+    to its raw source instead of breaking the bubble). Streamed deltas re-render incrementally,
+    so math/Markdown appears live. Each bubble carries a **Copy / Read / Delete / Edit** action
+    row (`buildMsgActions`): **Delete** opens a per-turn selection to tick the question and/or
+    answer, then issues `DELETE /sessions/{id}/messages/{mid}` per message; **Edit** (user
+    messages only) follows the **edit = re-ask** model — the edited message and every later one
+    are deleted server-side + DOM, then the question is re-sent through the stream so a fresh
+    answer regenerates (there is no server-side message-edit endpoint; the client rewrites the
+    history). Sessions are **renamed** inline (click the chat-header title or a sidebar row →
+    `PATCH /sessions/{id}`; empty title resets auto-naming) or **deleted** from the sidebar
+    (`DELETE /sessions/{id}`); `GET /sessions/{id}/messages` reloads a session's bubbles.
   - **Settings** — a modal with five tabs: **Appearance** (theme), **Window & Display** (font
     size), **Updates** (GitHub release check), **Help & Feedback**, and **About**.
 

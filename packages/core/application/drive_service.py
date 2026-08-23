@@ -34,6 +34,12 @@ from core.infrastructure.storage import Storage, get_storage, object_key
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
+# Files treated as editable text notes (markdown / plain text / code / data).
+_TEXT_EXT_RE = re.compile(
+    r"\.(txt|md|markdown|text|log|json|csv|yaml|yml|toml|ini|xml|html|py|js|ts|jsx|tsx|c|h|cpp|hpp|java|go|rs|sh|bat|sql)$",
+    re.IGNORECASE,
+)
+
 # File lifecycle.
 UPLOADING = "UPLOADING"
 PROCESSING = "PROCESSING"
@@ -207,6 +213,9 @@ class DriveService:
         if workspace_id is not None:
             await self.ensure_workspace_member(user_id, workspace_id)
 
+        # Folders and files share one name space per directory — auto-suffix busy names.
+        name = await self._unique_name(user_id, workspace_id, folder_path, name)
+
         existing = await self.objects.get(sha256)
         if existing is not None:
             # 秒传: physical bytes already present — bump ref_count, mark asset READY.
@@ -355,12 +364,17 @@ class DriveService:
         asset = await self.ensure_asset_writable(user_id, asset_id)
         old_name = asset.name
         old_folder = asset.folder_path
-        updated = await self.assets.update(asset.id, name=name, folder_path=folder_path)
+        new_name = name if name is not None else old_name
+        new_folder = self._validate_folder_path(folder_path) if folder_path is not None else old_folder
+        if new_name != old_name or new_folder != old_folder:
+            # Auto-suffix if the target directory already holds a folder/file with this name.
+            new_name = await self._unique_name(user_id, asset.workspace_id, new_folder, new_name)
+        updated = await self.assets.update(asset.id, name=new_name, folder_path=new_folder)
         changes = []
-        if name is not None and name != old_name:
-            changes.append(f"name: {old_name} -> {name}")
-        if folder_path is not None and folder_path != old_folder:
-            changes.append(f"folder: {old_folder or '(root)'} -> {folder_path or '(root)'}")
+        if new_name != old_name:
+            changes.append(f"name: {old_name} -> {new_name}")
+        if new_folder != old_folder:
+            changes.append(f"folder: {old_folder or '(root)'} -> {new_folder or '(root)'}")
         await self._log(
             user_id, asset.workspace_id, "file.rename", "file", asset.id,
             updated.name if updated else old_name, "; ".join(changes),
@@ -409,6 +423,72 @@ class DriveService:
             raise DriveError("asset not ready for download", 409)
         data = await self.storage.get(object_key(asset.object_sha256))
         return asset.mime_type or "application/octet-stream", asset.name, data
+
+    # ── Text notes (read / in-place update) ───────────────────────────────────
+
+    @staticmethod
+    def _is_text_asset(asset) -> bool:
+        mime = (asset.mime_type or "").lower()
+        if mime.startswith("text/"):
+            return True
+        return bool(_TEXT_EXT_RE.search(asset.name or ""))
+
+    async def read_text(self, user_id: UUID, asset_id: UUID) -> str:
+        """Return the UTF-8 text content of a note (.md/.txt/…)."""
+        asset = await self.ensure_asset_readable(user_id, asset_id)
+        if asset.file_status != READY or not asset.object_sha256:
+            raise DriveError("asset not ready", 409)
+        if not self._is_text_asset(asset):
+            raise DriveError("asset is not a text file", 415)
+        data = await self.storage.get(object_key(asset.object_sha256))
+        if data is None:
+            raise DriveError("object bytes missing", 404)
+        return data.decode("utf-8", errors="replace")
+
+    async def update_content(self, user_id: UUID, asset_id: UUID, content: str) -> dict:
+        """Overwrite a note's text in place and re-point it at a deduplicated object.
+
+        Mirrors :meth:`complete_upload` for the byte-store half (put + ref-count),
+        then retires the old object when its ref_count drops to zero. The router
+        re-enqueues ``ASSET_INGEST`` so RAG chunks are rebuilt for the new text.
+        """
+        asset = await self.ensure_asset_writable(user_id, asset_id)
+        if not self._is_text_asset(asset):
+            raise DriveError("asset is not a text file", 415)
+
+        data = content.encode("utf-8")
+        digest = hashlib.sha256(data).hexdigest()
+
+        if asset.object_sha256 == digest:
+            # Content unchanged — nothing to do, keep the asset as-is.
+            await self._log(
+                user_id, asset.workspace_id, "file.update", "file", asset.id, asset.name,
+                "content updated (unchanged)",
+            )
+            return self._asset_dict(asset)
+
+        storage_key = object_key(digest)
+        await self.storage.put(storage_key, data)
+        await self.objects.upsert_and_increment(
+            digest, len(data), storage_key, asset.mime_type or "text/plain"
+        )
+
+        updated = await self.assets.set_content_meta(
+            asset.id, digest, len(data), asset.mime_type or "text/plain"
+        )
+        # FK order: repoint the asset to the new object before retiring the old one.
+        if asset.object_sha256 and asset.object_sha256 != digest:
+            new_count = await self.objects.decrement(asset.object_sha256)
+            if new_count is not None and new_count <= 0:
+                removed_key = await self.objects.delete_if_zero(asset.object_sha256)
+                if removed_key:
+                    await self.storage.delete(removed_key)
+        await self.assets.set_status(asset.id, file_status=READY, rag_status=RAG_PENDING)
+        await self._log(
+            user_id, asset.workspace_id, "file.update", "file", asset.id, asset.name,
+            "content updated",
+        )
+        return self._asset_dict(updated)
 
     # ── Workspaces ──────────────────────────────────────────────────────────────
 
@@ -605,6 +685,40 @@ class DriveService:
             raise DriveError("folder path must not start or end with '/'", 400)
         return path
 
+    async def _name_taken(
+        self, user_id: UUID, workspace_id: UUID | None, parent_path: str | None, name: str
+    ) -> bool:
+        """True if a folder or file the user could see occupies ``parent_path/name``.
+
+        Folders and files share one namespace per directory (the UI merges them into a
+        single tree), so a folder "docs" and a file "docs" in the same parent are ambiguous.
+        Personal (My Drive) entries are scoped to ``user_id`` — another user's same-named
+        folder is not a clash.
+        """
+        full = f"{parent_path}/{name}" if parent_path else name
+        if await self.folders.get_by_path(user_id, workspace_id, full) is not None:
+            return True
+        if await self.assets.get_by_path(user_id, workspace_id, parent_path, name) is not None:
+            return True
+        return False
+
+    async def _unique_name(
+        self, user_id: UUID, workspace_id: UUID | None, parent_path: str | None, name: str
+    ) -> str:
+        """Return ``name``, or the first ``name (n)`` that no folder/file at that spot uses.
+
+        Mirrors desktop copy semantics ("untitled.txt" → "untitled (1).txt") so creating,
+        moving or renaming into a busy directory never fails — the requested name wins and
+        duplicates get a numeric suffix. The caller surfaces the final name to the user.
+        """
+        if not await self._name_taken(user_id, workspace_id, parent_path, name):
+            return name
+        for n in range(1, 1000):
+            candidate = f"{name} ({n})"
+            if not await self._name_taken(user_id, workspace_id, parent_path, candidate):
+                return candidate
+        raise DriveError("could not find a free name in that folder", 409)
+
     async def _ensure_folder_manageable(self, user_id: UUID, folder) -> None:
         """Folder rename/delete needs editor-or-owner rights (workspace) or ownership (My Drive).
 
@@ -633,6 +747,8 @@ class DriveService:
         if workspace_id is not None:
             await self.ensure_workspace_member(user_id, workspace_id)
         parent_path = self._validate_folder_path(parent_path)
+        # Folders and files share one name space per directory — auto-suffix busy names.
+        name = await self._unique_name(user_id, workspace_id, parent_path, name)
         full = f"{parent_path}/{name}" if parent_path else name
         try:
             folder = await self.folders.create(user_id, workspace_id, full)
@@ -657,14 +773,47 @@ class DriveService:
         await self._ensure_folder_manageable(user_id, folder)
         parent = folder.path.rsplit("/", 1)[0] if "/" in folder.path else ""
         old_path = folder.path
+        # Auto-suffix if the renamed folder would collide with a folder/file at that spot.
+        new_name = await self._unique_name(user_id, folder.workspace_id, parent, new_name)
         new_path = f"{parent}/{new_name}" if parent else new_name
         if old_path != new_path:
-            await self.folders.move_subtree(folder.workspace_id, old_path, new_path)
-            await self.assets.move_subtree(folder.workspace_id, old_path, new_path)
+            await self.folders.move_subtree(user_id, folder.workspace_id, old_path, new_path)
+            await self.assets.move_subtree(user_id, folder.workspace_id, old_path, new_path)
             await self._log(
                 user_id, folder.workspace_id, "folder.rename", "folder", folder_id,
                 new_path, f"{old_path} -> {new_path}",
             )
+        folder = await self.folders.get(folder_id)
+        return self._folder_dict(folder) if folder else {"id": str(folder_id), "path": new_path}
+
+    async def move_folder(self, user_id: UUID, folder_id: UUID, parent_path: str | None) -> dict:
+        """Move a folder (and its whole subtree) under a new parent in the same scope.
+
+        ``parent_path`` is the destination folder ('' / None = My Drive root). The
+        folder keeps its name, so only its path prefix changes. Moving into itself or
+        a descendant is refused (would create a cycle); a busy destination name is
+        auto-suffixed with ``(n)`` rather than failing.
+        """
+        folder = await self.folders.get(folder_id)
+        if folder is None:
+            raise DriveError("folder not found", 404)
+        await self._ensure_folder_manageable(user_id, folder)
+        parent = self._validate_folder_path(parent_path) or ""
+        name = folder.path.rsplit("/", 1)[-1]
+        old_path = folder.path
+        # Auto-suffix if a folder/file with this name already sits at the destination.
+        name = await self._unique_name(user_id, folder.workspace_id, parent, name)
+        new_path = f"{parent}/{name}" if parent else name
+        if new_path == old_path:
+            return self._folder_dict(folder)
+        if new_path.startswith(old_path + "/"):
+            raise DriveError("cannot move a folder into itself or a descendant", 409)
+        await self.folders.move_subtree(user_id, folder.workspace_id, old_path, new_path)
+        await self.assets.move_subtree(user_id, folder.workspace_id, old_path, new_path)
+        await self._log(
+            user_id, folder.workspace_id, "folder.move", "folder", folder_id,
+            new_path, f"{old_path} -> {new_path}",
+        )
         folder = await self.folders.get(folder_id)
         return self._folder_dict(folder) if folder else {"id": str(folder_id), "path": new_path}
 
@@ -674,8 +823,8 @@ class DriveService:
         if folder is None:
             raise DriveError("folder not found", 404)
         await self._ensure_folder_manageable(user_id, folder)
-        await self.assets.trash_subtree(folder.workspace_id, folder.path)
-        await self.folders.delete_subtree(folder.workspace_id, folder.path)
+        await self.assets.trash_subtree(user_id, folder.workspace_id, folder.path)
+        await self.folders.delete_subtree(user_id, folder.workspace_id, folder.path)
         await self._log(
             user_id, folder.workspace_id, "folder.delete", "folder", folder.id,
             folder.path, "folder removed; files moved to trash",
@@ -690,13 +839,21 @@ class DriveService:
         folder_path: str | None,
     ) -> dict:
         """Move a file to any location: another workspace or My Drive, any folder (None = root)."""
-        await self.ensure_asset_writable(user_id, asset_id)
+        asset = await self.ensure_asset_writable(user_id, asset_id)
         folder_path = self._validate_folder_path(folder_path)
         if workspace_id is not None:
             await self.ensure_workspace_member(user_id, workspace_id)
+        # Auto-suffix if the destination already holds a folder/file with this name
+        # (skip when the move is a no-op, so we don't rename the file into itself).
+        if workspace_id != asset.workspace_id or folder_path != asset.folder_path:
+            name = await self._unique_name(user_id, workspace_id, folder_path, asset.name)
+        else:
+            name = asset.name
         moved = await self.assets.move(asset_id, workspace_id, folder_path)
         if moved is None:
             raise DriveError("asset not found", 404)
+        if name != asset.name:
+            moved = await self.assets.update(asset_id, name=name) or moved
         dest = "My Drive"
         if workspace_id is not None:
             ws = await self.workspaces.get(workspace_id)

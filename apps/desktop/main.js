@@ -69,12 +69,19 @@ async function proxy(target, request) {
   const init = { method: request.method, headers: request.headers };
   // net.fetch defaults to GET; forward the body for anything that has one.
   if (request.method !== "GET" && request.method !== "HEAD") {
-    // Stream the raw request body instead of reading it as text, so binary
-    // multipart payloads (avatar uploads) reach the backend byte-for-byte.
     init.headers = new Headers(request.headers);
-    init.headers.delete("content-length");
-    init.body = request.body;
-    init.duplex = "half"; // required by net.fetch for streamed (non-string) bodies
+    // A zero-length body must not be forwarded as a stream: Chromium aborts empty
+    // streamed bodies with "Premature close", which broke creating empty text files
+    // (their single upload chunk is 0 bytes). Send an explicit empty body instead.
+    // Binary multipart / file-chunk payloads still stream byte-for-byte below.
+    if (init.headers.get("content-length") === "0") {
+      init.headers.delete("content-length");
+      init.body = "";
+    } else {
+      init.headers.delete("content-length");
+      init.body = request.body;
+      init.duplex = "half"; // required by net.fetch for streamed (non-string) bodies
+    }
   }
   return net
     .fetch(target, init)
@@ -298,6 +305,141 @@ function registerIpcHandlers() {
       }
       fs.unlinkSync(target);
       return { ok: true, name: path.basename(target) };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Delete a folder inside the open workspace, recursively. Workspace-bounded like
+  // delete-file, and the workspace root itself is refused so the user can't wipe it.
+  ipcMain.handle("delete-folder", (_event, { dirPath, workspaceDir }) => {
+    if (!dirPath || !workspaceDir) return { ok: false, error: "No folder or workspace folder selected." };
+    try {
+      const root = path.resolve(workspaceDir);
+      const target = path.resolve(dirPath);
+      if (target !== root && !target.startsWith(root + path.sep)) {
+        return { ok: false, error: "Refusing to delete a path outside the workspace." };
+      }
+      if (target === root) {
+        return { ok: false, error: "Refusing to delete the workspace root." };
+      }
+      if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
+        return { ok: false, error: "Not a folder (or it no longer exists)." };
+      }
+      fs.rmSync(target, { recursive: true, force: true });
+      return { ok: true, name: path.basename(target) };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Download a cloud file to a per-asset temp cache so the path-based in-window
+  // viewer can render it (PDF/image/video/audio all stream via the `local://`
+  // protocol). The cache path is keyed by asset id: stable across opens (annotation
+  // sidecars survive), and the filename extension is whitelisted so a hostile name
+  // can't escape the cache directory.
+  ipcMain.handle("cloud-cache", async (_event, { assetId, name, token }) => {
+    if (!assetId || !token) return { ok: false, error: "No asset or token." };
+    const ext = path.extname(String(name || "")).slice(1).toLowerCase();
+    const safeExt = /^[a-z0-9]{1,10}$/i.test(ext) ? ext : "bin";
+    const safeId = String(assetId).replace(/[^\w-]/g, "");
+    const dir = path.join(app.getPath("temp"), "deepdive-cloud");
+    const target = path.join(dir, `${safeId}.${safeExt}`);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const res = await net.fetch(`${BACKEND}/files/${safeId}/download`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        let detail = `${res.status} ${res.statusText}`;
+        try { const b = await res.json(); if (b && b.detail) detail = b.detail; } catch { /* not JSON */ }
+        return { ok: false, error: detail };
+      }
+      const out = fs.createWriteStream(target);
+      await new Promise((resolve, reject) => {
+        Readable.fromWeb(res.body)
+          .on("error", reject)
+          .pipe(out)
+          .on("error", reject)
+          .on("finish", resolve);
+      });
+      return { ok: true, path: target };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Create a folder inside the workspace (or a subfolder of it). Like delete-file,
+  // only paths that resolve inside the workspace folder are allowed.
+  ipcMain.handle("create-folder", (_event, { workspaceDir, parentDir, name }) => {
+    if (!workspaceDir || !parentDir || !name) return { ok: false, error: "No file or workspace folder selected." };
+    const clean = String(name).trim();
+    if (!clean || /[\\/]/.test(clean)) return { ok: false, error: "Folder name must be a single non-empty name." };
+    try {
+      const root = path.resolve(workspaceDir);
+      const parent = path.resolve(parentDir);
+      if (parent !== root && !parent.startsWith(root + path.sep)) {
+        return { ok: false, error: "Refusing to create a folder outside the workspace." };
+      }
+      const target = path.join(parent, clean);
+      if (fs.existsSync(target)) return { ok: false, error: `"${clean}" already exists.` };
+      fs.mkdirSync(target);
+      return { ok: true, name: clean, path: target };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Create a text file inside the workspace, resolving name collisions with " (n)".
+  ipcMain.handle("create-text-file", (_event, { workspaceDir, parentDir, name, content }) => {
+    if (!workspaceDir || !parentDir || !name) return { ok: false, error: "No file or workspace folder selected." };
+    const clean = String(name).trim();
+    if (!clean || /[\\/]/.test(clean)) return { ok: false, error: "File name must be a single non-empty name." };
+    try {
+      const root = path.resolve(workspaceDir);
+      const parent = path.resolve(parentDir);
+      if (parent !== root && !parent.startsWith(root + path.sep)) {
+        return { ok: false, error: "Refusing to create a file outside the workspace." };
+      }
+      const ext = path.extname(clean);
+      const stem = path.basename(clean, ext);
+      let target = path.join(parent, clean);
+      let n = 1;
+      while (fs.existsSync(target)) {
+        target = path.join(parent, `${stem} (${n})${ext}`);
+        n += 1;
+      }
+      fs.writeFileSync(target, String(content ?? ""), "utf8");
+      return { ok: true, name: path.basename(target), path: target };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Move a file or folder into another folder of the workspace (drag-and-drop).
+  // Both paths must resolve inside the workspace; a directory cannot be moved into
+  // itself or a descendant; a name collision at the destination is refused.
+  ipcMain.handle("move-path", (_event, { workspaceDir, srcPath, destDir }) => {
+    if (!workspaceDir || !srcPath || !destDir) return { ok: false, error: "No file or workspace folder selected." };
+    try {
+      const root = path.resolve(workspaceDir);
+      const src = path.resolve(srcPath);
+      const dest = path.resolve(destDir);
+      const inside = (p) => p === root || p.startsWith(root + path.sep);
+      if (!inside(src) || !inside(dest)) {
+        return { ok: false, error: "Refusing to move a path outside the workspace." };
+      }
+      if (!fs.existsSync(src)) return { ok: false, error: "Source no longer exists." };
+      if (!fs.statSync(dest).isDirectory()) return { ok: false, error: "Destination is not a folder." };
+      if (src === dest) return { ok: false, error: "Already there." };
+      if (dest.startsWith(src + path.sep)) {
+        return { ok: false, error: "Cannot move a folder into itself or a descendant." };
+      }
+      const name = path.basename(src);
+      const target = path.join(dest, name);
+      if (fs.existsSync(target)) return { ok: false, error: `"${name}" already exists there.` };
+      fs.renameSync(src, target);
+      return { ok: true, name, path: target };
     } catch (err) {
       return { ok: false, error: err.message };
     }

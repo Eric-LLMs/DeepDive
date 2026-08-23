@@ -44,12 +44,22 @@
   } catch { /* ignore */ }
 
   // ── File tree ──
-  function buildNode(node, open = false) {
+  // expandPaths: an optional Set of absolute dir paths that must render open (used to
+  // reveal a search result by expanding only its ancestor chain, not the whole tree).
+  function buildNode(node, open = false, expandPaths = null) {
     if (node.type === "file") {
       const row = document.createElement("div");
       row.className = "tree-node file";
       row.textContent = node.name;
       row.title = node.path;
+      row.dataset.path = node.path;
+      row.draggable = true;
+      row.addEventListener("dragstart", (e) => {
+        e.dataTransfer.setData("text/plain", JSON.stringify({ path: node.path, name: node.name }));
+        e.dataTransfer.effectAllowed = "move";
+        row.classList.add("dragging");
+      });
+      row.addEventListener("dragend", () => row.classList.remove("dragging"));
       const del = document.createElement("span");
       del.className = "tree-del";
       del.textContent = "🗑";
@@ -65,18 +75,27 @@
     const wrapper = document.createElement("div");
     const row = document.createElement("div");
     row.className = "tree-node dir";
+    row.dataset.path = node.path;
+    row.draggable = true;
+    row.addEventListener("dragstart", (e) => {
+      e.dataTransfer.setData("text/plain", JSON.stringify({ path: node.path, name: node.name }));
+      e.dataTransfer.effectAllowed = "move";
+      row.classList.add("dragging");
+    });
+    row.addEventListener("dragend", () => row.classList.remove("dragging"));
+    const shouldOpen = open || (expandPaths && expandPaths.has(node.path));
     const toggle = document.createElement("span");
     toggle.className = "tree-toggle";
-    toggle.textContent = open ? "▾" : "▸";
+    toggle.textContent = shouldOpen ? "▾" : "▸";
     row.appendChild(toggle);
     row.appendChild(document.createTextNode(node.name));
     wrapper.appendChild(row);
 
     const children = document.createElement("div");
     children.className = "tree-children";
-    children.style.display = open ? "block" : "none";
-    if (open) {
-      for (const child of node.children || []) children.appendChild(buildNode(child, true));
+    children.style.display = shouldOpen ? "block" : "none";
+    if (shouldOpen) {
+      for (const child of node.children || []) children.appendChild(buildNode(child, open, expandPaths));
     }
     row.addEventListener("click", () => {
       if (children.style.display === "none") {
@@ -94,21 +113,21 @@
     return wrapper;
   }
 
-  function renderTree(nodes, open = false) {
+  function renderTree(nodes, open = false, expandPaths = null) {
     treeEl.innerHTML = "";
-    for (const node of nodes) treeEl.appendChild(buildNode(node, open));
+    for (const node of nodes) treeEl.appendChild(buildNode(node, open, expandPaths));
   }
 
-  // Fuzzy filter: keep files/dirs whose name contains the query; a dir is kept when
-  // it matches or holds a matching descendant. An empty query restores the full tree.
+  // Fuzzy filter: keep files/dirs whose name fuzzy-matches the query; a dir is kept
+  // when it matches or holds a matching descendant. An empty query restores the tree.
   function filterNodes(nodes, q) {
     const out = [];
     for (const n of nodes) {
       if (n.type === "file") {
-        if (n.name.toLowerCase().includes(q)) out.push(n);
+        if (fuzzyScore(n.name, q) != null) out.push(n);
       } else {
         const kids = filterNodes(n.children || [], q);
-        if (n.name.toLowerCase().includes(q) || kids.length) {
+        if (fuzzyScore(n.name, q) != null || kids.length) {
           out.push({ ...n, children: kids });
         }
       }
@@ -117,10 +136,127 @@
   }
 
   function applyFileSearch(q) {
-    q = (q || "").trim().toLowerCase();
     if (!state.treeData) return;
+    q = (q || "").trim();
     if (!q) { renderTree(state.treeData); return; }
     renderTree(filterNodes(state.treeData, q), true);
+  }
+
+  // ── Local search: fuzzy autocomplete (mirrors the cloud panel) ──
+  // Case-insensitive fuzzy score; lower is better, null = no match. Ranked: exact >
+  // name prefix > name substring > path hit > loose subsequence of the name.
+  function fuzzyScore(hay, q) {
+    const h = String(hay || "").toLowerCase();
+    const qq = String(q || "").toLowerCase();
+    if (!qq) return null;
+    if (h === qq) return 0;
+    if (h.startsWith(qq)) return 1 + h.length * 0.001;
+    const idx = h.indexOf(qq);
+    if (idx >= 0) return 2 + idx / h.length;
+    let i = 0;
+    for (const ch of h) {
+      if (ch === qq[i]) i++;
+      if (i === qq.length) return 10 + h.length * 0.001;
+    }
+    return null;
+  }
+
+  const fileSuggestEl = document.getElementById("file-search-suggest");
+  let localSuggestIndex = -1;
+
+  // Flat list of every file/dir in the workspace (for suggestion scoring).
+  function flattenTree(nodes, out = []) {
+    for (const n of nodes || []) {
+      out.push(n);
+      if (n.type === "dir") flattenTree(n.children || [], out);
+    }
+    return out;
+  }
+
+  // Path of a node relative to the workspace root, for the suggestion meta line.
+  function relPath(node) {
+    if (!state.workspaceDir) return "";
+    const root = state.workspaceDir.replace(/\\/g, "/").replace(/\/+$/, "");
+    const p = String(node.path).replace(/\\/g, "/");
+    const rel = p.startsWith(root + "/") ? p.slice(root.length + 1) : p;
+    const i = rel.lastIndexOf("/");
+    return i < 0 ? "" : rel.slice(0, i);
+  }
+
+  function hideLocalSuggest() {
+    if (fileSuggestEl) { fileSuggestEl.classList.add("hidden"); fileSuggestEl.innerHTML = ""; }
+    localSuggestIndex = -1;
+  }
+
+  function renderLocalSuggest(q) {
+    if (!fileSuggestEl) return;
+    fileSuggestEl.innerHTML = "";
+    if (!q || !state.treeData) { hideLocalSuggest(); return; }
+    const scored = [];
+    for (const n of flattenTree(state.treeData)) {
+      const nameScore = fuzzyScore(n.name, q);
+      const pathScore = fuzzyScore(n.path, q);
+      const score = nameScore != null ? nameScore : pathScore != null ? 1000 + pathScore : null;
+      if (score != null) scored.push({ score, n });
+    }
+    if (!scored.length) { hideLocalSuggest(); return; }
+    scored.sort((a, b) => a.score - b.score);
+    for (const { n } of scored.slice(0, 10)) {
+      const row = document.createElement("div");
+      row.className = "cd-suggest-item";
+      const icon = document.createElement("span");
+      icon.className = "cd-suggest-icon";
+      icon.textContent = n.type === "dir" ? "📁" : "📄";
+      const name = document.createElement("span");
+      name.className = "cd-suggest-name";
+      name.textContent = n.name;
+      const meta = document.createElement("span");
+      meta.className = "cd-suggest-meta";
+      meta.textContent = relPath(n);
+      row.append(icon, name, meta);
+      row.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        if (n.type === "dir") revealLocalDir(n.path); else openLocalSearchHit(n);
+      });
+      fileSuggestEl.appendChild(row);
+    }
+    fileSuggestEl.classList.remove("hidden");
+  }
+
+  function clearLocalSearch() {
+    if (fileSearch) { fileSearch.value = ""; applyFileSearch(""); }
+    if (fileSearchClear) fileSearchClear.classList.remove("visible");
+    hideLocalSuggest();
+  }
+
+  // Clicking a file suggestion opens it in the viewer; a folder suggestion reveals
+  // its row in the tree (expands only the ancestor chain) and flashes it.
+  function openLocalSearchHit(node) {
+    clearLocalSearch();
+    Viewer.render(node.path, node.name);
+  }
+
+  function revealLocalDir(dirPath) {
+    const set = new Set();
+    const t = String(dirPath).replace(/\\/g, "/").toLowerCase();
+    (function walk(list) {
+      for (const n of list) {
+        if (n.type !== "dir") continue;
+        const np = String(n.path).replace(/\\/g, "/").toLowerCase();
+        if (t === np || t.startsWith(np + "/")) {
+          set.add(n.path);
+          walk(n.children || []);
+        }
+      }
+    })(state.treeData || []);
+    clearLocalSearch();
+    renderTree(state.treeData || [], false, set);
+    const row = treeEl.querySelector(`[data-path="${String(dirPath).replace(/"/g, '\\"')}"]`);
+    if (row) {
+      row.scrollIntoView({ block: "nearest" });
+      row.classList.add("cd-flash");
+      setTimeout(() => row.classList.remove("cd-flash"), 1400);
+    }
   }
 
   async function loadTree(dir) {
@@ -147,19 +283,97 @@
 
   function reflectWorkspaceName() {
     const name = workspaceDisplayName(state.workspaceDir);
-    const btn = document.getElementById("pick-folder");
-    if (btn) {
-      btn.textContent = name ? `📁 ${name}` : "📁 Open Workspace";
-      btn.title = state.workspaceDir || "";
+    const src = document.getElementById("workspace-source");
+    if (src) {
+      const localOpt = src.querySelector('option[value="local"]');
+      if (localOpt) localOpt.textContent = name ? `💻 ${name}` : "💻 Local";
+      src.title = state.workspaceDir || "Workspace source";
     }
     if (window.desktopAPI.setWorkspaceLabel) window.desktopAPI.setWorkspaceLabel(name);
   }
+
+  // ── Input modals ──
+  // Electron does not implement window.prompt()/window.confirm() (they return null /
+  // false silently), so both are replaced by small overlay modals using the app's
+  // modal styles. Exposed on window because clouddrive.js (a separate IIFE loaded
+  // after this file) reuses them for the cloud note editor.
+  window.promptModal = ({ title, placeholder = "", initial = "", multiline = false, okLabel = "Create" } = {}) => {
+    return new Promise((resolve) => {
+      const overlay = document.createElement("div");
+      overlay.className = "overlay";
+      const field = multiline
+        ? '<textarea class="cd-prompt-input" rows="5"></textarea>'
+        : '<input class="cd-prompt-input" type="text" />';
+      overlay.innerHTML = `
+        <div class="modal cd-prompt-modal">
+          <div class="modal-header">
+            <h3></h3>
+            <button type="button" class="modal-close" title="Cancel">×</button>
+          </div>
+          <label></label>
+          <div class="modal-actions">
+            <button type="button" class="cd-prompt-cancel">Cancel</button>
+            <button type="button" class="primary cd-prompt-ok"></button>
+          </div>
+        </div>`;
+      overlay.querySelector("h3").textContent = title;
+      overlay.querySelector("label").innerHTML = field;
+      const input = overlay.querySelector(".cd-prompt-input");
+      input.placeholder = placeholder;
+      input.value = initial;
+      overlay.querySelector(".cd-prompt-ok").textContent = okLabel;
+      const done = (val) => { overlay.remove(); resolve(val); };
+      overlay.querySelector(".modal-close").addEventListener("click", () => done(null));
+      overlay.querySelector(".cd-prompt-cancel").addEventListener("click", () => done(null));
+      overlay.querySelector(".cd-prompt-ok").addEventListener("click", () => done(input.value.trim()));
+      overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) done(null); });
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !multiline) overlay.querySelector(".cd-prompt-ok").click();
+        if (e.key === "Escape") { e.stopPropagation(); done(null); }
+      });
+      document.body.appendChild(overlay);
+      input.focus();
+      if (!multiline) input.select();
+    });
+  };
+
+  // Accepts a plain message string or { title, message, okLabel, okClass }.
+  window.confirmModal = (arg) => {
+    const { title = "Confirm", message, okLabel = "OK", okClass = "primary" } =
+      typeof arg === "string" ? { message: arg } : (arg || {});
+    return new Promise((resolve) => {
+      const overlay = document.createElement("div");
+      overlay.className = "overlay";
+      overlay.innerHTML = `
+        <div class="modal cd-prompt-modal">
+          <div class="modal-header"><h3></h3></div>
+          <p class="cd-confirm-msg"></p>
+          <div class="modal-actions">
+            <button type="button" class="cd-confirm-cancel">Cancel</button>
+            <button type="button" class="${okClass} cd-confirm-ok"></button>
+          </div>
+        </div>`;
+      overlay.querySelector("h3").textContent = title;
+      overlay.querySelector(".cd-confirm-msg").textContent = message;
+      overlay.querySelector(".cd-confirm-ok").textContent = okLabel;
+      const done = (val) => { overlay.remove(); resolve(val); };
+      overlay.querySelector(".cd-confirm-cancel").addEventListener("click", () => done(false));
+      overlay.querySelector(".cd-confirm-ok").addEventListener("click", () => done(true));
+      overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) done(false); });
+      const okBtn = overlay.querySelector(".cd-confirm-ok");
+      okBtn.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { e.stopPropagation(); done(false); }
+      });
+      document.body.appendChild(overlay);
+      okBtn.focus();
+    });
+  };
 
   // File menu → "Add File to Workspace": pick a file, copy it into the open workspace,
   // then refresh the tree so it shows up immediately.
   async function addFileToWorkspace() {
     if (!state.workspaceDir) {
-      Viewer.toast("Open a workspace folder first (📁 Open Workspace).");
+      Viewer.toast("Pick a workspace folder first (💻 Local in the sidebar).");
       return;
     }
     const src = await window.desktopAPI.pickFile();
@@ -174,14 +388,275 @@
   async function deleteFileFromWorkspace(filePath) {
     if (!state.workspaceDir) return;
     const name = filePath.replace(/\\/g, "/").split("/").filter(Boolean).pop() || filePath;
-    if (!confirm(`Delete "${name}" from the workspace?\nThis permanently removes the file.`)) return;
+    const ok = await window.confirmModal({
+      title: "Delete file?", message: `Delete "${name}" from the workspace?\nThis permanently removes the file.`,
+      okLabel: "Delete",
+    });
+    if (!ok) return;
     const res = await window.desktopAPI.deleteFile(filePath, state.workspaceDir);
     if (!res.ok) { Viewer.toast(`Delete failed: ${res.error}`); return; }
     await loadTree(state.workspaceDir);
     Viewer.toast(`Deleted ${res.name}.`);
   }
 
+  // Delete a folder (recursively) from the open workspace. The main process refuses
+  // the workspace root itself, so the whole tree can never be wiped by mistake.
+  async function deleteLocalFolder(dirPath) {
+    if (!state.workspaceDir) return;
+    const name = dirPath.replace(/\\/g, "/").split("/").filter(Boolean).pop() || dirPath;
+    const ok = await window.confirmModal({
+      title: "Delete folder?", message: `Delete "${name}" and everything inside it?\nThis permanently removes the folder from your disk.`,
+      okLabel: "Delete",
+    });
+    if (!ok) return;
+    const res = await window.desktopAPI.deleteFolder(dirPath, state.workspaceDir);
+    if (!res.ok) { Viewer.toast(`Delete failed: ${res.error}`); return; }
+    await loadTree(state.workspaceDir);
+    Viewer.toast(`Deleted ${res.name}.`);
+  }
+
+  // ── Local tree: right-click / toolbar to create folders + text files ──
+  // Mirrors the cloud drive: right-click a folder (or empty space / a file's parent)
+  // to create inside it. Local FS writes go through desktopAPI (workspace-bounded).
+  function dirnameOf(p) {
+    const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+    return i < 0 ? "" : p.slice(0, i);
+  }
+  let localCtxEl = null;
+  // ctx = { parentDir, targetPath?, isDir? } — targetPath is the clicked row's path,
+  // isDir whether that row is a folder. Empty area → create-only menu at root.
+  function showLocalCtxMenu(x, y, ctx) {
+    closeLocalCtxMenu();
+    localCtxEl = document.createElement("div");
+    localCtxEl.className = "drive-ctxmenu";
+    const mk = (label, fn) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+      b.addEventListener("click", () => { closeLocalCtxMenu(); fn(); });
+      return b;
+    };
+    localCtxEl.appendChild(mk("📄 New text file", () => createLocalTextFile(ctx.parentDir)));
+    localCtxEl.appendChild(mk("📁 New folder", () => createLocalFolder(ctx.parentDir)));
+    if (ctx.targetPath) {
+      const sep = document.createElement("div");
+      sep.className = "drive-ctxmenu-sep";
+      localCtxEl.appendChild(sep);
+      if (ctx.isDir) {
+        localCtxEl.appendChild(mk("🗑 Delete folder", () => deleteLocalFolder(ctx.targetPath)));
+      } else {
+        localCtxEl.appendChild(mk("🗑 Delete file", () => deleteFileFromWorkspace(ctx.targetPath)));
+      }
+    }
+    localCtxEl.style.left = `${Math.min(x, window.innerWidth - 200)}px`;
+    localCtxEl.style.top = `${Math.min(y, window.innerHeight - 120)}px`;
+    document.body.appendChild(localCtxEl);
+  }
+  function closeLocalCtxMenu() {
+    if (localCtxEl) { localCtxEl.remove(); localCtxEl = null; }
+  }
+  async function createLocalFolder(parentDir) {
+    const name = await window.promptModal({ title: "New folder", placeholder: "Folder name", initial: "" });
+    if (!name) return;
+    const res = await window.desktopAPI.createFolder({ workspaceDir: state.workspaceDir, parentDir, name });
+    if (!res.ok) { Viewer.toast(`Create folder failed: ${res.error}`); return; }
+    await loadTree(state.workspaceDir);
+    Viewer.toast(`Folder "${res.name}" created.`);
+  }
+  async function createLocalTextFile(parentDir) {
+    const name = await window.promptModal({ title: "New text file", placeholder: "File name", initial: "untitled.txt" });
+    if (!name) return;
+    const content = await window.promptModal({
+      title: "Initial content (optional)", placeholder: "Markdown / plain text", initial: "",
+      multiline: true, okLabel: "OK",
+    });
+    if (content === null) return; // cancelled
+    const finalName = /\.\w+$/.test(name) ? name : `${name}.txt`;
+    const res = await window.desktopAPI.createTextFile({ workspaceDir: state.workspaceDir, parentDir, name: finalName, content });
+    if (!res.ok) { Viewer.toast(`Create file failed: ${res.error}`); return; }
+    await loadTree(state.workspaceDir);
+    Viewer.toast(`Created "${res.name}".`);
+  }
+  treeEl.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    if (!state.workspaceDir) { Viewer.toast("Pick a workspace folder first (💻 Local in the sidebar)."); return; }
+    // Right-click a folder → create inside it / delete it; a file → create in its
+    // folder / delete it; empty area → create at the workspace root.
+    const nodeRow = e.target.closest(".tree-node");
+    const ctx = { parentDir: state.workspaceDir, targetPath: "", isDir: false };
+    if (nodeRow && nodeRow.dataset.path) {
+      ctx.isDir = nodeRow.classList.contains("dir");
+      ctx.targetPath = nodeRow.dataset.path;
+      ctx.parentDir = ctx.isDir ? nodeRow.dataset.path : dirnameOf(nodeRow.dataset.path);
+    }
+    showLocalCtxMenu(e.clientX, e.clientY, ctx);
+  });
+  document.addEventListener("mousedown", (e) => { if (localCtxEl && !localCtxEl.contains(e.target)) closeLocalCtxMenu(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLocalCtxMenu(); });
+  const localNewFolder = document.getElementById("local-new-folder");
+  const localNewText = document.getElementById("local-new-text");
+  if (localNewFolder) localNewFolder.addEventListener("click", () => {
+    if (!state.workspaceDir) { Viewer.toast("Pick a workspace folder first (💻 Local in the sidebar)."); return; }
+    createLocalFolder(state.workspaceDir);
+  });
+  if (localNewText) localNewText.addEventListener("click", () => {
+    if (!state.workspaceDir) { Viewer.toast("Pick a workspace folder first (💻 Local in the sidebar)."); return; }
+    createLocalTextFile(state.workspaceDir);
+  });
+
+  // ── Local tree: drag-and-drop to move files / folders ──
+  // Draggable rows carry their absolute path. Valid drop targets are folder rows
+  // (move into them) and empty tree area (move to the workspace root). File rows
+  // are not containers. The main process re-parents via fs.renameSync.
+  function localDropTargetFor(e) {
+    const dirRow = e.target.closest(".tree-node.dir");
+    if (dirRow) return { el: dirRow, dest: dirRow.dataset.path || "" };
+    if (e.target.closest(".tree-node.file")) return null; // files aren't containers
+    return { el: treeEl, dest: state.workspaceDir || "" }; // empty area → workspace root
+  }
+  function clearLocalDropTargets() {
+    treeEl.querySelectorAll(".drop-target").forEach((el) => el.classList.remove("drop-target"));
+  }
+  treeEl.addEventListener("dragover", (e) => {
+    const t = localDropTargetFor(e);
+    if (!t || !t.dest) return; // over a file row, or no workspace open
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    clearLocalDropTargets();
+    t.el.classList.add("drop-target");
+  });
+  treeEl.addEventListener("dragleave", (e) => {
+    if (!treeEl.contains(e.relatedTarget)) clearLocalDropTargets();
+  });
+  treeEl.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    clearLocalDropTargets();
+    const t = localDropTargetFor(e);
+    if (!t || !t.dest) return;
+    let payload = null;
+    try { payload = JSON.parse(e.dataTransfer.getData("text/plain") || "null"); } catch { /* ignore */ }
+    if (!payload || !payload.path) return;
+    const src = payload.path;
+    if (src === t.dest) return; // dropped back onto itself
+    if (t.dest.startsWith(src + "/") || t.dest.startsWith(src + "\\")) {
+      Viewer.toast("Can't move a folder into itself.");
+      return;
+    }
+    const res = await window.desktopAPI.movePath({ workspaceDir: state.workspaceDir, srcPath: src, destDir: t.dest });
+    if (!res.ok) { Viewer.toast(`Move failed: ${res.error}`); return; }
+    await loadTree(state.workspaceDir);
+    Viewer.toast(`Moved "${res.name}".`);
+  });
+  treeEl.addEventListener("dragend", clearLocalDropTargets);
+
   // ── Chat ──
+  // Markdown rendering for user/assistant bubbles. markdown-it is vendored in
+  // renderer/vendor/ (sets window.markdownit). html:false escapes raw HTML (never
+  // emitted), and the link validator only allows http/https/mailto + relative/anchor
+  // hrefs, so rendered bubbles can't smuggle javascript:/data: payloads. The raw
+  // source text is kept separately for copy / read-aloud.
+  function isSafeLink(url) {
+    const u = String(url || "").trim().toLowerCase();
+    if (!u) return false;
+    if (u.startsWith("http://") || u.startsWith("https://") || u.startsWith("mailto:")) return true;
+    if (u.startsWith("/") || u.startsWith("./") || u.startsWith("../") || u.startsWith("#")) return true;
+    return !/^[a-z][a-z0-9+.-]*:/i.test(u); // no scheme → bare relative reference
+  }
+  const markdownIt = (window.markdownit && window.markdownit({
+    html: false,
+    linkify: true,
+    breaks: true, // soft line breaks → <br>, so the bubble doesn't need white-space: pre-wrap
+    validateLink: isSafeLink,
+  })) || null;
+  // Math support: "$...$" inline and "$$...$$" display formulas render with KaTeX (vendored,
+  // sets window.katex; katex.min.css in index.html supplies its fonts/styles). KaTeX output
+  // is static HTML — no script execution — and renderToString fails soft (throwOnError:false),
+  // so a bad formula degrades to the raw source instead of breaking the bubble.
+  function mathPlugin(md) {
+    const render = (tex, display) => {
+      try {
+        const html = window.katex.renderToString(tex, { displayMode: display, throwOnError: false });
+        if (html.includes("katex-error")) return escapeHtml(tex); // unparseable → raw source
+        return html;
+      } catch {
+        return escapeHtml(tex); // KaTeX missing or failed → plain & safe
+      }
+    };
+    // Block rule: a "$$ ... $$" or "$ ... $" block on its own line(s). Registered
+    // before "lheading" (setext ===/--- headings) so a lone "=" line inside a math
+    // block can't be misread as an h1 underline (markdown-it would otherwise turn a
+    // "$ ... $" block into a literal "<h1>$...").
+    md.block.ruler.before("lheading", "math_block", (state, start, end, silent) => {
+      const b = state.bMarks[start] + state.tShift[start];
+      const e = state.eMarks[start];
+      if (b + 1 > e) return false;
+      if (state.src.charCodeAt(b) !== 0x24) return false; // starts with $
+      const dbl = state.src[b + 1] === "$";               // $$ block vs $ block
+      const open = dbl ? 2 : 1;
+      if (b + open > e) return false;
+      const close = dbl ? "$$" : "$";
+      let content = "", line = start, found = false;
+      const first = state.src.slice(b + open, e);
+      const tfirst = first.trim();
+      if (tfirst.endsWith(close)) { content = tfirst.slice(0, -close.length); found = true; }
+      else {
+        content = first;
+        line++;
+        while (line < end) {
+          const lb = state.bMarks[line] + state.tShift[line];
+          const lt = state.src.slice(lb, state.eMarks[line]).trim();
+          if (lt.endsWith(close)) { content += "\n" + lt.slice(0, -close.length); found = true; break; }
+          content += "\n" + lt;
+          line++;
+        }
+      }
+      if (!found) return false;
+      const trimmed = content.trim();
+      if (!trimmed.length) return false; // empty "$$$$" is not math
+      if (silent) return true;
+      state.line = line + 1;
+      const token = state.push("math_block", "math", 0);
+      token.block = true;
+      token.content = trimmed;
+      return true;
+    });
+    // Inline rule: "$$...$$" → display math, "$...$" → inline math. The "$" form rejects
+    // spaces right after/before the dollars so "$5"/"$10" stay currency; "$$" never is.
+    // Runs after "escape" so "\$" stays a literal dollar sign. Handling "$$" here too lets
+    // a display formula glued right after a text line (e.g. "**幂函数**\n$$...$$") still
+    // render as a centered block, since the block rule only fires at a block's first line.
+    md.inline.ruler.after("escape", "math_inline", (state, silent) => {
+      const pos = state.pos, src = state.src;
+      if (src.charCodeAt(pos) !== 0x24) return false; // $
+      const dbl = src[pos + 1] === "$";
+      const close = dbl ? src.indexOf("$$", pos + 2) : src.indexOf("$", pos + 1);
+      if (close === -1) return false;
+      const content = src.slice(pos + (dbl ? 2 : 1), close);
+      if (!content.length || content.includes("\n")) return false;
+      if (!dbl && (content[0] === " " || content[content.length - 1] === " ")) return false;
+      if (silent) return false;
+      state.pos = close + (dbl ? 2 : 1);
+      const token = state.push("math_inline", "math", 0);
+      token.content = content;
+      token.meta = { display: dbl };
+      return true;
+    });
+    md.renderer.rules.math_block = (tokens, idx) => `<div class="math-block">${render(tokens[idx].content, true)}</div>`;
+    md.renderer.rules.math_inline = (tokens, idx) => {
+      const t = tokens[idx];
+      const html = render(t.content, !!(t.meta && t.meta.display));
+      return t.meta && t.meta.display
+        ? `<span class="math-block">${html}</span>`
+        : `<span class="math-inline">${html}</span>`;
+    };
+  }
+  if (markdownIt) markdownIt.use(mathPlugin);
+  function renderMarkdown(text) {
+    const src = String(text ?? "");
+    if (!markdownIt) return escapeHtml(src); // lib missing → keep it plain & safe
+    return markdownIt.render(src);
+  }
+
   // Plain message for error/notice rows (no per-message actions).
   function appendMsg(role, text) {
     const div = document.createElement("div");
@@ -192,37 +667,54 @@
     return div;
   }
 
-  // User/assistant message with a per-message action row: copy / read aloud / delete.
+  // Shared action row for user/assistant bubbles. Each button is an icon + text chip so the
+  // controls read clearly and aren't easy to fat-finger. Delete opens a short selection mode
+  // (startDeleteSelection) where the question and answer are ticked and only the checked ones
+  // get removed. getText() returns the text to copy/speak — for streaming bubbles it reads
+  // the live buffer, for static ones it closes over the raw markdown source.
+  const ACTION_LABELS = { edit: "Edit", copy: "Copy", speak: "Read", delete: "Delete" };
+  function buildMsgActions(div, role, getText) {
+    const actions = document.createElement("div");
+    actions.className = "msg-actions";
+    const items = [];
+    if (role === "user") items.push(["edit", "✏️", () => startEdit(div)]);
+    items.push(
+      ["copy", "📋", () => copyText(getText())],
+      ["speak", "🔊", () => speakMessage(getText())],
+      ["delete", "🗑", () => startDeleteSelection(div)],
+    );
+    for (const [a, glyph, fn] of items) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.dataset.a = a;
+      b.innerHTML = `<span class="glyph">${glyph}</span><span class="lbl"></span>`;
+      b.title = ACTION_LABELS[a];
+      b.querySelector(".lbl").textContent = ACTION_LABELS[a];
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (a === "speak") speakMessage(getText(), b);
+        else fn();
+      });
+      actions.appendChild(b);
+    }
+    return actions;
+  }
+
+  // User/assistant message with the shared action row (buildMsgActions). User bubbles
+  // additionally get an edit button (edit + regenerate); assistant bubbles don't —
+  // regenerating an assistant message isn't supported by the API, only editing a user
+  // question is.
   function appendMessage(id, role, text) {
     if (role !== "user" && role !== "assistant") return appendMsg(role, text);
     const div = document.createElement("div");
     div.className = `msg ${role}`;
     if (id) div.dataset.id = id;
+    div.dataset.raw = text; // markdown source, kept for edit + copy of raw text
     const bubble = document.createElement("div");
     bubble.className = "msg-bubble";
-    bubble.textContent = text;
+    bubble.innerHTML = renderMarkdown(text);
     div.appendChild(bubble);
-    const actions = document.createElement("div");
-    actions.className = "msg-actions";
-    const buttons = [
-      ["copy", "📋", "Copy", () => copyText(text)],
-      ["speak", "🔊", "Read aloud", () => speakMessage(text)],
-      ["delete", "🗑", "Delete", () => deleteMessage(div)],
-    ];
-    for (const [a, glyph, title, fn] of buttons) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.dataset.a = a;
-      b.title = title;
-      b.textContent = glyph;
-      b.addEventListener("click", (e) => {
-        e.stopPropagation();
-        if (a === "speak") speakMessage(text, b);
-        else fn();
-      });
-      actions.appendChild(b);
-    }
-    div.appendChild(actions);
+    div.appendChild(buildMsgActions(div, role, () => text));
     chatLog.appendChild(div);
     chatLog.scrollTop = chatLog.scrollHeight;
     return div;
@@ -236,35 +728,15 @@
     div.className = "msg assistant";
     const bubble = document.createElement("div");
     bubble.className = "msg-bubble";
-    const actions = document.createElement("div");
-    actions.className = "msg-actions";
     let text = "";
     const scroll = () => { chatLog.scrollTop = chatLog.scrollHeight; };
-    const buttons = [
-      ["copy", "📋", "Copy", () => copyText(text)],
-      ["speak", "🔊", "Read aloud", () => speakMessage(text)],
-      ["delete", "🗑", "Delete", () => deleteMessage(div)],
-    ];
-    for (const [a, glyph, title, fn] of buttons) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.dataset.a = a;
-      b.title = title;
-      b.textContent = glyph;
-      b.addEventListener("click", (e) => {
-        e.stopPropagation();
-        if (a === "speak") speakMessage(text, b);
-        else fn();
-      });
-      actions.appendChild(b);
-    }
     div.appendChild(bubble);
-    div.appendChild(actions);
+    div.appendChild(buildMsgActions(div, "assistant", () => text));
     chatLog.appendChild(div);
     return {
       el: div,
-      add: (t) => { text += t; bubble.textContent = text; scroll(); },
-      reset: () => { text = ""; bubble.textContent = ""; },
+      add: (t) => { text += t; bubble.innerHTML = renderMarkdown(text); scroll(); },
+      reset: () => { text = ""; bubble.innerHTML = ""; },
     };
   }
 
@@ -399,26 +871,218 @@
     }
   }
 
-  // Delete a single message (server-side). With no id (e.g. old client state) it only
-  // removes the bubble from the view.
-  async function deleteMessage(msgEl) {
-    const id = msgEl.dataset.id;
-    if (!state.sessionId || !id) {
-      msgEl.remove();
-      return;
+  // ── Delete with selection ──────────────────────────────────────────
+  // Delete opens a short selection mode on the message's turn. The question and its answer
+  // each get a checkbox (both checked by default) plus a "Delete selected / Cancel" toolbar;
+  // only the checked messages are removed (best-effort server DELETE + DOM). Deleting the
+  // answer also drops the collapsible thinking bar (.msg-thinking) that produced it, so a
+  // removed reply never leaves a stale reasoning block behind.
+  let deleteSelection = null;
+
+  function findTurn(msgEl) {
+    // #chat-log layout for one turn: [question (.msg.user)] [thinking (.msg-thinking)?] [answer (.msg.assistant)?]
+    const isChat = (el) => el && el.classList && (el.classList.contains("user") || el.classList.contains("assistant"));
+    const isThinking = (el) => el && el.classList && el.classList.contains("msg-thinking");
+    let question = null, thinking = null, answer = null;
+    if (msgEl.classList.contains("user")) {
+      question = msgEl;
+      let cur = msgEl.nextElementSibling;
+      while (cur) {
+        if (isThinking(cur)) thinking = cur;
+        else if (isChat(cur)) { if (cur.classList.contains("assistant")) answer = cur; break; }
+        cur = cur.nextElementSibling;
+      }
+    } else {
+      answer = msgEl;
+      let cur = msgEl.previousElementSibling;
+      while (cur) {
+        if (isThinking(cur)) thinking = cur;
+        else if (isChat(cur)) { if (cur.classList.contains("user")) question = cur; break; }
+        cur = cur.previousElementSibling;
+      }
     }
-    try {
-      const res = await fetch(`/api/sessions/${state.sessionId}/messages/${id}`, {
-        method: "DELETE",
-        headers: authHeaders(),
-      });
-      if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
-      if (!res.ok) throw new Error(`${res.status}`);
-      msgEl.remove();
-      loadSessions();
-    } catch (err) {
-      appendMsg("error", `Delete failed: ${err.message}`);
+    return { question, thinking, answer };
+  }
+
+  function startDeleteSelection(msgEl) {
+    if (chatSend.disabled) return; // a chat is in flight — hold off until it finishes
+    if (deleteSelection) deleteSelection.cleanup(); // switch target if already selecting
+    const { question, thinking, answer } = findTurn(msgEl);
+    const group = [question, answer].filter(Boolean);
+    if (!group.length) return;
+
+    const bar = document.createElement("div");
+    bar.className = "msg-delete-bar";
+    const hint = document.createElement("span");
+    hint.className = "msg-delete-hint";
+    hint.textContent = "Select messages to delete";
+    const okBtn = document.createElement("button");
+    okBtn.type = "button";
+    okBtn.className = "msg-delete-btn ok";
+    okBtn.textContent = "🗑 Delete selected";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "msg-delete-btn cancel";
+    cancelBtn.textContent = "✕ Cancel";
+    bar.append(hint, okBtn, cancelBtn);
+    chatLog.insertBefore(bar, question || msgEl);
+
+    const checks = new Map(); // message element -> { cb }
+    for (const el of group) {
+      const lab = document.createElement("label");
+      lab.className = "msg-delete-check";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = true;
+      lab.append(cb, document.createTextNode(el.classList.contains("user") ? " Question" : " Answer"));
+      el.prepend(lab);
+      el.classList.add("selecting");
+      const actions = el.querySelector(".msg-actions");
+      if (actions) actions.style.display = "none";
+      checks.set(el, { cb });
     }
+
+    const cleanup = () => {
+      deleteSelection = null;
+      bar.remove();
+      for (const el of checks.keys()) {
+        const lab = el.querySelector(".msg-delete-check");
+        if (lab) lab.remove();
+        el.classList.remove("selecting");
+        const actions = el.querySelector(".msg-actions");
+        if (actions) actions.style.display = "";
+      }
+      document.removeEventListener("keydown", onKey, true);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); cleanup(); }
+    };
+    document.addEventListener("keydown", onKey, true);
+
+    const confirmDelete = async () => {
+      const toRemove = [];
+      for (const [el, { cb }] of checks) {
+        if (cb.checked) toRemove.push(el);
+      }
+      // The thinking bar is a per-turn artifact: whenever this turn loses a message, drop it too.
+      if (toRemove.length && thinking) toRemove.push(thinking);
+      cleanup();
+      if (!toRemove.length) return;
+      let failed = false;
+      for (const el of toRemove) {
+        const id = el.dataset.id;
+        if (!state.sessionId || !id) continue;
+        try {
+          const res = await fetch(`/api/sessions/${state.sessionId}/messages/${id}`, {
+            method: "DELETE",
+            headers: authHeaders(),
+          });
+          if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
+          if (!res.ok) throw new Error(`${res.status}`);
+        } catch (err) { failed = true; }
+      }
+      toRemove.forEach((el) => el.remove());
+      if (failed) appendMsg("error", "Some messages couldn't be removed on the server.");
+      else if (state.token) loadSessions();
+    };
+
+    okBtn.addEventListener("click", (e) => { e.stopPropagation(); confirmDelete(); });
+    cancelBtn.addEventListener("click", (e) => { e.stopPropagation(); cleanup(); });
+    deleteSelection = { cleanup };
+  }
+
+  // ── Edit & regenerate ──────────────────────────────────────────────
+  // Editing a user question follows the "edit = re-ask" model used by ChatGPT/Gemini: the
+  // edited message and everything after it are removed (server DELETE + DOM), then the
+  // question is re-sent through the normal chat stream so a fresh answer regenerates.
+  // Implemented entirely client-side — the API has no message-edit endpoint.
+  function startEdit(msgEl) {
+    if (chatSend.disabled) return; // a chat is in flight — hold off until it finishes
+    if (msgEl.querySelector(".msg-editor")) return; // already editing this message
+    const bubble = msgEl.querySelector(".msg-bubble");
+    const actions = msgEl.querySelector(".msg-actions");
+    const original = msgEl.dataset.raw ?? "";
+
+    const editor = document.createElement("div");
+    editor.className = "msg-editor";
+    const ta = document.createElement("textarea");
+    ta.className = "msg-edit-input";
+    ta.value = original;
+    ta.addEventListener("input", () => {
+      ta.style.height = "auto";
+      ta.style.height = ta.scrollHeight + "px";
+    });
+    const bar = document.createElement("div");
+    bar.className = "msg-edit-bar";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "msg-edit-btn cancel";
+    cancelBtn.textContent = "✕ Cancel";
+    const sendBtn = document.createElement("button");
+    sendBtn.type = "button";
+    sendBtn.className = "msg-edit-btn send";
+    sendBtn.textContent = "✓ Send";
+    bar.append(cancelBtn, sendBtn);
+    editor.append(ta, bar);
+
+    if (actions) actions.style.display = "none";
+    bubble.hidden = true;
+    bubble.insertAdjacentElement("afterend", editor);
+
+    const cancel = () => {
+      editor.remove();
+      bubble.hidden = false;
+      if (actions) actions.style.display = "";
+    };
+    const send = () => {
+      const text = ta.value.trim();
+      if (!text) { ta.focus(); return; }
+      resendEdited(msgEl, text);
+    };
+    cancelBtn.addEventListener("click", cancel);
+    sendBtn.addEventListener("click", send);
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+      else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+    });
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+    ta.style.height = "auto";
+    ta.style.height = ta.scrollHeight + "px";
+  }
+
+  // Drop this message + every later one from the view, best-effort DELETE each on the server,
+  // then re-run the chat so a fresh answer streams in for the edited question. The session id
+  // is untouched, so the rewritten history stays in the same conversation.
+  async function resendEdited(msgEl, text) {
+    const toRemove = [];
+    let cur = msgEl;
+    while (cur) {
+      // Message bubbles plus the collapsible thinking bar (msg-thinking) that sits between a
+      // question and its answer — both must go so the rewritten history stays contiguous.
+      if (cur.classList && (cur.classList.contains("msg") || cur.classList.contains("msg-thinking"))) toRemove.push(cur);
+      cur = cur.nextElementSibling;
+    }
+    let failed = false;
+    for (const el of toRemove) {
+      const id = el.dataset.id;
+      if (!state.sessionId || !id) continue;
+      try {
+        const res = await fetch(`/api/sessions/${state.sessionId}/messages/${id}`, {
+          method: "DELETE",
+          headers: authHeaders(),
+        });
+        if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
+        if (!res.ok) throw new Error(`${res.status}`);
+      } catch (err) {
+        failed = true;
+      }
+    }
+    toRemove.forEach((el) => el.remove());
+    if (failed) appendMsg("error", "Some messages couldn't be removed on the server.");
+    else if (state.token) loadSessions();
+    chatInput.value = "";
+    await sendChat(text); // appends the edited question + streams the new answer
   }
 
   function authHeaders() {
@@ -1519,7 +2183,39 @@
   refreshProfile();
 
 
-  document.getElementById("pick-folder").addEventListener("click", pickFolder);
+  // Workspace source dropdown (💻 Local / ☁️ Cloud). The Local option doubles as the
+  // folder picker: selecting it opens the workspace folder chooser when none is open.
+  // clouddrive.js registers window.loadCloudDrive and reads window.__cloudDriveActive;
+  // this module owns both so the local tree and the cloud panel never fight.
+  window.__cloudDriveActive = false;
+  function setCloudMode(active) {
+    window.__cloudDriveActive = active;
+    treeEl.style.display = active ? "none" : "";
+    // Resolve the search box here (not the later const) so the startup restore of a
+    // saved cloud source works before the sidebar-tabs block declares fileSearch.
+    const search = document.getElementById("file-search");
+    if (search) search.style.display = active ? "none" : "";
+    const cloudEl = document.getElementById("clouddrive");
+    if (cloudEl) cloudEl.classList.toggle("hidden", !active);
+    const localCreate = document.getElementById("local-create");
+    if (localCreate) localCreate.style.display = active ? "none" : "";
+    if (active && window.loadCloudDrive) window.loadCloudDrive();
+  }
+  const workspaceSource = document.getElementById("workspace-source");
+  if (workspaceSource) {
+    workspaceSource.addEventListener("change", () => {
+      try { localStorage.setItem("deepdive_workspace_source", workspaceSource.value); } catch { /* ignore */ }
+      if (workspaceSource.value === "cloud") {
+        setCloudMode(true);
+      } else {
+        setCloudMode(false);
+        if (!state.workspaceDir) pickFolder(); // Local = pick the workspace folder
+      }
+      // Pull the sidebar back to the Files tab so the chosen source is what's shown.
+      const tabFiles = document.getElementById("tab-files");
+      if (tabFiles && !tabFiles.classList.contains("active")) tabFiles.click();
+    });
+  }
   if (window.desktopAPI.onOpenWorkspace) {
     window.desktopAPI.onOpenWorkspace(pickFolder);
   }
@@ -1540,6 +2236,15 @@
     if (saved) { state.workspaceDir = saved; loadTree(saved); }
   } catch { /* ignore */ }
   reflectWorkspaceName();
+
+  // Restore the last source choice (cloud vs local); clouddrive.js runs after app.js
+  // and refreshes the panel itself when it sees #clouddrive already visible.
+  try {
+    if (workspaceSource && localStorage.getItem("deepdive_workspace_source") === "cloud") {
+      workspaceSource.value = "cloud";
+      setCloudMode(true);
+    }
+  } catch { /* ignore */ }
 
   const sidebarToggle = document.getElementById("sidebar-toggle");
   sidebarToggle.addEventListener("click", () => {
@@ -1743,8 +2448,18 @@
     const isSessions = name === "sessions";
     tabFiles.classList.toggle("active", !isSessions);
     tabSessions.classList.toggle("active", isSessions);
-    treeEl.style.display = isSessions ? "none" : "";
-    if (fileSearch) fileSearch.style.display = isSessions ? "none" : "";
+    // The Files tab shows either the local tree or the cloud drive, depending on the
+    // workspace-source dropdown (clouddrive.js writes window.__cloudDriveActive). The
+    // cloud panel must also be hidden on the Sessions tab, like the tree + search are.
+    const cloudActive = window.__cloudDriveActive === true;
+    const showLocal = !isSessions && !cloudActive;
+    treeEl.style.display = showLocal ? "" : "none";
+    if (fileSearch) fileSearch.style.display = showLocal ? "" : "none";
+    if (!showLocal) hideLocalSuggest();
+    const cloudEl = document.getElementById("clouddrive");
+    if (cloudEl) cloudEl.classList.toggle("hidden", isSessions || !cloudActive);
+    const localCreate = document.getElementById("local-create");
+    if (localCreate) localCreate.style.display = showLocal ? "" : "none";
     sessionsEl.classList.toggle("hidden", !isSessions);
     if (isSessions) loadSessions();
   }
@@ -1752,13 +2467,37 @@
   tabSessions.addEventListener("click", () => switchTab("sessions"));
   if (fileSearch) fileSearch.addEventListener("input", (e) => {
     applyFileSearch(e.target.value);
+    renderLocalSuggest(e.target.value.trim());
     if (fileSearchClear) fileSearchClear.classList.toggle("visible", !!e.target.value);
   });
+  if (fileSearch) fileSearch.addEventListener("keydown", (e) => {
+    const items = fileSuggestEl ? fileSuggestEl.querySelectorAll(".cd-suggest-item") : [];
+    if (e.key === "Escape") {
+      e.preventDefault();
+      clearLocalSearch();
+      fileSearch.blur();
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!items.length) return;
+      const dir = e.key === "ArrowDown" ? 1 : -1;
+      localSuggestIndex = (localSuggestIndex + dir + items.length) % items.length;
+      items.forEach((el, i) => el.classList.toggle("active", i === localSuggestIndex));
+      items[localSuggestIndex].scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (!items.length) return;
+      items[localSuggestIndex >= 0 ? localSuggestIndex : 0].dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    }
+  });
   if (fileSearchClear) fileSearchClear.addEventListener("click", () => {
-    fileSearch.value = "";
-    applyFileSearch("");
-    fileSearchClear.classList.remove("visible");
+    clearLocalSearch();
     fileSearch.focus();
+  });
+  document.addEventListener("mousedown", (e) => {
+    if (fileSuggestEl && !fileSuggestEl.classList.contains("hidden")
+        && fileSearch && !fileSearch.closest(".search-wrap").contains(e.target)) {
+      hideLocalSuggest();
+    }
   });
   if (sessionSearch) sessionSearch.addEventListener("input", (e) => {
     state.sessionQuery = e.target.value;

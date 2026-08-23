@@ -5,6 +5,7 @@
 // filtering + fuzzy autocomplete jumps straight to a file's folder.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
+import { renderMarkdown } from "./markdown";
 import type {
   DriveFile,
   DriveFolder,
@@ -343,13 +344,14 @@ function NewFolderModal({
 }: {
   loc: Loc;
   onClose: () => void;
-  onCreated: () => void;
+  onCreated: (requested: string, finalName: string) => void;
 }) {
   const [name, setName] = useState("");
   const [error, setError] = useState("");
 
   const save = async () => {
-    if (!name.trim()) {
+    const requested = name.trim();
+    if (!requested) {
       setError("Folder name is required.");
       return;
     }
@@ -358,8 +360,8 @@ function NewFolderModal({
       const workspace_id =
         loc.kind === "folder" ? loc.ws : loc.kind === "workspace" ? loc.id : null;
       const parent_path = loc.kind === "folder" ? loc.path : null;
-      await api.createFolder({ name: name.trim(), parent_path, workspace_id });
-      onCreated();
+      const created = await api.createFolder({ name: requested, parent_path, workspace_id });
+      onCreated(requested, created.name);
     } catch (e) {
       setError(String(e));
     }
@@ -383,6 +385,97 @@ function NewFolderModal({
         <div className="row" style={{ justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
           <button className="ghost" onClick={onClose}>Cancel</button>
           <button className="primary" onClick={save}>Create</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NewTextModal({
+  loc,
+  onClose,
+  onCreated,
+}: {
+  loc: Loc;
+  onClose: () => void;
+  onCreated: (requested: string, finalName: string) => void;
+}) {
+  const [name, setName] = useState("untitled.txt");
+  const [content, setContent] = useState("");
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      setError("File name is required.");
+      return;
+    }
+    setError("");
+    setSaving(true);
+    try {
+      const workspace_id =
+        loc.kind === "folder" ? loc.ws : loc.kind === "workspace" ? loc.id : null;
+      const folder_path = loc.kind === "folder" ? loc.path : null;
+      const bytes = new TextEncoder().encode(content);
+      const hex = toHex(await crypto.subtle.digest("SHA-256", bytes));
+      const finalName = /\.\w+$/.test(trimmed) ? trimmed : `${trimmed}.txt`;
+      const init = await api.initUpload({
+        sha256: hex,
+        size: bytes.length,
+        name: finalName,
+        folder_path,
+        mime_type: "text/plain",
+        workspace_id,
+      });
+      if (init.status === "instant") {
+        onCreated(finalName, init.asset?.name ?? finalName);
+        return;
+      }
+      const assetId = init.asset_id!;
+      const chunkSize = init.chunk_size!;
+      const num = init.num_chunks!;
+      for (let i = 0; i < num; i++) {
+        const start = i * chunkSize;
+        const slice = bytes.slice(start, Math.min(bytes.length, start + chunkSize));
+        await api.uploadChunk(assetId, i, new Blob([slice]));
+      }
+      const done = await api.completeUpload(assetId);
+      onCreated(finalName, done.asset?.name ?? finalName);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 420 }}>
+        <button className="modal-close ghost" onClick={onClose}>✖ Close</button>
+        <h2 style={{ marginTop: 0 }}>New text file</h2>
+        <p className="muted" style={{ marginTop: 0 }}>Created in: {locLabel(loc, [])}</p>
+        <label className="field-label">File name</label>
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && !saving && save()}
+          autoFocus
+        />
+        <label className="field-label" style={{ marginTop: 10 }}>Content (optional)</label>
+        <textarea
+          value={content}
+          onChange={(e) => setContent(e.target.value)}
+          rows={6}
+          style={{ width: "100%", resize: "vertical" }}
+          placeholder="Type text to save in the file…"
+        />
+        {error && <p className="error" style={{ fontSize: 13 }}>{error}</p>}
+        <div className="row" style={{ justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
+          <button className="ghost" onClick={onClose}>Cancel</button>
+          <button className="primary" onClick={save} disabled={saving}>
+            {saving ? "Creating…" : "Create"}
+          </button>
         </div>
       </div>
     </div>
@@ -904,6 +997,14 @@ export default function CloudDrive() {
   const [renameTarget, setRenameTarget] = useState<DriveFile | null>(null);
   const [moveTargets, setMoveTargets] = useState<DriveFile[]>([]);
   const [newFolderLoc, setNewFolderLoc] = useState<Loc | null>(null);
+  const [newTextLoc, setNewTextLoc] = useState<Loc | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
+  // Note editor: text files (.md/.txt/…) open in an in-page Markdown editor instead of a tab.
+  const [editing, setEditing] = useState<DriveFile | null>(null);
+  const [draft, setDraft] = useState("");
+  const [dirty, setDirty] = useState(false);
+  const [preview, setPreview] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmPurge, setConfirmPurge] = useState(false);
   const [confirmEmptyTrash, setConfirmEmptyTrash] = useState(false);
@@ -951,6 +1052,27 @@ export default function CloudDrive() {
   useEffect(() => {
     setSelected(new Set());
   }, [curKey]);
+
+  // Close the right-click menu on outside clicks, Escape, scroll, or window blur.
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("blur", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [ctxMenu]);
 
   // Drop ids that disappeared (deleted elsewhere / refresh races).
   useEffect(() => {
@@ -1207,6 +1329,59 @@ export default function CloudDrive() {
     }
   };
 
+  // ── Note editor (Markdown text files) ──────────────────────────────────────
+  const isTextFile = (f: DriveFile) => {
+    const mime = (f.mime_type || "").toLowerCase();
+    if (mime.startsWith("text/")) return true;
+    return /\.(txt|md|markdown|text|log|json|csv|yaml|yml|toml|ini|xml|html|py|js|ts|jsx|tsx|c|h|cpp|hpp|java|go|rs|sh|bat|sql)$/i.test(
+      f.name
+    );
+  };
+
+  const openNote = async (f: DriveFile) => {
+    setError("");
+    try {
+      const { content } = await api.getFileContent(f.id);
+      setEditing(f);
+      setDraft(content);
+      setDirty(false);
+      setPreview(false);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const openEntry = (f: DriveFile) => {
+    if (editMode) return toggleOne(f.id);
+    if (isTrash) return;
+    if (isTextFile(f)) return openNote(f);
+    return openFile(f);
+  };
+
+  const saveNote = async () => {
+    if (!editing) return;
+    setSaving(true);
+    try {
+      const { asset } = await api.updateFileContent(editing.id, draft);
+      setFiles((prev) => prev.map((x) => (x.id === asset.id ? asset : x)));
+      setEditing((prev) => (prev && prev.id === asset.id ? asset : prev));
+      setDirty(false);
+      setMsg("Note saved. Re-indexing in background…");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const closeNote = () => {
+    if (dirty && !window.confirm("Discard unsaved changes?")) return;
+    setEditing(null);
+    setDraft("");
+    setDirty(false);
+    setPreview(false);
+  };
+
   const openSelected = async () => {
     const f = selectedFiles[0];
     if (f) await openFile(f);
@@ -1343,7 +1518,7 @@ export default function CloudDrive() {
 
   return (
     <div>
-      <h1 style={{ marginTop: 0 }}>☁️ Cloud Drive</h1>
+      <h3 style={{ marginTop: 0 }}>☁️ Cloud Drive</h3>
 
       <div className="drive-layout">
         <aside className="drive-tree panel">
@@ -1360,7 +1535,14 @@ export default function CloudDrive() {
           />
         </aside>
 
-        <section className="drive-main panel">
+        <section
+          className="drive-main panel"
+          onContextMenu={(e) => {
+            if (isTrash) return;
+            e.preventDefault();
+            setCtxMenu({ x: e.clientX, y: e.clientY });
+          }}
+        >
           <div className="drive-toolbar">
             <span className="drive-path muted" title={locLabel(loc, workspaces)}>
               {locLabel(loc, workspaces)}
@@ -1532,7 +1714,54 @@ export default function CloudDrive() {
             </div>
           )}
 
-          {list.length === 0 && visibleFolders.length === 0 ? (
+          {editing ? (
+            <div className="note-editor">
+              <div className="note-editor-toolbar">
+                <span className="note-editor-title" title={editing.folder_path ?? ""}>
+                  📄 {editing.name}
+                  {dirty && <span className="muted"> • unsaved</span>}
+                </span>
+                <span style={{ flex: 1 }} />
+                <button
+                  className={preview ? "" : "active"}
+                  onClick={() => setPreview(false)}
+                  title="Edit Markdown source"
+                >✏ Edit</button>
+                <button
+                  className={preview ? "active" : ""}
+                  onClick={() => setPreview(true)}
+                  title="Preview rendered Markdown"
+                >👁 Preview</button>
+                <button
+                  className="primary"
+                  onClick={saveNote}
+                  disabled={!dirty || saving}
+                  title={dirty ? "Save changes" : "No unsaved changes"}
+                >{saving ? "Saving…" : "💾 Save"}</button>
+                <button className="ghost" onClick={closeNote} title="Close note">✖</button>
+              </div>
+              {preview ? (
+                <div className="md-preview" dangerouslySetInnerHTML={{ __html: renderMarkdown(draft) }} />
+              ) : (
+                <textarea
+                  className="note-editor-textarea"
+                  value={draft}
+                  onChange={(e) => {
+                    setDraft(e.target.value);
+                    setDirty(true);
+                  }}
+                  onKeyDown={(e) => {
+                    if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+                      e.preventDefault();
+                      if (dirty && !saving) saveNote();
+                    }
+                  }}
+                  spellCheck={false}
+                  placeholder="Type Markdown here…"
+                />
+              )}
+            </div>
+          ) : list.length === 0 && visibleFolders.length === 0 ? (
             <p className="muted" style={{ padding: "16px 4px" }}>
               {isTrash
                 ? "Trash is empty."
@@ -1560,7 +1789,7 @@ export default function CloudDrive() {
                 <div
                   key={f.id}
                   className={"drive-tile" + (selected.has(f.id) ? " selected" : "")}
-                  onClick={() => (editMode ? toggleOne(f.id) : openFile(f))}
+                  onClick={() => openEntry(f)}
                   title={editMode ? (selected.has(f.id) ? "Click to deselect" : "Click to select") : "Click to open"}
                 >
                   {editMode && (
@@ -1637,7 +1866,7 @@ export default function CloudDrive() {
                     <tr
                       key={f.id}
                       className={selected.has(f.id) ? "drive-row-selected" : ""}
-                      onClick={() => (editMode ? toggleOne(f.id) : isTrash ? undefined : openFile(f))}
+                      onClick={() => openEntry(f)}
                       title={editMode ? "" : isTrash ? "" : "Click to open"}
                     >
                       {editMode && (
@@ -1669,6 +1898,34 @@ export default function CloudDrive() {
           )}
         </section>
       </div>
+
+      {ctxMenu && (
+        <div
+          className="drive-ctxmenu"
+          style={{
+            left: Math.min(ctxMenu.x, window.innerWidth - 200),
+            top: Math.min(ctxMenu.y, window.innerHeight - 120),
+          }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            disabled={!canWrite}
+            onClick={() => {
+              setCtxMenu(null);
+              setNewTextLoc(loc);
+            }}
+            title={canWrite ? "Create a new text file here" : "You don't have write access here"}
+          >📄 New text file</button>
+          <button
+            disabled={!canWrite}
+            onClick={() => {
+              setCtxMenu(null);
+              setNewFolderLoc(loc);
+            }}
+            title={canWrite ? "Create a new folder here" : "You don't have write access here"}
+          >📁 New folder</button>
+        </div>
+      )}
 
       {shareTarget && <ShareModal file={shareTarget} onClose={() => setShareTarget(null)} />}
 
@@ -1704,9 +1961,29 @@ export default function CloudDrive() {
         <NewFolderModal
           loc={newFolderLoc}
           onClose={() => setNewFolderLoc(null)}
-          onCreated={async () => {
+          onCreated={async (requested, finalName) => {
             setNewFolderLoc(null);
-            setMsg("Folder created.");
+            setMsg(
+              requested !== finalName
+                ? `"${requested}" already exists — created as "${finalName}".`
+                : "Folder created."
+            );
+            await load();
+          }}
+        />
+      )}
+
+      {newTextLoc && (
+        <NewTextModal
+          loc={newTextLoc}
+          onClose={() => setNewTextLoc(null)}
+          onCreated={async (requested, finalName) => {
+            setNewTextLoc(null);
+            setMsg(
+              requested !== finalName
+                ? `"${requested}" already exists — created as "${finalName}".`
+                : "Text file created."
+            );
             await load();
           }}
         />

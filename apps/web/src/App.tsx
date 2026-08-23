@@ -57,9 +57,9 @@ export default function App() {
   const [auth, setAuth] = useState<AuthState>({ status: "loading" });
   const [page, setPage] = useState<Page>("home");
   const [profileOpen, setProfileOpen] = useState(false);
-  // The desktop client deep-links to the drive via ?sso=<token>#drive; the hash is
-  // preserved through the SSO handoff below so we land on the Cloud Drive tab.
-  const [tab, setTab] = useState<Tab>(() => (location.hash === "#drive" ? "drive" : "learn"));
+  // Default to the Cloud Drive tab. The desktop client deep-links via ?sso=<token>#drive;
+  // the hash is preserved through the SSO handoff below and stays on the drive tab.
+  const [tab, setTab] = useState<Tab>("drive");
 
   useEffect(() => {
     // SSO handoff from the desktop client: ?sso=<token>. Store it, then drop the
@@ -112,15 +112,19 @@ export default function App() {
   return (
     <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh" }}>
       <div className="tabs" style={{ padding: "10px 16px 0", marginBottom: 0, flexShrink: 0 }}>
-        <button className={tab === "learn" ? "tab active" : "tab"} onClick={() => setTab("learn")}>
-          Learning Platform
-        </button>
         <button className={tab === "drive" ? "tab active" : "tab"} onClick={() => setTab("drive")}>
           ☁️ Cloud Drive
+        </button>
+        <button className={tab === "learn" ? "tab active" : "tab"} onClick={() => setTab("learn")}>
+          Learning Platform
         </button>
         <button className={tab === "me" ? "tab active" : "tab"} onClick={() => setTab("me")}>
           My Account
         </button>
+      </div>
+      <div className="topbar">
+        <SettingsMenu />
+        <AccountChip user={auth.user} onLogout={logout} onProfile={() => setProfileOpen(true)} />
       </div>
       {tab === "learn" ? (
         <div className="layout" style={{ flex: 1, minHeight: 0 }}>
@@ -131,17 +135,6 @@ export default function App() {
             {page === "study" && <StudyMode />}
             {page === "manage" && <ManageVocabulary />}
           </main>
-          <div className="topbar">
-            <SettingsMenu />
-            <AccountChip user={auth.user} onLogout={logout} onProfile={() => setProfileOpen(true)} />
-          </div>
-          {profileOpen && (
-            <ProfileModal
-              user={auth.user}
-              onClose={() => setProfileOpen(false)}
-              onUpdated={(me) => setAuth({ status: "authed", user: me })}
-            />
-          )}
         </div>
       ) : tab === "me" ? (
         <div className="layout" style={{ flex: 1, minHeight: 0 }}>
@@ -155,6 +148,13 @@ export default function App() {
             <CloudDrive />
           </main>
         </div>
+      )}
+      {profileOpen && (
+        <ProfileModal
+          user={auth.user}
+          onClose={() => setProfileOpen(false)}
+          onUpdated={(me) => setAuth({ status: "authed", user: me })}
+        />
       )}
     </div>
   );
@@ -554,7 +554,7 @@ function Home() {
 
   return (
     <div>
-      <h1 style={{ marginTop: 0, display: "flex", alignItems: "center", gap: 8 }}><img src="/deepdive.png" className="brand-logo brand-logo-lg" alt="DeepDive" /> DeepDive Learning Assistant</h1>
+      <h3 style={{ marginTop: 0, display: "flex", alignItems: "center", gap: 8 }}><img src="/deepdive.png" className="brand-logo brand-logo-lg" alt="DeepDive" /> DeepDive Learning Assistant</h3>
       <h3 style={{ marginTop: 0 }}>Welcome to DeepDive</h3>
       <p className="muted">
         A domain-specific English learning tool tailored for your specific needs.
@@ -617,7 +617,7 @@ function MyAccount({ user }: { user: Me }) {
   if (error) {
     return (
       <div>
-        <h1 style={{ marginTop: 0 }}>My Account</h1>
+        <h3 style={{ marginTop: 0 }}>👤 My Account</h3>
         <p className="error">{error}</p>
       </div>
     );
@@ -626,7 +626,7 @@ function MyAccount({ user }: { user: Me }) {
 
   return (
     <div>
-      <h1 style={{ marginTop: 0 }}>My Account</h1>
+      <h3 style={{ marginTop: 0 }}>👤 My Account</h3>
 
       {/* Overview */}
       <div className="panel" style={{ display: "flex", gap: 48, flexWrap: "wrap" }}>

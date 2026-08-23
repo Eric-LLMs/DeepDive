@@ -42,6 +42,10 @@ class FileRename(BaseModel):
     folder_path: str | None = None
 
 
+class ContentUpdate(BaseModel):
+    content: str = Field(max_length=2_000_000)
+
+
 class FolderCreate(BaseModel):
     name: str
     parent_path: str | None = None  # folder this one is created inside (''/None = root)
@@ -55,3 +59,7 @@ class FolderRename(BaseModel):
 class MoveRequest(BaseModel):
     workspace_id: UUID | None = None  # None = My Drive
     folder_path: str | None  # required; null = workspace root
+
+
+class FolderMoveRequest(BaseModel):
+    parent_path: str | None = None  # folder to move this folder into (''/None = My Drive root)

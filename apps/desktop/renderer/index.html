@@ -5,13 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>DeepDive Workbench</title>
     <link rel="stylesheet" href="styles.css" />
+    <!-- KaTeX (vendored; fonts resolve relative to vendor/fonts/) -->
+    <link rel="stylesheet" href="vendor/katex.min.css" />
   </head>
   <body>
     <div id="app">
       <aside id="sidebar">
         <div id="sidebar-toolbar">
           <button id="sidebar-toggle" type="button" title="Collapse / Expand">«</button>
-          <button id="pick-folder" type="button">📁 Open Workspace</button>
+          <select id="workspace-source" class="workspace-source" title="Workspace source">
+            <option value="local">💻 Local</option>
+            <option value="cloud">☁️ Cloud</option>
+          </select>
+          <span id="local-create" class="local-create">
+            <button id="local-new-folder" type="button" title="New folder" aria-label="New folder">📁</button>
+            <button id="local-new-text" type="button" title="New text file" aria-label="New text file">📝</button>
+          </span>
         </div>
         <div id="sidebar-tabs">
           <button id="tab-files" class="active" type="button">Files</button>
@@ -20,8 +29,24 @@
         <div class="search-wrap">
           <input id="file-search" type="text" class="sidebar-search" placeholder="Search files…" autocomplete="off" />
           <button id="file-search-clear" type="button" class="search-clear" title="Clear search" aria-label="Clear search">✕</button>
+          <div id="file-search-suggest" class="cd-suggest hidden"></div>
         </div>
         <div id="tree" class="tree"></div>
+        <div id="clouddrive" class="clouddrive hidden">
+          <div class="clouddrive-toolbar">
+            <span id="cd-path" class="cd-path">☁️ My Drive</span>
+            <span class="spacer"></span>
+            <button id="cd-new-folder" type="button" title="New folder" aria-label="New folder">📁</button>
+            <button id="cd-new-text" type="button" title="New text file" aria-label="New text file">📝</button>
+          </div>
+          <div class="search-wrap">
+            <input id="cd-search" type="text" class="sidebar-search" placeholder="Search files & folders…" autocomplete="off" />
+            <button id="cd-search-clear" type="button" class="search-clear" title="Clear search" aria-label="Clear search">✕</button>
+            <div id="cd-suggest" class="cd-suggest hidden"></div>
+          </div>
+          <div id="cd-list" class="cd-list"></div>
+          <div id="cd-status" class="cd-status"></div>
+        </div>
         <div id="sessions" class="sessions hidden">
           <div class="search-wrap">
             <input id="session-search" type="text" class="sidebar-search" placeholder="Search sessions…" autocomplete="off" />
@@ -64,6 +89,19 @@
             <input id="chat-input" type="text" placeholder="Ask about the current material, or just chat…" autocomplete="off" />
             <button id="chat-send" type="submit">Send</button>
           </form>
+        </section>
+
+        <section id="note-editor" class="note-editor hidden">
+          <div class="note-editor-toolbar">
+            <span id="note-title" class="note-editor-title">note.md</span>
+            <span class="spacer"></span>
+            <span id="note-mode" class="note-mode">✏️ edit</span>
+            <button id="note-preview" type="button" title="Toggle edit / preview">👁 Preview</button>
+            <button id="note-save" type="button" title="Save to cloud (Ctrl+S)">💾 Save</button>
+            <button id="note-close" type="button" title="Close">✕</button>
+          </div>
+          <textarea id="note-textarea" class="note-editor-textarea" spellcheck="false" placeholder="Start writing…"></textarea>
+          <div id="note-preview-pane" class="md-preview hidden"></div>
         </section>
       </main>
     </div>
@@ -442,7 +480,12 @@
 
     <!-- PDF.js (vendored; pdf.min.js sets window.pdfjsLib) -->
     <script src="vendor/pdf.min.js"></script>
+    <!-- KaTeX (vendored; sets window.katex) -->
+    <script src="vendor/katex.min.js"></script>
+    <!-- markdown-it (vendored; sets window.markdownit) -->
+    <script src="vendor/markdown-it.min.js"></script>
     <script src="viewer.js"></script>
     <script src="app.js"></script>
+    <script src="clouddrive.js"></script>
   </body>
 </html>

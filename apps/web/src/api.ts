@@ -257,6 +257,13 @@ export const api = {
   // ── Cloud drive: files ──
   listFiles: () => request<{ files: DriveFile[] }>("/files"),
   getFile: (assetId: string) => request<DriveFile>(`/files/${assetId}`),
+  getFileContent: (assetId: string) =>
+    request<{ content: string }>(`/files/${assetId}/content`),
+  updateFileContent: (assetId: string, content: string) =>
+    request<{ asset: DriveFile; job_id?: string }>(`/files/${assetId}/content`, {
+      method: "PUT",
+      body: JSON.stringify({ content }),
+    }),
   initUpload: (body: {
     sha256: string;
     size: number;

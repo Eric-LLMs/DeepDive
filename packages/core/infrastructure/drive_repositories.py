@@ -150,6 +150,33 @@ class SqlAssetRepository:
                 )
             ).scalar_one_or_none()
 
+    async def get_by_path(
+        self, user_id: UUID, workspace_id: UUID | None, folder_path: str | None, name: str
+    ) -> AssetModel | None:
+        """Find an active asset at ``folder_path/name`` that ``user_id`` could see there.
+
+        A workspace scope matches any row in that workspace (all members share it); a
+        personal scope (workspace_id None = My Drive) matches only the user's own rows.
+        ``folder_path`` None/empty means the scope's root. Used to dedupe names that
+        would otherwise clash between files and folders in the same directory.
+        """
+        async with self.session_factory() as session:
+            conditions = [
+                self._scope(workspace_id),
+                AssetModel.folder_path.is_(None)
+                if folder_path in (None, "")
+                else AssetModel.folder_path == folder_path,
+                AssetModel.name == name,
+                AssetModel.deleted_at.is_(None),
+            ]
+            if workspace_id is None:  # personal (My Drive) rows belong to one user
+                conditions.append(AssetModel.user_id == user_id)
+            return (
+                await session.execute(
+                    select(AssetModel).where(*conditions)
+                )
+            ).scalar_one_or_none()
+
     async def list_visible(self, user_id: UUID) -> list[AssetModel]:
         async with self.session_factory() as session:
             rows = (
@@ -210,6 +237,21 @@ class SqlAssetRepository:
             await session.commit()
             return obj
 
+    async def set_content_meta(
+        self, asset_id: UUID, object_sha256: str, size: int, mime_type: str | None
+    ) -> AssetModel | None:
+        """Repoint an asset to a new physical object after an in-place content update."""
+        async with self.session_factory() as session:
+            obj = await session.get(AssetModel, asset_id)
+            if obj is None:
+                return None
+            obj.object_sha256 = object_sha256
+            obj.size = size
+            if mime_type is not None:
+                obj.mime_type = mime_type
+            await session.commit()
+            return obj
+
     async def update(
         self,
         asset_id: UUID,
@@ -256,19 +298,26 @@ class SqlAssetRepository:
             return obj
 
     async def move_subtree(
-        self, workspace_id: UUID | None, old_path: str, new_path: str
+        self, user_id: UUID, workspace_id: UUID | None, old_path: str, new_path: str
     ) -> None:
-        """Rewrite every asset under ``old_path`` to the matching path under ``new_path``."""
+        """Rewrite every asset under ``old_path`` to the matching path under ``new_path``.
+
+        Personal (My Drive) rows are scoped to ``user_id`` so one user's move never
+        rewrites another user's same-named folders.
+        """
         async with self.session_factory() as session:
+            conditions = [
+                self._scope(workspace_id),
+                or_(
+                    AssetModel.folder_path == old_path,
+                    AssetModel.folder_path.like(old_path + "/%"),
+                ),
+            ]
+            if workspace_id is None:
+                conditions.append(AssetModel.user_id == user_id)
             await session.execute(
                 update(AssetModel)
-                .where(
-                    self._scope(workspace_id),
-                    or_(
-                        AssetModel.folder_path == old_path,
-                        AssetModel.folder_path.like(old_path + "/%"),
-                    ),
-                )
+                .where(*conditions)
                 .values(
                     folder_path=func.concat(
                         new_path, func.substr(AssetModel.folder_path, len(old_path) + 1)
@@ -277,19 +326,22 @@ class SqlAssetRepository:
             )
             await session.commit()
 
-    async def trash_subtree(self, workspace_id: UUID | None, path: str) -> None:
+    async def trash_subtree(self, user_id: UUID, workspace_id: UUID | None, path: str) -> None:
         """Soft-delete (send to trash) every non-deleted asset under ``path``."""
         async with self.session_factory() as session:
+            conditions = [
+                self._scope(workspace_id),
+                or_(
+                    AssetModel.folder_path == path,
+                    AssetModel.folder_path.like(path + "/%"),
+                ),
+                AssetModel.deleted_at.is_(None),
+            ]
+            if workspace_id is None:
+                conditions.append(AssetModel.user_id == user_id)
             await session.execute(
                 update(AssetModel)
-                .where(
-                    self._scope(workspace_id),
-                    or_(
-                        AssetModel.folder_path == path,
-                        AssetModel.folder_path.like(path + "/%"),
-                    ),
-                    AssetModel.deleted_at.is_(None),
-                )
+                .where(*conditions)
                 .values(file_status="DELETED", deleted_at=datetime.now(timezone.utc))
             )
             await session.commit()
@@ -622,17 +674,20 @@ class SqlFolderRepository:
         )
 
     async def create(self, user_id: UUID, workspace_id: UUID | None, path: str) -> FolderModel:
-        """Create a folder, upserting any missing ancestor rows so the tree stays complete."""
+        """Create a folder, upserting any missing ancestor rows so the tree stays complete.
+
+        Personal (My Drive) rows are scoped to ``user_id``: another user's same-named
+        folder at the same workspace-NULL path is not a collision for this user.
+        """
         async with self.session_factory() as session:
             segs = path.split("/")
             for i in range(1, len(segs) + 1):
                 ancestor = "/".join(segs[:i])
+                conditions = [self._scope(workspace_id), FolderModel.path == ancestor]
+                if workspace_id is None:
+                    conditions.append(FolderModel.user_id == user_id)
                 existing = (
-                    await session.execute(
-                        select(FolderModel).where(
-                            self._scope(workspace_id), FolderModel.path == ancestor
-                        )
-                    )
+                    await session.execute(select(FolderModel).where(*conditions))
                 ).scalar_one_or_none()
                 if existing is not None:
                     if i == len(segs):
@@ -644,10 +699,11 @@ class SqlFolderRepository:
             except IntegrityError as e:  # race with a concurrent create
                 await session.rollback()
                 raise RepositoryConflict("folder already exists") from e
+            fetch_conditions = [self._scope(workspace_id), FolderModel.path == path]
+            if workspace_id is None:
+                fetch_conditions.append(FolderModel.user_id == user_id)
             obj = (
-                await session.execute(
-                    select(FolderModel).where(self._scope(workspace_id), FolderModel.path == path)
-                )
+                await session.execute(select(FolderModel).where(*fetch_conditions))
             ).scalar_one()
             return obj
 
@@ -666,34 +722,58 @@ class SqlFolderRepository:
             ).scalars().all()
             return list(rows)
 
-    async def move_subtree(
-        self, workspace_id: UUID | None, old_path: str, new_path: str
-    ) -> None:
-        """Rewrite every folder under ``old_path`` to the matching path under ``new_path``."""
+    async def get_by_path(
+        self, user_id: UUID, workspace_id: UUID | None, path: str
+    ) -> FolderModel | None:
+        """Find a folder row by its exact path, scoped like :meth:`SqlAssetRepository.get_by_path`.
+
+        Workspace rows are shared by members; personal (My Drive, workspace_id None) rows
+        belong to ``user_id`` alone, so another user's same-named folder is not a clash.
+        """
         async with self.session_factory() as session:
+            conditions = [self._scope(workspace_id), FolderModel.path == path]
+            if workspace_id is None:
+                conditions.append(FolderModel.user_id == user_id)
+            return (
+                await session.execute(select(FolderModel).where(*conditions))
+            ).scalar_one_or_none()
+
+    async def move_subtree(
+        self, user_id: UUID, workspace_id: UUID | None, old_path: str, new_path: str
+    ) -> None:
+        """Rewrite every folder under ``old_path`` to the matching path under ``new_path``.
+
+        Personal (My Drive) rows are scoped to ``user_id`` so one user's move never
+        rewrites another user's same-named folders.
+        """
+        async with self.session_factory() as session:
+            conditions = [
+                self._scope(workspace_id),
+                or_(
+                    FolderModel.path == old_path,
+                    FolderModel.path.like(old_path + "/%"),
+                ),
+            ]
+            if workspace_id is None:
+                conditions.append(FolderModel.user_id == user_id)
             await session.execute(
                 update(FolderModel)
-                .where(
-                    self._scope(workspace_id),
-                    or_(
-                        FolderModel.path == old_path,
-                        FolderModel.path.like(old_path + "/%"),
-                    ),
-                )
+                .where(*conditions)
                 .values(
                     path=func.concat(new_path, func.substr(FolderModel.path, len(old_path) + 1))
                 )
             )
             await session.commit()
 
-    async def delete_subtree(self, workspace_id: UUID | None, path: str) -> None:
+    async def delete_subtree(self, user_id: UUID, workspace_id: UUID | None, path: str) -> None:
         async with self.session_factory() as session:
-            await session.execute(
-                delete(FolderModel).where(
-                    self._scope(workspace_id),
-                    or_(FolderModel.path == path, FolderModel.path.like(path + "/%")),
-                )
-            )
+            conditions = [
+                self._scope(workspace_id),
+                or_(FolderModel.path == path, FolderModel.path.like(path + "/%")),
+            ]
+            if workspace_id is None:
+                conditions.append(FolderModel.user_id == user_id)
+            await session.execute(delete(FolderModel).where(*conditions))
             await session.commit()
 
 

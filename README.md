@@ -18,7 +18,7 @@ The engine is a native function-calling **agent** — an `AgentKernel` compositi
 
 Model inference never runs inside the API: embedding (**[BGE-M3](https://huggingface.co/BAAI/bge-m3)** via [TEI](https://github.com/huggingface/text-embeddings-inference)) and **TTS ([Kokoro](https://github.com/hexgrad/kokoro))** are separate Docker services, and retrieval can be extracted behind a capability seam into its own **gRPC service**. **LLM calls** go directly to the provider channel pinned to the session (managed in the admin console), with the [LiteLLM](https://github.com/BerriAI/litellm) gateway as the legacy fallback. Async enrichment (TTS, images, explanations, session finalize) runs on an [arq](https://arq-docs.helpmanual.io/) **worker** off the request path.
 
-Also included: multi-user accounts with per-role quotas, **per-role LLM channels** (role ↔ credential bindings with one channel pinned per login), pay-as-you-go **billing** with atomic wallet deduction, a self-contained **admin console** (Providers / Roles / Users / Tokens / Tools config), **self-service accounts** (email-verified registration, password reset, editable profiles with avatars), and a desktop workbench with a file tree, a multi-format media viewer, and one-click video screenshots.
+Also included: multi-user accounts with per-role quotas, **per-role LLM channels** (role ↔ credential bindings with one channel pinned per login), pay-as-you-go **billing** with atomic wallet deduction, a self-contained **admin console** (Providers / Roles / Users / Tokens / Tools config), **self-service accounts** (email-verified registration, password reset, editable profiles with avatars), and a desktop workbench with a file tree, a multi-format media viewer, one-click video screenshots, and a built-in **cloud note editor** (Markdown edit + preview) that edits your My Drive straight from the app.
 
 ---
 
@@ -209,6 +209,21 @@ flowchart TB
 
 ## ✨ Key Features
 
+### 🖥️ Desktop Workbench (Local Client)
+- **Workspace file tree**: open any local folder as your workspace (the last one is restored on the next launch); add files from anywhere, create folders and text files, delete files & folders with a right-click (permanent, workspace-bounded), and fuzzy-search the tree with live suggestions that jump straight to a match.
+- **My Drive in the app**: the sidebar's **☁️ Cloud** source browses your cloud **My Drive** — open `.md`/`.txt` notes in the built-in Markdown editor (✏ Edit / 👁 Preview / 💾 Save, synced straight back to the server), and stream PDFs, images, video, and audio into the in-window viewer via a temp-cache download. Anything you save shows up in the web console on refresh.
+- **Summarize**: condense a document/video into a summary or key-point outline.
+- **Generate slides & mind maps**: turn the current material into slide decks and mind-map overviews.
+- **Edit the material**: modify the loaded document in place.
+- **Clip & discuss**: select a passage in the viewer, clip it, and start a discussion with the AI tutor about that selection.
+- **Bookmarks**: mark pages, sections, or words to revisit — jump back to any saved spot anytime.
+- **Learning notes**: capture and organize your notes alongside the material as you study, ready when you review.
+- **Sessions search**: search your chat history by content — matching snippets are highlighted in the results.
+- **Multi-format viewer**: video (with subtitles), audio, images, PDF (with annotations), and text/code; Office files open in your OS default app. One-click video **screenshots** and **Generate PPT / Generate Book**.
+- **Subtitles**: a sibling `.srt`/`.vtt`/`.lrc` is auto-detected, or pick one manually; enable/disable and style it (size, color, background, position), and your settings are remembered.
+- **Streaming chat**: answers stream in with a collapsible **💭 thinking** panel; dock the chat to the bottom or side, or float it as a window. Messages render **Markdown + math** (`$...$` / `$$...$$` formulas via KaTeX), and every bubble has **Copy / Read / Delete / Edit** actions — **Edit** (on a user question) re-asks it, dropping that turn and everything after before streaming a fresh answer; sessions can be **renamed** (click the title) or **deleted** from the sidebar.
+- **Native menus & settings**: everything you'd expect — open/switch workspaces, zoom & font size, fullscreen, Help & Feedback, About. ⚙️ Settings covers theme, display, updates, help, and about.
+
 ### 💬 AI Chat Assistant
 - **Agentic Kernel** (`AgentKernel`): a composition root wiring a cache-boundary prompt assembler, deferred tool loading, dual-track memory, a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop.
 - **Cache-Boundary Prompt**: the system prompt is partitioned into three zones — a byte-stable static prefix (SOUL.md + compact tool/skill catalog), project context, and a per-step dynamic suffix — so the provider's prefix cache reuses the stable head across steps. Project conventions are loaded from the workspace's `DEEPDIVE.md` into their own stable zone; `snapshot_key()` makes the cache identity measurable.
@@ -235,7 +250,9 @@ flowchart TB
 ### ☁️ Cloud Drive (Personal & Shared File Storage)
 - **My Drive + shared workspaces**: every user gets a private **My Drive**, plus shared **workspaces** (owner / admin / editor / viewer roles) for team files. Files are stored in a per-user object store with **SHA-256 content-addressing**, so identical files deduplicate to a single physical blob (ref-counted, freed only when the last reference is purged).
 - **Instant upload & resumable chunks**: uploading an already-stored file short-circuits to **instant upload** (no bytes transferred); large files stream in **8 MB chunks** (`upload_sessions` tracks received chunks) with a progress bar and safe re-upload.
-- **First-class folders**: multi-level folders (`folders` rows with full `/`-paths) live side by side with files, and the file manager tree combines them. Create/rename/delete folders; renaming or deleting a folder rewrites the path prefix of every file and sub-folder beneath it.
+- **Notes & Markdown editing**: text files (`.md`, `.txt`, code, data) open in an in-page **note editor** — a **✏ Edit / 👁 Preview** toggle renders Markdown live, and **💾 Save** (`Ctrl+S`) rewrites the file in place (the bytes are re-deduplicated and RAG indexing re-runs). Rendering is XSS-safe: raw HTML is escaped and `javascript:`-style links are blocked.
+- **First-class folders**: multi-level folders (`folders` rows with full `/`-paths) live side by side with files, and the file manager tree combines them. Create/rename/move/delete folders; renaming or deleting a folder rewrites the path prefix of every file and sub-folder beneath it.
+- **Context menu & collision-safe naming**: right-click a file or folder for **📄 New text file**, **📁 New folder**, **📤 Upload**, and **🗑 Delete** (deleting a folder trashes its files first). Files and folders share one namespace per directory, so creating/moving/renaming into a busy spot auto-appends `(1)`, `(2)`, … (`docs` → `docs (1)`) instead of failing.
 - **Move anywhere**: files move across workspaces / My Drive freely (drag-and-drop is the planned UX; the API + batch bar support it today).
 - **Fuzzy search with suggestions**: a client-side, case-insensitive fuzzy matcher (prefix > substring > folder-path > subsequence scoring) with a live suggestion dropdown; you can scope a search to a workspace or search all of My Drive.
 - **Trash & retention**: deleting a file moves it to the trash — bytes are kept (no ref-count release) until you **Restore**, **Delete permanently**, or **Empty Trash**. Trash auto-purges entries older than **30 days** (lazy sweep on list). Deleting a workspace trashes all its files and moves assets to My Drive trash.
@@ -272,14 +289,6 @@ flowchart TB
 - **Transactional Page Commits**: Commit all modifications on a single page with one click for high-speed bulk updates while maintaining data integrity.
 - **Global Operation Flow**: Perform global sorting across the entire database and save changes page-by-page.
 - **Self-Healing Logic**: Automatically deduplicates duplicate matches to keep the UI stable.
-
-### 🖥️ Desktop Workbench (Electron)
-- **Workspace file tree**: open any local folder as your workspace (the last one is restored on the next launch); add files from anywhere, delete with one click, and fuzzy-search the tree.
-- **Sessions search**: search your chat history by content — matching snippets are highlighted in the results.
-- **Multi-format viewer**: video (with subtitles), audio, images, PDF (with annotations), and text/code; Office files open in your OS default app. One-click video **screenshots** and **Generate PPT / Generate Book**.
-- **Subtitles**: a sibling `.srt`/`.vtt`/`.lrc` is auto-detected, or pick one manually; enable/disable and style it (size, color, background, position), and your settings are remembered.
-- **Streaming chat**: answers stream in with a collapsible **💭 thinking** panel; dock the chat to the bottom or side, or float it as a window.
-- **Native menus & settings**: everything you'd expect — open/switch workspaces, zoom & font size, fullscreen, Help & Feedback, About. ⚙️ Settings covers theme, display, updates, help, and about.
 
 ---
 
@@ -466,6 +475,25 @@ no business-code change. See [docs/architecture.md](docs/architecture.md) for th
 
 ## 💡 How to Use
 
+All surfaces talk to the same backend. Start with the **desktop workbench** — the offline-first local
+client is the primary way to study; the **web console** covers browser-based learning, the **cloud
+drive** holds your files, and the **admin console** is for operators.
+
+### 🖥️ Desktop workbench (local client)
+
+A standalone local workbench — the file tree, multi-format viewer, video screenshots, and subtitles work **without the backend**:
+
+- **Open Workspace** to browse any local folder; the viewer plays video (with subtitles), audio, images, PDF (with annotations), and text/code, and opens Office files in your OS default app.
+- Switch the sidebar source from **💻 Local** to **☁️ Cloud** to browse your My Drive — open and edit text notes in the built-in Markdown editor (✏ / 👁 Preview / 💾 Save, `Ctrl+S`), or watch PDFs, video, images, and audio stream through the in-window viewer. Changes are saved straight to the server and show up in the web console.
+- Take one-click video **screenshots** and **Generate PPT / Generate Book** from the current material.
+- **Chat** streams answers with a collapsible **💭 thinking** panel (dock to bottom/side or float as a window); session history and search live in the sidebar. Bubbles render **Markdown + KaTeX math**; hover a bubble for **Copy / Read / Delete / Edit** — editing a question re-asks it (the turn and everything after are removed, then a fresh answer streams in). Click a session's title to **rename** it, or **delete** it from the sidebar.
+- **Sign in** from the account menu (register new accounts / reset passwords; guests chat anonymously up to the daily limit); ⚙️ **Settings** covers theme, font size, window & display, update checks, help, and about.
+- The account menu deep-links straight to the **web console**, the **Cloud Drive**, and — for admins — the **admin console**, signed in automatically via SSO.
+
+Chat, session history & search, media generation, sign-in, and the **☁️ Cloud** My Drive panel all need the backend on `localhost:8300`; the desktop main process forwards `/api`, `/audio`, and `/images` to it.
+
+### 🖥️ Web console (Learning Platform)
+
 1. **Create Domain**: Navigate to *Import Data* → *Domain Management* to start a new topic (e.g. "AI Research Papers").
 2. **Import Terms**: Switch to *Import Vocabulary*. Upload your vocabulary CSV or paste text directly.
 3. **Build Corpus (Two Layers)**:
@@ -474,6 +502,28 @@ no business-code change. See [docs/architecture.md](docs/architecture.md) for th
 4. **Interactive Study**: Navigate to *Study Mode* and click the **📖 View** icon to deep-dive — generate TTS audio, view AI definitions, record and compare your pronunciation, get context-aware sentence translations, view contextual images, navigate via Next/Prev, and save the best context to your database.
 5. **Library Governance**: Navigate to *Manage Vocabulary* to sort globally, refine definitions with click-to-edit, and toggle term visibility.
 6. **Chat Assistant**: Ask questions and get RAG-grounded, streamed answers.
+7. **My Account**: check your wallet balance, daily usage, usage logs (per model / channel / tool), and transactions; edit your profile and avatar.
+
+### ☁️ Cloud Drive (top tab *☁️ Cloud Drive*)
+
+- **My Drive + workspaces**: every account gets a private **My Drive**; click **＋ New workspace** in the folder tree to create a shared workspace, and manage its members (owner / admin / editor / viewer) from **⚙ Manage**.
+- **Upload & folders**: **⬆ Upload** streams files in chunks (already-stored content uploads instantly, deduplicated by SHA-256); **＋ New folder** builds multi-level paths like `English/Vocab`. Files larger than 256 MB go through the desktop client.
+- **Notes**: click any text file to open it in the built-in note editor — toggle **👁 Preview** for rendered Markdown and hit **💾 Save** (or `Ctrl+S`) to write it back and re-index. Right-click in the file area for **📄 New text file** / **📁 New folder** / **📤 Upload** / **🗑 Delete**; a name already used in that folder is auto-renamed (`name (1)`).
+- **Manage files**: toggle **✏ Edit** to multi-select, then download, open, share, rename, move (across workspaces / folders), or delete.
+- **Share**: **🔗 Share** grants read/write to a specific user or creates a public link.
+- **Search**: the search box fuzzy-matches file names and folder paths, scoped to a workspace or all of My Drive; jump straight to a result's folder.
+- **Trash**: deleting a file moves it to **Trash** — restore, purge permanently, or **Empty Trash**; entries older than 30 days purge automatically. Deleting a workspace trashes its files and moves them to My Drive trash.
+- **RAG status**: files are ingested for retrieval in the background; each file shows a badge (Pending → Parsing → Chunking → Embedding → Indexed) that settles on its own.
+
+### 🔧 Admin console (`/admin`, default `admin` / `admin`)
+
+Sign in as an operator to configure the whole instance from a single SPA:
+
+- **Providers**: add OpenAI-compatible **Credentials** (base_url + api_key) per LLM channel, maintain the **Model Catalog** (per-1k prompt/completion pricing), set **Routing & Weights**, and smoke-test a channel in **Chat Test**.
+- **Roles**: per-role quotas (daily/monthly requests, tokens, RPM, cost), default model, and the role ↔ credential channel bindings that decide which channels each role may use.
+- **Users**: create accounts directly, browse users, and manage their key grants.
+- **Tokens**: the per-user LLM key-grant matrix — which user may use which provider key (shown masked `sk-***`), with independent revoke/restore, plus a login-sessions view.
+- **Tools config**: web-search provider + API key + engine id, **SMTP** (email verification / password reset), free-form key/value tool params, and a test-email button.
 
 ---
 

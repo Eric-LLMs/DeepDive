@@ -20,6 +20,24 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   deleteFile: (filePath, workspaceDir) =>
     ipcRenderer.invoke("delete-file", { filePath, workspaceDir }),
 
+  // Delete a folder (recursively) inside the open workspace: { ok, name } | { ok, error }.
+  deleteFolder: (dirPath, workspaceDir) =>
+    ipcRenderer.invoke("delete-folder", { dirPath, workspaceDir }),
+
+  // Download a cloud file to a temp cache so the in-window viewer can render it.
+  // { assetId, name, token } → { ok, path } | { ok, error }.
+  cloudCache: (assetId, name, token) =>
+    ipcRenderer.invoke("cloud-cache", { assetId, name, token }),
+
+  // Create a folder inside the workspace (or a subfolder): { workspaceDir, parentDir, name }.
+  createFolder: (o) => ipcRenderer.invoke("create-folder", o),
+
+  // Create a text file inside the workspace (collision-safe): { workspaceDir, parentDir, name, content }.
+  createTextFile: (o) => ipcRenderer.invoke("create-text-file", o),
+
+  // Move a file/folder into another folder (drag-and-drop): { workspaceDir, srcPath, destDir }.
+  movePath: (o) => ipcRenderer.invoke("move-path", o),
+
   // File menu → renderer: "Add File to Workspace" was clicked.
   onAddFileToWorkspace: (cb) => { ipcRenderer.on("menu-add-file", () => cb()); },
 

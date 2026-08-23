@@ -20,8 +20,10 @@ from api.permissions import (
     require_workspace_owner,
 )
 from api.schemas_drive import (
+    ContentUpdate,
     FileRename,
     FolderCreate,
+    FolderMoveRequest,
     FolderRename,
     InitUploadRequest,
     MemberAdd,
@@ -268,6 +270,36 @@ async def download(
     )
 
 
+@files.get("/{asset_id}/content")
+async def read_content(
+    asset_id: UUID,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+):
+    """Return a text note's content (.md/.txt/…) as JSON."""
+    await require_file_read(drive, user.user_id, asset_id)
+    return {"content": await drive.read_text(user.user_id, asset_id)}
+
+
+@files.put("/{asset_id}/content")
+async def update_content(
+    asset_id: UUID,
+    body: ContentUpdate,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+    queue=Depends(get_task_queue),
+):
+    """Overwrite a text note's content and re-run RAG indexing."""
+    await require_file_write(drive, user.user_id, asset_id)
+    asset = await drive.update_content(user.user_id, asset_id, body.content)
+    job_id = await queue.enqueue(
+        ASSET_INGEST,
+        {"asset_id": asset["id"], "user_id": str(user.user_id)},
+        user_id=user.user_id,
+    )
+    return {"asset": asset, "job_id": str(job_id)}
+
+
 def _stream(data: bytes):
     chunk = 256 * 1024
     for i in range(0, len(data), chunk):
@@ -379,6 +411,16 @@ async def rename_folder(
     drive: DriveService = Depends(get_drive_service),
 ):
     return await drive.rename_folder(user.user_id, folder_id, body.name)
+
+
+@folders.post("/{folder_id}/move")
+async def move_folder(
+    folder_id: UUID,
+    body: FolderMoveRequest,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+):
+    return await drive.move_folder(user.user_id, folder_id, body.parent_path)
 
 
 @folders.delete("/{folder_id}")
