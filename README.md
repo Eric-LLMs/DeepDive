@@ -177,8 +177,10 @@ flowchart TB
         SNIP["per-message snip · prompt_message_max_chars<br/>request snapshot trimmed · persistence keeps full text"]
         AUTO --> SNIP
         SNIP --> REQ["LLM request · system + snipped messages"]
-        REQ --> REFRESH["refresh_dynamic · recompute only DYNAMIC_SUFFIX<br/>unchanged → system not re-sent · head reused"]
         REQ --> TOOLS["visible tools · core full schemas<br/>+ defer_loading stubs · name + description · empty params<br/>full schema via the tool_search result"]
+        REQ --> EXEC["tool execution · dispatch via runtime<br/>concurrency-safe → parallel gather · else serial<br/>Sandbox permission-guarded"]
+        EXEC --> COMMIT["tool result committed to messages<br/>role:tool + deferred contexts<br/>messages grows · next step reuses"]
+        COMMIT --> REFRESH["refresh_dynamic · recompute only DYNAMIC_SUFFIX<br/>unchanged → system not re-sent · head reused"]
         REFRESH --> REQ
         RENDER --> REQ
     end
