@@ -1822,3 +1822,146 @@ button.danger:hover:not(:disabled) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ── In-window Office previews (docx / xlsx / csv / tsv / pptx) ── */
+/* The preview panel reuses .note-editor's frame; give it a fixed height so the
+   spreadsheet tabs and the PowerPoint stage get real room to lay out in. */
+.file-preview {
+  /* Fill nearly the whole viewport so documents have room to breathe. */
+  height: calc(100vh - 150px);
+  min-height: 60vh;
+}
+.file-preview .docx-viewer,
+.file-preview .sheet-viewer,
+.file-preview .pptx-wrap {
+  flex: 1;
+  min-height: 0;
+}
+.preview-status {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  padding: 24px;
+}
+.preview-fallback {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+}
+.preview-fallback-msg {
+  color: var(--muted);
+  max-width: 420px;
+  margin: 0;
+}
+
+/* Word: mammoth emits semantic HTML; render on a white "page". */
+.docx-viewer {
+  overflow: auto;
+  padding: 24px 32px;
+  background: #fff;
+  color: #1a1a1a;
+  line-height: 1.6;
+}
+.docx-viewer h1, .docx-viewer h2, .docx-viewer h3, .docx-viewer h4 { margin: 0.8em 0 0.4em; line-height: 1.3; }
+.docx-viewer h1 { font-size: 1.7em; }
+.docx-viewer h2 { font-size: 1.4em; }
+.docx-viewer h3 { font-size: 1.15em; }
+.docx-viewer p { margin: 0.5em 0; }
+.docx-viewer ul, .docx-viewer ol { padding-left: 1.6em; margin: 0.5em 0; }
+.docx-viewer li { margin: 0.2em 0; }
+.docx-viewer table { border-collapse: collapse; margin: 0.6em 0; }
+.docx-viewer td, .docx-viewer th { border: 1px solid #999; padding: 4px 8px; }
+.docx-viewer blockquote { border-left: 3px solid #ccc; margin: 0.5em 0; padding-left: 12px; color: #444; }
+.docx-viewer a { color: #1a5fb4; }
+.docx-viewer img { max-width: 100%; height: auto; }
+.docx-viewer code, .docx-viewer pre { background: #f4f4f4; }
+.docx-viewer code { padding: 1px 4px; border-radius: 3px; }
+.docx-viewer pre { padding: 8px 10px; border-radius: 6px; overflow: auto; }
+
+/* Excel / CSV / TSV: sheet tabs + a scrollable table. */
+.sheet-viewer {
+  display: flex;
+  flex-direction: column;
+}
+.sheet-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-raised, var(--panel));
+  overflow-x: auto;
+}
+.sheet-tabs button {
+  padding: 4px 12px;
+  background: var(--panel-raised, var(--panel));
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.sheet-tabs button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.sheet-panels {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+}
+.sheet-panels table { border-collapse: collapse; font-size: 13px; }
+.sheet-panels td, .sheet-panels th { border: 1px solid var(--border); padding: 4px 8px; }
+.sheet-panels td { white-space: nowrap; }
+
+/* PowerPoint: slide deck with prev/next navigation. */
+.pptx-wrap {
+  display: flex;
+  flex-direction: column;
+  background: #2a2a2a;
+}
+.pptx-nav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 8px;
+}
+.pptx-nav button {
+  padding: 5px 12px;
+  background: var(--panel-raised, var(--panel));
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.pptx-nav button:disabled { opacity: 0.4; cursor: default; }
+.pptx-nav-label { color: var(--muted); font-size: 12px; }
+.pptx-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: #1e1e1e;
+}
+.pptx-slide {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: top left;
+  box-shadow: 0 0 12px rgba(0, 0, 0, 0.5);
+  background: #fff;
+}
+.pptx-shape { position: absolute; overflow: hidden; }
+.pptx-para { margin: 0; }
+.pptx-img { position: absolute; object-fit: contain; }

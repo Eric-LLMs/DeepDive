@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { renderMarkdown } from "./markdown";
+import FilePreview, { officeKindOf } from "./FilePreview";
 import type {
   DriveFile,
   DriveFolder,
@@ -1001,6 +1002,8 @@ export default function CloudDrive() {
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   // Note editor: text files (.md/.txt/…) open in an in-page Markdown editor instead of a tab.
   const [editing, setEditing] = useState<DriveFile | null>(null);
+  // In-window Office preview (docx/xlsx/csv/tsv/pptx/…). Mutually exclusive with the editor.
+  const [previewFile, setPreviewFile] = useState<DriveFile | null>(null);
   const [draft, setDraft] = useState("");
   const [dirty, setDirty] = useState(false);
   const [preview, setPreview] = useState(false);
@@ -1331,10 +1334,14 @@ export default function CloudDrive() {
 
   // ── Note editor (Markdown text files) ──────────────────────────────────────
   const isTextFile = (f: DriveFile) => {
+    const name = f.name || "";
+    // .csv/.tsv are delimited tables — they open in the in-window table preview, not
+    // the note editor, even if the server stored them with a text/* mime type.
+    if (/\.(csv|tsv)$/i.test(name)) return false;
     const mime = (f.mime_type || "").toLowerCase();
     if (mime.startsWith("text/")) return true;
-    return /\.(txt|md|markdown|text|log|json|csv|yaml|yml|toml|ini|xml|html|py|js|ts|jsx|tsx|c|h|cpp|hpp|java|go|rs|sh|bat|sql)$/i.test(
-      f.name
+    return /\.(txt|md|markdown|text|log|json|yaml|yml|toml|ini|xml|html|py|js|ts|jsx|tsx|c|h|cpp|hpp|java|go|rs|sh|bat|sql)$/i.test(
+      name
     );
   };
 
@@ -1354,6 +1361,7 @@ export default function CloudDrive() {
   const openEntry = (f: DriveFile) => {
     if (editMode) return toggleOne(f.id);
     if (isTrash) return;
+    if (officeKindOf(f.name)) return setPreviewFile(f);
     if (isTextFile(f)) return openNote(f);
     return openFile(f);
   };
@@ -1384,7 +1392,10 @@ export default function CloudDrive() {
 
   const openSelected = async () => {
     const f = selectedFiles[0];
-    if (f) await openFile(f);
+    if (!f) return;
+    if (officeKindOf(f.name)) return setPreviewFile(f);
+    if (isTextFile(f)) return openNote(f);
+    await openFile(f);
   };
 
   // Delete = move to the trash (bytes + sharing kept so it can be restored).
@@ -1714,7 +1725,14 @@ export default function CloudDrive() {
             </div>
           )}
 
-          {editing ? (
+          {previewFile ? (
+            <FilePreview
+              file={previewFile}
+              onClose={() => setPreviewFile(null)}
+              onDownload={() => download(previewFile)}
+              onOpen={() => openFile(previewFile)}
+            />
+          ) : editing ? (
             <div className="note-editor">
               <div className="note-editor-toolbar">
                 <span className="note-editor-title" title={editing.folder_path ?? ""}>
