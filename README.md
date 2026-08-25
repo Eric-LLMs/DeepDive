@@ -21,6 +21,11 @@ Dive deeper: [**Key Features**](#-key-features) walks through every feature, and
 
 ## 🏗️ Architecture at a glance
 
+![Architecture overview — frontends, backend, data, and model services](./docs/images/architecture-overview.png)
+
+<details>
+<summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
+
 ```mermaid
 flowchart LR
     subgraph Frontends
@@ -58,7 +63,14 @@ flowchart LR
     rs --> emb
 ```
 
+</details>
+
 **Agent kernel** — the core, composed in and running inside the FastAPI gateway process:
+
+![Agent kernel — the ReactLoopAgent composition root](./docs/images/agent-kernel.png)
+
+<details>
+<summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
 
 ```mermaid
 flowchart TB
@@ -69,6 +81,8 @@ flowchart TB
     loop --> memory[MemoryService<br/>PG tsvector + pgvector RRF]
     tools --> sandbox[Sandbox<br/>READ / WRITE / NETWORK]
 ```
+
+</details>
 
 > Agent kernel — design: [architecture.md §5 Agent Module](docs/architecture.md#5-agent-module).
 
