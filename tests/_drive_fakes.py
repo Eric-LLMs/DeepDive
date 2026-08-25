@@ -433,7 +433,9 @@ class FakeChunks:
     async def delete_by_asset(self, asset_id):
         self.rows = [r for r in self.rows if r[0] != asset_id]
 
-    async def bulk_insert(self, asset_id, user_id, workspace_id, chunks):
+    async def bulk_insert(
+        self, asset_id, user_id, workspace_id, chunks, source_type="file", source_id=None
+    ):
         self.rows.extend((asset_id, c) for c in chunks)
 
 

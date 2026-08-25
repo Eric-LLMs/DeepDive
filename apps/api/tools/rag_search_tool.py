@@ -22,6 +22,10 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
         # Tenant isolation: bind the current request's user so retrieval only sees their
         # assets (owner / workspace / ACL). A guest (None) sees public-link assets only.
         filters = {"user_id": get_request_user_id()}
+        # Optional domain scoping (P1): when the model/console pins a domain id, retrieval
+        # narrows to assets of that domain (assets.domain_id, migration 0010).
+        if args.get("domain"):
+            filters["domain_id"] = str(args["domain"])
         try:
             return await retriever.retrieve(
                 args.get("query", ""), args.get("top_k", 5), filters
@@ -40,6 +44,10 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
                 "properties": {
                     "query": {"type": "string", "description": "The search query."},
                     "top_k": {"type": "integer", "description": "Number of results."},
+                    "domain": {
+                        "type": "string",
+                        "description": "Optional domain id to scope the search to.",
+                    },
                 },
                 "required": ["query"],
             },

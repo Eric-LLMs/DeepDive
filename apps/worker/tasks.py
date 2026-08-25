@@ -6,22 +6,36 @@ enrichment work the gateway used to do in-process. arq calls every task as
 task drives its own status transitions via :class:`JobStore`.
 """
 import asyncio
+import json
+import logging
 import time
 from pathlib import Path
 from uuid import UUID
 
+from sqlalchemy import select
+
+logger = logging.getLogger(__name__)
+
 from core.application.drive_service import READY
 from core.config import settings
 from core.infrastructure import media
-from core.infrastructure.db import SessionEventModel
+from core.infrastructure.db import MessageModel, SessionEventModel
 from core.infrastructure.drive_repositories import (
     SqlAssetRepository,
     SqlChunkRepository,
 )
-from core.infrastructure.ingest import extract_text, split_chunks
+from core.infrastructure.ingest import (
+    Chunk,
+    build_chunks,
+    extract_document_text,
+    write_query_repo_chunks,
+)
 from core.infrastructure.jobs import JobStore
 from core.infrastructure.memory import finalize_session
-from core.infrastructure.repositories import SqlSentenceRepository
+from core.infrastructure.repositories import (
+    SqlArticleRepository,
+    SqlSentenceRepository,
+)
 from core.infrastructure.storage import get_storage, object_key
 
 
@@ -181,27 +195,40 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
         if data is None:
             raise RuntimeError("object bytes missing from storage")
 
-        text = extract_text(data, asset.name)
+        # Runtime pipeline config (admin console) governs chunking / enrichment; config
+        # changes take effect on the next re-ingest via /admin/rag/reindex.
+        from rag.config_store import load_config
+
+        cfg = await load_config(ctx["session_factory"])
+
+        # PDF runs the async path (body + vision-transcribed tables via the PDF tools);
+        # every other extension goes through the sync ``extract_text`` dispatch.
+        text = await extract_document_text(data, asset.name, ctx["llm"])
         await assets.set_status(asset_id, rag_status="CHUNKING")
-        chunks = split_chunks(text)
+        chunks = await build_chunks(text, cfg, doc_title=asset.name, llm=ctx["llm"])
 
         await assets.set_status(asset_id, rag_status="EMBEDDING")
         embeddings: list[list[float]] = []
         for i in range(0, len(chunks), settings.embed_batch_size):
             batch = chunks[i : i + settings.embed_batch_size]
-            embeddings.extend(await ctx["embedder"].embed(batch))
+            embeddings.extend(await ctx["embedder"].embed([c.content_en for c in batch]))
 
+        rows = [
+            {
+                "id": c.id,
+                "content_en": c.content_en,
+                "content_cn": c.content_cn,
+                "meta": {**c.meta, "asset_id": str(asset_id)},
+                "embedding": emb,
+                "chunk_kind": c.chunk_kind,
+                "parent_chunk_id": c.parent_chunk_id,
+                "content_search": c.content_search,
+            }
+            for c, emb in zip(chunks, embeddings)
+        ]
         chunks_repo = SqlChunkRepository(ctx["session_factory"])
         await chunks_repo.delete_by_asset(asset_id)
-        await chunks_repo.bulk_insert(
-            asset_id,
-            asset.user_id,
-            asset.workspace_id,
-            [
-                (chunk, None, {"asset_id": str(asset_id), "seq": idx}, emb)
-                for idx, (chunk, emb) in enumerate(zip(chunks, embeddings))
-            ],
-        )
+        await chunks_repo.bulk_insert(asset_id, asset.user_id, asset.workspace_id, rows)
         await assets.set_status(asset_id, rag_status="INDEXED")
         return {"chunks": len(chunks)}
 
@@ -212,3 +239,189 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
         # even though the job row itself carries the failure detail.
         await assets.set_status(asset_id, rag_status="FAILED")
         raise
+
+
+async def _write_query_repo_chunks(
+    ctx, *, chunks: list[Chunk], user_id, source_type: str, source_id: str | None
+) -> dict:
+    """Embed + persist chunks as a non-file query-repo source (shared helper in ingest)."""
+    return await write_query_repo_chunks(
+        ctx["session_factory"],
+        ctx["embedder"],
+        chunks=chunks,
+        user_id=user_id,
+        source_type=source_type,
+        source_id=source_id,
+    )
+
+
+async def learning_import(ctx, job_id: str, payload: dict) -> dict:
+    """Push Learning-Platform content (sentences / articles) into the query repository.
+
+    Each sentence / article is chunked under the runtime pipeline config and stored with
+    ``source_type='learning'`` + ``source_id=<id>``. Re-importing the same id is
+    idempotent (delete-by-source then rewrite), so the ImportData page can safely re-push.
+    """
+    user_id = UUID(payload["user_id"])
+    kind = payload["kind"]
+
+    async def work() -> dict:
+        from rag.config_store import load_config  # lazy: rag is a sibling package
+
+        cfg = await load_config(ctx["session_factory"])
+        docs: list[tuple[str, str, str, str]] = []  # (id, title, text, kind)
+        async with ctx["session_factory"]() as session:
+            if kind == "sentence":
+                repo = SqlSentenceRepository(session)
+                for sid in payload["ids"]:
+                    s = await repo.get(UUID(sid))
+                    if s is not None and s.content_en.strip():
+                        docs.append((str(sid), s.content_en[:60], s.content_en, "sentence"))
+            elif kind == "article":
+                repo = SqlArticleRepository(session)
+                for aid in payload["ids"]:
+                    a = await repo.get(UUID(aid))
+                    if a is not None and a.content.strip():
+                        docs.append((str(aid), a.title, a.content, "article"))
+            else:
+                raise ValueError(f"unknown learning import kind: {kind}")
+
+        if not docs:
+            return {"chunks": 0}
+        chunks_repo = SqlChunkRepository(ctx["session_factory"])
+        total = 0
+        for sid, title, text, doc_kind in docs:
+            await chunks_repo.delete_by_source("learning", [sid])
+            chunks = await build_chunks(text, cfg, doc_title=title, llm=ctx["llm"])
+            for c in chunks:
+                c.meta = {**c.meta, "title": title, "kind": doc_kind}
+            res = await _write_query_repo_chunks(
+                ctx,
+                chunks=chunks,
+                user_id=user_id,
+                source_type="learning",
+                source_id=sid,
+            )
+            total += res["chunks"]
+        return {"chunks": total}
+
+    return await _run(ctx, job_id, work())
+
+
+def _default_chat_pairs(messages) -> list[dict]:
+    """Group a message list into Q&A pairs: each user message starts a pair, the assistant
+    messages until the next user message are its answer (merging multi-turn follow-ups)."""
+    pairs: list[dict] = []
+    current: dict | None = None
+    for m in messages:
+        if m.role == "user":
+            if current is not None:
+                pairs.append(current)
+            current = {"question": m.text, "answer": ""}
+        elif m.role == "assistant" and current is not None:
+            current["answer"] = (
+                (current["answer"] + "\n" + m.text).strip() if current["answer"] else m.text
+            )
+    if current is not None:
+        pairs.append(current)
+    return pairs
+
+
+def _strip_code_fence(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+async def _segment_chat(messages, llm) -> list[dict]:
+    """Split a chat into Q&A entries: merge same-question turns, split distinct questions.
+
+    The LLM reads the transcript and returns a JSON array of ``{question, answer}``;
+    any failure (unparseable output, model error) degrades to ``_default_chat_pairs`` —
+    organize or fall back, never fail the import job.
+    """
+    transcript = "\n".join(f"{i}: {m.role}: {m.text[:400]}" for i, m in enumerate(messages))
+    try:
+        out = await llm.complete(
+            "Here is a chat log where each line is '<index>: <role>: <text>'.\n"
+            "Group the conversation into Q&A entries: merge all turns that belong to the "
+            "same user question (including follow-ups and clarifications) into one entry, "
+            "and separate different questions into different entries.\n"
+            "Reply with ONLY a JSON array, no code fences:\n"
+            '[{"question": "...", "answer": "..."}, ...]\n\n' + transcript,
+            "You are a conversation organiser. Output only JSON.",
+        )
+        data = json.loads(_strip_code_fence(out))
+        pairs = [
+            {"question": str(it.get("question", "")).strip(), "answer": str(it.get("answer", "")).strip()}
+            for it in data
+            if isinstance(it, dict) and (it.get("question") or it.get("answer"))
+        ]
+        if pairs:
+            return pairs
+    except Exception as exc:  # noqa: BLE001 - degrade to default grouping
+        logger.warning("chat session LLM segmentation failed, using default grouping: %s", exc)
+    return _default_chat_pairs(messages)
+
+
+async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
+    """Import a whole chat session into the query repository as Q&A chunks.
+
+    The LLM (falling back to a per-turn default) groups the conversation into Q&A entries:
+    the same question asked over multiple turns is merged into one entry, distinct
+    questions become separate entries, and each entry is chunked + embedded with
+    ``source_type='chat'`` + ``source_id=<session_id>`` (idempotent on re-import).
+    """
+    session_id = UUID(payload["session_id"])
+    user_id = UUID(payload["user_id"])
+
+    async def work() -> dict:
+        from rag.config_store import load_config  # lazy: rag is a sibling package
+
+        cfg = await load_config(ctx["session_factory"])
+        async with ctx["session_factory"]() as session:
+            messages = (
+                await session.execute(
+                    select(MessageModel)
+                    .where(MessageModel.session_id == session_id)
+                    .order_by(MessageModel.created_at)
+                )
+            ).scalars().all()
+
+        pairs = await _segment_chat(messages, ctx["llm"])
+        pairs = [p for p in pairs if p["answer"]]
+        if not pairs:
+            return {"chunks": 0, "groups": 0}
+
+        chunks_repo = SqlChunkRepository(ctx["session_factory"])
+        await chunks_repo.delete_by_source("chat", [str(session_id)])
+        total = 0
+        for i, pair in enumerate(pairs):
+            text = f"{pair['question']}\n\n{pair['answer']}"
+            title = pair["question"].strip()[:60] or f"Chat Q{i + 1}"
+            chunks = await build_chunks(text, cfg, doc_title=title, llm=ctx["llm"])
+            for c in chunks:
+                c.meta = {
+                    **c.meta,
+                    "title": title,
+                    "kind": "session-qa",
+                    "session_id": str(session_id),
+                    "qid": i,
+                }
+            res = await _write_query_repo_chunks(
+                ctx,
+                chunks=chunks,
+                user_id=user_id,
+                source_type="chat",
+                source_id=str(session_id),
+            )
+            total += res["chunks"]
+        return {"chunks": total, "groups": len(pairs)}
+
+    return await _run(ctx, job_id, work())

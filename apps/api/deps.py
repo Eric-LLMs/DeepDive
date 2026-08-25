@@ -38,6 +38,7 @@ from core.infrastructure.repositories import (
     SqlTermRepository,
 )
 from core.infrastructure.retrieval_grpc import GrpcRetriever
+from core.infrastructure.storage import get_storage
 from core.infrastructure.tts import TTSClient
 from core.infrastructure.vector import PgVectorStore, TEIEmbedder
 from core.infrastructure.web_search import get_web_search_provider
@@ -78,6 +79,11 @@ def _agent() -> AgentKernel:
         ctx.provide("retrieval", _retriever())
 
     ctx.provide("web_search", get_web_search_provider())
+
+    # File-backed tools (pdf_extract_text / pdf_table_to_text) read a drive asset's stored
+    # bytes via the shared object storage + a DB session.
+    ctx.provide("storage", get_storage())
+    ctx.provide("session_factory", SessionLocal)
 
     # Domain tools first (the kernel registers the core meta-tools on top).
     register_builtin_tools(runtime, ctx, llm)

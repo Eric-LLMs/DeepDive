@@ -25,6 +25,8 @@
     treeData: null,
     sessions: null,
     sessionQuery: "",
+    importedQaIds: new Set(),  // user-message ids already imported into the query repo (active session)
+    sessionImported: false,    // true when the whole active session was imported as session-qa
   };
   try { state.token = localStorage.getItem("deepdive_token"); } catch { /* ignore */ }
   try { state.guestId = localStorage.getItem("deepdive_guest_id"); } catch { /* ignore */ }
@@ -672,7 +674,24 @@
   // (startDeleteSelection) where the question and answer are ticked and only the checked ones
   // get removed. getText() returns the text to copy/speak — for streaming bubbles it reads
   // the live buffer, for static ones it closes over the raw markdown source.
-  const ACTION_LABELS = { edit: "Edit", copy: "Copy", speak: "Read", delete: "Delete" };
+  const ACTION_LABELS = {
+    edit: "Edit",
+    copy: "Copy",
+    speak: "Read",
+    import: "Import to Knowledge",
+    delete: "Delete",
+  };
+  // Walk up the chat log to the user message this assistant reply answers.
+  function boundUserMsgId(div) {
+    const chain = [];
+    for (let n = div.previousElementSibling; n; n = n.previousElementSibling) {
+      chain.push(`{${n.className}|id=${n.dataset ? n.dataset.id : "(none)"}}`);
+      if (n.classList.contains("msg") && n.classList.contains("user") && n.dataset.id) return n.dataset.id;
+    }
+    console.log("[imported] chain null for", div.className, "prevSibs:", chain.join(" "));
+    return null;
+  }
+
   function buildMsgActions(div, role, getText) {
     const actions = document.createElement("div");
     actions.className = "msg-actions";
@@ -681,23 +700,266 @@
     items.push(
       ["copy", "📋", () => copyText(getText())],
       ["speak", "🔊", () => speakMessage(getText())],
-      ["delete", "🗑", () => startDeleteSelection(div)],
     );
-    for (const [a, glyph, fn] of items) {
+    // Bind a reply to its question and push the Q&A pair into the query repository.
+    // The button is born disabled + "✓ Imported" when this pair (or the whole session)
+    // is already in the repo — the state is fetched on session load and persisted in
+    // `state` so it survives session switches and app restarts.
+    if (role === "assistant") {
+      const qid = boundUserMsgId(div);
+      const done = (qid && state.importedQaIds.has(qid)) || state.sessionImported;
+      console.log("[imported] render qid", qid, "done", done, "known", [...state.importedQaIds]);
+      items.push(["import", "📥", (b) => importPair(div, b), done]);
+    }
+    items.push(["delete", "🗑", () => startDeleteSelection(div)]);
+    for (const [a, glyph, fn, done] of items) {
       const b = document.createElement("button");
       b.type = "button";
       b.dataset.a = a;
       b.innerHTML = `<span class="glyph">${glyph}</span><span class="lbl"></span>`;
       b.title = ACTION_LABELS[a];
       b.querySelector(".lbl").textContent = ACTION_LABELS[a];
+      if (a === "import" && done) {
+        b.disabled = true;
+        setBtnLabel(b, "✓ Imported");
+      }
       b.addEventListener("click", (e) => {
         e.stopPropagation();
         if (a === "speak") speakMessage(getText(), b);
+        else if (a === "import") fn(b); // importPair(div, b): button shows importing / done / failed
         else fn();
       });
       actions.appendChild(b);
     }
     return actions;
+  }
+
+  // Update an action button's text + tooltip. The button keeps its glyph; the label
+  // reflects import state (Importing… / ✓ Imported / Failed — retry).
+  function setBtnLabel(btn, text) {
+    if (!btn) return;
+    const lbl = btn.querySelector(".lbl");
+    if (lbl) lbl.textContent = text;
+    else btn.textContent = text;
+    btn.title = text;
+  }
+
+  // Push one Q&A pair (the preceding user question + this reply) into the query repo.
+  // The assistant bubble owns the button; the question is bound by walking up the chat log
+  // to the closest user message. Requires a saved session (message ids + session id).
+  // The button shows importing → done / failed; while importing it is disabled so the same
+  // pair cannot be re-imported (the endpoint is idempotent, but a second run would re-embed).
+  async function importPair(div, btn) {
+    const asstId = div.dataset.id;
+    if (!state.sessionId || !asstId) {
+      Viewer.toast("Import needs a saved chat session with message ids.");
+      return;
+    }
+    let userEl = null;
+    for (let n = div.previousElementSibling; n; n = n.previousElementSibling) {
+      if (n.classList.contains("msg") && n.classList.contains("user") && n.dataset.id) {
+        userEl = n;
+        break;
+      }
+    }
+    if (!userEl) {
+      Viewer.toast("No question found above this reply to bind with.");
+      return;
+    }
+    // Defense-in-depth: a stale render may have left this button enabled even though the
+    // pair is already in the repo. Re-check the backend so a pair can never be imported
+    // twice, and flip the button to its persistent "✓ Imported" state on the spot.
+    const fresh = await fetchImportedState(state.sessionId);
+    if (fresh && (fresh.session_imported || fresh.qa_source_ids.includes(userEl.dataset.id))) {
+      state.importedQaIds.add(userEl.dataset.id);
+      if (fresh.session_imported) state.sessionImported = true;
+      if (btn) { btn.disabled = true; setBtnLabel(btn, "✓ Imported"); }
+      Viewer.toast("This Q&A pair is already in the query repo.");
+      return;
+    }
+    if (btn) {
+      btn.disabled = true;
+      setBtnLabel(btn, "Importing…");
+    }
+    try {
+      const res = await fetch("/api/chat/import", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          session_id: state.sessionId,
+          user_message_id: userEl.dataset.id,
+          assistant_message_id: asstId,
+        }),
+      });
+      if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `${res.status}`);
+      }
+      const data = await res.json();
+      if (btn) setBtnLabel(btn, "✓ Imported");
+      if (userEl && userEl.dataset.id) state.importedQaIds.add(userEl.dataset.id);
+      Viewer.toast(`✅ Imported ${data.chunks} chunk${data.chunks === 1 ? "" : "s"} into the query repo.`);
+    } catch (err) {
+      if (btn) {
+        btn.disabled = false; // keep the button clickable so the user can retry
+        setBtnLabel(btn, "Failed — retry");
+      }
+      Viewer.toast(`Import failed: ${err.message}`);
+    }
+  }
+
+  // Organize the whole active session: the LLM groups its Q&A turns and imports each
+  // distinct question (with merged follow-ups) as a query-repo chunk. The job runs
+  // async on the worker; this polls GET /jobs/{id} and shows the final result on the
+  // button, keeping the button disabled while it is in flight so a session is not
+  // queued twice.
+  async function importSession(btn) {
+    if (!state.sessionId) {
+      Viewer.toast("No active chat session to import.");
+      return;
+    }
+    // Defense-in-depth mirror of the button's render state: if the backend says the whole
+    // session is already imported, don't queue a second organizing job.
+    const fresh = await fetchImportedState(state.sessionId);
+    if (fresh && fresh.session_imported) {
+      state.sessionImported = true;
+      if (btn) { btn.disabled = true; setBtnLabel(btn, "✓ Imported"); }
+      Viewer.toast("This session is already in the query repo.");
+      return;
+    }
+    if (btn) {
+      btn.disabled = true;
+      setBtnLabel(btn, "Organizing…");
+    }
+    let jobId;
+    try {
+      const res = await fetch("/api/chat/import-session", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ session_id: state.sessionId }),
+      });
+      if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `${res.status}`);
+      }
+      const data = await res.json();
+      jobId = data.job_id;
+      Viewer.toast(`⏳ Session queued for Q&A organizing (job ${jobId.slice(0, 8)}…)`);
+    } catch (err) {
+      if (btn) {
+        btn.disabled = false;
+        setBtnLabel(btn, "Failed — retry");
+      }
+      Viewer.toast(`Import failed: ${err.message}`);
+      return;
+    }
+    // Poll the job to a terminal state (succeeded / failed), capped at 3 minutes.
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2000));
+      let st;
+      try {
+        const r = await fetch(`/api/jobs/${jobId}`, { headers: authHeaders() });
+        if (r.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
+        st = await r.json();
+      } catch (err) {
+        if (btn) {
+          btn.disabled = false;
+          setBtnLabel(btn, "Import to Knowledge");
+        }
+        Viewer.toast(`Status check failed: ${err.message}`);
+        return;
+      }
+      if (st.status === "succeeded") {
+        const n = (st.result && st.result.chunks) || 0;
+        if (btn) { btn.disabled = true; setBtnLabel(btn, "✓ Imported"); }
+        state.sessionImported = true;
+        // Every pair is covered by the session import: mark all import buttons done.
+        chatLog.querySelectorAll('.msg-actions button[data-a="import"]').forEach((b) => {
+          b.disabled = true;
+          setBtnLabel(b, "✓ Imported");
+        });
+        Viewer.toast(`✅ Imported ${n} chunks into the query repo.`);
+        return;
+      }
+      if (st.status === "failed") {
+        if (btn) {
+          btn.disabled = false;
+          setBtnLabel(btn, "Failed — retry");
+        }
+        Viewer.toast(`Import failed: ${st.error || "unknown error"}`);
+        return;
+      }
+      // still queued / running → keep polling
+    }
+    if (btn) {
+      btn.disabled = false;
+      setBtnLabel(btn, "Import to Knowledge");
+    }
+    Viewer.toast("⏳ Still organizing… check the job later or retry.");
+  }
+
+  // Shared helper: ask the backend which Q&A pairs of a session are already in the query
+  // repo. Returns {qa_source_ids, session_imported} or null on failure, so the render-time
+  // refresh and the click-time guard both use the one code path.
+  async function fetchImportedState(sessionId) {
+    try {
+      const res = await fetch(`/api/chat/imported?session_id=${encodeURIComponent(sessionId)}`, {
+        headers: authHeaders(),
+      });
+      if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
+      if (!res.ok) { console.log("[imported] non-ok", res.status, sessionId); return null; }
+      return await res.json();
+    } catch (err) {
+      return null; // Non-fatal — leave buttons enabled so import still works.
+    }
+  }
+
+  // Refresh the persistent "imported" state for the active session: which Q&A pairs are
+  // already in the query repo, and whether the whole session was imported as session-qa.
+  // Called on session load (before rendering buttons) so an already-imported pair stays
+  // disabled across session switches and app restarts. Non-fatal on network errors — the
+  // buttons just stay enabled and a retry via the toast still works.
+  async function refreshImportedState() {
+    state.importedQaIds = new Set();
+    state.sessionImported = false;
+    if (!state.sessionId) {
+      if (chatImportSession) { chatImportSession.disabled = false; setBtnLabel(chatImportSession, "Import to Knowledge"); }
+      return;
+    }
+    const data = await fetchImportedState(state.sessionId);
+    if (!data) return;
+    state.importedQaIds = new Set(data.qa_source_ids || []);
+    state.sessionImported = !!data.session_imported;
+    console.log("[imported] session", state.sessionId, "qaIds", [...state.importedQaIds], "sessionImported", state.sessionImported);
+    if (chatImportSession) {
+      chatImportSession.disabled = state.sessionImported;
+      setBtnLabel(chatImportSession, state.sessionImported ? "✓ Imported" : "Import to Knowledge");
+    }
+    applyImportedStateToDom();
+  }
+
+  // Reconcile already-rendered import buttons with the current state. The buttons are
+  // born with their state in buildMsgActions, but if state arrives late (or a message
+  // was rendered before its id was known) this flips the buttons to the persistent
+  // "✓ Imported" state after the fact, so a reopened session can never show an
+  // enabled import button on a pair that is already in the repo.
+  function applyImportedStateToDom() {
+    chatLog.querySelectorAll('.msg.assistant .msg-actions button[data-a="import"]').forEach((b) => {
+      const div = b.closest(".msg.assistant");
+      const qid = div ? boundUserMsgId(div) : null;
+      const done = (qid && state.importedQaIds.has(qid)) || state.sessionImported;
+      if (done) {
+        b.disabled = true;
+        setBtnLabel(b, "✓ Imported");
+      }
+    });
+    if (chatImportSession) {
+      chatImportSession.disabled = state.sessionImported;
+      setBtnLabel(chatImportSession, state.sessionImported ? "✓ Imported" : "Import to Knowledge");
+    }
   }
 
   // User/assistant message with the shared action row (buildMsgActions). User bubbles
@@ -714,8 +976,12 @@
     bubble.className = "msg-bubble";
     bubble.innerHTML = renderMarkdown(text);
     div.appendChild(bubble);
-    div.appendChild(buildMsgActions(div, role, () => text));
+    // Append to the log BEFORE building the action row: buildMsgActions binds an
+    // assistant reply to the question above it via previousElementSibling, which only
+    // exists once the div is in the DOM. Building first meant the walk always came up
+    // empty and an already-imported pair never rendered as "✓ Imported" on reopen.
     chatLog.appendChild(div);
+    div.appendChild(buildMsgActions(div, role, () => text));
     chatLog.scrollTop = chatLog.scrollHeight;
     return div;
   }
@@ -731,8 +997,10 @@
     let text = "";
     const scroll = () => { chatLog.scrollTop = chatLog.scrollHeight; };
     div.appendChild(bubble);
-    div.appendChild(buildMsgActions(div, "assistant", () => text));
+    // Same ordering as appendMessage: the div must be in the log before buildMsgActions
+    // so the import button can bind the preceding user question via previousElementSibling.
     chatLog.appendChild(div);
+    div.appendChild(buildMsgActions(div, "assistant", () => text));
     return {
       el: div,
       add: (t) => { text += t; bubble.innerHTML = renderMarkdown(text); scroll(); },
@@ -1217,6 +1485,9 @@
   // New chat: drop the active session reference and clear the pane.
   function newChat() {
     state.sessionId = null;
+    state.importedQaIds = new Set();
+    state.sessionImported = false;
+    if (chatImportSession) { chatImportSession.disabled = false; setBtnLabel(chatImportSession, "Import to Knowledge"); }
     chatLog.innerHTML = "";
     chatTitle.textContent = "New chat";
     if (state.token) loadSessions();
@@ -2392,6 +2663,7 @@
   let recognition = null;
   const chatSpeak = document.getElementById("chat-speak");
   const chatMic = document.getElementById("chat-mic");
+  const chatImportSession = document.getElementById("chat-import-session");
 
   function speak(text) {
     if (!("speechSynthesis" in window)) return;
@@ -2406,6 +2678,8 @@
     speakEnabled = !speakEnabled;
     chatSpeak.classList.toggle("active", speakEnabled);
   });
+
+  chatImportSession.addEventListener("click", () => importSession(chatImportSession));
 
   chatMic.addEventListener("click", () => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -2630,13 +2904,20 @@
       const res = await fetch(`/api/sessions/${id}`, { headers: authHeaders() });
       if (!res.ok) throw new Error(`${res.status}`);
       const data = await res.json();
+      state.sessionId = id;
+      // Fetch which pairs are already imported BEFORE rendering so the import buttons
+      // are born with their persistent state (disabled + "✓ Imported").
+      await refreshImportedState();
       chatLog.innerHTML = "";
       for (const m of data.messages) {
         if (m.role === "tool") continue;
         appendMessage(m.id, m.role === "assistant" ? "assistant" : "user", m.content);
       }
-      state.sessionId = id;
       chatTitle.textContent = data.title || (data.messages[0] ? data.messages[0].content.slice(0, 30) : "Chat");
+      // Reconciliation: the buttons were rendered from state above, but re-apply so a
+      // pair already in the repo can never show as importable even if a message was
+      // rendered without its bound question id.
+      applyImportedStateToDom();
     } catch (err) {
       appendMsg("error", `Failed to load session: ${err.message}`);
     }

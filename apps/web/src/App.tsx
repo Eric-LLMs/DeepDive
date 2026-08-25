@@ -4,7 +4,7 @@ import { api, clearToken, getToken, setToken, type AuthActionResponse } from "./
 import CloudDrive from "./CloudDrive";
 import MicRecorder from "./MicRecorder";
 import { useJob } from "./useJob";
-import type { Domain, Me, Model, Sentence, Term, UsageReport } from "./types";
+import type { Article, Domain, Me, Model, Sentence, Term, UsageReport } from "./types";
 
 type Page = "home" | "import" | "study" | "manage";
 type Tab = "learn" | "me" | "drive";
@@ -905,6 +905,7 @@ function ImportData() {
     "Import Vocabulary",
     "Import Sentences (SQL)",
     "Import VectorDB (Independent)",
+    "Articles & Query Repo",
   ];
   return (
     <div>
@@ -936,6 +937,7 @@ function ImportData() {
       {tab === 1 && <VocabularyTab />}
       {tab === 2 && <SentencesTab />}
       {tab === 3 && <VectorTab />}
+      {tab === 4 && <ArticlesTab />}
     </div>
   );
 }
@@ -1194,6 +1196,55 @@ function SentencesTab() {
 
   const activeDomain = domainId || domains[0]?.id || "";
 
+  // ── Query repository: push saved sentences into the unified RAG search repo ──
+  const [sentences, setSentences] = useState<Sentence[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const repoJob = useJob<{ chunks: number }>();
+  const [repoMsg, setRepoMsg] = useState("");
+  const [repoErr, setRepoErr] = useState("");
+
+  useEffect(() => {
+    if (!activeDomain) {
+      setSentences([]);
+      setSelected(new Set());
+      return;
+    }
+    let cancelled = false;
+    api
+      .listSentences(activeDomain)
+      .then((rows) => {
+        if (!cancelled) setSentences(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setSentences([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeDomain]);
+
+  const toggleSelect = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const importToRepo = async () => {
+    if (!selected.size) return;
+    setRepoMsg("");
+    setRepoErr("");
+    try {
+      const r = await repoJob.run(() => api.learningImport("sentence", [...selected]));
+      setRepoMsg(`✅ Imported ${r.chunks} chunks into the query repository.`);
+      setSelected(new Set());
+    } catch (e) {
+      setRepoErr(String(e));
+    }
+  };
+
   const splitLines = (raw: string): string[] =>
     raw.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 5);
 
@@ -1341,8 +1392,183 @@ function SentencesTab() {
         </div>
       )}
 
+      <hr style={{ border: "none", borderTop: "1px solid var(--border)", margin: "14px 0" }} />
+      <h4 style={{ margin: 0 }}>Query Repository</h4>
+      <p className="muted">
+        Push saved sentences into the unified RAG search repo (source_type='learning').
+      </p>
+      <button
+        onClick={importToRepo}
+        disabled={!selected.size || repoJob.busy}
+        style={{ marginBottom: 8 }}
+      >
+        {repoJob.busy
+          ? "Importing…"
+          : `📥 Import ${selected.size} to Query Repo`}
+      </button>
+      {repoMsg && <p className="muted">{repoMsg}</p>}
+      {repoErr && <p className="error">{repoErr}</p>}
+      {sentences.length > 0 ? (
+        <table className="table">
+          <thead>
+            <tr>
+              <th></th>
+              <th>Sentence</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sentences.slice(0, 100).map((s) => (
+              <tr key={s.id}>
+                <td>
+                  <input
+                    type="checkbox"
+                    checked={selected.has(s.id)}
+                    onChange={() => toggleSelect(s.id)}
+                  />
+                </td>
+                <td>{s.content_en}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <p className="muted">No sentences in the active domain yet.</p>
+      )}
+
       {result && <p className="muted">{result}</p>}
       {error && <p className="error">{error}</p>}
+    </div>
+  );
+}
+
+function ArticlesTab() {
+  const { domains } = useDomains();
+  const [articles, setArticles] = useState<Article[]>([]);
+  const [title, setTitle] = useState("");
+  const [content, setContent] = useState("");
+  const [domainId, setDomainId] = useState("");
+  const [msg, setMsg] = useState("");
+  const [error, setError] = useState("");
+  const [importingId, setImportingId] = useState<string | null>(null);
+
+  const reload = async () => {
+    try {
+      const r = await api.listArticles();
+      setArticles(r.items);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  useEffect(() => {
+    reload();
+  }, []);
+
+  const save = async (alsoImport: boolean) => {
+    setMsg("");
+    setError("");
+    try {
+      const a = await api.createArticle({
+        title: title.trim(),
+        content,
+        domain_id: domainId || null,
+      });
+      setTitle("");
+      setContent("");
+      setMsg(`✅ Article "${a.title}" saved.`);
+      await reload();
+      if (alsoImport) {
+        const r = await api.importArticleToRepo(a.id);
+        setMsg(`✅ Article saved & imported ${r.chunks} chunks into the query repository.`);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const remove = async (id: string) => {
+    setError("");
+    try {
+      await api.deleteArticle(id);
+      await reload();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const importOne = async (id: string) => {
+    setError("");
+    setImportingId(id);
+    try {
+      const r = await api.importArticleToRepo(id);
+      setMsg(`✅ Imported ${r.chunks} chunks into the query repository.`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setImportingId(null);
+    }
+  };
+
+  return (
+    <div className="panel">
+      <h3 style={{ marginTop: 0 }}>Articles (Query Repository)</h3>
+      <p className="muted">Write study articles; import them into the unified RAG search repo.</p>
+      <div className="field">
+        <label className="field-label">Title</label>
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="e.g. The Water Cycle"
+        />
+      </div>
+      <div className="field">
+        <label className="field-label">Content</label>
+        <textarea value={content} onChange={(e) => setContent(e.target.value)} style={{ minHeight: 160 }} />
+      </div>
+      <div className="row" style={{ marginBottom: 8 }}>
+        <span className="muted">Domain (optional):</span>
+        <DomainSelect domains={domains} value={domainId} onChange={setDomainId} />
+      </div>
+      <button onClick={() => save(false)} disabled={!title.trim() || !content.trim()}>
+        💾 Save Article
+      </button>{" "}
+      <button
+        onClick={() => save(true)}
+        disabled={!title.trim() || !content.trim() || importingId !== null}
+      >
+        💾 Save & Import to Query Repo
+      </button>
+      {msg && <p className="muted">{msg}</p>}
+      {error && <p className="error">{error}</p>}
+
+      {articles.length > 0 ? (
+        <table className="table" style={{ marginTop: 12 }}>
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Preview</th>
+              <th>Created</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {articles.map((a) => (
+              <tr key={a.id}>
+                <td>{a.title}</td>
+                <td className="muted">{a.content.slice(0, 80)}…</td>
+                <td className="muted">{new Date(a.created_at).toLocaleString()}</td>
+                <td>
+                  <button onClick={() => importOne(a.id)} disabled={importingId !== null}>
+                    {importingId === a.id ? "Importing…" : "Import to Query Repo"}
+                  </button>{" "}
+                  <button onClick={() => remove(a.id)}>Delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <p className="muted" style={{ marginTop: 12 }}>No articles yet.</p>
+      )}
     </div>
   );
 }

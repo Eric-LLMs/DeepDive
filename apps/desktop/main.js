@@ -767,9 +767,18 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
     },
   });
-  // Surface renderer console output / load failures in the main-process log.
+  // Surface renderer console output / load failures in the main-process log, and
+  // mirror the [imported] diagnostics to a file the dev can inspect after a run.
   win.webContents.on("console-message", (_e, level, message, line, sourceId) => {
     console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`);
+    if (String(message).includes("[imported]")) {
+      try {
+        fs.appendFileSync(
+          path.join(__dirname, "..", "..", "data", "desktop_console.log"),
+          `${new Date().toISOString()} [renderer:${level}] ${message}\n`
+        );
+      } catch { /* non-fatal */ }
+    }
   });
   win.webContents.on("did-fail-load", (_e, code, desc, url) => {
     console.error(`[renderer] did-fail-load ${code} ${desc} ${url}`);

@@ -317,6 +317,66 @@ class ChatTestRequest(BaseModel):
     message: str = "你好,请简单回复 OK"
 
 
+class RagConfigUpdateRequest(BaseModel):
+    """Wholesale pipeline config blob; validated server-side against the node registry."""
+
+    config: dict = {}
+
+
+class RagTestRequest(BaseModel):
+    """Run the configured pipeline and return the per-node trace."""
+
+    query: str = ""
+    top_k: int = 5
+    domain_id: str | None = None
+
+
+class RagChunkPreviewRequest(BaseModel):
+    """Preview chunking / enrichment for a text sample without persisting anything."""
+
+    strategy: str = "fixed"
+    chunk_chars: int = 1200
+    overlap: int = 150
+    text: str = ""
+    cjk: bool = False
+    contextual: bool = False
+
+
+class RagEvalRequest(BaseModel):
+    """Run the golden-set regression and return the metric table."""
+
+    golden_path: str | None = None
+
+
+class LearningImportRequest(BaseModel):
+    """Push Learning-Platform content (sentences / articles) into the query repository."""
+
+    kind: str  # "sentence" | "article"
+    ids: list[str] = []
+
+
+class ArticleCreateRequest(BaseModel):
+    """Create a Learning-Platform article (optionally imported into the query repo)."""
+
+    title: str
+    content: str = ""
+    domain_id: str | None = None
+
+
+class ChatImportRequest(BaseModel):
+    """Import one chat Q&A pair (a user message + its assistant reply) as a repo chunk."""
+
+    session_id: str
+    user_message_id: str
+    assistant_message_id: str
+
+
+class ChatSessionImportRequest(BaseModel):
+    """Import a whole chat session: LLM-groups the Q&A turns into query-repo chunks."""
+
+    session_id: str
+
+
 class RoleCreateRequest(BaseModel):
     """Create a brand-new quota/feature role (mirrors UserRoleModel columns)."""
 

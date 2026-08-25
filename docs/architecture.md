@@ -7,6 +7,67 @@
 > The status tables below mark what runs today versus what is designed-only, so it is clear what
 > to fill in when extending the business.
 
+## Table of Contents
+
+- [Implementation Status](#implementation-status)
+  - [Implemented (runs today)](#implemented-runs-today)
+  - [Designed, not yet implemented](#designed-not-yet-implemented)
+- [1. Product Positioning](#1-product-positioning)
+- [2. Tech Stack](#2-tech-stack)
+- [3. Repository Structure (Monorepo)](#3-repository-structure-monorepo)
+- [4. Layered Architecture (Hexagonal + Capability Seam)](#4-layered-architecture-hexagonal--capability-seam)
+- [5. Agent Module](#5-agent-module)
+  - [5.1 DI state machine — `Context` / `Fiber`](#51-di-state-machine--context--fiber)
+  - [5.2 Agent loop — `ReactLoopAgent`](#52-agent-loop--reactloopagent)
+  - [5.3 System prompt — `CacheBoundaryAssembler` (three-zone, cache-boundary)](#53-system-prompt--cacheboundaryassembler-three-zone-cache-boundary)
+  - [5.4 Memory, skills, sessions](#54-memory-skills-sessions)
+- [6. Tool Runtime](#6-tool-runtime)
+  - [6.1 Typed tool definition — `define_tool`](#61-typed-tool-definition--define_tool)
+  - [6.2 Lifecycle — `ToolRuntime.execute`](#62-lifecycle--toolruntimeexecute)
+  - [6.3 Plugins](#63-plugins)
+  - [6.4 What is deliberately *not* implemented](#64-what-is-deliberately-not-implemented)
+  - [6.5 Deferred loading, permissions & sandbox](#65-deferred-loading-permissions--sandbox)
+- [7. Capability Seam (Definition / Provider / Consumer)](#7-capability-seam-definition--provider--consumer)
+- [8. Distributed Topology](#8-distributed-topology)
+  - [8.1 Async enrichment (job model)](#81-async-enrichment-job-model)
+- [9. Retrieval Service (gRPC)](#9-retrieval-service-grpc)
+- [10. RAG Module (Config-Node Pipeline)](#10-rag-module-config-node-pipeline)
+  - [10.1 Node contract](#101-node-contract)
+  - [10.2 Context blackboard](#102-context-blackboard)
+  - [10.3 Registry](#103-registry)
+  - [10.4 Configuration](#104-configuration)
+  - [10.5 Executor](#105-executor)
+  - [10.6 Nodes](#106-nodes)
+  - [10.7 Ingest side (runtime-configured chunking)](#107-ingest-side-runtime-configured-chunking)
+  - [10.8 Query Repository — multi-source import](#108-query-repository--multi-source-import)
+  - [10.9 Quality regression (P0)](#109-quality-regression-p0)
+  - [10.10 Admin console](#1010-admin-console)
+  - [10.11 Schema](#1011-schema)
+- [11. Feature → Mechanism Map](#11-feature--mechanism-map)
+- [12. Data Model](#12-data-model)
+  - [12.1 Indexes and Retrieval](#121-indexes-and-retrieval)
+  - [12.2 Billing and Logs](#122-billing-and-logs)
+  - [12.3 Implemented auth, RBAC & billing schema](#123-implemented-auth-rbac--billing-schema)
+  - [12.4 Business logic — per-user LLM-key assignment & the disable (Tokens module)](#124-business-logic--per-user-llm-key-assignment--the-disable-tokens-module)
+- [13. Multi-Tenancy and Deployment Strategy](#13-multi-tenancy-and-deployment-strategy)
+- [14. Cloud Drive Module](#14-cloud-drive-module)
+  - [14.1 Database](#141-database)
+  - [14.2 Core logic](#142-core-logic)
+  - [14.3 Permission management](#143-permission-management)
+  - [14.4 REST surface](#144-rest-surface)
+  - [14.5 Frontend](#145-frontend)
+  - [14.6 Configuration](#146-configuration)
+- [15. Desktop Workbench (Electron)](#15-desktop-workbench-electron)
+- [16. Prompt Module](#16-prompt-module)
+  - [16.1 Goals](#161-goals)
+  - [16.2 Three-zone cache-boundary assembly](#162-three-zone-cache-boundary-assembly)
+  - [16.3 Rendering and cache identity](#163-rendering-and-cache-identity)
+  - [16.4 Project context loader](#164-project-context-loader)
+  - [16.5 Compression pipeline](#165-compression-pipeline)
+  - [16.6 Deferred tool loading (defer_loading stubs)](#166-deferred-tool-loading-defer_loading-stubs)
+  - [16.7 Per-step process](#167-per-step-process)
+  - [16.8 Configuration](#168-configuration)
+
 ## Implementation Status
 
 ### Implemented (runs today)
@@ -16,7 +77,8 @@
 | Vocabulary subdomain | domains / terms / sentences / matches / materials / chunks (6 tables) |
 | Hybrid search | pgvector (semantic) + tsvector (keyword) + RRF fusion |
 | Agent runtime | `AgentKernel` composition root: cache-boundary `CacheBoundaryAssembler` (3 zones + `snapshot_key`) + deferred-tool `ToolGateway` + dual-track `MemoryService` (PG tsvector/pgvector RRF) + skill catalog + READ-only `Sandbox`, over `ReactLoopAgent` step loop + plugin `ToolRuntime` |
-| Retrieval | RAG pipeline (rewrite → recall → RRF → rerank); `in_process` default, gRPC service available |
+| Retrieval | config-driven node pipeline (rewrite → recall → RRF → rerank, plus optional parent-expand / CRAG nodes; CJK + contextual + parent-child indexing); `in_process` default, gRPC service available; admin RAG console + golden-set eval (Recall@k / Precision@k / MRR) |
+| Query repository | unified multi-source corpus: cloud-drive files (`source_type='file'`) + Learning-Platform sentences/articles (`'learning'`) + chat Q&A pairs / LLM-grouped whole-session imports (`'chat'`); `chunks.asset_id` nullable + `source_type`/`source_id`, source-aware recall (both recallers `LEFT JOIN assets`); PDF tool chain (body text + tables rendered to PNG → vision LLM, per-table skip on failure); admin RAG → **Repository** tab lists non-file chunks with delete |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
 | Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs` |
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
@@ -24,9 +86,9 @@
 | Chat | agent loop with tool use, SSE streaming |
 | Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload) |
 | Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover. The Tokens page disables a user's access to a key per (user, channel); a user with no usable key degrades to the anonymous tier (guest quota) instead of losing login |
-| Admin console | single-file SPA at `/admin` with 5 modules (Providers / Roles / Users / Tokens / **Tools config**): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint). The **Tools config** module edits the generic `tools` namespace (web-search provider, SMTP, free-form key/value params) with a one-click *Test email*; the Chat Test user picker is a fuzzy-autocomplete text box |
+| Admin console | single-file SPA at `/admin` with 5 modules (Providers / Roles / Users / Tokens / **Tools config**): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint). The **Tools config** module edits the generic `tools` namespace (web-search provider, SMTP, free-form key/value params) with a one-click *Test email*; the Chat Test user picker is a fuzzy-autocomplete text box; a **RAG** module adds live pipeline testing (per-node trace), chunking preview, node-topology editing, and golden-set eval |
 | Billing | `llm_models` (per-1k pricing) + `user_wallets` + `wallet_transactions` + `llm_credentials` + `credential_models`; cost calc + atomic wallet deduct |
-| Settings in DB | `app_settings` key/value JSONB (admin credential + LLM provider config + tiers + the generic `tools` namespace for web search / SMTP), written by the admin console |
+| Settings in DB | `app_settings` key/value JSONB (admin credential + LLM provider config + tiers + the generic `tools` namespace for web search / SMTP + the `rag` pipeline config), written by the admin console |
 | Cloud drive | per-user My Drive + shared workspaces: `global_objects` (SHA-256 dedup, ref-counted physical store) + logical `assets` + first-class `folders` (per scope) + `workspace_members` roles + `asset_acl` sharing + chunked `upload_sessions` + RAG `chunks` + no-FK `workspace_activity` audit; trash with 30-day lazy retention; roles owner > admin > editor > viewer; **text-note editing** (`GET/PUT /files/{id}/content` — read/in-place overwrite with re-dedup + RAG re-index), **collision-safe naming** (`name (1)` auto-suffix across files+folders), and **personal-scope `user_id` filtering** on every My Drive folder/asset operation; full file manager with an in-page Markdown note editor in the web console (see §14) |
 | Guest access | anonymous chat via the `anonymous` role's channels, with per-day Redis limit (`guest_daily_limit`), 429 → prompt login |
 
@@ -34,11 +96,11 @@
 
 | Area | Gap |
 |----|------|
-| Multi-tenancy isolation | PostgreSQL RLS not enabled (app-level isolation by `user_id` only) |
 | Subscriptions | recurring plan billing not created (pay-as-you-go wallet exists) |
 | Observability | audit_logs / ai_call_logs / activity_logs / job_logs not created |
 | Video / document learning | media → chunks pipeline (ingestion / transcription / chunking) designed only |
 | Reranking | in-process cross-encoder exists but disabled (`reranker_model` empty); TEI reranker not wired |
+| GraphRAG node | graph-of-communities `graph_rag` node (LLM entity/relation extraction → community summaries → global/local search) designed only, see §10.6 |
 | Edge gateway | Traefik skeleton only; dev runs FastAPI directly on the host |
 
 ## 1. Product Positioning
@@ -65,7 +127,7 @@ DeepDive is an "AI learning workbench" unified by a single abstraction:
 | LLM gateway | LiteLLM Proxy | legacy default client; pinned channels call their provider directly (`llm_credentials.base_url` + `api_key`) |
 | Embedding | BGE-M3 (dim 1024) via TEI | multilingual, moderate dim |
 | Reranking | BGE-reranker cross-encoder | post-recall precision |
-| Retrieval (RAG) | query rewrite → pgvector + tsvector recall → RRF fusion → rerank | hybrid keyword + semantic search |
+| Retrieval (RAG) | config-driven node pipeline: query rewrite → pgvector + tsvector recall → RRF fusion → rerank, plus optional parent-expand / CRAG nodes | hybrid keyword + semantic search; CJK queries segmented with jieba; topology + params editable live in the admin console |
 | Agent | `AgentKernel` (cache-boundary prompt + deferred tool loading + dual-track memory + sandbox) over `ReactLoopAgent` + plugin `ToolRuntime` | controllable, testable, plugin-based |
 | MCP | FastMCP | optional external exposure of the tool runtime (`core/infrastructure/mcp.py`) |
 | Speech | STT: faster-whisper / Whisper API; TTS: local Kokoro-82M | |
@@ -81,7 +143,7 @@ deepdive/
 │   ├── api/                      # package `api` (FastAPI gateway: REST/SSE + job enqueue)
 │   │   ├── main.py               # uvicorn apps.api.main:app (REST/SSE endpoints + GET /jobs/{id})
 │   │   ├── auth.py               # opaque-token auth (require_admin / require_user + stateless console session signing)
-│   │   ├── admin/                # admin console SPA (single-file index.html: Providers / Roles / Users / Tokens)
+│   │   ├── admin/                # admin console SPA (single-file index.html: Providers / Roles / Users / Tokens / Tools / RAG)
 │   │   ├── deps.py               # DI assembly (capability seam + agent kernel wiring + plugins)
 │   │   ├── tools/                # gateway tools, auto-discovered by `_tool.py` modules (rag_search / translate / web_search)
 │   │   └── schemas.py            # Pydantic request/response models
@@ -107,7 +169,17 @@ deepdive/
 │   │   ├── loop.py               # ReactLoopAgent step loop (gateway-aware, per-step dynamic diff)
 │   │   ├── runtime.py            # ToolRuntime lifecycle (pre-execute → guard → execute → post-execute)
 │   │   └── plugins/              # plugin manager + built-in tool_audit
-│   ├── rag/                      # package `rag`: retrieval DAG + build_pipeline factory
+│   ├── rag/                      # package `rag`: config-driven retrieval pipeline
+│   │   ├── pipeline.py           # executor: enabled-node list = topology; degrade, never stop
+│   │   ├── nodes/                # pluggable pipeline nodes (one file per stage)
+│   │   ├── registry.py           # node registry (name → class, X-macro registration)
+│   │   ├── context.py            # PipelineContext blackboard + NodeTrace
+│   │   ├── pipeline_config.py    # RagPipelineConfig / NodeConfig / ChunkingConfig
+│   │   ├── config_store.py       # app_settings["rag"] persistence + validation + cache
+│   │   ├── eval.py               # golden-set regression (Recall@k / Precision@k / MRR)
+│   │   ├── cjk.py                # jieba segmentation for the CJK keyword channel
+│   │   ├── recall/               # VectorRecaller (pgvector) + KeywordRecaller (tsvector / CJK)
+│   │   └── rank/                 # rrf_fusion + CrossEncoderReranker
 │   ├── core/                     # package `core`: config + domain/application/ports/infrastructure
 │   │   ├── infrastructure/mailer.py            # stdlib smtplib emailer (verification / reset / test)
 │   │   └── infrastructure/memory_retrieval.py  # PG tsvector + pgvector session-recall channels
@@ -530,19 +602,235 @@ message SearchHit { string id = 1; string text = 2; double score = 3; string met
 - `core/infrastructure/retrieval_grpc.py` (`GrpcRetriever`) maps proto `SearchHit` back to dicts.
 - Codegen: `scripts/gen_proto.sh` (buf if present, else `grpc_tools.protoc`) → `packages/shared/proto/retrieval/v1/`.
 
-## 10. RAG Module (Config-Node DAG)
+## 10. RAG Module (Config-Node Pipeline)
 
-Retrieval is a deterministic DAG (declarative node order + parameters), each node independently togglable:
+Retrieval is a **config-driven node pipeline**: the enabled node list *is* the topology. Each stage
+is a `Node` running against a shared `PipelineContext` blackboard; the executor creates nodes from
+the configured name list, runs them in order, records a per-node trace, and **degrades rather than
+stops** — one node failing appends an error and the pipeline continues downstream.
 
-```
-rewrite → multi-recall → RRF fusion → rerank
-```
+### 10.1 Node contract
 
-- **rewrite** `query_rewrite.py`: multi-query expansion + HyDE (LLM JSON with code-fence fallback).
-- **recall** `recall/`: `VectorRecaller` (pgvector cosine) + `KeywordRecaller` (tsvector FTS).
-- **fusion** `rank/rrf.py`: Reciprocal Rank Fusion (k=60).
-- **rerank** `rank/cross_encoder.py`: BGE-reranker, lazy-loaded, `asyncio.to_thread`.
-- **orchestration** `pipeline.py`: `RAGPipeline.retrieve(query, top_k, filters)`.
+The node contract lives in `rag/nodes/base.py`:
+
+- `NodeStatus` — `OK` / `FAIL` / `SKIP` (`FAIL` records an error, the pipeline keeps going).
+- `Node(name, display_name, stage, params_schema, run(ctx, deps) -> NodeStatus)`. `params_schema` is
+  a JSON Schema that drives the admin-console node form; `deps` carries pipeline-level dependencies
+  so a node is constructible from a name + params alone.
+
+### 10.2 Context blackboard
+
+The blackboard lives in `rag/context.py`:
+
+`PipelineContext` carries the `request` (query / top_k / filters), a typed `store` dict for stage
+artifacts (`variants`, `rankings`, `fused`, `hits`, `quality`, …), a per-node `trace`
+(`name / status / ms / out`), and an `errors` list. `set_out` / `get_out` let a node publish a
+human-readable summary of what it produced for the console.
+
+### 10.3 Registry
+
+The registry lives in `rag/registry.py`:
+
+Name → class map with X-macro single-point registration (`registry._import_and_register`).
+**Registering a node = one file in `rag/nodes/` + one line in the registrar.** Unknown names are
+rejected at config-validation time, so a typo cannot silently produce a no-op pipeline.
+
+### 10.4 Configuration
+
+The config model and its persistence live in `rag/pipeline_config.py` and `rag/config_store.py`:
+
+- `RagPipelineConfig` = `nodes: list[NodeConfig]` (name / enabled / params) + `chunking`
+  (strategy / chunk_chars / overlap) + flags `contextual` / `parent_child` / `cjk`.
+- Stored as the `app_settings["rag"]` JSON blob; env settings seed the defaults on first boot.
+  `config_store` validates against the registry + param schemas and caches the result in-process.
+  Saving a new config clears the API's retriever lru_cache, so the next retrieval is built from the
+  new topology — **no restart**.
+
+### 10.5 Executor
+
+The executor lives in `rag/pipeline.py`:
+
+`RAGPipeline.retrieve(query, top_k, filters)` keeps the pre-refactor contract (returns
+`[{id, text, score, meta}]`) and runs every enabled node in order. Per-node failure degrades
+(rewrite / HyDE failure falls back to the original query) and downstream still runs; if *every*
+ranking channel fails it raises `RetrievalUnavailable` so the `rag_search` tool surfaces the
+"answer from knowledge" notice instead of a silent empty. The admin console uses `RAGPipeline.trace()`
+to read hits + per-node trace + errors.
+
+### 10.6 Nodes
+
+Default topology (behavior-identical to the pre-refactor DAG):
+
+| node | file | what it does |
+|---|---|---|
+| `query_rewrite` | `nodes/query_rewrite.py` | multi-query variants + HyDE via `QueryRewriter`; falls back to the original query on LLM failure |
+| `vector_recall` | `nodes/vector_recall.py` | embeds each variant / HyDE doc, pgvector cosine over `leaf` chunks, tenant- + domain-filtered |
+| `keyword_recall` | `nodes/keyword_recall.py` | tsvector FTS; a CJK query is jieba-segmented and matched against `content_search` via `to_tsvector('simple', …)` |
+| `rrf_fusion` | `nodes/rrf_fusion.py` | Reciprocal Rank Fusion (k=60) over all ranking channels |
+| `cross_encoder` | `nodes/cross_encoder.py` | BGE-reranker (lazy, `asyncio.to_thread`); SKIPs while `model_name` is empty |
+
+Optional nodes:
+
+| node | file | what it does |
+|---|---|---|
+| `parent_expand` | `nodes/parent_expand.py` | small-to-big: leaf hit → parent-chunk text; sibling leaves deduped by `parent_chunk_id`, ordered by first-leaf position |
+| `crg_check` | `nodes/crg_check.py` | simplified CRAG: LLM judges relevant / ambiguous / irrelevant; drops hits judged irrelevant |
+
+**parent_child / parent_expand — an input/output pair, configured in different places.** They are two
+*independent* knobs, not one flag. The **input** side is the top-level config flag `parent_child`
+(`RagPipelineConfig.parent_child`, persisted in `app_settings["rag"]["parent_child"]`, toggled under
+admin **RAG → Nodes → Chunking & enrichment**): when on, `build_chunks` calls `split_hierarchy`
+(`core/infrastructure/ingest.py`) to write parent + leaf chunks, and recall searches leaves only. The
+**output** side is the `parent_expand` node in the pipeline node list: when present *and* enabled it
+replaces each leaf hit with its parent chunk's text; there is no boolean parameter — the executor's
+`enabled_nodes` filter (`rag/pipeline_config.py`) is what the row's enable switch / Remove toggles.
+Combinations: `parent_child=off` + `parent_expand=on` is a pass-through (no parents exist to expand);
+`parent_child=on` + `parent_expand=off` returns narrow leaf text; both on gives the full small-to-big
+flow.
+
+**Planned (designed, not yet implemented)** — `graph_rag`: a graph-of-communities node over the query
+repository. Per chunk, an LLM extracts entities + relations; a co-occurrence graph is built, community
+detection groups related chunks, and community summaries are written. Recall then runs two tracks: the
+existing chunk-level search above, plus a graph track answering global questions from community
+summaries (global / local search). It registers the same way as any node (one file in `rag/nodes/` +
+one line in the registrar) and its params ride in `app_settings["rag"]` like every other node.
+
+**Fusion vs. rerank** — `rrf_fusion` and `cross_encoder` solve *different* stages of ranking and are
+not redundant. RRF is **rank-only fusion**: it never reads content, it aggregates the rank position of
+every document across all recall channels via `score = Σ 1/(k + rank + 1)` (k=60), which lets vector
+cosine and `ts_rank` scores of different scales fuse fairly. `cross_encoder` is **content-based
+rerank**: it discards the RRF ordering and the stored chunk embedding, reconstructs a `(query, hit)`
+pair for every candidate, and runs it through the BGE cross-encoder (query + doc concatenated through
+one transformer) to get a relevance score, then re-sorts by that new score — it can overturn the RRF
+order entirely. Because the cross-encoder reads real text interaction, it corrects "embedding-similar
+but semantically unrelated" false positives that a pure rank fusion cannot see.
+
+**Candidate count flow** — `vector_recall` / `keyword_recall` each fetch `top_k × 2` hits (the `×2`
+headroom is for the fusion + rerank stages to cut half of it away). `rrf_fusion` merges and dedups the
+full set — it does **not** truncate. `cross_encoder` (when `model_name` is configured) reranks all of
+them. The only truncation point is the executor's final `ctx.final_hits()[:top_k]`.
+
+**Hard dependency — do not remove `rrf_fusion` from the default topology.** The recall nodes only append
+to `ctx["rankings"]`; they never write `ctx["hits"]`. `rrf_fusion` is the *only* default node that
+produces `hits`, so removing it silently returns an empty result: every recall channel succeeds,
+`rankings` is non-empty (so `RetrievalUnavailable` is *not* raised — that guard fires only when
+rankings are entirely absent), and the executor returns `[]`. The minimal viable pipeline is
+`vector_recall → rrf_fusion` (or `keyword_recall → rrf_fusion`); at least one fusion/rerank node that
+writes `ctx["hits"]` must remain.
+
+The `rag_search` tool's optional `domain` argument maps to `filters["domain_id"]` (→
+`assets.domain_id`).
+
+### 10.7 Ingest side (runtime-configured chunking)
+
+The chunking + enrichment pipeline lives in `core/infrastructure/ingest.py`. `asset_ingest` reads the
+current `RagPipelineConfig` at job time, so a chunking / enrichment config
+change takes effect on the next `POST /admin/rag/reindex` (re-ingests every READY asset):
+
+- **Strategies** — `fixed` (sliding window), `paragraph` (blank-line groups merged), `sentence`
+  (sentence-boundary merge), `semantic` (embedding breakpoints; interface reserved).
+- **Contextual enrichment** — each chunk gets an LLM-generated 50–100 token context prefix
+  (`content_en = context + "\n" + raw`, raw kept in `meta["raw"]`); `asyncio.Semaphore(8)` bounds
+  concurrency, and the raw chunk is kept on any LLM failure.
+- **Parent/child indexing** — `split_hierarchy` emits parent chunks (`chunk_kind='parent'`) plus
+  leaf chunks (`chunk_kind='leaf'`, `parent_chunk_id` → parent; parent ids are client-side UUIDs
+  assigned before insert). Parents are embedded too; recall searches `leaf` only.
+- **CJK keywords** — `rag/cjk.py` lazily loads jieba; segmented tokens are stored in
+  `chunks.content_search` and matched with `to_tsvector('simple', content_search) @@
+  plainto_tsquery('simple', <segmented query>)` (GIN-indexed). English queries keep the original
+  `english` FTS path unchanged.
+
+### 10.8 Query Repository — multi-source import
+
+The **query repository** is the unified retrieval corpus: the existing `chunks` table, extended so
+content can arrive from three entries instead of only cloud-drive files. Recall is
+**source-aware** — one query searches file, learning, and chat content together, still tenant-scoped.
+
+**Schema** (migration `0011_query_repository.sql`): `chunks.asset_id` is now nullable; two new columns
+`source_type TEXT NOT NULL DEFAULT 'file'` (`file` / `learning` / `chat`) and `source_id TEXT NULL`
+(article id, sentence id, or chat session / Q&A id) tag non-file content, indexed by
+`chunks_source_idx`. A new `articles` table (user / domain / title / content) backs the Learning-Platform
+article entity. Non-file chunks store the importing owner in `user_id` and leave `workspace_id` NULL —
+the owner is the visibility boundary (sharing / domain filters for learning/chat chunks are out of scope
+for now).
+
+**Import entries:**
+
+| entry | UI trigger | processing logic | result |
+|---|---|---|---|
+| Cloud Drive | file row **＋ 加入查询仓库** (`POST /files/{id}/import-rag`) | worker `asset_ingest` → `extract_document_text` dispatch; `.pdf` runs the PDF tool chain | `source_type='file'`, `asset_id` set |
+| Learning Platform | Import Data → sentence checkboxes / *Articles & Query Repo* (`POST /learning/import`, `POST /learning/articles/{id}/import`) | worker `learning_import` (batch) or the API (single article) reads rows → `build_chunks` → embed → insert | `source_type='learning'`, `source_id=<id>` |
+| Chat (single pair) | desktop reply **📥 Import Repo** (`POST /chat/import`) | API binds the assistant reply to its preceding user question, `build_chunks` the Q&A text | `source_type='chat'`, `source_id=<user_message_id>` |
+| Chat (whole session) | desktop header **📥** (`POST /chat/import-session`) | worker `chat_session_import` → LLM `_segment_chat` groups turns (same question across turns merges; distinct questions split), default per-turn grouping on failure | `source_type='chat'`, `source_id=<session_id>` |
+
+**Persistent import state** — `GET /chat/imported?session_id=` reports which Q&A pairs of a session are
+already in the repo (`qa_source_ids`, keyed by the user-message id) and whether the whole session was
+imported (`session_imported`). The desktop fetches it on session load — before rendering buttons — so an
+already-imported pair/session renders its **📥** as a disabled **✓ Imported**, surviving session switches
+and app restarts; a click-time re-check on the same endpoint prevents re-importing a pair already in the repo.
+
+**PDF tool chain** — processing is extracted into **tools** (the admin can toggle them like any tool)
+wrapping pure functions in `core/infrastructure/pdf.py`:
+
+1. `page.get_text("text")` extracts the body text page by page (PyMuPDF).
+2. `page.find_tables()` detects tables (no torch / Table-Transformer); each table's bounding box is
+   rendered to a PNG (`get_pixmap(clip=bbox)`).
+3. Each table PNG goes to the vision LLM as an `image_url` content part (`OpenAILLM.chat` passes it
+   through to any vision-capable model, e.g. `gpt-4o-mini`) → transcribed text. A per-table failure
+   is logged and skipped — enrichment never fails the ingest.
+
+The tools (`apps/api/tools/pdf_tools.py`: `pdf_extract_text_tool`, `pdf_table_to_text_tool`) resolve
+the asset's bytes via `ctx.resolve("storage")` / `ctx.resolve("session_factory")`; the worker calls the
+shared `extract_pdf_document` directly (same function body). `.docx` extracts paragraphs + table cells
+via `python-docx`; `.txt`/`.md`/subtitles use the existing `extract_text` dispatch.
+
+**Recall visibility** — both recallers `LEFT JOIN assets` instead of `JOIN`:
+
+- `keyword_recall` / `vector_recall`: `AND (c.asset_id IS NULL OR a.file_status = 'READY')`; the
+  domain filter applies only to file chunks (`c.asset_id IS NOT NULL AND a.domain_id = …`).
+- Tenant isolation (`asset_visibility_sql`) already keys off `c.user_id` / `c.workspace_id`, so
+  non-file chunks are visible to their owner automatically.
+- `chunk_kind='leaf'` filtering is unchanged; parent/child, contextual, and CJK enrichment apply to
+  every source identically (they operate on `Chunk` objects before insert).
+
+**Idempotency** — every non-file import deletes the source's existing chunks first
+(`delete_by_source`) then re-inserts, so re-importing after a config change or a partial failure is safe.
+
+**Verification** — admin console **RAG → Repository** tab lists every non-file chunk (source badge,
+title from `meta`, per-chunk delete via `DELETE /admin/rag/repository/{chunk_id}`); the **Test** tab
+searches across all three sources; **Eval** runs the golden-set regression unchanged. Config flow
+(Nodes / Chunking) is source-agnostic — it governs how any text is chunked.
+
+### 10.9 Quality regression (P0)
+
+The eval engine lives in `rag/eval.py`. Golden cases (`data/eval/golden.json`) pin a query to the
+**asset ids** that should surface.
+`run_golden_set(pipeline_factory, golden_path, top_k)` runs every case through one pipeline and
+scores asset-level **Recall@k / Precision@k / MRR** — asset-level expectations make the metrics
+insensitive to chunk-boundary changes. Driven by the admin **Eval** tab or `scripts/eval_rag.py`
+(prints a table, writes `data/eval/results/<ts>.json`).
+
+### 10.10 Admin console
+
+The endpoints live in `apps/api/main.py`; the console page in `apps/api/admin/index.html`. Six
+`/admin/rag/*` endpoints (all `require_admin`) sit behind the **RAG** module's four tabs:
+
+| endpoint | tab | purpose |
+|---|---|---|
+| `GET/POST /admin/rag/config` | Nodes | read / validate + persist the pipeline config; POST clears the retriever cache |
+| `POST /admin/rag/test` | Test | run the configured pipeline → hits + per-node trace |
+| `POST /admin/rag/chunk-preview` | Chunking | split a pasted text with a strategy (+ CJK / contextual), no DB writes |
+| `POST /admin/rag/eval` | Eval | run the golden-set regression → metric table |
+| `POST /admin/rag/reindex` | Nodes | re-ingest every READY asset under the current chunking config |
+
+### 10.11 Schema
+
+Defined in migration `0010_rag_pipeline.sql`:
+
+`assets.domain_id UUID NULL REFERENCES domains(id) ON DELETE SET NULL` (+ `assets_domain_idx`);
+`chunks.parent_chunk_id` (FK → `chunks.id` ON DELETE SET NULL), `chunks.chunk_kind` (default
+`'leaf'`), `chunks.content_search TEXT NULL`; indexes on `parent_chunk_id` and GIN on
+`to_tsvector('simple', content_search)`.
 
 ## 11. Feature → Mechanism Map
 
@@ -564,6 +852,8 @@ rewrite → multi-recall → RRF fusion → rerank
 | Gate a tool by session permission | `Sandbox.guard()` + `ToolPermission` (`classify_permissions`) |
 | Recall / write memory as a tool | `memory_search` / `memory_save` (guardrailed, READ-classified; importance + supersede) |
 | Lazy-load a skill body | `skill` meta-tool over `SkillCatalog.render()` compressed index |
+| Reconfigure retrieval at runtime | `app_settings["rag"]` + `rag.config_store` (validated against the registry, cached; a save clears the retriever lru_cache) |
+| Measure retrieval quality | `rag.eval` golden-set regression (asset-level Recall@k / Precision@k / MRR); admin **Eval** tab or `scripts/eval_rag.py` |
 
 ## 12. Data Model
 
@@ -574,9 +864,10 @@ rewrite → multi-recall → RRF fusion → rerank
 > earlier design names (`conversations`, `job_logs` …). `migrations/0001_init.sql` is the single
 > consolidated base schema (the squash of the original 0001–0008 development migrations; every
 > statement is idempotent). On top of it, the incremental migrations `0002_auth_profiles.sql` …
-> `0009_session_title.sql` layer later changes (self-service accounts + `verification_tokens`,
+> `0011_query_repository.sql` layer later changes (self-service accounts + `verification_tokens`,
 > usage-log channel, cloud-drive objects, vocabulary isolation, folders, workspace activity,
-> memory-retention index, session title). All are applied in filename order by `init_db()`.
+> memory-retention index, session title, RAG pipeline columns, and the multi-source query
+> repository). All are applied in filename order by `init_db()`.
 
 The core learning + chat tables that run today (`migrations/0001_init.sql`):
 
@@ -585,7 +876,14 @@ The core learning + chat tables that run today (`migrations/0001_init.sql`):
 - **users** — `id`, `created_at`; the auth columns are added by the consolidated schema (see §12.3).
 - **terms** — `id`, `domain_id` (FK → `domains`), `word`, `definition`, `frequency`, `star_level`, `audio_hash`, `image_paths` (JSONB), `is_active`.
 - **sentences** — `id`, `domain_id` (FK → `domains`), `origin_source`, `content_en` (unique), `content_cn`, `audio_hash`, `cn_explanation`, `embedding` (vector(1024)).
-- **chunks** — `id`, `material_id` (FK → `materials`), `seq`, `content_en`, `content_cn`, `meta` (JSONB), `embedding` (vector(1024)).
+- **chunks** — the RAG chunk table (added by `0004_drive_objects.sql`): `id`, `asset_id` (FK →
+  `assets` CASCADE, **nullable since `0011`**), denormalized `user_id` / `workspace_id` for filtered
+  recall, `seq`, `content_en`, `content_cn`, `meta` (JSONB), `embedding` (vector(1024), HNSW-indexed).
+  The `0010_rag_pipeline.sql` migration adds `parent_chunk_id` (FK → `chunks.id`, parent/child indexing),
+  `chunk_kind` (`'leaf'` default | `'parent'`), and `content_search` (jieba-segmented CJK keywords,
+  GIN-indexed). The `0011_query_repository.sql` migration makes non-file content first-class:
+  `source_type` (`'file'` default | `'learning'` | `'chat'`, indexed) + `source_id`, and the new
+  `articles` table (user / domain / title / content / created_at) for Learning-Platform study material.
 - **sessions** — `id`, `user_id` (FK → `users`), `title`, `created_at`, `closed_at`, `summary`.
   `title` (`0009_session_title.sql`) is auto-set at creation from the first user message —
   whitespace-normalized and capped at 40 chars — so the sidebar shows a readable name while the
@@ -597,21 +895,25 @@ The core learning + chat tables that run today (`migrations/0001_init.sql`):
 - **jobs** — `id`, `type`, `status`, `payload` (JSONB), `result` (JSONB), `error`, `created_at`, `started_at`, `completed_at`.
 
 Multi-tenancy is carried by `user_id` on `sessions` / `messages` and the auth/billing tables;
-PostgreSQL RLS is the isolation strategy (see §13). Runtime access is via the SQLAlchemy 2.0
+isolation is app-level predicates — `user_id` scoping plus the `visibility` tenant predicate, not RLS (see §13).
+Runtime access is via the SQLAlchemy 2.0
 async models in `packages/core/infrastructure/db.py`.
 
 ### 12.1 Indexes and Retrieval
 
-Hybrid recall is computed in code, not stored in schema:
+Hybrid recall is computed in code over two channels:
 
-- **Keyword (tsvector)** — `to_tsvector('english', …) @@ websearch_to_tsquery` evaluated at query
-  time over `chunks.content_en` / `messages.text` (`packages/rag/recall/keyword.py`,
-  `packages/core/infrastructure/memory_retrieval.py`); no stored tsvector column.
+- **Keyword (tsvector)** — the English path evaluates `to_tsvector('english', …) @@
+  websearch_to_tsquery` at query time over `chunks.content_en` / `messages.text`
+  (`packages/rag/recall/keyword.py`, `packages/core/infrastructure/memory_retrieval.py`). A CJK
+  query is jieba-segmented (`rag/cjk.py`) and matched against the stored `chunks.content_search`
+  column via `to_tsvector('simple', content_search) @@ plainto_tsquery('simple', <segments>)`.
 - **Semantic (pgvector)** — cosine search over the `embedding vector(1024)` columns.
-- **Indexes** — the migrations currently define no explicit FTS / vector index; the design
-  proposes a GIN index on a generated `fts` column and an ivfflat (or HNSW for large data) index
-  on `embedding`. `0008_memory_retention.sql` adds a plain B-tree index on
-  `session_events(timestamp)` so the daily audit-event sweep's range DELETE stays fast.
+- **Indexes** — `0004_drive_objects.sql` adds an HNSW index on `chunks.embedding`;
+  `0010_rag_pipeline.sql` adds a GIN index on `to_tsvector('simple', COALESCE(content_search, ''))`
+  plus B-tree indexes on `chunks.parent_chunk_id` and `assets.domain_id`. `0008_memory_retention.sql`
+  adds a plain B-tree index on `session_events(timestamp)` so the daily audit-event sweep's range
+  DELETE stays fast.
 
 ### 12.2 Billing and Logs
 
@@ -847,7 +1149,7 @@ request-time, and admin-only:
 
 | Scenario | Strategy |
 |------|------|
-| B2C (multi-user) | Shared DB + PostgreSQL RLS row-level isolation |
+| B2C (multi-user) | Shared DB + app-level predicates (`user_id` scoping + `visibility` tenant predicate) |
 | B2B (enterprise) | database-per-tenant |
 | Read scaling | read replicas + pgBouncer connection pool |
 | Edge vs internal | external REST/SSE via Traefik ↔ internal gRPC |
@@ -876,10 +1178,10 @@ Sources: `migrations/0004_drive_objects.sql`, `0006_folders.sql`, `0007_workspac
 | `workspaces` | User-owned group (`owner_id`, `name`). Ownership is **not** a member row. |
 | `workspace_members` | `(workspace_id, user_id)` PK + `role` (`admin` / `editor` / `viewer`). Membership is the sharing mechanism. |
 | `folders` | One row per folder path inside a scope; `workspace_id` NULL = My Drive. `path` is the full `/`-separated relative path (`"English/Vocab"`), so ancestors are implicit — no parent FK. Uniqueness per scope via `folders_unique_ws` (partial) and `folders_unique_personal`. |
-| `assets` | Logical file: `user_id` (owner), nullable `workspace_id`, `object_sha256` → `global_objects`, `name`, `folder_path`, `file_status` (`uploading/processing/ready/deleted`), `rag_status` (`pending/parsing/chunking/embedding/indexed/failed`), `meta` JSONB, `deleted_at`. |
+| `assets` | Logical file: `user_id` (owner), nullable `workspace_id`, `object_sha256` → `global_objects`, `name`, `folder_path`, `file_status` (`uploading/processing/ready/deleted`), `rag_status` (`pending/parsing/chunking/embedding/indexed/failed`), `domain_id` (nullable → `domains`, added by `0010_rag_pipeline.sql`, drives the RAG domain filter), `meta` JSONB, `deleted_at`. |
 | `asset_acl` | Asset-level sharing: `(asset_id, grantee_user_id)` PK; `grantee_user_id` NULL = public link (`asset_acl_public_uniq` unique partial index). `permission` = `read` / `write`. |
 | `upload_sessions` | Chunked-upload state: expected `sha256`, `size`, `chunk_size`, `num_chunks`, `received_chunks` (boolean array) → resumable uploads. |
-| `chunks` | RAG chunks rebuilt with denormalized `asset_id` / `user_id` / `workspace_id` for filtered recall; `embedding vector(1024)` with an HNSW index. |
+| `chunks` | RAG chunks rebuilt with denormalized `asset_id` / `user_id` / `workspace_id` for filtered recall; `embedding vector(1024)` with an HNSW index; `0010_rag_pipeline.sql` adds `parent_chunk_id` + `chunk_kind` (parent/child indexing, recall searches `leaf` only) and `content_search` (jieba-segmented CJK keywords, GIN-indexed). |
 | `workspace_activity` | Audit trail: `workspace_id`, `actor_user_id` / `actor_username`, `action` (e.g. `file.create`, `member.add`), `target_type` / `target_id` / `target_name`, `detail`. **No foreign keys by design** — an entry survives the deletion of the workspace / user it references. |
 
 ### 14.2 Core logic

@@ -45,20 +45,27 @@ class QueryRewriter:
             "relevant passages from a knowledge base. Output ONLY a JSON array of strings."
         )
         prompt = f"Original query: {query}\nGenerate {self.n_variants} alternative search queries."
-        raw = await self.llm.complete(prompt, system)
         try:
+            raw = await self.llm.complete(prompt, system)
             parsed = json.loads(_strip_code_fence(raw))
             variants = [str(q).strip() for q in parsed if isinstance(q, str) and str(q).strip()]
             return variants[: self.n_variants]
         except Exception:
+            # LLM unreachable (gateway 503, timeout, …) or returned unparsable JSON —
+            # never fail the pipeline, just keep the original query.
             return []
 
     async def _hyde(self, query: str) -> str | None:
         """Generate a hypothetical document; returns None on failure (fall back to vectorizing the original query)."""
         system = "You are a helpful assistant. Write a short, factual passage that answers the question."
         prompt = f"Question: {query}\nPassage:"
-        raw = await self.llm.complete(prompt, system)
-        return raw or None
+        try:
+            raw = await self.llm.complete(prompt, system)
+            return raw or None
+        except Exception:
+            # Same degrade as multi-query: a down LLM means "no hypothetical document",
+            # so recall vectorizes the original query.
+            return None
 
 
 def _strip_code_fence(raw: str) -> str:

@@ -280,6 +280,37 @@
       .section-title { font-size: 14px; font-weight: 600; margin: 22px 0 12px; display: flex; align-items: center; gap: 8px; }
       .section-title:first-child { margin-top: 0; }
       .kbd-note { font-size: 12px; color: var(--muted); }
+
+      /* ── RAG node trace ── */
+      .node-trace { border: 1px solid var(--border); border-radius: 8px; margin-top: 8px; overflow: hidden; }
+      .node-trace .trace-head {
+        display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+        background: var(--bg2); border-bottom: 1px solid var(--border);
+      }
+      .trace-ms { margin-left: auto; color: var(--muted); font-size: 12px; font-family: var(--mono); }
+      .node-desc {
+        font-size: 12px; color: var(--muted); background: var(--panel);
+        border-top: 1px solid var(--border); padding: 7px 12px; line-height: 1.45;
+      }
+      .trace-out {
+        margin: 0; padding: 10px 12px; font-family: var(--mono); font-size: 11.5px;
+        color: var(--muted); white-space: pre-wrap; word-break: break-word; line-height: 1.5;
+      }
+      .trace-out.err { color: var(--danger); }
+      .hit-text { max-width: 520px; vertical-align: top; }
+      .hit-text .trace-out { max-height: 240px; overflow-y: auto; }
+      .trace-params {
+        display: block; width: 100%; box-sizing: border-box; resize: vertical;
+        background: var(--panel); border: none; border-top: 1px solid var(--border);
+        color: var(--muted); padding: 8px 12px; font-family: var(--mono); font-size: 11.5px;
+        min-height: 96px;
+      }
+      .trace-params:focus { outline: none; color: var(--text); }
+      .field-hint {
+        font-size: 11.5px; color: var(--muted); background: var(--panel);
+        border-top: 1px solid var(--border); padding: 6px 12px;
+        border-radius: 0 0 8px 8px; line-height: 1.5;
+      }
       .scroll-x { overflow-x: auto; }
 
       /* ── channel picker / relation cards ── */
@@ -416,6 +447,7 @@
             <div class="nav-item" data-page="users">Users</div>
             <div class="nav-item" data-page="tokens">Tokens</div>
             <div class="nav-item" data-page="tools">Tools config</div>
+            <div class="nav-item" data-page="rag">RAG</div>
           </div>
           <div class="content" id="content"></div>
         </div>
@@ -761,6 +793,7 @@
             users: renderUsersPage,
             tokens: renderTokensPage,
             tools: renderToolsPage,
+            rag: renderRagPage,
           };
           (renderers[page] || renderProvidersPage)();
         }
@@ -2799,6 +2832,509 @@
               if (theme === "system") applyTheme("system");
             });
           } catch { /* ignore */ }
+        }
+
+        // ───────────────────────── RAG pipeline console ─────────────────────────
+        let ragTab = "test";
+
+        async function renderRagPage() {
+          content.innerHTML = "";
+          const head = el("div", "page-head");
+          const t = el("div");
+          t.appendChild(el("h2", "", "RAG"));
+          t.appendChild(el("div", "sub", "Config-driven retrieval pipeline: nodes, chunking, live test, and golden-set eval"));
+          head.appendChild(t);
+          content.appendChild(head);
+
+          const tabs = el("div", "tabs");
+          for (const [key, label] of [["test", "Test"], ["chunking", "Chunking"], ["nodes", "Nodes"], ["eval", "Eval"], ["repository", "Repository"]]) {
+            const tab = el("div", "tab" + (ragTab === key ? " active" : ""), label);
+            tab.onclick = () => { ragTab = key; renderRagPage(); };
+            tabs.appendChild(tab);
+          }
+          content.appendChild(tabs);
+
+          const section = el("div");
+          content.appendChild(section);
+          if (ragTab === "test") await renderRagTest(section);
+          else if (ragTab === "chunking") await renderRagChunking(section);
+          else if (ragTab === "nodes") await renderRagNodes(section);
+          else if (ragTab === "repository") await renderRagRepository(section);
+          else await renderRagEval(section);
+        }
+
+        const ragFlag = (label, sw) => {
+          const c = el("label", "cfg-toggle");
+          c.appendChild(sw);
+          c.appendChild(el("span", "", label));
+          return c;
+        };
+
+        // ── Tab 1: live test (per-node trace) ──
+        async function renderRagTest(container) {
+          container.innerHTML = "";
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "bar-title", "Test — run the configured pipeline stage by stage"));
+          card.appendChild(el("div", "kbd-note", "Runs your query through every enabled node in order and shows what each stage produced (status / timing / output). Hits are the final fused and reranked chunks."));
+
+          const query = el("textarea");
+          query.rows = 2;
+          query.placeholder = "e.g. what is attention in transformers";
+          const topK = numInput(5);
+          const domain = textInput("", { placeholder: "optional domain UUID" });
+          const row1 = el("div", "chat-test-row");
+          row1.append(field("Query", query), field("Top-K", topK), field("Domain ID", domain));
+          card.appendChild(row1);
+
+          const run = el("button", "btn primary", "Run pipeline");
+          const res = el("div", "test-res");
+          card.append(run, res);
+          container.appendChild(card);
+          const out = el("div");
+          container.appendChild(out);
+
+          run.onclick = async () => {
+            run.disabled = true;
+            run.textContent = "Running…";
+            res.textContent = "";
+            out.innerHTML = "";
+            const payload = {
+              query: query.value.trim(),
+              top_k: parseInt(topK.value || "5", 10),
+              domain_id: domain.value.trim() || null,
+            };
+            try {
+              const d = await apiFetch("/admin/rag/test", { method: "POST", body: JSON.stringify(payload) });
+              if (!d.ok) {
+                res.textContent = "✗ " + (d.error || "unavailable");
+                res.className = "test-res err";
+                return;
+              }
+              res.textContent = "✓ " + (d.hits || []).length + " hits · " + (d.trace || []).length + " nodes";
+              res.className = "test-res ok";
+
+              const traceCard = el("div", "legacy-card");
+              traceCard.appendChild(el("div", "bar-title", "Node trace"));
+              for (const tr of d.trace || []) {
+                const p = el("div", "node-trace");
+                const h = el("div", "trace-head");
+                h.appendChild(el("span", "cell-main code", tr.name));
+                h.appendChild(badge(tr.status, tr.status === "OK" ? "ok" : tr.status === "SKIP" ? "" : "danger"));
+                h.appendChild(el("span", "trace-ms", tr.ms != null ? tr.ms + " ms" : ""));
+                p.appendChild(h);
+                if (tr.out !== undefined && tr.out !== null && tr.out !== "") {
+                  const outText = (typeof tr.out === "object")
+                    ? JSON.stringify(tr.out, null, 2)
+                    : String(tr.out);
+                  p.appendChild(el("pre", "trace-out", outText));
+                }
+                traceCard.appendChild(p);
+              }
+              out.appendChild(traceCard);
+
+              if ((d.errors || []).length) {
+                const errCard = el("div", "legacy-card");
+                errCard.appendChild(el("div", "bar-title", "Errors"));
+                for (const e of d.errors) errCard.appendChild(el("div", "trace-out err", e));
+                out.appendChild(errCard);
+              }
+
+              const hitsCard = el("div", "legacy-card");
+              hitsCard.appendChild(el("div", "bar-title", "Hits (final top-" + (d.hits || []).length + ")"));
+              if (!(d.hits || []).length) {
+                hitsCard.appendChild(emptyState("No hits — check node errors above."));
+              } else {
+                const { wrap, tbody } = table(["#", "score", "asset", "text"]);
+                (d.hits || []).forEach((hit, i) => {
+                  const tr = el("tr");
+                  tr.appendChild(td(String(i + 1)));
+                  tr.appendChild(td(hit.score != null ? hit.score.toFixed(4) : "—"));
+                  tr.appendChild(td((hit.meta && hit.meta.asset_id) || "—"));
+                  // Show the full hit text (scrollable cell) so a test result reads the
+                  // whole chunk — truncating to 180 chars made long replies look empty.
+                  const cell = el("td", "hit-text");
+                  const pre = el("pre", "trace-out");
+                  pre.textContent = String(hit.text || "");
+                  cell.appendChild(pre);
+                  tr.appendChild(cell);
+                  tbody.appendChild(tr);
+                });
+                hitsCard.appendChild(wrap);
+              }
+              out.appendChild(hitsCard);
+            } catch (e) {
+              res.textContent = "✗ " + e.message;
+              res.className = "test-res err";
+            }
+            run.disabled = false;
+            run.textContent = "Run pipeline";
+          };
+        }
+
+        // ── Tab 2: chunking preview ──
+        async function renderRagChunking(container) {
+          container.innerHTML = "";
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "bar-title", "Chunking preview"));
+          card.appendChild(el("div", "kbd-note", "Preview how a strategy splits text — optionally with CJK keyword segmentation and contextual prefixes. Nothing is written to the database."));
+
+          const stratSel = select([
+            { value: "fixed", label: "fixed — sliding window" },
+            { value: "paragraph", label: "paragraph — by blank line" },
+            { value: "sentence", label: "sentence — by sentence boundary" },
+            { value: "semantic", label: "semantic — embedding breakpoints" },
+          ], "fixed");
+          const chars = numInput(1200);
+          const overlap = numInput(150);
+          const row1 = el("div", "chat-test-row");
+          row1.append(field("Strategy", stratSel), field("Chunk chars", chars), field("Overlap", overlap));
+          card.appendChild(row1);
+
+          const cjkSw = switchToggle(false);
+          const ctxSw = switchToggle(false);
+          const flagRow = el("div", "cfg-row");
+          flagRow.append(ragFlag("CJK segmentation", cjkSw), ragFlag("Contextual prefixes", ctxSw));
+          card.appendChild(flagRow);
+
+          const text = el("textarea");
+          text.rows = 8;
+          text.placeholder = "Paste sample text to chunk…";
+          card.appendChild(field("Text", text));
+
+          const run = el("button", "btn primary", "Preview chunks");
+          card.appendChild(run);
+          container.appendChild(card);
+          const out = el("div");
+          container.appendChild(out);
+
+          run.onclick = async () => {
+            run.disabled = true;
+            run.textContent = "Splitting…";
+            out.innerHTML = "";
+            const payload = {
+              strategy: stratSel.value,
+              chunk_chars: parseInt(chars.value || "1200", 10),
+              overlap: parseInt(overlap.value || "150", 10),
+              text: text.value,
+              cjk: cjkSw.classList.contains("on"),
+              contextual: ctxSw.classList.contains("on"),
+            };
+            try {
+              const d = await apiFetch("/admin/rag/chunk-preview", { method: "POST", body: JSON.stringify(payload) });
+              const chunks = d.chunks || [];
+              const resCard = el("div", "legacy-card");
+              resCard.appendChild(el("div", "bar-title", chunks.length + " chunks"));
+              if (!chunks.length) {
+                resCard.appendChild(emptyState("No chunks produced."));
+              }
+              chunks.forEach((c, i) => {
+                const blk = el("div", "node-trace");
+                const h = el("div", "trace-head");
+                h.appendChild(el("span", "cell-main code", "chunk " + (i + 1)));
+                if (c.search) h.appendChild(el("span", "mini-chip", "CJK keywords"));
+                if (c.context) h.appendChild(badge("context", "accent"));
+                blk.appendChild(h);
+                if (c.context) blk.appendChild(el("div", "trace-out", "CONTEXT: " + c.context));
+                blk.appendChild(el("div", "trace-out", c.text));
+                if (c.search) blk.appendChild(el("div", "trace-out", "segments: " + c.search));
+                resCard.appendChild(blk);
+              });
+              out.appendChild(resCard);
+            } catch (e) {
+              out.appendChild(errBox(e));
+            }
+            run.disabled = false;
+            run.textContent = "Preview chunks";
+          };
+        }
+
+        // ── Tab 3: pipeline config (node list IS the topology) ──
+        async function renderRagNodes(container) {
+          container.innerHTML = '<div class="loading">Loading…</div>';
+          let data;
+          try {
+            data = await apiFetch("/admin/rag/config");
+          } catch (e) { container.innerHTML = ""; container.appendChild(errBox(e)); return; }
+          container.innerHTML = "";
+
+          const cfg = data.config || { nodes: [], chunking: {}, contextual: false, parent_child: false, cjk: false };
+          const available = data.available_nodes || [];
+          const metaByName = {};
+          for (const m of available) metaByName[m.name] = m;
+
+          // If no node list is stored (or it was saved empty), fall back to the
+          // default order so the topology stays visible instead of collapsing to
+          // a bare "Add node…" dropdown.
+          if (!cfg.nodes || cfg.nodes.length === 0) {
+            cfg.nodes = [
+              { name: "query_rewrite", enabled: true, params: {} },
+              { name: "vector_recall", enabled: true, params: {} },
+              { name: "keyword_recall", enabled: true, params: {} },
+              { name: "rrf_fusion", enabled: true, params: {} },
+              { name: "cross_encoder", enabled: true, params: {} },
+            ];
+          }
+
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "bar-title", "Pipeline config"));
+          card.appendChild(el("div", "kbd-note", "The node list IS the pipeline topology — stages run top to bottom. Default order: query_rewrite → vector_recall → keyword_recall → rrf_fusion → cross_encoder; optional parent_expand / crg_check slot in after rrf_fusion. Each row: the switch enables / disables the stage (off = skipped at run time); the gray line says what the stage does; the JSON box is that stage's key/value overrides — the keys are the fields listed under the box, leave {} to use the runtime defaults. Disabling, reordering, adding, or removing nodes is applied on save; one node failing degrades but does not stop the rest."));
+          const listBox = el("div");
+          card.appendChild(listBox);
+          container.appendChild(card);
+
+          function render() {
+            listBox.innerHTML = "";
+            cfg.nodes.forEach((n, i) => {
+              const row = el("div", "node-trace");
+              const h = el("div", "trace-head");
+              h.appendChild(switchToggle(n.enabled !== false, (on) => { n.enabled = on; }));
+              h.appendChild(el("span", "cell-main code", n.name));
+              const acts = el("div");
+              acts.style.marginLeft = "auto";
+              const up = el("button", "btn sm ghost", "↑");
+              up.type = "button";
+              up.disabled = i === 0;
+              up.onclick = () => { [cfg.nodes[i - 1], cfg.nodes[i]] = [cfg.nodes[i], cfg.nodes[i - 1]]; render(); };
+              const down = el("button", "btn sm ghost", "↓");
+              down.type = "button";
+              down.disabled = i === cfg.nodes.length - 1;
+              down.onclick = () => { [cfg.nodes[i], cfg.nodes[i + 1]] = [cfg.nodes[i + 1], cfg.nodes[i]]; render(); };
+              const rm = el("button", "btn sm ghost danger", "Remove");
+              rm.type = "button";
+              rm.onclick = () => { cfg.nodes.splice(i, 1); render(); };
+              acts.append(up, down, rm);
+              h.appendChild(acts);
+              row.appendChild(h);
+              const meta = metaByName[n.name] || {};
+              if (meta.description) {
+                const desc = el("div", "node-desc", meta.description);
+                row.appendChild(desc);
+              }
+              const defaults = meta.default_params || {};
+              const props = (meta.params_schema && meta.params_schema.properties) || {};
+              // Always render every declared field — stored value → runtime default →
+              // null — plus any stored extras, so the field list is discoverable even
+              // when a value (or all values) are unset.
+              const paramsObj = {};
+              const stored = n.params || {};
+              const allKeys = new Set([...Object.keys(props), ...Object.keys(stored)]);
+              for (const k of allKeys) {
+                paramsObj[k] = stored[k] !== undefined ? stored[k]
+                  : (defaults[k] !== undefined ? defaults[k] : null);
+              }
+              const params = el("textarea");
+              params.className = "trace-params";
+              params.rows = 4;
+              params.value = JSON.stringify(paramsObj, null, 2);
+              params.placeholder = "{} — node params as JSON";
+              row._params = params;
+              row.appendChild(params);
+              const fields = Object.keys(props).map((k) => {
+                const p = props[k] || {};
+                const dflt = defaults[k] !== undefined ? " default=" + JSON.stringify(defaults[k]) : "";
+                return k + " (" + (p.type || "any") + "): " + (p.description || "") + dflt;
+              });
+              const hint = el("div", "field-hint");
+              hint.textContent = fields.length
+                ? "Fields: " + fields.join(" · ")
+                : "No parameters — this stage runs with built-in defaults.";
+              row.appendChild(hint);
+              listBox.appendChild(row);
+            });
+
+            const addRow = el("div", "cfg-row");
+            const used = new Set(cfg.nodes.map((n) => n.name));
+            const opts = available
+              .filter((m) => m && !used.has(m.name))
+              .map((m) => ({ value: m.name, label: m.display_name ? m.name + " — " + m.display_name : m.name }));
+            const addSel = select([{ value: "", label: "Add node…" }, ...opts], "");
+            const addBtn = el("button", "btn sm", "Add");
+            addBtn.type = "button";
+            addBtn.onclick = () => {
+              if (!addSel.value) return;
+              cfg.nodes.push({ name: addSel.value, enabled: true, params: {} });
+              render();
+            };
+            addRow.append(addSel, addBtn);
+            listBox.appendChild(addRow);
+          }
+
+          const chunkCard = el("div", "legacy-card");
+          chunkCard.appendChild(el("div", "bar-title", "Chunking & enrichment"));
+          chunkCard.appendChild(el("div", "kbd-note", "Applied at ingest / reindex time. Contextual prepends an LLM prefix per chunk (P1); parent-child indexes small-to-big (P1); CJK routes queries through jieba segmentation (P2)."));
+          const ck = cfg.chunking || {};
+          const stratSel = select([
+            { value: "fixed", label: "fixed — sliding window" },
+            { value: "paragraph", label: "paragraph — by blank line" },
+            { value: "sentence", label: "sentence — by sentence boundary" },
+            { value: "semantic", label: "semantic — embedding breakpoints" },
+          ], ck.strategy || "fixed");
+          const chars = numInput(ck.chunk_chars != null ? ck.chunk_chars : 1200);
+          const overlap = numInput(ck.overlap != null ? ck.overlap : 150);
+          const row1 = el("div", "chat-test-row");
+          row1.append(field("Strategy", stratSel), field("Chunk chars", chars), field("Overlap", overlap));
+          chunkCard.appendChild(row1);
+          const ctxSw = switchToggle(!!cfg.contextual);
+          const ppSw = switchToggle(!!cfg.parent_child);
+          const cjkSw = switchToggle(!!cfg.cjk);
+          const flagRow = el("div", "cfg-row");
+          flagRow.append(ragFlag("Contextual enrichment", ctxSw), ragFlag("Parent/child indexing", ppSw), ragFlag("CJK segmentation", cjkSw));
+          chunkCard.appendChild(flagRow);
+          container.appendChild(chunkCard);
+
+          const saveRow = el("div", "cfg-row");
+          const save = el("button", "btn primary", "Save config");
+          const saveRes = el("div", "test-res");
+          save.onclick = async () => {
+            const nodes = [];
+            for (const row of listBox.querySelectorAll(".node-trace")) {
+              const swOn = row.querySelector(".switch").classList.contains("on");
+              const name = row.querySelector(".cell-main").textContent;
+              const raw = row._params.value || "{}";
+              let params;
+              try { params = JSON.parse(raw); }
+              catch { toast(name + ": params is not valid JSON", "err"); return; }
+              // null = "use the runtime default"; dropping the key keeps the node's
+              // own fallback (e.g. .get("k", 60)) from seeing an explicit None.
+              for (const k of Object.keys(params)) if (params[k] === null) delete params[k];
+              nodes.push({ name, enabled: swOn, params });
+            }
+            const payload = {
+              nodes,
+              chunking: {
+                strategy: stratSel.value,
+                chunk_chars: parseInt(chars.value || "1200", 10),
+                overlap: parseInt(overlap.value || "150", 10),
+              },
+              contextual: ctxSw.classList.contains("on"),
+              parent_child: ppSw.classList.contains("on"),
+              cjk: cjkSw.classList.contains("on"),
+            };
+            save.disabled = true;
+            saveRes.textContent = "Saving…";
+            saveRes.className = "";
+            try {
+              await apiFetch("/admin/rag/config", { method: "POST", body: JSON.stringify({ config: payload }) });
+              saveRes.textContent = "✓ saved — retriever cache invalidated";
+              saveRes.className = "test-res ok";
+              toast("RAG config saved");
+            } catch (e) {
+              saveRes.textContent = "✗ " + e.message;
+              saveRes.className = "test-res err";
+            }
+            save.disabled = false;
+          };
+          saveRow.append(save, saveRes);
+          container.appendChild(saveRow);
+
+          render();
+        }
+
+        // ── Tab 4: golden-set eval ──
+        async function renderRagEval(container) {
+          container.innerHTML = "";
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "bar-title", "Golden-set regression"));
+          card.appendChild(el("div", "kbd-note", "Runs every golden case (data/eval/golden.json) through the pipeline and scores asset-level Recall@k, Precision@k, and MRR. Expectations are asset UUIDs, so chunk-boundary changes do not break the metrics."));
+          const pathInput = textInput("data/eval/golden.json");
+          const run = el("button", "btn primary", "Run golden set");
+          const row1 = el("div", "chat-test-row");
+          row1.append(field("Golden file", pathInput));
+          card.append(row1, run);
+          container.appendChild(card);
+          const out = el("div");
+          container.appendChild(out);
+
+          run.onclick = async () => {
+            run.disabled = true;
+            run.textContent = "Running…";
+            out.innerHTML = '<div class="loading">Running…</div>';
+            try {
+              const d = await apiFetch("/admin/rag/eval", { method: "POST", body: JSON.stringify({ golden_path: pathInput.value.trim() }) });
+              out.innerHTML = "";
+              const m = d.metrics || {};
+              const metricsCard = el("div", "legacy-card");
+              const head = el("div", "route-summary");
+              const kv = (k, v) => { const c = el("div", "kv"); c.appendChild(el("div", "k", k)); c.appendChild(el("div", "v", String(v))); return c; };
+              head.append(kv("Cases", m.n_cases), kv("Avg Recall@k", m.avg_recall), kv("Avg Precision@k", m.avg_precision), kv("Avg MRR", m.avg_mrr));
+              metricsCard.appendChild(head);
+              out.appendChild(metricsCard);
+
+              const casesCard = el("div", "legacy-card");
+              casesCard.appendChild(el("div", "bar-title", "Per-case"));
+              const { wrap, tbody } = table(["case", "recall@k", "precision@k", "mrr", "query", "hits"]);
+              for (const c of d.cases || []) {
+                const tr = el("tr");
+                tr.appendChild(td(c.case_id));
+                tr.appendChild(td(String(c["recall@k"])));
+                tr.appendChild(td(String(c["precision@k"])));
+                tr.appendChild(td(String(c.mrr)));
+                tr.appendChild(td(c.query));
+                tr.appendChild(td((c.hit_asset_ids || []).join(", ") || "—"));
+                tbody.appendChild(tr);
+              }
+              casesCard.appendChild(wrap);
+              out.appendChild(casesCard);
+            } catch (e) {
+              out.innerHTML = "";
+              out.appendChild(errBox(e));
+            }
+            run.disabled = false;
+            run.textContent = "Run golden set";
+          };
+        }
+
+        // ── Tab 5: query-repository contents (learning / chat chunks) ──
+        const SOURCE_BADGES = { learning: "学习", chat: "聊天" };
+        async function renderRagRepository(container) {
+          container.innerHTML = "";
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "bar-title", "Query Repository — non-file sources"));
+          card.appendChild(el("div", "kbd-note", "Chunks imported from the Learning Platform (sentences / articles) and chat Q&A pairs. Delete removes the chunk from the searchable corpus."));
+          const refresh = el("button", "btn primary", "Refresh");
+          card.appendChild(refresh);
+          container.appendChild(card);
+          const out = el("div");
+          container.appendChild(out);
+
+          const load = async () => {
+            out.innerHTML = '<div class="loading">Loading…</div>';
+            try {
+              const d = await apiFetch("/admin/rag/repository");
+              out.innerHTML = "";
+              if (!d.items || !d.items.length) { out.appendChild(emptyState("No non-file chunks in the repository yet.")); return; }
+              const { wrap, tbody } = table(["Source", "Title", "Source ID", "User", "Chunk ID", ""]);
+              for (const it of d.items) {
+                const tr = el("tr");
+                const src = el("td");
+                const badge = el("span", "badge", SOURCE_BADGES[it.source_type] || it.source_type);
+                src.appendChild(badge);
+                tr.appendChild(src);
+                tr.appendChild(td(it.title || "—"));
+                tr.appendChild(td(it.source_id ? it.source_id.slice(0, 12) : "—"));
+                tr.appendChild(td(it.user_id ? it.user_id.slice(0, 12) : "—"));
+                tr.appendChild(td(it.id.slice(0, 12)));
+                const del = el("button", "btn ghost", "Delete");
+                del.onclick = async () => {
+                  try {
+                    await apiFetch("/admin/rag/repository/" + it.id, { method: "DELETE" });
+                    toast("Deleted chunk " + it.id.slice(0, 8));
+                    await load();
+                  } catch (e) { toast("Delete failed: " + e.message, "error"); }
+                };
+                const cell = el("td");
+                cell.appendChild(del);
+                tr.appendChild(cell);
+                tbody.appendChild(tr);
+              }
+              out.appendChild(wrap);
+            } catch (e) {
+              out.innerHTML = "";
+              out.appendChild(errBox(e));
+            }
+          };
+          refresh.onclick = load;
+          await load();
         }
 
         boot();

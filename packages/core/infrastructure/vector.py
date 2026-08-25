@@ -1,12 +1,13 @@
 """Embedding via the TEI (Text Embeddings Inference) service + pgvector vector store."""
 import uuid
+from uuid import UUID
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from core.config import settings
 from core.infrastructure.db import AssetModel, ChunkModel
-from core.infrastructure.visibility import asset_visible_expr
+from core.infrastructure.visibility import chunk_visible_expr
 
 
 class TEIEmbedder:
@@ -68,19 +69,38 @@ class PgVectorStore:
                     (1 - ChunkModel.embedding.cosine_distance(query_embedding)).label("score"),
                 )
                 .where(ChunkModel.embedding.is_not(None))
+                # Parent chunks are context only; recall surfaces leaves (parent_expand
+                # widens a hit to its parent's text).
+                .where(ChunkModel.chunk_kind == "leaf")
                 .order_by(ChunkModel.embedding.cosine_distance(query_embedding))
                 .limit(top_k)
             )
             # Tenant isolation: same predicate as keyword recall — owner / workspace / ACL
             # over READY assets. ``user_id`` None (guest) resolves to public-link assets.
-            if filters and "user_id" in filters:
-                stmt = (
-                    stmt.join(AssetModel, AssetModel.id == ChunkModel.asset_id)
-                    .where(
-                        AssetModel.file_status == "READY",
-                        asset_visible_expr(filters["user_id"]),
+            # ``domain_id`` (P1) narrows to one domain; both join assets.
+            #
+            # LEFT JOIN so non-file chunks (learning / chat, ``asset_id`` NULL) survive the
+            # join; the READY / domain predicates apply only to file chunks while the
+            # owner/workspace/ACL visibility (via ``chunk_visible_expr``, which checks
+            # ``chunks.user_id`` directly) keeps working for both — a non-file chunk is
+            # visible to its ``user_id`` owner.
+            if filters and ("user_id" in filters or filters.get("domain_id")):
+                stmt = stmt.outerjoin(AssetModel, AssetModel.id == ChunkModel.asset_id)
+                if "user_id" in filters:
+                    stmt = stmt.where(
+                        or_(
+                            ChunkModel.asset_id.is_(None),
+                            AssetModel.file_status == "READY",
+                        ),
+                        chunk_visible_expr(filters["user_id"]),
                     )
-                )
+                if filters.get("domain_id"):
+                    stmt = stmt.where(
+                        and_(
+                            ChunkModel.asset_id.is_not(None),
+                            AssetModel.domain_id == UUID(str(filters["domain_id"])),
+                        )
+                    )
             rows = (await session.execute(stmt)).all()
             return [
                 {"id": str(r.id), "text": r.content_en, "score": float(r.score), "meta": r.meta}

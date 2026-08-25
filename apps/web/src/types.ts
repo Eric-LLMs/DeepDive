@@ -29,6 +29,15 @@ export interface Sentence {
   score?: number;
 }
 
+// Learning-Platform article (mirrors Article in core/domain/models.py).
+export interface Article {
+  id: string;
+  title: string;
+  content: string;
+  domain_id?: string | null;
+  created_at: string;
+}
+
 // Authenticated user profile (mirrors GET /auth/me from apps/api/main.py).
 export interface Me {
   user_id: string;

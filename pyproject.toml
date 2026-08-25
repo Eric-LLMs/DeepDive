@@ -33,6 +33,13 @@ dependencies = [
     # the API only calls them over HTTP via `openai` / `httpx` (declared above).
     # MCP
     "fastmcp>=0.2",
+    # CJK keyword channel (jieba segmentation; lazy-imported on first CJK query/ingest)
+    "jieba>=0.42",
+    # Document parsing for the query repository: PyMuPDF (PDF text + table detection →
+    # vision transcription), python-docx (Word .docx). Both lazy-imported in
+    # core/infrastructure/{pdf,ingest}.py so the API stays light until a file is ingested.
+    "PyMuPDF>=1.24",
+    "python-docx>=1.1",
     # gRPC (internal)
     "grpcio>=1.62",
     "grpcio-tools>=1.62",

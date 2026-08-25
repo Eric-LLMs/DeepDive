@@ -14,7 +14,7 @@
 - **Learn Together**: Share files from the built-in cloud drive in shared workspaces and study the same material as a group.
 - **One Place, All Forms**: A fast web app, a desktop workbench that works offline, and a fully self-hosted AI engine — your materials stay yours.
 
-The engine is a native function-calling **agent** — an `AgentKernel` composition root that wires a cache-boundary prompt (a byte-stable static head so the provider reuses its prefix cache), deferred tool loading, dual-track memory (PostgreSQL tsvector + [pgvector](https://github.com/pgvector/pgvector) fused by RRF), a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop. A **hybrid search engine** finds context even when exact keywords are missing, and a **RAG pipeline** (rewrite → recall → RRF → rerank) grounds every chat answer.
+The engine is a native function-calling **agent** — an `AgentKernel` composition root that wires a cache-boundary prompt (a byte-stable static head so the provider reuses its prefix cache), deferred tool loading, dual-track memory (PostgreSQL tsvector + [pgvector](https://github.com/pgvector/pgvector) fused by RRF), a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop. A **hybrid search engine** finds context even when exact keywords are missing, and a **config-driven RAG pipeline** (pluggable nodes — rewrite → recall → RRF fusion → rerank, plus optional CJK segmentation, contextual enrichment, and parent/child indexing) grounds every chat answer.
 
 Model inference never runs inside the API: embedding (**[BGE-M3](https://huggingface.co/BAAI/bge-m3)** via [TEI](https://github.com/huggingface/text-embeddings-inference)) and **TTS ([Kokoro](https://github.com/hexgrad/kokoro))** are separate Docker services, and retrieval can be extracted behind a capability seam into its own **gRPC service**. **LLM calls** go directly to the provider channel pinned to the session (managed in the admin console), with the [LiteLLM](https://github.com/BerriAI/litellm) gateway as the legacy fallback. Async enrichment (TTS, images, explanations, session finalize) runs on an [arq](https://arq-docs.helpmanual.io/) **worker** off the request path.
 
@@ -72,6 +72,12 @@ flowchart TB
     loop --> memory[MemoryService<br/>PG tsvector + pgvector RRF]
     tools --> sandbox[Sandbox<br/>READ / WRITE / NETWORK]
 ```
+
+**Answering flow** — each turn runs the `ReactLoopAgent` step loop, which decides what to retrieve and
+composes the reply. It calls the **`rag_search` tool** (runs the RAG node pipeline and returns `top_k`
+chunks — the retrieval layer described in the RAG section) and, only when local material is
+insufficient, the **`web_search` tool** (duckduckgo / tavily / bing / google) for up-to-date external
+results; it then composes the answer from both.
 
 **Memory — two independent tracks, orchestrated by `MemoryService`** (writes go to the local
 memdir, recall reads the database; the tracks never cross):
@@ -201,6 +207,171 @@ flowchart TB
 > mounted tools appear as stable defer_loading stubs, with the full schema riding in the tool_search
 > result.
 
+**RAG — a config-driven node pipeline** (`ingest → rewrite → multi-recall → RRF fusion → rerank`).
+The corpus is a single **Query Repository** — one `chunks` table fed by three entry points: cloud-drive
+files, Learning-Platform sentences/articles, and chat Q&A — each chunk tagged `source_type`
+(`file` / `learning` / `chat`). On ingest, the pipeline's **chunking** config (size / overlap /
+contextualization) splits each source into leaf chunks and embeds them; on query, the **node list**
+IS the retrieval topology, and the admin console's **RAG** module lets you add / remove / reorder /
+toggle nodes and edit each node's parameters live — no code or restart.
+
+`QueryRewriter` expands the user's question (multi-query variants + a HyDE hypothetical answer), then
+a two-channel recall — pgvector semantic (`VectorRecaller`) + tsvector keyword (`KeywordRecaller`) —
+is fused by rank (`rrf_fusion`, k=60, scale-agnostic), with an optional BGE cross-encoder rerank
+tightening the final order. Optional nodes extend the default chain: **parent/child expansion** (recall
+the small leaf chunks, return the big parent chunk) and a **CRAG-style relevance check** (drop chunks
+the LLM judges irrelevant). Both recallers are source-aware — READY + domain filters apply only to
+`file` chunks; learning / chat chunks stay visible to their importer (owner). Tenant isolation rides
+on the per-request `user_id` filter the `rag_search` tool binds — recall sees only the caller's assets
+(owner / workspace / ACL; guests see public links only) — and an optional `domain` argument filters
+by `assets.domain_id`.
+
+![RAG — config-driven node pipeline](./docs/images/rag-architecture.png)
+
+<details>
+<summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
+
+```mermaid
+flowchart TB
+    %% ── ① sources → per-entry processing ───────────────────────────
+    subgraph ENTRY["Three import entries"]
+        DRIVE["Cloud Drive<br/>doc · pdf · txt · docx"]
+        LEARN["Learning Platform<br/>sentences · articles"]
+        CHAT["Chat<br/>reply pairs · whole sessions"]
+        PDFT["PDF tools<br/>page text + tables → image → vision LLM text"]
+        LEARNP["learning_import job<br/>sentences / articles → chunks"]
+        CHATP["chat import<br/>LLM merges one question's turns · splits distinct Qs"]
+        DRIVE --> PDFT
+        LEARN --> LEARNP
+        CHAT --> CHATP
+    end
+
+    %% ── ② query repository ────────────────────────────────────────
+    subgraph REPO["Query Repository"]
+        CHUNK["chunks table<br/>source_type file · learning · chat<br/>source_id · asset_id nullable · owner = importer"]
+        EMBED["build_chunks + BGE-M3 embed → pgvector<br/>leaf-only · chunked per runtime config"]
+        PDFT --> CHUNK
+        LEARNP --> CHUNK
+        CHATP --> CHUNK
+        CHUNK --> EMBED
+    end
+
+    %% ── ③ retrieval node pipeline ─────────────────────────────────
+    subgraph RETR["Retrieval — config-driven node pipeline"]
+        Q["user query · top_k<br/>+ filters.user_id · tenant binding<br/>owner / workspace / ACL · guest → public links"]
+        REWRITE["QueryRewriter<br/>multi-query expansion + HyDE answer"]
+        VEC["VectorRecaller<br/>pgvector cosine · BGE-M3 via TEI<br/>source-aware · LEFT JOIN assets"]
+        KW["KeywordRecaller<br/>tsvector FTS · CJK via jieba<br/>source-aware · READY only for files"]
+        RRF["rrf_fusion · k=60<br/>fuses cross-scale scores"]
+        CE["CrossEncoderReranker<br/>BGE-reranker · optional"]
+        PE["ParentExpandNode<br/>leaf → parent · optional"]
+        CRG["CrgCheckNode<br/>LLM relevance gate · optional"]
+        OUT["top_k SearchHits<br/>ground the chat answer"]
+        Q --> REWRITE
+        REWRITE --> VEC
+        REWRITE --> KW
+        VEC --> RRF
+        KW --> RRF
+        RRF --> CE
+        RRF -. no reranker .-> OUT
+        CE --> OUT
+        RRF -. optional extension .-> PE
+        PE --> CRG
+        CRG --> OUT
+    end
+
+    EMBED -. source-aware recall<br/>leaf-only · LEFT JOIN assets .-> VEC
+    EMBED -. source-aware recall .-> KW
+
+    %% ── ④ RAG pipeline config ─────────────────────────────────────
+    subgraph CFG["RAG Pipeline Config · admin console RAG module"]
+        NODES["Nodes<br/>add / remove / reorder / toggle<br/>per-node params · live, no restart"]
+        CHUNKCFG["Chunking<br/>size / overlap · contextualization"]
+    end
+    NODES -. drives topology .-> RETR
+    CHUNKCFG -. drives chunking .-> EMBED
+```
+
+</details>
+
+> **RAG invariants**
+> - **Degrade, never stop** — a single node failing (rewrite / HyDE falls back to the original query,
+>   an embedding or keyword channel is down) degrades but the pipeline keeps running downstream nodes.
+> - **Never a silent empty** — if *every* ranking channel fails, retrieval raises a graceful notice so
+>   the model answers from knowledge instead of silently returning nothing or retrying.
+> - **Retrieval is a capability seam** — the `rag_search` tool calls `ctx.resolve("retrieval")`, so
+>   swapping the in-process `RAGPipeline` for the gRPC retrieval service (`RETRIEVAL_MODE=grpc`)
+>   needs no tool change.
+> - **Rerank is optional** and off until `reranker_model` is configured; CJK queries route through
+>   jieba segmentation when the CJK flag is on.
+
+**Pipeline nodes & logic** — the config's node list *is* the topology; the executor runs each enabled
+node against the shared blackboard and degrades rather than stops:
+
+| node | stage | logic |
+|---|---|---|
+| `query_rewrite` | query | LLM expands the question into N variants (+ optional HyDE hypothetical doc); on LLM failure it falls back to the original query |
+| `vector_recall` | recall | embeds each variant / HyDE doc, pgvector cosine over `leaf` chunks, tenant- + domain-filtered |
+| `keyword_recall` | recall | tsvector FTS; a CJK query is jieba-segmented and matched against `content_search` via `to_tsvector('simple', …)` |
+| `rrf_fusion` | rank | Reciprocal Rank Fusion (k=60) over every ranking channel |
+| `cross_encoder` | rank | BGE reranker (lazy, `asyncio.to_thread`); SKIPs while `model_name` is empty |
+| `parent_expand` | rank | small-to-big: replaces each leaf hit with its parent chunk's text; sibling leaves dedupe to one parent (first-leaf order preserved) |
+| `crg_check` | rank | simplified CRAG: LLM judges the top evidence relevant / ambiguous / irrelevant; drops hits judged irrelevant; a parse failure keeps the hits |
+
+**Fusion vs. rerank** — the two "rank" stages are complementary, not redundant. `rrf_fusion` is
+**rank-only**: it never reads content, just aggregates each document's rank position across the recall
+channels (`Σ 1/(k + rank + 1)`, k=60), so the different-scale vector and keyword scores fuse fairly.
+`cross_encoder` is **content-based**: it discards the RRF order and the stored chunk embedding, scores
+each `(query, hit)` pair through the BGE reranker, and re-sorts — it can overturn the RRF ranking and
+catch "embedding-similar but irrelevant" hits. Candidate flow: each recall channel fetches `top_k × 2`
+hits → RRF merges the full set (no truncation) → rerank re-scores them all (off until `reranker_model`
+is set) → the pipeline returns only the final `top_k`. `rrf_fusion` is a required node: the recall
+channels only produce rankings, fusion is what turns them into results — without it retrieval silently
+returns empty.
+
+**Ingest-side enrichments** (config-driven, applied on re-chunking / `reindex`): **contextual** — an
+LLM writes a 50–100 token context prefix per leaf chunk (`content_en = context + raw`, raw kept in
+`meta["raw"]`; per-chunk failure keeps the raw chunk); **parent/child** — `split_hierarchy` writes
+parent + leaf chunks, recall searches leaves only; **CJK** — jieba-segmented tokens stored in
+`content_search`, matched via `to_tsvector('simple', …)`. **Chunking preview** — the admin **RAG →
+Chunking** tab pastes sample text and shows how the chosen strategy (`fixed` / `paragraph` /
+`sentence` / `semantic`) splits it — optionally with CJK segmentation and contextual prefixes —
+before you reindex; nothing is written to the database. **Domain filtering** — `rag_search`'s
+optional `domain` arg maps to `filters["domain_id"]` (→ `assets.domain_id`, file chunks only).
+**Baseline eval** — golden-set regression (`data/eval/golden.json`) pins each query to the asset ids
+that *should* surface and scores Recall@k / Precision@k / MRR (admin **RAG → Eval** tab). **GraphRAG**
+— a graph-of-communities node is designed but not yet implemented (see [architecture.md](docs/architecture.md) §10.6).
+
+**parent/child = an input/output pair, configured separately** — small-to-big is not one flag, it is two
+*independent* knobs in different places. The **input** side is the ingest flag `parent_child` (admin
+**RAG → Nodes → Chunking & enrichment**): when on, `split_hierarchy` writes parent + leaf chunks and
+recall searches leaves only. The **output** side is the `parent_expand` node in the pipeline list: when
+present *and* enabled it replaces each leaf hit with its parent chunk's text — there is no boolean
+field, the row's enable switch (or Remove) is the off-switch. The two combine freely: `parent_child=off`
++ `parent_expand=on` is a pass-through (no parents exist to expand); `parent_child=on` +
+`parent_expand=off` returns narrow leaf text; both on gives the full small-to-big flow.
+
+**Query Repository — a unified search surface over three import entries.** Everything you study
+lands in one retrievable corpus: cloud-drive documents, Learning-Platform content, and chat answers.
+Each entry feeds the same `chunks` table tagged with a `source_type` (`file` / `learning` / `chat`),
+so one query hits your files, your study material, and your past Q&A together. The diagram above
+shows the full flow — the three entries run through per-source processing, land in the `chunks`
+table (the query repository), and the source-aware recallers search it as part of the RAG pipeline,
+whose nodes and chunking are both driven by the runtime config:
+
+- **Cloud Drive**: text-bearing files (`.txt`/`.md`/`.pdf`/`.docx`/…) get a **＋ Import to Knowledge** button;
+  PDFs go through the PDF **tools** (page text + tables rendered to images and transcribed by the
+  vision LLM — a per-table failure is skipped, never fatal). Audio/video/slides are not supported.
+- **Learning Platform**: import sentences and write articles (Import Data → *Articles & Query Repo*),
+  then push them into the corpus — each is chunked under the runtime pipeline config.
+- **Chat**: a reply's **Import Repo** action binds it to its question as one Q&A chunk; the header
+  **📥** button organizes a whole session — the LLM merges the same question's follow-up turns into
+  one entry and splits distinct questions into separate chunks. Imported pairs/sessions show a
+  persistent **✓ Imported** (disabled) state, fetched on session load via `GET /chat/imported`, so
+  they stay marked across session switches and app restarts.
+- **Verify**: the admin console's RAG → **Repository** tab lists every non-file chunk (source badge +
+  delete), and the RAG **Test** tab retrieves across all three sources.
+
 > [docs/architecture.md](docs/architecture.md) is the single source of truth for the full design —
 > tech stack, repository layout, agent-kernel internals, tool runtime, data model, and deployment
 > topology (including what is implemented today vs. designed-only).
@@ -231,7 +402,8 @@ flowchart TB
 - **Dual-Track Memory**: session recall fuses PostgreSQL tsvector (keyword) + pgvector (semantic) via RRF, recency-weighted so newer messages win near-ties; when the embedding service is offline it degrades to tsvector-only — never a silent empty. `memory_search` / `memory_save` are tools; `memory_save` writes guardrailed notes (kebab-case key, length-capped content, closed type taxonomy) to the local memory directory while the session stays read-only. Proactive recall injects top hits for your question into the prompt, and long conversations are auto-compacted into an LLM summary (bounded token window).
 - **Skill Catalog**: skills (SKILL.md) are advertised as a one-line compressed index; the full instructions are lazy-loaded through the `skill` meta-tool.
 - **Read-Only Sandbox**: every tool call is gated by session permissions (READ / WRITE / NETWORK); file tools are rooted at the workspace dir and path escape is rejected. Writes and network access need an explicit grant or human approval.
-- **RAG Retrieval**: query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank.
+- **RAG Retrieval**: a config-driven node pipeline — query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank, extensible with CJK segmentation, contextual enrichment, parent/child indexing, and domain filtering.
+- **Query Repository**: one search corpus for cloud-drive files (PDF tables transcribed via vision), Learning-Platform sentences/articles, and chat Q&A — see the Query Repository section above.
 - **SSE Streaming**: Real-time token streaming to the frontend.
 
 ### 🤖 AI-Powered Interactive Study
@@ -252,6 +424,7 @@ flowchart TB
 - **Instant upload & resumable chunks**: uploading an already-stored file short-circuits to **instant upload** (no bytes transferred); large files stream in **8 MB chunks** (`upload_sessions` tracks received chunks) with a progress bar and safe re-upload.
 - **Notes & Markdown editing**: text files (`.md`, `.txt`, code, data) open in an in-page **note editor** — a **✏ Edit / 👁 Preview** toggle renders Markdown live, and **💾 Save** (`Ctrl+S`) rewrites the file in place (the bytes are re-deduplicated and RAG indexing re-runs). Rendering is XSS-safe: raw HTML is escaped and `javascript:`-style links are blocked.
 - **In-window Office previews — web console and desktop**: both the **web console Cloud Drive** and the **desktop app** render Word/Excel/PowerPoint files in-window (`.docx`; `.xlsx`/`.xls`/`.csv`/`.tsv`; `.pptx`/`.ppsx`/`.potx`/… slide decks) with the same pure-JS renderers (**mammoth** for Word, **SheetJS** for spreadsheets — one tab per sheet — and a **JSZip**-based slide deck for PowerPoint). Clicking never downloads: only the **⬇ Download** button fetches the bytes. `.doc`/`.ppt` have no browser parser and show a **can't-preview** panel (Download / Open in new tab), while images, PDF, video, and audio open in a new tab.
+- **Push files into the query repository**: text-bearing files (`.txt`/`.md`/`.pdf`/`.docx`/…; audio/video/slides excluded) show a **＋ Import to Knowledge** button — click it to ingest (or re-ingest under the latest RAG config), and an **In Knowledge** badge marks files already in the corpus.
 - **First-class folders**: multi-level folders (`folders` rows with full `/`-paths) live side by side with files, and the file manager tree combines them. Create/rename/move/delete folders; renaming or deleting a folder rewrites the path prefix of every file and sub-folder beneath it.
 - **Context menu & collision-safe naming**: right-click a file or folder for **📄 New text file**, **📁 New folder**, **📤 Upload**, and **🗑 Delete** (deleting a folder trashes its files first). Files and folders share one namespace per directory, so creating/moving/renaming into a busy spot auto-suffixes `(1)`, `(2)`, … before the extension (`docs` → `docs(1)`, `a.docx` → `a(1).docx`) instead of failing.
 - **Move anywhere**: files move across workspaces / My Drive freely (drag-and-drop is the planned UX; the API + batch bar support it today).
@@ -276,6 +449,7 @@ flowchart TB
 - **Flexible Import**: Import vocabulary (with frequencies) and contextual sentences via CSV/Excel/TXT uploads or manual entry.
 - **Intelligent Deduplication**: Automatically skips existing terms during import (case-insensitive) to maintain a clean database.
 - **Vector Indexing**: One-click generation of embeddings for your corpus using the industrial-grade **BGE-M3** model (stored in pgvector) to enable semantic search.
+- **Query Repository import**: push saved sentences and written articles (Articles & Query Repo tab) into the unified search corpus alongside cloud-drive files and chat Q&A.
 
 ### 📖 Minimalist & Powerful Study Mode
 - **Client-side Pagination & Sorting**: Lightning-fast UI with in-memory pagination. Sort vocabulary by Word (A-Z), Frequency, or Importance Level (Stars).
@@ -487,7 +661,7 @@ A standalone local workbench — the file tree, multi-format viewer, video scree
 - **Open Workspace** to browse any local folder; the viewer plays video (with subtitles), audio, images, PDF (with annotations), and text/code, and previews Word/Excel/PowerPoint in-window with pure-JS renderers (`.docx`/`.xlsx`/`.xls`/`.csv`/`.tsv`/`.pptx`, plus `.doc` as extracted text and images) — only `.ppt` opens in the OS app.
 - Switch the sidebar source from **💻 Local** to **☁️ Cloud** to browse your My Drive — open and edit text notes in the built-in Markdown editor (✏ / 👁 Preview / 💾 Save, `Ctrl+S`), or watch PDFs, video, images, and audio stream through the in-window viewer. Changes are saved straight to the server and show up in the web console.
 - Take one-click video **screenshots** and **Generate PPT / Generate Book** from the current material.
-- **Chat** streams answers with a collapsible **💭 thinking** panel (dock to bottom/side or float as a window); session history and search live in the sidebar. Bubbles render **Markdown + KaTeX math**; hover a bubble for **Copy / Read / Delete / Edit** — editing a question re-asks it (the turn and everything after are removed, then a fresh answer streams in). Click a session's title to **rename** it, or **delete** it from the sidebar.
+- **Chat** streams answers with a collapsible **💭 thinking** panel (dock to bottom/side or float as a window); session history and search live in the sidebar. Bubbles render **Markdown + KaTeX math**; hover a bubble for **Copy / Read / Delete / Edit** — editing a question re-asks it (the turn and everything after are removed, then a fresh answer streams in). A reply's **📥 Import Repo** action binds it to its question as one query-repository chunk, and the header **📥** organizes the whole session (the LLM groups each distinct question into its own chunk). An imported pair or session turns its **📥** into a persistent **✓ Imported** (disabled) state that survives session switches and app restarts. Click a session's title to **rename** it, or **delete** it from the sidebar.
 - **Sign in** from the account menu (register new accounts / reset passwords; guests chat anonymously up to the daily limit); ⚙️ **Settings** covers theme, font size, window & display, update checks, help, and about.
 - The account menu deep-links straight to the **web console**, the **Cloud Drive**, and — for admins — the **admin console**, signed in automatically via SSO.
 
@@ -515,7 +689,7 @@ Chat, session history & search, media generation, sign-in, and the **☁️ Clou
 - **Share**: **🔗 Share** grants read/write to a specific user or creates a public link.
 - **Search**: the search box fuzzy-matches file names and folder paths, scoped to a workspace or all of My Drive; jump straight to a result's folder.
 - **Trash**: deleting a file moves it to **Trash** — restore, purge permanently, or **Empty Trash**; entries older than 30 days purge automatically. Deleting a workspace trashes its files and moves them to My Drive trash.
-- **RAG status**: files are ingested for retrieval in the background; each file shows a badge (Pending → Parsing → Chunking → Embedding → Indexed) that settles on its own.
+- **Query Repo column**: files are ingested for retrieval in the background — each file shows a badge (Pending → Parsing → Chunking → Embedding → Indexed) plus a **＋ Import to Knowledge** button to (re)ingest text-bearing files (PDF tables are read via vision); unsupported formats (audio/video/slides) show a disabled hint, and ingested files show a grey **In Knowledge** badge.
 
 ### 🔧 Admin console (`/admin`, default `admin` / `admin`)
 
@@ -526,6 +700,7 @@ Sign in as an operator to configure the whole instance from a single SPA:
 - **Users**: create accounts directly, browse users, and manage their key grants.
 - **Tokens**: the per-user LLM key-grant matrix — which user may use which provider key (shown masked `sk-***`), with independent revoke/restore, plus a login-sessions view.
 - **Tools config**: web-search provider + API key + engine id, **SMTP** (email verification / password reset), free-form key/value tool params, and a test-email button.
+- **RAG**: a live console for the retrieval pipeline — **Test** a query and inspect every node's per-stage trace, **Chunking** previews split strategies (fixed / paragraph / sentence) with optional CJK keywords and contextual prefixes, **Nodes** edits the pipeline topology (add / remove / reorder / toggle nodes and their params), **Eval** runs the golden-set regression (Recall@k / Precision@k / MRR) to catch quality regressions, and **Repository** lists every non-file query-repository chunk (learning / chat sources) with per-chunk delete.
 
 ---
 

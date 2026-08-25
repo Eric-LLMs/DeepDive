@@ -99,6 +99,27 @@ class SentenceModel(Base):
     embedding: Mapped[list] = mapped_column(Vector(settings.embedding_dim), nullable=True)
 
 
+class ArticleModel(Base):
+    """A Learning-Platform article: free-text study material importable into the query repo."""
+
+    __tablename__ = "articles"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    domain_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("domains.id", ondelete="SET NULL")
+    )
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class MatchModel(Base):
     __tablename__ = "matches"
 
@@ -238,6 +259,9 @@ class AssetModel(Base):
     workspace_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("workspaces.id")
     )
+    domain_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("domains.id", ondelete="SET NULL")
+    )
     object_sha256: Mapped[str | None] = mapped_column(
         String, ForeignKey("global_objects.sha256")  # set once the upload completes
     )
@@ -305,16 +329,27 @@ class UploadSessionModel(Base):
 
 
 class ChunkModel(Base):
-    """RAG chunk belonging to an asset; denormalized user/workspace for filtered recall."""
+    """RAG chunk in the unified query repository.
+
+    ``source_type`` discriminates the three import paths: ``file`` (a drive asset, the
+    legacy path), ``learning`` (sentences / articles) and ``chat`` (Q&A pairs). Only file
+    chunks carry ``asset_id``; the others carry ``source_id`` plus owner in ``user_id``.
+    ``chunk_kind`` is ``leaf`` (recalled) or ``parent`` (small-to-big context). A leaf
+    records its ``parent_chunk_id``; recall searches leaf chunks only and parent_expand
+    swaps a leaf hit for its parent's text. ``content_search`` holds jieba-segmented
+    text for the CJK keyword channel (English still uses ``content_en`` tsvector).
+    """
 
     __tablename__ = "chunks"
 
     id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    asset_id: Mapped[uuid.UUID] = mapped_column(
+    asset_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("assets.id", ondelete="CASCADE")
     )
+    source_type: Mapped[str] = mapped_column(String, nullable=False, default="file")
+    source_id: Mapped[str | None] = mapped_column(String)
     user_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     workspace_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -322,6 +357,11 @@ class ChunkModel(Base):
     content_cn: Mapped[str | None] = mapped_column(Text)
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)  # timestamps/page numbers etc.
     embedding: Mapped[list] = mapped_column(Vector(settings.embedding_dim))
+    parent_chunk_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("chunks.id", ondelete="SET NULL")
+    )
+    chunk_kind: Mapped[str] = mapped_column(String, nullable=False, default="leaf")
+    content_search: Mapped[str | None] = mapped_column(Text)
 
 
 class UserModel(Base):

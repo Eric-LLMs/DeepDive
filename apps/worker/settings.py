@@ -75,6 +75,8 @@ class WorkerSettings:
         tasks.session_finalize,
         tasks.generate_media,
         tasks.asset_ingest,
+        tasks.learning_import,
+        tasks.chat_session_import,
     ]
     on_startup = startup
     on_shutdown = shutdown

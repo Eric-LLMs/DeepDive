@@ -1,11 +1,19 @@
 """Visibility predicate: owner / workspace member / ACL grantee / public share channels."""
+import asyncio
 import hashlib
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from core.application.drive_service import DriveError
-from core.infrastructure.visibility import asset_visible_expr, asset_visibility_sql
+from core.infrastructure.drive_repositories import SqlChunkRepository
+from core.infrastructure.vector import PgVectorStore
+from core.infrastructure.visibility import (
+    asset_visible_expr,
+    asset_visibility_sql,
+    chunk_visible_expr,
+)
 from tests._drive_fakes import make_drive
 
 
@@ -20,6 +28,88 @@ def test_visibility_sql_contains_all_three_channels():
 def test_visible_expr_builds():
     expr = asset_visible_expr(uuid4())
     assert expr is not None
+
+
+def test_chunk_visible_expr_builds():
+    expr = chunk_visible_expr(uuid4())
+    assert expr is not None
+
+
+class _CapturingSession:
+    """Fake async session that records the compiled statement it is handed."""
+
+    def __init__(self):
+        self.sql = ""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, stmt):
+        self.sql = str(stmt.compile(dialect=postgresql.dialect()))
+        return self
+
+    def all(self):
+        return []
+
+
+class _CapturingFactory:
+    def __init__(self):
+        self.session = _CapturingSession()
+
+    def __call__(self):
+        return self.session
+
+
+def test_vector_search_visibility_checks_chunk_owner():
+    """Non-file chunks (chat / learning, asset_id NULL) must stay visible to their owner.
+
+    Regression: the vector recaller previously applied the asset-only visibility
+    expression over the LEFT JOINed row, which evaluated NULL for non-file chunks and
+    dropped them from semantic recall entirely.
+    """
+    factory = _CapturingFactory()
+    store = PgVectorStore(factory)
+    asyncio.run(store.search([0.1, 0.2], 5, {"user_id": "u-1"}))
+    sql = factory.session.sql
+    # chunk-level ownership/workspace — the channels that keep non-file chunks visible
+    assert "chunks.user_id" in sql
+    assert "chunks.workspace_id" in sql
+    # ACL still rides on the chunk's asset_id
+    assert "asset_acl" in sql
+
+
+def test_vector_search_keeps_non_ready_file_guard():
+    factory = _CapturingFactory()
+    store = PgVectorStore(factory)
+    asyncio.run(store.search([0.1, 0.2], 5, {"user_id": "u-1"}))
+    sql = factory.session.sql
+    assert "chunks.asset_id IS NULL" in sql
+    assert "assets.file_status" in sql  # 'READY' is a bound parameter in the compiled SQL
+
+
+def test_vector_search_without_user_id_has_no_visibility_predicate():
+    factory = _CapturingFactory()
+    store = PgVectorStore(factory)
+    asyncio.run(store.search([0.1, 0.2], 5))
+    assert "chunks.user_id" not in factory.session.sql
+    assert "asset_acl" not in factory.session.sql
+
+
+def test_get_parents_by_child_ids_selects_parent_text():
+    """parent_expand must return the *parent* chunk's text, not the leaf's.
+
+    Regression: the repo selected content_en/meta from the leaf row while keying by the
+    parent id, so siblings were deduped but the hit never widened to the parent text.
+    """
+    factory = _CapturingFactory()
+    repo = SqlChunkRepository(factory)
+    asyncio.run(repo.get_parents_by_child_ids([str(uuid4())]))
+    sql = factory.session.sql
+    assert "JOIN chunks" in sql  # self-joins the parent row
+    assert "chunks_1.content_en" in sql  # parent text is what gets returned
 
 
 async def _owned_file(svc, user, content=b"notes"):

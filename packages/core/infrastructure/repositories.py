@@ -7,8 +7,9 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.domain.models import Domain, Match, Sentence, Term
+from core.domain.models import Article, Domain, Match, Sentence, Term
 from core.infrastructure.db import (
+    ArticleModel,
     DomainModel,
     MatchModel,
     SentenceModel,
@@ -300,6 +301,46 @@ class SqlSentenceRepository:
             item["score"] = round(float(score), 4)
             result.append(item)
         return result
+
+
+class SqlArticleRepository:
+    """Articles (Learning-Platform study material) that can be pushed into the query repo."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def get(self, article_id: UUID) -> Article | None:
+        row = await self.session.get(ArticleModel, article_id)
+        return Article.model_validate(row) if row else None
+
+    async def add(
+        self,
+        user_id: UUID,
+        title: str,
+        content: str,
+        domain_id: UUID | None = None,
+    ) -> Article:
+        obj = ArticleModel(user_id=user_id, title=title, content=content, domain_id=domain_id)
+        self.session.add(obj)
+        await self.session.commit()
+        await self.session.refresh(obj)
+        return Article.model_validate(obj)
+
+    async def list_by_user(self, user_id: UUID) -> list[Article]:
+        rows = (
+            await self.session.execute(
+                select(ArticleModel)
+                .where(ArticleModel.user_id == user_id)
+                .order_by(ArticleModel.created_at.desc())
+            )
+        ).scalars().all()
+        return [Article.model_validate(r) for r in rows]
+
+    async def delete(self, article_id: UUID) -> None:
+        row = await self.session.get(ArticleModel, article_id)
+        if row is not None:
+            await self.session.delete(row)
+            await self.session.commit()
 
 
 class SqlMatchRepository:

@@ -55,6 +55,19 @@ class Match(BaseModel):
     cn_explanation: str | None = None
 
 
+class Article(BaseModel):
+    """A Learning-Platform article: free-text study material importable into the query repo."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID | None = None
+    user_id: UUID
+    domain_id: UUID | None = None
+    title: str
+    content: str
+    created_at: datetime | None = None
+
+
 class Chunk(BaseModel):
     """Unified text chunk abstraction (video timestamp chunks / document page chunks / sentence chunks)."""
 

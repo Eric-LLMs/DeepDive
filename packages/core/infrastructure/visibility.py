@@ -17,6 +17,7 @@ from sqlalchemy import or_, select
 from core.infrastructure.db import (
     AssetAclModel,
     AssetModel,
+    ChunkModel,
     FolderModel,
     WorkspaceMemberModel,
     WorkspaceModel,
@@ -58,6 +59,25 @@ def asset_visible_expr(user_id: UUID):
         AssetModel.user_id == user_id,
         AssetModel.workspace_id.in_(_visible_workspaces(user_id)),
         AssetModel.id.in_(acl_ok),
+    )
+
+
+def chunk_visible_expr(user_id: UUID, chunk_alias=ChunkModel):
+    """ORM boolean expression selecting ``chunks`` rows the user may see.
+
+    Mirrors the raw ``asset_visibility_sql``: a chunk is visible to its ``chunks.user_id``
+    owner (which covers non-file chunks — learning / chat — whose joined asset row is
+    NULL), through a workspace the user owns or belongs to, or through an ACL grant on
+    its ``asset_id``. The vector recaller uses this so its LEFT JOINed asset row does not
+    drop non-file chunks the way the asset-only ``asset_visible_expr`` does.
+    """
+    acl_ok = select(AssetAclModel.asset_id).where(
+        or_(AssetAclModel.grantee_user_id == user_id, AssetAclModel.grantee_user_id.is_(None))
+    )
+    return or_(
+        chunk_alias.user_id == user_id,
+        chunk_alias.workspace_id.in_(_visible_workspaces(user_id)),
+        chunk_alias.asset_id.in_(acl_ok),
     )
 
 

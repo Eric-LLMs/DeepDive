@@ -8,7 +8,7 @@ from __future__ import annotations
 import urllib.parse
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from api.auth import AuthUser, require_user
@@ -380,6 +380,31 @@ async def ingest_status(
     drive: DriveService = Depends(get_drive_service),
 ):
     return await drive.ingest_status(user.user_id, asset_id)
+
+
+@files.post("/{asset_id}/import-rag")
+async def import_rag(
+    asset_id: UUID,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+    queue=Depends(get_task_queue),
+):
+    """(Re)push a READY asset into the RAG query repository.
+
+    Uploads auto-enqueue on complete; this is the explicit retry / re-import entry the
+    cloud-drive "加入查询仓库" button calls. Rebuilding a chunk set is idempotent
+    (delete-by-asset + bulk insert), so calling it on an already-indexed file is safe.
+    """
+    await require_file_read(drive, user.user_id, asset_id)
+    asset = await drive.get_file(user.user_id, asset_id)
+    if asset.get("file_status") != "READY" or not asset.get("object_sha256"):
+        raise HTTPException(status_code=400, detail="asset is not ready for ingestion")
+    job_id = await queue.enqueue(
+        ASSET_INGEST,
+        {"asset_id": asset["id"], "user_id": str(user.user_id)},
+        user_id=user.user_id,
+    )
+    return {"job_id": str(job_id), "rag_status": "queued"}
 
 
 # ── Folders ───────────────────────────────────────────────────────────────────────

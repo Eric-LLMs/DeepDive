@@ -31,6 +31,18 @@ const RAG_LABEL: Record<string, string> = {
   FAILED: "Failed",
 };
 
+// Extensions the query repository can index (text / subtitle / PDF / Word). Everything
+// else (audio, video, legacy formats) shows a disabled "暂不支持" button.
+const RAG_IMPORTABLE_EXTS = new Set([
+  ".txt", ".md", ".markdown", ".text", ".log", ".json", ".csv",
+  ".srt", ".vtt", ".lrc", ".pdf", ".docx",
+]);
+
+function fileExt(name: string): string {
+  const i = name.lastIndexOf(".");
+  return i >= 0 ? name.slice(i).toLowerCase() : "";
+}
+
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -1037,6 +1049,28 @@ export default function CloudDrive() {
     load();
   }, [load]);
 
+  // "Import to Knowledge": (re)push a READY file into the searchable corpus. Uploads already
+  // auto-enqueue; this is the explicit retry / re-import (e.g. after a config change).
+  // Per-file feedback: "importing" while the job is enqueued, then "ok" / "err" for the outcome.
+  const [importState, setImportState] = useState<
+    Record<string, "importing" | "ok" | "err">
+  >({});
+  const [importError, setImportError] = useState<Record<string, string>>({});
+  const importToRepo = useCallback(
+    async (f: DriveFile) => {
+      setImportState((s) => ({ ...s, [f.id]: "importing" }));
+      try {
+        await api.importRagFile(f.id);
+        setImportState((s) => ({ ...s, [f.id]: "ok" }));
+        await load();
+      } catch (e) {
+        setImportState((s) => ({ ...s, [f.id]: "err" }));
+        setImportError((m) => ({ ...m, [f.id]: String(e) }));
+      }
+    },
+    [load]
+  );
+
   // Current user id, for gating workspace-owner controls in the Manage modal.
   useEffect(() => {
     api.me().then(setMe).catch(() => {});
@@ -1876,6 +1910,7 @@ export default function CloudDrive() {
                     <th>Name</th>
                     {isTrash ? <th>Deleted</th> : <th>Size</th>}
                     {!isTrash && <th>RAG Status</th>}
+                    {!isTrash && <th>Query Repo</th>}
                     <th>Updated</th>
                   </tr>
                 </thead>
@@ -1905,6 +1940,43 @@ export default function CloudDrive() {
                           <span className={`badge rag ${ragClass(f.rag_status)}`}>
                             {RAG_LABEL[f.rag_status] ?? f.rag_status}
                           </span>
+                        </td>
+                      )}
+                      {!isTrash && (
+                        <td onClick={(e) => e.stopPropagation()}>
+                          {f.rag_status === "INDEXED" ? (
+                            <button className="ghost" disabled title="Already in knowledge">
+                              ✓ In Knowledge
+                            </button>
+                          ) : importState[f.id] === "importing" ? (
+                            <button
+                              className="ghost"
+                              disabled
+                              title="Importing into the searchable corpus…"
+                            >
+                              Importing…
+                            </button>
+                          ) : RAG_IMPORTABLE_EXTS.has(fileExt(f.name)) ? (
+                            <button
+                              className={`ghost${importState[f.id] === "err" ? " danger" : ""}`}
+                              onClick={() => importToRepo(f)}
+                              title={
+                                importState[f.id] === "err"
+                                  ? importError[f.id] || "Import failed"
+                                  : "Import this file into your searchable knowledge"
+                              }
+                            >
+                              {importState[f.id] === "ok" && RAG_WORKING.has(f.rag_status)
+                                ? "✓ Imported"
+                                : importState[f.id] === "err"
+                                ? "Failed — retry"
+                                : "＋ Import to Knowledge"}
+                            </button>
+                          ) : (
+                            <button className="ghost" disabled title="Format not supported">
+                              Not supported
+                            </button>
+                          )}
                         </td>
                       )}
                       <td className="muted">{fmtDate(f.updated_at ?? f.created_at)}</td>

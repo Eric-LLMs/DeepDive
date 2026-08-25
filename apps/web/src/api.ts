@@ -1,6 +1,7 @@
 // Thin fetch wrapper around the DeepDive REST API.
 // In dev, Vite proxies /api/* to http://localhost:8300 (see vite.config.ts).
 import type {
+  Article,
   Domain,
   DriveFile,
   DriveFolder,
@@ -302,10 +303,41 @@ export const api = {
     request<{ asset_id: string; file_status: string; rag_status: string }>(
       `/files/${assetId}/ingest-status`
     ),
+  importRagFile: (assetId: string) =>
+    request<{ job_id: string; rag_status: string }>(`/files/${assetId}/import-rag`, {
+      method: "POST",
+    }),
   moveFile: (assetId: string, body: { workspace_id?: string | null; folder_path: string | null }) =>
     request<DriveFile>(`/files/${assetId}/move`, {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+
+  // ── Query repository: learning-platform & chat imports ──
+  learningImport: (kind: "sentence" | "article", ids: string[]) =>
+    request<JobId>("/learning/import", {
+      method: "POST",
+      body: JSON.stringify({ kind, ids }),
+    }),
+  listArticles: () => request<{ items: Article[] }>("/learning/articles"),
+  createArticle: (body: { title: string; content: string; domain_id?: string | null }) =>
+    request<{ id: string; title: string; created_at: string }>("/learning/articles", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteArticle: (articleId: string) =>
+    request<{ status: string }>(`/learning/articles/${articleId}`, { method: "DELETE" }),
+  importArticleToRepo: (articleId: string) =>
+    request<{ chunks: number }>(`/learning/articles/${articleId}/import`, { method: "POST" }),
+  chatImportPair: (body: {
+    session_id: string;
+    user_message_id: string;
+    assistant_message_id: string;
+  }) => request<{ chunks: number }>("/chat/import", { method: "POST", body: JSON.stringify(body) }),
+  chatImportSession: (sessionId: string) =>
+    request<JobId>("/chat/import-session", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId }),
     }),
 
   // ── Cloud drive: folders ──

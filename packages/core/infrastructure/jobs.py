@@ -26,6 +26,8 @@ INDEX_SENTENCES = "index_sentences"
 SESSION_FINALIZE = "session_finalize"
 GENERATE_MEDIA = "generate_media"
 ASSET_INGEST = "asset_ingest"
+LEARNING_IMPORT = "learning_import"        # Learning-Platform sentences/articles → query repo
+CHAT_SESSION_IMPORT = "chat_session_import"  # a whole chat session → query repo Q&A chunks
 
 # Job status values.
 QUEUED = "queued"

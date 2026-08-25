@@ -31,6 +31,7 @@ from api.auth import (
 )
 from api.deps import (
     _embedder,
+    _retriever,
     get_agent,
     get_drive_service,
     get_task_queue,
@@ -44,8 +45,11 @@ from api.routers.drive import users as drive_users_router
 from api.routers.drive import workspaces as drive_workspaces_router
 from api.schemas import (
     AdminLoginRequest,
+    ArticleCreateRequest,
     BulkUpdateRequest,
+    ChatImportRequest,
     ChatRequest,
+    ChatSessionImportRequest,
     ChatTestRequest,
     CredentialCreateRequest,
     CredentialUpdateRequest,
@@ -62,6 +66,10 @@ from api.schemas import (
     ProbeModelsRequest,
     ProfileUpdateRequest,
     ProvidersUpdateRequest,
+    RagChunkPreviewRequest,
+    RagConfigUpdateRequest,
+    RagEvalRequest,
+    RagTestRequest,
     RegisterRequest,
     ResendVerificationRequest,
     ResetPasswordRequest,
@@ -80,6 +88,7 @@ from api.schemas import (
     SessionRenameRequest,
     TTSRequest,
     GrantUpdateRequest,
+    LearningImportRequest,
     TokenCreateRequest,
     TokenUpdateRequest,
     UserCreateRequest,
@@ -100,6 +109,7 @@ from core.infrastructure.billing import (
 )
 from core.infrastructure.db import (
     AccessTokenModel,
+    ChunkModel,
     CredentialModelModel,
     LoginTokenModel,
     LLMCredentialModel,
@@ -116,13 +126,17 @@ from core.infrastructure.db import (
     VerificationTokenModel,
     init_db,
 )
+from core.infrastructure.drive_repositories import SqlChunkRepository
+from core.infrastructure.ingest import build_chunks, write_query_repo_chunks
 from core.infrastructure.jobs import (
     ANALYZE_SYNTAX,
+    CHAT_SESSION_IMPORT,
     EXPLAIN,
     GENERATE_DEFINITION,
     GENERATE_MEDIA,
     IMAGE_FETCH,
     INDEX_SENTENCES,
+    LEARNING_IMPORT,
     SESSION_FINALIZE,
     TTS,
     TaskQueue,
@@ -135,8 +149,9 @@ from core.infrastructure.memory import (
     list_sessions,
     load_session_detail,
 )
+from core.infrastructure.repositories import SqlArticleRepository
 from core.infrastructure.mailer import MailNotConfigured, send_email
-from core.infrastructure.request_context import set_request_user
+from core.infrastructure.request_context import get_request_user_id, set_request_user
 from core.infrastructure.tts import TTSClient
 from core.infrastructure.security import (
     check_quota,
@@ -573,7 +588,9 @@ async def admin_page() -> FileResponse:
     """Serve the self-contained admin console."""
     if not ADMIN_INDEX.exists():
         raise HTTPException(status_code=404, detail="admin console not found")
-    return FileResponse(ADMIN_INDEX, media_type="text/html")
+    # no-store: the console is self-contained JS under active development; a cached
+    # copy masks code changes and shows stale UI (e.g. empty node params).
+    return FileResponse(ADMIN_INDEX, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 # ── User auth (desktop workbench login) ──
@@ -1674,6 +1691,183 @@ async def test_chat(body: ChatTestRequest, _: AuthAdmin = Depends(require_admin)
         return {"ok": False, "route": route, "error": str(err)}
 
 
+# ── RAG pipeline console (admin-only development UI for the config-driven RAG) ──
+def _rag_pipeline():
+    """Build the RAG pipeline from the currently stored config + the env-seeded deps."""
+    from core.infrastructure.vector import PgVectorStore
+    from rag import build_pipeline
+    from rag.config_store import current_config
+
+    return build_pipeline(
+        embedder=_embedder(),
+        vector_store=PgVectorStore(SessionLocal),
+        session_factory=SessionLocal,
+        llm=llm,
+        settings=settings,
+        config=current_config(),
+    )
+
+
+@app.get("/admin/rag/config")
+async def get_rag_config(_: AuthAdmin = Depends(require_admin)) -> dict:
+    """Read the stored pipeline config (or the env-seeded defaults)."""
+    from rag.config_store import load_config
+    from rag.registry import registry
+
+    cfg = await load_config(SessionLocal)
+    return {"config": cfg.to_dict(), "available_nodes": registry.metadata()}
+
+
+@app.post("/admin/rag/config")
+async def update_rag_config(
+    body: RagConfigUpdateRequest, _: AuthAdmin = Depends(require_admin)
+) -> dict:
+    """Validate + persist a full pipeline config blob; invalidates the retriever cache."""
+    from rag.config_store import RagPipelineConfig, save_config
+
+    cfg = RagPipelineConfig.from_dict(body.config or {})
+    errors = await save_config(SessionLocal, cfg)
+    if errors:
+        raise HTTPException(status_code=422, detail={"errors": errors})
+    _retriever.cache_clear()
+    return {"ok": True}
+
+
+@app.post("/admin/rag/test")
+async def rag_test(body: RagTestRequest, admin: AuthAdmin = Depends(require_admin)) -> dict:
+    """Run the configured pipeline and return hits + the per-node trace."""
+    from rag import RetrievalUnavailable
+
+    # The admin console never sets the per-request user contextvar (only /chat does), so
+    # get_request_user_id() would be None here — and recallers treat user_id=None as a
+    # tenant that sees nothing. Scope the test to the admin account's own user row (the
+    # account the admin imports content under) so isolation matches the product; a
+    # token-only admin with no matching user falls back to an unfiltered global view.
+    async with SessionLocal() as session:
+        admin_user = (
+            await session.execute(select(UserModel).where(UserModel.username == admin.username))
+        ).scalar_one_or_none()
+    filters: dict = {}
+    if admin_user is not None:
+        filters["user_id"] = admin_user.id
+    if body.domain_id:
+        filters["domain_id"] = body.domain_id
+
+    pipe = _rag_pipeline()
+    try:
+        result = await pipe.trace(body.query or "", body.top_k, filters)
+    except RetrievalUnavailable as exc:  # noqa: PLC0105 - imported inside the function
+        return {"ok": False, "error": str(exc), "trace": [], "hits": []}
+    return {
+        "ok": True,
+        "hits": result["hits"],
+        "trace": [
+            {"name": t.name, "status": t.status, "ms": t.ms, "out": t.out}
+            for t in result["trace"]
+        ],
+        "errors": result["errors"],
+    }
+
+
+@app.post("/admin/rag/chunk-preview")
+async def rag_chunk_preview(
+    body: RagChunkPreviewRequest, _: AuthAdmin = Depends(require_admin)
+) -> dict:
+    """Preview chunking + (optionally) CJK segmentation / context prefixes, no DB writes."""
+    from core.infrastructure.ingest import Chunk, contextualize_chunks, split_chunks
+    from rag.cjk import segment
+
+    texts = split_chunks(
+        body.text, body.chunk_chars, body.overlap, body.strategy
+    )
+    chunks = [Chunk(content_en=t) for t in texts]
+    if body.cjk:
+        for c in chunks:
+            c.content_search = segment(c.content_en)
+    if body.contextual:
+        chunks = await contextualize_chunks(chunks, "preview", llm)
+    return {
+        "chunks": [
+            {
+                "text": c.content_en,
+                "search": c.content_search,
+                "context": (c.meta or {}).get("context"),
+            }
+            for c in chunks
+        ]
+    }
+
+
+@app.post("/admin/rag/eval")
+async def rag_eval(body: RagEvalRequest, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """Run the golden-set regression and return the metric table."""
+    from rag.eval import run_golden_set
+
+    report = await run_golden_set(_rag_pipeline, body.golden_path)
+    return report.to_dict()
+
+
+@app.post("/admin/rag/reindex")
+async def rag_reindex(
+    request: Request, _: AuthAdmin = Depends(require_admin)
+) -> dict:
+    """Re-ingest every READY asset under the current chunking/enrichment config."""
+    async with SessionLocal() as session:
+        ready = (
+            await session.execute(
+                select(AssetModel).where(
+                    AssetModel.file_status == "READY",
+                    AssetModel.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+    task_queue = get_task_queue(request)
+    for asset in ready:
+        await task_queue.enqueue("asset_ingest", {"asset_id": str(asset.id)})
+    return {"queued": len(ready)}
+
+
+@app.get("/admin/rag/repository")
+async def rag_repository(_: AuthAdmin = Depends(require_admin)) -> dict:
+    """List non-file query-repository chunks (learning / chat sources) for the admin console."""
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(ChunkModel)
+                .where(ChunkModel.source_type != "file")
+                .order_by(ChunkModel.id)
+                .limit(500)
+            )
+        ).scalars().all()
+    return {
+        "items": [
+            {
+                "id": str(r.id),
+                "source_type": r.source_type,
+                "source_id": r.source_id,
+                "title": (r.meta or {}).get("title") or "",
+                "user_id": str(r.user_id) if r.user_id else None,
+                "created_at": None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.delete("/admin/rag/repository/{chunk_id}")
+async def rag_repository_delete(
+    chunk_id: UUID, _: AuthAdmin = Depends(require_admin)
+) -> dict:
+    """Delete one non-file query-repository chunk."""
+    async with SessionLocal() as session:
+        row = await session.get(ChunkModel, chunk_id)
+        if row is None or row.source_type == "file":
+            raise HTTPException(status_code=404, detail="chunk not found")
+        await session.delete(row)
+        await session.commit()
+    return {"status": "ok"}
+
+
 # ── Role ↔ channel bindings (admin-only; the routing source for per-role LLM keys) ──
 def _credential_summary(c: LLMCredentialModel, pricing: dict | None) -> dict:
     """Compact channel card for the token-management browser."""
@@ -2590,6 +2784,200 @@ async def import_sentences_structured(
     svc=Depends(get_vocab_service),
 ):
     return await svc.import_sentences_structured(body.domain_id, body.items, _uid(user))
+
+
+@app.post("/learning/import")
+async def learning_import_to_repo(
+    body: LearningImportRequest,
+    user: AuthUser = Depends(require_user),
+    queue: TaskQueue = Depends(get_task_queue),
+):
+    """Push selected Learning-Platform sentences / articles into the query repository.
+
+    The worker chunks each id under the runtime pipeline config and writes
+    ``source_type='learning'`` + ``source_id=<id>`` chunks; re-importing is idempotent.
+    """
+    if body.kind not in ("sentence", "article"):
+        raise HTTPException(status_code=400, detail="kind must be 'sentence' or 'article'")
+    if not body.ids:
+        raise HTTPException(status_code=400, detail="no ids given")
+    job_id = await queue.enqueue(
+        LEARNING_IMPORT,
+        {"user_id": str(user.user_id), "kind": body.kind, "ids": body.ids},
+        user_id=user.user_id,
+    )
+    return {"job_id": str(job_id)}
+
+
+@app.post("/learning/articles", status_code=201)
+async def create_article(
+    body: ArticleCreateRequest,
+    user: AuthUser = Depends(require_user),
+):
+    """Create a Learning-Platform article; import into the query repo is a separate call."""
+    async with SessionLocal() as session:
+        article = await SqlArticleRepository(session).add(
+            user.user_id,
+            body.title,
+            body.content,
+            UUID(body.domain_id) if body.domain_id else None,
+        )
+    return {"id": str(article.id), "title": article.title, "created_at": article.created_at}
+
+
+@app.get("/learning/articles")
+async def list_articles(
+    user: AuthUser = Depends(require_user),
+):
+    """List the caller's articles, newest first."""
+    async with SessionLocal() as session:
+        articles = await SqlArticleRepository(session).list_by_user(user.user_id)
+    return {
+        "items": [
+            {
+                "id": str(a.id),
+                "title": a.title,
+                "content": a.content,
+                "domain_id": str(a.domain_id) if a.domain_id else None,
+                "created_at": a.created_at,
+            }
+            for a in articles
+        ]
+    }
+
+
+@app.delete("/learning/articles/{article_id}")
+async def delete_article(
+    article_id: UUID,
+    user: AuthUser = Depends(require_user),
+):
+    """Delete an article (owner only) and drop its query-repo chunks."""
+    async with SessionLocal() as session:
+        repo = SqlArticleRepository(session)
+        article = await repo.get(article_id)
+        if article is None or article.user_id != user.user_id:
+            raise HTTPException(status_code=404, detail="article not found")
+        await repo.delete(article_id)
+    await SqlChunkRepository(SessionLocal).delete_by_source("learning", [str(article_id)])
+    return {"status": "ok"}
+
+
+@app.post("/learning/articles/{article_id}/import")
+async def import_article_to_repo(
+    article_id: UUID,
+    user: AuthUser = Depends(require_user),
+):
+    """Chunk + embed a single article into the query repository (source_type='learning')."""
+    async with SessionLocal() as session:
+        article = await SqlArticleRepository(session).get(article_id)
+    if article is None or article.user_id != user.user_id:
+        raise HTTPException(status_code=404, detail="article not found")
+
+    from rag.config_store import load_config  # lazy: rag is a sibling package
+
+    cfg = await load_config(SessionLocal)
+    chunks = await build_chunks(article.content, cfg, doc_title=article.title, llm=llm)
+    for c in chunks:
+        c.meta = {**c.meta, "title": article.title, "kind": "article"}
+    chunks_repo = SqlChunkRepository(SessionLocal)
+    await chunks_repo.delete_by_source("learning", [str(article_id)])
+    res = await write_query_repo_chunks(
+        SessionLocal,
+        _embedder(),
+        chunks=chunks,
+        user_id=user.user_id,
+        source_type="learning",
+        source_id=str(article_id),
+    )
+    return {"chunks": res["chunks"]}
+
+
+@app.post("/chat/import")
+async def chat_import_pair(
+    body: ChatImportRequest,
+    user: AuthUser = Depends(require_user),
+):
+    """Import one chat Q&A pair (user message + assistant reply) as a query-repo chunk.
+
+    Stored with ``source_type='chat'`` + ``source_id=<user_message_id>`` so re-importing
+    the same pair is idempotent.
+    """
+    async with SessionLocal() as session:
+        user_msg = await session.get(MessageModel, UUID(body.user_message_id))
+        asst_msg = await session.get(MessageModel, UUID(body.assistant_message_id))
+    if user_msg is None or asst_msg is None:
+        raise HTTPException(status_code=404, detail="message not found")
+    if user_msg.session_id != UUID(body.session_id) or asst_msg.session_id != user_msg.session_id:
+        raise HTTPException(status_code=400, detail="messages do not belong to the given session")
+    if user_msg.role != "user" or asst_msg.role != "assistant":
+        raise HTTPException(status_code=400, detail="expected a user/assistant message pair")
+
+    from rag.config_store import load_config  # lazy: rag is a sibling package
+
+    content = f"{user_msg.text}\n\n{asst_msg.text}"
+    cfg = await load_config(SessionLocal)
+    title = user_msg.text.strip()[:60] or "Chat Q&A"
+    chunks = await build_chunks(content, cfg, doc_title=title, llm=llm)
+    for c in chunks:
+        c.meta = {**c.meta, "title": title, "kind": "qa", "session_id": str(user_msg.session_id)}
+    chunks_repo = SqlChunkRepository(SessionLocal)
+    await chunks_repo.delete_by_source("chat", [str(user_msg.id)])
+    res = await write_query_repo_chunks(
+        SessionLocal,
+        _embedder(),
+        chunks=chunks,
+        user_id=user.user_id,
+        source_type="chat",
+        source_id=str(user_msg.id),
+    )
+    return {"chunks": res["chunks"]}
+
+
+@app.post("/chat/import-session")
+async def chat_import_session(
+    body: ChatSessionImportRequest,
+    user: AuthUser = Depends(require_user),
+    queue: TaskQueue = Depends(get_task_queue),
+):
+    """Enqueue a whole chat session: the LLM groups its Q&A turns into repo chunks."""
+    job_id = await queue.enqueue(
+        CHAT_SESSION_IMPORT,
+        {"session_id": body.session_id, "user_id": str(user.user_id)},
+        user_id=user.user_id,
+    )
+    return {"job_id": str(job_id)}
+
+
+@app.get("/chat/imported")
+async def chat_imported_status(
+    session_id: UUID, user: AuthUser = Depends(require_user)
+) -> dict:
+    """Which Q&A pairs of a session are already in the query repo.
+
+    Drives the persistent "✓ Imported" state on the desktop chat buttons: on session
+    load the client fetches this so an already-imported pair (or a fully imported
+    session) stays disabled across session switches and app restarts.
+    """
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(ChunkModel.source_id, ChunkModel.meta).where(
+                    ChunkModel.source_type == "chat",
+                    ChunkModel.user_id == user.user_id,
+                    ChunkModel.meta["session_id"].astext == str(session_id),
+                )
+            )
+        ).all()
+    qa_source_ids: list[str] = []
+    session_imported = False
+    for source_id, meta in rows:
+        kind = (meta or {}).get("kind")
+        if kind == "qa":
+            if source_id not in qa_source_ids:
+                qa_source_ids.append(source_id)
+        elif kind == "session-qa":
+            session_imported = True
+    return {"qa_source_ids": qa_source_ids, "session_imported": session_imported}
 
 
 @app.post("/image-fetch")

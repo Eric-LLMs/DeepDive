@@ -13,6 +13,7 @@ from uuid import UUID
 
 from sqlalchemy import Text, cast, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import aliased
 from sqlalchemy.exc import IntegrityError
 
 from core.infrastructure.db import (
@@ -908,26 +909,86 @@ class SqlChunkRepository:
             )
             await session.commit()
 
+    async def delete_by_source(self, source_type: str, source_ids: list[str]) -> None:
+        """Drop a non-file source's chunks so re-importing it is idempotent."""
+        if not source_ids:
+            return
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(ChunkModel).where(
+                    ChunkModel.source_type == source_type,
+                    ChunkModel.source_id.in_(source_ids),
+                )
+            )
+            await session.commit()
+
     async def bulk_insert(
         self,
-        asset_id: UUID,
+        asset_id: UUID | None,
         user_id: UUID,
         workspace_id: UUID | None,
-        chunks: list[tuple[str, str | None, dict, list[float]]],
+        chunks: list[dict],
+        source_type: str = "file",
+        source_id: str | None = None,
     ) -> None:
-        """Insert ``(content_en, content_cn, meta, embedding)`` tuples with running seq."""
+        """Insert chunk rows with a running seq.
+
+        Each ``chunks`` dict matches the ChunkModel columns plus ``embedding``:
+        ``{content_en, content_cn?, meta?, embedding, chunk_kind?, parent_chunk_id?, id?}``.
+        ``id`` defaults to a server-generated UUID; parents pass a client UUID so their
+        leaves can reference ``parent_chunk_id`` before insert.
+
+        ``asset_id`` is optional — non-file sources (learning / chat) leave it NULL and
+        instead pass ``source_type`` + ``source_id`` (e.g. an article id or a chat Q&A
+        pair); the caller still provides the owner ``user_id`` so recall scoping works.
+        """
         async with self.session_factory() as session:
-            for seq, (content_en, content_cn, meta, embedding) in enumerate(chunks):
+            for seq, c in enumerate(chunks):
+                parent_id = c.get("parent_chunk_id")
+                chunk_id = c.get("id")
                 session.add(
                     ChunkModel(
+                        id=UUID(chunk_id) if chunk_id else None,
                         asset_id=asset_id,
+                        source_type=source_type,
+                        source_id=source_id,
                         user_id=user_id,
                         workspace_id=workspace_id,
                         seq=seq,
-                        content_en=content_en,
-                        content_cn=content_cn,
-                        meta=meta,
-                        embedding=embedding,
+                        content_en=c["content_en"],
+                        content_cn=c.get("content_cn"),
+                        meta=c.get("meta") or {},
+                        embedding=c["embedding"],
+                        chunk_kind=c.get("chunk_kind", "leaf"),
+                        parent_chunk_id=UUID(parent_id) if parent_id else None,
+                        content_search=c.get("content_search"),
                     )
                 )
             await session.commit()
+
+    async def get_parents_by_child_ids(self, child_ids: list[str]) -> dict[str, dict]:
+        """Map leaf chunk ids → their parent row ``{id, text, meta}`` (parent_expand).
+
+        Self-joins the parent row so the returned text/meta come from the *parent* chunk,
+        not from the leaf that only references it.
+        """
+        if not child_ids:
+            return {}
+        parent = aliased(ChunkModel)
+        async with self.session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        ChunkModel.id,
+                        parent.id,
+                        parent.content_en,
+                        parent.meta,
+                    )
+                    .join(parent, parent.id == ChunkModel.parent_chunk_id)
+                    .where(ChunkModel.id.in_([UUID(c) for c in child_ids]))
+                )
+            ).all()
+        return {
+            str(child_id): {"id": str(parent_id), "text": text, "meta": meta}
+            for child_id, parent_id, text, meta in rows
+        }
