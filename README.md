@@ -8,17 +8,14 @@
 
 **DeepDive** is an **AI-powered learning workbench** for researchers, students, and lifelong learners — a **1-on-1 AI tutor** that walks you through anything you read or watch, from first skim to final review.
 
-- **1-on-1 AI Tutoring**: Load a paper, book, lecture, or video and ask about anything — get explanations, related sources, and discussion until it clicks, even as the video plays.
-- **Knowledge Synthesis**: Skim a 600-page book in minutes — get a structured summary or slide deck before you commit to reading it.
-- **Note-Taking That Sticks**: The tutor records and organizes your insights as you study, ready when you review.
-- **Learn Together**: Share files from the built-in cloud drive in shared workspaces and study the same material as a group.
-- **One Place, All Forms**: A fast web app, a desktop workbench that works offline, and a fully self-hosted AI engine — your materials stay yours.
+- **1-on-1 AI Tutoring**: Load a paper, book, lecture, or video — PDFs with tables, Office documents, and subtitled media included — and ask about anything. Get explanations grounded in the material, related sources, and discussion until it clicks, even as the video plays.
+- **Knowledge Synthesis**: Skim a 600-page book in minutes — get a structured summary, slide deck, or mind map before you commit to reading it.
+- **One Searchable Knowledge Base**: your cloud-drive files, Learning-Platform material, and chat Q&A live in a single query repository — one query searches all of it at once.
+- **Notes & Memory That Stick**: the tutor records your insights and remembers them across sessions — bookmarks and session memory ready when you review.
+- **Learn Together**: share files from the built-in cloud drive in shared workspaces and study the same material as a group.
+- **One Place, All Forms**: a fast web app, a desktop workbench that works offline, and a fully self-hosted AI engine — your materials stay yours.
 
-The engine is a native function-calling **agent** — an `AgentKernel` composition root that wires a cache-boundary prompt (a byte-stable static head so the provider reuses its prefix cache), deferred tool loading, dual-track memory (PostgreSQL tsvector + [pgvector](https://github.com/pgvector/pgvector) fused by RRF), a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop. A **hybrid search engine** finds context even when exact keywords are missing, and a **config-driven RAG pipeline** (pluggable nodes — rewrite → recall → RRF fusion → rerank, plus optional CJK segmentation, contextual enrichment, and parent/child indexing) grounds every chat answer.
-
-Model inference never runs inside the API: embedding (**[BGE-M3](https://huggingface.co/BAAI/bge-m3)** via [TEI](https://github.com/huggingface/text-embeddings-inference)) and **TTS ([Kokoro](https://github.com/hexgrad/kokoro))** are separate Docker services, and retrieval can be extracted behind a capability seam into its own **gRPC service**. **LLM calls** go directly to the provider channel pinned to the session (managed in the admin console), with the [LiteLLM](https://github.com/BerriAI/litellm) gateway as the legacy fallback. Async enrichment (TTS, images, explanations, session finalize) runs on an [arq](https://arq-docs.helpmanual.io/) **worker** off the request path.
-
-Also included: multi-user accounts with per-role quotas, **per-role LLM channels** (role ↔ credential bindings with one channel pinned per login), pay-as-you-go **billing** with atomic wallet deduction, a self-contained **admin console** (Providers / Roles / Users / Tokens / Tools config), **self-service accounts** (email-verified registration, password reset, editable profiles with avatars), and a desktop workbench with a file tree, a multi-format media viewer, one-click video screenshots, and a built-in **cloud note editor** (Markdown edit + preview) that edits your My Drive straight from the app.
+Dive deeper: [**Key Features**](#-key-features) walks through every feature, and [docs/architecture.md](docs/architecture.md) documents the design in full.
 
 ---
 
@@ -72,6 +69,8 @@ flowchart TB
     loop --> memory[MemoryService<br/>PG tsvector + pgvector RRF]
     tools --> sandbox[Sandbox<br/>READ / WRITE / NETWORK]
 ```
+
+> Agent kernel — design: [architecture.md §5 Agent Module](docs/architecture.md#5-agent-module).
 
 **Answering flow** — each turn runs the `ReactLoopAgent` step loop, which decides what to retrieve and
 composes the reply. It calls the **`rag_search` tool** (runs the RAG node pipeline and returns `top_k`
@@ -144,6 +143,7 @@ flowchart TB
 > keeps the file as an audit trail — it is never deleted; the recall gate skips only the deep
 > recall on non-memory-seeking turns (the Lane-1 brief always injects); cosmetic failures
 > (summary / title / compaction) never block the main flow.
+> Design: [architecture.md §5.4 — Memory, skills, sessions](docs/architecture.md#54-memory-skills-sessions).
 
 **Prompt — cache-boundary assembly, compression, and deferred tool stubs** (architecture, design
 features, and per-step process logic):
@@ -206,12 +206,14 @@ flowchart TB
 > unchanged; the per-message snip trims the request snapshot only, keeping the persistence copy raw;
 > mounted tools appear as stable defer_loading stubs, with the full schema riding in the tool_search
 > result.
+> Design: [architecture.md §16 — Prompt Module](docs/architecture.md#16-prompt-module).
 
 **RAG & Query Repository — a config-driven, plug-and-play retrieval pipeline** over one unified search
 corpus. A single query searches your cloud-drive files, Learning-Platform material, and chat Q&A
 together. The pipeline's node list *is* the retrieval topology: compose, reorder, toggle, and tune every
 stage from the admin console — live, no code, no restart. Feature walk-through in **Key Features** →
-**RAG & Query Repository**; the design detail lives in [architecture.md](docs/architecture.md) §10.
+[**RAG & Query Repository**](#-rag--query-repository); the design detail lives in
+[§10 RAG Module (architecture.md)](docs/architecture.md#10-rag-module-config-node-pipeline).
 
 ![RAG — config-driven node pipeline](./docs/images/rag-architecture.png)
 
@@ -320,11 +322,11 @@ flowchart TB
   *query rewrite → vector recall + keyword recall → RRF fusion → cross-encoder rerank*, plus two optional
   stages — *parent-expand* (widen a leaf hit to its parent chunk) and *relevance check* (drop chunks the
   LLM judges irrelevant). From admin **RAG → Nodes** you add / remove / reorder / enable / disable any
-  stage and edit its parameters live — no code, no restart.
+  stage and edit its parameters live — no code, no restart — [design: architecture.md §10.6](docs/architecture.md#106-nodes).
 - **Three input channels, one searchable corpus**: cloud-drive files, Learning-Platform sentences &
   articles, and chat Q&A all feed a single query repository, so one query retrieves across all of them.
   Each entry is tagged by source; learning / chat content stays visible to the user who imported it,
-  while files keep their usual sharing / ACL rules.
+  while files keep their usual sharing / ACL rules — [design: §10.8](docs/architecture.md#108-query-repository-multi-source-import).
 - **Import content & multiple text formats**: files get a **＋ Import to Knowledge** button and an
   "in knowledge" badge once indexed. Supported formats: plain text (`.txt` / `.md` / `.log` / `.json` /
   `.csv`), subtitles (`.srt` / `.vtt` / `.lrc`), Word (`.docx`), and PDF (`.pdf`). PDFs extract body text
@@ -332,25 +334,25 @@ flowchart TB
   never fatal). The Learning Platform lets you import saved sentences and write articles; chat lets you
   import a single reply (bound to its question) or organize a whole session — the LLM merges the same
   question's follow-up turns into one entry and splits distinct questions. Imported chat entries show a
-  persistent **✓ Imported** state.
+  persistent **✓ Imported** state — [design: §10.8](docs/architecture.md#108-query-repository-multi-source-import).
 - **Configurable chunking**: pick a split strategy — `fixed` sliding window, `paragraph`, `sentence`, or
   `semantic` — and set chunk size / overlap. Optionally enable **contextual** enrichment (an LLM-written
   context prefix per chunk), **parent/child** indexing, and **CJK** keyword search (jieba). All of it is
   driven from the admin console and applied on re-index; a **Chunking preview** tab shows exactly how a
-  strategy splits your text before you commit.
+  strategy splits your text before you commit — [design: §10.7](docs/architecture.md#107-ingest-side-runtime-configured-chunking).
 - **Parent/child (small-to-big), an input/output pair**: turn on parent/child **indexing** under chunking
   to store leaf chunks plus larger parent windows (retrieval searches the leaves), then add the
   **parent_expand** stage so a leaf hit returns its parent's fuller text. The admin **RAG → Repository**
-  tab lists every imported non-file chunk with a source badge and per-chunk delete.
+  tab lists every imported non-file chunk with a source badge and per-chunk delete — [design: §10.6](docs/architecture.md#106-nodes).
 - **Test before you ship**: the admin RAG module has a **Test** tab that runs the configured pipeline
   stage by stage and shows a per-node trace, and a golden-set **Eval** regression that scores
-  Recall@k / Precision@k / MRR against your expected answers.
+  Recall@k / Precision@k / MRR against your expected answers — [design: §10.10](docs/architecture.md#1010-admin-console).
 - **Domain-scoped search**: the `rag_search` tool takes an optional `domain` argument — retrieval
-  narrows to assets in that knowledge domain (file chunks only).
+  narrows to assets in that knowledge domain (file chunks only) — [design: §10.6](docs/architecture.md#106-nodes).
 - **Re-index & safe re-import**: an admin **Reindex** button re-ingests every ready file under the
-  latest chunking config; re-importing a source replaces its old chunks first — no duplicates.
+  latest chunking config; re-importing a source replaces its old chunks first — no duplicates — [design: §10.8](docs/architecture.md#108-query-repository-multi-source-import).
 - **Degrade, never break the chat**: when the retrieval stack is unavailable, the assistant answers
-  from its own knowledge with a notice instead of erroring or retrying.
+  from its own knowledge with a notice instead of erroring or retrying — [design: §10](docs/architecture.md#10-rag-module-config-node-pipeline).
 
 ### 🤖 AI-Powered Interactive Study
 - **Seamless Navigation**: Switch instantly between words using **"⬅️ Prev"** and **"Next ➡️"** buttons without closing the dialog.
