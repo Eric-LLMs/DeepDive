@@ -756,7 +756,11 @@ change takes effect on the next `POST /admin/rag/reindex` (re-ingests every READ
   concurrency, and the raw chunk is kept on any LLM failure.
 - **Parent/child indexing** — `split_hierarchy` emits parent chunks (`chunk_kind='parent'`) plus
   leaf chunks (`chunk_kind='leaf'`, `parent_chunk_id` → parent; parent ids are client-side UUIDs
-  assigned before insert). Parents are embedded too; recall searches `leaf` only.
+  assigned before insert). Parents are context only: they get a zero-vector sentinel and are
+  never vector-recalled (recall searches `leaf`; `parent_expand` fetches a parent by id), so large
+  documents don't blow the embed budget. Leaves embed + insert in incremental `embed_batch_size`
+  batches, so a worker timeout preserves already-committed chunks and a re-run re-does only the
+  remainder.
 - **CJK keywords** — `rag/cjk.py` lazily loads jieba; segmented tokens are stored in
   `chunks.content_search` and matched with `to_tsvector('simple', content_search) @@
   plainto_tsquery('simple', <segmented query>)` (GIN-indexed). English queries keep the original

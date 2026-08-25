@@ -1,4 +1,6 @@
 """Embedding via the TEI (Text Embeddings Inference) service + pgvector vector store."""
+import asyncio
+import random
 import uuid
 from uuid import UUID
 
@@ -27,9 +29,24 @@ class TEIEmbedder:
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        resp = await self._client.post("/embed", json={"inputs": texts, "normalize": True})
-        resp.raise_for_status()
-        return resp.json()
+        # Worker concurrency (10) × concurrent ingest batches can exceed TEI's
+        # --max-concurrent-requests, so 429 (and transient 5xx) is a normal "slow down"
+        # condition, not an outage — retry with exponential backoff. Connection errors still
+        # fail fast so a genuinely dead embedding service stalls nothing.
+        for attempt in range(4):
+            try:
+                resp = await self._client.post(
+                    "/embed", json={"inputs": texts, "normalize": True}
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status != 429 and not (500 <= status < 600):
+                    raise
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(0.5 * (2**attempt) + random.uniform(0, 0.2))
 
 
 class PgVectorStore:

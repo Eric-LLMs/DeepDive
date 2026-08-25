@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     # ── Worker / jobs ──
     worker_concurrency: int = 10         # arq max concurrent jobs
-    worker_job_timeout: int = 300        # arq per-job timeout (seconds)
+    worker_job_timeout: int = 3600       # arq per-job timeout (seconds) — large-file ingest (PDF parse + embed) can exceed a few minutes
     # Audit-event retention: a daily cron purges session_events older than this many days.
     # Only the audit log is swept; messages (the recall corpus) and sessions (summaries) stay.
     session_events_retention_days: int = 30

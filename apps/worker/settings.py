@@ -21,9 +21,10 @@ async def startup(ctx) -> None:
     ctx["llm"] = OpenAILLM()
     ctx["tts"] = TTSClient()
     ctx["images"] = ImageScraper()
-    # Batch embed (session finalize / sentence indexing) can exceed the chat-path fast-fail
-    # budget (5s) when messages are long; give the worker more headroom.
-    ctx["embedder"] = TEIEmbedder(timeout=60.0)
+    # Batch embed (session finalize / sentence indexing / RAG ingest) can exceed the
+    # chat-path fast-fail budget (5s) when inputs are long; a leaf batch of 16 chunks runs
+    # ~20-25s on TEI, so keep a generous headroom.
+    ctx["embedder"] = TEIEmbedder(timeout=120.0)
     ctx["session_factory"] = SessionLocal
     ctx["job_store"] = JobStore(SessionLocal)
 

@@ -46,6 +46,12 @@ async def _run(ctx, job_id: str, work) -> dict:
     await store.mark_running(uid)
     try:
         result = await work
+    except asyncio.CancelledError:
+        # arq cancels jobs past job_timeout (CancelledError is a BaseException, so a
+        # bare ``except Exception`` would swallow nothing — the job row would stay
+        # "running" forever). Record the honest terminal state before re-raising.
+        await store.mark_failed(uid, "job cancelled: worker job timeout exceeded")
+        raise
     except Exception as exc:  # noqa: BLE001 - record failure then re-raise for arq retries/logging
         await store.mark_failed(uid, str(exc))
         raise
@@ -208,32 +214,69 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
         chunks = await build_chunks(text, cfg, doc_title=asset.name, llm=ctx["llm"])
 
         await assets.set_status(asset_id, rag_status="EMBEDDING")
-        embeddings: list[list[float]] = []
-        for i in range(0, len(chunks), settings.embed_batch_size):
-            batch = chunks[i : i + settings.embed_batch_size]
-            embeddings.extend(await ctx["embedder"].embed([c.content_en for c in batch]))
+        # Drop previous chunks up front, then embed + insert incrementally per batch so a
+        # worker timeout preserves whatever already committed — a re-run re-does only the
+        # remainder instead of losing the whole document.
+        chunks_repo = SqlChunkRepository(ctx["session_factory"])
+        await chunks_repo.delete_by_asset(asset_id)
 
-        rows = [
+        # Parents are context only: recall searches leaf chunks (``chunk_kind='leaf'``) and
+        # parent_expand fetches parents by ID, so parent embeddings are never queried. Skipping
+        # them removes the ingest bottleneck — 3600-char parents pushed a 16-row batch to
+        # ~14k tokens, which TEI (max-batch-tokens 2048) took ~70s to embed, blowing the
+        # embedder timeout. Parents get a zero-vector sentinel to satisfy the NOT NULL column.
+        zero = [0.0] * settings.embedding_dim
+        parent_rows = [
             {
                 "id": c.id,
                 "content_en": c.content_en,
                 "content_cn": c.content_cn,
                 "meta": {**c.meta, "asset_id": str(asset_id)},
-                "embedding": emb,
+                "embedding": zero,
                 "chunk_kind": c.chunk_kind,
                 "parent_chunk_id": c.parent_chunk_id,
                 "content_search": c.content_search,
             }
-            for c, emb in zip(chunks, embeddings)
+            for c in chunks
+            if c.chunk_kind == "parent"
         ]
-        chunks_repo = SqlChunkRepository(ctx["session_factory"])
-        await chunks_repo.delete_by_asset(asset_id)
-        await chunks_repo.bulk_insert(asset_id, asset.user_id, asset.workspace_id, rows)
+        if parent_rows:
+            await chunks_repo.bulk_insert(
+                asset_id, asset.user_id, asset.workspace_id, parent_rows
+            )
+
+        # Leaf chunks embed + insert in batches; parents were inserted first so every
+        # ``parent_chunk_id`` reference is already satisfied.
+        inserted = len(parent_rows)
+        leaves = [c for c in chunks if c.chunk_kind != "parent"]
+        for i in range(0, len(leaves), settings.embed_batch_size):
+            batch = leaves[i : i + settings.embed_batch_size]
+            embeddings = await ctx["embedder"].embed([c.content_en for c in batch])
+            rows = [
+                {
+                    "id": c.id,
+                    "content_en": c.content_en,
+                    "content_cn": c.content_cn,
+                    "meta": {**c.meta, "asset_id": str(asset_id)},
+                    "embedding": emb,
+                    "chunk_kind": c.chunk_kind,
+                    "parent_chunk_id": c.parent_chunk_id,
+                    "content_search": c.content_search,
+                }
+                for c, emb in zip(batch, embeddings)
+            ]
+            await chunks_repo.bulk_insert(asset_id, asset.user_id, asset.workspace_id, rows)
+            inserted += len(batch)
         await assets.set_status(asset_id, rag_status="INDEXED")
-        return {"chunks": len(chunks)}
+        return {"chunks": inserted}
 
     try:
         return await _run(ctx, job_id, work())
+    except asyncio.CancelledError:
+        # Cancellation is a BaseException — it skips ``except Exception``. Mark the asset
+        # FAILED so the UI doesn't show a forever-stuck CHUNKING/EMBEDDING badge.
+        await assets.set_status(asset_id, rag_status="FAILED")
+        raise
     except Exception:
         # Keep the asset's rag_status in a terminal FAILED state so the UI can surface it
         # even though the job row itself carries the failure detail.

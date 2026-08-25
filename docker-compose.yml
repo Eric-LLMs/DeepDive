@@ -48,6 +48,10 @@ services:
   embedding:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
     container_name: deepdive-embedding
+    # max-batch-tokens kept at 2048 (not the model's 8192 cap): a higher budget speeds
+    # up batch embedding (fewer internal passes) but the warmup pre-allocation crashes on
+    # memory-constrained hosts (~5.5 GiB for 4096). Embedding parent chunks is skipped in
+    # the worker instead (parents are never vector-recalled), which removes the big batches.
     command: --model-id BAAI/bge-m3 --port 80 --max-batch-tokens 2048 --max-concurrent-requests 16
     ports:
       - "18080:80"

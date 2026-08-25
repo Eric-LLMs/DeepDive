@@ -8,6 +8,7 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 sse-starlette>=2.0
 python-multipart>=0.0.9
+PyJWT>=2.8
 
 # Data
 sqlalchemy[asyncio]>=2.0
@@ -27,6 +28,15 @@ tenacity>=8.2
 
 # MCP
 fastmcp>=0.2
+
+# CJK keyword channel (jieba segmentation; lazy-imported on first CJK query/ingest)
+jieba>=0.42
+
+# Document parsing for the query repository: PyMuPDF (PDF text + table detection →
+# vision transcription), python-docx (Word .docx). Both lazy-imported in
+# core/infrastructure/{pdf,ingest}.py so the API stays light until a file is ingested.
+PyMuPDF>=1.24
+python-docx>=1.1
 
 # gRPC (internal retrieval service)
 grpcio>=1.62
