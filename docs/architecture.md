@@ -609,6 +609,14 @@ is a `Node` running against a shared `PipelineContext` blackboard; the executor 
 the configured name list, runs them in order, records a per-node trace, and **degrades rather than
 stops** — one node failing appends an error and the pipeline continues downstream.
 
+**Design invariants** — the pipeline degrades, it never stops: a failing node appends an error and the
+downstream stages keep running; rewrite / HyDE failure falls back to the original query. If *every*
+ranking channel fails, retrieval raises `RetrievalUnavailable` so the `rag_search` tool answers from
+knowledge instead of returning a silent empty. Rerank is off until a `model_name` is configured; a CJK
+query routes through jieba segmentation when the CJK flag is on. Retrieval is a capability seam —
+`rag_search` calls `ctx.resolve("retrieval")`, so swapping the in-process `RAGPipeline` for the gRPC
+retrieval service (`RETRIEVAL_MODE=grpc`) needs no tool change.
+
 ### 10.1 Node contract
 
 The node contract lives in `rag/nodes/base.py`:
@@ -675,6 +683,20 @@ Optional nodes:
 |---|---|---|
 | `parent_expand` | `nodes/parent_expand.py` | small-to-big: leaf hit → parent-chunk text; sibling leaves deduped by `parent_chunk_id`, ordered by first-leaf position |
 | `crg_check` | `nodes/crg_check.py` | simplified CRAG: LLM judges relevant / ambiguous / irrelevant; drops hits judged irrelevant |
+
+**Per-node parameters** — each node declares a JSON `params_schema` + `default_params` that drive the
+admin-console node form (a node without a schema shows an empty editor):
+
+| node | param | type | default | meaning |
+|---|---|---|---|---|
+| `query_rewrite` | `n_variants` | int | `2` | extra query variants the LLM generates beyond the original; recall runs over every variant |
+| `query_rewrite` | `hyde` | bool | `false` | also generate a hypothetical answer doc (HyDE), embedded and searched alongside the variants |
+| `vector_recall` | — | — | — | no params; candidate count derives from the request `top_k` (`top_k × 2`) |
+| `keyword_recall` | — | — | — | no params; candidate count derives from the request `top_k` (`top_k × 2`) |
+| `rrf_fusion` | `k` | int | `60` | RRF smoothing constant: `score = Σ 1/(k + rank + 1)`, scale-free across recall channels |
+| `cross_encoder` | `model_name` | str | `""` | BGE reranker model id; **empty string disables the stage** (SKIPs) |
+| `parent_expand` | — | — | — | no params; its presence in the enabled node list *is* the on/off switch |
+| `crg_check` | `max_evidence_chars` | int | `800` | per-hit text prefix length sent to the LLM judge |
 
 **parent_child / parent_expand — an input/output pair, configured in different places.** They are two
 *independent* knobs, not one flag. The **input** side is the top-level config flag `parent_child`
