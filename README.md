@@ -262,6 +262,7 @@ flowchart TB
     %% ── ③ retrieval node pipeline ─────────────────────────────────
     subgraph RETR["Retrieval — config-driven node pipeline"]
         Q["user query · top_k<br/>+ filters.user_id · tenant binding<br/>owner / workspace / ACL · guest → public links"]
+        QC["QueryCache<br/>Redis · key(query, filters, top_k,<br/>config_version, corpus_version)<br/>pure accelerator · failure falls through"]
         REWRITE["QueryRewriter<br/>multi-query expansion + HyDE answer"]
         VEC["VectorRecaller<br/>pgvector cosine · BGE-M3 via TEI<br/>source-aware · LEFT JOIN assets"]
         KW["KeywordRecaller<br/>tsvector FTS · CJK via jieba<br/>source-aware · READY only for files"]
@@ -270,7 +271,10 @@ flowchart TB
         PE["ParentExpandNode<br/>leaf → parent · optional"]
         CRG["CrgCheckNode<br/>LLM relevance gate · optional"]
         OUT["top_k SearchHits<br/>ground the chat answer"]
+        FB["rag_feedback<br/>query · hits · rating → golden eval set"]
         Q --> REWRITE
+        Q -. cache hit → .-> QC
+        QC -.-> OUT
         REWRITE --> VEC
         REWRITE --> KW
         VEC --> RRF
@@ -281,10 +285,12 @@ flowchart TB
         RRF -. optional extension .-> PE
         PE --> CRG
         CRG --> OUT
+        OUT -. rated → .-> FB
     end
 
     EMBED -. source-aware recall<br/>leaf-only · LEFT JOIN assets .-> VEC
     EMBED -. source-aware recall .-> KW
+    EMBED -. ingest / re-index<br/>bumps corpus_version .-> QC
 
     %% ── ④ RAG pipeline config ─────────────────────────────────────
     subgraph CFG["RAG Pipeline Config · admin console RAG module"]
@@ -326,7 +332,10 @@ flowchart TB
 - **Deferred Tool Loading**: the prompt carries only a compact `name + blurb` catalog plus the resident `tool_search` meta-tool; matched tools appear in the visible set as stable `name + description` stubs (defer_loading style) so the cached tools array never churns, and each tool's full schema is returned in the `tool_search` result. The prompt window is also bounded by a per-message snip plus a token-aware autocompact that fires on a character budget.
 - **Dual-Track Memory**: session recall fuses PostgreSQL tsvector (keyword) + pgvector (semantic) via RRF, recency-weighted so newer messages win near-ties; when the embedding service is offline it degrades to tsvector-only — never a silent empty. `memory_search` / `memory_save` are tools; `memory_save` writes guardrailed notes (kebab-case key, length-capped content, closed type taxonomy) to the local memory directory while the session stays read-only. Proactive recall injects top hits for your question into the prompt, and long conversations are auto-compacted into an LLM summary (bounded token window).
 - **Skill Catalog**: skills (SKILL.md) are advertised as a one-line compressed index; the full instructions are lazy-loaded through the `skill` meta-tool.
-- **Read-Only Sandbox**: every tool call is gated by session permissions (READ / WRITE / NETWORK); file tools are rooted at the workspace dir and path escape is rejected. Writes and network access need an explicit grant or human approval.
+- **Read-Only Sandbox**: every tool call is gated by session permissions (READ / WRITE / NETWORK); file tools are rooted at the workspace dir and path escape is rejected. Writes and network access need an explicit grant or human approval. The `bash` tool runs behind a sandbox backend — **Docker** (production: one-shot container, workspace mounted read-write, network disabled by default, resource-capped) or a host sandbox (local development only, not a security boundary).
+- **Reliable LLM calls & per-turn budget**: every model call goes through a timeout/retry guard — a hard 90 s timeout (streams bound only the first token), exponential-backoff retries for transient errors only (timeout / 429 / 5xx), and an error taxonomy that never swallows cancellation; an SSE disconnect aborts the request at once and the turn closes cleanly. Each turn accumulates usage, is priced against `max_budget_usd`, and aborts the loop when the cap is crossed — accounting is per-turn, so concurrent turns never share it.
+- **Human-in-the-loop approvals**: a tool gated to **ASK** routes through a process-global approval bridge that emits an `approval-request` SSE event and blocks on your decision (`POST /approvals/{id}`; timeout → deny). In multi-node setups approvals resolve over Redis Pub/Sub; with no approver bound the tool is denied — safe by default.
+- **Plan mode, subagents & checkpoints**: the `plan` meta-tool streams an explicit step breakdown before acting; `run_subagent` spawns a bounded child turn (empty history, filtered tool set, depth/step-capped) that returns its final answer as the tool result; before each turn the workspace is snapshotted into an out-of-tree shadow git repo, so `revert_to_checkpoint` can roll back a bad batch of agent edits.
 - **RAG Retrieval**: a config-driven node pipeline — query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank, extensible with CJK segmentation, contextual enrichment, parent/child indexing, and domain filtering. Full feature walk-through in **RAG & Query Repository** below.
 - **Query Repository**: one search corpus for cloud-drive files (PDF tables transcribed via vision), Learning-Platform sentences/articles, and chat Q&A.
 - **SSE Streaming**: Real-time token streaming to the frontend.
@@ -364,7 +373,16 @@ flowchart TB
 - **Domain-scoped search**: the `rag_search` tool takes an optional `domain` argument — retrieval
   narrows to assets in that knowledge domain (file chunks only) — [design: §10.6](docs/architecture.md#106-nodes).
 - **Re-index & safe re-import**: an admin **Reindex** button re-ingests every ready file under the
-  latest chunking config; re-importing a source replaces its old chunks first — no duplicates — [design: §10.8](docs/architecture.md#108-query-repository-multi-source-import).
+  latest chunking config; re-importing a source replaces its old chunks first — no duplicates. Rebuilds
+  are atomic per asset (old chunks replaced in one step), so a worker timeout preserves already-committed
+  chunks; on completion the corpus version bumps, dropping stale cache hits immediately — [design: §10.12](docs/architecture.md#1012-query-cache--retrieval-feedback).
+- **Query cache**: repeated queries short-circuit through a Redis cache keyed on (query, filters,
+  top_k, config version, corpus version) — a topology change or a re-index invalidates automatically.
+  The cache is a pure accelerator: any failure falls through to the pipeline — [design: §10.12](docs/architecture.md#1012-query-cache--retrieval-feedback).
+- **Retrieval feedback loop**: a 👍/👎 rating for the chunks behind an answer is recorded via
+  `POST /rag/feedback` — each entry snapshots the query, the retrieved hits, and an optional reason
+  into `rag_feedback`, growing a golden dataset for eval and fine-tuning — [design: §10.12](docs/architecture.md#1012-query-cache--retrieval-feedback).
+  (The recording endpoint is live; the workbench UI that calls it is not wired up yet.)
 - **Degrade, never break the chat**: when the retrieval stack is unavailable, the assistant answers
   from its own knowledge with a notice instead of erroring or retrying — [design: §10](docs/architecture.md#10-rag-module-config-node-pipeline).
 

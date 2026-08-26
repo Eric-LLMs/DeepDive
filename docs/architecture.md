@@ -76,11 +76,11 @@
 |----|------|
 | Vocabulary subdomain | domains / terms / sentences / matches / materials / chunks (6 tables) |
 | Hybrid search | pgvector (semantic) + tsvector (keyword) + RRF fusion |
-| Agent runtime | `AgentKernel` composition root: cache-boundary `CacheBoundaryAssembler` (3 zones + `snapshot_key`) + deferred-tool `ToolGateway` + dual-track `MemoryService` (PG tsvector/pgvector RRF) + skill catalog + READ-only `Sandbox`, over `ReactLoopAgent` step loop + plugin `ToolRuntime` |
-| Retrieval | config-driven node pipeline (rewrite → recall → RRF → rerank, plus optional parent-expand / CRAG nodes; CJK + contextual + parent-child indexing); `in_process` default, gRPC service available; admin RAG console + golden-set eval (Recall@k / Precision@k / MRR) |
+| Agent runtime | `AgentKernel` composition root: cache-boundary `CacheBoundaryAssembler` (3 zones + `snapshot_key`) + deferred-tool `ToolGateway` + dual-track `MemoryService` (PG tsvector/pgvector RRF) + skill catalog + READ-only `Sandbox`, over `ReactLoopAgent` step loop + plugin `ToolRuntime`; `ReliableLLM` timeout/retry (error taxonomy + cancellation) + per-turn cost budget; HITL approvals (memory / Redis pub-sub broker); `run_subagent` (bounded child turns); `plan` meta-tool; shadow-git checkpoints (`revert_to_checkpoint`); Docker `BashSandbox` backend |
+| Retrieval | config-driven node pipeline (rewrite → recall → RRF → rerank, plus optional parent-expand / CRAG nodes; CJK + contextual + parent-child indexing); `in_process` default, gRPC service available (`AuthGuard` token gate / per-peer rate limit / tenant binding); admin RAG console + golden-set eval (Recall@k / Precision@k / MRR); Redis **query cache** (keyed by query/filters/top_k + config + corpus version); `POST /rag/feedback` golden-dataset recorder |
 | Query repository | unified multi-source corpus: cloud-drive files (`source_type='file'`) + Learning-Platform sentences/articles (`'learning'`) + chat Q&A pairs / LLM-grouped whole-session imports (`'chat'`); `chunks.asset_id` nullable + `source_type`/`source_id`, source-aware recall (both recallers `LEFT JOIN assets`); PDF tool chain (body text + tables rendered to PNG → vision LLM, per-table skip on failure); admin RAG → **Repository** tab lists non-file chunks with delete |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
-| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs` |
+| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the API's `AgentKernel` singleton for scheduled background turns |
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
@@ -102,6 +102,7 @@
 | Reranking | in-process cross-encoder exists but disabled (`reranker_model` empty); TEI reranker not wired |
 | GraphRAG node | graph-of-communities `graph_rag` node (LLM entity/relation extraction → community summaries → global/local search) designed only, see §10.6 |
 | Edge gateway | Traefik skeleton only; dev runs FastAPI directly on the host |
+| Retrieval-feedback UI | `POST /rag/feedback` + `rag_feedback` table exist (tests green), but no workbench/web UI calls the endpoint yet |
 
 ## 1. Product Positioning
 
@@ -413,6 +414,62 @@ visible-tool stubs).
   (the earliest matching message, truncated to 500 chars) so the client can show exactly where the
   match landed even when it is not in the title.
 
+### 5.5 Reliability & per-turn budget
+
+Every agent LLM call goes through :class:`~agent.llm.llm_guard.ReliableLLM` (wired once on the
+kernel, wrapping any ``AgentLLMPort``):
+
+- **hard timeout** — ``asyncio.wait_for`` (``settings.llm_timeout_seconds``, default 90 s); a hung
+  provider stalls the turn no longer. For streams the timeout bounds only the *first token*; once
+  deltas are flowing they forward untouched, so mid-stream failures surface to the loop as a step error.
+- **retry with exponential backoff** — tenacity retries only *temporary* errors
+  (``LLMTemporaryError``: timeout, 429, 5xx, connection hiccups) up to ``max_retries`` with
+  exponential backoff capped at 15 s; fatal errors surface immediately.
+- **error taxonomy** (:mod:`~agent.llm.llm_errors`) — ``classify`` maps any exception to
+  ``LLMTemporaryError`` (retryable) or ``LLMFatalError`` (auth, bad request, unknown) without
+  hard-coding an SDK; base-exception control flow (``CancelledError`` / ``KeyboardInterrupt`` /
+  ``SystemExit``) is passed through unchanged and **never caught by a retry loop**.
+- **cancellation** — an SSE disconnect aborts the underlying request at once; the loop logs
+  ``turn-cancelled``, closes session memory, and re-raises, so a dropped client never leaks state.
+
+The loop also enforces a **hard per-turn budget** (:class:`AgentTurn.max_budget_usd`, default
+``settings.max_budget_per_turn_usd``). Each step accumulates ``usage`` on the turn; after the step
+``estimate_cost_usd(turn.usage, model)`` prices it and `_budget_exceeded` aborts the loop once the
+accumulated cost crosses the cap (an ``error`` event is streamed on the SSE path). Cost, usage, and
+budget all live on the per-turn object — concurrent turns never share accounting.
+
+### 5.6 Human-in-the-loop: approvals, subagents, plan mode, checkpoints
+
+**Approvals** (:mod:`~agent.security.approvals`) — when the sandbox gates a tool to **ASK**, the
+runtime calls the process-global :class:`ApprovalBridge` wired as ``ToolRuntime(approval=bridge)``.
+The bridge reads the per-request :class:`ApprovalStore` bound to the current task via a contextvar
+(so concurrent requests never share approval state), emits an ``approval-request`` SSE event with the
+tool name / arguments / reason, and blocks on a decision future until
+``settings.approval_timeout_seconds`` (timeout → deny). ``POST /approvals/{id}`` resolves it. The
+:class:`ApprovalBroker` is **distributed**: state lives in Redis and resolutions wake the pending SSE
+across nodes via Redis Pub/Sub; :class:`MemoryApprovalBroker` is the single-process dev/tests
+fallback. A tool that ASKs with no approver bound **degrades to deny** — safe by default.
+
+**Subagents** (:mod:`~agent.tools.subagent`) — the ``run_subagent`` tool spawns a *bounded child
+turn*: a fresh ``AgentTurn`` (empty history) on the same runtime but with a filtered tool schema —
+no recursive ``run_subagent`` and no parent meta-tools (``tool_search`` / ``plan`` /
+``revert_to_checkpoint``) — capped at ``SUBAGENT_MAX_STEPS`` steps and ``max_subagent_depth``
+nesting (tracked in a task-local ``ContextVar``). The child runs in its own task with a copied
+context, so nested subagents on the shared kernel never interfere with the parent turn or each
+other; the child's final answer returns as the tool result and its messages are discarded.
+
+**Plan mode** (:mod:`~agent.tools.plan_tool`) — the ``plan`` meta-tool lets the model present an
+explicit multi-step breakdown before acting: it emits a ``{"type": "plan", "data": {goal, steps}}``
+event to the turn's progress sink (streamed as an SSE frame) and returns a confirmation. The loop
+needs no change — ``plan`` is just another tool the model may choose.
+
+**Checkpoints** (:mod:`~agent.tools.checkpoints`) — before each turn the kernel records a
+**shadow-git snapshot** of ``settings.workspace_dir`` into an *out-of-tree* git-dir
+(``settings.checkpoint_dir``), so ``revert_to_checkpoint`` / ``POST /checkpoints/{id}/revert`` can
+roll the workspace back to a known-good state after a bad batch of agent file edits. The shadow repo
+is initialized once with ignore rules in ``info/exclude`` (never a ``.gitignore`` in the user's
+workspace); large media and derived artifacts never enter a snapshot, keeping each commit small.
+
 ## 6. Tool Runtime
 
 The Agent core implements a plugin-based tool runtime in Python. The essentials:
@@ -506,6 +563,16 @@ host granted it or a human approver confirms. `ASK` with no approver degrades to
 rejected (`_resolve`). The desktop workbench's "generate media" flow (`/media/generate` → worker
 `generate_media`) stays a separate HTTP+job pipeline, not an agent tool.
 
+**`bash_sandbox.py`** — where the ``bash`` tool's commands actually run, two backends behind one
+:class:`BashSandbox` protocol (`settings.bash_sandbox` = ``"docker"`` | ``"host"``, default
+``"host"``):
+- :class:`DockerBashSandbox` — the **production path**: each command runs in a fresh, one-shot
+  container (docker-py) with the workspace mounted read-write, **network disabled by default**,
+  memory/CPU caps, and a call-level timeout. Real isolation lives here.
+- :class:`HostBashSandbox` — a hardened **local-development-only** fallback: the command runs on
+  the host process, so it is **not a security boundary** — only a best-effort workspace-escape
+  guard (:func:`assert_no_escape`), a hard timeout, and an output cap.
+
 ## 7. Capability Seam (Definition / Provider / Consumer)
 
 ```
@@ -587,6 +654,14 @@ A daily retention cron (`prune_session_events`, registered in `WorkerSettings.cr
 `session_events` older than `SESSION_EVENTS_RETENTION_DAYS` (30); only the audit log is purged —
 `messages` (the recall corpus) and `sessions` (summaries) are deliberately kept.
 
+**Background agent turns** — the `run_agent_turn` job (cron / scheduled activity) runs one agent
+turn for a user/session in the worker. It **reuses the API's hardened `AgentKernel` singleton**, so
+a scheduled turn gets exactly the same prompt assembly, recall, approvals, telemetry, and budget
+guard as an interactive one — no second, drift-prone kernel construction in the worker. The answer
+lands in the session like a normal chat message and `session_finalize` is deferred exactly as in the
+interactive path (payload: `user_id` / `session_id` / `message`, plus optional `model` / `base_url` /
+`api_key` to pin an LLM channel).
+
 ## 9. Retrieval Service (gRPC)
 
 Contract (`proto/retrieval/v1/retrieval.proto`, `package retrieval.v1`):
@@ -605,6 +680,24 @@ message SearchHit { string id = 1; string text = 2; double score = 3; string met
 - `apps/retrieval/main.py` starts `grpc.aio.server()` on `RETRIEVAL_GRPC_ADDR`.
 - `core/infrastructure/retrieval_grpc.py` (`GrpcRetriever`) maps proto `SearchHit` back to dicts.
 - Codegen: `scripts/gen_proto.sh` (buf if present, else `grpc_tools.protoc`) → `packages/shared/proto/retrieval/v1/`.
+
+Every `Retrieve` is gated by an :class:`AuthGuard` (in `apps/retrieval/server.py`) before reaching
+the pipeline:
+
+- **token gate** — a shared secret from gRPC metadata (`authorization: Bearer <token>`); an empty
+  ``token`` disables auth so local development needs no secret. Wrong/missing token →
+  ``UNAUTHENTICATED``.
+- **per-peer rate limit** — a per-peer token bucket when ``rate_limit > 0`` (0 = unlimited);
+  an exhausted bucket → ``RESOURCE_EXHAUSTED``.
+- **tenant binding** — the pipeline only applies its owner / workspace / ACL visibility predicate
+  when a ``user_id`` filter is present; a request without one reads across every tenant. The guard
+  therefore **requires** a non-empty ``user_id`` (or an explicit ``guest=1`` marker) and rejects
+  anything else with ``PERMISSION_DENIED``. A guest resolves to ``user_id=None``, which the recall
+  nodes treat as public-link assets only.
+
+``Health`` is deliberately unauthenticated (a liveness probe that leaks no data). On the client
+side, `GrpcRetriever` stringifies the filter values (UUIDs → str) and attaches the same Bearer
+token as metadata, normalizing a guest `user_id=None` to the ``guest=1`` marker on the wire.
 
 ## 10. RAG Module (Config-Node Pipeline)
 
@@ -861,6 +954,32 @@ Defined in migration `0010_rag_pipeline.sql`:
 `chunks.parent_chunk_id` (FK → `chunks.id` ON DELETE SET NULL), `chunks.chunk_kind` (default
 `'leaf'`), `chunks.content_search TEXT NULL`; indexes on `parent_chunk_id` and GIN on
 `to_tsvector('simple', content_search)`.
+
+### 10.12 Query cache & retrieval feedback
+
+**Query cache** (`rag/query_cache.py`) — a Redis cache in front of any `Retriever` (in-process
+`RAGPipeline` or the gRPC client), keyed by `(query, filters, top_k, config-version, corpus-version)`:
+
+- **config change** — the key embeds a hash of the current node config, so a new topology
+  invalidates automatically (no explicit flush needed).
+- **corpus change** — a `rag:corpus_version` Redis counter is bumped on every ingest / re-index
+  (worker `asset_ingest` / `learning_import` / `chat_session_import`, admin `reindex`); the version
+  is part of the key, so stale hits vanish as soon as the corpus moves.
+- **degradation contract** — the cache is a pure accelerator: Redis down, a missing value, or a
+  write failure all fall through to the wrapped retriever, so a retrieval is never failed by the
+  cache. Disabled when `query_cache_ttl_seconds <= 0` or no Redis client is bound
+  (`wrap_retriever` returns the inner retriever untouched).
+
+**Incremental re-index** — `POST /admin/rag/reindex` re-ingests every READY asset under the current
+chunking config. Per asset the rebuild is atomic (delete-by-asset + bulk insert) so a worker timeout
+preserves already-committed chunks and a re-run redoes only the remainder; on completion the corpus
+version bumps, dropping stale query-cache hits immediately.
+
+**Retrieval feedback** (`rag_feedback` table, `RagFeedbackModel`) — `POST /rag/feedback` persists a
+👍/👎 rating for the chunks behind an answer. Each row snapshots the query, the retrieved hits
+(`id` / `score` / text), the rating, and an optional reason, so the corpus becomes a **golden
+dataset** for future fine-tuning / eval without re-running retrieval. The endpoint and table are
+implemented (with tests); a rating UI that calls it is not wired up yet.
 
 ## 11. Feature → Mechanism Map
 
