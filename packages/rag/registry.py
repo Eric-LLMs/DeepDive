@@ -65,8 +65,15 @@ def _import_and_register() -> None:
     Importing a node module is a pure class definition (no side effects), so this is
     safe to call repeatedly; the registry raises if a name were ever registered twice.
     """
-    from rag.nodes import crg_check, cross_encoder, keyword_recall, parent_expand
-    from rag.nodes import query_rewrite, rrf_fusion, vector_recall
+    from rag.nodes import (
+        crg_check,
+        cross_encoder,
+        keyword_recall,
+        parent_expand,
+        query_rewrite,
+        rrf_fusion,
+        vector_recall,
+    )
 
     for cls in (
         query_rewrite.QueryRewriteNode,

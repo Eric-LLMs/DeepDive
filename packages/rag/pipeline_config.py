@@ -10,7 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from core.config import Settings, settings as _env_settings
+from core.config import Settings
+from core.config import settings as _env_settings
 
 
 @dataclass
@@ -42,7 +43,7 @@ class RagPipelineConfig:
         return [n for n in self.nodes if n.enabled]
 
     @classmethod
-    def default(cls, s: Settings | None = None) -> "RagPipelineConfig":
+    def default(cls, s: Settings | None = None) -> RagPipelineConfig:
         """Seed config matching the current env settings (behavior-identical to pre-refactor)."""
         s = s or _env_settings
         return cls(
@@ -80,7 +81,7 @@ class RagPipelineConfig:
         }
 
     @classmethod
-    def from_dict(cls, raw: dict) -> "RagPipelineConfig":
+    def from_dict(cls, raw: dict) -> RagPipelineConfig:
         chunking = raw.get("chunking") or {}
         nodes = []
         for n in raw.get("nodes", []):

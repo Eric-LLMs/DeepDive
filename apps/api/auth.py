@@ -18,12 +18,8 @@ import hmac
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
-
-from fastapi import Depends, HTTPException
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select, update
 
 from core.infrastructure.db import (
     LoginTokenModel,
@@ -34,10 +30,13 @@ from core.infrastructure.db import (
 from core.infrastructure.security import (
     get_role,
     get_setting,
-    set_setting,
     hash_token,
+    set_setting,
     verify_password,
 )
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select, update
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -70,12 +69,12 @@ async def _lookup_token(token: str) -> LoginTokenModel:
         ).scalar_one_or_none()
         if row is None or not row.is_active:
             raise HTTPException(status_code=401, detail="Invalid or revoked token")
-        if row.expires_at is not None and row.expires_at < datetime.now(timezone.utc):
+        if row.expires_at is not None and row.expires_at < datetime.now(UTC):
             raise HTTPException(status_code=401, detail="Token expired")
         await session.execute(
             update(LoginTokenModel)
             .where(LoginTokenModel.id == row.id)
-            .values(last_used_at=datetime.now(timezone.utc))
+            .values(last_used_at=datetime.now(UTC))
         )
         await session.commit()
     return row

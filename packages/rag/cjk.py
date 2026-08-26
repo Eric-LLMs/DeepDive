@@ -24,7 +24,7 @@ def _get_segmenter():
     """Lazily import jieba (heavy first-load dictionary build) and cache it."""
     global _segmenter
     if _segmenter is None:
-        import jieba  # noqa: PLC0415 - heavy, lazy first load
+        import jieba
 
         _segmenter = jieba
     return _segmenter

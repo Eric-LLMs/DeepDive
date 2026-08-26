@@ -7,9 +7,9 @@ retrieval is built from the new topology.
 """
 from __future__ import annotations
 
+from rag.nodes.base import Node
 from rag.pipeline_config import RagPipelineConfig
 from rag.registry import registry
-from rag.nodes.base import Node
 
 _loaded: RagPipelineConfig | None = None
 
@@ -73,7 +73,7 @@ def validate(cfg: RagPipelineConfig) -> list[str]:
         for key, value in nc.params.items():
             if key not in schema:
                 errors.append(f"node '{nc.name}' has unknown param '{key}'")
-            elif not isinstance(value, type(None)) and isinstance(schema[key], dict):
+            elif not (value is None) and isinstance(schema[key], dict):
                 ptype = schema[key].get("type")
                 if ptype == "integer" and not isinstance(value, int):
                     errors.append(f"param '{nc.name}.{key}' must be an integer")

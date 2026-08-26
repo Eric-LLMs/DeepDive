@@ -19,8 +19,8 @@ import time
 from dataclasses import dataclass
 
 from rag.context import NodeTrace, PipelineContext, RagRequest
-from rag.registry import registry
 from rag.pipeline_config import RagPipelineConfig
+from rag.registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ class RAGPipeline:
             started = time.perf_counter()
             try:
                 status = await node.run(ctx, self.deps)
-            except Exception as exc:  # noqa: BLE001 - degrade, never stop the pipeline
+            except Exception as exc:
                 status = "FAIL"
                 ctx.errors.append(f"{nc.name}: {exc!r}")
                 logger.exception("rag node '%s' failed", nc.name)

@@ -14,15 +14,15 @@ from agent.plugins.hooks import (
 from agent.plugins.manager import PluginManager
 
 __all__ = [
+    "POST_TOOL_USE",
+    "PRE_TOOL_USE",
+    "SESSION_END",
+    "SESSION_START",
+    "TOOL_EXECUTE",
+    "TOOL_RESULT",
     "Plugin",
     "PluginManager",
-    "register_builtin_plugins",
-    "SESSION_START",
-    "SESSION_END",
-    "PRE_TOOL_USE",
-    "TOOL_EXECUTE",
-    "POST_TOOL_USE",
-    "TOOL_RESULT",
-    "waterfall",
     "observe",
+    "register_builtin_plugins",
+    "waterfall",
 ]

@@ -6,6 +6,8 @@ name across runs, so a per-query node construction does not reload it.
 """
 from __future__ import annotations
 
+from typing import ClassVar
+
 from rag.nodes.base import Node, NodeStatus
 from rag.rank.cross_encoder import CrossEncoderReranker
 
@@ -22,7 +24,7 @@ class CrossEncoderNode(Node):
     name = "cross_encoder"
     display_name = "Cross Encoder Rerank"
     stage = "ranking"
-    params_schema = {
+    params_schema: ClassVar[dict] = {
         "type": "object",
         "properties": {
             "model_name": {
@@ -32,7 +34,7 @@ class CrossEncoderNode(Node):
         },
         "required": [],
     }
-    default_params = {"model_name": ""}
+    default_params: ClassVar[dict] = {"model_name": ""}
     description = "Content-based rerank of the fused candidates with a BGE cross-encoder; SKIPs (no-op) while model_name is empty."
 
     async def run(self, ctx, deps) -> NodeStatus:

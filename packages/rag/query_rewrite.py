@@ -50,7 +50,7 @@ class QueryRewriter:
             parsed = json.loads(_strip_code_fence(raw))
             variants = [str(q).strip() for q in parsed if isinstance(q, str) and str(q).strip()]
             return variants[: self.n_variants]
-        except Exception:
+        except Exception:  # noqa: BLE001 - deliberate degrade: never fail the pipeline
             # LLM unreachable (gateway 503, timeout, …) or returned unparsable JSON —
             # never fail the pipeline, just keep the original query.
             return []
@@ -62,7 +62,7 @@ class QueryRewriter:
         try:
             raw = await self.llm.complete(prompt, system)
             return raw or None
-        except Exception:
+        except Exception:  # noqa: BLE001 - deliberate degrade: no HyDE doc on LLM failure
             # Same degrade as multi-query: a down LLM means "no hypothetical document",
             # so recall vectorizes the original query.
             return None
@@ -73,6 +73,5 @@ def _strip_code_fence(raw: str) -> str:
     text = raw.strip()
     if text.startswith("```"):
         text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:]
+        text = text.removeprefix("json")
     return text.strip()

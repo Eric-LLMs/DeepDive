@@ -6,6 +6,8 @@ never a pipeline-stopper.
 """
 from __future__ import annotations
 
+from typing import ClassVar
+
 from rag.nodes.base import Node, NodeStatus
 from rag.query_rewrite import QueryRewriter
 
@@ -13,7 +15,7 @@ from rag.query_rewrite import QueryRewriter
 class QueryRewriteNode(Node):
     name = "query_rewrite"
     display_name = "Query Rewrite"
-    params_schema = {
+    params_schema: ClassVar[dict] = {
         "type": "object",
         "properties": {
             "n_variants": {"type": "integer", "description": "Extra query variants to generate"},
@@ -21,7 +23,7 @@ class QueryRewriteNode(Node):
         },
         "required": [],
     }
-    default_params = {"n_variants": 2, "hyde": False}
+    default_params: ClassVar[dict] = {"n_variants": 2, "hyde": False}
     description = "LLM expands the question into N variant queries (optionally a HyDE hypothetical doc); falls back to the original query on LLM failure."
 
     async def run(self, ctx, deps) -> NodeStatus:

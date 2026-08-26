@@ -8,7 +8,8 @@ Hooks are expressed as named events on the :class:`EventBus`:
 
 A plugin listener is a ``(kind, event, handler)`` tuple; the manager mounts it onto the bus.
 """
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 # Event name constants
 SESSION_START = "agent/session-start"

@@ -16,7 +16,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -85,5 +86,5 @@ class EventBus:
             result = handler(payload)
             if inspect.isawaitable(result):
                 await result
-        except Exception:  # noqa: BLE001 - observers must not break the pipeline
+        except Exception:
             logger.exception("observer %s failed", name)

@@ -15,7 +15,7 @@ from uuid import UUID
 from agent import Context, ToolExecution, ToolOutput, ToolRuntime, define_tool, text_block
 from core.infrastructure import pdf as pdf_lib
 from core.infrastructure.drive_repositories import SqlAssetRepository
-from core.infrastructure.storage import get_storage, object_key
+from core.infrastructure.storage import object_key
 
 log = logging.getLogger(__name__)
 

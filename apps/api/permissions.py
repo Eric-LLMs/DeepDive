@@ -3,9 +3,8 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import HTTPException
-
 from core.application.drive_service import DriveError, DriveService
+from fastapi import HTTPException
 
 
 def _http(e: DriveError) -> HTTPException:

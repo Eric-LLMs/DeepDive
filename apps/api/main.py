@@ -1031,7 +1031,9 @@ async def update_me(
 
 @app.post("/auth/me/avatar")
 async def upload_avatar(
-    file: UploadFile = File(...), user: AuthUser = Depends(require_user)
+    # B008: FastAPI requires the File() marker in the default — not a pre-executed call.
+    file: UploadFile = File(...),  # noqa: B008
+    user: AuthUser = Depends(require_user),
 ) -> dict:
     """Accept an avatar image (PNG/JPG/WEBP/GIF ≤ 2 MB), store it, and record its URL."""
     allowed = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}

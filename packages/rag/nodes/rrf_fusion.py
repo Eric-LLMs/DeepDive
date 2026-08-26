@@ -6,6 +6,8 @@ different scales fuse fairly.
 """
 from __future__ import annotations
 
+from typing import ClassVar
+
 from rag.nodes.base import Node, NodeStatus
 from rag.rank.rrf import rrf_fusion
 
@@ -14,14 +16,14 @@ class RrfFusionNode(Node):
     name = "rrf_fusion"
     display_name = "RRF Fusion"
     stage = "ranking"
-    params_schema = {
+    params_schema: ClassVar[dict] = {
         "type": "object",
         "properties": {
             "k": {"type": "integer", "description": "RRF constant (default 60)"},
         },
         "required": [],
     }
-    default_params = {"k": 60}
+    default_params: ClassVar[dict] = {"k": 60}
     description = "Fuses every per-channel ranking into one result list via Reciprocal Rank Fusion (rank-only, scale-free). Required: the recall channels only produce rankings."
 
     async def run(self, ctx, deps) -> NodeStatus:

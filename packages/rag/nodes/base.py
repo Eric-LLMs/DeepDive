@@ -13,7 +13,7 @@ params alone.
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     from rag.context import PipelineContext
@@ -30,12 +30,12 @@ class Node:
     name: str = "base"                                    # unique registry id
     display_name: str = "Base"                            # human label for the console
     stage: str = "transform"                              # "transform" | "ranking"
-    params_schema: dict = {                               # JSON Schema → console form
+    params_schema: ClassVar[dict] = {                     # JSON Schema → console form
         "type": "object",
         "properties": {},
         "required": [],
     }
-    default_params: dict = {}                             # console pre-fill (mirrors runtime defaults)
+    default_params: ClassVar[dict] = {}                   # console pre-fill (mirrors runtime defaults)
     description: str = ""                                 # one-line "what this stage does" for the console
 
     def __init__(self, params: dict | None = None) -> None:

@@ -11,8 +11,9 @@ pipeline state mid-flight.
 """
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -36,15 +37,15 @@ class PreToolDecision:
     reason: str | None = None
 
     @classmethod
-    def allow(cls) -> "PreToolDecision":
+    def allow(cls) -> PreToolDecision:
         return cls(kind="allow")
 
     @classmethod
-    def deny(cls, reason: str) -> "PreToolDecision":
+    def deny(cls, reason: str) -> PreToolDecision:
         return cls(kind="deny", reason=reason)
 
     @classmethod
-    def ask(cls, reason: str | None = None) -> "PreToolDecision":
+    def ask(cls, reason: str | None = None) -> PreToolDecision:
         return cls(kind="ask", reason=reason)
 
 
@@ -59,11 +60,11 @@ class PostToolDecision:
     additional_contexts: list[Any] = field(default_factory=list)
 
     @classmethod
-    def accept(cls, **kwargs) -> "PostToolDecision":
+    def accept(cls, **kwargs) -> PostToolDecision:
         return cls(kind="accept", **kwargs)
 
     @classmethod
-    def block(cls, feedback: str, **kwargs) -> "PostToolDecision":
+    def block(cls, feedback: str, **kwargs) -> PostToolDecision:
         return cls(kind="block", feedback=feedback, **kwargs)
 
 

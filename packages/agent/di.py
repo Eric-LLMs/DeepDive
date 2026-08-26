@@ -13,8 +13,9 @@ immediately resolvable, so plugin ``inject`` names may be satisfied either by an
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, ClassVar
 
 
 class CapabilityError(RuntimeError):
@@ -55,7 +56,7 @@ class Fiber:
 
 
 class Context:
-    def __init__(self, parent: "Context | None" = None) -> None:
+    def __init__(self, parent: Context | None = None) -> None:
         self._parent = parent
         self._externals: dict[str, Any] = {}  # capability name -> external value (immediate)
         self._fibers: dict[str, Fiber] = {}  # provider name -> Fiber (plugins/services)
@@ -85,7 +86,7 @@ class Context:
             return True
         return self._parent.has(name) if self._parent is not None else False
 
-    def extend(self, **meta: Any) -> "Context":
+    def extend(self, **meta: Any) -> Context:
         """Create a child scope (fallback to parent on miss)."""
         return Context(parent=self)
 
@@ -110,7 +111,7 @@ class Context:
         """Register a plugin (a packaging unit with ``inject``/``provides``)."""
         self._add_fiber(plugin.name, list(plugin.inject), dict(plugin.provides), mount, unmount)
 
-    def service(self, service: "Service") -> None:
+    def service(self, service: Service) -> None:
         """Register a class-based :class:`Service` provider."""
         self._add_fiber(
             service._name,
@@ -203,7 +204,7 @@ class Service:
     """
 
     provide: str = ""
-    inject: list[str] = []
+    inject: ClassVar[list[str]] = []
 
     def __init__(self, ctx: Context | None = None, name: str | None = None) -> None:
         self.ctx = ctx
@@ -211,8 +212,8 @@ class Service:
         if ctx is not None and self._name:
             ctx.service(self)
 
-    def start(self) -> None:  # noqa: B027 - intentional no-op hook
+    def start(self) -> None:
         pass
 
-    def stop(self) -> None:  # noqa: B027 - intentional no-op hook
+    def stop(self) -> None:
         pass

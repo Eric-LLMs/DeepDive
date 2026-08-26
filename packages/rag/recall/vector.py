@@ -1,5 +1,6 @@
 """Semantic recall: pgvector cosine similarity."""
 from core.ports.vector import VectorStorePort
+
 from rag.recall.base import Recaller
 from rag.types import SearchHit
 

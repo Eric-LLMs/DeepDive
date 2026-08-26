@@ -12,6 +12,7 @@ silently.
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 
 from rag.nodes.base import Node, NodeStatus
 
@@ -38,8 +39,7 @@ def _strip_code_fence(raw: str) -> str:
     text = raw.strip()
     if text.startswith("```"):
         text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:]
+        text = text.removeprefix("json")
     return text.strip()
 
 
@@ -47,7 +47,7 @@ class CrgCheckNode(Node):
     name = "crg_check"
     display_name = "CRAG Relevance Check"
     stage = "ranking"
-    params_schema = {
+    params_schema: ClassVar[dict] = {
         "type": "object",
         "properties": {
             "max_evidence_chars": {
@@ -57,7 +57,7 @@ class CrgCheckNode(Node):
         },
         "required": [],
     }
-    default_params = {"max_evidence_chars": 800}
+    default_params: ClassVar[dict] = {"max_evidence_chars": 800}
     description = "Simplified CRAG: LLM judges the top evidence relevant / ambiguous / irrelevant; drops hits judged irrelevant. A parse failure keeps the hits (never empties the result)."
 
     async def run(self, ctx, deps) -> NodeStatus:

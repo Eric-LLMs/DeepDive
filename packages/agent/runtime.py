@@ -15,7 +15,7 @@ Registration is reversible: ``register`` and ``guard`` both return a disposer ca
 from __future__ import annotations
 
 import inspect
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 from agent.decisions import (
     ContentBlock,
