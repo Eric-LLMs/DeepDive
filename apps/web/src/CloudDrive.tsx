@@ -54,6 +54,25 @@ function fmtDate(s: string | null): string {
   return s ? new Date(s).toLocaleString() : "—";
 }
 
+// Coarse ingest ETA for the "Processing…" countdown. Real ingest time varies wildly (PDF
+// table vision, LLM contextual enrichment), so this is a floor + size-proportional term,
+// clamped and clearly approximate; the phase badge + 5s auto-refresh count it down live.
+function estimateIngestSeconds(size: number, name: string): number {
+  const mb = Math.max(0.1, (size || 0) / (1024 * 1024));
+  const perMb = name.toLowerCase().endsWith(".pdf") ? 12 : 6; // PDF table vision is slower
+  return Math.min(600, Math.round(20 + mb * perMb));
+}
+
+function ingestEtaRemaining(size: number, name: string, startMs?: number): number {
+  if (!startMs) return 0;
+  return Math.max(0, estimateIngestSeconds(size, name) - Math.floor((Date.now() - startMs) / 1000));
+}
+
+function ingestEtaSuffix(size: number, name: string, startMs?: number): string {
+  const remain = ingestEtaRemaining(size, name, startMs);
+  return remain > 0 ? ` · ~${remain}s` : "";
+}
+
 function toHex(buf: ArrayBuffer): string {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
@@ -1056,6 +1075,9 @@ export default function CloudDrive() {
     Record<string, "importing" | "ok" | "err">
   >({});
   const [importError, setImportError] = useState<Record<string, string>>({});
+  // When a file is first seen mid-ingest, remember the wall-clock time so the button can
+  // show an approximate ~Ns countdown (see ingestEtaRemaining).
+  const [ingestStart, setIngestStart] = useState<Record<string, number>>({});
   const importToRepo = useCallback(
     async (f: DriveFile) => {
       setImportState((s) => ({ ...s, [f.id]: "importing" }));
@@ -1082,6 +1104,19 @@ export default function CloudDrive() {
     const t = window.setInterval(load, REFRESH_MS);
     return () => window.clearInterval(t);
   }, [files, load]);
+
+  // Record the start time (once) when a file enters a WORKING phase, for the countdown.
+  useEffect(() => {
+    let changed = false;
+    const next: Record<string, number> = { ...ingestStart };
+    for (const f of files) {
+      if (RAG_WORKING.has(f.rag_status) && !(f.id in next)) {
+        next[f.id] = Date.now();
+        changed = true;
+      }
+    }
+    if (changed) setIngestStart(next);
+  }, [files, ingestStart]);
 
   const curKey = locKey(loc);
 
@@ -1956,6 +1991,16 @@ export default function CloudDrive() {
                             >
                               Importing…
                             </button>
+                          ) : RAG_WORKING.has(f.rag_status) ? (
+                            <button
+                              className="ghost"
+                              disabled
+                              title="Already queued / processing — flips to In Knowledge when done"
+                            >
+                              {f.rag_status === "PENDING"
+                                ? "Queued…"
+                                : `Processing…${ingestEtaSuffix(f.size, f.name, ingestStart[f.id])}`}
+                            </button>
                           ) : RAG_IMPORTABLE_EXTS.has(fileExt(f.name)) ? (
                             <button
                               className={`ghost${importState[f.id] === "err" ? " danger" : ""}`}
@@ -1966,9 +2011,7 @@ export default function CloudDrive() {
                                   : "Import this file into your searchable knowledge"
                               }
                             >
-                              {importState[f.id] === "ok" && RAG_WORKING.has(f.rag_status)
-                                ? "✓ Imported"
-                                : importState[f.id] === "err"
+                              {importState[f.id] === "err"
                                 ? "Failed — retry"
                                 : "＋ Import to Knowledge"}
                             </button>

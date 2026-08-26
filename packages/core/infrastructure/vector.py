@@ -31,9 +31,10 @@ class TEIEmbedder:
     async def embed(self, texts: list[str]) -> list[list[float]]:
         # Worker concurrency (10) × concurrent ingest batches can exceed TEI's
         # --max-concurrent-requests, so 429 (and transient 5xx) is a normal "slow down"
-        # condition, not an outage — retry with exponential backoff. Connection errors still
-        # fail fast so a genuinely dead embedding service stalls nothing.
-        for attempt in range(4):
+        # condition, not an outage — retry with exponential backoff (~0.5/1/2/4/8s) so a
+        # burst of concurrent ingests backs off instead of failing the job. Connection errors
+        # still fail fast so a genuinely dead embedding service stalls nothing.
+        for attempt in range(6):
             try:
                 resp = await self._client.post(
                     "/embed", json={"inputs": texts, "normalize": True}
@@ -44,7 +45,7 @@ class TEIEmbedder:
                 status = exc.response.status_code
                 if status != 429 and not (500 <= status < 600):
                     raise
-                if attempt == 3:
+                if attempt == 5:
                     raise
                 await asyncio.sleep(0.5 * (2**attempt) + random.uniform(0, 0.2))
 

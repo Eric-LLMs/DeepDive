@@ -59,6 +59,24 @@ async def _run(ctx, job_id: str, work) -> dict:
     return result
 
 
+# Serialize asset_ingest per asset. Upload auto-enqueue (complete_upload), the manual
+# cloud-drive "Import to Knowledge" button, and admin reindex can all enqueue the same
+# asset; two jobs racing their delete-by-asset + incremental insert would delete each
+# other's parent chunks mid-flight and hit ``chunks_parent_chunk_id_fkey``.
+_asset_ingest_locks: dict[str, asyncio.Lock] = {}
+_asset_ingest_locks_guard = asyncio.Lock()
+
+
+async def _asset_ingest_lock(asset_id: str) -> asyncio.Lock:
+    """Return the per-asset ingest lock, creating it on first use."""
+    async with _asset_ingest_locks_guard:
+        lock = _asset_ingest_locks.get(asset_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _asset_ingest_locks[asset_id] = lock
+        return lock
+
+
 async def tts(ctx, job_id: str, payload: dict) -> dict:
     async def work() -> dict:
         path = await ctx["tts"].synthesize(payload["text"])
@@ -270,18 +288,23 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
         await assets.set_status(asset_id, rag_status="INDEXED")
         return {"chunks": inserted}
 
-    try:
-        return await _run(ctx, job_id, work())
-    except asyncio.CancelledError:
-        # Cancellation is a BaseException — it skips ``except Exception``. Mark the asset
-        # FAILED so the UI doesn't show a forever-stuck CHUNKING/EMBEDDING badge.
-        await assets.set_status(asset_id, rag_status="FAILED")
-        raise
-    except Exception:
-        # Keep the asset's rag_status in a terminal FAILED state so the UI can surface it
-        # even though the job row itself carries the failure detail.
-        await assets.set_status(asset_id, rag_status="FAILED")
-        raise
+    # Serialize per asset (see _asset_ingest_lock): without this, concurrent jobs for the
+    # same asset interleave their delete-by-asset + incremental insert and can delete each
+    # other's parent chunks mid-flight (chunks_parent_chunk_id_fkey).
+    lock = await _asset_ingest_lock(str(asset_id))
+    async with lock:
+        try:
+            return await _run(ctx, job_id, work())
+        except asyncio.CancelledError:
+            # Cancellation is a BaseException — it skips ``except Exception``. Mark the asset
+            # FAILED so the UI doesn't show a forever-stuck CHUNKING/EMBEDDING badge.
+            await assets.set_status(asset_id, rag_status="FAILED")
+            raise
+        except Exception:
+            # Keep the asset's rag_status in a terminal FAILED state so the UI can surface it
+            # even though the job row itself carries the failure detail.
+            await assets.set_status(asset_id, rag_status="FAILED")
+            raise
 
 
 async def _write_query_repo_chunks(
