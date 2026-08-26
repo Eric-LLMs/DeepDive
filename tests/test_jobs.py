@@ -78,6 +78,18 @@ async def test_job_store_lifecycle():
     assert done.result == {"url": "/audio/x.mp3"}
 
 
+async def test_mark_running_records_retry_note():
+    store = _Store()
+    jobs = JobStore(store.session)
+
+    job = await jobs.create("tts", {"text": "hi"})
+    await jobs.mark_running(job.id, error="attempt 1 failed: boom — retrying")
+
+    row = await jobs.get(job.id)
+    assert row.status == RUNNING
+    assert row.error == "attempt 1 failed: boom — retrying"
+
+
 async def test_task_queue_enqueue_and_get():
     store = _Store()
     redis = _FakeRedis()

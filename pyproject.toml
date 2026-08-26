@@ -66,6 +66,12 @@ media = [
     "reportlab>=4.0",
     "imageio-ffmpeg>=0.4.9",
 ]
+# Bash sandbox (production path): docker-py for the per-command container sandbox.
+# NOT a hard dependency — when it is absent the host sandbox (settings.bash_sandbox="host")
+# is the fallback, so the API/worker run fine without Docker installed.
+docker = [
+    "docker>=7.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = [

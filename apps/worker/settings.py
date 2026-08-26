@@ -3,9 +3,10 @@
 The worker never loads models in-process; llm/tts/embedder are HTTP clients to the model
 containers, images is the scraper, and session_factory/job_store talk to PostgreSQL.
 """
+from typing import ClassVar
+
 from arq import cron
 from arq.connections import RedisSettings
-
 from core.config import settings
 from core.infrastructure.db import SessionLocal
 from core.infrastructure.images import ImageScraper
@@ -66,7 +67,7 @@ def _cron_parts(schedule: str) -> dict:
 
 
 class WorkerSettings:
-    functions = [
+    functions: ClassVar[list] = [
         tasks.tts,
         tasks.image_fetch,
         tasks.explain,
@@ -84,7 +85,9 @@ class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = settings.worker_concurrency
     job_timeout = settings.worker_job_timeout
+    # Match arq's retry budget to PG: FAILED is only written on the final attempt.
+    max_tries = settings.worker_max_tries
     # Daily audit-event retention (purges only session_events; runs once at startup too).
-    cron_jobs = [
+    cron_jobs: ClassVar[list] = [
         cron(tasks.prune_session_events, run_at_startup=True, **_cron_parts(settings.retention_cron)),
     ]

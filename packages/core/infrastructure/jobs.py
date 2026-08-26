@@ -11,7 +11,7 @@ Two collaborators share one contract:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from core.infrastructure.db import JobModel
@@ -56,12 +56,14 @@ class JobStore:
         async with self.session_factory() as session:
             return await session.get(JobModel, job_id)
 
-    async def mark_running(self, job_id: uuid.UUID) -> None:
+    async def mark_running(self, job_id: uuid.UUID, error: str | None = None) -> None:
         async with self.session_factory() as session:
             job = await session.get(JobModel, job_id)
             if job is not None:
                 job.status = RUNNING
-                job.started_at = datetime.now(timezone.utc)
+                job.started_at = datetime.now(UTC)
+                if error is not None:
+                    job.error = error
                 await session.commit()
 
     async def mark_succeeded(self, job_id: uuid.UUID, result: dict) -> None:
@@ -70,7 +72,7 @@ class JobStore:
             if job is not None:
                 job.status = SUCCEEDED
                 job.result = result
-                job.completed_at = datetime.now(timezone.utc)
+                job.completed_at = datetime.now(UTC)
                 await session.commit()
 
     async def mark_failed(self, job_id: uuid.UUID, error: str) -> None:
@@ -79,7 +81,7 @@ class JobStore:
             if job is not None:
                 job.status = FAILED
                 job.error = error
-                job.completed_at = datetime.now(timezone.utc)
+                job.completed_at = datetime.now(UTC)
                 await session.commit()
 
 

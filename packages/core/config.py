@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     # ── Worker / jobs ──
     worker_concurrency: int = 10         # arq max concurrent jobs
     worker_job_timeout: int = 3600       # arq per-job timeout (seconds) — large-file ingest (PDF parse + embed) can exceed a few minutes
+    worker_max_tries: int = 1            # max arq retries per job; 1 = no retry (PG stays the honest terminal source)
     # Audit-event retention: a daily cron purges session_events older than this many days.
     # Only the audit log is swept; messages (the recall corpus) and sessions (summaries) stay.
     session_events_retention_days: int = 30
@@ -87,6 +88,15 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 90            # max wall time for one LLM call (first-token for streams)
     llm_max_retries: int = 2                   # retries on temporary errors (timeout / 429 / 5xx)
     llm_retry_backoff: float = 1.0             # base backoff seconds (doubles per retry)
+
+    # Bash sandbox: "docker" runs each command in a fresh container (docker-py, optional);
+    # "host" uses the local-process fallback (dev only — NOT a security boundary).
+    bash_sandbox: str = "host"                  # "docker" | "host"
+    bash_sandbox_image: str = "debian:bookworm-slim"
+    bash_sandbox_network: bool = False          # container network access
+    bash_sandbox_mem_limit: str = "512m"        # per-container memory cap
+    bash_sandbox_cpus: float = 0.5              # per-container CPU budget (of one core)
+    bash_sandbox_timeout: int = 30              # default per-command timeout (seconds)
 
     # Human-in-the-loop: how long an approval request waits before it is denied.
     approval_timeout_seconds: float = 120

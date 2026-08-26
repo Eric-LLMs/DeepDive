@@ -9,26 +9,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from agent.frontmatter import parse_frontmatter
 from agent.memory.types import MEMORY_TYPES, Memory
-
-
-def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    """Split a leading ``---`` frontmatter block (key: value lines) from the body."""
-    if not text.startswith("---"):
-        return {}, text
-    lines = text.splitlines()
-    end = len(lines)
-    for i in range(1, len(lines)):
-        if lines[i].strip() == "---":
-            end = i
-            break
-    meta: dict[str, str] = {}
-    for line in lines[1:end]:
-        if ":" in line:
-            k, v = line.split(":", 1)
-            meta[k.strip()] = v.strip()
-    body = "\n".join(lines[end + 1 :]).strip()
-    return meta, body
 
 
 def _parse_int(value: str | None, *, default: int) -> int:
@@ -59,7 +41,7 @@ class FileMemoryStore:
         if not path.is_file():
             return None
         text = path.read_text(encoding="utf-8")
-        meta, body = _parse_frontmatter(text)
+        meta, body = parse_frontmatter(text)
         return Memory(
             name=meta.get("name") or path.stem,
             description=meta.get("description", ""),

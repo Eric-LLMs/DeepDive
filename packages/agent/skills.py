@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent.decisions import ToolExecution, text_block
+from agent.frontmatter import parse_frontmatter
 from agent.tools import ToolDefinition, ToolOutput, define_tool
 
 
@@ -78,7 +79,7 @@ class SkillRegistry:
     @staticmethod
     def _parse(path: Path, default_name: str) -> Skill | None:
         text = path.read_text(encoding="utf-8")
-        meta, body = SkillRegistry._parse_frontmatter(text)
+        meta, body = parse_frontmatter(text)
         if not body:
             return None
         keywords = [k.strip() for k in meta.get("keywords", "").split(",") if k.strip()]
@@ -91,25 +92,6 @@ class SkillRegistry:
             allowed_tools=allowed,
             path=path,
         )
-
-    @staticmethod
-    def _parse_frontmatter(text: str) -> tuple[dict, str]:
-        """Minimal frontmatter parsing (single-line key: value), taking the block between the first two --- markers."""
-        if not text.startswith("---"):
-            return {}, text
-        lines = text.splitlines()
-        end = len(lines)
-        for i in range(1, len(lines)):
-            if lines[i].strip() == "---":
-                end = i
-                break
-        meta: dict[str, str] = {}
-        for line in lines[1:end]:
-            if ":" in line:
-                k, v = line.split(":", 1)
-                meta[k.strip()] = v.strip()
-        body = "\n".join(lines[end + 1:]).strip()
-        return meta, body
 
 
 def _escape_xml(text: str) -> str:

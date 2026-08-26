@@ -5,6 +5,8 @@ The model name is configured in config.reranker_model; when empty this stage is 
 """
 import asyncio
 
+from core.config import settings
+
 from rag.types import SearchHit
 
 
@@ -12,19 +14,32 @@ class CrossEncoderReranker:
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
         self._model = None
+        self._load_lock = asyncio.Lock()
 
-    def _load(self):
-        if self._model is None:
+    async def _load(self):
+        """Load the model once, off the event loop, with a timeout.
+
+        The lock guards the first load so concurrent ``rerank`` calls download/construct the
+        model a single time; the cached ``self._model`` is returned on every later call.
+        """
+        if self._model is not None:
+            return self._model
+        timeout = getattr(settings, "rag_embed_timeout", None) or 300
+        async with self._load_lock:
+            if self._model is not None:
+                return self._model
             from sentence_transformers import CrossEncoder
 
-            self._model = CrossEncoder(self.model_name)
-        return self._model
+            self._model = await asyncio.wait_for(
+                asyncio.to_thread(CrossEncoder, self.model_name), timeout=timeout
+            )
+            return self._model
 
     async def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
         """Score each (query, hit.text) pair for relevance, returns hits sorted by the new score in descending order."""
         if not hits:
             return hits
-        model = self._load()
+        model = await self._load()
         pairs = [(query, hit.text) for hit in hits]
         # sentence-transformers is synchronous; run it in a thread pool to avoid blocking the event loop
         scores = await asyncio.to_thread(model.predict, pairs)

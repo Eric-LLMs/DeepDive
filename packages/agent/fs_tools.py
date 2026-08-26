@@ -5,12 +5,18 @@ microkernel's resident file-system tools. All file access is rooted at a workspa
 directory (path traversal is rejected), and the permission class is declared explicitly
 so the :class:`~agent.sandbox.Sandbox` gates them: the default READ-only session denies
 ``edit_file`` / ``bash`` unless the host grants WRITE / NETWORK.
+
+``bash`` delegates to a :class:`~agent.bash_sandbox.BashSandbox` (host or docker) and
+applies a best-effort workspace-escape guard; the sandbox is the real isolation boundary.
 """
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
 from pathlib import Path
 
+from agent.bash_sandbox import BashSandbox, assert_no_escape, get_bash_sandbox
 from agent.decisions import ToolExecution, text_block
 from agent.tool_permissions import ToolPermission
 from agent.tools import ToolDefinition, ToolOutput, define_tool
@@ -25,17 +31,20 @@ def _resolve(workspace: Path, raw_path: str) -> Path:
     return candidate
 
 
+def _read(path: Path, max_chars: int) -> str:
+    """Sync body of ``read_file`` (runs in a worker thread to keep the loop free)."""
+    if not path.is_file():
+        raise FileNotFoundError(f"no such file: {path}")
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if max_chars and path.stat().st_size > max_chars:
+        return text[:max_chars] + "\n…(truncated)"
+    return text
+
+
 def read_file_tool(workspace: Path) -> ToolDefinition:
     async def execute(args: dict, exec: ToolExecution) -> str:
         path = _resolve(workspace, args["path"])
-        if not path.is_file():
-            raise FileNotFoundError(f"no such file: {path}")
-        if path.stat().st_size > args.get("max_chars", 0) and args.get("max_chars"):
-            return (
-                path.read_text(encoding="utf-8", errors="replace")[: args["max_chars"]]
-                + "\n…(truncated)"
-            )
-        return path.read_text(encoding="utf-8", errors="replace")
+        return await asyncio.to_thread(_read, path, args.get("max_chars", 0))
 
     return define_tool(
         name="read_file",
@@ -57,19 +66,44 @@ def read_file_tool(workspace: Path) -> ToolDefinition:
     )
 
 
+def _apply_edit(path: Path, old: str | None, new: str) -> tuple[str, bool]:
+    """Compute the edited content in a worker thread; returns ``(content, replaced)``."""
+    if old is not None and path.is_file():
+        current = path.read_text(encoding="utf-8", errors="replace")
+        if old not in current:
+            raise ValueError("old_text not found in the file — nothing replaced")
+        return current.replace(old, new, 1), True
+    return new, False
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write ``content`` to ``path`` atomically: temp file in the same dir + ``os.replace``.
+
+    Never leaves a truncated file if the process dies mid-write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def edit_file_tool(workspace: Path) -> ToolDefinition:
     async def execute(args: dict, exec: ToolExecution) -> str:
         path = _resolve(workspace, args["path"])
-        path.parent.mkdir(parents=True, exist_ok=True)
         old = args.get("old_text")
         new = args.get("new_text", "")
-        if old is not None and path.is_file():
-            current = path.read_text(encoding="utf-8", errors="replace")
-            if old not in current:
-                raise ValueError("old_text not found in the file — nothing replaced")
-            path.write_text(current.replace(old, new, 1), encoding="utf-8")
+        content, replaced = await asyncio.to_thread(_apply_edit, path, old, new)
+        await asyncio.to_thread(_atomic_write, path, content)
+        if replaced:
             return f"replaced 1 occurrence in {args['path']}"
-        path.write_text(new, encoding="utf-8")
         return f"wrote {args['path']}"
 
     return define_tool(
@@ -96,25 +130,15 @@ def edit_file_tool(workspace: Path) -> ToolDefinition:
     )
 
 
-def bash_tool() -> ToolDefinition:
+def bash_tool(workspace: Path, sandbox: BashSandbox) -> ToolDefinition:
     async def execute(args: dict, exec: ToolExecution) -> str:
-        proc = await asyncio.create_subprocess_shell(
-            args["command"],
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        command = args["command"]
+        timeout = int(args.get("timeout", 30))
+        assert_no_escape(workspace, command)
         try:
-            stdout, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=args.get("timeout", 30)
-            )
+            return await sandbox.run(command, timeout)
         except TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise TimeoutError(f"command timed out after {args.get('timeout', 30)}s")
-        output = stdout.decode("utf-8", errors="replace").strip()
-        if proc.returncode != 0 and not output:
-            output = f"(exit {proc.returncode})"
-        return output or f"(exit {proc.returncode})"
+            raise TimeoutError(f"command timed out after {timeout}s")
 
     return define_tool(
         name="bash",
@@ -139,9 +163,16 @@ def bash_tool() -> ToolDefinition:
     )
 
 
-def register_fs_tools(runtime, workspace: Path) -> list[ToolDefinition]:
+def register_fs_tools(
+    runtime, workspace: Path, sandbox: BashSandbox | None = None
+) -> list[ToolDefinition]:
     """Register the resident fs/shell tools onto ``runtime``; returns the definitions."""
-    tools = [read_file_tool(workspace), edit_file_tool(workspace), bash_tool()]
+    sandbox = sandbox or get_bash_sandbox()
+    tools = [
+        read_file_tool(workspace),
+        edit_file_tool(workspace),
+        bash_tool(workspace, sandbox),
+    ]
     for tool in tools:
         runtime.register(tool)
     return tools

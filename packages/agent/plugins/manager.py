@@ -14,12 +14,33 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
+import re
 from pathlib import Path
 
 from agent.di import CapabilityError, Context, FiberState
 from agent.plugins.base import Plugin
 from agent.runtime import ToolRuntime
 from agent.skills import SkillRegistry
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_identifier(part: str) -> str:
+    """Replace characters that are not valid in a Python identifier with ``_``."""
+    return re.sub(r"[^0-9A-Za-z_]", "_", part)
+
+
+def _deterministic_module_name(path: Path) -> str:
+    """Deterministic, path-derived module name for a plugin file.
+
+    The old ``abs(hash(path))`` scheme was process-random (PYTHONHASHSEED) — non-deterministic
+    across restarts and collision-prone. The parent directory + stem make the name stable
+    and keep same-named plugin files in different directories distinct.
+    """
+    parent = _sanitize_identifier(path.parent.name) or "root"
+    stem = _sanitize_identifier(path.stem)
+    return f"deepdive_plugin_{parent}_{stem}"
 
 
 class PluginManager:
@@ -171,8 +192,8 @@ class PluginManager:
         while True:
             try:
                 self._sync(directory)
-            except Exception:  # noqa: BLE001 - a bad plugin must not kill the watcher
-                pass
+            except Exception:
+                logger.warning("plugin directory sync failed", exc_info=True)
             await asyncio.sleep(poll_interval)
 
     def _sync(self, directory: Path) -> None:
@@ -199,7 +220,7 @@ class PluginManager:
 
     @staticmethod
     def _load_plugin_file(path: Path) -> Plugin | None:
-        module_name = f"deepdive_plugin_{abs(hash(path))}"
+        module_name = _deterministic_module_name(path)
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:
             return None

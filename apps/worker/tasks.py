@@ -39,21 +39,59 @@ from core.infrastructure.repositories import (
 from core.infrastructure.storage import get_storage, object_key
 
 
+def _record_dead_letter(job_id, attempt: int, error: str) -> None:
+    """Best-effort dead-letter marker: one JSONL line on the audit log.
+
+    There is no ``job_events`` table, so a terminal failure is appended to
+    ``settings.audit_log_path`` (the same best-effort pattern as the agent audit trail).
+    """
+    payload = {
+        "event": "job_dead_letter",
+        "job_id": str(job_id),
+        "attempt": attempt,
+        "error": error,
+    }
+    path = settings.audit_log_path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        logger.warning("job_dead_letter_write_failed job_id=%s", job_id)
+
+
 async def _run(ctx, job_id: str, work) -> dict:
-    """Mark the job running, execute ``work``, and record the terminal state."""
+    """Mark the job running, execute ``work``, and record the terminal state.
+
+    FAILED is only written on the FINAL failure (``attempt >= worker_max_tries``); a
+    non-terminal failure flips the job back to RUNNING with a "retrying" note so PG never
+    shows a false FAILED while arq is still retrying. The dead-letter marker is recorded on
+    terminal failure.
+    """
     store: JobStore = ctx["job_store"]
     uid = UUID(job_id)
     await store.mark_running(uid)
+    attempt = int(ctx.get("job_try") or 1)
+    max_tries = settings.worker_max_tries
+    terminal = max_tries <= 1 or attempt >= max_tries
     try:
         result = await work
     except asyncio.CancelledError:
         # arq cancels jobs past job_timeout (CancelledError is a BaseException, so a
         # bare ``except Exception`` would swallow nothing — the job row would stay
         # "running" forever). Record the honest terminal state before re-raising.
-        await store.mark_failed(uid, "job cancelled: worker job timeout exceeded")
+        if terminal:
+            await store.mark_failed(uid, "job cancelled: worker job timeout exceeded")
+            _record_dead_letter(uid, attempt, "job cancelled: worker job timeout exceeded")
+        else:
+            await store.mark_running(uid, error=f"attempt {attempt} failed: job cancelled — retrying")
         raise
-    except Exception as exc:  # noqa: BLE001 - record failure then re-raise for arq retries/logging
-        await store.mark_failed(uid, str(exc))
+    except Exception as exc:
+        if terminal:
+            await store.mark_failed(uid, str(exc))
+            _record_dead_letter(uid, attempt, str(exc))
+        else:
+            await store.mark_running(uid, error=f"attempt {attempt} failed: {exc} — retrying")
         raise
     await store.mark_succeeded(uid, result)
     return result
