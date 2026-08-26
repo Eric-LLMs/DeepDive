@@ -7,8 +7,8 @@ with an optional rerank stage that skips when no model is configured.
 import pytest
 
 from rag import build_pipeline
-from rag.pipeline import RetrievalUnavailable
-from rag.pipeline_config import NodeConfig, RagPipelineConfig
+from rag.pipeline.executor import RetrievalUnavailable
+from rag.pipeline.pipeline_config import NodeConfig, RagPipelineConfig
 from rag.types import SearchHit
 
 
@@ -76,7 +76,7 @@ def _pipe(vec_hits=None, kw_hits=None, vec_raise=False, kw_raise=False, config=N
         chunk_repo=None,
     )
     # build deps manually so we control the recallers (build_pipeline would build real ones)
-    from rag.pipeline import PipelineDeps, RAGPipeline
+    from rag.pipeline.executor import PipelineDeps, RAGPipeline
 
     return RAGPipeline(cfg, PipelineDeps(**deps))
 

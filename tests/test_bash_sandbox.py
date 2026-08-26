@@ -2,7 +2,7 @@
 import sys
 
 import pytest
-from agent.bash_sandbox import (
+from agent.tools.bash_sandbox import (
     DockerBashSandbox,
     HostBashSandbox,
     assert_no_escape,
@@ -73,7 +73,7 @@ async def test_docker_missing_dependency_raises_clear_error(monkeypatch, tmp_pat
 
 
 def test_docker_decode_output():
-    from agent.bash_sandbox import _decode_output
+    from agent.tools.bash_sandbox import _decode_output
 
     assert _decode_output(None) == ""
     assert _decode_output(b"hello\n") == "hello"

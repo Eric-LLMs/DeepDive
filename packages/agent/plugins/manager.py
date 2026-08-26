@@ -19,9 +19,9 @@ import re
 from pathlib import Path
 
 from agent.di import CapabilityError, Context, FiberState
+from agent.engine.runtime import ToolRuntime
 from agent.plugins.base import Plugin
-from agent.runtime import ToolRuntime
-from agent.skills import SkillRegistry
+from agent.skills.registry import SkillRegistry
 
 logger = logging.getLogger(__name__)
 

@@ -11,7 +11,7 @@ Two ways to stop a tool are demonstrated side by side:
 """
 import logging
 
-from agent.decisions import PreToolDecision, ToolExecution
+from agent.engine.decisions import PreToolDecision, ToolExecution
 from agent.plugins.base import Plugin
 from agent.plugins.hooks import PRE_TOOL_USE, TOOL_RESULT, observe, waterfall
 from agent.plugins.manager import PluginManager

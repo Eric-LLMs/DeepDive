@@ -4,10 +4,9 @@ Direction one: expose DeepDive's tools externally so other AI clients can call t
 Direction two (MCP Client consuming external tools) is wired up on demand at the API layer,
 and registered into the ToolRuntime the same way.
 """
+from agent.engine.decisions import ToolExecution
+from agent.engine.runtime import ToolRuntime
 from fastmcp import FastMCP
-
-from agent.decisions import ToolExecution
-from agent.runtime import ToolRuntime
 
 
 def build_mcp_server(runtime: ToolRuntime, name: str = "deepdive") -> FastMCP:

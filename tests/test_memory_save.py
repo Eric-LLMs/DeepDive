@@ -8,8 +8,8 @@ import pytest
 from agent.memory.file import FileMemoryStore
 from agent.memory.service import MemoryService, memory_save_tool
 from agent.memory.types import Memory
-from agent.tool_permissions import ToolPermission
-from agent.tools import classify_permissions
+from agent.tools.tool_permissions import ToolPermission
+from agent.tools.definition import classify_permissions
 
 
 class _FakeRetriever:

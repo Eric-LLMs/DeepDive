@@ -1,5 +1,5 @@
 """Tests for the jieba CJK keyword channel."""
-from rag.cjk import contains_cjk, segment
+from rag.query.cjk import contains_cjk, segment
 
 
 def test_contains_cjk_detects_chinese():

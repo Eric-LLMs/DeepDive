@@ -11,7 +11,7 @@ honors the tenant-isolation predicate plus an optional ``domain_id`` filter.
 from core.infrastructure.visibility import asset_visibility_sql
 from sqlalchemy import text
 
-from rag.cjk import contains_cjk, segment
+from rag.query.cjk import contains_cjk, segment
 from rag.recall.base import Recaller
 from rag.types import SearchHit
 

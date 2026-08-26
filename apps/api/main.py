@@ -13,13 +13,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
-from agent.approvals import (
+from agent.security.approvals import (
     ApprovalStore,
     configure_approval_broker,
     get_approval_bridge,
     set_request_approval,
 )
-from agent.checkpoints import CheckpointError
+from agent.tools.checkpoints import CheckpointError
 from api.auth import (
     ADMIN_ROLE,
     USER_ROLE,
@@ -1727,7 +1727,7 @@ def _rag_pipeline():
 async def get_rag_config(_: AuthAdmin = Depends(require_admin)) -> dict:
     """Read the stored pipeline config (or the env-seeded defaults)."""
     from rag.config_store import load_config
-    from rag.registry import registry
+    from rag.pipeline.registry import registry
 
     cfg = await load_config(SessionLocal)
     return {"config": cfg.to_dict(), "available_nodes": registry.metadata()}
@@ -1790,7 +1790,7 @@ async def rag_chunk_preview(
 ) -> dict:
     """Preview chunking + (optionally) CJK segmentation / context prefixes, no DB writes."""
     from core.infrastructure.ingest import Chunk, contextualize_chunks, split_chunks
-    from rag.cjk import segment
+    from rag.query.cjk import segment
 
     texts = split_chunks(
         body.text, body.chunk_chars, body.overlap, body.strategy
@@ -3526,6 +3526,13 @@ async def chat_stream(
         set_request_approval(store)
 
         async def pump():
+            # NOTE: only ever await INSIDE run_stream (never on frames). If the pump task
+            # suspended on `await frames.put` were cancelled there, the CancelledError would
+            # be consumed by this `finally` and the run_stream generator abandoned — its
+            # cleanup would only run on a later GC aclose (GeneratorExit, not CancelledError),
+            # so `turn-cancelled` would never be logged. The queue is unbounded, so put_nowait
+            # never blocks; a client disconnect then lands the CancelledError in the loop's
+            # `except asyncio.CancelledError`, which logs turn-cancelled and closes memory.
             try:
                 async for evt in get_agent().run_stream(
                     body.message,
@@ -3536,11 +3543,11 @@ async def chat_stream(
                     api_key=api_key or None,
                     progress_sink=lambda evt: frames.put_nowait(("agent", evt)),
                 ):
-                    await frames.put(("agent", evt))
+                    frames.put_nowait(("agent", evt))
             finally:
                 # Sentinel so the consumer below always terminates after the stream ends,
                 # including on cancellation (the loop already logs turn-cancelled).
-                await frames.put(("agent", {"type": "done", "data": None}))
+                frames.put_nowait(("agent", {"type": "done", "data": None}))
 
         pump_task = asyncio.create_task(pump())
         final = None

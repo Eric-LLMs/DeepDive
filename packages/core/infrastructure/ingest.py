@@ -234,7 +234,7 @@ async def build_chunks(text: str, config, *, doc_title: str, llm) -> list[Chunk]
     ``config`` is a :class:`RagPipelineConfig` (duck-typed so this module does not import
     the rag package at module scope).
     """
-    from rag.cjk import segment  # lazy: rag is a sibling package
+    from rag.query.cjk import segment  # lazy: rag is a sibling package
 
     chunking = config.chunking
     if config.parent_child:

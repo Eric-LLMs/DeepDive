@@ -1,4 +1,4 @@
-"""ReliableLLM: a thin reliability wrapper around any :class:`~agent.loop.AgentLLMPort`.
+"""ReliableLLM: a thin reliability wrapper around any :class:`~agent.engine.loop.AgentLLMPort`.
 
 Every agent LLM call gets:
 
@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from agent.llm_errors import LLMTemporaryError, classify
+from agent.llm.llm_errors import LLMTemporaryError, classify
 
 
 class ReliableLLM:

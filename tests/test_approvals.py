@@ -2,7 +2,7 @@
 import asyncio
 import json
 
-from agent.approvals import (
+from agent.security.approvals import (
     ApprovalBridge,
     ApprovalStore,
     MemoryApprovalBroker,
@@ -10,7 +10,7 @@ from agent.approvals import (
     current_approval_store,
     set_request_approval,
 )
-from agent.decisions import PreToolDecision, ToolExecution
+from agent.engine.decisions import PreToolDecision, ToolExecution
 
 
 def _ask(exec_: ToolExecution) -> PreToolDecision:

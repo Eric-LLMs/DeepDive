@@ -6,7 +6,7 @@ dispatch and, after ``threshold`` consecutive identical ``(name, args-hash)`` ca
 ``threshold`` identical repeated errors, reports :meth:`should_break` so the loop stops
 dispatching and injects forced guidance instead of running the turn to ``max_steps``.
 
-The tracker lives on the per-turn :class:`~agent.context.AgentTurn` (``turn.loop_tracker``),
+The tracker lives on the per-turn :class:`~agent.engine.context.AgentTurn` (``turn.loop_tracker``),
 so concurrent turns never share counters. The loop resets it after injecting guidance so a
 genuine new approach starts from a clean slate.
 """

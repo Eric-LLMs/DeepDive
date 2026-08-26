@@ -16,10 +16,10 @@ from contextvars import ContextVar
 
 from core.config import settings
 
-from agent.context import AgentTurn, current_turn
-from agent.decisions import text_block
-from agent.loop import ReactLoopAgent
-from agent.tools import ToolDefinition, ToolOutput, define_tool
+from agent.engine.context import AgentTurn, current_turn
+from agent.engine.decisions import text_block
+from agent.engine.loop import ReactLoopAgent
+from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
 
 _DEPTH_CTX: ContextVar[int] = ContextVar("subagent_depth", default=0)
 

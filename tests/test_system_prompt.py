@@ -1,7 +1,7 @@
 """Tests for the SystemPrompt layered assembly + rendering."""
 import pytest
 
-from agent.system_prompt import SystemPrompt, render_prompt
+from agent.prompt.system_prompt import SystemPrompt, render_prompt
 
 
 async def test_sections_sorted_by_order():

@@ -167,5 +167,8 @@ def log_llm(**kw: Any) -> None:
     _log.info("agent.llm", **{**TraceContext.snapshot(), **kw})
 
 
-def log_error(**kw: Any) -> None:
-    _log.error("agent.error", **{**TraceContext.snapshot(), **kw})
+def log_error(*, kind: str = "", **kw: Any) -> None:
+    # ``kind`` names the error class (e.g. turn_cancelled / llm_fatal). It must NOT be the
+    # ``event`` kwarg: structlog's ``_log.error(event_str, event=...)`` collides on the
+    # reserved ``event`` keyword (TypeError), which would swallow the log line itself.
+    _log.error("agent.error", **{**TraceContext.snapshot(), "kind": kind, **kw})

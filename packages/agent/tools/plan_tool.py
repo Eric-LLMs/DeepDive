@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 
-from agent.context import current_turn
-from agent.decisions import text_block
-from agent.tools import ToolDefinition, ToolOutput, define_tool
+from agent.engine.context import current_turn
+from agent.engine.decisions import text_block
+from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
 
 
 def plan_tool() -> ToolDefinition:

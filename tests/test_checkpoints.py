@@ -1,6 +1,6 @@
 """Workspace checkpoints: shadow-git snapshot / revert round-trips."""
 import pytest
-from agent.checkpoints import CheckpointError, CheckpointStore
+from agent.tools.checkpoints import CheckpointError, CheckpointStore
 
 
 async def test_snapshot_and_revert_round_trip(tmp_path):

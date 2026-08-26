@@ -1,6 +1,6 @@
 """Tests for pipeline config serialization + validation (app_settings["rag"] blob)."""
 from rag.config_store import validate
-from rag.pipeline_config import ChunkingConfig, NodeConfig, RagPipelineConfig
+from rag.pipeline.pipeline_config import ChunkingConfig, NodeConfig, RagPipelineConfig
 
 
 def test_roundtrip_to_dict_from_dict():

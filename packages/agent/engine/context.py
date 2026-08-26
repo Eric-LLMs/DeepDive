@@ -9,7 +9,7 @@ the shared kernel instance racing on instance fields.
 
 The turn is also the home of cross-cutting concerns:
 
-- ``span`` — the turn's observability span (:class:`~agent.telemetry.TurnSpan`).
+- ``span`` — the turn's observability span (:class:`~agent.engine.telemetry.TurnSpan`).
 - ``cancel_token`` — cooperative cancellation checked at step boundaries (task
   cancellation additionally propagates ``CancelledError`` into whatever the loop awaits).
 - ``usage`` / ``step_usage`` — per-step token & cost accounting.
@@ -73,16 +73,16 @@ class AgentTurn:
     # ── reliability / control ──
     cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
     max_budget_usd: float | None = None
-    loop_tracker: Any | None = None           # ToolLoopTracker (see agent.loop_guard)
+    loop_tracker: Any | None = None           # ToolLoopTracker (see agent.engine.loop_guard)
 
     # ── observability / streaming ──
     span: TurnSpan | None = None
-    audit: Any | None = None                # AuditSink (agent.telemetry); JSONL turn trail
+    audit: Any | None = None                # AuditSink (agent.engine.telemetry); JSONL turn trail
     progress_sink: Callable[[dict], None] | None = None
-    checkpoint_id: str | None = None         # pre-turn workspace snapshot (agent.checkpoints)
+    checkpoint_id: str | None = None         # pre-turn workspace snapshot (agent.tools.checkpoints)
 
     # ── approval (human-in-the-loop) ──
-    approvals: Any | None = None              # ApprovalStore (see agent.approvals)
+    approvals: Any | None = None              # ApprovalStore (see agent.security.approvals)
 
     def inject(self, text: str, *, name: str | None = None) -> None:
         """Append durable dynamic content to the prompt suffix for this turn."""

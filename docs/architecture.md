@@ -158,28 +158,27 @@ deepdive/
 │   └── desktop/                  # Electron workbench (file tree + media viewer + chat; proxies API to the backend)
 ├── packages/
 │   ├── agent/                    # package `agent`: kernel + DI + loop + runtime + memory + skills + prompt
-│   │   ├── kernel.py             # AgentKernel composition root (core tools + sandbox guard + zone sections)
-│   │   ├── system_prompt.py      # PromptZone + CacheBoundaryAssembler (inject / snapshot_key / refresh_dynamic)
-│   │   ├── tool_gateway.py       # ToolCatalog + ToolVisibilityPolicy + ToolGateway + tool_search meta-tool
-│   │   ├── tool_permissions.py   # ToolPermission (READ/WRITE/NETWORK) + classify_permissions
-│   │   ├── sandbox.py            # Sandbox permission gate (default READ-only; ASK w/o approver → deny)
-│   │   ├── fs_tools.py           # resident read_file / edit_file / bash (workspace-rooted; escape rejected)
-│   │   ├── skills.py             # Skill + SkillRegistry + SkillCatalog + skill meta-tool (lazy load)
+│   │   ├── engine/               # Agent Kernel: kernel.py (AgentKernel composition root) + loop.py (ReactLoopAgent step loop) + loop_guard.py + context.py (AgentTurn) + decisions.py + runtime.py (ToolRuntime lifecycle) + events.py + sessions.py + telemetry.py
+│   │   ├── prompt/               # system_prompt.py: PromptZone + CacheBoundaryAssembler (inject / snapshot_key / refresh_dynamic)
+│   │   ├── tools/                # definition.py (ToolDefinition / define_tool) + tool_gateway.py (ToolCatalog + ToolGateway + tool_search) + tool_permissions.py (READ/WRITE/NETWORK) + fs_tools.py (read_file / edit_file / bash) + bash_sandbox.py + subagent.py + plan_tool.py + checkpoints.py + project_context.py
+│   │   ├── skills/               # registry.py: Skill + SkillRegistry + SkillCatalog + skill meta-tool (lazy load)
+│   │   ├── security/             # sandbox.py (permission gate: default READ-only; ASK w/o approver → deny) + approvals.py (HITL approval broker)
+│   │   ├── llm/                  # llm_guard.py (ReliableLLM timeout/retry) + llm_errors.py (error taxonomy)
 │   │   ├── memory/               # base/file (memdir store) + retrieval (RRF fusion) + service (memory tools)
-│   │   ├── loop.py               # ReactLoopAgent step loop (gateway-aware, per-step dynamic diff)
-│   │   ├── runtime.py            # ToolRuntime lifecycle (pre-execute → guard → execute → post-execute)
+│   │   ├── di.py                 # Cordis-style DI (Context / Fiber / Service)
+│   │   ├── harness.py            # FakeLLM / assistant / tool_call test harness
+│   │   ├── frontmatter.py        # SKILL.md frontmatter parser
 │   │   └── plugins/              # plugin manager + built-in tool_audit
 │   ├── rag/                      # package `rag`: config-driven retrieval pipeline
-│   │   ├── pipeline.py           # executor: enabled-node list = topology; degrade, never stop
+│   │   ├── pipeline/             # executor.py (enabled-node list = topology; degrade, never stop) + factory.py + pipeline_config.py (RagPipelineConfig / NodeConfig / ChunkingConfig) + context.py (PipelineContext blackboard + NodeTrace) + registry.py (node registry, name → class)
+│   │   ├── query/                # query_rewrite.py (QueryRewriter) + cjk.py (jieba segmentation for the CJK keyword channel)
 │   │   ├── nodes/                # pluggable pipeline nodes (one file per stage)
-│   │   ├── registry.py           # node registry (name → class, X-macro registration)
-│   │   ├── context.py            # PipelineContext blackboard + NodeTrace
-│   │   ├── pipeline_config.py    # RagPipelineConfig / NodeConfig / ChunkingConfig
+│   │   ├── recall/               # VectorRecaller (pgvector) + KeywordRecaller (tsvector / CJK)
+│   │   ├── rank/                 # rrf_fusion + CrossEncoderReranker
+│   │   ├── types.py              # shared pipeline types (SearchHit / ...)
 │   │   ├── config_store.py       # app_settings["rag"] persistence + validation + cache
 │   │   ├── eval.py               # golden-set regression (Recall@k / Precision@k / MRR)
-│   │   ├── cjk.py                # jieba segmentation for the CJK keyword channel
-│   │   ├── recall/               # VectorRecaller (pgvector) + KeywordRecaller (tsvector / CJK)
-│   │   └── rank/                 # rrf_fusion + CrossEncoderReranker
+│   │   └── query_cache.py        # retrieval response cache
 │   ├── core/                     # package `core`: config + domain/application/ports/infrastructure
 │   │   ├── infrastructure/mailer.py            # stdlib smtplib emailer (verification / reset / test)
 │   │   └── infrastructure/memory_retrieval.py  # PG tsvector + pgvector session-recall channels
@@ -336,7 +335,7 @@ A section's text may be static or an async callable over the assemble context (u
 memory/skill retrieval). `{{name}}` placeholders interpolate from registered variables. The legacy
 flat `SystemPrompt` (no zones, no boundary) still renders for backward compatibility.
 
-The **project context loader** (`agent/project_context.py::read_project_context`) reads the first
+The **project context loader** (`agent/tools/project_context.py::read_project_context`) reads the first
 existing convention file (`DEEPDIVE.md`) under the agent's workspace and
 caps it at `settings.project_context_max_chars`; the kernel registers it into
 `PromptZone.PROJECT_CONTEXT`, so project rules become part of `snapshot_key`'s cache identity and
@@ -633,7 +632,7 @@ The node contract lives in `rag/nodes/base.py`:
 
 ### 10.2 Context blackboard
 
-The blackboard lives in `rag/context.py`:
+The blackboard lives in `rag/pipeline/context.py`:
 
 `PipelineContext` carries the `request` (query / top_k / filters), a typed `store` dict for stage
 artifacts (`variants`, `rankings`, `fused`, `hits`, `quality`, …), a per-node `trace`
@@ -642,7 +641,7 @@ human-readable summary of what it produced for the console.
 
 ### 10.3 Registry
 
-The registry lives in `rag/registry.py`:
+The registry lives in `rag/pipeline/registry.py`:
 
 Name → class map with X-macro single-point registration (`registry._import_and_register`).
 **Registering a node = one file in `rag/nodes/` + one line in the registrar.** Unknown names are
@@ -650,7 +649,7 @@ rejected at config-validation time, so a typo cannot silently produce a no-op pi
 
 ### 10.4 Configuration
 
-The config model and its persistence live in `rag/pipeline_config.py` and `rag/config_store.py`:
+The config model and its persistence live in `rag/pipeline/pipeline_config.py` and `rag/config_store.py`:
 
 - `RagPipelineConfig` = `nodes: list[NodeConfig]` (name / enabled / params) + `chunking`
   (strategy / chunk_chars / overlap) + flags `contextual` / `parent_child` / `cjk`.
@@ -661,7 +660,7 @@ The config model and its persistence live in `rag/pipeline_config.py` and `rag/c
 
 ### 10.5 Executor
 
-The executor lives in `rag/pipeline.py`:
+The executor lives in `rag/pipeline/executor.py`:
 
 `RAGPipeline.retrieve(query, top_k, filters)` keeps the pre-refactor contract (returns
 `[{id, text, score, meta}]`) and runs every enabled node in order. Per-node failure degrades
@@ -710,7 +709,7 @@ admin **RAG → Nodes → Chunking & enrichment**): when on, `build_chunks` call
 (`core/infrastructure/ingest.py`) to write parent + leaf chunks, and recall searches leaves only. The
 **output** side is the `parent_expand` node in the pipeline node list: when present *and* enabled it
 replaces each leaf hit with its parent chunk's text; there is no boolean parameter — the executor's
-`enabled_nodes` filter (`rag/pipeline_config.py`) is what the row's enable switch / Remove toggles.
+`enabled_nodes` filter (`rag/pipeline/pipeline_config.py`) is what the row's enable switch / Remove toggles.
 Combinations: `parent_child=off` + `parent_expand=on` is a pass-through (no parents exist to expand);
 `parent_child=on` + `parent_expand=off` returns narrow leaf text; both on gives the full small-to-big
 flow.
@@ -766,7 +765,7 @@ change takes effect on the next `POST /admin/rag/reindex` (re-ingests every READ
   documents don't blow the embed budget. Leaves embed + insert in incremental `embed_batch_size`
   batches, so a worker timeout preserves already-committed chunks and a re-run re-does only the
   remainder.
-- **CJK keywords** — `rag/cjk.py` lazily loads jieba; segmented tokens are stored in
+- **CJK keywords** — `rag/query/cjk.py` lazily loads jieba; segmented tokens are stored in
   `chunks.content_search` and matched with `to_tsvector('simple', content_search) @@
   plainto_tsquery('simple', <segmented query>)` (GIN-indexed). English queries keep the original
   `english` FTS path unchanged.
@@ -937,7 +936,7 @@ Hybrid recall is computed in code over two channels:
 - **Keyword (tsvector)** — the English path evaluates `to_tsvector('english', …) @@
   websearch_to_tsquery` at query time over `chunks.content_en` / `messages.text`
   (`packages/rag/recall/keyword.py`, `packages/core/infrastructure/memory_retrieval.py`). A CJK
-  query is jieba-segmented (`rag/cjk.py`) and matched against the stored `chunks.content_search`
+  query is jieba-segmented (`rag/query/cjk.py`) and matched against the stored `chunks.content_search`
   column via `to_tsvector('simple', content_search) @@ plainto_tsquery('simple', <segments>)`.
 - **Semantic (pgvector)** — cosine search over the `embedding vector(1024)` columns.
 - **Indexes** — `0004_drive_objects.sql` adds an HNSW index on `chunks.embedding`;
@@ -1514,7 +1513,7 @@ project-context zone is part of the prefix-cache contract.
 
 ### 16.4 Project context loader
 
-`agent/project_context.py::read_project_context(workspace, *, files, max_chars)` reads the first
+`agent/tools/project_context.py::read_project_context(workspace, *, files, max_chars)` reads the first
 existing convention file (`DEEPDIVE.md` by default) under the agent's workspace, caps it at
 `settings.project_context_max_chars` (appending a
 `…(truncated)` marker), and returns `""` when none exists. The kernel registers a non-empty result

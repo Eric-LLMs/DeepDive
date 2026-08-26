@@ -8,8 +8,8 @@ retrieval is built from the new topology.
 from __future__ import annotations
 
 from rag.nodes.base import Node
-from rag.pipeline_config import RagPipelineConfig
-from rag.registry import registry
+from rag.pipeline.pipeline_config import RagPipelineConfig
+from rag.pipeline.registry import registry
 
 _loaded: RagPipelineConfig | None = None
 

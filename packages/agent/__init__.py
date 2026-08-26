@@ -2,7 +2,8 @@
 
 Exposes composable parts for assembly/testing/replacement in deps.
 """
-from agent.decisions import (
+from agent.di import CapabilityError, Context, Fiber, FiberState, Service
+from agent.engine.decisions import (
     ContentBlock,
     PostToolDecision,
     PreToolDecision,
@@ -13,12 +14,12 @@ from agent.decisions import (
     ToolFailure,
     text_block,
 )
-from agent.di import CapabilityError, Context, Fiber, FiberState, Service
-from agent.events import EventBus
-from agent.fs_tools import register_fs_tools
+from agent.engine.events import EventBus
+from agent.engine.kernel import AgentKernel, KernelConfig
+from agent.engine.loop import AgentLLMPort, AgentResult, ReactLoopAgent
+from agent.engine.runtime import ToolRuntime
+from agent.engine.sessions import SessionEvent, SessionLog
 from agent.harness import FakeLLM, assistant, tool_call
-from agent.kernel import AgentKernel, KernelConfig
-from agent.loop import AgentLLMPort, AgentResult, ReactLoopAgent
 from agent.memory import MEMORY_TYPES, FileMemoryStore, Memory, MemoryStore
 from agent.memory.retrieval import MemoryHit, RRFMemoryRetriever
 from agent.memory.service import MemoryService, memory_save_tool, memory_search_tool
@@ -35,11 +36,7 @@ from agent.plugins import (
     register_builtin_plugins,
     waterfall,
 )
-from agent.runtime import ToolRuntime
-from agent.sandbox import Sandbox, SandboxDecision, SandboxRule
-from agent.sessions import SessionEvent, SessionLog
-from agent.skills import Skill, SkillCatalog, SkillRegistry, skill_tool
-from agent.system_prompt import (
+from agent.prompt.system_prompt import (
     CACHE_BOUNDARY,
     HARNESS_IDENTITY_ORDER,
     MEMORY_ORDER,
@@ -53,21 +50,24 @@ from agent.system_prompt import (
     SystemPrompt,
     render_prompt,
 )
-from agent.tool_gateway import (
-    ToolCatalog,
-    ToolGateway,
-    ToolIndexEntry,
-    ToolVisibilityPolicy,
-    tool_search_tool,
-)
-from agent.tool_permissions import ToolPermission
-from agent.tools import (
+from agent.security.sandbox import Sandbox, SandboxDecision, SandboxRule
+from agent.skills.registry import Skill, SkillCatalog, SkillRegistry, skill_tool
+from agent.tools.definition import (
     ToolArgsError,
     ToolDefinition,
     ToolOutput,
     ToolOutputError,
     define_tool,
 )
+from agent.tools.fs_tools import register_fs_tools
+from agent.tools.tool_gateway import (
+    ToolCatalog,
+    ToolGateway,
+    ToolIndexEntry,
+    ToolVisibilityPolicy,
+    tool_search_tool,
+)
+from agent.tools.tool_permissions import ToolPermission
 
 __all__ = [
     "CACHE_BOUNDARY",

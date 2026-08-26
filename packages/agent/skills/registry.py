@@ -7,9 +7,9 @@ The Agent loads relevant skill instructions into context on demand and then foll
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent.decisions import ToolExecution, text_block
+from agent.engine.decisions import ToolExecution, text_block
 from agent.frontmatter import parse_frontmatter
-from agent.tools import ToolDefinition, ToolOutput, define_tool
+from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
 
 
 @dataclass

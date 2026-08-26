@@ -1,12 +1,12 @@
 """Smoke tests for the tool runtime."""
-from agent.decisions import (
+from agent.engine.decisions import (
     PreToolDecision,
     ToolExecution,
     ToolExecutionFailure,
     ToolExecutionSuccess,
 )
-from agent.runtime import ToolRuntime
-from agent.tools import ToolOutput, define_tool
+from agent.engine.runtime import ToolRuntime
+from agent.tools.definition import ToolOutput, define_tool
 from agent import text_block
 
 

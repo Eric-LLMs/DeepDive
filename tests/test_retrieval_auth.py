@@ -27,7 +27,8 @@ class _FakeContext:
     def peer(self):
         return self._peer
 
-    def abort(self, code, details):
+    async def abort(self, code, details):
+        # Mirrors grpc.aio: abort() is a coroutine; awaiting it raises the abort error.
         self.aborts.append((code, details))
         raise _Abort(code, details)
 
@@ -48,21 +49,21 @@ def test_rate_limiter_bucket_exhausts_then_refills():
 
 
 # ── token gate ──
-def test_token_disabled_when_empty():
+async def test_token_disabled_when_empty():
     guard = AuthGuard(token="")
-    guard.require_token(_FakeContext())  # no abort
+    await guard.require_token(_FakeContext())  # no abort
 
 
-def test_token_rejects_missing_or_wrong():
+async def test_token_rejects_missing_or_wrong():
     guard = AuthGuard(token="s3cret")
     with pytest.raises(_Abort) as exc:
-        guard.require_token(_FakeContext(metadata=[("authorization", "Bearer wrong")]))
+        await guard.require_token(_FakeContext(metadata=[("authorization", "Bearer wrong")]))
     assert exc.value.code == grpc.StatusCode.UNAUTHENTICATED
 
 
-def test_token_accepts_bearer():
+async def test_token_accepts_bearer():
     guard = AuthGuard(token="s3cret")
-    guard.require_token(_FakeContext(metadata=[("authorization", "Bearer s3cret")]))
+    await guard.require_token(_FakeContext(metadata=[("authorization", "Bearer s3cret")]))
 
 
 # ── tenant binding ──
@@ -70,25 +71,25 @@ def _req(filters):
     return SimpleNamespace(query="", top_k=0, filters=filters)
 
 
-def test_tenant_requires_user_id():
+async def test_tenant_requires_user_id():
     guard = AuthGuard()
     with pytest.raises(_Abort) as exc:
-        guard.bind_tenant(_req({}), _FakeContext())
+        await guard.bind_tenant(_req({}), _FakeContext())
     assert exc.value.code == grpc.StatusCode.PERMISSION_DENIED
     # A bare domain filter is also a cross-tenant read — refused without user_id.
     with pytest.raises(_Abort):
-        guard.bind_tenant(_req({"domain_id": "abc"}), _FakeContext())
+        await guard.bind_tenant(_req({"domain_id": "abc"}), _FakeContext())
 
 
-def test_tenant_guest_marker_normalizes_to_none():
+async def test_tenant_guest_marker_normalizes_to_none():
     guard = AuthGuard()
-    filters = guard.bind_tenant(_req({"guest": "1"}), _FakeContext())
+    filters = await guard.bind_tenant(_req({"guest": "1"}), _FakeContext())
     assert filters["user_id"] is None
 
 
-def test_tenant_keeps_user_id():
+async def test_tenant_keeps_user_id():
     guard = AuthGuard()
-    filters = guard.bind_tenant(_req({"user_id": "u-1", "domain_id": "d"}), _FakeContext())
+    filters = await guard.bind_tenant(_req({"user_id": "u-1", "domain_id": "d"}), _FakeContext())
     assert filters == {"user_id": "u-1", "domain_id": "d"}
 
 

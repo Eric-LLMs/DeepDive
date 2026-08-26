@@ -13,8 +13,8 @@ from typing import Any
 
 from jsonschema import Draft7Validator
 
-from agent.decisions import ContentBlock, ToolExecution
-from agent.tool_permissions import ToolPermission, permission_names
+from agent.engine.decisions import ContentBlock, ToolExecution
+from agent.tools.tool_permissions import ToolPermission, permission_names
 
 
 class ToolArgsError(ValueError):

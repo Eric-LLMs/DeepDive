@@ -1,7 +1,7 @@
 """Resident fs/shell tools: async reads, atomic edits, bash sandbox wiring."""
 import pytest
-from agent.bash_sandbox import HostBashSandbox
-from agent.fs_tools import bash_tool, edit_file_tool, read_file_tool
+from agent.tools.bash_sandbox import HostBashSandbox
+from agent.tools.fs_tools import bash_tool, edit_file_tool, read_file_tool
 
 
 async def test_read_file_returns_content(tmp_path):

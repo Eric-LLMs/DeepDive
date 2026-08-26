@@ -14,9 +14,9 @@ import json
 import subprocess
 from pathlib import Path
 
-from agent.decisions import text_block
-from agent.tool_permissions import ToolPermission
-from agent.tools import ToolDefinition, ToolOutput, define_tool
+from agent.engine.decisions import text_block
+from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
+from agent.tools.tool_permissions import ToolPermission
 
 # Large / derived artifacts never enter a checkpoint (info/exclude — no workspace .gitignore).
 _IGNORED = (

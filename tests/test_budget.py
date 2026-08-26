@@ -4,7 +4,7 @@ Also verifies per-step tool progress events (``tool-start`` / ``tool-result``) s
 turn's ``progress_sink`` — the other half of the per-step cost/observability work.
 """
 from agent import ReactLoopAgent, SystemPrompt, ToolOutput, ToolRuntime, define_tool, text_block
-from agent.context import AgentTurn
+from agent.engine.context import AgentTurn
 from agent.harness import FakeLLM, assistant, tool_call
 
 # 1000 prompt + 1000 completion tokens on deepdive-chat costs 0.00075 USD.

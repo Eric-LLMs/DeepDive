@@ -26,18 +26,14 @@ from typing import Any
 
 from core.config import settings
 
-from agent.checkpoints import CheckpointStore, revert_to_checkpoint_tool
-from agent.context import AgentTurn, bind_turn, current_turn
-from agent.llm_guard import ReliableLLM
-from agent.loop import AgentLLMPort, AgentResult, ReactLoopAgent
+from agent.engine.context import AgentTurn, bind_turn, current_turn
+from agent.engine.loop import AgentLLMPort, AgentResult, ReactLoopAgent
+from agent.engine.runtime import ToolRuntime
+from agent.engine.sessions import SessionLog
+from agent.engine.telemetry import AuditSink
+from agent.llm.llm_guard import ReliableLLM
 from agent.memory.service import MemoryService, memory_save_tool, memory_search_tool
-from agent.plan_tool import plan_tool
-from agent.runtime import ToolRuntime
-from agent.sandbox import Sandbox
-from agent.sessions import SessionLog
-from agent.skills import SkillCatalog, SkillRegistry, skill_tool
-from agent.subagent import run_subagent_tool
-from agent.system_prompt import (
+from agent.prompt.system_prompt import (
     HARNESS_IDENTITY_ORDER,
     MEMORY_ORDER,
     PERSONA_ORDER,
@@ -46,8 +42,12 @@ from agent.system_prompt import (
     CacheBoundaryAssembler,
     PromptZone,
 )
-from agent.telemetry import AuditSink
-from agent.tool_gateway import ToolGateway, tool_search_tool
+from agent.security.sandbox import Sandbox
+from agent.skills.registry import SkillCatalog, SkillRegistry, skill_tool
+from agent.tools.checkpoints import CheckpointStore, revert_to_checkpoint_tool
+from agent.tools.plan_tool import plan_tool
+from agent.tools.subagent import run_subagent_tool
+from agent.tools.tool_gateway import ToolGateway, tool_search_tool
 
 
 @dataclass
@@ -89,7 +89,7 @@ class AgentKernel:
         self._assemble_sections(soul=soul, project_context=project_context)
 
         # Reliability wrapper: hard timeout + tenacity retry on temporary errors +
-        # cancellation pass-through (see agent.llm_guard). Wrapped once, kernel-wide.
+        # cancellation pass-through (see agent.llm.llm_guard). Wrapped once, kernel-wide.
         llm = ReliableLLM(
             llm,
             timeout_s=settings.llm_timeout_seconds,
@@ -183,7 +183,7 @@ class AgentKernel:
         """Proactive recall: top hits for the user's message, injected into the suffix.
 
         Computed once per turn (cached on ``AgentTurn.recall_hits``, reset when a fresh
-        :class:`~agent.context.AgentTurn` is built in :meth:`run`), so per-step
+        :class:`~agent.engine.context.AgentTurn` is built in :meth:`run`), so per-step
         ``refresh_dynamic`` reuses it instead of hitting the recall channels again.
         Recall is gated by ``MemoryService.should_recall`` (OpenClaw Lane-2 style): the
         expensive RRF query only runs on memory-seeking turns; every turn still gets the

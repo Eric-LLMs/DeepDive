@@ -1,5 +1,5 @@
 """Tests for individual pipeline nodes: rewrite degrade, parent dedup, CRAG verdict."""
-from rag.context import PipelineContext, RagRequest
+from rag.pipeline.context import PipelineContext, RagRequest
 from rag.nodes.base import NodeStatus
 from rag.nodes.crg_check import CrgCheckNode, judge_relevance
 from rag.nodes.parent_expand import ParentExpandNode, expand_with_parents

@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 from rag.nodes.base import Node, NodeStatus
-from rag.query_rewrite import QueryRewriter
+from rag.query.query_rewrite import QueryRewriter
 
 
 class QueryRewriteNode(Node):

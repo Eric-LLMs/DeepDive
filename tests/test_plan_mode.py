@@ -1,8 +1,8 @@
 """Plan mode: the ``plan`` meta-tool streams a plan event to the turn's progress sink."""
-from agent.context import AgentTurn, bind_turn
-from agent.decisions import ToolExecution
-from agent.plan_tool import plan_tool
-from agent.runtime import ToolRuntime
+from agent.engine.context import AgentTurn, bind_turn
+from agent.engine.decisions import ToolExecution
+from agent.tools.plan_tool import plan_tool
+from agent.engine.runtime import ToolRuntime
 
 
 async def test_plan_emits_event_to_turn_progress_sink():

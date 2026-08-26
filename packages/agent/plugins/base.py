@@ -11,9 +11,9 @@ as before (flat, order-independent).
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent.decisions import Guard
-from agent.skills import Skill
-from agent.tools import ToolDefinition
+from agent.engine.decisions import Guard
+from agent.skills.registry import Skill
+from agent.tools.definition import ToolDefinition
 
 
 @dataclass

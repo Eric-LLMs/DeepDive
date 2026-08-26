@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from core.infrastructure.drive_repositories import SqlChunkRepository
 
-from rag.pipeline import PipelineDeps, RAGPipeline
-from rag.pipeline_config import RagPipelineConfig
+from rag.pipeline.executor import PipelineDeps, RAGPipeline
+from rag.pipeline.pipeline_config import RagPipelineConfig
 from rag.recall.keyword import KeywordRecaller
 from rag.recall.vector import VectorRecaller
 

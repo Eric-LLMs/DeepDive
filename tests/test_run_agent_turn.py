@@ -6,7 +6,7 @@ same session memory, same channel pinning — and it must defer session_finalize
 from types import SimpleNamespace
 from uuid import uuid4
 
-from agent.loop import AgentResult
+from agent.engine.loop import AgentResult
 
 from apps.worker import tasks
 

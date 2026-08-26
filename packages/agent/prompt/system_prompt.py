@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
-from agent.context import current_turn
+from agent.engine.context import current_turn
 
 # Order conventions (matching Cordis's system-prompt ordering).
 PERSONA_ORDER = 0
@@ -190,7 +190,7 @@ class CacheBoundaryAssembler(SystemPrompt):
 
     The static/project zones render once and are reused across steps; only the dynamic
     suffix is re-rendered per step. The assembler is **stateless** — injected content lives
-    on the current :class:`~agent.context.AgentTurn` (never on the singleton), so concurrent
+    on the current :class:`~agent.engine.context.AgentTurn` (never on the singleton), so concurrent
     turns on a shared kernel cannot race. ``inject()`` appends durable content below the
     boundary (mirrors DSH's ``agent.inject()``) by delegating to the bound turn.
     ``snapshot_key()`` exposes the stable-prefix identity for prefix-cache observability.

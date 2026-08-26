@@ -12,9 +12,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from agent.decisions import Guard, PreToolDecision, ToolExecution
-from agent.tool_permissions import ToolPermission, permission_names
-from agent.tools import ToolDefinition, classify_permissions
+from agent.engine.decisions import Guard, PreToolDecision, ToolExecution
+from agent.tools.definition import ToolDefinition, classify_permissions
+from agent.tools.tool_permissions import ToolPermission, permission_names
 
 
 class SandboxDecision(Enum):
@@ -117,7 +117,7 @@ class Sandbox:
 
         The runtime resolves an ASK through its approval bridge (a human-in-the-loop
         approver); with no approver bound it degrades to DENY (see
-        :meth:`~agent.runtime.ToolRuntime._resolve_ask`).
+        :meth:`~agent.engine.runtime.ToolRuntime._resolve_ask`).
         """
 
         async def _ask(exec: ToolExecution, next_: Callable) -> PreToolDecision:

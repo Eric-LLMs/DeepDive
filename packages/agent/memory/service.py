@@ -20,12 +20,12 @@ from pathlib import Path
 
 from core.config import settings
 
-from agent.decisions import ToolExecution, text_block
+from agent.engine.decisions import ToolExecution, text_block
 from agent.memory.base import MemoryStore
 from agent.memory.retrieval import MemoryHit, RRFMemoryRetriever
 from agent.memory.types import MEMORY_TYPES, Memory
-from agent.tool_permissions import ToolPermission
-from agent.tools import ToolDefinition, ToolOutput, define_tool
+from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
+from agent.tools.tool_permissions import ToolPermission
 
 # kebab-case memory key: lowercase letters/digits/hyphens.
 _NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
@@ -52,7 +52,7 @@ class MemoryService:
         """Load and return the ``MEMORY.md`` short-term brief (first ``top_lines`` lines).
 
         The returned text is per-turn state: the kernel stores it on the current
-        :class:`~agent.context.AgentTurn` (``turn.memory_brief``), so concurrent turns never
+        :class:`~agent.engine.context.AgentTurn` (``turn.memory_brief``), so concurrent turns never
         share it (the old ``self._brief`` instance field raced across turns).
         """
         brief: list[str] = []

@@ -6,9 +6,9 @@ turn resets the cache so each turn recomputes. Recall is turn-scoped (``AgentTur
 — the old shared ``kernel._recall_hits`` field is gone.
 """
 from agent import ToolRuntime
-from agent.context import AgentTurn
+from agent.engine.context import AgentTurn
 from agent.harness import FakeLLM, assistant
-from agent.kernel import AgentKernel
+from agent.engine.kernel import AgentKernel
 from agent.memory.retrieval import MemoryHit
 
 

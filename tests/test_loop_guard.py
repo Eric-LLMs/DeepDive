@@ -13,7 +13,7 @@ from agent import (
     text_block,
 )
 from agent.harness import FakeLLM, assistant, tool_call
-from agent.loop_guard import ToolLoopTracker
+from agent.engine.loop_guard import ToolLoopTracker
 
 
 def _echo_tool():

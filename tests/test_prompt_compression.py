@@ -4,7 +4,7 @@ Verifies that oversized message content is trimmed for the LLM request snapshot 
 persistence copy keeps the full text, and that non-string content (e.g. ``tool_calls``) passes
 through untouched.
 """
-from agent.loop import ReactLoopAgent
+from agent.engine.loop import ReactLoopAgent
 from core.config import settings
 
 

@@ -18,9 +18,9 @@ import logging
 import time
 from dataclasses import dataclass
 
-from rag.context import NodeTrace, PipelineContext, RagRequest
-from rag.pipeline_config import RagPipelineConfig
-from rag.registry import registry
+from rag.pipeline.context import NodeTrace, PipelineContext, RagRequest
+from rag.pipeline.pipeline_config import RagPipelineConfig
+from rag.pipeline.registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class RetrievalUnavailable(RuntimeError):
 
 @dataclass
 class PipelineDeps:
-    """Pipeline-level dependencies injected at assembly time (see ``rag.factory``)."""
+    """Pipeline-level dependencies injected at assembly time (see ``rag.pipeline.factory``)."""
 
     embedder: object = None          # EmbeddingPort
     vector_recaller: object = None   # Recaller (semantic)

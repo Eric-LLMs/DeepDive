@@ -17,14 +17,14 @@ from agent import (
     ToolRuntime,
     register_builtin_plugins,
 )
-from agent.approvals import get_approval_bridge
-from agent.checkpoints import CheckpointStore
-from agent.fs_tools import register_fs_tools
-from agent.kernel import AgentKernel, KernelConfig
+from agent.engine.kernel import AgentKernel, KernelConfig
 from agent.memory.retrieval import RRFMemoryRetriever
 from agent.memory.service import MemoryService
-from agent.project_context import read_project_context
-from agent.sandbox import Sandbox
+from agent.security.approvals import get_approval_bridge
+from agent.security.sandbox import Sandbox
+from agent.tools.checkpoints import CheckpointStore
+from agent.tools.fs_tools import register_fs_tools
+from agent.tools.project_context import read_project_context
 from api.tools import register_builtin_tools
 from core.application.drive_service import DriveService
 from core.application.services import VocabularyService

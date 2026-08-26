@@ -14,9 +14,9 @@ import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
-from agent.decisions import ToolExecution, text_block
-from agent.tool_permissions import permission_names
-from agent.tools import ToolDefinition, ToolOutput, define_tool
+from agent.engine.decisions import ToolExecution, text_block
+from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
+from agent.tools.tool_permissions import permission_names
 
 
 def _blurb(tool: ToolDefinition, max_chars: int = 120) -> str:

@@ -1,7 +1,7 @@
 """Tests for the telemetry layer (cost estimate, TurnSpan, AuditSink JSONL)."""
 import json
 
-from agent.telemetry import AuditSink, TurnSpan, estimate_cost_usd
+from agent.engine.telemetry import AuditSink, TurnSpan, estimate_cost_usd
 
 
 def test_estimate_cost_usd_prices_a_known_model():

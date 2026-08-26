@@ -1,7 +1,7 @@
 """Tool permission vocabulary: the Read / Write / Network capability classes.
 
 A tool's permission class (auto-classified from its definition, or declared explicitly)
-is what the :class:`~agent.sandbox.Sandbox` checks before execution: tools that require a
+is what the :class:`~agent.security.sandbox.Sandbox` checks before execution: tools that require a
 permission outside the session's granted set are denied (or asked for approval) by the
 PreToolUse permission gate.
 """

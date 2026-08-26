@@ -8,8 +8,8 @@ from agent import (
     text_block,
 )
 from agent.harness import FakeLLM, assistant, tool_call
-from agent.plan_tool import plan_tool
-from agent.subagent import _DEPTH_CTX, _filter_schemas, run_subagent_tool
+from agent.tools.plan_tool import plan_tool
+from agent.tools.subagent import _DEPTH_CTX, _filter_schemas, run_subagent_tool
 from core.config import settings
 
 
@@ -44,7 +44,7 @@ def test_schema_filter_excludes_meta_tools():
 
 
 async def test_depth_cap_returns_error():
-    from agent.decisions import ToolExecution
+    from agent.engine.decisions import ToolExecution
 
     runtime = ToolRuntime()
     runtime.register(run_subagent_tool())
@@ -84,7 +84,7 @@ async def test_parent_delegates_to_child_and_returns_child_answer():
 
 
 async def test_subagent_requires_a_parent_loop():
-    from agent.decisions import ToolExecution
+    from agent.engine.decisions import ToolExecution
 
     runtime = ToolRuntime()
     runtime.register(run_subagent_tool())

@@ -3,10 +3,10 @@
 ``read_file`` (READ), ``edit_file`` (WRITE), and ``bash`` (WRITE + NETWORK) are the
 microkernel's resident file-system tools. All file access is rooted at a workspace
 directory (path traversal is rejected), and the permission class is declared explicitly
-so the :class:`~agent.sandbox.Sandbox` gates them: the default READ-only session denies
+so the :class:`~agent.security.sandbox.Sandbox` gates them: the default READ-only session denies
 ``edit_file`` / ``bash`` unless the host grants WRITE / NETWORK.
 
-``bash`` delegates to a :class:`~agent.bash_sandbox.BashSandbox` (host or docker) and
+``bash`` delegates to a :class:`~agent.tools.bash_sandbox.BashSandbox` (host or docker) and
 applies a best-effort workspace-escape guard; the sandbox is the real isolation boundary.
 """
 from __future__ import annotations
@@ -16,10 +16,10 @@ import os
 import tempfile
 from pathlib import Path
 
-from agent.bash_sandbox import BashSandbox, assert_no_escape, get_bash_sandbox
-from agent.decisions import ToolExecution, text_block
-from agent.tool_permissions import ToolPermission
-from agent.tools import ToolDefinition, ToolOutput, define_tool
+from agent.engine.decisions import ToolExecution, text_block
+from agent.tools.bash_sandbox import BashSandbox, assert_no_escape, get_bash_sandbox
+from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
+from agent.tools.tool_permissions import ToolPermission
 
 
 def _resolve(workspace: Path, raw_path: str) -> Path:

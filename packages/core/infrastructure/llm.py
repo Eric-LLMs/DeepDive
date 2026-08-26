@@ -5,7 +5,7 @@ The endpoint, key, and model are read from configuration.
 import json
 from collections.abc import AsyncIterator
 
-from agent.llm_errors import raise_classified
+from agent.llm.llm_errors import raise_classified
 from openai import AsyncOpenAI
 
 from core.config import settings

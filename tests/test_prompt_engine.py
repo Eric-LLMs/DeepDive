@@ -5,7 +5,7 @@ Verifies the three-zone partition, byte-identical stable head across assembles, 
 into the rendered prompt.
 """
 
-from agent.system_prompt import (
+from agent.prompt.system_prompt import (
     CACHE_BOUNDARY,
     CacheBoundaryAssembler,
     PromptZone,
@@ -60,7 +60,7 @@ async def test_only_dynamic_changes_per_step():
 
 
 async def test_inject_survives_across_steps_and_clears_on_new_turn():
-    from agent.context import AgentTurn, bind_turn
+    from agent.engine.context import AgentTurn, bind_turn
 
     asm = CacheBoundaryAssembler()
     asm.section("soul", 0, "identity", zone=PromptZone.STATIC_PREFIX)
@@ -95,7 +95,7 @@ async def test_rendered_prompt_contains_no_boundary_marker():
 
 async def test_legacy_flat_assembly_still_renders():
     """Backward compatibility: a plain SystemPrompt renders flat with no boundary."""
-    from agent.system_prompt import SystemPrompt
+    from agent.prompt.system_prompt import SystemPrompt
 
     sp = SystemPrompt()
     sp.section("a", 0, "one")

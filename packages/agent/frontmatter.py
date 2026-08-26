@@ -1,6 +1,6 @@
 """Shared frontmatter parsing: the leading ``---`` key/value block used by skills and memory.
 
-Both :mod:`agent.skills` and :mod:`agent.memory.file` parsed this identically; the single
+Both :mod:`agent.skills.registry` and :mod:`agent.memory.file` parsed this identically; the single
 helper keeps the format consistent and the duplication gone.
 """
 from __future__ import annotations

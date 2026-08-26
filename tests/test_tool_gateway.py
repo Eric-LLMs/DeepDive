@@ -1,12 +1,12 @@
 """Tests for the deferred tool-loading gateway (catalog blurb, mount, allow/deny)."""
 import pytest
-from agent.tool_gateway import (
+from agent.tools.tool_gateway import (
     ToolCatalog,
     ToolGateway,
     ToolVisibilityPolicy,
     tool_search_tool,
 )
-from agent.tools import ToolDefinition, ToolOutput, define_tool
+from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
 
 
 def _def(name: str, description: str, params: dict | None = None) -> ToolDefinition:
@@ -24,7 +24,7 @@ def _def(name: str, description: str, params: dict | None = None) -> ToolDefinit
 
 @pytest.fixture
 def runtime():
-    from agent.runtime import ToolRuntime
+    from agent.engine.runtime import ToolRuntime
 
     rt = ToolRuntime()
     rt.register(_def("rag_search", "Search learning material chunks for a query."))

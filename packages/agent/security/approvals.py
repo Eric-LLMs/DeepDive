@@ -1,6 +1,6 @@
 """Human-in-the-loop approvals: per-request store + process-global bridge.
 
-When a high-risk tool is gated to ASK (see :class:`~agent.sandbox.Sandbox`), the runtime
+When a high-risk tool is gated to ASK (see :class:`~agent.security.sandbox.Sandbox`), the runtime
 calls the :class:`ApprovalBridge` wired as ``ToolRuntime(approval=bridge)``. The bridge
 reads the per-request :class:`ApprovalStore` bound to the current task via a contextvar
 (FastAPI runs each request in its own task), so concurrent requests never share approval
@@ -28,7 +28,7 @@ from uuid import uuid4
 import structlog
 from core.config import settings
 
-from agent.decisions import PreToolDecision, ToolExecution
+from agent.engine.decisions import PreToolDecision, ToolExecution
 
 _log = structlog.get_logger("deepdive.agent")
 

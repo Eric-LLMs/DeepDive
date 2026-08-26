@@ -16,7 +16,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
-    from rag.context import PipelineContext
+    from rag.pipeline.context import PipelineContext
 
 
 class NodeStatus(str, Enum):

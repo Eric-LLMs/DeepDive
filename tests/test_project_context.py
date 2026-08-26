@@ -6,9 +6,9 @@ that a non-empty ``project_context`` renders into the system prompt and feeds ``
 while an absent one renders nothing.
 """
 from agent import FakeLLM, ToolRuntime, assistant
-from agent.kernel import AgentKernel
-from agent.project_context import read_project_context
-from agent.system_prompt import render_prompt
+from agent.engine.kernel import AgentKernel
+from agent.tools.project_context import read_project_context
+from agent.prompt.system_prompt import render_prompt
 
 
 def test_reads_deepdive_md(tmp_path):

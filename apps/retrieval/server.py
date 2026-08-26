@@ -57,19 +57,23 @@ class AuthGuard:
                 return value.removeprefix("Bearer ").strip()
         return ""
 
-    def require_token(self, context) -> None:
+    # NOTE: grpc.aio's ``ServicerContext.abort`` is a coroutine — it must be *awaited* or the
+    # RPC is never aborted (the handler falls through to the pipeline). So every guard method
+    # here is async; the sync-looking ``context.abort(...)`` would only log a "coroutine never
+    # awaited" RuntimeWarning and leak a cross-tenant read.
+    async def require_token(self, context) -> None:
         """Abort UNAUTHENTICATED when a configured token is missing / wrong."""
         if not self.token:
             return  # auth disabled (dev)
         if self._bearer(context.invocation_metadata()) != self.token:
-            context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or missing retrieval token")
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or missing retrieval token")
 
-    def rate_limit(self, context) -> None:
+    async def rate_limit(self, context) -> None:
         """Abort RESOURCE_EXHAUSTED when the caller's per-peer bucket is empty."""
         if not self._limiter.allow(context.peer() or "unknown"):
-            context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "retrieval rate limit exceeded")
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "retrieval rate limit exceeded")
 
-    def bind_tenant(self, request, context) -> dict:
+    async def bind_tenant(self, request, context) -> dict:
         """Enforce tenant isolation and return the pipeline filters for this request.
 
         ``user_id`` is required; a guest request (no user) must say so explicitly with
@@ -80,7 +84,7 @@ class AuthGuard:
         uid = (filters.get("user_id") or "").strip()
         is_guest = filters.get("guest") in ("1", "true", "yes")
         if not uid and not is_guest:
-            context.abort(
+            await context.abort(
                 grpc.StatusCode.PERMISSION_DENIED,
                 "user_id filter is required for tenant isolation",
             )
@@ -96,9 +100,9 @@ class RetrievalService(retrieval_pb2_grpc.RetrievalServiceServicer):
         self.auth = auth or AuthGuard()
 
     async def Retrieve(self, request, context):
-        self.auth.require_token(context)
-        self.auth.rate_limit(context)
-        filters = self.auth.bind_tenant(request, context)
+        await self.auth.require_token(context)
+        await self.auth.rate_limit(context)
+        filters = await self.auth.bind_tenant(request, context)
         top_k = request.top_k if request.top_k > 0 else 5
         hits = await self.pipeline.retrieve(request.query, top_k, filters)
         return retrieval_pb2.RetrieveResponse(

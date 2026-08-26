@@ -17,7 +17,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable
 
-from agent.decisions import (
+from agent.engine.decisions import (
     ContentBlock,
     Guard,
     PostToolDecision,
@@ -29,8 +29,8 @@ from agent.decisions import (
     ToolFailure,
     text_block,
 )
-from agent.events import EventBus
-from agent.tools import ToolArgsError, ToolDefinition, ToolOutputError
+from agent.engine.events import EventBus
+from agent.tools.definition import ToolArgsError, ToolDefinition, ToolOutputError
 
 
 class ToolRuntime:

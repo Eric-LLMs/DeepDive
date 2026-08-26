@@ -1,10 +1,10 @@
 """LLM error taxonomy: temporary (retryable) vs fatal (surface to the caller).
 
-The agent's LLM calls go through :class:`~agent.llm_guard.ReliableLLM`, which retries
+The agent's LLM calls go through :class:`~agent.llm.llm_guard.ReliableLLM`, which retries
 temporary errors (timeout, rate limit, server/connection hiccups) with backoff and lets
 fatal errors (auth, bad request) surface as :class:`LLMFatalError`. ``classify`` maps any
 exception to the right bucket without hard-coding a specific SDK, so the wrapper works with
-any :class:`~agent.loop.AgentLLMPort` implementation (tests use a fake port).
+any :class:`~agent.engine.loop.AgentLLMPort` implementation (tests use a fake port).
 """
 from __future__ import annotations
 

@@ -29,7 +29,11 @@ from pgvector.sqlalchemy import Vector
 
 from core.config import settings
 
-engine = create_async_engine(settings.database_url, echo=False)
+# ``pool_pre_ping`` discards connections killed mid-transaction (e.g. a DB commit in
+# flight when the turn is cancelled leaves the asyncpg socket broken); without it the
+# next checkout can hand that dead connection to a request and fail with
+# "connection is closed". Pre-ping trades one round-trip for never serving a dead socket.
+engine = create_async_engine(settings.database_url, echo=False, pool_pre_ping=True)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 

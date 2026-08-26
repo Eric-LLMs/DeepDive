@@ -11,7 +11,7 @@ cancellation, budget) lives on the :class:`AgentTurn` bound for the duration of 
 concurrent turns on the shared kernel/loop never race. When no turn is passed, the loop builds
 one from the legacy positional arguments (kept for backward compatibility).
 
-**Reliability** — the LLM port is expected to be a :class:`~agent.llm_guard.ReliableLLM`
+**Reliability** — the LLM port is expected to be a :class:`~agent.llm.llm_guard.ReliableLLM`
 (timeout + retry + cancellation). A fatal LLM error surfaces as a graceful ``AgentResult.error``
 (never a hang); ``CancelledError`` (SSE disconnect) is logged and re-raised after session
 cleanup; tool failures are isolated per child (one failure never aborts healthy siblings); the
@@ -28,20 +28,25 @@ from typing import Any, Protocol
 
 from core.config import settings
 
-from agent.context import AgentTurn, bind_turn
-from agent.decisions import (
+from agent.engine.context import AgentTurn, bind_turn
+from agent.engine.decisions import (
     ToolExecution,
     ToolExecutionFailure,
     ToolExecutionResult,
     ToolFailure,
 )
-from agent.llm_errors import LLMFatalError
-from agent.loop_guard import ToolLoopTracker
-from agent.runtime import ToolRuntime
-from agent.sessions import SessionLog
-from agent.system_prompt import CacheBoundaryAssembler, PromptAssembly, SystemPrompt, render_prompt
-from agent.telemetry import TraceContext, TurnSpan, estimate_cost_usd, log_error, log_event
-from agent.tool_gateway import ToolGateway
+from agent.engine.loop_guard import ToolLoopTracker
+from agent.engine.runtime import ToolRuntime
+from agent.engine.sessions import SessionLog
+from agent.engine.telemetry import TraceContext, TurnSpan, estimate_cost_usd, log_error, log_event
+from agent.llm.llm_errors import LLMFatalError
+from agent.prompt.system_prompt import (
+    CacheBoundaryAssembler,
+    PromptAssembly,
+    SystemPrompt,
+    render_prompt,
+)
+from agent.tools.tool_gateway import ToolGateway
 
 
 class AgentLLMPort(Protocol):
@@ -218,7 +223,7 @@ class ReactLoopAgent:
                     )
                 except LLMFatalError as exc:
                     error = str(exc)
-                    log_error(event="llm_fatal", message=error)
+                    log_error(kind="llm_fatal", message=error)
                     turn.span.record_error(kind="llm_fatal", message=error)
                     break
                 turn.add_usage(step_usage)
@@ -239,7 +244,7 @@ class ReactLoopAgent:
                 if finished:
                     break
         except asyncio.CancelledError:
-            log_error(event="turn_cancelled")
+            log_error(kind="turn_cancelled")
             turn.span.record_error(kind="cancelled", message="turn cancelled")
             raise
         finally:
@@ -345,7 +350,7 @@ class ReactLoopAgent:
                             step_usage = evt.get("data")
                 except LLMFatalError as exc:
                     error = str(exc)
-                    log_error(event="llm_fatal", message=error)
+                    log_error(kind="llm_fatal", message=error)
                     turn.span.record_error(kind="llm_fatal", message=error)
                     yield {"type": "error", "data": {"message": error}}
                     break
@@ -380,7 +385,7 @@ class ReactLoopAgent:
                 if concludes:
                     break
         except asyncio.CancelledError:
-            log_error(event="turn_cancelled")
+            log_error(kind="turn_cancelled")
             turn.span.record_error(kind="cancelled", message="turn cancelled")
             raise
         finally:
