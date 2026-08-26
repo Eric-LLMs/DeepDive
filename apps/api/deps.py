@@ -7,6 +7,7 @@ assembler, a deferred-tool :class:`ToolGateway`, dual-track memory, and a
 :class:`ReactLoopAgent` step pipeline.
 """
 from functools import lru_cache
+from pathlib import Path
 
 from agent import (
     Context,
@@ -16,6 +17,8 @@ from agent import (
     ToolRuntime,
     register_builtin_plugins,
 )
+from agent.approvals import get_approval_bridge
+from agent.checkpoints import CheckpointStore
 from agent.fs_tools import register_fs_tools
 from agent.kernel import AgentKernel, KernelConfig
 from agent.memory.retrieval import RRFMemoryRetriever
@@ -68,13 +71,20 @@ def _retriever() -> RAGPipeline:
 
 @lru_cache
 def _agent() -> AgentKernel:
-    runtime = ToolRuntime()
+    runtime = ToolRuntime(approval=get_approval_bridge())
     ctx = Context()
 
     # Retrieval is a capability seam: the tool calls require("retrieval"), so the provider
     # (in-process RAGPipeline or a gRPC client) is swappable via settings.retrieval_mode.
     if settings.retrieval_mode == "grpc":
-        ctx.provide("retrieval", GrpcRetriever(settings.retrieval_grpc_addr))
+        ctx.provide(
+            "retrieval",
+            GrpcRetriever(
+                settings.retrieval_grpc_addr,
+                token=settings.retrieval_grpc_token,
+                tls_ca=Path(settings.retrieval_grpc_tls_ca) if settings.retrieval_grpc_tls_ca else None,
+            ),
+        )
     else:
         ctx.provide("retrieval", _retriever())
 
@@ -120,6 +130,9 @@ def _agent() -> AgentKernel:
         memory=memory,
         skills=skills,
         sandbox=sandbox,
+        checkpoints=CheckpointStore(
+            settings.workspace_dir, settings.workspace_dir / settings.checkpoint_dir
+        ),
         config=KernelConfig(recall_top_k=settings.memory_recall_top_k),
     )
 

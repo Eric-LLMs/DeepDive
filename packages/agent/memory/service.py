@@ -18,8 +18,9 @@ import json
 import re
 from pathlib import Path
 
-from agent.decisions import ToolExecution, text_block
 from core.config import settings
+
+from agent.decisions import ToolExecution, text_block
 from agent.memory.base import MemoryStore
 from agent.memory.retrieval import MemoryHit, RRFMemoryRetriever
 from agent.memory.types import MEMORY_TYPES, Memory
@@ -45,22 +46,22 @@ class MemoryService:
         self._memory_md = memory_md_path
         self._top_lines = top_lines
         self._note_max_chars = note_max_chars
-        self._brief = ""
 
     # ── session lifecycle ──
-    def begin_session(self) -> None:
-        """Load the ``MEMORY.md`` short-term brief (first ``top_lines`` lines)."""
+    def begin_session(self) -> str:
+        """Load and return the ``MEMORY.md`` short-term brief (first ``top_lines`` lines).
+
+        The returned text is per-turn state: the kernel stores it on the current
+        :class:`~agent.context.AgentTurn` (``turn.memory_brief``), so concurrent turns never
+        share it (the old ``self._brief`` instance field raced across turns).
+        """
         brief: list[str] = []
         if self._memory_md is not None and self._memory_md.is_file():
             try:
                 brief = self._memory_md.read_text(encoding="utf-8").splitlines()[: self._top_lines]
             except OSError:
                 brief = []
-        self._brief = "\n".join(brief)
-
-    def session_brief(self) -> str:
-        """The injected short-term memory brief (empty when no MEMORY.md exists)."""
-        return self._brief
+        return "\n".join(brief)
 
     # ── recall ──
     async def recall(self, query: str, top_k: int = 5) -> list[MemoryHit]:

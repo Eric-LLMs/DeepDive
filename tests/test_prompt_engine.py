@@ -59,21 +59,25 @@ async def test_only_dynamic_changes_per_step():
     assert first.static_prefix == "identity"  # head unchanged; only the suffix would differ
 
 
-async def test_inject_survives_across_steps_and_clears_on_new_session():
+async def test_inject_survives_across_steps_and_clears_on_new_turn():
+    from agent.context import AgentTurn, bind_turn
+
     asm = CacheBoundaryAssembler()
     asm.section("soul", 0, "identity", zone=PromptZone.STATIC_PREFIX)
     asm.section("memory", 20, "", zone=PromptZone.DYNAMIC_SUFFIX)
 
-    asm.begin_session()
-    asm.inject("user set target to level 3", name="target")
-    step1 = await asm.refresh_dynamic({})
-    step2 = await asm.refresh_dynamic({})
+    turn = AgentTurn(user_msg="hi")
+    bind_turn(turn)
+    asm.inject("user set target to level 3", name="target")  # delegates to the bound turn
+    step1 = await asm.refresh_dynamic({"turn": turn})
+    step2 = await asm.refresh_dynamic({"turn": turn})
 
     assert "level 3" in step1
     assert step1 == step2  # durable across steps
 
-    asm.begin_session()  # new run → injected content reset
-    assert await asm.refresh_dynamic({}) == ""
+    turn2 = AgentTurn(user_msg="new run")
+    bind_turn(turn2)  # new turn → injected content empty
+    assert await asm.refresh_dynamic({"turn": turn2}) == ""
 
 
 async def test_rendered_prompt_contains_no_boundary_marker():

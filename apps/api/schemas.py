@@ -112,6 +112,10 @@ class ChatRequest(BaseModel):
     session_id: UUID | None = None   # optional: resume an existing session
 
 
+class ApprovalResolveRequest(BaseModel):
+    allow: bool
+
+
 class MediaGenerateRequest(BaseModel):
     video_path: str
     subtitle_path: str | None = None

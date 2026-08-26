@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from agent.decisions import Guard, ToolExecution
+from agent.decisions import Guard, PreToolDecision, ToolExecution
 from agent.tool_permissions import ToolPermission, permission_names
 from agent.tools import ToolDefinition, classify_permissions
 
@@ -92,10 +92,12 @@ class Sandbox:
         return worst
 
     def guard(self) -> Guard:
-        """A monotonic PreToolUse guard enforcing this sandbox inside the runtime.
+        """A monotonic PreToolUse guard enforcing DENY inside the runtime.
 
-        Returns a deny *reason* string (or ``None`` to pass). ASK without a human
-        approver degrades to deny so the default is safe.
+        Returns a deny *reason* string (or ``None`` to pass). ASK is *not* collapsed here:
+        it passes through to :meth:`ask_listener` (a ``tools/pre-execute`` listener) so a
+        human approver can allow it. ASK with no approver bound degrades to deny — the
+        default stays safe.
         """
 
         async def _guard(exec: ToolExecution) -> str | None:
@@ -103,12 +105,31 @@ class Sandbox:
             tool = runtime.get(exec.name) if runtime is not None else None
             if tool is None:
                 return None
-            decision = self.check(tool, exec.arguments)
-            if decision is SandboxDecision.ALLOW:
-                return None
-            tag = ",".join(permission_names(classify_permissions(tool)))
-            if decision is SandboxDecision.DENY:
+            if self.check(tool, exec.arguments) is SandboxDecision.DENY:
+                tag = ",".join(permission_names(classify_permissions(tool)))
                 return f"sandbox denied: {exec.name} needs [{tag}] but the session has [{','.join(permission_names(self._permissions))}]"
-            return f"sandbox approval required for {exec.name} (needs [{tag}])"
+            return None
 
         return _guard
+
+    def ask_listener(self) -> Callable[[ToolExecution, Callable], object]:
+        """A ``tools/pre-execute`` listener surfacing ASK as an approval request.
+
+        The runtime resolves an ASK through its approval bridge (a human-in-the-loop
+        approver); with no approver bound it degrades to DENY (see
+        :meth:`~agent.runtime.ToolRuntime._resolve_ask`).
+        """
+
+        async def _ask(exec: ToolExecution, next_: Callable) -> PreToolDecision:
+            runtime = getattr(getattr(exec, "agent", None), "runtime", None)
+            tool = runtime.get(exec.name) if runtime is not None else None
+            if tool is None:
+                return await next_()
+            if self.check(tool, exec.arguments) is SandboxDecision.ASK:
+                tag = ",".join(permission_names(classify_permissions(tool)))
+                return PreToolDecision.ask(
+                    f"sandbox approval required for {exec.name} (needs [{tag}])"
+                )
+            return await next_()
+
+        return _ask

@@ -3,8 +3,9 @@
 The endpoint, key, and model are read from configuration.
 """
 import json
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
+from agent.llm_errors import raise_classified
 from openai import AsyncOpenAI
 
 from core.config import settings
@@ -248,8 +249,8 @@ class OpenAILLM:
                 temperature=0.3,
             )
             return json.loads(resp.choices[0].message.content)
-        except Exception:
-            return {"translation": "Error parsing AI response.", "explanation": "LLM call failed."}
+        except Exception as exc:
+            raise raise_classified(exc) from exc
 
     async def chat(
         self,

@@ -25,6 +25,7 @@ arq>=0.26
 openai>=1.30
 litellm>=1.40
 tenacity>=8.2
+structlog>=24.0
 
 # MCP
 fastmcp>=0.2

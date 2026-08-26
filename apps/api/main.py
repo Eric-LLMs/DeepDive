@@ -2,22 +2,24 @@
 
 Start: uvicorn api.main:app --reload
 """
+import asyncio
+import contextlib
 import json
 import logging
 import random
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
-from arq import create_pool
-from arq.connections import RedisSettings
-from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from sse_starlette.sse import EventSourceResponse
-
+from agent.approvals import (
+    ApprovalStore,
+    configure_approval_broker,
+    get_approval_bridge,
+    set_request_approval,
+)
+from agent.checkpoints import CheckpointError
 from api.auth import (
     ADMIN_ROLE,
     USER_ROLE,
@@ -45,6 +47,7 @@ from api.routers.drive import users as drive_users_router
 from api.routers.drive import workspaces as drive_workspaces_router
 from api.schemas import (
     AdminLoginRequest,
+    ApprovalResolveRequest,
     ArticleCreateRequest,
     BulkUpdateRequest,
     ChatImportRequest,
@@ -57,8 +60,10 @@ from api.schemas import (
     ExplainRequest,
     ForgotPasswordRequest,
     GenerateDefinitionRequest,
+    GrantUpdateRequest,
     ImageFetchRequest,
     ImportRequest,
+    LearningImportRequest,
     MatchCreate,
     MediaGenerateRequest,
     ModelCreateRequest,
@@ -80,22 +85,22 @@ from api.schemas import (
     SentenceCreate,
     SentenceImportRequest,
     SentenceUpdate,
+    SessionRenameRequest,
     SyntaxAnalysisRequest,
     TermCreate,
     TermImportRequest,
     TermUpdate,
     TestEmailRequest,
-    SessionRenameRequest,
-    TTSRequest,
-    GrantUpdateRequest,
-    LearningImportRequest,
     TokenCreateRequest,
     TokenUpdateRequest,
+    TTSRequest,
     UserCreateRequest,
     UserLoginRequest,
     UserUpdateRequest,
     WalletTopupRequest,
 )
+from arq import create_pool
+from arq.connections import RedisSettings
 from core.application.drive_service import DriveError
 from core.application.services import VocabError
 from core.config import settings
@@ -111,9 +116,9 @@ from core.infrastructure.db import (
     AccessTokenModel,
     ChunkModel,
     CredentialModelModel,
-    LoginTokenModel,
     LLMCredentialModel,
     LLMModelModel,
+    LoginTokenModel,
     MessageModel,
     RoleCredentialModel,
     SessionLocal,
@@ -141,6 +146,7 @@ from core.infrastructure.jobs import (
     TTS,
     TaskQueue,
 )
+from core.infrastructure.mailer import MailNotConfigured, send_email
 from core.infrastructure.memory import (
     SessionMemoryStore,
     compact_history,
@@ -150,9 +156,7 @@ from core.infrastructure.memory import (
     load_session_detail,
 )
 from core.infrastructure.repositories import SqlArticleRepository
-from core.infrastructure.mailer import MailNotConfigured, send_email
 from core.infrastructure.request_context import get_request_user_id, set_request_user
-from core.infrastructure.tts import TTSClient
 from core.infrastructure.security import (
     check_quota,
     ensure_admin_user,
@@ -167,10 +171,14 @@ from core.infrastructure.security import (
     set_setting,
     verify_password,
 )
-from collections import defaultdict
-
+from core.infrastructure.tts import TTSClient
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sse_starlette.sse import EventSourceResponse
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -184,6 +192,7 @@ async def lifespan(app: FastAPI):
         await _bootstrap_config(session)
     redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
     app.state.redis = redis
+    configure_approval_broker(redis)  # distributed approval wakeup across API nodes
     yield
     await redis.aclose()
 
@@ -3463,19 +3472,56 @@ async def chat_stream(
     )
 
     async def gen():
+        # The agent may block on a human-in-the-loop approval (awaiting POST /approvals/{id}),
+        # so a plain `async for` over run_stream would deadlock — the stream can't advance while
+        # the approval-request frame sits unyielded. Pump the stream into a queue in a sibling
+        # task, and let the ApprovalStore's sink push approval frames into the same queue; this
+        # generator only ever reads from the queue.
+        frames: asyncio.Queue = asyncio.Queue()
+        store = ApprovalStore(
+            get_approval_bridge().broker,
+            user_id=str(user_id),
+            sink=lambda evt: frames.put_nowait(("approval", evt)),
+        )
+        set_request_approval(store)
+
+        async def pump():
+            try:
+                async for evt in get_agent().run_stream(
+                    body.message,
+                    history,
+                    session_memory=session_memory,
+                    model=model,
+                    base_url=base_url or None,
+                    api_key=api_key or None,
+                    progress_sink=lambda evt: frames.put_nowait(("agent", evt)),
+                ):
+                    await frames.put(("agent", evt))
+            finally:
+                # Sentinel so the consumer below always terminates after the stream ends,
+                # including on cancellation (the loop already logs turn-cancelled).
+                await frames.put(("agent", {"type": "done", "data": None}))
+
+        pump_task = asyncio.create_task(pump())
         final = None
-        async for evt in get_agent().run_stream(
-            body.message,
-            history,
-            session_memory=session_memory,
-            model=model,
-            base_url=base_url or None,
-            api_key=api_key or None,
-        ):
-            if evt["type"] == "done":
-                final = evt["data"]
-            else:
-                yield {"data": json.dumps(evt, ensure_ascii=False)}
+        try:
+            while True:
+                kind, data = await frames.get()
+                if kind == "approval":
+                    # Approval-request frame: forward verbatim (client POSTs /approvals/{id}).
+                    yield {"data": json.dumps(data, ensure_ascii=False, default=str)}
+                    continue
+                if data["type"] == "done":
+                    final = data["data"]
+                    break
+                yield {"data": json.dumps(data, ensure_ascii=False)}
+        finally:
+            # Client disconnect / generator close: stop the pump so the turn's awaits
+            # (wait_for/tenacity/gather) re-raise CancelledError and unwind cleanly.
+            set_request_approval(None)
+            pump_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pump_task
 
         # Defer the expensive embed+summary work exactly like /chat; log usage now that the
         # turn's token counts are known.
@@ -3514,3 +3560,43 @@ async def chat_stream(
         yield {"data": json.dumps({"type": "done", "data": done}, ensure_ascii=False)}
 
     return EventSourceResponse(gen())
+
+
+@app.post("/approvals/{approval_id}")
+async def resolve_approval(
+    approval_id: str,
+    body: ApprovalResolveRequest,
+    user: AuthUser = Depends(require_user),
+):
+    """Resolve a pending human-in-the-loop approval (allow / deny).
+
+    Approvals are registered under the requesting user's id when their chat store is built, so
+    ownership is checked before resolving — one user can't approve another's tool call. The
+    shared broker resolves the store's pending future (cross-node via Redis pub/sub when
+    configured), which unblocks the agent turn awaiting it.
+    """
+    bridge = get_approval_bridge()
+    owner = await bridge.owner(approval_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="approval not found or already resolved")
+    if str(user.user_id) != owner:
+        raise HTTPException(status_code=403, detail="approval belongs to another user")
+    await bridge.resolve(approval_id, body.allow)
+    return {"ok": True, "allow": body.allow}
+
+
+@app.post("/checkpoints/{checkpoint_id}/revert")
+async def revert_checkpoint(checkpoint_id: str, user: AuthUser = Depends(require_user)):
+    """Restore the agent workspace to a prior shadow-git checkpoint.
+
+    Checkpoint ids are recorded before each chat turn (see the agent kernel); this endpoint
+    rolls the workspace back to a known-good state after a bad batch of agent file edits.
+    """
+    agent = get_agent()
+    if agent.checkpoints is None:
+        raise HTTPException(status_code=503, detail="workspace checkpoints are disabled")
+    try:
+        head = await asyncio.to_thread(agent.checkpoints.revert, checkpoint_id)
+    except CheckpointError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "head": head}

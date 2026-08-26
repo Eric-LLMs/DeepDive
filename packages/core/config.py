@@ -82,6 +82,32 @@ class Settings(BaseSettings):
     session_summary_enabled: bool = True       # generate an LLM summary on session close
     memory_recall_top_k: int = 5               # proactive recall count for the prompt memory section
     memory_note_max_chars: int = 4000          # memory_save content length cap (guardrail)
+
+    # LLM call reliability: hard timeout + retry budget for every agent LLM call.
+    llm_timeout_seconds: float = 90            # max wall time for one LLM call (first-token for streams)
+    llm_max_retries: int = 2                   # retries on temporary errors (timeout / 429 / 5xx)
+    llm_retry_backoff: float = 1.0             # base backoff seconds (doubles per retry)
+
+    # Human-in-the-loop: how long an approval request waits before it is denied.
+    approval_timeout_seconds: float = 120
+    # Subagents: how deep child turns may nest before the loop refuses to spawn more.
+    max_subagent_depth: int = 3
+    # Per-turn cost cap (USD) — the loop aborts once the accumulated cost passes this.
+    max_budget_per_turn_usd: float = 1.0
+    # Workspace checkpoints: shadow-git snapshot dir (relative to the workspace root).
+    checkpoint_dir: Path = Path(".deepdive-snapshots")
+    # Agent audit trail: one JSONL line per turn event (best-effort; dir created on demand).
+    audit_log_path: Path = Path("data/audit.jsonl")
+
+    # ── gRPC retrieval service auth ──
+    retrieval_grpc_token: str = ""             # shared secret; empty disables auth (dev only)
+    retrieval_grpc_tls_cert: str = ""          # server TLS cert path; empty = insecure port
+    retrieval_grpc_tls_key: str = ""           # server TLS private-key path (with the cert)
+    retrieval_grpc_tls_ca: str = ""            # client-side CA bundle; empty = insecure channel
+    retrieval_grpc_rate_limit: int = 0         # max Retrieve req/s per client (0 = unlimited)
+
+    # ── RAG operations ──
+    query_cache_ttl_seconds: int = 300         # Redis query-cache TTL (0 disables the cache)
     memory_recall_min_len: int = 4             # queries at/below this length always recall (elliptical)
     memory_recall_trigger_words: list[str] = [  # lexical prefilter: these imply memory-seeking intent
         "remember", "recall", "earlier", "before", "previously", "prior",

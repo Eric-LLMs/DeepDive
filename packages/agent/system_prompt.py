@@ -22,6 +22,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
+from agent.context import current_turn
+
 # Order conventions (matching Cordis's system-prompt ordering).
 PERSONA_ORDER = 0
 HARNESS_IDENTITY_ORDER = -100
@@ -187,26 +189,23 @@ class CacheBoundaryAssembler(SystemPrompt):
     """Zone-aware prompt assembly with a stable cache boundary.
 
     The static/project zones render once and are reused across steps; only the dynamic
-    suffix is re-rendered per step. ``inject()`` appends durable session-level content
-    below the boundary (mirrors DSH's ``agent.inject()``); the loop calls ``begin_session()``
-    at the start of each run so injected content lives within one turn. ``snapshot_key()``
-    exposes the stable-prefix identity for prefix-cache observability.
+    suffix is re-rendered per step. The assembler is **stateless** — injected content lives
+    on the current :class:`~agent.context.AgentTurn` (never on the singleton), so concurrent
+    turns on a shared kernel cannot race. ``inject()`` appends durable content below the
+    boundary (mirrors DSH's ``agent.inject()``) by delegating to the bound turn.
+    ``snapshot_key()`` exposes the stable-prefix identity for prefix-cache observability.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._injected: list[tuple[str, str]] = []
         self._cached_static = ""
         self._cached_project = ""
 
-    # ── session lifecycle ──
-    def begin_session(self) -> None:
-        """Reset per-session injected content (called at the start of each run)."""
-        self._injected.clear()
-
     def inject(self, text: str, *, name: str | None = None) -> None:
-        """Append durable dynamic content to the suffix; survives across steps."""
-        self._injected.append((name or f"inject:{len(self._injected)}", text))
+        """Append durable dynamic content to the current turn's suffix (no-op off-turn)."""
+        turn = current_turn()
+        if turn is not None:
+            turn.inject(text, name=name)
 
     # ── zone resolution ──
     async def _resolve_zone(self, zone: PromptZone, context: dict) -> str:
@@ -219,10 +218,13 @@ class CacheBoundaryAssembler(SystemPrompt):
                 parts.append(text)
         return "\n\n".join(parts)
 
-    def _render_injected(self) -> str:
-        if not self._injected:
+    def _render_injected(self, context: dict) -> str:
+        """Render the current turn's injected content (from context, else the bound turn)."""
+        turn = context.get("turn") or current_turn()
+        injected = turn.injected if turn is not None else []
+        if not injected:
             return ""
-        return "\n\n".join(f"[{name}]\n{text}" for name, text in self._injected)
+        return "\n\n".join(f"[{name}]\n{text}" for name, text in injected)
 
     async def assemble(self, context: dict | None = None) -> PromptAssembly:
         """Build the zone-partitioned assembly, caching the stable static/project head."""
@@ -263,7 +265,7 @@ class CacheBoundaryAssembler(SystemPrompt):
         """Re-render only the dynamic suffix (dynamic sections + injected content)."""
         context = context or {}
         dynamic_sections = await self._resolve_zone(PromptZone.DYNAMIC_SUFFIX, context)
-        injected = self._render_injected()
+        injected = self._render_injected(context)
         return "\n\n".join(p for p in (dynamic_sections, injected) if p)
 
     def snapshot_key(self) -> str:
