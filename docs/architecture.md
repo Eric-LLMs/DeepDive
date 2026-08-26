@@ -203,6 +203,11 @@ deepdive/
 └── docker-compose.yml            # data + model services + worker + retrieval + traefik
 ```
 
+> The tree is illustrative, not an exhaustive inventory: each directory shows a few
+> representative files and the rest are collapsed — `apps/desktop`, `apps/web/src`,
+> `packages/core/{domain,ports,infrastructure}`, `migrations/*.sql` and `tests/` account for
+> most of the omitted files. `git ls-files` is the authoritative list.
+
 > `packages/agent`, `packages/rag`, `packages/core`, and `apps/api` are independent top-level
 > packages (import names `agent` / `rag` / `core` / `api`); no nested `deepdive` package layer.
 > Generated proto stubs live under `packages/shared/proto` and are imported as
