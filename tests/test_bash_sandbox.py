@@ -65,7 +65,7 @@ async def test_docker_missing_dependency_raises_clear_error(monkeypatch, tmp_pat
     sb = DockerBashSandbox(tmp_path)
 
     def _no_docker():
-        raise RuntimeError("docker-py is not installed; install the 'docker' extra")
+        raise RuntimeError("docker-py is not installed; it is a hard dependency (docker>=7.0)")
 
     monkeypatch.setattr(DockerBashSandbox, "_import_docker", staticmethod(_no_docker))
     with pytest.raises(RuntimeError, match="docker-py is not installed"):
@@ -81,7 +81,14 @@ def test_docker_decode_output():
 
 
 # ── factory ──
-def test_factory_returns_host_by_default(monkeypatch):
+def test_factory_returns_docker_by_default(monkeypatch):
+    # The production default is the Docker sandbox (settings.bash_sandbox="docker").
+    monkeypatch.setattr(settings, "bash_sandbox", "docker")
+    assert isinstance(get_bash_sandbox(), DockerBashSandbox)
+
+
+def test_factory_returns_host_when_explicitly_opted_in(monkeypatch):
+    # "host" is an explicit opt-in for local dev only — never the default.
     monkeypatch.setattr(settings, "bash_sandbox", "host")
     assert isinstance(get_bash_sandbox(), HostBashSandbox)
 

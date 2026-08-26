@@ -188,6 +188,12 @@ logger = logging.getLogger("uvicorn.error")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if settings.bash_sandbox == "host":
+        logger.warning(
+            "bash_sandbox=\"host\": the agent bash tool runs directly on the host process. "
+            "This is NOT a security boundary — use it for local dev only; the production "
+            "default is \"docker\" (per-command container sandbox)."
+        )
     await init_db()
     async with SessionLocal() as session:
         await ensure_default_admin(session)

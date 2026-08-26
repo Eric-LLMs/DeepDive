@@ -44,6 +44,8 @@ dependencies = [
     # gRPC (internal)
     "grpcio>=1.62",
     "grpcio-tools>=1.62",
+    # Bash sandbox (production path): docker-py for the per-command container sandbox.
+    "docker>=7.0",
     # Misc
     "httpx>=0.27",
     "jsonschema>=4.21",
@@ -65,12 +67,6 @@ media = [
     "python-pptx>=0.6.21",
     "reportlab>=4.0",
     "imageio-ffmpeg>=0.4.9",
-]
-# Bash sandbox (production path): docker-py for the per-command container sandbox.
-# NOT a hard dependency — when it is absent the host sandbox (settings.bash_sandbox="host")
-# is the fallback, so the API/worker run fine without Docker installed.
-docker = [
-    "docker>=7.0",
 ]
 
 [tool.hatch.build.targets.wheel]

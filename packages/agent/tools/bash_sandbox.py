@@ -2,18 +2,17 @@
 
 Two backends behind one :class:`BashSandbox` protocol:
 
-- :class:`HostBashSandbox` — hardened host fallback for LOCAL DEVELOPMENT ONLY. It is NOT a
-  security boundary: the command runs directly on the host process. A best-effort
-  workspace-escape guard (:func:`assert_no_escape`), a hard timeout, and an output cap are
-  the only limits.
-- :class:`DockerBashSandbox` — the production path: each command runs in a fresh, one-shot
-  container (via docker-py) with the workspace mounted read-write, network disabled by
-  default, memory/CPU caps, and a call-level timeout. docker-py is an optional dependency;
-  when it is missing or the daemon is unreachable, a clear error tells the operator to fall
-  back to the host sandbox.
+- :class:`DockerBashSandbox` — the default production path: each command runs in a fresh,
+  one-shot container (via docker-py, a hard dependency) with the workspace mounted
+  read-write, network disabled by default, memory/CPU caps, and a call-level timeout.
+  If the daemon is unreachable, a clear error tells the operator what to check.
+- :class:`HostBashSandbox` — hardened host fallback for LOCAL DEVELOPMENT ONLY (explicit
+  opt-in via ``settings.bash_sandbox="host"``). It is NOT a security boundary: the command
+  runs directly on the host process. A best-effort workspace-escape guard
+  (:func:`assert_no_escape`), a hard timeout, and an output cap are the only limits.
 
 :func:`get_bash_sandbox` reads ``settings.bash_sandbox`` (``"docker"`` | ``"host"``,
-default ``"host"``) and returns the matching implementation.
+default ``"docker"``) and returns the matching implementation.
 """
 from __future__ import annotations
 
@@ -98,13 +97,13 @@ class HostBashSandbox:
 
 
 class DockerBashSandbox:
-    """Production bash sandbox: one command per fresh container.
+    """Production bash sandbox (default): one command per fresh container.
 
-    Uses docker-py (the optional ``docker`` extra). Each ``run`` starts a one-shot container
-    with the workspace mounted read-write, network disabled by default, memory/CPU caps, and
-    a call-level timeout. On timeout the container is stopped and removed so nothing leaks.
-    If docker-py is missing or the daemon is unreachable, a clear error tells the operator
-    to fall back to :class:`HostBashSandbox`.
+    Uses docker-py (a hard dependency). Each ``run`` starts a one-shot container with the
+    workspace mounted read-write, network disabled by default, memory/CPU caps, and a
+    call-level timeout. On timeout the container is stopped and removed so nothing leaks.
+    If the daemon is unreachable, a clear error tells the operator what to check before
+    considering the :class:`HostBashSandbox` local fallback.
     """
 
     def __init__(
@@ -129,8 +128,9 @@ class DockerBashSandbox:
             import docker
         except ImportError as exc:
             raise RuntimeError(
-                "docker-py is not installed; install the 'docker' extra (docker>=7.0) or "
-                "set settings.bash_sandbox=\"host\" to use the HostBashSandbox fallback"
+                "docker-py is not installed; it is a hard dependency (docker>=7.0). "
+                "Install the package or, for local dev only, set "
+                "settings.bash_sandbox=\"host\" to use the HostBashSandbox fallback"
             ) from exc
         return docker
 
@@ -196,7 +196,7 @@ def _decode_output(raw) -> str:
 
 
 def get_bash_sandbox() -> BashSandbox:
-    """Return the sandbox configured by ``settings.bash_sandbox`` ("docker" | "host")."""
+    """Return the sandbox configured by ``settings.bash_sandbox`` ("docker" | "host", default "docker")."""
     if settings.bash_sandbox == "docker":
         return DockerBashSandbox(
             workspace=settings.workspace_dir,

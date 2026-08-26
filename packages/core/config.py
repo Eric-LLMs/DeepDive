@@ -89,9 +89,9 @@ class Settings(BaseSettings):
     llm_max_retries: int = 2                   # retries on temporary errors (timeout / 429 / 5xx)
     llm_retry_backoff: float = 1.0             # base backoff seconds (doubles per retry)
 
-    # Bash sandbox: "docker" runs each command in a fresh container (docker-py, optional);
-    # "host" uses the local-process fallback (dev only — NOT a security boundary).
-    bash_sandbox: str = "host"                  # "docker" | "host"
+    # Bash sandbox: "docker" runs each command in a fresh container (docker-py, hard dep);
+    # "host" uses the local-process fallback (explicit opt-in, dev only — NOT a security boundary).
+    bash_sandbox: str = "docker"                # "docker" | "host"
     bash_sandbox_image: str = "debian:bookworm-slim"
     bash_sandbox_network: bool = False          # container network access
     bash_sandbox_mem_limit: str = "512m"        # per-container memory cap
@@ -137,6 +137,9 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 10080
+    # When True, startup fails fast if jwt_secret is left at its insecure default ("change-me").
+    # Off by default so zero-config local startup (scripts/start_desktop.sh) keeps working.
+    enforce_secure_secrets: bool = False
 
     # Anonymous guests may chat without an account, capped per day (-1 = unlimited).
     guest_daily_limit: int = 10

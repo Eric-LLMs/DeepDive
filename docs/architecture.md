@@ -564,14 +564,16 @@ rejected (`_resolve`). The desktop workbench's "generate media" flow (`/media/ge
 `generate_media`) stays a separate HTTP+job pipeline, not an agent tool.
 
 **`bash_sandbox.py`** — where the ``bash`` tool's commands actually run, two backends behind one
-:class:`BashSandbox` protocol (`settings.bash_sandbox` = ``"docker"`` | ``"host"``, default
-``"host"``):
-- :class:`DockerBashSandbox` — the **production path**: each command runs in a fresh, one-shot
-  container (docker-py) with the workspace mounted read-write, **network disabled by default**,
-  memory/CPU caps, and a call-level timeout. Real isolation lives here.
-- :class:`HostBashSandbox` — a hardened **local-development-only** fallback: the command runs on
-  the host process, so it is **not a security boundary** — only a best-effort workspace-escape
-  guard (:func:`assert_no_escape`), a hard timeout, and an output cap.
+:class:`BashSandbox` protocol (`settings.bash_sandbox` = ``"docker"`` | ``"host"``, **default
+``"docker"``**):
+- :class:`DockerBashSandbox` — the **default production path**: each command runs in a fresh,
+  one-shot container (docker-py, a hard dependency) with the workspace mounted read-write,
+  **network disabled by default**, memory/CPU caps, and a call-level timeout. Real isolation
+  lives here.
+- :class:`HostBashSandbox` — a hardened **local-development-only** fallback (explicit opt-in via
+  ``settings.bash_sandbox="host"``): the command runs on the host process, so it is **not a
+  security boundary** — only a best-effort workspace-escape guard (:func:`assert_no_escape`),
+  a hard timeout, and an output cap.
 
 ## 7. Capability Seam (Definition / Provider / Consumer)
 
