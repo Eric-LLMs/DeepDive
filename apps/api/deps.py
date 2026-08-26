@@ -60,6 +60,18 @@ def _embedder() -> TEIEmbedder:
 
 
 @lru_cache
+def _batch_embedder() -> TEIEmbedder:
+    """Embedder for batch chunk embedding (chat import / learning import).
+
+    The 5s fast-fail ``_embedder`` is for single short query embeddings on the chat path.
+    A full chunk batch (default ``embed_batch_size`` × ``ingest_chunk_chars``) measures in
+    the tens of seconds against a local TEI, so the batch paths get the same 120s budget
+    the ingest worker uses (``apps/worker/settings.py``) instead of timing out.
+    """
+    return TEIEmbedder(timeout=120.0)
+
+
+@lru_cache
 def _retriever() -> RAGPipeline:
     return build_pipeline(
         embedder=TEIEmbedder(),

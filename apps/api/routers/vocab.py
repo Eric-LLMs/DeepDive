@@ -7,7 +7,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from api.auth import AuthUser, require_user, require_user_optional
-from api.deps import _embedder, get_task_queue, get_vocab_service, llm
+from api.deps import _batch_embedder, get_task_queue, get_vocab_service, llm
 from api.schemas import (
     ArticleCreateRequest,
     BulkUpdateRequest,
@@ -261,7 +261,7 @@ async def import_article_to_repo(
     await chunks_repo.delete_by_source("learning", [str(article_id)])
     res = await write_query_repo_chunks(
         SessionLocal,
-        _embedder(),
+        _batch_embedder(),
         chunks=chunks,
         user_id=user.user_id,
         source_type="learning",

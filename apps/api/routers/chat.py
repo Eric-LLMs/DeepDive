@@ -14,7 +14,7 @@ from agent.security.approvals import (
     set_request_approval,
 )
 from api.auth import AuthUser, require_user, require_user_optional
-from api.deps import _embedder, get_agent, get_task_queue, llm
+from api.deps import _batch_embedder, _embedder, get_agent, get_task_queue, llm
 from api.routers._shared import _guest_quota, _log_usage, _resolve_chat_route
 from api.schemas import ChatImportRequest, ChatRequest, ChatSessionImportRequest
 from core.config import settings
@@ -69,7 +69,7 @@ async def chat_import_pair(
     await chunks_repo.delete_by_source("chat", [str(user_msg.id)])
     res = await write_query_repo_chunks(
         SessionLocal,
-        _embedder(),
+        _batch_embedder(),
         chunks=chunks,
         user_id=user.user_id,
         source_type="chat",
