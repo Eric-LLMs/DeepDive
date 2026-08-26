@@ -17,6 +17,7 @@ from api.account_email import (
 )
 from api.auth import USER_ROLE, AuthUser, require_user, sign_console_token
 from api.routers._shared import (
+    _auth_rate_limit,
     _login_expiry,
     _masked_model,
     _pick_credential,
@@ -129,7 +130,7 @@ async def _login_token(
 
 
 @router.post("/auth/login")
-async def user_login(body: UserLoginRequest) -> dict:
+async def user_login(body: UserLoginRequest, request: Request) -> dict:
     """Verify a user's credentials and mint an opaque API token (``dd_``).
 
     The token is one row in ``login_tokens`` per (user, channel); the next login for the
@@ -137,6 +138,7 @@ async def user_login(body: UserLoginRequest) -> dict:
     desktop) or mint their own tokens. The web console uses ``/auth/session-login``
     instead, whose stateless session survives re-logins.
     """
+    await _auth_rate_limit(request, getattr(request.app.state, "redis", None), "login")
     async with SessionLocal() as session:
         row = await _verify_user_login(session, body.username, body.password)
         role = await get_role(session, row.role_id)
@@ -158,13 +160,14 @@ async def user_login(body: UserLoginRequest) -> dict:
 
 
 @router.post("/auth/session-login")
-async def user_session_login(body: UserLoginRequest) -> dict:
+async def user_session_login(body: UserLoginRequest, request: Request) -> dict:
     """Verify credentials and mint a stateless web-console session token (``cc_``).
 
     Console sessions are signed, self-contained strings held in the browser's
     localStorage — nothing is written to login_tokens, so a desktop re-login (which
     rotates the ``dd_`` API token) cannot invalidate the web console's session.
     """
+    await _auth_rate_limit(request, getattr(request.app.state, "redis", None), "login")
     async with SessionLocal() as session:
         row = await _verify_user_login(session, body.username, body.password)
         role = await get_role(session, row.role_id)
@@ -257,6 +260,7 @@ async def auth_models(user: AuthUser = Depends(require_user)) -> dict:
 @router.post("/auth/register")
 async def register(body: RegisterRequest, request: Request) -> dict:
     """Self-service signup: create a regular account gated on email verification."""
+    await _auth_rate_limit(request, getattr(request.app.state, "redis", None), "register")
     username = body.username.strip()
     email = body.email.strip().lower()
     if not username or not email or not body.password:
@@ -313,6 +317,7 @@ async def verify_email(token: str) -> HTMLResponse:
 @router.post("/auth/resend-verification")
 async def resend_verification(body: ResendVerificationRequest, request: Request) -> dict:
     """Re-send the verification email (60 s Redis cooldown per address)."""
+    await _auth_rate_limit(request, getattr(request.app.state, "redis", None), "recovery")
     email = body.email.strip().lower()
     key = f"verify:{email}"
     redis = getattr(request.app.state, "redis", None)
@@ -335,6 +340,7 @@ async def resend_verification(body: ResendVerificationRequest, request: Request)
 @router.post("/auth/forgot-password")
 async def forgot_password(body: ForgotPasswordRequest, request: Request) -> dict:
     """Email a one-time password-reset link (does not reveal whether the email exists)."""
+    await _auth_rate_limit(request, getattr(request.app.state, "redis", None), "recovery")
     email = body.email.strip().lower()
     async with SessionLocal() as session:
         user = (
@@ -377,8 +383,9 @@ async def reset_password_page(token: str) -> HTMLResponse:
 
 
 @router.post("/auth/reset-password")
-async def reset_password(body: ResetPasswordRequest) -> dict:
+async def reset_password(body: ResetPasswordRequest, request: Request) -> dict:
     """Apply a new password from a valid reset token and revoke the user's login tokens."""
+    await _auth_rate_limit(request, getattr(request.app.state, "redis", None), "recovery")
     if len(body.password) < 6:
         raise HTTPException(status_code=400, detail="密码至少 6 位")
     async with SessionLocal() as session:

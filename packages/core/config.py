@@ -140,6 +140,11 @@ class Settings(BaseSettings):
     # When True, startup fails fast if jwt_secret is left at its insecure default ("change-me").
     # Off by default so zero-config local startup (scripts/start_desktop.sh) keeps working.
     enforce_secure_secrets: bool = False
+    # Fixed-window auth rate limits (per client IP, redis INCR+EXPIRE). 0 disables the limit.
+    auth_login_rpm: int = 30            # /auth/login + /auth/session-login
+    auth_register_rpm: int = 10         # /auth/register
+    auth_recovery_rpm: int = 5          # forgot-password / reset-password / resend-verification
+    auth_rate_limit_window: int = 60    # counter window in seconds
 
     # Anonymous guests may chat without an account, capped per day (-1 = unlimited).
     guest_daily_limit: int = 10

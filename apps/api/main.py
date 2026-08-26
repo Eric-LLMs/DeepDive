@@ -46,6 +46,13 @@ async def lifespan(app: FastAPI):
             "This is NOT a security boundary — use it for local dev only; the production "
             "default is \"docker\" (per-command container sandbox)."
         )
+    if settings.jwt_secret == "change-me":
+        if settings.enforce_secure_secrets:
+            raise RuntimeError(
+                "enforce_secure_secrets is enabled but JWT_SECRET is still the default "
+                "'change-me'. Set a strong secret before starting in a secure environment."
+            )
+        logger.warning("JWT_SECRET is the default 'change-me' — set it for production.")
     await init_db()
     async with SessionLocal() as session:
         await ensure_default_admin(session)

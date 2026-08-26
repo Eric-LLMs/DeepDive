@@ -27,10 +27,56 @@ from core.infrastructure.db import (
     UserUsageLogModel,
 )
 from core.infrastructure.security import get_role, verify_password
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from sqlalchemy import func, select
 
 logger = logging.getLogger(__name__)
+
+_AUTH_LIMITS = {
+    "login": "auth_login_rpm",
+    "register": "auth_register_rpm",
+    "recovery": "auth_recovery_rpm",
+}
+
+
+async def check_rate_limit(redis, key: str, limit: int, window: int) -> bool:
+    """Enforce a fixed-window rate limit; True if the call may proceed.
+
+    Same INCR+EXPIRE-on-first pattern as ``_guest_quota``: the window starts at the first
+    hit, so a quiet burst then idle resets naturally. A ``limit <= 0`` disables the limit.
+
+    A Redis failure fails *open*: the limiter is a brute-force guard, and a Redis outage
+    must never hard-block the login/register path (it only logs a warning and lets the
+    request through, keeping the endpoint available over strict enforcement).
+    """
+    if limit <= 0:
+        return True
+    try:
+        count = await redis.incr(key)
+        if count == 1:
+            await redis.expire(key, window)
+        return count <= limit
+    except Exception:
+        logger.warning("rate-limit check failed (key=%s), failing open", key, exc_info=True)
+        return True
+
+
+async def _auth_rate_limit(request: Request, redis, kind: str) -> None:
+    """Apply the per-kind auth rate limit, keyed by client IP (redis-less env = no-op).
+
+    ``kind`` is one of ``_AUTH_LIMITS`` (login / register / recovery). Raises 429 when the
+    fixed window is exhausted so brute-force and credential-stuffing get a hard throttle.
+    """
+    attr = _AUTH_LIMITS.get(kind)
+    if attr is None or redis is None:
+        return
+    limit = getattr(settings, attr, 0)
+    if limit <= 0:
+        return
+    client_ip = request.client.host if request.client is not None else "unknown"
+    key = f"ratelimit:auth:{kind}:{client_ip}"
+    if not await check_rate_limit(redis, key, limit, settings.auth_rate_limit_window):
+        raise HTTPException(status_code=429, detail="请求过于频繁,请稍后再试。")
 
 
 async def _pick_credential(
