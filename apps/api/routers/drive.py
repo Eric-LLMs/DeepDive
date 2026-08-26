@@ -229,17 +229,10 @@ async def complete_upload(
     asset_id: UUID,
     user: AuthUser = Depends(require_user),
     drive: DriveService = Depends(get_drive_service),
-    queue=Depends(get_task_queue),
 ):
     result = await drive.complete_upload(user.user_id, asset_id)
-    asset = result.get("asset")
-    if asset:
-        job_id = await queue.enqueue(
-            ASSET_INGEST,
-            {"asset_id": asset["id"], "user_id": str(user.user_id)},
-            user_id=user.user_id,
-        )
-        result["job_id"] = str(job_id)
+    # No auto-import: the file lands at rag_status=NOT_STARTED and the user decides when
+    # to push it into the query repository via the cloud-drive "Import to Knowledge" button.
     return result
 
 
@@ -287,17 +280,15 @@ async def update_content(
     body: ContentUpdate,
     user: AuthUser = Depends(require_user),
     drive: DriveService = Depends(get_drive_service),
-    queue=Depends(get_task_queue),
 ):
-    """Overwrite a text note's content and re-run RAG indexing."""
+    """Overwrite a text note's content.
+
+    The asset resets to rag_status=NOT_STARTED (its previous import is now stale); the
+    user re-imports it manually via "Import to Knowledge". No auto-enqueue.
+    """
     await require_file_write(drive, user.user_id, asset_id)
     asset = await drive.update_content(user.user_id, asset_id, body.content)
-    job_id = await queue.enqueue(
-        ASSET_INGEST,
-        {"asset_id": asset["id"], "user_id": str(user.user_id)},
-        user_id=user.user_id,
-    )
-    return {"asset": asset, "job_id": str(job_id)}
+    return {"asset": asset}
 
 
 def _stream(data: bytes):
@@ -391,8 +382,8 @@ async def import_rag(
 ):
     """(Re)push a READY asset into the RAG query repository.
 
-    Uploads auto-enqueue on complete; this is the explicit retry / re-import entry the
-    cloud-drive "加入查询仓库" button calls. Rebuilding a chunk set is idempotent
+    Import is manual-only: uploads never auto-enqueue. This is the entry the cloud-drive
+    "Import to Knowledge" button calls. Rebuilding a chunk set is idempotent
     (delete-by-asset + bulk insert), so calling it on an already-indexed file is safe.
     """
     await require_file_read(drive, user.user_id, asset_id)
@@ -404,6 +395,10 @@ async def import_rag(
         {"asset_id": asset["id"], "user_id": str(user.user_id)},
         user_id=user.user_id,
     )
+    # Mark pending only after the enqueue succeeded (a failed enqueue leaves NOT_STARTED
+    # so the user can retry) — the frontend polls WORKING rag states, so this flips the
+    # button to "Queued…"/"Processing…" instead of reverting to "Import to Knowledge".
+    await drive.mark_rag_pending(asset_id)
     return {"job_id": str(job_id), "rag_status": "queued"}
 
 

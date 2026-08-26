@@ -47,7 +47,8 @@ READY = "READY"
 DELETED = "DELETED"
 
 # RAG ingest lifecycle.
-RAG_PENDING = "PENDING"
+RAG_NOT_STARTED = "NOT_STARTED"  # uploaded but never imported; manual "Import to Knowledge" only
+RAG_PENDING = "PENDING"          # a manual import job is queued / about to run
 RAG_INDEXED = "INDEXED"
 
 # Trash retention: items older than this are permanently purged (lazily, on list_trash).
@@ -231,7 +232,7 @@ class DriveService:
                 size=existing.size,
                 object_sha256=sha256,
                 file_status=READY,
-                rag_status=RAG_PENDING,
+                rag_status=RAG_NOT_STARTED,
             )
             await self._log(
                 user_id, workspace_id, "file.create", "file", asset.id, name,
@@ -249,7 +250,7 @@ class DriveService:
             mime_type=mime_type,
             size=size,
             file_status=UPLOADING,
-            rag_status=RAG_PENDING,
+            rag_status=RAG_NOT_STARTED,
         )
         await self._log(
             user_id, workspace_id, "file.create", "file", asset.id, name,
@@ -324,7 +325,7 @@ class DriveService:
             digest, len(data), storage_key, asset.mime_type
         )
         await self.assets.set_object(asset.id, digest)
-        ready = await self.assets.set_status(asset.id, file_status=READY, rag_status=RAG_PENDING)
+        ready = await self.assets.set_status(asset.id, file_status=READY, rag_status=RAG_NOT_STARTED)
         return {"asset": self._asset_dict(ready) if ready else None}
 
     def _assemble(self, session) -> bytes:
@@ -449,8 +450,8 @@ class DriveService:
         """Overwrite a note's text in place and re-point it at a deduplicated object.
 
         Mirrors :meth:`complete_upload` for the byte-store half (put + ref-count),
-        then retires the old object when its ref_count drops to zero. The router
-        re-enqueues ``ASSET_INGEST`` so RAG chunks are rebuilt for the new text.
+        then retires the old object when its ref_count drops to zero. The asset resets
+        to ``NOT_STARTED`` — re-importing into the query repository is manual.
         """
         asset = await self.ensure_asset_writable(user_id, asset_id)
         if not self._is_text_asset(asset):
@@ -483,7 +484,7 @@ class DriveService:
                 removed_key = await self.objects.delete_if_zero(asset.object_sha256)
                 if removed_key:
                     await self.storage.delete(removed_key)
-        await self.assets.set_status(asset.id, file_status=READY, rag_status=RAG_PENDING)
+        await self.assets.set_status(asset.id, file_status=READY, rag_status=RAG_NOT_STARTED)
         await self._log(
             user_id, asset.workspace_id, "file.update", "file", asset.id, asset.name,
             "content updated",
@@ -982,6 +983,15 @@ class DriveService:
             "file_status": asset.file_status,
             "rag_status": asset.rag_status,
         }
+
+    async def mark_rag_pending(self, asset_id: UUID) -> None:
+        """Flip a file to ``PENDING`` when a manual import is enqueued.
+
+        The frontend polls while a file is in a WORKING rag state, so marking it pending
+        immediately lets the "Queued…" → "Processing…" → "In Knowledge" flow drive itself
+        without the button reverting to "Import to Knowledge" during the queue gap.
+        """
+        await self.assets.set_status(asset_id, rag_status=RAG_PENDING)
 
     # ── Serialization ───────────────────────────────────────────────────────────
 

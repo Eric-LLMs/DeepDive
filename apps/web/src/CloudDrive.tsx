@@ -23,6 +23,7 @@ const REFRESH_MS = 5000;
 
 const RAG_WORKING = new Set(["PENDING", "PARSING", "CHUNKING", "EMBEDDING"]);
 const RAG_LABEL: Record<string, string> = {
+  NOT_STARTED: "—",
   PENDING: "Pending",
   PARSING: "Parsing",
   CHUNKING: "Chunking",
