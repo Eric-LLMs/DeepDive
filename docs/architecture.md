@@ -142,10 +142,12 @@ API-only: REST/SSE at the edge, gRPC between internal services, HTTP to model se
 deepdive/
 ├── apps/
 │   ├── api/                      # package `api` (FastAPI gateway: REST/SSE + job enqueue)
-│   │   ├── main.py               # uvicorn apps.api.main:app (REST/SSE endpoints + GET /jobs/{id})
+│   │   ├── main.py               # uvicorn apps.api.main:app (composition root: lifespan, app, CORS, static mounts)
 │   │   ├── auth.py               # opaque-token auth (require_admin / require_user + stateless console session signing)
+│   │   ├── account_email.py      # email / verification helpers shared by auth + config routes
 │   │   ├── admin/                # admin console SPA (single-file index.html: Providers / Roles / Users / Tokens / Tools / RAG)
 │   │   ├── deps.py               # DI assembly (capability seam + agent kernel wiring + plugins)
+│   │   ├── routers/              # functional routers: drive (files/folders/trash/users/workspaces), auth, admin, rag_admin, config, vocab, chat, sessions, jobs
 │   │   ├── tools/                # gateway tools, auto-discovered by `_tool.py` modules (rag_search / translate / web_search)
 │   │   └── schemas.py            # Pydantic request/response models
 │   ├── worker/                   # arq worker (executes async enrichment jobs)
@@ -937,7 +939,8 @@ insensitive to chunk-boundary changes. Driven by the admin **Eval** tab or `scri
 
 ### 10.10 Admin console
 
-The endpoints live in `apps/api/main.py`; the console page in `apps/api/admin/index.html`. Six
+The endpoints live in `apps/api/routers/admin.py` (+ `rag_admin.py` for the RAG module); the
+console page in `apps/api/admin/index.html`. Six
 `/admin/rag/*` endpoints (all `require_admin`) sit behind the **RAG** module's four tabs:
 
 | endpoint | tab | purpose |
