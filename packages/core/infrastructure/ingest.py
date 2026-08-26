@@ -26,6 +26,12 @@ from core.infrastructure import media
 _SUBTITLE_EXTS = {".srt", ".vtt", ".lrc"}
 _TEXT_EXTS = {".txt", ".md", ".markdown", ".text", ".log", ".json", ".csv"}
 
+# C0 control characters except the whitespace ones (\t \n \r) plus DEL. Broken PDF glyph
+# mappings (e.g. inline math in some fonts) decode to control chars like NUL; PostgreSQL
+# refuses to store NUL in TEXT/VARCHAR, so a NUL that reaches a chunk fails the whole
+# ingest job (asyncpg CharacterNotInRepertoireError). Stripped at the extraction boundary.
+_CONTROL_STRIP_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
 
 class UnsupportedFileType(ValueError):
     """Raised when no text extractor exists for the uploaded file type."""
@@ -90,14 +96,29 @@ async def extract_document_text(content: bytes, name: str, llm=None) -> str:
     """Async dispatch for the ingest worker: PDF (body + vision tables) vs plain extract.
 
     PDF extraction needs the async LLM (table images → text), so it cannot live in the
-    sync ``extract_text``; every other extension delegates there unchanged.
+    sync ``extract_text``; every other extension delegates there unchanged. Control
+    characters are stripped on the way out so a NUL from a broken PDF font cannot fail the
+    downstream chunk insert.
     """
     ext = Path(name).suffix.lower()
     if ext == ".pdf":
         from core.infrastructure.pdf import extract_pdf_document
 
-        return await extract_pdf_document(content, llm)
-    return extract_text(content, name)
+        text = await extract_pdf_document(content, llm)
+    else:
+        text = extract_text(content, name)
+    return _strip_control_chars(text)
+
+
+def _strip_control_chars(text: str) -> str:
+    """Remove NUL and other non-whitespace control characters from extracted text.
+
+    Whitespace controls (``\\t \\n \\r``) are legitimate and kept; every other C0 control
+    and DEL is dropped. PyMuPDF decodes broken glyph mappings (e.g. inline math) to control
+    characters like ``\\x00``, which PostgreSQL rejects in TEXT/VARCHAR — removing them
+    here is the ingest-boundary guarantee that a chunk never carries a storable control char.
+    """
+    return _CONTROL_STRIP_RE.sub("", text)
 
 
 async def write_query_repo_chunks(

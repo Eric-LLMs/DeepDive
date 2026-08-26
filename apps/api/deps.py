@@ -141,6 +141,11 @@ def _agent() -> AgentKernel:
         config=KernelConfig(recall_top_k=settings.memory_recall_top_k),
     )
 
+    # rag_search is the learning-corpus retrieval tool; allowlist it so the model
+    # always sees its full schema in the tools array from step 0 — no tool_search
+    # discovery step required before it can retrieve from imported material.
+    kernel.gateway.policy.allow("rag_search")
+
     manager = PluginManager(runtime, skills, ctx)
     register_builtin_plugins(manager)
     manager.discover(settings.plugins_dir)

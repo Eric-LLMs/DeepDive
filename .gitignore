@@ -45,3 +45,7 @@ apps/desktop/release/
 
 # Local temp record (never committed)
 docs/temp.md
+
+# Trace / debug scratch (do not commit)
+docs/trace_chat_prompt.md
+scripts/trace_chat_prompt.py
