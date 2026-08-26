@@ -451,7 +451,8 @@ class DriveService:
 
         Mirrors :meth:`complete_upload` for the byte-store half (put + ref-count),
         then retires the old object when its ref_count drops to zero. The asset resets
-        to ``NOT_STARTED`` — re-importing into the query repository is manual.
+        to ``NOT_STARTED``. Returns ``{"asset": ..., "content_changed": bool}`` — a content
+        change is the incremental-reindex trigger (the API auto-enqueues ``asset_ingest``).
         """
         asset = await self.ensure_asset_writable(user_id, asset_id)
         if not self._is_text_asset(asset):
@@ -466,7 +467,7 @@ class DriveService:
                 user_id, asset.workspace_id, "file.update", "file", asset.id, asset.name,
                 "content updated (unchanged)",
             )
-            return self._asset_dict(asset)
+            return {"asset": self._asset_dict(asset), "content_changed": False}
 
         storage_key = object_key(digest)
         await self.storage.put(storage_key, data)
@@ -489,7 +490,7 @@ class DriveService:
             user_id, asset.workspace_id, "file.update", "file", asset.id, asset.name,
             "content updated",
         )
-        return self._asset_dict(updated)
+        return {"asset": self._asset_dict(updated), "content_changed": True}
 
     # ── Workspaces ──────────────────────────────────────────────────────────────
 

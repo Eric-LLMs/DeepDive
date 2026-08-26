@@ -9,7 +9,7 @@ import logging
 import random
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -35,7 +35,6 @@ from api.deps import (
     _embedder,
     _retriever,
     get_agent,
-    get_drive_service,
     get_task_queue,
     get_vocab_service,
     llm,
@@ -74,6 +73,7 @@ from api.schemas import (
     RagChunkPreviewRequest,
     RagConfigUpdateRequest,
     RagEvalRequest,
+    RagFeedbackRequest,
     RagTestRequest,
     RegisterRequest,
     ResendVerificationRequest,
@@ -114,12 +114,14 @@ from core.infrastructure.billing import (
 )
 from core.infrastructure.db import (
     AccessTokenModel,
+    AssetModel,
     ChunkModel,
     CredentialModelModel,
     LLMCredentialModel,
     LLMModelModel,
     LoginTokenModel,
     MessageModel,
+    RagFeedbackModel,
     RoleCredentialModel,
     SessionLocal,
     SessionModel,
@@ -156,7 +158,7 @@ from core.infrastructure.memory import (
     load_session_detail,
 )
 from core.infrastructure.repositories import SqlArticleRepository
-from core.infrastructure.request_context import get_request_user_id, set_request_user
+from core.infrastructure.request_context import set_request_user
 from core.infrastructure.security import (
     check_quota,
     ensure_admin_user,
@@ -176,6 +178,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, Up
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from rag.query_cache import bump_corpus_version, configure_query_cache
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sse_starlette.sse import EventSourceResponse
@@ -193,6 +196,7 @@ async def lifespan(app: FastAPI):
     redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
     app.state.redis = redis
     configure_approval_broker(redis)  # distributed approval wakeup across API nodes
+    configure_query_cache(redis)      # RAG query cache (keyed by config + corpus version)
     yield
     await redis.aclose()
 
@@ -329,7 +333,7 @@ async def _login_token(
         raw, token_hash = generate_token()
         existing.token_hash = token_hash
         existing.is_active = True
-        existing.last_used_at = datetime.now(timezone.utc)
+        existing.last_used_at = datetime.now(UTC)
         existing.expires_at = expires_at
         await session.commit()
         return raw
@@ -547,7 +551,7 @@ async def _channel_route(
 
 def _login_expiry() -> datetime:
     """Login-token lifetime, mirroring the old JWT expiry."""
-    return datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_expire_minutes)
+    return datetime.now(UTC) + timedelta(minutes=settings.access_token_expire_minutes)
 
 
 async def _verify_user_login(session, username: str, password: str) -> UserModel:
@@ -764,7 +768,7 @@ async def _issue_verification(session, user_id: UUID, kind: str, ttl_minutes: in
             user_id=user_id,
             kind=kind,
             token_hash=token_hash_,
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes),
+            expires_at=datetime.now(UTC) + timedelta(minutes=ttl_minutes),
         )
     )
     await session.commit()
@@ -782,9 +786,9 @@ async def _consume_verification(session, raw: str, kind: str) -> VerificationTok
     ).scalar_one_or_none()
     if row is None or row.kind != kind or row.used_at is not None:
         return None
-    if row.expires_at is not None and row.expires_at < datetime.now(timezone.utc):
+    if row.expires_at is not None and row.expires_at < datetime.now(UTC):
         return None
-    row.used_at = datetime.now(timezone.utc)
+    row.used_at = datetime.now(UTC)
     return row
 
 
@@ -1765,7 +1769,7 @@ async def rag_test(body: RagTestRequest, admin: AuthAdmin = Depends(require_admi
     pipe = _rag_pipeline()
     try:
         result = await pipe.trace(body.query or "", body.top_k, filters)
-    except RetrievalUnavailable as exc:  # noqa: PLC0105 - imported inside the function
+    except RetrievalUnavailable as exc:
         return {"ok": False, "error": str(exc), "trace": [], "hits": []}
     return {
         "ok": True,
@@ -1833,6 +1837,11 @@ async def rag_reindex(
     task_queue = get_task_queue(request)
     for asset in ready:
         await task_queue.enqueue("asset_ingest", {"asset_id": str(asset.id)})
+    # Reindex changes the whole corpus: bump the version so the Redis query cache stops
+    # serving pre-reindex hits immediately (the key embeds the corpus version).
+    redis = getattr(request.app.state, "redis", None)
+    if redis is not None:
+        await bump_corpus_version(redis)
     return {"queued": len(ready)}
 
 
@@ -1875,6 +1884,35 @@ async def rag_repository_delete(
         await session.delete(row)
         await session.commit()
     return {"status": "ok"}
+
+
+@app.post("/rag/feedback")
+async def rag_feedback(
+    body: RagFeedbackRequest, user: AuthUser = Depends(require_user)
+) -> dict:
+    """Persist 👍/👎 retrieval feedback (query → chunks → rating → reason).
+
+    Each row snapshots the query, the retrieved hits (ids + scores), and the rating so the
+    corpus becomes a golden dataset for future fine-tuning / eval without re-running
+    retrieval.
+    """
+    hits = [
+        {str(k): v for k, v in (h or {}).items() if k in ("id", "score", "text")}
+        for h in body.hits
+    ]
+    async with SessionLocal() as session:
+        session.add(
+            RagFeedbackModel(
+                user_id=user.user_id,
+                query=body.query,
+                rating=body.rating,
+                reason=body.reason or None,
+                hits=hits,
+                filters={"user_id": str(user.user_id)},
+            )
+        )
+        await session.commit()
+    return {"ok": True, "recorded": len(hits)}
 
 
 # ── Role ↔ channel bindings (admin-only; the routing source for per-role LLM keys) ──
@@ -2181,7 +2219,7 @@ async def _usage_report(
         except ValueError:
             return None
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         # Bare "YYYY-MM-DD" gets the day-boundary heuristic; full datetimes (which
         # the admin console sends, already converted from local to UTC) are used as-is.
         if end_of_day and len(s) == 10:
@@ -2312,7 +2350,7 @@ async def usage_by_channel(
         except ValueError:
             return None
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         if end_of_day and len(s) == 10:
             dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
         return dt
@@ -3158,10 +3196,10 @@ async def _guest_quota(redis, guest_id: UUID, detail: str | None = None) -> None
     """
     if settings.guest_daily_limit <= 0:
         return
-    key = f"ratelimit:guest:{guest_id}:{datetime.now(timezone.utc).date().isoformat()}"
+    key = f"ratelimit:guest:{guest_id}:{datetime.now(UTC).date().isoformat()}"
     count = await redis.incr(key)
     if count == 1:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         await redis.expire(key, int((midnight - now).total_seconds()) + 1)
     if count > settings.guest_daily_limit:

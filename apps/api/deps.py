@@ -47,6 +47,7 @@ from core.infrastructure.vector import PgVectorStore, TEIEmbedder
 from core.infrastructure.web_search import get_web_search_provider
 from fastapi import Depends, Request
 from rag import RAGPipeline, build_pipeline
+from rag.query_cache import wrap_retriever
 
 # Lightweight singletons
 llm = OpenAILLM()
@@ -79,14 +80,18 @@ def _agent() -> AgentKernel:
     if settings.retrieval_mode == "grpc":
         ctx.provide(
             "retrieval",
-            GrpcRetriever(
-                settings.retrieval_grpc_addr,
-                token=settings.retrieval_grpc_token,
-                tls_ca=Path(settings.retrieval_grpc_tls_ca) if settings.retrieval_grpc_tls_ca else None,
+            wrap_retriever(
+                GrpcRetriever(
+                    settings.retrieval_grpc_addr,
+                    token=settings.retrieval_grpc_token,
+                    tls_ca=Path(settings.retrieval_grpc_tls_ca)
+                    if settings.retrieval_grpc_tls_ca
+                    else None,
+                )
             ),
         )
     else:
-        ctx.provide("retrieval", _retriever())
+        ctx.provide("retrieval", wrap_retriever(_retriever()))
 
     ctx.provide("web_search", get_web_search_provider())
 

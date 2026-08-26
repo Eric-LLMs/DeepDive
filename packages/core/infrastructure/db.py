@@ -753,6 +753,33 @@ class JobModel(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class RagFeedbackModel(Base):
+    """RAG retrieval feedback: query → chunks → rating → reason (golden eval data).
+
+    The desktop workbench lets a user rate the chunks behind an answer (👍/👎); each row
+    snapshots the query, the retrieved hits (ids + scores + text), and the rating/reason so
+    the corpus becomes a golden dataset for future fine-tuning / eval without re-running
+    retrieval.
+    """
+
+    __tablename__ = "rag_feedback"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    rating: Mapped[bool] = mapped_column(Boolean, nullable=False)  # True = relevant
+    reason: Mapped[str | None] = mapped_column(Text)
+    hits: Mapped[list] = mapped_column(JSONB, default=list)   # [{id, score, text?}]
+    filters: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MIGRATIONS_DIR = _REPO_ROOT / "migrations"
 

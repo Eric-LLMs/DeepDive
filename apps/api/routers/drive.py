@@ -8,9 +8,6 @@ from __future__ import annotations
 import urllib.parse
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
-
 from api.auth import AuthUser, require_user
 from api.deps import get_drive_service, get_task_queue
 from api.permissions import (
@@ -35,6 +32,8 @@ from api.schemas_drive import (
 )
 from core.application.drive_service import DriveService
 from core.infrastructure.jobs import ASSET_INGEST
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 
 router = APIRouter()
 workspaces = APIRouter(prefix="/workspaces", tags=["workspaces"])
@@ -280,15 +279,31 @@ async def update_content(
     body: ContentUpdate,
     user: AuthUser = Depends(require_user),
     drive: DriveService = Depends(get_drive_service),
+    queue=Depends(get_task_queue),
 ):
     """Overwrite a text note's content.
 
-    The asset resets to rag_status=NOT_STARTED (its previous import is now stale); the
-    user re-imports it manually via "Import to Knowledge". No auto-enqueue.
+    A content change is the incremental-reindex trigger: the asset resets to
+    rag_status=NOT_STARTED (its previous import is now stale) and ``asset_ingest`` is
+    auto-enqueued so the query repository stays fresh. An identical rewrite (no-op) is
+    left untouched.
     """
     await require_file_write(drive, user.user_id, asset_id)
-    asset = await drive.update_content(user.user_id, asset_id, body.content)
-    return {"asset": asset}
+    result = await drive.update_content(user.user_id, asset_id, body.content)
+    asset = result["asset"]
+    response: dict = {"asset": asset, "content_changed": result["content_changed"]}
+    if result["content_changed"]:
+        job_id = await queue.enqueue(
+            ASSET_INGEST,
+            {"asset_id": asset["id"], "user_id": str(user.user_id)},
+            user_id=user.user_id,
+        )
+        # Mark pending only after the enqueue succeeded (a failed enqueue leaves
+        # NOT_STARTED so the user can retry) — mirrors the manual import-rag flow.
+        await drive.mark_rag_pending(asset_id)
+        response["job_id"] = str(job_id)
+        response["rag_status"] = "queued"
+    return response
 
 
 def _stream(data: bytes):

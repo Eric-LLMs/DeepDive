@@ -37,6 +37,7 @@ from core.infrastructure.repositories import (
     SqlSentenceRepository,
 )
 from core.infrastructure.storage import get_storage, object_key
+from rag.query_cache import bump_corpus_version
 
 
 def _record_dead_letter(job_id, attempt: int, error: str) -> None:
@@ -324,6 +325,8 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
             await chunks_repo.bulk_insert(asset_id, asset.user_id, asset.workspace_id, rows)
             inserted += len(batch)
         await assets.set_status(asset_id, rag_status="INDEXED")
+        # The corpus changed → invalidate the Redis query cache (best-effort).
+        await bump_corpus_version(ctx["redis"])
         return {"chunks": inserted}
 
     # Serialize per asset (see _asset_ingest_lock): without this, concurrent jobs for the
@@ -407,6 +410,7 @@ async def learning_import(ctx, job_id: str, payload: dict) -> dict:
                 source_id=sid,
             )
             total += res["chunks"]
+        await bump_corpus_version(ctx["redis"])  # corpus changed → drop stale query-cache hits
         return {"chunks": total}
 
     return await _run(ctx, job_id, work())
@@ -526,6 +530,7 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
                 source_id=str(session_id),
             )
             total += res["chunks"]
+        await bump_corpus_version(ctx["redis"])  # corpus changed → drop stale query-cache hits
         return {"chunks": total, "groups": len(pairs)}
 
     return await _run(ctx, job_id, work())

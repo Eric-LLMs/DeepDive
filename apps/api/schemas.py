@@ -352,6 +352,15 @@ class RagEvalRequest(BaseModel):
     golden_path: str | None = None
 
 
+class RagFeedbackRequest(BaseModel):
+    """Rate the retrieved chunks behind an answer (👍 relevant / 👎 not)."""
+
+    query: str
+    rating: bool
+    reason: str = ""
+    hits: list[dict] = []  # [{id, score, text?}] as returned by retrieval
+
+
 class LearningImportRequest(BaseModel):
     """Push Learning-Platform content (sentences / articles) into the query repository."""
 
