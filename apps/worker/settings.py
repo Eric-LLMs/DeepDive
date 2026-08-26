@@ -79,6 +79,7 @@ class WorkerSettings:
         tasks.asset_ingest,
         tasks.learning_import,
         tasks.chat_session_import,
+        tasks.run_agent_turn,
     ]
     on_startup = startup
     on_shutdown = shutdown

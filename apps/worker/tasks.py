@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
 
+from api.deps import get_agent  # the hardened AgentKernel singleton (worker→api coupling)
 from core.application.drive_service import READY
 from core.config import settings
 from core.infrastructure import media
@@ -30,8 +31,8 @@ from core.infrastructure.ingest import (
     extract_document_text,
     write_query_repo_chunks,
 )
-from core.infrastructure.jobs import JobStore
-from core.infrastructure.memory import finalize_session
+from core.infrastructure.jobs import SESSION_FINALIZE, JobStore, TaskQueue
+from core.infrastructure.memory import SessionMemoryStore, finalize_session
 from core.infrastructure.repositories import (
     SqlArticleRepository,
     SqlSentenceRepository,
@@ -532,5 +533,48 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
             total += res["chunks"]
         await bump_corpus_version(ctx["redis"])  # corpus changed → drop stale query-cache hits
         return {"chunks": total, "groups": len(pairs)}
+
+    return await _run(ctx, job_id, work())
+
+
+async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
+    """Run one agent turn for a user/session in the background (cron / scheduled activity).
+
+    Reuses the API's hardened :class:`AgentKernel` singleton, so a scheduled turn gets the
+    exact same prompt assembly, recall, approvals, telemetry, and budget guard as an
+    interactive one — no second, drift-prone kernel construction in the worker. The answer
+    lands in the session like a normal chat message and ``session_finalize`` is deferred
+    exactly as in the interactive path.
+
+    Payload: ``user_id``, ``session_id``, ``message`` (+ optional ``model`` / ``base_url`` /
+    ``api_key`` to pin an LLM channel, mirroring the chat endpoint).
+    """
+    async def work() -> dict:
+        user_id = UUID(payload["user_id"])
+        session_id = UUID(payload["session_id"])
+        message = payload["message"]
+        session_memory = SessionMemoryStore(
+            ctx["session_factory"], ctx["embedder"], ctx["llm"], session_id, user_id
+        )
+        history = await session_memory.load_messages()
+        result = await get_agent().run(
+            message,
+            history,
+            session_memory=session_memory,
+            model=payload.get("model"),
+            base_url=payload.get("base_url"),
+            api_key=payload.get("api_key"),
+        )
+        # run() already closed session_memory (flushed events); defer the expensive
+        # embed + summary work to session_finalize, like the interactive chat path.
+        await TaskQueue(ctx["redis"], ctx["job_store"]).enqueue(
+            SESSION_FINALIZE, {"session_id": str(session_id)}
+        )
+        return {
+            "final_answer": result.final_answer,
+            "steps": len(result.messages),
+            "usage": result.usage,
+            "cost_usd": result.cost_usd,
+        }
 
     return await _run(ctx, job_id, work())
