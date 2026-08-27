@@ -26,7 +26,8 @@
     sessions: null,
     sessionQuery: "",
     importedQaIds: new Set(),  // user-message ids already imported into the query repo (active session)
-    sessionImported: false,    // true when the whole active session was imported as session-qa
+    sessionImported: false,    // true when every current user message of the session is covered
+    sessionImportedLegacy: false, // legacy pre-coverage whole-session import (no per-message data)
   };
   try { state.token = localStorage.getItem("deepdive_token"); } catch { /* ignore */ }
   try { state.guestId = localStorage.getItem("deepdive_guest_id"); } catch { /* ignore */ }
@@ -99,7 +100,9 @@
     if (shouldOpen) {
       for (const child of node.children || []) children.appendChild(buildNode(child, open, expandPaths));
     }
-    row.addEventListener("click", () => {
+    // ▸/▾ toggle keeps the inline expand/collapse behaviour.
+    toggle.addEventListener("click", (e) => {
+      e.stopPropagation();
       if (children.style.display === "none") {
         if (children.childElementCount === 0) {
           for (const child of node.children || []) children.appendChild(buildNode(child));
@@ -111,6 +114,8 @@
         toggle.textContent = "▸";
       }
     });
+    // Clicking the folder row browses its contents in the main viewing area.
+    row.addEventListener("click", () => browseLocalFolder(node.path));
     wrapper.appendChild(children);
     return wrapper;
   }
@@ -265,6 +270,53 @@
     const tree = await window.desktopAPI.readTree(dir);
     state.treeData = tree;
     renderTree(tree);
+  }
+
+  // ── Folder-browse view (local) ──
+  // The main-area listing re-reads the folder's direct children from disk on every
+  // navigation, so it always reflects the current filesystem (the sidebar tree is a
+  // bounded-depth snapshot that can go stale).
+  function relFromAbs(abs) {
+    const base = String(state.workspaceDir || "").replace(/[\\/]+$/, "");
+    const a = String(abs).replace(/\\/g, "/");
+    const b = base.replace(/\\/g, "/");
+    return a.startsWith(b + "/") ? a.slice(b.length + 1) : a;
+  }
+
+  function absOfRel(rel) {
+    if (!rel) return state.workspaceDir;
+    return state.workspaceDir.replace(/[\\/]+$/, "") + "\\" + rel.split("/").join("\\");
+  }
+
+  async function readLocalDir(relPath) {
+    const abs = absOfRel(relPath);
+    const raw = await window.desktopAPI.readDir(abs);
+    // Dir entries carry the relative path (breadcrumb/navigation); file entries keep
+    // the absolute path so the viewer can open them directly.
+    const entries = raw.map((e) =>
+      e.type === "dir"
+        ? { type: "dir", name: e.name, path: relFromAbs(e.path), size: e.size }
+        : { type: "file", name: e.name, path: e.path, size: e.size }
+    );
+    return { entries, localPath: abs };
+  }
+
+  async function browseLocalFolder(absPath) {
+    if (!state.workspaceDir) return;
+    const rel = relFromAbs(absPath);
+    try {
+      const res = await readLocalDir(rel);
+      Viewer.renderFolder(res.entries, {
+        rootPath: state.workspaceDir,
+        rootName: workspaceDisplayName(state.workspaceDir),
+        path: rel,
+        read: readLocalDir,
+        open: (entry) => Viewer.render(entry.path, entry.name),
+        localPath: res.localPath,
+      });
+    } catch (err) {
+      Viewer.toast(`Cannot browse folder: ${err.message || err}`);
+    }
   }
 
   async function pickFolder() {
@@ -707,7 +759,9 @@
     // `state` so it survives session switches and app restarts.
     if (role === "assistant") {
       const qid = boundUserMsgId(div);
-      const done = (qid && state.importedQaIds.has(qid)) || state.sessionImported;
+      // Per-message coverage: only pairs whose user message is actually in the repo are
+      // marked done. Legacy whole-session imports (no per-message data) stay a blanket.
+      const done = (qid && state.importedQaIds.has(qid)) || state.sessionImportedLegacy;
       console.log("[imported] render qid", qid, "done", done, "known", [...state.importedQaIds]);
       items.push(["import", "📥", (b) => importPair(div, b), done]);
     }
@@ -814,16 +868,31 @@
   // async on the worker; this polls GET /jobs/{id} and shows the final result on the
   // button, keeping the button disabled while it is in flight so a session is not
   // queued twice.
-  async function importSession(btn) {
-    if (!state.sessionId) {
-      Viewer.toast("No active chat session to import.");
+  // Import any session's Q&A into the query repo (not just the active one — the sidebar
+  // session menu uses this). Active-session UI (chat log import buttons, sessionImported
+  // flag) is only touched when the target session is the one on screen.
+  //
+  // While a job runs the session is marked in `importingSessions`: the sidebar shows an
+  // "Importing…" status under its title and locks the row (no resume / no menu) until the
+  // job reaches a terminal state.
+  const importingSessions = new Set();
+  function finishImporting(sessionId) {
+    importingSessions.delete(String(sessionId));
+    loadSessions();
+  }
+  async function importSessionFor(sessionId, btn) {
+    if (!sessionId) {
+      Viewer.toast("No chat session to import.");
       return;
     }
+    const isActive = sessionId === state.sessionId;
     // Defense-in-depth mirror of the button's render state: if the backend says the whole
     // session is already imported, don't queue a second organizing job.
-    const fresh = await fetchImportedState(state.sessionId);
-    if (fresh && fresh.session_imported) {
-      state.sessionImported = true;
+    const fresh = await fetchImportedState(sessionId);
+    // Modern full coverage blocks a re-queue; a legacy import (no per-message data) is
+    // still allowed so re-importing converts it to the per-message model.
+    if (fresh && fresh.session_imported && !fresh.legacy_session_imported) {
+      if (isActive) state.sessionImported = true;
       if (btn) { btn.disabled = true; setBtnLabel(btn, "✓ Imported"); }
       Viewer.toast("This session is already in the query repo.");
       return;
@@ -834,10 +903,12 @@
     }
     let jobId;
     try {
+      importingSessions.add(String(sessionId));
+      loadSessions();
       const res = await fetch("/api/chat/import-session", {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({ session_id: state.sessionId }),
+        body: JSON.stringify({ session_id: sessionId }),
       });
       if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
       if (!res.ok) {
@@ -848,6 +919,7 @@
       jobId = data.job_id;
       Viewer.toast(`⏳ Session queued for Q&A organizing (job ${jobId.slice(0, 8)}…)`);
     } catch (err) {
+      finishImporting(sessionId);
       if (btn) {
         btn.disabled = false;
         setBtnLabel(btn, "Failed — retry");
@@ -865,6 +937,7 @@
         if (r.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
         st = await r.json();
       } catch (err) {
+        finishImporting(sessionId);
         if (btn) {
           btn.disabled = false;
           setBtnLabel(btn, "Import to Knowledge");
@@ -875,16 +948,17 @@
       if (st.status === "succeeded") {
         const n = (st.result && st.result.chunks) || 0;
         if (btn) { btn.disabled = true; setBtnLabel(btn, "✓ Imported"); }
-        state.sessionImported = true;
-        // Every pair is covered by the session import: mark all import buttons done.
-        chatLog.querySelectorAll('.msg-actions button[data-a="import"]').forEach((b) => {
-          b.disabled = true;
-          setBtnLabel(b, "✓ Imported");
-        });
+        if (isActive) {
+          // Re-fetch per-message coverage: pairs imported just now flip to "✓ Imported",
+          // while any message appended since the job was queued stays importable.
+          await refreshImportedState();
+        }
+        finishImporting(sessionId);
         Viewer.toast(`✅ Imported ${n} chunks into the query repo.`);
         return;
       }
       if (st.status === "failed") {
+        finishImporting(sessionId);
         if (btn) {
           btn.disabled = false;
           setBtnLabel(btn, "Failed — retry");
@@ -894,6 +968,7 @@
       }
       // still queued / running → keep polling
     }
+    finishImporting(sessionId);
     if (btn) {
       btn.disabled = false;
       setBtnLabel(btn, "Import to Knowledge");
@@ -925,19 +1000,16 @@
   async function refreshImportedState() {
     state.importedQaIds = new Set();
     state.sessionImported = false;
+    state.sessionImportedLegacy = false;
     if (!state.sessionId) {
-      if (chatImportSession) { chatImportSession.disabled = false; setBtnLabel(chatImportSession, "Import to Knowledge"); }
       return;
     }
     const data = await fetchImportedState(state.sessionId);
     if (!data) return;
     state.importedQaIds = new Set(data.qa_source_ids || []);
     state.sessionImported = !!data.session_imported;
-    console.log("[imported] session", state.sessionId, "qaIds", [...state.importedQaIds], "sessionImported", state.sessionImported);
-    if (chatImportSession) {
-      chatImportSession.disabled = state.sessionImported;
-      setBtnLabel(chatImportSession, state.sessionImported ? "✓ Imported" : "Import to Knowledge");
-    }
+    state.sessionImportedLegacy = !!data.legacy_session_imported;
+    console.log("[imported] session", state.sessionId, "qaIds", [...state.importedQaIds], "sessionImported", state.sessionImported, "legacy", state.sessionImportedLegacy);
     applyImportedStateToDom();
   }
 
@@ -950,16 +1022,12 @@
     chatLog.querySelectorAll('.msg.assistant .msg-actions button[data-a="import"]').forEach((b) => {
       const div = b.closest(".msg.assistant");
       const qid = div ? boundUserMsgId(div) : null;
-      const done = (qid && state.importedQaIds.has(qid)) || state.sessionImported;
+      const done = (qid && state.importedQaIds.has(qid)) || state.sessionImportedLegacy;
       if (done) {
         b.disabled = true;
         setBtnLabel(b, "✓ Imported");
       }
     });
-    if (chatImportSession) {
-      chatImportSession.disabled = state.sessionImported;
-      setBtnLabel(chatImportSession, state.sessionImported ? "✓ Imported" : "Import to Knowledge");
-    }
   }
 
   // User/assistant message with the shared action row (buildMsgActions). User bubbles
@@ -1096,7 +1164,7 @@
     try {
       const res = await fetch("/api/tts/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({ text }),
         signal: voiceAbort.signal,
       });
@@ -1365,6 +1433,11 @@
     chatSend.disabled = true;
     const payload = { message, session_id: state.sessionId ?? undefined };
     if (!state.token) payload.user_id = state.guestId ?? undefined;
+    if (pendingAttach) {
+      payload.attach = pendingAttach;
+      pendingAttach = null;
+      renderAttachBar();
+    }
 
     // Streaming state: status bar + assistant bubble are created lazily on first event.
     let statusBar = null;      // collapsible reasoning/tool status line
@@ -1487,7 +1560,7 @@
     state.sessionId = null;
     state.importedQaIds = new Set();
     state.sessionImported = false;
-    if (chatImportSession) { chatImportSession.disabled = false; setBtnLabel(chatImportSession, "Import to Knowledge"); }
+    state.sessionImportedLegacy = false;
     chatLog.innerHTML = "";
     chatTitle.textContent = "New chat";
     if (state.token) loadSessions();
@@ -2062,8 +2135,8 @@
     }
     openUrl(
       session
-        ? `http://localhost:5173/?sso=${encodeURIComponent(session)}${hash}`
-        : `http://localhost:5173/${hash}`
+        ? `http://localhost:5273/?sso=${encodeURIComponent(session)}${hash}`
+        : `http://localhost:5273/${hash}`
     );
   }
 
@@ -2482,6 +2555,9 @@
         setCloudMode(false);
         if (!state.workspaceDir) pickFolder(); // Local = pick the workspace folder
       }
+      // Reset the main viewer so it never keeps showing content from the other
+      // source (e.g. a cloud folder view lingering after switching back to Local).
+      Viewer.close();
       // Pull the sidebar back to the Files tab so the chosen source is what's shown.
       const tabFiles = document.getElementById("tab-files");
       if (tabFiles && !tabFiles.classList.contains("active")) tabFiles.click();
@@ -2518,9 +2594,20 @@
   } catch { /* ignore */ }
 
   const sidebarToggle = document.getElementById("sidebar-toggle");
+  // The splitter drag writes an inline width on #sidebar; an inline style beats the
+  // `#app.collapsed #sidebar { width: 44px }` rule, so a dragged sidebar would collapse
+  // to content-hidden-but-still-wide. Remember the dragged width and clear the inline
+  // style on collapse so the 44px strip applies; restore it on expand.
+  let sidebarDragWidth = null;
   sidebarToggle.addEventListener("click", () => {
     const collapsed = document.getElementById("app").classList.toggle("collapsed");
     sidebarToggle.textContent = collapsed ? "»" : "«";
+    if (collapsed) {
+      if (sidebarEl.style.width) sidebarDragWidth = sidebarEl.style.width;
+      sidebarEl.style.width = "";
+    } else if (sidebarDragWidth) {
+      sidebarEl.style.width = sidebarDragWidth;
+    }
   });
 
   // ── Resizable sidebar (drag the splitter) ──
@@ -2624,6 +2711,21 @@
     chatHeader.addEventListener("pointercancel", onUp);
   });
 
+  // ── Hide chat → floating DeepDive logo mini-icon ──
+  // Hiding just adds a class (display:none) so the chat keeps its dock side / floating
+  // position / drag offset; restoring removes the class, putting it back exactly where
+  // it was. The mini icon is a fixed corner button showing the DeepDive logo.
+  const chatHide = document.getElementById("chat-hide");
+  const chatMini = document.getElementById("chat-mini");
+  chatHide.addEventListener("click", () => {
+    chatEl.classList.add("minimized");
+    chatMini.classList.remove("hidden");
+  });
+  chatMini.addEventListener("click", () => {
+    chatEl.classList.remove("minimized");
+    chatMini.classList.add("hidden");
+  });
+
   // ── Resize the docked chat by dragging its boundary edge ──
   // Bottom-docked: drag the top edge to change height. Right-docked: drag the left edge to
   // change width. Writes an inline size (clamped), so a later dock still restores the default
@@ -2663,7 +2765,6 @@
   let recognition = null;
   const chatSpeak = document.getElementById("chat-speak");
   const chatMic = document.getElementById("chat-mic");
-  const chatImportSession = document.getElementById("chat-import-session");
 
   function speak(text) {
     if (!("speechSynthesis" in window)) return;
@@ -2678,8 +2779,6 @@
     speakEnabled = !speakEnabled;
     chatSpeak.classList.toggle("active", speakEnabled);
   });
-
-  chatImportSession.addEventListener("click", () => importSession(chatImportSession));
 
   chatMic.addEventListener("click", () => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -2704,6 +2803,131 @@
     recognition.onerror = () => { recognition = null; chatMic.classList.remove("active"); };
     recognition.start();
     chatMic.classList.add("active");
+  });
+
+  // ── Chat attachments: attach the current file / selected text / a window screenshot ──
+  // The in-input 📎 button was removed (per request); the toolbar's "attach to chat"
+  // entry point and the pending-attach chip still work.
+  const chatAttachBar = document.getElementById("chat-attach-bar");
+  let pendingAttach = null; // { kind: "asset", asset_id, name } riding on the next send
+
+  function setPendingAttach(attach) {
+    pendingAttach = attach || null;
+    renderAttachBar();
+  }
+
+  function renderAttachBar() {
+    chatAttachBar.innerHTML = "";
+    chatAttachBar.classList.toggle("hidden", !pendingAttach);
+    if (!pendingAttach) return;
+    const chip = document.createElement("span");
+    chip.className = "chat-attach-chip";
+    const label = document.createElement("span");
+    label.textContent = `🔗 ${pendingAttach.name || "attached file"}`;
+    const rm = document.createElement("button");
+    rm.textContent = "✕";
+    rm.title = "Remove attachment";
+    rm.addEventListener("click", () => setPendingAttach(null));
+    chip.appendChild(label);
+    chip.appendChild(rm);
+    chatAttachBar.appendChild(chip);
+  }
+
+  async function sha256Hex(bytes) {
+    const buf = await crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // Upload raw bytes into the cloud drive (the same init → chunked PUT → complete flow the
+  // cloud panel uses) and return the created file row { id, name }.
+  async function uploadBytesToCloud(bytes, name) {
+    const hex = await sha256Hex(bytes);
+    const init = await fetch("/api/files/init-upload", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ sha256: hex, size: bytes.length, name, folder_path: null, mime_type: null }),
+    });
+    if (init.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
+    if (!init.ok) throw new Error(`Upload init failed (${init.status})`);
+    const body = await init.json();
+    let created;
+    if (body.status !== "instant") {
+      const chunkSize = body.chunk_size || 5 * 1024 * 1024;
+      const num = body.num_chunks || Math.ceil(bytes.length / chunkSize);
+      for (let i = 0; i < num; i++) {
+        const start = i * chunkSize;
+        const slice = bytes.slice(start, Math.min(bytes.length, start + chunkSize));
+        const put = await fetch(`/api/files/${body.asset_id}/chunks/${i}`, {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${state.token}` },
+          body: new Blob([slice]),
+        });
+        if (!put.ok) throw new Error(`chunk ${i} failed (${put.status})`);
+      }
+      await fetch(`/api/files/${body.asset_id}/complete`, { method: "POST", headers: authHeaders() });
+      created = await (await fetch(`/api/files/${body.asset_id}`, { headers: authHeaders() })).json();
+    } else {
+      created = body.asset || await (await fetch(`/api/files/${body.asset_id}`, { headers: authHeaders() })).json();
+    }
+    return created;
+  }
+
+  // The attach action shared by the viewer toolbar (🔗 / 📷) and the chat 📎 button.
+  // mode: "file" (attach the currently-open file) | "screenshot" (window capture).
+  async function attachCurrent(mode, file) {
+    if (!state.token) {
+      appendMsg("error", "Sign in to attach files to the chat.");
+      openAccount();
+      return;
+    }
+    try {
+      let created;
+      if (mode === "screenshot") {
+        const shot = await window.desktopAPI.captureWindow();
+        if (!shot || !shot.ok) { appendMsg("error", (shot && shot.error) || "Screenshot failed."); return; }
+        const b64 = String(shot.data).replace(/^data:image\/png;base64,/, "");
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        created = await uploadBytesToCloud(bytes, `screenshot_${Date.now()}.png`);
+      } else {
+        // A cloud asset opened in the viewer attaches directly by id; a local file is
+        // uploaded to the cloud drive first (the agent works on drive assets).
+        const cf = window.__cloudDriveActive === true ? (window.__getViewerCloudFile?.() || null) : null;
+        if (cf && cf.id) {
+          setPendingAttach({ kind: "asset", asset_id: cf.id, name: cf.name });
+          return;
+        }
+        const f = file || {};
+        if (!f.path) { appendMsg("error", "No file is open to attach."); return; }
+        const res = await window.desktopAPI.readFileBytes(f.path);
+        if (!res.ok) throw new Error(res.error || "Cannot read the file");
+        created = await uploadBytesToCloud(res.data, f.name || "attached.bin");
+      }
+      setPendingAttach({ kind: "asset", asset_id: created.id, name: created.name });
+    } catch (err) {
+      appendMsg("error", `Attach failed: ${err.message || err}`);
+    }
+  }
+
+  Viewer.setAttachHandler(attachCurrent);
+
+  // The chat input ＋ button: open an OS file picker, upload the chosen file to the
+  // cloud drive, and stage it as the pending attachment (rides on the next send).
+  const chatAttachPick = document.getElementById("chat-attach-pick");
+  chatAttachPick.addEventListener("click", async () => {
+    if (!state.token) { appendMsg("error", "Sign in to attach files to the chat."); openAccount(); return; }
+    const path = await window.desktopAPI.pickFile();
+    if (!path) return; // user canceled the dialog
+    const name = String(path).split(/[\\/]/).pop() || "attached.bin";
+    try {
+      const res = await window.desktopAPI.readFileBytes(path);
+      if (!res.ok) throw new Error(res.error || "Cannot read the file");
+      const created = await uploadBytesToCloud(res.data, name);
+      setPendingAttach({ kind: "asset", asset_id: created.id, name: created.name });
+    } catch (err) {
+      appendMsg("error", `Attach failed: ${err.message || err}`);
+    }
   });
 
   // ── Sidebar tabs (Files / Sessions) ──
@@ -2839,6 +3063,120 @@
     return (start > 0 ? "…" : "") + str.slice(start, end) + (end < str.length ? "…" : "");
   }
 
+  // ── Session row menu (Gemini-style ⋯): Pin / Rename / Import to Knowledge / Delete ──
+  // Stroke-style (line) icons, no fills — matched to the rest of the chrome.
+  const SESSION_ICONS = {
+    more: '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="19" r="1.6"/></svg>',
+    pin: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1z"/></svg>',
+    pencil: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>',
+    book: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+  };
+
+  // Pin state is client-side only (Gemini-style): a pinned session sorts above the rest.
+  function getPinned() {
+    try { return JSON.parse(localStorage.getItem("deepdive_pinned") || "[]"); } catch { return []; }
+  }
+  function setPinned(list) {
+    try { localStorage.setItem("deepdive_pinned", JSON.stringify(list)); } catch { /* ignore */ }
+  }
+  function isPinned(id) { return getPinned().includes(String(id)); }
+  function togglePin(id) {
+    const list = getPinned();
+    const i = list.indexOf(String(id));
+    if (i >= 0) list.splice(i, 1);
+    else list.push(String(id));
+    setPinned(list);
+  }
+
+  // One shared dropdown, positioned under the ⋯ button that opened it.
+  let sessionMenuEl = null;
+  function ensureSessionMenu() {
+    if (sessionMenuEl) return sessionMenuEl;
+    sessionMenuEl = document.createElement("div");
+    sessionMenuEl.className = "session-menu";
+    document.body.appendChild(sessionMenuEl);
+    return sessionMenuEl;
+  }
+  function closeSessionMenu() {
+    if (sessionMenuEl) {
+      sessionMenuEl.classList.remove("open");
+      sessionMenuEl.innerHTML = "";
+    }
+  }
+  function openSessionMenu(anchor, items) {
+    const menu = ensureSessionMenu();
+    menu.innerHTML = "";
+    for (const it of items) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "session-menu-item" + (it.danger ? " danger" : "");
+      row.innerHTML = `${it.iconSvg}<span>${it.label}</span>`;
+      row.addEventListener("click", () => {
+        closeSessionMenu();
+        it.action();
+      });
+      menu.appendChild(row);
+    }
+    menu.classList.add("open");
+    const r = anchor.getBoundingClientRect();
+    const mw = menu.offsetWidth || 200;
+    const mh = menu.offsetHeight || items.length * 34 + 8;
+    let left = r.right + 4;
+    if (left + mw > window.innerWidth - 8) left = r.left - mw - 4;
+    if (left < 8) left = 8;
+    let top = r.bottom + 4;
+    if (top + mh > window.innerHeight - 8) top = r.top - mh - 4;
+    if (top < 8) top = 8;
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+  }
+  document.addEventListener("click", (e) => {
+    if (sessionMenuEl && sessionMenuEl.classList.contains("open") && !sessionMenuEl.contains(e.target)) closeSessionMenu();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeSessionMenu();
+  });
+
+  function buildSessionMenu(s, summaryEl) {
+    const pinned = isPinned(s.id);
+    return [
+      {
+        iconSvg: SESSION_ICONS.pin,
+        label: pinned ? "Unpin" : "Pin",
+        action: () => { togglePin(s.id); loadSessions(); },
+      },
+      {
+        iconSvg: SESSION_ICONS.pencil,
+        label: "Rename",
+        action: () => startSessionRename(s, summaryEl),
+      },
+      {
+        iconSvg: SESSION_ICONS.book,
+        label: "Import to Knowledge",
+        action: () => importSessionFor(s.id),
+      },
+      {
+        iconSvg: SESSION_ICONS.trash,
+        label: "Delete",
+        danger: true,
+        action: () => confirmDeleteSession(s),
+      },
+    ];
+  }
+
+  // Gemini-style delete confirmation: Cancel / Delete.
+  async function confirmDeleteSession(s) {
+    const ok = await window.confirmModal({
+      title: "Delete chat?",
+      message: "This will delete the prompts and responses in this chat session, plus any content you created.",
+      okLabel: "Delete",
+      okClass: "danger",
+    });
+    if (!ok) return;
+    await deleteSession(s.id);
+  }
+
   function renderSessions(failed) {
     sessionsList.innerHTML = "";
     if (failed) {
@@ -2855,9 +3193,17 @@
       sessionsList.innerHTML = `<div class="session-item"><span class="session-summary">${q ? "No matching sessions." : "No sessions yet."}</span></div>`;
       return;
     }
-    for (const s of list) {
+    const pinnedIds = getPinned();
+    const sorted = [...list].sort((a, b) => {
+      const pa = pinnedIds.includes(String(a.id)) ? 0 : 1;
+      const pb = pinnedIds.includes(String(b.id)) ? 0 : 1;
+      return pa - pb;
+    });
+    for (const s of sorted) {
       const item = document.createElement("div");
       item.className = "session-item";
+      const importing = importingSessions.has(String(s.id));
+      if (importing) item.classList.add("session-importing");
       const row = document.createElement("div");
       row.className = "session-row";
       const summary = document.createElement("span");
@@ -2865,28 +3211,33 @@
       const displayText = s.title || s.summary || s.id.slice(0, 8);
       if (q) summary.innerHTML = highlightText(displayText, q);
       else summary.textContent = displayText;
-      const edit = document.createElement("button");
-      edit.type = "button";
-      edit.className = "session-edit";
-      edit.title = "Rename session";
-      edit.textContent = "✎";
-      edit.addEventListener("click", (e) => {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "session-more";
+      more.title = "Session actions";
+      more.innerHTML = SESSION_ICONS.more;
+      more.disabled = importing;
+      more.addEventListener("click", (e) => {
         e.stopPropagation();
-        startSessionRename(s, summary);
+        openSessionMenu(more, buildSessionMenu(s, summary));
       });
-      const del = document.createElement("button");
-      del.type = "button";
-      del.className = "session-del";
-      del.title = "Delete session";
-      del.textContent = "🗑";
-      del.addEventListener("click", (e) => {
-        e.stopPropagation();
-        deleteSession(s.id);
-      });
-      row.append(summary, edit, del);
+      if (isPinned(s.id)) {
+        const pin = document.createElement("span");
+        pin.className = "session-pinned";
+        pin.title = "Pinned";
+        pin.innerHTML = SESSION_ICONS.pin;
+        row.append(pin, summary, more);
+      } else {
+        row.append(summary, more);
+      }
       const time = document.createElement("span");
-      time.className = "session-time";
-      time.textContent = s.created_at ? new Date(s.created_at).toLocaleString() : "";
+      if (importing) {
+        time.className = "session-import-status";
+        time.textContent = "⏳ Importing…";
+      } else {
+        time.className = "session-time";
+        time.textContent = s.created_at ? new Date(s.created_at).toLocaleString() : "";
+      }
       item.append(row, time);
       if (q && s.snippet) {
         const snip = document.createElement("div");
@@ -2894,7 +3245,10 @@
         snip.innerHTML = highlightText(snippetPreview(s.snippet, q), q);
         item.appendChild(snip);
       }
-      item.addEventListener("click", () => resumeSession(s.id));
+      item.addEventListener("click", () => {
+        if (importing) return; // locked while the import job is running
+        resumeSession(s.id);
+      });
       sessionsList.appendChild(item);
     }
   }

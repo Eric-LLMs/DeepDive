@@ -16,11 +16,13 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -289,14 +291,33 @@ class AssetAclModel(Base):
     """Asset-level sharing. ``grantee_user_id`` NULL = public link (anyone with access)."""
 
     __tablename__ = "asset_acl"
+    # A surrogate id PK keeps grantee_user_id nullable (a composite PK would force it
+    # NOT NULL and reject the NULL public-link rows). Uniqueness is enforced by the
+    # two partial indexes below, matching the original DDL.
+    __table_args__ = (
+        Index(
+            "asset_acl_public_uniq",
+            "asset_id",
+            unique=True,
+            postgresql_where=text("grantee_user_id IS NULL"),
+        ),
+        Index(
+            "asset_acl_grantee_uniq",
+            "asset_id",
+            "grantee_user_id",
+            unique=True,
+            postgresql_where=text("grantee_user_id IS NOT NULL"),
+        ),
+    )
 
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
     asset_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True),
-        ForeignKey("assets.id", ondelete="CASCADE"),
-        primary_key=True,
+        PG_UUID(as_uuid=True), ForeignKey("assets.id", ondelete="CASCADE")
     )
     grantee_user_id: Mapped[uuid.UUID | None] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
     )
     permission: Mapped[str] = mapped_column(String, nullable=False)  # 'read' | 'write'
     created_at: Mapped[datetime] = mapped_column(

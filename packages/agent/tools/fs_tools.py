@@ -20,6 +20,7 @@ from agent.engine.decisions import ToolExecution, text_block
 from agent.tools.bash_sandbox import BashSandbox, assert_no_escape, get_bash_sandbox
 from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
 from agent.tools.tool_permissions import ToolPermission
+from core.config import settings
 
 
 def _resolve(workspace: Path, raw_path: str) -> Path:
@@ -133,7 +134,12 @@ def edit_file_tool(workspace: Path) -> ToolDefinition:
 def bash_tool(workspace: Path, sandbox: BashSandbox) -> ToolDefinition:
     async def execute(args: dict, exec: ToolExecution) -> str:
         command = args["command"]
-        timeout = int(args.get("timeout", 30))
+        # Cap the model-supplied timeout: an unbounded value would let a prompt park a
+        # process forever. Default to (and clamp at) the configured sandbox timeout.
+        timeout = min(
+            int(args.get("timeout", settings.bash_sandbox_timeout)),
+            settings.bash_sandbox_timeout,
+        )
         assert_no_escape(workspace, command)
         try:
             return await sandbox.run(command, timeout)

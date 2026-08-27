@@ -18,6 +18,8 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from core.config import settings
+from core.infrastructure.billing import get_balance
 from core.infrastructure.db import (
     AppSettingModel,
     UserModel,
@@ -195,39 +197,68 @@ async def increment_usage(
     return int(row[0]), int(row[1])
 
 
-async def check_quota(
-    session, user_id: UUID, role: UserRoleModel, requests: int = 1, tokens: int = 0
-) -> None:
-    """Increment the user's day+month counters and raise 429 if any role limit is exceeded.
+async def get_usage(
+    session, user_id: UUID, period_type: str, period_start: date
+) -> tuple[int, int]:
+    """Read a (user, period) counter row without incrementing (0/0 when absent)."""
+    row = (
+        await session.execute(
+            select(UserUsageCounterModel).where(
+                UserUsageCounterModel.user_id == user_id,
+                UserUsageCounterModel.period_type == period_type,
+                UserUsageCounterModel.period_start == period_start,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return 0, 0
+    return row.request_count, row.token_count
 
-    The increment is intentional even when a limit is exceeded: the denied request still
-    consumes quota (no free retries). ``-1`` on a limit means unlimited.
+
+async def authorize_usage(
+    session, user_id: UUID, role: UserRoleModel, requests: int = 1, tokens: int = 0
+) -> str:
+    """Authorize one usage request under the free-quota-first model.
+
+    Returns the tier the request is charged to:
+
+    - ``"free"`` — within the role's daily/monthly/token limits; the day+month counters are
+      incremented (as before) and the wallet is untouched.
+    - ``"paid"`` — the role quota is exhausted (overflow); the free counters are NOT
+      incremented, the wallet must hold a positive balance, and the caller settles the exact
+      cost at usage-log time. A balance at or below ``settings.wallet_gate_min_balance_usd``
+      raises ``402 Payment Required``.
+
+    ``-1`` on a limit means unlimited (always free). The overflow gate is deliberately a
+    wallet balance check rather than a hard block: it requires *some* balance up front and
+    defers the exact charge to logging, so a drained wallet blocks the next overflow request.
     """
     today = datetime.now(timezone.utc).date()
     month_start = today.replace(day=1)
-    day_requests, day_tokens = await increment_usage(
-        session, user_id, "day", today, requests, tokens
-    )
-    month_requests, _ = await increment_usage(
-        session, user_id, "month", month_start, requests, tokens
-    )
-    await session.commit()
+    day_requests, day_tokens = await get_usage(session, user_id, "day", today)
+    month_requests, _ = await get_usage(session, user_id, "month", month_start)
 
-    if role.daily_request_limit >= 0 and day_requests > role.daily_request_limit:
+    def within_free() -> bool:
+        if role.daily_request_limit >= 0 and day_requests + requests > role.daily_request_limit:
+            return False
+        if role.monthly_request_limit >= 0 and month_requests + requests > role.monthly_request_limit:
+            return False
+        if role.daily_token_limit >= 0 and day_tokens + tokens > role.daily_token_limit:
+            return False
+        return True
+
+    if within_free():
+        await increment_usage(session, user_id, "day", today, requests, tokens)
+        await increment_usage(session, user_id, "month", month_start, requests, tokens)
+        await session.commit()
+        return "free"
+
+    if await get_balance(session, user_id) <= settings.wallet_gate_min_balance_usd:
         raise HTTPException(
-            status_code=429,
-            detail=f"今日请求次数已达上限({role.daily_request_limit} 次/天,角色 {role.role_name})。请充值或升级套餐后继续使用。",
+            status_code=402,
+            detail="免费额度已用完且余额不足,请充值或升级套餐后继续使用。",
         )
-    if role.monthly_request_limit >= 0 and month_requests > role.monthly_request_limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"本月请求次数已达上限({role.monthly_request_limit} 次/月,角色 {role.role_name})。请充值或升级套餐后继续使用。",
-        )
-    if role.daily_token_limit >= 0 and day_tokens > role.daily_token_limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"今日 token 用量已达上限({role.daily_token_limit}/天,角色 {role.role_name})。请充值或升级套餐后继续使用。",
-        )
+    return "paid"
 
 
 async def get_user(session, user_id: UUID) -> UserModel | None:

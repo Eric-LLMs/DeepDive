@@ -98,11 +98,23 @@ class TaskQueue:
         job = await self.job_store.create(type_, payload, user_id=user_id)
         # arq resolves `type_` against WorkerSettings.functions by name; job_id is passed
         # as a string so the worker can reconstruct the UUID regardless of serializer.
-        await self.redis.enqueue_job(type_, str(job.id), payload)
+        # If Redis delivery fails, don't leave the PG row stuck "queued" forever: mark it
+        # failed (so the status endpoint reports an error instead of a phantom pending job)
+        # and re-raise for the caller to surface as a 5xx.
+        try:
+            await self.redis.enqueue_job(type_, str(job.id), payload)
+        except Exception as exc:  # noqa: BLE001 - delivery is the failure surface here
+            await self.job_store.mark_failed(job.id, f"enqueue failed: {exc}")
+            raise
         return job.id
 
     async def get(self, job_id: uuid.UUID) -> dict[str, Any]:
         job = await self.job_store.get(job_id)
         if job is None:
             return {"status": "unknown", "result": None, "error": "job not found"}
-        return {"status": job.status, "result": job.result, "error": job.error}
+        return {
+            "status": job.status,
+            "result": job.result,
+            "error": job.error,
+            "user_id": str(job.user_id) if job.user_id is not None else None,
+        }

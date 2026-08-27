@@ -20,7 +20,7 @@ from api.deps import get_agent  # the hardened AgentKernel singleton (worker→a
 from core.application.drive_service import READY
 from core.config import settings
 from core.infrastructure import media
-from core.infrastructure.db import MessageModel, SessionEventModel
+from core.infrastructure.db import ChunkModel, MessageModel, SessionEventModel
 from core.infrastructure.drive_repositories import (
     SqlAssetRepository,
     SqlChunkRepository,
@@ -419,14 +419,18 @@ async def learning_import(ctx, job_id: str, payload: dict) -> dict:
 
 def _default_chat_pairs(messages) -> list[dict]:
     """Group a message list into Q&A pairs: each user message starts a pair, the assistant
-    messages until the next user message are its answer (merging multi-turn follow-ups)."""
+    messages until the next user message are its answer (merging multi-turn follow-ups).
+
+    Each pair records ``indices`` — the message index (0-based position in ``messages``)
+    of the user line it answers — so the caller can track per-message coverage.
+    """
     pairs: list[dict] = []
     current: dict | None = None
-    for m in messages:
+    for i, m in enumerate(messages):
         if m.role == "user":
             if current is not None:
                 pairs.append(current)
-            current = {"question": m.text, "answer": ""}
+            current = {"question": m.text, "answer": "", "indices": [i]}
         elif m.role == "assistant" and current is not None:
             current["answer"] = (
                 (current["answer"] + "\n" + m.text).strip() if current["answer"] else m.text
@@ -434,6 +438,25 @@ def _default_chat_pairs(messages) -> list[dict]:
     if current is not None:
         pairs.append(current)
     return pairs
+
+
+def _normalize_pair_indices(pair: dict, roles: list[str]) -> list[int]:
+    """Keep only message indexes that really are user lines; drop out-of-range / dups."""
+    raw = pair.get("indices")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    seen: set[int] = set()
+    out: list[int] = []
+    for x in raw:
+        try:
+            i = int(x)
+        except (TypeError, ValueError):
+            continue
+        if i < 0 or i >= len(roles) or roles[i] != "user" or i in seen:
+            continue
+        seen.add(i)
+        out.append(i)
+    return out
 
 
 def _strip_code_fence(text: str) -> str:
@@ -451,9 +474,12 @@ def _strip_code_fence(text: str) -> str:
 async def _segment_chat(messages, llm) -> list[dict]:
     """Split a chat into Q&A entries: merge same-question turns, split distinct questions.
 
-    The LLM reads the transcript and returns a JSON array of ``{question, answer}``;
-    any failure (unparseable output, model error) degrades to ``_default_chat_pairs`` —
-    organize or fall back, never fail the import job.
+    The LLM reads the transcript and returns a JSON array of
+    ``{"question", "answer", "indices"}`` where ``indices`` are the transcript line
+    indexes the entry covers (the user-question line, plus any follow-up user lines
+    merged in). Entries missing ``indices`` fall back to the remaining user lines in
+    transcript order; any failure (unparseable output, model error) degrades to
+    ``_default_chat_pairs`` — organize or fall back, never fail the import job.
     """
     transcript = "\n".join(f"{i}: {m.role}: {m.text[:400]}" for i, m in enumerate(messages))
     try:
@@ -462,21 +488,119 @@ async def _segment_chat(messages, llm) -> list[dict]:
             "Group the conversation into Q&A entries: merge all turns that belong to the "
             "same user question (including follow-ups and clarifications) into one entry, "
             "and separate different questions into different entries.\n"
+            "For each entry, \"indices\" must list the line indexes it covers — the user "
+            "question line plus any follow-up user lines that are part of that same "
+            "question.\n"
             "Reply with ONLY a JSON array, no code fences:\n"
-            '[{"question": "...", "answer": "..."}, ...]\n\n' + transcript,
+            '[{"question": "...", "answer": "...", "indices": [i, j, ...]}, ...]\n\n' + transcript,
             "You are a conversation organiser. Output only JSON.",
         )
         data = json.loads(_strip_code_fence(out))
-        pairs = [
-            {"question": str(it.get("question", "")).strip(), "answer": str(it.get("answer", "")).strip()}
-            for it in data
-            if isinstance(it, dict) and (it.get("question") or it.get("answer"))
-        ]
+        roles = [m.role for m in messages]
+        pairs: list[dict] = []
+        for it in data:
+            if not isinstance(it, dict) or not (it.get("question") or it.get("answer")):
+                continue
+            pairs.append(
+                {
+                    "question": str(it.get("question", "")).strip(),
+                    "answer": str(it.get("answer", "")).strip(),
+                    "indices": _normalize_pair_indices(it, roles),
+                }
+            )
         if pairs:
+            # Fill any pair the LLM left without indices from the remaining user lines so
+            # every pair still carries an anchor for per-message coverage / incremental
+            # import (an older model may return {question, answer} without indices).
+            claimed: set[int] = set()
+            for p in pairs:
+                claimed.update(p["indices"])
+            for p in pairs:
+                if p["indices"]:
+                    continue
+                for i, role in enumerate(roles):
+                    if role == "user" and i not in claimed:
+                        p["indices"] = [i]
+                        claimed.add(i)
+                        break
             return pairs
     except Exception as exc:  # noqa: BLE001 - degrade to default grouping
         logger.warning("chat session LLM segmentation failed, using default grouping: %s", exc)
     return _default_chat_pairs(messages)
+
+
+async def _chat_covered_ids(session_factory, user_id: UUID, session_id: str) -> set[str]:
+    """All user-message ids already covered by imported chat chunks for a session.
+
+    New-style ``kind='qa'`` chunks record their covered user-message ids in
+    ``meta['covered']``; legacy single-pair imports used ``source_id=<user-message id>``
+    directly (recognizable by the lack of a ``session_id:`` prefix).
+    """
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(ChunkModel.source_id, ChunkModel.meta).where(
+                    ChunkModel.source_type == "chat",
+                    ChunkModel.user_id == user_id,
+                    ChunkModel.meta["session_id"].astext == session_id,
+                )
+            )
+        ).all()
+    covered: set[str] = set()
+    for source_id, meta in rows:
+        if (meta or {}).get("kind") != "qa":
+            continue
+        cov = (meta or {}).get("covered")
+        if isinstance(cov, list) and cov:
+            covered.update(str(c) for c in cov)
+        elif source_id and ":" not in source_id:
+            covered.add(source_id)
+    return covered
+
+
+async def _chat_delete_stale_keys(
+    session_factory, user_id: UUID, session_id: str, written: set[str]
+) -> None:
+    """Drop per-entry chat chunks whose key the current grouping no longer produces.
+
+    The LLM may regroup after an append (e.g. two turns that used to be separate entries
+    merge into one), leaving an old per-entry key behind; it would otherwise become a
+    stale duplicate. Single-pair chunks (``source_id`` == a user-message id) are untouched.
+    """
+    prefix = f"{session_id}:"
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(ChunkModel.source_id).where(
+                    ChunkModel.source_type == "chat",
+                    ChunkModel.user_id == user_id,
+                    ChunkModel.meta["session_id"].astext == session_id,
+                    ChunkModel.meta["kind"].astext == "qa",
+                )
+            )
+        ).all()
+    stale = [sid for (sid,) in rows if sid.startswith(prefix) and sid not in written]
+    if stale:
+        await SqlChunkRepository(session_factory).delete_by_source("chat", stale)
+
+
+def _pending_chat_entries(
+    pairs: list[dict], covered_by_pair: list[list[str]], existing: set[str]
+) -> list[tuple[int, dict, list[str]]]:
+    """Which segmentation entries still need importing.
+
+    An entry is skipped when it has no user message to anchor, or when every user message
+    it covers is already in the query repo — that is the incremental append behavior:
+    re-importing a session only embeds newly asked questions.
+    """
+    out: list[tuple[int, dict, list[str]]] = []
+    for i, (pair, covered) in enumerate(zip(pairs, covered_by_pair)):
+        if not covered:
+            continue
+        if all(cid in existing for cid in covered):
+            continue
+        out.append((i, pair, covered))
+    return out
 
 
 async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
@@ -484,8 +608,16 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
 
     The LLM (falling back to a per-turn default) groups the conversation into Q&A entries:
     the same question asked over multiple turns is merged into one entry, distinct
-    questions become separate entries, and each entry is chunked + embedded with
-    ``source_type='chat'`` + ``source_id=<session_id>`` (idempotent on re-import).
+    questions become separate entries. Each entry is chunked + embedded with
+    ``source_type='chat'`` + ``source_id=<session_id>:<i>`` (per-entry key), so a re-import
+    replaces entries independently.
+
+    Imports are incremental: an entry whose covered user messages are all already in the
+    query repo is skipped, so re-importing after an append only embeds the newly asked
+    questions. Every chunk records the user-message ids it covers (``meta['covered']``),
+    which drives the per-message "✓ Imported" state on the client. Legacy whole-session
+    chunks (old ``kind='session-qa'``) are converted to this per-message model on the next
+    import.
     """
     session_id = UUID(payload["session_id"])
     user_id = UUID(payload["user_id"])
@@ -509,9 +641,26 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
             return {"chunks": 0, "groups": 0}
 
         chunks_repo = SqlChunkRepository(ctx["session_factory"])
+        # Convert legacy whole-session imports (old kind="session-qa" keyed on the session
+        # id): they have no per-message coverage, so rebuild them under the new model.
         await chunks_repo.delete_by_source("chat", [str(session_id)])
+
+        # Coverage per entry: the user-message ids this Q&A answers (order preserved).
+        covered_by_pair: list[list[str]] = []
+        for p in pairs:
+            cov: list[str] = []
+            for i in p.get("indices") or []:
+                if i < len(messages) and messages[i].role == "user":
+                    cid = str(messages[i].id)
+                    if cid not in cov:
+                        cov.append(cid)
+            covered_by_pair.append(cov)
+
+        existing = await _chat_covered_ids(ctx["session_factory"], user_id, str(session_id))
+        written: set[str] = set()
         total = 0
-        for i, pair in enumerate(pairs):
+        for i, pair, covered in _pending_chat_entries(pairs, covered_by_pair, existing):
+            key = f"{session_id}:{i}"
             text = f"{pair['question']}\n\n{pair['answer']}"
             title = pair["question"].strip()[:60] or f"Chat Q{i + 1}"
             chunks = await build_chunks(text, cfg, doc_title=title, llm=ctx["llm"])
@@ -519,18 +668,25 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
                 c.meta = {
                     **c.meta,
                     "title": title,
-                    "kind": "session-qa",
+                    "kind": "qa",
                     "session_id": str(session_id),
+                    "covered": covered,
                     "qid": i,
                 }
+            # Idempotent per-entry: replace any earlier version of this same key.
+            await chunks_repo.delete_by_source("chat", [key])
             res = await _write_query_repo_chunks(
                 ctx,
                 chunks=chunks,
                 user_id=user_id,
                 source_type="chat",
-                source_id=str(session_id),
+                source_id=key,
             )
             total += res["chunks"]
+            written.add(key)
+            existing.update(covered)
+
+        await _chat_delete_stale_keys(ctx["session_factory"], user_id, str(session_id), written)
         await bump_corpus_version(ctx["redis"])  # corpus changed → drop stale query-cache hits
         return {"chunks": total, "groups": len(pairs)}
 

@@ -11,9 +11,15 @@ import random
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from api.auth import AuthUser
+from api.auth import AuthUser, sign_guest_token, verify_guest_token
 from core.config import settings
-from core.infrastructure.billing import compute_cost, deduct, get_model_prices, list_transactions
+from core.infrastructure.billing import (
+    compute_cost,
+    deduct,
+    get_balance,
+    get_model_prices,
+    list_transactions,
+)
 from core.infrastructure.db import (
     AccessTokenModel,
     CredentialModelModel,
@@ -26,6 +32,7 @@ from core.infrastructure.db import (
     UserUsageCounterModel,
     UserUsageLogModel,
 )
+from core.infrastructure.memory import ensure_user
 from core.infrastructure.security import get_role, verify_password
 from fastapi import HTTPException, Request
 from sqlalchemy import func, select
@@ -299,20 +306,46 @@ async def _verify_user_login(session, username: str, password: str) -> UserModel
     return row
 
 
+async def resolve_guest_identity(session_factory, guest_token: str | None) -> tuple[UUID, str | None]:
+    """Resolve an anonymous request's user_id from its signed ``gt_`` token.
+
+    Returns ``(user_id, new_token)``: when ``guest_token`` verifies, ``new_token`` is None;
+    otherwise a fresh guest user is created and a token minted for it, so the client can
+    persist it and stay the same guest across requests. A client-supplied user_id is never
+    trusted here — the identity is always the token's embedded one (or brand-new).
+    """
+    if guest_token:
+        uid = await verify_guest_token(guest_token)
+        if uid is not None:
+            return uid, None
+    uid = await ensure_user(session_factory)
+    expires_at = datetime.now(UTC) + timedelta(seconds=settings.guest_token_ttl_seconds)
+    return uid, await sign_guest_token(uid, expires_at)
+
+
 async def _guest_quota(redis, guest_id: UUID, detail: str | None = None) -> None:
     """Cap anonymous guest chat to ``guest_daily_limit`` requests per day (Redis counter).
 
     ``detail`` overrides the 429 message so a signed-in user who degraded to the anonymous
     tier gets a top-up/upgrade prompt instead of the "sign in" one aimed at true guests.
+
+    Deliberately fail-*open*: the counter is a soft abuse guard, not an invariant — a Redis
+    outage must not take down chat entirely, so we log a warning and let the request through.
+    The cost of that leak (a guest may exceed the daily limit during an outage) is bounded
+    and transient, whereas a 500 on every chat turn during an outage is not.
     """
     if settings.guest_daily_limit <= 0:
         return
-    key = f"ratelimit:guest:{guest_id}:{datetime.now(UTC).date().isoformat()}"
-    count = await redis.incr(key)
-    if count == 1:
-        now = datetime.now(UTC)
-        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        await redis.expire(key, int((midnight - now).total_seconds()) + 1)
+    try:
+        key = f"ratelimit:guest:{guest_id}:{datetime.now(UTC).date().isoformat()}"
+        count = await redis.incr(key)
+        if count == 1:
+            now = datetime.now(UTC)
+            midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            await redis.expire(key, int((midnight - now).total_seconds()) + 1)
+    except Exception:  # noqa: BLE001 - quota counting is best-effort; availability wins
+        logger.warning("guest quota counter unavailable for %s — allowing request", guest_id, exc_info=True)
+        return
     if count > settings.guest_daily_limit:
         raise HTTPException(
             status_code=429,
@@ -322,13 +355,15 @@ async def _guest_quota(redis, guest_id: UUID, detail: str | None = None) -> None
 
 async def _log_usage(
     user: AuthUser, model: str, tool: str, usage: dict | None = None,
-    credential_id: UUID | None = None,
+    credential_id: UUID | None = None, *, paid: bool = False,
 ) -> None:
     """Record one usage-log row, pricing it against the catalog and debiting the wallet.
 
-    Billing is best-effort: if the user has no funds, the deduction is skipped (the request
-    still succeeds) and the usage row is written with the real cost. This keeps PAYG from
-    hard-blocking a request while the admin reviews balances.
+    Free-quota-first model (the settlement side of ``authorize_usage``): a ``paid`` (overflow)
+    request is charged its exact cost from the wallet, clamped to the available balance so a
+    cost larger than the balance drains it to zero — the next overflow request then hits the
+    402 gate, bounding the undercharge to one request. A ``free`` request only records the
+    usage row (cost is reported for admin metrics, never charged).
 
     The cost is always the catalog model price; ``credential_id`` only records which channel
     served the request so the admin can aggregate cost per channel.
@@ -340,8 +375,13 @@ async def _log_usage(
     async with SessionLocal() as session:
         prompt_price, completion_price = await get_model_prices(session, model)
         cost = compute_cost(prompt_tokens, completion_tokens, prompt_price, completion_price)
-        if cost > 0:
-            await deduct(session, user.user_id, cost, description=f"chat ({model})", meta={"tool": tool})
+        if paid and cost > 0:
+            charge = min(cost, await get_balance(session, user.user_id))
+            if charge > 0:
+                await deduct(
+                    session, user.user_id, charge,
+                    description=f"chat ({model})", meta={"tool": tool},
+                )
         session.add(
             UserUsageLogModel(
                 user_id=user.user_id,

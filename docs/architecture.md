@@ -887,14 +887,18 @@ for now).
 |---|---|---|---|
 | Cloud Drive | file row **＋ 加入查询仓库** (`POST /files/{id}/import-rag`) | worker `asset_ingest` → `extract_document_text` dispatch; `.pdf` runs the PDF tool chain | `source_type='file'`, `asset_id` set |
 | Learning Platform | Import Data → sentence checkboxes / *Articles & Query Repo* (`POST /learning/import`, `POST /learning/articles/{id}/import`) | worker `learning_import` (batch) or the API (single article) reads rows → `build_chunks` → embed → insert | `source_type='learning'`, `source_id=<id>` |
-| Chat (single pair) | desktop reply **📥 Import Repo** (`POST /chat/import`) | API binds the assistant reply to its preceding user question, `build_chunks` the Q&A text | `source_type='chat'`, `source_id=<user_message_id>` |
-| Chat (whole session) | desktop header **📥** (`POST /chat/import-session`) | worker `chat_session_import` → LLM `_segment_chat` groups turns (same question across turns merges; distinct questions split), default per-turn grouping on failure | `source_type='chat'`, `source_id=<session_id>` |
+| Chat (single pair) | desktop reply **Import to Knowledge** (`POST /chat/import`) | API binds the assistant reply to its preceding user question, `build_chunks` the Q&A text | `source_type='chat'`, `source_id=<user_message_id>` |
+| Chat (whole session) | desktop session **⋯ → Import to Knowledge** (`POST /chat/import-session`) | worker `chat_session_import` → LLM `_segment_chat` groups turns (same question across turns merges; distinct questions split; each entry carries the covered transcript indexes), default per-turn grouping on failure | `source_type='chat'`, per-entry `source_id=<session_id>:<i>`, `kind='qa'`, `meta.covered` = covered user-message ids |
 
-**Persistent import state** — `GET /chat/imported?session_id=` reports which Q&A pairs of a session are
-already in the repo (`qa_source_ids`, keyed by the user-message id) and whether the whole session was
-imported (`session_imported`). The desktop fetches it on session load — before rendering buttons — so an
-already-imported pair/session renders its **📥** as a disabled **✓ Imported**, surviving session switches
-and app restarts; a click-time re-check on the same endpoint prevents re-importing a pair already in the repo.
+**Persistent import state** — `GET /chat/imported?session_id=` reports which user messages of a session are
+already in the repo: `qa_source_ids` lists every covered user-message id (from `meta.covered`, falling back
+to the legacy single-pair `source_id`), `session_imported` is true only when *every* current user message is
+covered, and `legacy_session_imported` marks a pre-coverage whole-session import with no per-message data.
+The desktop fetches it on session load — before rendering buttons — so an already-imported pair renders its
+**📥** as a disabled **✓ Imported**, surviving session switches and app restarts; a click-time re-check on
+the same endpoint prevents re-importing a pair already in the repo. Whole-session imports are incremental:
+re-importing after an append skips entries whose covered user messages are all already in the repo, so only
+the newly asked questions get embedded.
 
 **PDF tool chain** — processing is extracted into **tools** (the admin can toggle them like any tool)
 wrapping pure functions in `core/infrastructure/pdf.py`:
@@ -1018,10 +1022,11 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 > earlier design names (`conversations`, `job_logs` …). `migrations/0001_init.sql` is the single
 > consolidated base schema (the squash of the original 0001–0008 development migrations; every
 > statement is idempotent). On top of it, the incremental migrations `0002_auth_profiles.sql` …
-> `0011_query_repository.sql` layer later changes (self-service accounts + `verification_tokens`,
+> `0013_asset_acl_public.sql` layer later changes (self-service accounts + `verification_tokens`,
 > usage-log channel, cloud-drive objects, vocabulary isolation, folders, workspace activity,
-> memory-retention index, session title, RAG pipeline columns, and the multi-source query
-> repository). All are applied in filename order by `init_db()`.
+> memory-retention index, session title, RAG pipeline columns, the multi-source query
+> repository, RAG retrieval feedback, and the public-link asset ACL). All are applied in
+> filename order by `init_db()`.
 
 The core learning + chat tables that run today (`migrations/0001_init.sql`):
 
@@ -1076,6 +1081,18 @@ Hybrid recall is computed in code over two channels:
   `wallet_transactions` (documented in §12.3).
 - **Design-only (not created)** — `subscriptions`, `credit_ledger`, `audit_logs`, `ai_call_logs`,
   `activity_logs`, `job_logs` (job state lives in the implemented `jobs` table).
+
+**Quota settlement (free-first)** — `authorize_usage()` (replacing the old hard `check_quota`)
+returns the tier a request is charged to: **`free`** when within the role's daily/monthly/token
+limits (counters incremented, wallet untouched), else **`paid`** — the wallet must hold at least
+`wallet_gate_min_balance_usd` or the request gets **402**; the exact cost is then debited at
+`_log_usage` (clamped to the balance, so an overflow undercharges at most one request). A
+`-1` limit means unlimited (always free). **Anonymous guests** skip the wallet entirely: they are
+identified by a **signed `gt_` HMAC token** (`sign_guest_token` / `verify_guest_token`, TTL
+`guest_token_ttl_seconds`) minted on the first request and returned in the chat response — a
+client-supplied `user_id` is never trusted — and capped by the `guest_daily_limit` Redis counter
+(429; fail-open on a Redis outage). A signed-in user whose every LLM key is disabled degrades to
+the anonymous tier for that request (guest quota + `anonymous` routing).
 
 ### 12.3 Implemented auth, RBAC & billing schema
 
@@ -1525,16 +1542,23 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     right-click context menu — New folder, New text file, Delete file / Delete folder (permanent,
     workspace-bounded). The last workspace folder is persisted in `localStorage` and re-opened on
     launch.
-  - **My Drive panel** (`clouddrive.js`) — the **☁️ Cloud** source renders a minimal cloud
-    browser over the same `/api/*` the web console uses (Bearer token from
-    `localStorage["deepdive_token"]`): folder breadcrumbs + file rows, a **fuzzy search with
-    suggestions** (same `fuzzyScore`, jump-to-result), and New folder / New text file buttons
-    (New text file runs the full chunked-upload flow with `crypto.subtle` hashing, reusing the
-    usual instant-upload dedup when the content is already stored). Clicking a `.md`/`.txt`/code row opens the in-window
-    **note editor** (`#note-editor`); any other file is cached via `cloud-cache` and rendered by
-    the existing `Viewer.render` on the temp path, so PDFs, images, video, and audio play in
-    window. A right-click menu offers upload / delete / new text / new folder (deleting a folder
-    issues `DELETE /folders/{id}`).
+  - **Cloud Drive panel** (`clouddrive.js` + `viewer.js`) — the **☁️ Cloud** source is a full
+    cloud-file manager aligned with the web console, over the same `/api/*` (Bearer token from
+    `localStorage["deepdive_token"]`). A tree shows **My Drive**, every **workspace** (with its
+    subfolders), and **🗑 Trash** at the bottom; selecting a node navigates the main area to that
+    scope (`loc = root | workspace | folder | trash`). The main area is a **list / grid toggle**
+    (☰ / ▦) with a **five-column table** — `Name | Size | RAG Status | Query Repo | Updated`
+    (Trash: `Name | Deleted`) — directory rows double-click to enter, file rows click to open, and
+    a per-scope **search** box filters by name. **✏ Edit** mode adds selection checkboxes and a
+    **batch bar** (Download / Open / Share / Rename / Move / Trash; in Trash: Restore / Delete
+    permanently / Empty Trash). A toolbar offers **⚙ Manage** (workspace members + activity logs,
+    role-gated `canManage`), **＋ New folder**, **＋ New text**, and **⬆ Upload** (role-gated
+    `canWrite`). The **Query Repo** column renders a status cell — `✓ In Knowledge` /
+    `Importing…` / `Processing… (ETA)` / `＋ Import to Knowledge` / `Not supported` — driven by
+    `ragCell(f)` + `ingestEtaSuffix`, with a 5 s `pollWhileWorking` re-poll. Clicking a
+    `.md`/`.txt`/code row opens the in-window **note editor** (`#note-editor`); any other file is
+    cached via `cloud-cache` and rendered by `Viewer.render` on the temp path, so PDFs, images,
+    video, and audio play in window.
   - **Note editor** — an overlay with a **✏ Edit / 👁 Preview** toggle and **💾 Save**
     (`Ctrl+S`). Edit mode is a monospace `textarea`; Preview renders the draft through the
     vendored `markdown-it` + `katex` chat renderer (`renderMarkdown`, XSS-safe `validateLink`).
@@ -1569,21 +1593,34 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     rendering; the pane docks bottom/right or floats as a draggable window. Splitter and
     floating-window drags use **pointer events + `setPointerCapture`**, so drag tracking continues
     even when the pointer passes over the `<video>` element. Sign-in / register / password-reset
-    and profile/avatar editing are modal dialogs against `/auth/*`.
+    and profile/avatar editing are modal dialogs against `/auth/*`. The **input box** is a
+    Gemini-style row — a **＋ attach** button, the text field, inline **🎤 / 🔊** buttons, and
+    Send — with an attachment preview strip above it. Attach stages a pending attachment that
+    rides on the next send: pick a file (OS picker → uploaded to the cloud drive), attach the
+    currently-open cloud asset by id, or capture a **window screenshot** (`capture-window` IPC →
+    base64 → uploaded); the API prefixes an `[Attached: …]` note to the user message so the
+    agent's document tools can fetch the bytes by `asset_id`. The chat-header also carries a
+    **⋯** session menu (pin / rename / **Import to Knowledge** / delete) and a **hide** toggle
+    that collapses the chat into a floating restore icon.
   - **Chat bubbles & message management** — every user/assistant bubble renders through the
     vendored `markdown-it` (`renderMarkdown`, `html:false` + XSS-safe `validateLink`) with a
     **KaTeX math plugin** (`$...$` inline, `$$...$$` display — block rule registered before
     `lheading`, inline rule after `escape`; `throwOnError:false` degrades an unparseable formula
     to its raw source instead of breaking the bubble). Streamed deltas re-render incrementally,
-    so math/Markdown appears live. Each bubble carries a **Copy / Read / Delete / Edit** action
-    row (`buildMsgActions`): **Delete** opens a per-turn selection to tick the question and/or
-    answer, then issues `DELETE /sessions/{id}/messages/{mid}` per message; **Edit** (user
-    messages only) follows the **edit = re-ask** model — the edited message and every later one
-    are deleted server-side + DOM, then the question is re-sent through the stream so a fresh
-    answer regenerates (there is no server-side message-edit endpoint; the client rewrites the
-    history). Sessions are **renamed** inline (click the chat-header title or a sidebar row →
-    `PATCH /sessions/{id}`; empty title resets auto-naming) or **deleted** from the sidebar
-    (`DELETE /sessions/{id}`); `GET /sessions/{id}/messages` reloads a session's bubbles.
+    so math/Markdown appears live. Each bubble carries a **Copy / Read / Delete / Edit /
+    Import to Knowledge** action row (`buildMsgActions`): **Read** speaks the message aloud via
+    the server-side streaming **Kokoro TTS** (`POST /tts/stream` → SSE) with a sequential
+    segment queue (`speakMessage` / `voiceStop`, abortable and tagged by generation); **Delete**
+    opens a per-turn selection to tick the question and/or answer, then issues
+    `DELETE /sessions/{id}/messages/{mid}` per message; **Edit** (user messages only) follows
+    the **edit = re-ask** model — the edited message and every later one are deleted server-side
+    + DOM, then the question is re-sent through the stream so a fresh answer regenerates (there
+    is no server-side message-edit endpoint; the client rewrites the history). **Import to
+    Knowledge** writes the Q&A pair to the query repository (§10.8) and flips to a disabled
+    **✓ Imported** once covered, driven by `GET /chat/imported` per user message. Sessions are
+    **renamed** inline (click the chat-header title or a sidebar row → `PATCH /sessions/{id}`;
+    empty title resets auto-naming) or **deleted** from the sidebar (`DELETE /sessions/{id}`);
+    `GET /sessions/{id}/messages` reloads a session's bubbles.
   - **Settings** — a modal with five tabs: **Appearance** (theme), **Window & Display** (font
     size), **Updates** (GitHub release check), **Help & Feedback**, and **About**.
 

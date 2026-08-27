@@ -14,11 +14,31 @@ from agent.security.approvals import (
     set_request_approval,
 )
 from api.auth import AuthUser, require_user, require_user_optional
-from api.deps import _batch_embedder, _embedder, get_agent, get_task_queue, llm
-from api.routers._shared import _guest_quota, _log_usage, _resolve_chat_route
+from api.deps import (
+    _batch_embedder,
+    _embedder,
+    get_agent,
+    get_drive_service,
+    get_task_queue,
+    llm,
+)
+from api.schemas import ChatImportRequest, ChatRequest, ChatSessionImportRequest
+from core.application.drive_service import DriveError, DriveService
+from api.routers._shared import (
+    _guest_quota,
+    _log_usage,
+    _resolve_chat_route,
+    resolve_guest_identity,
+)
 from api.schemas import ChatImportRequest, ChatRequest, ChatSessionImportRequest
 from core.config import settings
-from core.infrastructure.db import ChunkModel, LoginTokenModel, MessageModel, SessionLocal
+from core.infrastructure.db import (
+    ChunkModel,
+    LoginTokenModel,
+    MessageModel,
+    SessionLocal,
+    SessionModel,
+)
 from core.infrastructure.drive_repositories import SqlChunkRepository
 from core.infrastructure.ingest import build_chunks, write_query_repo_chunks
 from core.infrastructure.jobs import CHAT_SESSION_IMPORT, SESSION_FINALIZE, TaskQueue
@@ -26,15 +46,36 @@ from core.infrastructure.memory import (
     SessionMemoryStore,
     compact_history,
     create_session,
-    ensure_user,
 )
 from core.infrastructure.request_context import set_request_user
-from core.infrastructure.security import check_quota, get_role
+from core.infrastructure.security import authorize_usage, get_role
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
 router = APIRouter(tags=["chat"])
+
+
+async def _attach_note(body: ChatRequest, drive: DriveService, user_id) -> str | None:
+    """Build a context note for an attached cloud asset, or ``None`` when there is none.
+
+    Attachments are read-only references: we verify the caller can read the asset, then
+    prefix a ``[Attached: …]`` note to the user message so the agent knows which document
+    the user is troubleshooting. The agent's existing drive tools (pdf_extract_text,
+    doc_outline, …) can then fetch the bytes by ``asset_id``.
+    """
+    attach = body.attach or {}
+    if attach.get("kind") != "asset" or user_id is None:
+        return None
+    asset_id = attach.get("asset_id")
+    if not asset_id:
+        return None
+    try:
+        await drive.ensure_asset_readable(user_id, UUID(asset_id))
+    except DriveError as exc:
+        raise HTTPException(status_code=403, detail=f"no access to the attached file: {exc}")
+    name = attach.get("name") or "document"
+    return f"[Attached: {name} (asset_id {asset_id})]"
 
 
 @router.post("/chat/import")
@@ -50,6 +91,13 @@ async def chat_import_pair(
     async with SessionLocal() as session:
         user_msg = await session.get(MessageModel, UUID(body.user_message_id))
         asst_msg = await session.get(MessageModel, UUID(body.assistant_message_id))
+        session_row = await session.get(SessionModel, UUID(body.session_id))
+    if session_row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    # Ownership gate: a user may only import pairs from their own sessions, so a forged
+    # session_id cannot pull another user's messages into the caller's query repo.
+    if session_row.user_id != user.user_id:
+        raise HTTPException(status_code=403, detail="session does not belong to you")
     if user_msg is None or asst_msg is None:
         raise HTTPException(status_code=404, detail="message not found")
     if user_msg.session_id != UUID(body.session_id) or asst_msg.session_id != user_msg.session_id:
@@ -85,6 +133,10 @@ async def chat_import_session(
     queue: TaskQueue = Depends(get_task_queue),
 ):
     """Enqueue a whole chat session: the LLM groups its Q&A turns into repo chunks."""
+    async with SessionLocal() as session:
+        session_row = await session.get(SessionModel, UUID(body.session_id))
+    if session_row is None or session_row.user_id != user.user_id:
+        raise HTTPException(status_code=403, detail="session does not belong to you")
     job_id = await queue.enqueue(
         CHAT_SESSION_IMPORT,
         {"session_id": body.session_id, "user_id": str(user.user_id)},
@@ -100,10 +152,29 @@ async def chat_imported_status(
     """Which Q&A pairs of a session are already in the query repo.
 
     Drives the persistent "✓ Imported" state on the desktop chat buttons: on session
-    load the client fetches this so an already-imported pair (or a fully imported
-    session) stays disabled across session switches and app restarts.
+    load the client fetches this so an already-imported pair stays disabled across
+    session switches and app restarts.
+
+    Coverage is tracked per user message: ``qa_source_ids`` lists every user-message id
+    covered by an imported chunk (from ``meta['covered']``, or the legacy single-pair
+    ``source_id``). ``session_imported`` is only true when *every* current user message
+    is covered, so an appended question stays importable and re-importing a session only
+    imports the new pairs. ``legacy_session_imported`` marks a pre-coverage whole-session
+    import (old ``kind='session-qa'``) that has no per-message data — the client treats it
+    as fully imported but allows a re-import to convert it.
     """
     async with SessionLocal() as session:
+        user_msg_ids = [
+            str(m)
+            for m in (
+                await session.execute(
+                    select(MessageModel.id).where(
+                        MessageModel.session_id == session_id,
+                        MessageModel.role == "user",
+                    )
+                )
+            ).scalars().all()
+        ]
         rows = (
             await session.execute(
                 select(ChunkModel.source_id, ChunkModel.meta).where(
@@ -113,16 +184,24 @@ async def chat_imported_status(
                 )
             )
         ).all()
-    qa_source_ids: list[str] = []
-    session_imported = False
+    covered: set[str] = set()
+    legacy_session_imported = False
     for source_id, meta in rows:
         kind = (meta or {}).get("kind")
         if kind == "qa":
-            if source_id not in qa_source_ids:
-                qa_source_ids.append(source_id)
+            cov = (meta or {}).get("covered")
+            if isinstance(cov, list) and cov:
+                covered.update(str(c) for c in cov)
+            else:
+                covered.add(source_id)  # legacy single-pair: source_id is the user-message id
         elif kind == "session-qa":
-            session_imported = True
-    return {"qa_source_ids": qa_source_ids, "session_imported": session_imported}
+            legacy_session_imported = True
+    fully_covered = bool(user_msg_ids) and covered.issuperset(user_msg_ids)
+    return {
+        "qa_source_ids": sorted(covered),
+        "session_imported": legacy_session_imported or fully_covered,
+        "legacy_session_imported": legacy_session_imported,
+    }
 
 
 @router.post("/chat")
@@ -131,6 +210,7 @@ async def chat(
     request: Request,
     user: AuthUser | None = Depends(require_user_optional),
     queue: TaskQueue = Depends(get_task_queue),
+    drive: DriveService = Depends(get_drive_service),
 ):
     # Scope RAG / memory recall to this request's user (guest → public-link assets only).
     set_request_user(user.user_id if user is not None else None)
@@ -144,9 +224,11 @@ async def chat(
     # guest daily quota + anonymous routing (that's the "equivalent to an anonymous user"
     # behavior; full access returns when the admin re-enables a key).
     notice = None
+    guest_token = None
+    tier = "free"
     async with SessionLocal() as session:
         if user is None:
-            user_id = body.user_id or await ensure_user(SessionLocal)
+            user_id, guest_token = await resolve_guest_identity(SessionLocal, body.guest_token)
             await _guest_quota(request.app.state.redis, user_id)
             token = None
             role_id = "anonymous"
@@ -173,7 +255,7 @@ async def chat(
             )
             base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, None, role_id)
         elif user is not None:
-            await check_quota(session, user.user_id, user.role)
+            tier = await authorize_usage(session, user.user_id, user.role)
         # The anonymous tier has no channel either: do NOT fall back to the legacy global
         # connection — tell the user instead (the admin must bind a channel to the role).
         if not base_url and not api_key:
@@ -182,6 +264,11 @@ async def chat(
                 detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
             )
 
+    user_text = body.message
+    if body.attach:
+        note = await _attach_note(body, drive, user_id)
+        if note:
+            user_text = f"{note}\n\n{body.message}"
     session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
     session_memory = SessionMemoryStore(SessionLocal, _embedder(), llm, session_id, user_id)
     history = body.history or await session_memory.load_messages()
@@ -196,7 +283,7 @@ async def chat(
         api_key=api_key or None,
     )
     result = await get_agent().run(
-        body.message,
+        user_text,
         history,
         session_memory=session_memory,
         model=model,
@@ -206,7 +293,10 @@ async def chat(
     # close() (inside run) already flushed events; defer the expensive embed+summary work.
     await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
     if log_user is not None:
-        await _log_usage(log_user, business_name, "chat", result.usage, credential_id=credential_id)
+        await _log_usage(
+            log_user, business_name, "chat", result.usage,
+            credential_id=credential_id, paid=(tier == "paid"),
+        )
     # Resolve this turn's user-message / assistant-answer ids so the client can delete a
     # single message. Scan ascending for the last row matching each text (texts may repeat,
     # but this turn's rows are always the newest).
@@ -220,7 +310,7 @@ async def chat(
             )
         ).all()
         for m_id, role, text in rows:
-            if role == "user" and text == body.message:
+            if role == "user" and text == user_text:
                 user_message_id = str(m_id)
             elif role == "assistant" and text == result.final_answer:
                 assistant_message_id = str(m_id)
@@ -232,6 +322,8 @@ async def chat(
         "user_message_id": user_message_id,
         "assistant_message_id": assistant_message_id,
     }
+    if guest_token:
+        resp["guest_token"] = guest_token
     if notice:
         resp["notice"] = notice
     return resp
@@ -243,6 +335,7 @@ async def chat_stream(
     request: Request,
     user: AuthUser | None = Depends(require_user_optional),
     queue: TaskQueue = Depends(get_task_queue),
+    drive: DriveService = Depends(get_drive_service),
 ):
     """SSE streaming chat over the full agent path (tools + session persistence + quota).
 
@@ -253,9 +346,11 @@ async def chat_stream(
     """
     set_request_user(user.user_id if user is not None else None)
     notice = None
+    guest_token = None
+    tier = "free"
     async with SessionLocal() as session:
         if user is None:
-            user_id = body.user_id or await ensure_user(SessionLocal)
+            user_id, guest_token = await resolve_guest_identity(SessionLocal, body.guest_token)
             await _guest_quota(request.app.state.redis, user_id)
             token = None
             role_id = "anonymous"
@@ -282,7 +377,7 @@ async def chat_stream(
             )
             base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, None, role_id)
         elif user is not None:
-            await check_quota(session, user.user_id, user.role)
+            tier = await authorize_usage(session, user.user_id, user.role)
     # All keys + the anonymous tier are exhausted too — block, don't fall back to the
     # legacy global connection; the user must top up / upgrade.
     if not base_url and not api_key:
@@ -291,6 +386,11 @@ async def chat_stream(
             detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
         )
 
+    user_text = body.message
+    if body.attach:
+        note = await _attach_note(body, drive, user_id)
+        if note:
+            user_text = f"{note}\n\n{body.message}"
     session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
     session_memory = SessionMemoryStore(SessionLocal, _embedder(), llm, session_id, user_id)
     history = body.history or await session_memory.load_messages()
@@ -329,7 +429,7 @@ async def chat_stream(
             # `except asyncio.CancelledError`, which logs turn-cancelled and closes memory.
             try:
                 async for evt in get_agent().run_stream(
-                    body.message,
+                    user_text,
                     history,
                     session_memory=session_memory,
                     model=model,
@@ -370,7 +470,8 @@ async def chat_stream(
         if log_user is not None:
             await _log_usage(
                 log_user, business_name, "chat_stream",
-                final["usage"] if final else None, credential_id=credential_id,
+                final["usage"] if final else None,
+                credential_id=credential_id, paid=(tier == "paid"),
             )
         # Resolve this turn's user/assistant message ids (same scan as /chat: ascending,
         # last row matching each text) so the client can delete a single message.
@@ -385,7 +486,7 @@ async def chat_stream(
                 )
             ).all()
             for m_id, role, text in rows:
-                if role == "user" and text == body.message:
+                if role == "user" and text == user_text:
                     user_message_id = str(m_id)
                 elif role == "assistant" and answer and text == answer:
                     assistant_message_id = str(m_id)
@@ -396,6 +497,8 @@ async def chat_stream(
             "user_message_id": user_message_id,
             "assistant_message_id": assistant_message_id,
         }
+        if guest_token:
+            done["guest_token"] = guest_token
         if notice:
             done["notice"] = notice
         yield {"data": json.dumps({"type": "done", "data": done}, ensure_ascii=False)}

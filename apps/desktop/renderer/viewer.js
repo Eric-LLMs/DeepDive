@@ -3,6 +3,11 @@
 const Viewer = (() => {
   const state = { path: null, name: null, kind: null, openPath: null, zoom: 1 };
 
+  // app.js registers this so every file toolbar can offer "attach to chat". The handler
+  // receives "file" (attach the currently-open file) or "screenshot" (capture the window).
+  let attachHandler = null;
+  function setAttachHandler(fn) { attachHandler = fn; }
+
   const VIDEO_EXT = new Set(["mp4", "webm", "mov", "m4v"]);
   const AUDIO_EXT = new Set(["mp3", "wav", "m4a", "flac", "ogg"]);
   const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"]);
@@ -274,6 +279,22 @@ const Viewer = (() => {
       fs.title = "Fullscreen / Exit fullscreen";
       fs.onclick = toggleFullscreen;
       bar.appendChild(fs);
+    }
+
+    // "Attach to chat" buttons: only meaningful while a real file is open (folder browse
+    // has nothing to attach, and app.js must have registered an attach handler).
+    if (attachHandler && state.kind !== "folder") {
+      const attachBtn = document.createElement("button");
+      attachBtn.textContent = "🔗";
+      attachBtn.title = "Attach current file to chat";
+      attachBtn.onclick = () => attachHandler("file", { path: state.openPath || state.path, name: state.name });
+      bar.appendChild(attachBtn);
+
+      const shotBtn = document.createElement("button");
+      shotBtn.textContent = "📷";
+      shotBtn.title = "Screenshot this window and attach to chat";
+      shotBtn.onclick = () => attachHandler("screenshot");
+      bar.appendChild(shotBtn);
     }
 
     const openBtn = document.createElement("button");
@@ -1162,7 +1183,390 @@ const Viewer = (() => {
   // Re-render the current view at the current zoom (used by the zoom buttons).
   function rerender() {
     if (!state.path) return;
+    if (state.kind === "folder") return; // folder browse has no zoom
     dispatch(state.kind, state.path, state.name);
+  }
+
+  function fmtSize(n) {
+    if (n == null) return "";
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  function fmtDate(s) {
+    return s ? new Date(s).toLocaleString() : "—";
+  }
+
+  function span(className, text) {
+    const s = document.createElement("span");
+    if (className) s.className = className;
+    if (text != null) s.textContent = text;
+    return s;
+  }
+
+  // Folder-browse view: list a folder's children in the main area with breadcrumb
+  // navigation. `entries` are opaque to the viewer — dir entries must carry
+  // { type: "dir", name, path }, file entries are passed whole to `open`.
+  // `opts`:
+  //   rootPath   browse-root folder path (workspaceDir for local, "" for cloud)
+  //   rootName   display name of the root (workspace folder name / "My Drive")
+  //   path       current folder path relative to root ("" = root)
+  //   read       async (relPath) => { entries, localPath } — children of a folder
+  //   open       (entry) => void — source-specific file opener
+  //   localPath  current folder's OS absolute path (null hides "Open in OS")
+  async function renderFolder(entries, opts) {
+    const { rootPath, rootName, path = "", read, open, localPath = null } = opts;
+    const segs = path ? path.split("/").filter(Boolean) : [];
+    state.path = path || rootPath || rootName;
+    state.name = segs.length ? segs[segs.length - 1] : rootName;
+    state.kind = "folder";
+
+    const el = clear();
+
+    // The cloud drive view renders its own toolbar (view toggle / search / actions),
+    // so the plain local-file toolbar is skipped there.
+    if (!opts.cloudTable) {
+      const bar = makeToolbar(state.name, localPath);
+      if (!localPath) {
+        const osBtn = Array.from(bar.querySelectorAll("button")).find(
+          (b) => b.textContent === "Open in OS"
+        );
+        if (osBtn) osBtn.remove();
+      }
+      el.appendChild(bar);
+    }
+
+    // Breadcrumb: root crumb + each ancestor segment; clicking navigates up.
+    const crumbBar = document.createElement("div");
+    crumbBar.className = "folder-breadcrumb";
+    const crumbs = [{ label: rootName, relPath: "" }];
+    let acc = "";
+    for (const s of segs) {
+      acc = acc ? `${acc}/${s}` : s;
+      crumbs.push({ label: s, relPath: acc });
+    }
+    for (let i = 0; i < crumbs.length; i++) {
+      if (i > 0) {
+        const sep = span("cd-crumb-sep", "›");
+        crumbBar.appendChild(sep);
+      }
+      const c = document.createElement("button");
+      c.className = "cd-crumb" + (i === crumbs.length - 1 ? " current" : "");
+      c.textContent = crumbs[i].label;
+      c.title = `Open folder ${crumbs[i].relPath || rootName}`;
+      if (i < crumbs.length - 1) {
+        c.onclick = async () => {
+          if (opts.onCrumb) {
+            opts.onCrumb(crumbs[i].relPath);
+            return;
+          }
+          try {
+            const res = await read(crumbs[i].relPath);
+            renderFolder(res.entries, {
+              ...opts,
+              path: crumbs[i].relPath,
+              localPath: res.localPath,
+            });
+          } catch (err) {
+            toast(`Cannot open folder: ${err.message || err}`);
+          }
+        };
+      }
+      crumbBar.appendChild(c);
+    }
+    el.appendChild(crumbBar);
+
+    // Cloud drive (web CloudDrive parity): the clouddrive.js owner drives a
+    // rich table/grid renderer instead of the simple local-folder list below.
+    if (opts.cloudTable) return renderCloudBody(el, entries, opts);
+
+    // List body: folders first, then files (reuse the cloud-drive row styles).
+    const body = document.createElement("div");
+    body.className = "folder-body";
+    const folders = (entries || []).filter((e) => e.type === "dir");
+    const files = (entries || []).filter((e) => e.type !== "dir");
+    if (!folders.length && !files.length) {
+      const empty = document.createElement("div");
+      empty.className = "folder-empty";
+      empty.textContent = "Empty folder.";
+      body.appendChild(empty);
+    } else {
+      for (const d of folders) {
+        const row = document.createElement("div");
+        row.className = "cd-row cd-folder";
+        row.title = `Browse ${d.name}`;
+        row.appendChild(span("cd-icon", "📁"));
+        row.appendChild(span("cd-name", d.name));
+        row.addEventListener("click", async () => {
+          try {
+            const res = await read(d.path);
+            renderFolder(res.entries, {
+              ...opts,
+              path: d.path,
+              localPath: res.localPath,
+            });
+          } catch (err) {
+            toast(`Cannot open folder: ${err.message || err}`);
+          }
+        });
+        body.appendChild(row);
+      }
+      for (const f of files) {
+        const row = document.createElement("div");
+        row.className = "cd-row cd-file";
+        row.title = f.name;
+        row.appendChild(span("cd-icon", "📄"));
+        row.appendChild(span("cd-name", f.name));
+        if (f.size != null) row.appendChild(span("cd-meta", fmtSize(f.size)));
+        // Optional per-file trailing widget (e.g. a RAG status badge / import button).
+        if (opts.rowAction) {
+          const act = opts.rowAction(f);
+          if (act) row.appendChild(act);
+        }
+        row.addEventListener("click", () => open(f));
+        body.appendChild(row);
+      }
+    }
+    el.appendChild(body);
+  }
+
+  // Cloud drive parity view (web CloudDrive.tsx): toolbar + (edit-mode) batch
+  // bar + list/grid body. Pure renderer — every interaction routes back through
+  // the opts callbacks so clouddrive.js stays the single owner of state.
+  function renderCloudBody(el, entries, opts) {
+    const { cloud, onAction, onSearch, onEnterFolder, onOpenEntry, onToggleOne, onToggleAll, onDeleteFolder, onBatch, ragCell, ragBadge } = opts;
+    const { viewMode, editMode, isTrash, canWrite, canManage, inWs, trashCount, selected, query, locLabel, emptyText } = cloud;
+
+    const dirs = (entries || []).filter((e) => e.type === "dir");
+    const files = (entries || []).filter((e) => e.type !== "dir");
+
+    function btn(label, title, onClick, cls = "", disabled = false) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.title = title;
+      if (cls) b.className = cls;
+      b.disabled = disabled;
+      if (onClick) b.onclick = onClick;
+      return b;
+    }
+    function thEl(text) {
+      const th = document.createElement("th");
+      th.textContent = text;
+      return th;
+    }
+    function tdEl(children) {
+      const td = document.createElement("td");
+      if (Array.isArray(children)) children.forEach((c) => td.appendChild(c));
+      else if (children) td.appendChild(children);
+      return td;
+    }
+
+    // ---- Toolbar ----
+    const tool = document.createElement("div");
+    tool.className = "cdt-toolbar";
+    const pathLab = span("cdt-path", locLabel);
+    pathLab.title = locLabel;
+    tool.appendChild(pathLab);
+
+    const vt = document.createElement("span");
+    vt.className = "cdt-view-toggle";
+    vt.appendChild(btn("☰", "List view", () => onAction("view-list"), viewMode === "list" ? "active" : ""));
+    vt.appendChild(btn("▦", "Grid view", () => onAction("view-grid"), viewMode === "grid" ? "active" : ""));
+    tool.appendChild(vt);
+
+    if (!isTrash) {
+      const sw = document.createElement("span");
+      sw.className = "cdt-search-wrap";
+      const inp = document.createElement("input");
+      inp.className = "cdt-search";
+      inp.placeholder = "Search files…";
+      inp.value = query || "";
+      inp.addEventListener("input", () => onSearch(inp.value));
+      sw.appendChild(inp);
+      tool.appendChild(sw);
+    }
+
+    tool.appendChild(span("cdt-spacer", ""));
+
+    if (inWs && canManage) {
+      tool.appendChild(btn("⚙ Manage", "Manage workspace members and settings", () => onAction("manage")));
+    }
+    tool.appendChild(btn(editMode ? "✓ Done" : "✏ Edit", editMode ? "Done selecting" : "Show selection checkboxes", () => onAction("edit")));
+    if (isTrash) {
+      tool.appendChild(btn("Empty Trash", "Permanently delete everything in Trash", () => onAction("empty-trash"), "danger", trashCount === 0));
+    } else {
+      if (canWrite) tool.appendChild(btn("＋ New folder", "Create a new folder here", () => onAction("new-folder")));
+      if (canWrite) tool.appendChild(btn("＋ New text", "Create a new text file here", () => onAction("new-text")));
+      if (canWrite) tool.appendChild(btn("⬆ Upload", "Upload a file here", () => onAction("upload"), "primary"));
+    }
+    el.appendChild(tool);
+
+    // ---- Edit-mode batch bar ----
+    if (editMode) {
+      const bb = document.createElement("div");
+      bb.className = "cdt-batchbar";
+      const count = files.filter((f) => selected.has(f.id)).length;
+      bb.appendChild(span("cdt-batch-count", `${count} selected`));
+      const add = (label, title, fn, cls, disabled) => bb.appendChild(btn(label, title, fn, cls, disabled));
+      if (isTrash) {
+        add("↩ Restore", "Restore selected files", () => onBatch("restore"), "", count === 0);
+        add("✖ Delete permanently", "Permanently delete selected files", () => onBatch("purge"), "danger", count === 0);
+      } else {
+        add("⬇ Download", "Download selected files", () => onBatch("download"), "", count === 0);
+        add("↗ Open", "Open the selected file", () => onBatch("open"), "", count !== 1);
+        add("🔗 Share", "Share the selected file", () => onBatch("share"), "", count !== 1 || !canWrite);
+        add("✏ Rename", "Rename the selected file", () => onBatch("rename"), "", count !== 1 || !canWrite);
+        add("⇄ Move", "Move selected files to another folder or workspace", () => onBatch("move"), "", count === 0 || !canWrite);
+        add("🗑 Delete", "Move selected files to Trash", () => onBatch("delete"), "danger", count === 0 || !canWrite);
+      }
+      el.appendChild(bb);
+    }
+
+    // ---- Body ----
+    const body = document.createElement("div");
+    body.className = "cdt-body";
+
+    if (!dirs.length && !files.length) {
+      const empty = document.createElement("div");
+      empty.className = "cdt-empty";
+      empty.textContent = emptyText;
+      body.appendChild(empty);
+    } else if (viewMode === "grid") {
+      const grid = document.createElement("div");
+      grid.className = "cdt-grid";
+      for (const d of dirs) {
+        const tile = document.createElement("div");
+        tile.className = "cdt-tile cdt-dir-tile";
+        tile.title = "Double-click to enter";
+        tile.addEventListener("dblclick", () => onEnterFolder(d));
+        tile.appendChild(span("cdt-tile-icon", "📁"));
+        tile.appendChild(span("cdt-tile-name", d.name));
+        const meta = document.createElement("div");
+        meta.className = "cdt-tile-meta";
+        meta.appendChild(span("muted", "Folder"));
+        tile.appendChild(meta);
+        grid.appendChild(tile);
+      }
+      for (const f of files) {
+        const tile = document.createElement("div");
+        tile.className = "cdt-tile" + (selected.has(f.id) ? " selected" : "");
+        tile.title = editMode ? (selected.has(f.id) ? "Click to deselect" : "Click to select") : "Click to open";
+        tile.addEventListener("click", () => onOpenEntry(f));
+        if (editMode) {
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.className = "cdt-tile-check";
+          cb.checked = selected.has(f.id);
+          cb.addEventListener("click", (e) => e.stopPropagation());
+          cb.addEventListener("change", () => onToggleOne(f.id));
+          tile.appendChild(cb);
+        }
+        tile.appendChild(span("cdt-tile-icon", "📄"));
+        tile.appendChild(span("cdt-tile-name", f.name));
+        const meta = document.createElement("div");
+        meta.className = "cdt-tile-meta";
+        if (isTrash) {
+          meta.appendChild(span("muted", fmtDate(f.deleted_at)));
+        } else {
+          meta.appendChild(span("muted", fmtSize(f.size)));
+          const b = ragBadge ? ragBadge(f) : null;
+          if (b) meta.appendChild(b);
+        }
+        tile.appendChild(meta);
+        grid.appendChild(tile);
+      }
+      body.appendChild(grid);
+    } else {
+      // List view: folder rows on top, then the file table.
+      if (dirs.length) {
+        const dl = document.createElement("div");
+        dl.className = "cdt-dir-list";
+        for (const d of dirs) {
+          const row = document.createElement("div");
+          row.className = "cdt-dir-row";
+          row.title = "Double-click to enter";
+          row.addEventListener("dblclick", () => onEnterFolder(d));
+          row.appendChild(span("cdt-folder-icon", "📁"));
+          row.appendChild(span("cdt-node-name", d.name));
+          row.appendChild(span("cdt-flex", ""));
+          if (editMode) {
+            const del = btn("🗑", canWrite ? "Delete folder (its files move to Trash)" : "You don't have write access here", () => onDeleteFolder(d), "cdt-danger", !canWrite);
+            row.appendChild(del);
+          }
+          dl.appendChild(row);
+        }
+        body.appendChild(dl);
+      }
+
+      const table = document.createElement("table");
+      table.className = "cdt-table";
+      const thead = document.createElement("thead");
+      const trh = document.createElement("tr");
+      if (editMode) {
+        const th = document.createElement("th");
+        th.style.width = "32px";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = files.length > 0 && files.every((f) => selected.has(f.id));
+        cb.title = "Select all files in this folder";
+        cb.addEventListener("change", () => onToggleAll(cb.checked));
+        th.appendChild(cb);
+        trh.appendChild(th);
+      }
+      trh.appendChild(thEl("Name"));
+      if (isTrash) trh.appendChild(thEl("Deleted"));
+      else {
+        trh.appendChild(thEl("Size"));
+        trh.appendChild(thEl("RAG Status"));
+        trh.appendChild(thEl("Query Repo"));
+      }
+      trh.appendChild(thEl("Updated"));
+      thead.appendChild(trh);
+      table.appendChild(thead);
+
+      const tbody = document.createElement("tbody");
+      for (const f of files) {
+        const tr = document.createElement("tr");
+        if (selected.has(f.id)) tr.className = "cdt-row-selected";
+        tr.title = editMode ? "" : isTrash ? "" : "Click to open";
+        tr.addEventListener("click", () => onOpenEntry(f));
+        if (editMode) {
+          const td = document.createElement("td");
+          td.addEventListener("click", (e) => e.stopPropagation());
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.checked = selected.has(f.id);
+          cb.addEventListener("change", () => onToggleOne(f.id));
+          td.appendChild(cb);
+          tr.appendChild(td);
+        }
+        const nameTd = tdEl([span("cdt-file-icon", "📄"), document.createTextNode(f.name)]);
+        nameTd.className = "cdt-name-cell";
+        nameTd.title = f.name;
+        tr.appendChild(nameTd);
+        if (isTrash) {
+          tr.appendChild(tdEl(span("muted", fmtDate(f.deleted_at))));
+        } else {
+          tr.appendChild(tdEl(span("muted", fmtSize(f.size))));
+          const ragTd = document.createElement("td");
+          const b = ragBadge ? ragBadge(f) : null;
+          if (b) ragTd.appendChild(b);
+          tr.appendChild(ragTd);
+          const qtd = document.createElement("td");
+          qtd.addEventListener("click", (e) => e.stopPropagation());
+          const cell = ragCell ? ragCell(f) : null;
+          if (cell) qtd.appendChild(cell);
+          tr.appendChild(qtd);
+        }
+        tr.appendChild(tdEl(span("muted", fmtDate(f.updated_at ?? f.created_at))));
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      body.appendChild(table);
+    }
+
+    el.appendChild(body);
   }
 
   // Keep the fullscreen button label in sync when toggled (incl. Esc to exit).
@@ -1184,5 +1588,11 @@ const Viewer = (() => {
     close();
   });
 
-  return { render, kindFor, localUrl, toast, close };
+  // A document (file) is open in the viewer — vs. a folder listing or nothing.
+  // The cloud drive uses this to avoid background refreshes clobbering an open file.
+  function isOpen() {
+    return state.path != null && state.kind !== "folder";
+  }
+
+  return { render, renderFolder, kindFor, localUrl, toast, close, setAttachHandler, isOpen };
 })();

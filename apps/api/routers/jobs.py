@@ -1,5 +1,10 @@
 """Enrichment / media jobs: enqueue TTS, image fetch, media generation, explanation, and
 poll job state. Streaming TTS synthesizes directly in-process over SSE.
+
+Every endpoint requires an authenticated user: jobs are bound to a caller so ``/jobs/{id}``
+can scope reads to the job's owner (admin bypass). ``/media/generate`` confines its
+video/subtitle paths to the workspace so a caller cannot point the worker at arbitrary
+server files.
 """
 from __future__ import annotations
 
@@ -7,18 +12,43 @@ import json
 from pathlib import Path
 from uuid import UUID
 
+from api.auth import AuthUser, require_user
 from api.deps import get_task_queue
 from api.schemas import ExplainRequest, ImageFetchRequest, MediaGenerateRequest, TTSRequest
+from core.config import settings
 from core.infrastructure.jobs import EXPLAIN, GENERATE_MEDIA, IMAGE_FETCH, TTS, TaskQueue
 from core.infrastructure.tts import TTSClient
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
 router = APIRouter(tags=["jobs"])
 
 
+def _confined_path(path: str, *, field: str) -> str:
+    """Return ``path`` only if it resolves inside ``settings.workspace_dir``.
+
+    The worker reads these paths directly off the server filesystem (apps/worker/tasks.py
+    _build_media), so an unconfined value would let a caller make the worker open any server
+    file and render it into a returned PPT/PDF. Absolute escapes and ``..`` are rejected here.
+    """
+    root = Path(settings.workspace_dir).expanduser().resolve()
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except (OSError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field}: invalid path")
+    if not resolved.is_relative_to(root):
+        raise HTTPException(
+            status_code=400, detail=f"{field}: path must be inside the workspace"
+        )
+    return str(resolved)
+
+
 @router.post("/image-fetch")
-async def fetch_images(body: ImageFetchRequest, queue: TaskQueue = Depends(get_task_queue)):
+async def fetch_images(
+    body: ImageFetchRequest,
+    queue: TaskQueue = Depends(get_task_queue),
+    user: AuthUser = Depends(require_user),
+):
     job_id = await queue.enqueue(
         IMAGE_FETCH,
         {
@@ -27,33 +57,56 @@ async def fetch_images(body: ImageFetchRequest, queue: TaskQueue = Depends(get_t
             "context": body.context,
             "regenerate": body.regenerate,
         },
+        user_id=user.user_id,
     )
     return {"job_id": str(job_id)}
 
 
 @router.post("/media/generate")
-async def generate_media(body: MediaGenerateRequest, queue: TaskQueue = Depends(get_task_queue)):
-    """Enqueue PPT/PDF generation from a local video (subtitles + keyframes)."""
+async def generate_media(
+    body: MediaGenerateRequest,
+    queue: TaskQueue = Depends(get_task_queue),
+    user: AuthUser = Depends(require_user),
+):
+    """Enqueue PPT/PDF generation from a local video (subtitles + keyframes).
+
+    Both paths are confined to the workspace so the worker only ever reads files the
+    operator staged there — never arbitrary server paths.
+    """
+    video_path = _confined_path(body.video_path, field="video_path")
+    subtitle_path = (
+        _confined_path(body.subtitle_path, field="subtitle_path")
+        if body.subtitle_path
+        else None
+    )
     job_id = await queue.enqueue(
         GENERATE_MEDIA,
         {
-            "video_path": body.video_path,
-            "subtitle_path": body.subtitle_path,
+            "video_path": video_path,
+            "subtitle_path": subtitle_path,
             "format": body.format,
             "title": body.title,
         },
+        user_id=user.user_id,
     )
     return {"job_id": str(job_id)}
 
 
 @router.post("/tts")
-async def synthesize_audio(body: TTSRequest, queue: TaskQueue = Depends(get_task_queue)):
-    job_id = await queue.enqueue(TTS, {"text": body.text})
+async def synthesize_audio(
+    body: TTSRequest,
+    queue: TaskQueue = Depends(get_task_queue),
+    user: AuthUser = Depends(require_user),
+):
+    job_id = await queue.enqueue(TTS, {"text": body.text}, user_id=user.user_id)
     return {"job_id": str(job_id)}
 
 
 @router.post("/tts/stream")
-async def synthesize_audio_stream(body: TTSRequest):
+async def synthesize_audio_stream(
+    body: TTSRequest,
+    user: AuthUser = Depends(require_user),
+):
     """Stream TTS audio sentence-by-sentence as SSE.
 
     Each ``segment`` event carries the ``/audio/<file>`` URL of one cached WAV (synthesized
@@ -77,12 +130,32 @@ async def synthesize_audio_stream(body: TTSRequest):
 
 
 @router.post("/explain")
-async def explain(body: ExplainRequest, queue: TaskQueue = Depends(get_task_queue)):
-    job_id = await queue.enqueue(EXPLAIN, {"term": body.term, "context": body.context})
+async def explain(
+    body: ExplainRequest,
+    queue: TaskQueue = Depends(get_task_queue),
+    user: AuthUser = Depends(require_user),
+):
+    job_id = await queue.enqueue(
+        EXPLAIN, {"term": body.term, "context": body.context}, user_id=user.user_id
+    )
     return {"job_id": str(job_id)}
 
 
 @router.get("/jobs/{job_id}")
-async def get_job(job_id: UUID, queue: TaskQueue = Depends(get_task_queue)):
-    """Return the state of an async enrichment job (single source of truth: the jobs table)."""
-    return await queue.get(job_id)
+async def get_job(
+    job_id: UUID,
+    queue: TaskQueue = Depends(get_task_queue),
+    user: AuthUser = Depends(require_user),
+):
+    """Return the state of an async enrichment job (single source of truth: the jobs table).
+
+    Jobs are owner-scoped: a non-admin may only read their own jobs (404 otherwise, so a
+    foreign UUID is indistinguishable from a missing one).
+    """
+    state = await queue.get(job_id)
+    if state["status"] != "unknown":
+        owner = state.get("user_id")
+        is_admin = user.role.role_id == "admin"
+        if not is_admin and owner is not None and owner != str(user.user_id):
+            raise HTTPException(status_code=404, detail="job not found")
+    return state

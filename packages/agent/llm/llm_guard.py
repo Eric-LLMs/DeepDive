@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from agent.llm.llm_errors import LLMTemporaryError, classify
+from agent.llm.llm_errors import LLMFatalError, LLMTemporaryError, classify
 
 
 class ReliableLLM:
@@ -35,15 +35,26 @@ class ReliableLLM:
         self.max_retries = max_retries
         self.backoff = backoff
 
-    def _retry(self, fn: Callable[[], Awaitable]):
-        """Run ``fn`` with timeout+retry semantics; returns the successful result."""
-        retryer = AsyncRetrying(
-            stop=stop_after_attempt(self.max_retries + 1),
-            wait=wait_exponential(multiplier=self.backoff, max=15.0),
-            retry=retry_if_exception_type(LLMTemporaryError),
-            reraise=True,
-        )
-        return retryer(fn)
+    async def _retry(self, fn: Callable[[], Awaitable]):
+        """Run ``fn`` with timeout+retry semantics; returns the successful result.
+
+        When every attempt fails on a temporary error, the exhausted ``LLMTemporaryError``
+        is re-raised as ``LLMFatalError`` so the loop's error path treats it as terminal
+        instead of letting a retryable-looking error escape the catch for fatal ones.
+        ``CancelledError`` is a ``BaseException`` and flows straight through: a disconnect
+        must never be consumed as a retryable failure.
+        """
+        try:
+            return await AsyncRetrying(
+                stop=stop_after_attempt(self.max_retries + 1),
+                wait=wait_exponential(multiplier=self.backoff, max=15.0),
+                retry=retry_if_exception_type(LLMTemporaryError),
+                reraise=True,
+            )(fn)
+        except LLMTemporaryError as exc:
+            raise LLMFatalError(
+                f"LLM call failed after {self.max_retries + 1} attempts: {exc}"
+            ) from exc
 
     async def chat(
         self,
@@ -74,9 +85,11 @@ class ReliableLLM:
         base_url: str | None = None,
         api_key: str | None = None,
     ) -> AsyncIterator[dict]:
-        self._gen: AsyncIterator[dict] | None = None
-
-        async def open_stream() -> dict:
+        # The stream generator is returned through the retry wrapper and kept only in the
+        # local frame of this coroutine — never stored on the instance. Two overlapping
+        # turns each own their generator, so concurrent streams cannot overwrite each
+        # other's deltas (the old ``self._gen`` instance slot was the cross-talk bug).
+        async def open_stream() -> tuple[dict, AsyncIterator[dict]]:
             gen = self._inner.chat_stream(
                 messages, tools=tools, model=model, base_url=base_url, api_key=api_key
             )
@@ -88,10 +101,9 @@ class ReliableLLM:
                     await gen.aclose()
                     raise mapped from exc
                 raise
-            self._gen = gen
-            return first
+            return first, gen
 
-        first = await self._retry(open_stream)
+        first, gen = await self._retry(open_stream)
         yield first
-        async for evt in self._gen:
+        async for evt in gen:
             yield evt

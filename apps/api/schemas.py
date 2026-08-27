@@ -108,8 +108,14 @@ class ExplainRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list[dict] = []
-    user_id: UUID | None = None      # optional: per-user memory isolation
+    user_id: UUID | None = None      # deprecated: ignored for anonymous requests — the
+    guest_token: str | None = None   #   server resolves a guest's identity from the signed
+                                     #   gt_ token (api.auth.sign_guest_token), never from a
+                                     #   client-supplied user_id.
     session_id: UUID | None = None   # optional: resume an existing session
+    attach: dict | None = None       # optional: { kind: "asset", asset_id, name } — a cloud
+                                     #   file the user wants the agent to troubleshoot; its
+                                     #   name + asset_id are prefixed to the message context.
 
 
 class ApprovalResolveRequest(BaseModel):

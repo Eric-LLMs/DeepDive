@@ -91,6 +91,53 @@ async def verify_admin(username: str, password: str) -> bool:
     )
 
 
+# ── Stateless guest identities ──
+# Anonymous guests get a signed ``gt_`` token so their user_id is server-verifiable. Without
+# this, an unauthenticated client could claim any ``body.user_id`` (forging a victim's id to
+# bind a session under their account / burn their guest quota). The token is signed with the
+# same lazily-minted console secret; the ``guest|`` payload prefix keeps it distinct from
+# ``cc_`` console sessions in the shared signing space.
+GUEST_PREFIX = "gt_"
+
+
+async def sign_guest_token(user_id: UUID, expires_at: datetime) -> str:
+    """Mint a signed guest identity token: ``gt_<payload_b64>.<sig_hex>``.
+
+    The payload is ``guest|user_id|expiry_ts``; the signature is HMAC-SHA256 of the payload
+    with the console secret. The token is unforgeable and self-contained (no DB lookup).
+    """
+    secret = await _console_secret()
+    payload = f"guest|{user_id}|{int(expires_at.timestamp())}"
+    payload_b64 = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    sig = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{GUEST_PREFIX}{payload_b64}.{sig}"
+
+
+async def verify_guest_token(token: str) -> UUID | None:
+    """Return the guest ``user_id`` if ``token`` is a valid, unexpired guest token."""
+    if not token.startswith(GUEST_PREFIX):
+        return None
+    body = token[len(GUEST_PREFIX):]
+    if "." not in body:
+        return None
+    payload_b64, sig = body.split(".", 1)
+    try:
+        payload = base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4)).decode()
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    secret = await _console_secret()
+    expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None
+    try:
+        prefix, user_id, ts = payload.rsplit("|", 2)
+        if prefix != "guest" or int(ts) < time.time():
+            return None
+        return UUID(user_id)
+    except (ValueError, TypeError):
+        return None
+
+
 # ── Stateless admin console sessions ──
 _CONSOLE_PREFIX = "cc_"
 

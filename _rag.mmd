@@ -1,0 +1,76 @@
+flowchart TB
+    %% ── ① sources → per-entry processing ───────────────────────────
+    subgraph ENTRY["Three import entries"]
+        DRIVE["Cloud Drive<br/>doc · pdf · txt · docx"]
+        LEARN["Learning Platform<br/>sentences · articles"]
+        CHAT["Chat<br/>reply pairs · whole sessions"]
+        PDFT["PDF tools<br/>page text + tables → image → vision LLM text"]
+        LEARNP["learning_import job<br/>sentences / articles → chunks"]
+        CHATP["chat import<br/>LLM merges one question's turns · splits distinct Qs"]
+        DRIVE --> PDFT
+        LEARN --> LEARNP
+        CHAT --> CHATP
+    end
+
+    %% ── ② query repository ────────────────────────────────────────
+    subgraph REPO["Query Repository"]
+        CHUNK["chunks table<br/>source_type file · learning · chat<br/>source_id · asset_id nullable · owner = importer"]
+        EMBED["build_chunks + BGE-M3 embed → pgvector<br/>leaf-only · chunked per runtime config"]
+        PDFT --> CHUNK
+        LEARNP --> CHUNK
+        CHATP --> CHUNK
+        CHUNK --> EMBED
+    end
+
+    %% ── ③ agent answer flow — rag_search + web_search + LLM ───────
+    subgraph AGENT["Agent answer flow — LLM composes the reply"]
+        USER["user query"]
+        LLM["Agent (LLM loop)<br/>decides which tools to call"]
+        RAGTOOL["rag_search tool<br/>binds filters.user_id · optional domain"]
+        WEBTOOL["web_search tool<br/>duckduckgo / tavily / bing / google<br/>only when local material is insufficient"]
+        WEBHITS["top_k web results<br/>title · url · snippet"]
+        REPLY["reply grounded in chunks + web results"]
+        USER --> LLM
+        LLM --> RAGTOOL
+        LLM --> WEBTOOL
+        WEBTOOL --> WEBHITS
+        WEBHITS --> LLM
+        LLM --> REPLY
+    end
+
+    %% ── ④ retrieval node pipeline (inside rag_search) ─────────────
+    subgraph RETR["Retrieval — config-driven node pipeline (inside rag_search)"]
+        Q["query · top_k<br/>filters.user_id · tenant binding<br/>owner / workspace / ACL · guest → public links"]
+        REWRITE["QueryRewriter<br/>multi-query expansion + HyDE answer"]
+        VEC["VectorRecaller<br/>pgvector cosine · BGE-M3 via TEI<br/>source-aware · LEFT JOIN assets"]
+        KW["KeywordRecaller<br/>tsvector FTS · CJK via jieba<br/>source-aware · READY only for files"]
+        RRF["rrf_fusion · k=60<br/>fuses cross-scale scores"]
+        CE["CrossEncoderReranker<br/>BGE-reranker · optional"]
+        PE["ParentExpandNode<br/>leaf → parent · optional"]
+        CRG["CrgCheckNode<br/>LLM relevance gate · optional"]
+        OUT["top_k SearchHits → back to the agent"]
+        Q --> REWRITE
+        REWRITE --> VEC
+        REWRITE --> KW
+        VEC --> RRF
+        KW --> RRF
+        RRF --> CE
+        RRF -. no reranker .-> OUT
+        CE --> OUT
+        RRF -. optional extension .-> PE
+        PE --> CRG
+        CRG --> OUT
+        RAGTOOL --> Q
+        OUT --> LLM
+    end
+
+    EMBED -. source-aware recall<br/>leaf-only · LEFT JOIN assets .-> VEC
+    EMBED -. source-aware recall .-> KW
+
+    %% ── ⑤ RAG pipeline config ─────────────────────────────────────
+    subgraph CFG["RAG Pipeline Config · admin console RAG module"]
+        NODES["Nodes<br/>add / remove / reorder / toggle<br/>per-node params · live, no restart"]
+        CHUNKCFG["Chunking<br/>size / overlap · contextualization"]
+    end
+    NODES -. drives topology .-> RETR
+    CHUNKCFG -. drives chunking .-> EMBED

@@ -211,6 +211,9 @@ class DriveService:
             raise DriveError("invalid sha256", 400)
         if size < 0:
             raise DriveError("invalid size", 400)
+        if settings.drive_max_file_size > 0 and size > settings.drive_max_file_size:
+            max_mb = settings.drive_max_file_size // (1024 * 1024)
+            raise DriveError(f"file too large: {size} bytes exceeds the {max_mb} MB limit", 413)
         if workspace_id is not None:
             await self.ensure_workspace_member(user_id, workspace_id)
 

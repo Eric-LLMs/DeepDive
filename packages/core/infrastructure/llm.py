@@ -61,6 +61,7 @@ class OpenAILLM:
         self.client = AsyncOpenAI(
             base_url=base_url or settings.llm_base_url,
             api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+            timeout=settings.llm_timeout_seconds,
         )
         self.model = model or settings.llm_model
 
@@ -69,6 +70,7 @@ class OpenAILLM:
         self.client = AsyncOpenAI(
             base_url=base_url or settings.llm_base_url,
             api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+            timeout=settings.llm_timeout_seconds,
         )
         if model:
             self.model = model
@@ -93,6 +95,7 @@ class OpenAILLM:
             client = AsyncOpenAI(
                 base_url=base_url or settings.llm_base_url,
                 api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+                timeout=settings.llm_timeout_seconds,
             )
         resp = await client.chat.completions.create(
             model=model or self.model,
@@ -114,6 +117,7 @@ class OpenAILLM:
             client = AsyncOpenAI(
                 base_url=base_url or settings.llm_base_url,
                 api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+                timeout=settings.llm_timeout_seconds,
             )
         stream = await client.chat.completions.create(
             model=model or self.model,
@@ -151,6 +155,7 @@ class OpenAILLM:
             client = AsyncOpenAI(
                 base_url=base_url or settings.llm_base_url,
                 api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+                timeout=settings.llm_timeout_seconds,
             )
         kwargs = {
             "model": model or self.model,
@@ -274,6 +279,7 @@ class OpenAILLM:
             client = AsyncOpenAI(
                 base_url=base_url or settings.llm_base_url,
                 api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+                timeout=settings.llm_timeout_seconds,
             )
         kwargs = {"model": model or self.model, "messages": _wire_messages(messages), "temperature": 0.3}
         if tools:

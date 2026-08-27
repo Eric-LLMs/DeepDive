@@ -313,7 +313,7 @@ flowchart TB
 
 ### 🖥️ Desktop Workbench (Local Client)
 - **Workspace file tree**: open any local folder as your workspace (the last one is restored on the next launch); add files from anywhere, create folders and text files, delete files & folders with a right-click (permanent, workspace-bounded), and fuzzy-search the tree with live suggestions that jump straight to a match.
-- **My Drive in the app**: the sidebar's **☁️ Cloud** source browses your cloud **My Drive** — open `.md`/`.txt` notes in the built-in Markdown editor (✏ Edit / 👁 Preview / 💾 Save, synced straight back to the server), and stream PDFs, images, video, and audio into the in-window viewer via a temp-cache download. Anything you save shows up in the web console on refresh.
+- **Cloud Drive in the app**: the sidebar's **☁️ Cloud** source is a full cloud-file manager aligned with the web console — a tree (**My Drive**, every **workspace**, and **🗑 Trash**) plus a main-area **list / grid** toggle with a five-column table (`Name | Size | RAG Status | Query Repo | Updated`), per-folder **search**, **✏ Edit** mode with a **batch bar** (Download / Open / Share / Rename / Move / Trash; Restore / Delete permanently / Empty Trash in the Trash), role-gated **⚙ Manage** (workspace members + activity logs), New folder / New text / Upload, and a **Query Repo** status column (`✓ In Knowledge` / Importing / Processing with ETA / **＋ Import to Knowledge**). `.md`/`.txt`/code rows open in the built-in Markdown editor (✏ Edit / 👁 Preview / 💾 Save, synced straight back to the server); other files stream into the in-window viewer via a temp-cache download. Anything you save shows up in the web console on refresh.
 - **Summarize**: condense a document/video into a summary or key-point outline.
 - **Generate slides & mind maps**: turn the current material into slide decks and mind-map overviews.
 - **Edit the material**: modify the loaded document in place.
@@ -323,7 +323,7 @@ flowchart TB
 - **Sessions search**: search your chat history by content — matching snippets are highlighted in the results.
 - **Multi-format viewer**: video (with subtitles), audio, images, PDF (with annotations), and text/code. Word/Excel/PowerPoint (`.docx`/`.xlsx`/`.xls`/`.pptx`) preview **in-window** with pure-JS renderers — **mammoth** (Word), **SheetJS** (Excel), **JSZip** slide deck (PowerPoint) — no external apps required; older binary formats (`.doc`/`.ppt`) fall back to your OS default app. One-click video **screenshots** and **Generate PPT / Generate Book**. A toolbar **✕** (or **Esc**) dismisses the current document back to the empty state.
 - **Subtitles**: a sibling `.srt`/`.vtt`/`.lrc` is auto-detected, or pick one manually; enable/disable and style it (size, color, background, position), and your settings are remembered.
-- **Streaming chat**: answers stream in with a collapsible **💭 thinking** panel; dock the chat to the bottom or side, or float it as a window. Messages render **Markdown + math** (`$...$` / `$$...$$` formulas via KaTeX), and every bubble has **Copy / Read / Delete / Edit** actions — **Edit** (on a user question) re-asks it, dropping that turn and everything after before streaming a fresh answer; sessions can be **renamed** (click the title) or **deleted** from the sidebar.
+- **Streaming chat**: answers stream in with a collapsible **💭 thinking** panel; dock the chat to the bottom or side, or float it as a window. Messages render **Markdown + math** (`$...$` / `$$...$$` formulas via KaTeX), and every bubble has **Copy / Read / Delete / Edit / Import to Knowledge** actions — **Read** speaks the message aloud via streaming Kokoro TTS (with a stop button); **Edit** (on a user question) re-asks it, dropping that turn and everything after before streaming a fresh answer; **Import to Knowledge** writes the Q&A pair into the query repository and flips to **✓ Imported** once covered. Sessions can be **renamed** (click the title), **pinned** / imported / **deleted** from a header **⋯** menu. The input box is Gemini-style — a **＋ attach** button (pick a file, attach the open cloud asset, or capture a window screenshot), the text field, and inline **🎤 / 🔊** toggles — attachments ride on the next send.
 - **Native menus & settings**: everything you'd expect — open/switch workspaces, zoom & font size, fullscreen, Help & Feedback, About. ⚙️ Settings covers theme, display, updates, help, and about.
 
 ### 💬 AI Chat Assistant
@@ -421,8 +421,8 @@ flowchart TB
 - **Email & SMTP**: verification / reset mail is sent over SMTP configured in the admin **Tools config** page. When SMTP is not configured, the one-time link is returned to the client instead and shown inline (dev mode), so registration still works locally.
 - **User accounts**: users (and the web/desktop console) log in to receive an opaque token. Roles (`regular` / `pro` / `vip` / `admin` / `anonymous`) carry per-role quota (daily/monthly requests, tokens, RPM, cost) and an optional default model.
 - **Server-managed config**: LLM provider keys, the model catalog, and the admin credential live in PostgreSQL (`app_settings`) — not `.env` or repo files — and are edited from the admin console.
-- **Pay-as-you-go billing**: per-model pricing (prompt/completion per 1k tokens), a cash wallet per user, and an append-only ledger with a `balance_after` snapshot. Chat usage is priced and debited atomically (always the catalog model price). Every usage log records the **serving channel** too, so the admin can aggregate cost per provider key.
-- **Guest access**: anonymous users can chat without an account, capped per day (`guest_daily_limit`, default 10); exceeding the cap prompts them to sign in.
+- **Pay-as-you-go billing**: per-model pricing (prompt/completion per 1k tokens), a cash wallet per user, and an append-only ledger with a `balance_after` snapshot. Usage is **free first** (within the role's daily/monthly/token quota); once the free quota is exhausted, overflow is charged to the wallet — a drained balance returns **402**. Every usage log records the **serving channel** too, so the admin can aggregate cost per provider key.
+- **Guest access**: anonymous users can chat without an account, identified by a **signed server token** (a client-supplied id is never trusted) and capped per day (`guest_daily_limit`, default 10); exceeding the cap prompts them to sign in.
 
 ### 📥 Smart Data Ingestion
 - **Domain Management**: Organize your learning materials into isolated domains.
@@ -547,7 +547,7 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173. The Vite dev server proxies `/api`, `/audio`, and `/images` to the backend.
+Open http://localhost:5273. The Vite dev server proxies `/api`, `/audio`, and `/images` to the backend.
 
 ### 12. Run the desktop workbench (Electron, optional)
 
@@ -585,7 +585,7 @@ First run on a fresh machine also installs Docker and the Python/Node deps autom
 | Environment | Script | What it does |
 |---|---|---|
 | **Windows desktop** (local PC client) | `bash scripts/start_desktop.sh` | Auto-installs Docker Desktop if missing → starts **all** dependency services (postgres, redis, embedding, tts, llm-gateway, worker) → ensures the Python venv → starts the backend (boot seeds `admin`/`admin`) → opens the Electron workbench. |
-| **Linux server** (browser access) | `bash scripts/start_server.sh` | Auto-installs Docker Engine if missing → starts **all** dependency services (postgres, redis, embedding, tts, llm-gateway, worker) → ensures the Python venv → starts the backend (boot seeds `admin`/`admin`) → builds and serves the React web UI at `http://<server-ip>:5173`. |
+| **Linux server** (browser access) | `bash scripts/start_server.sh` | Auto-installs Docker Engine if missing → starts **all** dependency services (postgres, redis, embedding, tts, llm-gateway, worker) → ensures the Python venv → starts the backend (boot seeds `admin`/`admin`) → builds and serves the React web UI at `http://<server-ip>:5273`. |
 
 The default `admin` / `admin` account is seeded on first boot and ready to sign in from the start.
 
@@ -639,13 +639,13 @@ drive** holds your files, and the **admin console** is for operators.
 A standalone local workbench — the file tree, multi-format viewer, video screenshots, and subtitles work **without the backend**:
 
 - **Open Workspace** to browse any local folder; the viewer plays video (with subtitles), audio, images, PDF (with annotations), and text/code, and previews Word/Excel/PowerPoint in-window with pure-JS renderers (`.docx`/`.xlsx`/`.xls`/`.csv`/`.tsv`/`.pptx`, plus `.doc` as extracted text and images) — only `.ppt` opens in the OS app.
-- Switch the sidebar source from **💻 Local** to **☁️ Cloud** to browse your My Drive — open and edit text notes in the built-in Markdown editor (✏ / 👁 Preview / 💾 Save, `Ctrl+S`), or watch PDFs, video, images, and audio stream through the in-window viewer. Changes are saved straight to the server and show up in the web console.
+- Switch the sidebar source from **💻 Local** to **☁️ Cloud** to browse your cloud drive — **My Drive**, shared **workspaces**, and **🗑 Trash**, with **list / grid** views, per-folder **search**, **✏ Edit** mode + batch actions (Download / Share / Rename / Move / Trash), workspace **⚙ Manage**, and a **Query Repo** column (**＋ Import to Knowledge** / ✓ In Knowledge). Open and edit text notes in the built-in Markdown editor (✏ / 👁 Preview / 💾 Save, `Ctrl+S`), or watch PDFs, video, images, and audio stream through the in-window viewer. Changes are saved straight to the server and show up in the web console.
 - Take one-click video **screenshots** and **Generate PPT / Generate Book** from the current material.
-- **Chat** streams answers with a collapsible **💭 thinking** panel (dock to bottom/side or float as a window); session history and search live in the sidebar. Bubbles render **Markdown + KaTeX math**; hover a bubble for **Copy / Read / Delete / Edit** — editing a question re-asks it (the turn and everything after are removed, then a fresh answer streams in). A reply's **📥 Import Repo** action binds it to its question as one query-repository chunk, and the header **📥** organizes the whole session (the LLM groups each distinct question into its own chunk). An imported pair or session turns its **📥** into a persistent **✓ Imported** (disabled) state that survives session switches and app restarts. Click a session's title to **rename** it, or **delete** it from the sidebar.
+- **Chat** streams answers with a collapsible **💭 thinking** panel (dock to bottom/side or float as a window); session history and search live in the sidebar. Bubbles render **Markdown + KaTeX math**; hover a bubble for **Copy / Read / Delete / Edit / Import to Knowledge** — editing a question re-asks it (the turn and everything after are removed, then a fresh answer streams in); **Read** speaks the message aloud via streaming TTS. A reply's **Import to Knowledge** binds it to its question as one query-repository chunk, and the header **⋯** menu organizes the whole session (the LLM groups each distinct question into its own chunk). An imported pair or session turns its import button into a persistent **✓ Imported** (disabled) state that survives session switches and app restarts. Click a session's title to **rename** it, or **delete** it from the sidebar.
 - **Sign in** from the account menu (register new accounts / reset passwords; guests chat anonymously up to the daily limit); ⚙️ **Settings** covers theme, font size, window & display, update checks, help, and about.
 - The account menu deep-links straight to the **web console**, the **Cloud Drive**, and — for admins — the **admin console**, signed in automatically via SSO.
 
-Chat, session history & search, media generation, sign-in, and the **☁️ Cloud** My Drive panel all need the backend on `localhost:8300`; the desktop main process forwards `/api`, `/audio`, and `/images` to it.
+Chat, session history & search, media generation, sign-in, and the **☁️ Cloud** drive panel all need the backend on `localhost:8300`; the desktop main process forwards `/api`, `/audio`, and `/images` to it.
 
 ### 🖥️ Web console (Learning Platform)
 

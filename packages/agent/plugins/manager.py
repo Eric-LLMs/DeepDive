@@ -106,7 +106,12 @@ class PluginManager:
 
     # ── validation (Cordis-style FAILED stage) ──
     def validate(self) -> None:
-        """Reject a broken plugin set before mounting, instead of silently stalling PENDING."""
+        """Reject a broken plugin set before mounting, instead of silently stalling PENDING.
+
+        Checks unknown inject names and dependency cycles, then asserts every remaining fiber
+        can actually activate — so a plugin depending on a FAILED provider (mount error) also
+        fails loudly here instead of lingering PENDING with no signal.
+        """
         known = self.ctx.provided_names()
         for fiber in self.ctx.fibers():
             for name in fiber.inject:
@@ -115,6 +120,7 @@ class PluginManager:
                         f"plugin {fiber.name!r} injects unknown capability {name!r}"
                     )
         self._check_cycles()
+        self.ctx.assert_settled()
 
     def _check_cycles(self) -> None:
         """Detect dependency cycles between plugins (DFS three-colour)."""

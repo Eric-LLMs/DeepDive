@@ -7,7 +7,12 @@ fallback), and the .docx / .pdf text-extraction dispatch. Uses scripted fakes �
 import asyncio
 from types import SimpleNamespace
 
-from apps.worker.tasks import _default_chat_pairs, _segment_chat, _strip_code_fence
+from apps.worker.tasks import (
+    _default_chat_pairs,
+    _pending_chat_entries,
+    _segment_chat,
+    _strip_code_fence,
+)
 from core.infrastructure.ingest import (
     Chunk,
     extract_document_text,
@@ -140,7 +145,11 @@ def test_default_chat_pairs_merge_follow_ups_into_one_answer():
     ]
     pairs = _default_chat_pairs(messages)
     assert pairs == [
-        {"question": "What is RRF?", "answer": "Reciprocal Rank Fusion.\nIt fuses ranks."}
+        {
+            "question": "What is RRF?",
+            "answer": "Reciprocal Rank Fusion.\nIt fuses ranks.",
+            "indices": [0],
+        }
     ]
 
 
@@ -153,8 +162,8 @@ def test_default_chat_pairs_splits_distinct_questions():
     ]
     pairs = _default_chat_pairs(messages)
     assert pairs == [
-        {"question": "Q1", "answer": "A1"},
-        {"question": "Q2", "answer": "A2"},
+        {"question": "Q1", "answer": "A1", "indices": [0]},
+        {"question": "Q2", "answer": "A2", "indices": [2]},
     ]
 
 
@@ -165,13 +174,38 @@ def test_strip_code_fence():
 def test_segment_chat_parses_llm_json():
     class _GoodLLM:
         async def complete(self, prompt, system):
+            # No indices field (older model) → fallback assigns user lines in order.
             return '[{"question": "Q1", "answer": "A1"}, {"question": "Q2", "answer": "A2"}]'
 
     messages = [_msg("user", "Q1"), _msg("assistant", "A1"), _msg("user", "Q2"), _msg("assistant", "A2")]
     pairs = asyncio.run(_segment_chat(messages, _GoodLLM()))
     assert pairs == [
-        {"question": "Q1", "answer": "A1"},
-        {"question": "Q2", "answer": "A2"},
+        {"question": "Q1", "answer": "A1", "indices": [0]},
+        {"question": "Q2", "answer": "A2", "indices": [2]},
+    ]
+
+
+def test_segment_chat_keeps_llm_merged_indices():
+    class _MergingLLM:
+        async def complete(self, prompt, system):
+            # The LLM merged two follow-up user turns (indexes 2, 4) into one entry.
+            return (
+                '[{"question": "What is RRF?", "answer": "A1", "indices": [0]},'
+                '{"question": "Explain more", "answer": "A2", "indices": [2, 4]}]'
+            )
+
+    messages = [
+        _msg("user", "What is RRF?"),
+        _msg("assistant", "A1"),
+        _msg("user", "Wait, clarify"),
+        _msg("assistant", "A2"),
+        _msg("user", "And an example?"),
+        _msg("assistant", "A3"),
+    ]
+    pairs = asyncio.run(_segment_chat(messages, _MergingLLM()))
+    assert pairs == [
+        {"question": "What is RRF?", "answer": "A1", "indices": [0]},
+        {"question": "Explain more", "answer": "A2", "indices": [2, 4]},
     ]
 
 
@@ -182,7 +216,22 @@ def test_segment_chat_degrades_to_default_grouping_on_llm_failure():
 
     messages = [_msg("user", "Q"), _msg("assistant", "A")]
     pairs = asyncio.run(_segment_chat(messages, _BoomLLM()))
-    assert pairs == [{"question": "Q", "answer": "A"}]
+    assert pairs == [{"question": "Q", "answer": "A", "indices": [0]}]
+
+
+def test_pending_chat_entries_skips_fully_covered_only():
+    # Three entries; the first two are fully in the repo already → only the appended
+    # third entry (new user message "m4") should still be written.
+    pairs = [{"question": "Q1", "answer": "A1"}, {"question": "Q2", "answer": "A2"}, {"question": "Q3", "answer": "A3"}]
+    covered_by_pair = [["m1"], ["m2", "m3"], ["m4"]]
+    pending = _pending_chat_entries(pairs, covered_by_pair, existing={"m1", "m2", "m3"})
+    assert [(i, p["question"], cov) for i, p, cov in pending] == [(2, "Q3", ["m4"])]
+
+
+def test_pending_chat_entries_requires_an_anchor():
+    # An entry with no covered user message can never be imported incrementally.
+    pairs = [{"question": "Q", "answer": "A"}]
+    assert _pending_chat_entries(pairs, [[]], existing=set()) == []
 
 
 # ── text-extraction dispatch: .docx and .pdf ──

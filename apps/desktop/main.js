@@ -4,7 +4,7 @@
 // protocol, proxies /api to the FastAPI backend, and gives the renderer access to
 // local files through a `local://` protocol + a small IPC surface (folder pick,
 // file tree, open-with-OS-default, text read, screenshot save).
-const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, Menu } = require("electron");
+const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, Menu, desktopCapturer } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -213,6 +213,35 @@ function readTree(dir, depth = 0) {
   return result;
 }
 
+// List the direct children of a single folder (no recursion / depth limit). The
+// folder-browse view re-reads on every navigation so its contents always reflect
+// disk, unlike the sidebar tree which is a bounded-depth snapshot.
+function readDir(dir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const result = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith(".")) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (IGNORED_DIRS.has(entry.name)) continue;
+      result.push({ name: entry.name, path: full, type: "dir", size: 0 });
+    } else if (entry.isFile()) {
+      let size = 0;
+      try { size = fs.statSync(full).size; } catch { /* stat race */ }
+      result.push({ name: entry.name, path: full, type: "file", size });
+    }
+  }
+  result.sort((a, b) =>
+    a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1
+  );
+  return result;
+}
+
 function registerIpcHandlers() {
   ipcMain.handle("pick-folder", async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ["openDirectory"] });
@@ -403,6 +432,9 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle("read-tree", (_event, dir) => readTree(dir));
+
+  // List one folder's direct children (folder-browse view; always reflects disk).
+  ipcMain.handle("read-dir", (_event, dir) => readDir(dir));
 
   ipcMain.handle("open-external", (_event, filePath) => shell.openPath(filePath));
 
@@ -649,6 +681,27 @@ function registerIpcHandlers() {
     return filePath;
   });
 
+  // Capture this app's own window as a PNG data URL, so the renderer can one-click attach
+  // a screenshot of the current main-window content to the chat. Returns
+  // { ok, data } | { ok: false, error }.
+  ipcMain.handle("capture-window", async (event) => {
+    try {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const sources = await desktopCapturer.getSources({
+        types: ["window"],
+        thumbnailSize: { width: 1600, height: 1000 },
+      });
+      const id = win ? win.id.toString() : "";
+      const src = sources.find((s) => s.id === `window:${id}`) || sources[0];
+      if (!src || src.thumbnail.isEmpty()) {
+        return { ok: false, error: "capture returned no image" };
+      }
+      return { ok: true, data: src.thumbnail.toDataURL() };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
   // Pick an avatar image: open the OS file picker, read the bytes, and return a
   // base64 string + mime so the renderer can POST it as multipart to /auth/me/avatar.
   ipcMain.handle("pick-image", async () => {
@@ -756,8 +809,8 @@ function createWindow() {
   const saved = readPrefs().window || {};
   const remember = saved.rememberBounds !== false;
   const win = new BrowserWindow({
-    width: remember && saved.width ? saved.width : 1280,
-    height: remember && saved.height ? saved.height : 820,
+    width: remember && saved.width ? saved.width : 1440,
+    height: remember && saved.height ? saved.height : 860,
     x: remember && Number.isInteger(saved.x) ? saved.x : undefined,
     y: remember && Number.isInteger(saved.y) ? saved.y : undefined,
     icon: path.join(__dirname, "deepdive.ico"),

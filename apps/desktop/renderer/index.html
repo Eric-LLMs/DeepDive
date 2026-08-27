@@ -36,6 +36,7 @@
           <div class="clouddrive-toolbar">
             <span id="cd-path" class="cd-path">☁️ My Drive</span>
             <span class="spacer"></span>
+            <button id="cd-new-workspace" type="button" title="New workspace" aria-label="New workspace">＋ Workspace</button>
             <button id="cd-new-folder" type="button" title="New folder" aria-label="New folder">📁</button>
             <button id="cd-new-text" type="button" title="New text file" aria-label="New text file">📝</button>
           </div>
@@ -78,17 +79,21 @@
           <div id="chat-header">
             <span id="chat-title">Chat</span>
             <div class="chat-header-actions">
-              <button id="chat-import-session" type="button" title="Import to Knowledge — organize this session's Q&A into the query repository">📥 <span class="lbl">Import to Knowledge</span></button>
-              <button id="chat-mic" type="button" title="Voice input (talk to the assistant)">🎤</button>
-              <button id="chat-speak" type="button" title="Speak replies aloud">🔊</button>
-              <button id="chat-float" type="button" title="Float the chat window">⤢</button>
+              <button id="chat-hide" type="button" title="Hide chat (restore from the DeepDive logo)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+              <button id="chat-float" type="button" title="Float the chat window"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
               <button id="chat-dock" type="button" title="Move chat to the right column">Dock right</button>
             </div>
           </div>
           <div id="chat-log"></div>
           <form id="chat-form">
-            <input id="chat-input" type="text" placeholder="Ask about the current material, or just chat…" autocomplete="off" />
-            <button id="chat-send" type="submit">Send</button>
+            <div id="chat-attach-bar" class="chat-attach-bar hidden"></div>
+            <div class="chat-input-box">
+              <button id="chat-attach-pick" type="button" class="chat-input-btn" title="Attach a file">＋</button>
+              <input id="chat-input" type="text" placeholder="Ask about the current material, or just chat…" autocomplete="off" />
+              <button id="chat-mic" type="button" class="chat-input-btn" title="Voice input (talk to the assistant)"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
+              <button id="chat-speak" type="button" class="chat-input-btn" title="Speak replies aloud"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3.5" y="10" width="3" height="6" rx="1.5"/><rect x="9" y="4" width="3" height="18" rx="1.5"/><rect x="14.5" y="7" width="3" height="12" rx="1.5"/><rect x="20" y="9.5" width="3" height="7" rx="1.5"/></svg></button>
+              <button id="chat-send" type="submit">Send</button>
+            </div>
           </form>
         </section>
 
@@ -105,6 +110,9 @@
           <div id="note-preview-pane" class="md-preview hidden"></div>
         </section>
       </main>
+
+      <!-- Floating mini-icon shown while the chat is hidden; clicking it restores the chat. -->
+      <button id="chat-mini" type="button" class="chat-mini hidden" title="Restore chat" aria-label="Restore chat"></button>
     </div>
 
     <!-- User action menu (upward from the bottom bar) -->

@@ -45,6 +45,10 @@ class CheckpointStore:
         self.shadow = shadow_dir.resolve()
         self._git_dir = self.shadow / ".git"
         self._ready = False
+        # Serialize git operations: two concurrent snapshots/reverts on the same shadow
+        # repo collide on git's index.lock and one fails with a spurious CheckpointError.
+        # Every public op (the off-thread git work) runs under this one asyncio lock.
+        self._lock = asyncio.Lock()
 
     # ── plumbing ──
     def _git(self, *args: str) -> str:
@@ -93,30 +97,39 @@ class CheckpointStore:
             with exclude.open("a", encoding="utf-8") as fh:
                 fh.write("\n".join(missing) + "\n")
 
-    # ── public API ──
-    def snapshot(self, reason: str = "checkpoint") -> str:
+    # ── public API (async; serialized) ──
+    async def snapshot(self, reason: str = "checkpoint") -> str:
         """Commit the workspace's current state; returns the commit id (HEAD when unchanged)."""
+        async with self._lock:
+            return await asyncio.to_thread(self._snapshot_sync, reason)
+
+    def _snapshot_sync(self, reason: str) -> str:
         self.ensure_ready()
         self._git("add", "-A")
         if self._git("diff", "--cached", "--name-only"):
             self._git("commit", "--quiet", "-m", reason, "--no-verify")
         return self._git("rev-parse", "HEAD")
 
-    def revert(self, checkpoint_id: str) -> str:
+    async def revert(self, checkpoint_id: str) -> str:
         """Restore tracked workspace files to ``checkpoint_id`` (reset --hard).
 
         Untracked files are left in place; only content that was committed into the shadow
         repo is rolled back. A full wipe of files the agent created mid-turn is out of scope.
         """
+        async with self._lock:
+            return await asyncio.to_thread(self._revert_sync, checkpoint_id)
+
+    def _revert_sync(self, checkpoint_id: str) -> str:
         self.ensure_ready()
         self._git("cat-file", "-e", f"{checkpoint_id}^{{commit}}")  # raises if unknown
         self._git("reset", "--hard", checkpoint_id)
         return self._git("rev-parse", "HEAD")
 
-    def current(self) -> str:
+    async def current(self) -> str:
         """The latest checkpoint id (shadow repo HEAD)."""
-        self.ensure_ready()
-        return self._git("rev-parse", "HEAD")
+        async with self._lock:
+            await asyncio.to_thread(self.ensure_ready)
+            return await asyncio.to_thread(self._git, "rev-parse", "HEAD")
 
 
 def revert_to_checkpoint_tool(store: CheckpointStore) -> ToolDefinition:
@@ -128,7 +141,7 @@ def revert_to_checkpoint_tool(store: CheckpointStore) -> ToolDefinition:
 
     async def execute(args: dict, exec) -> dict:
         try:
-            head = await asyncio.to_thread(store.revert, args["checkpoint_id"])
+            head = await store.revert(args["checkpoint_id"])
         except CheckpointError as exc:
             return {"ok": False, "error": str(exc)}
         return {

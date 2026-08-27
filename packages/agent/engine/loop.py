@@ -39,7 +39,7 @@ from agent.engine.loop_guard import ToolLoopTracker
 from agent.engine.runtime import ToolRuntime
 from agent.engine.sessions import SessionLog
 from agent.engine.telemetry import TraceContext, TurnSpan, estimate_cost_usd, log_error, log_event
-from agent.llm.llm_errors import LLMFatalError
+from agent.llm.llm_errors import LLMFatalError, LLMTemporaryError
 from agent.prompt.system_prompt import (
     CacheBoundaryAssembler,
     PromptAssembly,
@@ -221,7 +221,7 @@ class ReactLoopAgent:
                     finished, step_usage = await self._step(
                         turn, system, visible_tools, messages, step, model, base_url, api_key
                     )
-                except LLMFatalError as exc:
+                except (LLMFatalError, LLMTemporaryError) as exc:
                     error = str(exc)
                     log_error(kind="llm_fatal", message=error)
                     turn.span.record_error(kind="llm_fatal", message=error)
@@ -348,7 +348,7 @@ class ReactLoopAgent:
                             tool_calls = evt.get("data") or []
                         elif kind == "usage":
                             step_usage = evt.get("data")
-                except LLMFatalError as exc:
+                except (LLMFatalError, LLMTemporaryError) as exc:
                     error = str(exc)
                     log_error(kind="llm_fatal", message=error)
                     turn.span.record_error(kind="llm_fatal", message=error)

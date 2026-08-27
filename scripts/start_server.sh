@@ -9,7 +9,7 @@
 #   [4] All dependency services up      -> postgres/redis/embedding/tts/litellm/worker
 #   [5] Python venv + pip deps ensured  -> create .venv, pip install -e ".[dev]"
 #   [6] Backend started + admin verified-> uvicorn boot seeds admin/admin
-#   [7] React web UI built + served     -> vite preview at :5173 (proxies /api etc.)
+#   [7] React web UI built + served     -> vite preview at :5273 (proxies /api etc.)
 #
 # Designed for Linux servers — there is no Electron client here; the browser-facing
 # entry point is the web UI. Windows desktops use scripts/start_desktop.sh.
@@ -22,7 +22,7 @@ BACKEND_URL="http://localhost:8300"
 BACKEND_HEALTH="$BACKEND_URL/health"
 PG_PORT=15432
 REDIS_PORT=16379
-WEB_PORT=5173
+WEB_PORT=5273
 PYTHON_BIN=".venv/bin/python"
 WEB_DIR="apps/web"
 LOG_DIR="data"

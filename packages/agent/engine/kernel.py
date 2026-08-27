@@ -19,7 +19,6 @@ only supply the domain tools (rag_search/translate/web_search/fs …) and the LL
 """
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -248,9 +247,7 @@ class AgentKernel:
         if self.checkpoints is None:
             return
         try:
-            turn.checkpoint_id = await asyncio.to_thread(
-                self.checkpoints.snapshot, "pre-turn"
-            )
+            turn.checkpoint_id = await self.checkpoints.snapshot("pre-turn")
         except Exception:  # noqa: BLE001 - checkpointing is advisory, never fatal
             turn.checkpoint_id = None
 

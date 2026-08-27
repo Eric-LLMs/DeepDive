@@ -10,6 +10,9 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   // Recursively list a directory into a file tree (bounded depth, filtered).
   readTree: (dir) => ipcRenderer.invoke("read-tree", dir),
 
+  // List a single folder's direct children [{ name, path, type, size }] (no depth limit).
+  readDir: (dir) => ipcRenderer.invoke("read-dir", dir),
+
   // Pick a single file (for the File menu's "Add File to Workspace").
   pickFile: () => ipcRenderer.invoke("pick-file"),
 
@@ -86,6 +89,10 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   // Save a PNG screenshot (data URL) to a user-chosen location.
   saveScreenshot: (dataURL, defaultName) =>
     ipcRenderer.invoke("save-screenshot", { dataURL, defaultName }),
+
+  // Capture this app's own window as a PNG data URL (for one-click attach to chat).
+  // Resolves to { ok, data } | { ok: false, error }.
+  captureWindow: () => ipcRenderer.invoke("capture-window"),
 
   // Pick an avatar image; resolves to { ok, name, mime, base64 } | { ok, error } | null.
   pickImage: () => ipcRenderer.invoke("pick-image"),

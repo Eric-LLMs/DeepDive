@@ -148,6 +148,12 @@ class Settings(BaseSettings):
 
     # Anonymous guests may chat without an account, capped per day (-1 = unlimited).
     guest_daily_limit: int = 10
+    # Signed guest identity token lifetime (seconds): after this the client's gt_ token
+    # expires and the server mints a fresh identity on the next anonymous request.
+    guest_token_ttl_seconds: int = 30 * 86400
+    # Minimum wallet balance (USD) required for an overflow (beyond free quota) request.
+    # 0 means "positive balance" — a drained wallet blocks the next overflow request with 402.
+    wallet_gate_min_balance_usd: float = 0.0
 
     # ── Cache paths ──
     audio_cache_path: Path = Path("data/audio_cache")

@@ -9,7 +9,7 @@
 #   [4] All dependency services up      -> postgres/redis/embedding/tts/litellm/worker
 #   [5] Python venv + pip deps ensured  -> create .venv, pip install -e ".[dev]"
 #   [6] Backend started + admin verified-> uvicorn boot seeds admin/admin
-#   [7] React web UI served             -> vite dev server at :5173 (proxies /api)
+#   [7] React web UI served             -> vite dev server at :5273 (proxies /api)
 #   [8] Electron client launched
 #
 # If the backend cannot be brought up (e.g. a fresh Docker install needs a reboot),
@@ -31,7 +31,7 @@ LOG_DIR="data"
 UVICORN_LOG="$LOG_DIR/uvicorn.log"
 WEB_LOG="$LOG_DIR/web.log"
 PID_FILE="$LOG_DIR/uvicorn.pid"
-WEB_PORT=5173
+WEB_PORT=5273
 COMPOSE_SERVICES="postgres redis embedding tts llm-gateway worker"
 
 # Make the Docker CLI resolvable even before the system PATH refreshes after install.
@@ -178,7 +178,7 @@ start_backend() {
 }
 
 serve_web() {
-  # Start the React web UI (Vite dev server) and wait until :5173 actually answers.
+  # Start the React web UI (Vite dev server) and wait until :5273 actually answers.
   if ! command -v npm >/dev/null 2>&1; then
     warn "npm not found — skipping the web UI (API + desktop client still available)."
     return 1

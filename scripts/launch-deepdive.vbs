@@ -28,7 +28,7 @@ If bash = "" Then
 End If
 
 ' Start the one-click script in a hidden console (window style 0). The script
-' is idempotent: starts backend :8300 + web UI :5173 if needed, then Electron.
+' is idempotent: starts backend :8300 + web UI :5273 if needed, then Electron.
 sh.CurrentDirectory = root
 cmd = """" & bash & """ scripts/start_desktop.sh"
 sh.Run cmd, 0, False

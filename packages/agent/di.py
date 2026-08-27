@@ -194,6 +194,42 @@ class Context:
         fiber = self._fibers.get(name)
         return fiber.state if fiber is not None else None
 
+    def assert_settled(self) -> None:
+        """Raise if any PENDING fiber can never activate (dangling / FAILED / stuck deps).
+
+        ``_settle`` is a fixpoint, so a dependency cycle (A injects B, B injects A) or a
+        typo'd inject name leaves fibers PENDING forever with no error. This walks the stuck
+        fibers and reports each unsatisfiable dependency chain, making the stall loud instead
+        of silent. It is intentionally a *separate* method: registration is order-independent
+        (a fiber may legitimately be registered before its provider), so call it once
+        composition is complete.
+        """
+        stuck = [f for f in self._fibers.values() if f.state is FiberState.PENDING]
+        if not stuck:
+            return
+        reasons: list[str] = []
+        for fiber in stuck:
+            for dep in fiber.inject:
+                if self.has(dep):
+                    continue
+                provider = self._by_name.get(dep)
+                if provider is None:
+                    reasons.append(f"{fiber.name!r} injects unknown capability {dep!r}")
+                elif provider.state is FiberState.FAILED:
+                    reasons.append(
+                        f"{fiber.name!r} injects {dep!r} from failed provider "
+                        f"{provider.name!r} ({provider.error})"
+                    )
+                else:
+                    reasons.append(
+                        f"{fiber.name!r} injects {dep!r} from {provider.name!r} "
+                        f"which is stuck in {provider.state.name}"
+                    )
+        raise CapabilityError(
+            f"{len(stuck)} fiber(s) could not settle: "
+            + "; ".join(dict.fromkeys(reasons))
+        )
+
 
 class Service:
     """Optional base for class-based providers.

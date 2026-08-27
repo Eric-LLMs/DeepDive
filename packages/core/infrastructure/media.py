@@ -253,6 +253,57 @@ def build_pptx(
     return str(out_path)
 
 
+def build_text_pptx(
+    slides: list[tuple[str, str]],
+    out_path: str | Path,
+    title: str = "",
+) -> str:
+    """Build a text-only .pptx: one bullet slide per ``(heading, bullets)`` tuple.
+
+    Unlike :func:`build_pptx` (which stamps a frame image per page), this variant is
+    for document-derived decks — the agent turns extracted document text into a slide
+    outline and we lay it out as title + bullet text boxes. ``bullets`` may contain
+    newline-separated points; each becomes its own paragraph.
+    """
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    blank = prs.slide_layouts[6]
+
+    if title:
+        slide = prs.slides.add_slide(blank)
+        box = slide.shapes.add_textbox(Inches(1), Inches(3), Inches(11.3), Inches(1.5))
+        para = box.text_frame.paragraphs[0]
+        para.text = title
+        para.font.size = Pt(40)
+        para.font.bold = True
+
+    for heading, bullets in slides:
+        slide = prs.slides.add_slide(blank)
+        title_box = slide.shapes.add_textbox(Inches(0.7), Inches(0.5), Inches(11.9), Inches(1.1))
+        tp = title_box.text_frame.paragraphs[0]
+        tp.text = heading
+        tp.font.size = Pt(32)
+        tp.font.bold = True
+
+        body_box = slide.shapes.add_textbox(Inches(0.7), Inches(1.9), Inches(11.9), Inches(5.2))
+        tf = body_box.text_frame
+        tf.word_wrap = True
+        lines = [ln for ln in (bullets or "").split("\n") if ln.strip()]
+        for i, line in enumerate(lines):
+            para = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            para.text = f"• {line.strip()}"
+            para.font.size = Pt(18)
+            para.space_after = Pt(8)
+
+    out_path = Path(out_path)
+    prs.save(str(out_path))
+    return str(out_path)
+
+
 # ── PDF "book" generation ──
 def _wrap_text(text: str, width_fn, max_width: int) -> list[str]:
     lines: list[str] = []

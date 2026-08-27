@@ -1,7 +1,7 @@
 @echo off
 rem Double-click launcher for the DeepDive desktop workbench (Windows).
 rem Runs scripts/start_desktop.sh (bash) which is idempotent: it starts the
-rem backend on :8300 if needed, the web UI on :5173, then opens Electron.
+rem backend on :8300 if needed, the web UI on :5273, then opens Electron.
 rem The console window stays open while the app runs; close the app to exit.
 
 cd /d "%~dp0"

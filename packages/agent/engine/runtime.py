@@ -15,7 +15,10 @@ Registration is reversible: ``register`` and ``guard`` both return a disposer ca
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import Awaitable, Callable
+
+logger = logging.getLogger(__name__)
 
 from agent.engine.decisions import (
     ContentBlock,
@@ -75,8 +78,22 @@ class ToolRuntime:
 
     # ── execution ──
     async def execute(self, exec: ToolExecution) -> ToolExecutionResult:
+        """Run the full lifecycle, isolating each decision stage so a raising hook can never
+        escape the loop. Stage defaults are fail-closed: a broken pre-execute chain denies the
+        tool, a broken execute chain is a failure (never a fabricated success), and a broken
+        post-execute chain blocks — so a buggy approval/guard hook cannot let a tool run
+        unchecked. Each failure is logged with a traceback.
+        """
         # ① pre-execute
-        pre = await self.events.waterfall("tools/pre-execute", exec, base=PreToolDecision.allow())
+        try:
+            pre = await self.events.waterfall(
+                "tools/pre-execute", exec, base=PreToolDecision.allow()
+            )
+        except Exception as exc:  # noqa: BLE001 - a broken decision hook must not escape the loop
+            logger.exception("pre-execute chain failed for tool %s", exec.name)
+            return await self._finish(
+                exec, ToolExecutionFailure(ToolFailure(f"pre-execute failed: {exc}"))
+            )
         if pre.kind == "ask":
             pre = await self._resolve_ask(exec, pre)
         if pre.kind == "deny":
@@ -84,7 +101,7 @@ class ToolRuntime:
                 exec, ToolExecutionFailure(ToolFailure(pre.reason or "tool use denied"))
             )
 
-        # ② monotonic guard (deny-only)
+        # ② monotonic guard (deny-only; a raising guard fails closed)
         reason = await self._guard_reason(exec)
         if reason is not None:
             return await self._finish(exec, ToolExecutionFailure(ToolFailure(reason)))
@@ -93,10 +110,24 @@ class ToolRuntime:
         async def dispatch_body() -> ToolExecutionResult:
             return await self._dispatch_body(exec)
 
-        result = await self.events.waterfall("tools/execute", exec, base=dispatch_body)
+        try:
+            result = await self.events.waterfall("tools/execute", exec, base=dispatch_body)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("execute chain failed for tool %s", exec.name)
+            return await self._finish(
+                exec, ToolExecutionFailure(ToolFailure(f"execute failed: {exc}"))
+            )
 
         # ④ post-execute
-        post = await self.events.waterfall("tools/post-execute", exec, result, base=PostToolDecision.accept())
+        try:
+            post = await self.events.waterfall(
+                "tools/post-execute", exec, result, base=PostToolDecision.accept()
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("post-execute chain failed for tool %s", exec.name)
+            return await self._finish(
+                exec, ToolExecutionFailure(ToolFailure(f"post-execute failed: {exc}"))
+            )
         result = self._apply_post(exec, result, post)
 
         return await self._finish(exec, result)
@@ -108,7 +139,11 @@ class ToolRuntime:
 
     async def _guard_reason(self, exec: ToolExecution) -> str | None:
         for guard in self._guards:
-            reason = await guard(exec)
+            try:
+                reason = await guard(exec)
+            except Exception as exc:  # noqa: BLE001 - a broken guard must fail closed
+                logger.exception("sandbox guard %r failed for tool %s", guard, exec.name)
+                return f"sandbox guard error: {exc}"
             if reason is not None:
                 return reason
         return None
