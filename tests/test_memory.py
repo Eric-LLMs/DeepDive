@@ -5,9 +5,10 @@ close flushes buffered events and clears the buffer, and search maps recalled ro
 duck-typed dict shape the loop consumes.
 """
 import uuid
+from types import SimpleNamespace
 
 from core.infrastructure.db import MessageModel, SessionEventModel
-from core.infrastructure.memory import SessionMemoryStore
+from core.infrastructure.memory import SessionMemoryStore, load_session_detail
 
 
 class _Result:
@@ -92,3 +93,56 @@ async def test_search_maps_recalled_rows():
     assert results == [
         {"id": str(m.id), "role": "assistant", "text": "remember this", "score": 0.9}
     ]
+
+
+class _DetailResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar_one_or_none(self):
+        return self._value
+
+    def scalars(self):
+        return _DetailScalars(self._value)
+
+
+class _DetailScalars:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _DetailSession:
+    def __init__(self, sess, msgs):
+        self._calls = [sess, msgs]  # load_session_detail: session row, then messages
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, stmt):
+        return _DetailResult(self._calls.pop(0))
+
+
+async def test_load_session_detail_carries_imported_rag_flag():
+    mid1, mid2 = uuid.uuid4(), uuid.uuid4()
+    sess = SimpleNamespace(title="Chat", imported_rag=None)  # title read only
+    msgs = [
+        SimpleNamespace(
+            id=mid1, role="user", text="Q", imported_rag=True,
+            created_at=SimpleNamespace(isoformat=lambda: "2026-08-28T10:00:00+00:00"),
+        ),
+        SimpleNamespace(
+            id=mid2, role="assistant", text="A", imported_rag=False,
+            created_at=SimpleNamespace(isoformat=lambda: "2026-08-28T10:00:01+00:00"),
+        ),
+    ]
+    detail = await load_session_detail(lambda: _DetailSession(sess, msgs), uuid.uuid4())
+
+    assert detail["messages"][0]["imported_rag"] is True
+    assert detail["messages"][1]["imported_rag"] is False
+    assert detail["messages"][0]["id"] == str(mid1)

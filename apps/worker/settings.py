@@ -18,8 +18,65 @@ from core.infrastructure.vector import TEIEmbedder
 from apps.worker import tasks
 
 
+async def _active_llm_channel() -> tuple[str | None, str | None, str | None]:
+    """Resolve the admin-configured LLM channel from the DB as ``(base_url, api_key, model)``.
+
+    Mirrors the API chat path (``_channel_route``): pick an active credential, then the model
+    it routes to (preferred active ``credential_models`` route, else the first active catalog
+    model). The model is the provider's real id (``provider_model_name``). When the catalog has
+    no active channel the worker falls back to the legacy settings (the litellm gateway), so a
+    fresh deploy still boots.
+    """
+    from sqlalchemy import select
+
+    from core.infrastructure.db import (
+        CredentialModelModel,
+        LLMCredentialModel,
+        LLMModelModel,
+    )
+
+    async with SessionLocal() as session:
+        credential = (
+            await session.execute(
+                select(LLMCredentialModel)
+                .where(LLMCredentialModel.is_active.is_(True))
+                .order_by(LLMCredentialModel.created_at)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        model = None
+        if credential is not None:
+            model_id = (
+                await session.execute(
+                    select(CredentialModelModel.model_id)
+                    .where(
+                        CredentialModelModel.credential_id == credential.id,
+                        CredentialModelModel.is_active.is_(True),
+                    )
+                    .order_by(CredentialModelModel.priority)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if model_id is not None:
+                model = await session.get(LLMModelModel, model_id)
+        if model is None:
+            model = (
+                await session.execute(
+                    select(LLMModelModel)
+                    .where(LLMModelModel.is_active.is_(True))
+                    .order_by(LLMModelModel.created_at)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        if credential is None:
+            return None, None, None
+        model_name = (model.provider_model_name or model.name) if model is not None else None
+        return credential.base_url, credential.api_key, model_name
+
+
 async def startup(ctx) -> None:
-    ctx["llm"] = OpenAILLM()
+    base_url, api_key, model = await _active_llm_channel()
+    ctx["llm"] = OpenAILLM(api_key=api_key, base_url=base_url, model=model)
     ctx["tts"] = TTSClient()
     ctx["images"] = ImageScraper()
     # Batch embed (session finalize / sentence indexing / RAG ingest) can exceed the

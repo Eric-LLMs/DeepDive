@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 
 logger = logging.getLogger(__name__)
 
@@ -510,8 +510,8 @@ async def _segment_chat(messages, llm) -> list[dict]:
             )
         if pairs:
             # Fill any pair the LLM left without indices from the remaining user lines so
-            # every pair still carries an anchor for per-message coverage / incremental
-            # import (an older model may return {question, answer} without indices).
+            # every pair still carries an anchor for per-message "✓ Imported" coverage (an
+            # older model may return {question, answer} without indices).
             claimed: set[int] = set()
             for p in pairs:
                 claimed.update(p["indices"])
@@ -529,43 +529,13 @@ async def _segment_chat(messages, llm) -> list[dict]:
     return _default_chat_pairs(messages)
 
 
-async def _chat_covered_ids(session_factory, user_id: UUID, session_id: str) -> set[str]:
-    """All user-message ids already covered by imported chat chunks for a session.
-
-    New-style ``kind='qa'`` chunks record their covered user-message ids in
-    ``meta['covered']``; legacy single-pair imports used ``source_id=<user-message id>``
-    directly (recognizable by the lack of a ``session_id:`` prefix).
-    """
-    async with session_factory() as session:
-        rows = (
-            await session.execute(
-                select(ChunkModel.source_id, ChunkModel.meta).where(
-                    ChunkModel.source_type == "chat",
-                    ChunkModel.user_id == user_id,
-                    ChunkModel.meta["session_id"].astext == session_id,
-                )
-            )
-        ).all()
-    covered: set[str] = set()
-    for source_id, meta in rows:
-        if (meta or {}).get("kind") != "qa":
-            continue
-        cov = (meta or {}).get("covered")
-        if isinstance(cov, list) and cov:
-            covered.update(str(c) for c in cov)
-        elif source_id and ":" not in source_id:
-            covered.add(source_id)
-    return covered
-
-
-async def _chat_delete_stale_keys(
-    session_factory, user_id: UUID, session_id: str, written: set[str]
+async def _chat_delete_legacy_session_chunks(
+    session_factory, user_id: UUID, session_id: str
 ) -> None:
-    """Drop per-entry chat chunks whose key the current grouping no longer produces.
-
-    The LLM may regroup after an append (e.g. two turns that used to be separate entries
-    merge into one), leaving an old per-entry key behind; it would otherwise become a
-    stale duplicate. Single-pair chunks (``source_id`` == a user-message id) are untouched.
+    """Drop pre-flag whole-session chunk keys (``<session_id>:<i>`` and the bare
+    ``<session_id>``) so a legacy session converts to the per-message flag model on its next
+    import without duplicating content. A no-op for flag-era sessions (those write per-message
+    keys under the first covered user-message id, which this predicate never matches).
     """
     prefix = f"{session_id}:"
     async with session_factory() as session:
@@ -574,33 +544,59 @@ async def _chat_delete_stale_keys(
                 select(ChunkModel.source_id).where(
                     ChunkModel.source_type == "chat",
                     ChunkModel.user_id == user_id,
-                    ChunkModel.meta["session_id"].astext == session_id,
-                    ChunkModel.meta["kind"].astext == "qa",
+                    or_(
+                        ChunkModel.source_id.startswith(prefix),
+                        ChunkModel.source_id == session_id,
+                    ),
                 )
             )
         ).all()
-    stale = [sid for (sid,) in rows if sid.startswith(prefix) and sid not in written]
-    if stale:
-        await SqlChunkRepository(session_factory).delete_by_source("chat", stale)
+    ids = [sid for (sid,) in rows if sid]
+    if ids:
+        await SqlChunkRepository(session_factory).delete_by_source("chat", ids)
 
 
-def _pending_chat_entries(
-    pairs: list[dict], covered_by_pair: list[list[str]], existing: set[str]
-) -> list[tuple[int, dict, list[str]]]:
-    """Which segmentation entries still need importing.
+def _pair_covered_ids(pair: dict, messages) -> list[str]:
+    """User-message ids a Q&A entry answers (from its transcript line indexes)."""
+    cov: list[str] = []
+    for i in pair.get("indices") or []:
+        if i < len(messages) and messages[i].role == "user":
+            cid = str(messages[i].id)
+            if cid not in cov:
+                cov.append(cid)
+    return cov
 
-    An entry is skipped when it has no user message to anchor, or when every user message
-    it covers is already in the query repo — that is the incremental append behavior:
-    re-importing a session only embeds newly asked questions.
+
+def _pair_spans(pairs: list[dict], messages) -> list[tuple[int, int]]:
+    """Transcript ``[start, end)`` index spans each Q&A entry covers.
+
+    ``start`` is the pair's first question line; ``end`` is the first user line *after* the
+    pair's last covered line (or the end of the transcript) — i.e. the question plus its
+    merged assistant answer, never a trailing question with no answer. Spans are disjoint, so
+    flagging a span never double-flags.
     """
-    out: list[tuple[int, dict, list[str]]] = []
-    for i, (pair, covered) in enumerate(zip(pairs, covered_by_pair)):
-        if not covered:
-            continue
-        if all(cid in existing for cid in covered):
-            continue
-        out.append((i, pair, covered))
-    return out
+    user_indexes = [i for i, m in enumerate(messages) if m.role == "user"]
+    spans: list[tuple[int, int]] = []
+    for pair in pairs:
+        idx = sorted(pair.get("indices") or [])
+        start = idx[0]
+        end = next((i for i in user_indexes if i > idx[-1]), len(messages))
+        spans.append((start, end))
+    return spans
+
+
+def _span_imported(messages, span: tuple[int, int], flagged: dict[str, bool]) -> bool:
+    """True when every user/assistant message in a span already carries ``imported_rag``.
+
+    The whole span must be flagged (not just the question): a regenerated answer creates a
+    fresh assistant message id, so an untouched imported pair is skipped while a pair whose
+    answer was regenerated re-imports.
+    """
+    start, end = span
+    return all(
+        messages[j].role not in ("user", "assistant") or flagged.get(str(messages[j].id), False)
+        for j in range(start, end)
+    )
 
 
 async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
@@ -609,15 +605,17 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
     The LLM (falling back to a per-turn default) groups the conversation into Q&A entries:
     the same question asked over multiple turns is merged into one entry, distinct
     questions become separate entries. Each entry is chunked + embedded with
-    ``source_type='chat'`` + ``source_id=<session_id>:<i>`` (per-entry key), so a re-import
-    replaces entries independently.
+    ``source_type='chat'`` + ``source_id=<first covered user-message id>`` (a stable key, so
+    positional drift after message deletes / regroupings never collides with old chunks).
 
-    Imports are incremental: an entry whose covered user messages are all already in the
-    query repo is skipped, so re-importing after an append only embeds the newly asked
-    questions. Every chunk records the user-message ids it covers (``meta['covered']``),
-    which drives the per-message "✓ Imported" state on the client. Legacy whole-session
-    chunks (old ``kind='session-qa'``) are converted to this per-message model on the next
-    import.
+    Imports are **incremental and flag-driven**: a pair is only embedded when its span (the
+    question plus its merged answer) is not yet fully ``imported_rag``-flagged — re-importing
+    a session therefore never re-embeds content that is already in the repo, only newly
+    appended or regenerated pairs. Pre-flag legacy whole-session keys (``<session_id>:<i>``)
+    are purged once so a legacy session converts cleanly without duplicating content. On
+    success the imported pairs' messages get their ``imported_rag`` flag set, which drives the
+    per-message "✓ Imported" state on the client straight from the message rows — stable
+    across message deletes, because each message carries its own flag.
     """
     session_id = UUID(payload["session_id"])
     user_id = UUID(payload["user_id"])
@@ -635,34 +633,38 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
                 )
             ).scalars().all()
 
+        # Fast path: every chat message is already imported → there is nothing to embed, so
+        # skip the LLM segment call entirely. That call is the slow part (minutes when the
+        # model gateway is slow or down), and a re-import of an already-imported session must
+        # resolve instantly instead of leaving the job "running" while the client polls.
+        if messages and all(
+            m.imported_rag for m in messages if m.role in ("user", "assistant")
+        ):
+            return {"chunks": 0, "groups": 0}
+
         pairs = await _segment_chat(messages, ctx["llm"])
         pairs = [p for p in pairs if p["answer"]]
         if not pairs:
             return {"chunks": 0, "groups": 0}
 
-        chunks_repo = SqlChunkRepository(ctx["session_factory"])
-        # Convert legacy whole-session imports (old kind="session-qa" keyed on the session
-        # id): they have no per-message coverage, so rebuild them under the new model.
-        await chunks_repo.delete_by_source("chat", [str(session_id)])
+        # One-time conversion: drop legacy whole-session keys so this session moves to the
+        # per-message model without leaving duplicate content behind. No-op for flag-era
+        # sessions (which never write positional keys).
+        await _chat_delete_legacy_session_chunks(ctx["session_factory"], user_id, str(session_id))
 
-        # Coverage per entry: the user-message ids this Q&A answers (order preserved).
-        covered_by_pair: list[list[str]] = []
-        for p in pairs:
-            cov: list[str] = []
-            for i in p.get("indices") or []:
-                if i < len(messages) and messages[i].role == "user":
-                    cid = str(messages[i].id)
-                    if cid not in cov:
-                        cov.append(cid)
-            covered_by_pair.append(cov)
+        spans = _pair_spans(pairs, messages)
+        flagged = {str(m.id): m.imported_rag for m in messages}
 
-        existing = await _chat_covered_ids(ctx["session_factory"], user_id, str(session_id))
-        written: set[str] = set()
         total = 0
-        for i, pair, covered in _pending_chat_entries(pairs, covered_by_pair, existing):
-            key = f"{session_id}:{i}"
+        flag_ids: set[str] = set()
+        chunks_repo = SqlChunkRepository(ctx["session_factory"])
+        for pair, (start, end) in zip(pairs, spans):
+            if _span_imported(messages, (start, end), flagged):
+                continue  # already in the repo — never re-embed
+            covered = _pair_covered_ids(pair, messages)
+            key = covered[0] if covered else f"{session_id}:{start}"
             text = f"{pair['question']}\n\n{pair['answer']}"
-            title = pair["question"].strip()[:60] or f"Chat Q{i + 1}"
+            title = pair["question"].strip()[:60] or f"Chat Q{start + 1}"
             chunks = await build_chunks(text, cfg, doc_title=title, llm=ctx["llm"])
             for c in chunks:
                 c.meta = {
@@ -671,9 +673,9 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
                     "kind": "qa",
                     "session_id": str(session_id),
                     "covered": covered,
-                    "qid": i,
                 }
-            # Idempotent per-entry: replace any earlier version of this same key.
+            # Idempotent: replace any chunk already keyed by this question (e.g. a prior
+            # single-pair import, or a re-import after the answer was regenerated).
             await chunks_repo.delete_by_source("chat", [key])
             res = await _write_query_repo_chunks(
                 ctx,
@@ -683,10 +685,19 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
                 source_id=key,
             )
             total += res["chunks"]
-            written.add(key)
-            existing.update(covered)
+            for j in range(start, end):
+                if messages[j].role in ("user", "assistant"):
+                    flag_ids.add(str(messages[j].id))
 
-        await _chat_delete_stale_keys(ctx["session_factory"], user_id, str(session_id), written)
+        if flag_ids:
+            async with ctx["session_factory"]() as session:
+                await session.execute(
+                    update(MessageModel)
+                    .where(MessageModel.id.in_(list(flag_ids)))
+                    .values(imported_rag=True)
+                )
+                await session.commit()
+
         await bump_corpus_version(ctx["redis"])  # corpus changed → drop stale query-cache hits
         return {"chunks": total, "groups": len(pairs)}
 

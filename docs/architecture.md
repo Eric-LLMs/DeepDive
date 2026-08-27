@@ -888,17 +888,40 @@ for now).
 | Cloud Drive | file row **＋ 加入查询仓库** (`POST /files/{id}/import-rag`) | worker `asset_ingest` → `extract_document_text` dispatch; `.pdf` runs the PDF tool chain | `source_type='file'`, `asset_id` set |
 | Learning Platform | Import Data → sentence checkboxes / *Articles & Query Repo* (`POST /learning/import`, `POST /learning/articles/{id}/import`) | worker `learning_import` (batch) or the API (single article) reads rows → `build_chunks` → embed → insert | `source_type='learning'`, `source_id=<id>` |
 | Chat (single pair) | desktop reply **Import to Knowledge** (`POST /chat/import`) | API binds the assistant reply to its preceding user question, `build_chunks` the Q&A text | `source_type='chat'`, `source_id=<user_message_id>` |
-| Chat (whole session) | desktop session **⋯ → Import to Knowledge** (`POST /chat/import-session`) | worker `chat_session_import` → LLM `_segment_chat` groups turns (same question across turns merges; distinct questions split; each entry carries the covered transcript indexes), default per-turn grouping on failure | `source_type='chat'`, per-entry `source_id=<session_id>:<i>`, `kind='qa'`, `meta.covered` = covered user-message ids |
+| Chat (whole session) | desktop session **⋯ → Import to Knowledge** (`POST /chat/import-session`) | worker `chat_session_import` → LLM `_segment_chat` groups turns (same question across turns merges; distinct questions split; each entry carries the covered transcript indexes), default per-turn grouping on failure | `source_type='chat'`, `source_id=<first covered user-message id>`, `kind='qa'`, `meta.covered` = covered user-message ids |
 
-**Persistent import state** — `GET /chat/imported?session_id=` reports which user messages of a session are
-already in the repo: `qa_source_ids` lists every covered user-message id (from `meta.covered`, falling back
-to the legacy single-pair `source_id`), `session_imported` is true only when *every* current user message is
-covered, and `legacy_session_imported` marks a pre-coverage whole-session import with no per-message data.
-The desktop fetches it on session load — before rendering buttons — so an already-imported pair renders its
-**📥** as a disabled **✓ Imported**, surviving session switches and app restarts; a click-time re-check on
-the same endpoint prevents re-importing a pair already in the repo. Whole-session imports are incremental:
-re-importing after an append skips entries whose covered user messages are all already in the repo, so only
-the newly asked questions get embedded.
+**Persistent import state** — the source of truth is a per-message `messages.imported_rag` flag (default 0,
+set to 1 on import), returned by `GET /sessions/{id}` so the desktop renders each reply's **📥** button from
+its own row — never from the question it happens to bind to, so deleting or re-grouping a message can't
+spread the state to sibling pairs or hide it. `GET /chat/imported?session_id=` reads the same flags for the
+click-time re-check: `qa_source_ids` lists every flagged user message, `session_imported` is true only when
+*every* current user message is flagged, and `legacy_session_imported` marks a pre-flag whole-session import
+(old `kind='session-qa'`) with no per-message data. On session load a one-time backfill
+(`GET /sessions/{id}`) reconstructs flags from pre-flag chunk meta (whole-session `meta.covered` → all
+messages when every current user message is covered, else the covered user messages; single-pair
+`source_id` → that user message), so already-imported sessions keep their **✓ Imported** state after the
+upgrade without a re-import.
+
+**Chat storage granularity** — both chat imports store **Q&A pairs**, never raw messages and never a
+single row per whole session. A single `/chat/import` binds an assistant reply to its preceding user
+question, merges them into one text (`question\n\nanswer`), runs `build_chunks`, and inserts the
+resulting 1..N rows under `source_id=<user_message_id>`. A whole-session import first groups the
+transcript into Q&A entries (`_segment_chat` — same question across turns merges, distinct questions
+split), then stores each entry the same way under a stable key `source_id=<first covered user-message id>`
+(message-id-derived, so positional drift after message deletes / regroupings never collides with an old
+chunk), with every chunk's `meta` tagged `kind='qa'`, `covered` (the user-message ids the entry answers),
+and `session_id`. Long answers split into several leaf chunks (plus an optional `parent`) that share
+one `source_id` — so one Q&A pair maps to one `source_id` but possibly many `chunks` rows.
+
+Whole-session imports are **incremental and flag-driven — no delete-and-rebuild**: a Q&A entry is embedded
+only when its span (the question plus its merged answer) is not yet fully `imported_rag`-flagged, so
+re-importing a session never re-embeds content already in the repo (a regenerated answer — a fresh
+assistant-message id — re-imports; an appended question imports; an untouched imported pair is skipped).
+Each import replaces the pair's chunk keyed by its question id (`delete_by_source` then write), keeping
+single-pair and whole-session imports idempotent and non-overlapping. Pre-flag legacy whole-session keys
+(`<session_id>:<i>` and the bare `<session_id>`) are purged once on a legacy session's first re-import so it
+converts cleanly without duplicating content. On success the imported pairs' messages get their
+`imported_rag` flag set, and the corpus version is bumped so stale query-cache hits drop immediately.
 
 **PDF tool chain** — processing is extracted into **tools** (the admin can toggle them like any tool)
 wrapping pure functions in `core/infrastructure/pdf.py`:

@@ -123,6 +123,15 @@ async def chat_import_pair(
         source_type="chat",
         source_id=str(user_msg.id),
     )
+    # Flip the per-message flag on both halves of the pair: the client renders "✓ Imported"
+    # from these rows, and the flag is what stops a later duplicate re-import (the assistant
+    # reply keeps its state even if the bound question is deleted or re-grouped).
+    async with SessionLocal() as session:
+        for mid in (user_msg.id, asst_msg.id):
+            row = await session.get(MessageModel, mid)
+            if row is not None:
+                row.imported_rag = True
+        await session.commit()
     return {"chunks": res["chunks"]}
 
 
@@ -155,50 +164,39 @@ async def chat_imported_status(
     load the client fetches this so an already-imported pair stays disabled across
     session switches and app restarts.
 
-    Coverage is tracked per user message: ``qa_source_ids`` lists every user-message id
-    covered by an imported chunk (from ``meta['covered']``, or the legacy single-pair
-    ``source_id``). ``session_imported`` is only true when *every* current user message
-    is covered, so an appended question stays importable and re-importing a session only
-    imports the new pairs. ``legacy_session_imported`` marks a pre-coverage whole-session
-    import (old ``kind='session-qa'``) that has no per-message data — the client treats it
-    as fully imported but allows a re-import to convert it.
+    Coverage comes from the per-message ``imported_rag`` flags set on import (stable across
+    message deletes / regroupings, so the state never spreads to sibling pairs). ``qa_source_ids``
+    lists every flagged user message; ``session_imported`` is true when every current user
+    message is flagged. ``legacy_session_imported`` marks a pre-flag whole-session import (old
+    ``kind='session-qa'``) that has no per-message data — the client treats it as fully imported
+    but allows a re-import to convert it to the flag model.
     """
     async with SessionLocal() as session:
-        user_msg_ids = [
-            str(m)
-            for m in (
-                await session.execute(
-                    select(MessageModel.id).where(
-                        MessageModel.session_id == session_id,
-                        MessageModel.role == "user",
-                    )
-                )
-            ).scalars().all()
-        ]
         rows = (
             await session.execute(
-                select(ChunkModel.source_id, ChunkModel.meta).where(
+                select(MessageModel.id, MessageModel.role, MessageModel.imported_rag)
+                .where(MessageModel.session_id == session_id)
+                .order_by(MessageModel.created_at)
+            )
+        ).all()
+        legacy = (
+            await session.execute(
+                select(ChunkModel.id)
+                .where(
                     ChunkModel.source_type == "chat",
                     ChunkModel.user_id == user.user_id,
                     ChunkModel.meta["session_id"].astext == str(session_id),
+                    ChunkModel.meta["kind"].astext == "session-qa",
                 )
+                .limit(1)
             )
-        ).all()
-    covered: set[str] = set()
-    legacy_session_imported = False
-    for source_id, meta in rows:
-        kind = (meta or {}).get("kind")
-        if kind == "qa":
-            cov = (meta or {}).get("covered")
-            if isinstance(cov, list) and cov:
-                covered.update(str(c) for c in cov)
-            else:
-                covered.add(source_id)  # legacy single-pair: source_id is the user-message id
-        elif kind == "session-qa":
-            legacy_session_imported = True
-    fully_covered = bool(user_msg_ids) and covered.issuperset(user_msg_ids)
+        ).first()
+    user_msg_ids = [str(mid) for mid, role, _ in rows if role == "user"]
+    flagged_ids = [str(mid) for mid, role, flag in rows if role == "user" and flag]
+    legacy_session_imported = legacy is not None
+    fully_covered = bool(user_msg_ids) and len(flagged_ids) == len(user_msg_ids)
     return {
-        "qa_source_ids": sorted(covered),
+        "qa_source_ids": sorted(flagged_ids),
         "session_imported": legacy_session_imported or fully_covered,
         "legacy_session_imported": legacy_session_imported,
     }

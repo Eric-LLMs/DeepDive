@@ -9,7 +9,6 @@ from types import SimpleNamespace
 
 from apps.worker.tasks import (
     _default_chat_pairs,
-    _pending_chat_entries,
     _segment_chat,
     _strip_code_fence,
 )
@@ -219,19 +218,295 @@ def test_segment_chat_degrades_to_default_grouping_on_llm_failure():
     assert pairs == [{"question": "Q", "answer": "A", "indices": [0]}]
 
 
-def test_pending_chat_entries_skips_fully_covered_only():
-    # Three entries; the first two are fully in the repo already → only the appended
-    # third entry (new user message "m4") should still be written.
-    pairs = [{"question": "Q1", "answer": "A1"}, {"question": "Q2", "answer": "A2"}, {"question": "Q3", "answer": "A3"}]
-    covered_by_pair = [["m1"], ["m2", "m3"], ["m4"]]
-    pending = _pending_chat_entries(pairs, covered_by_pair, existing={"m1", "m2", "m3"})
-    assert [(i, p["question"], cov) for i, p, cov in pending] == [(2, "Q3", ["m4"])]
+# ── chat_session_import: incremental, flag-driven (no delete-and-rebuild) ──
+class _Msg:
+    def __init__(self, id, role, text, imported_rag=False):
+        self.id = id
+        self.role = role
+        self.text = text
+        self.imported_rag = imported_rag
 
 
-def test_pending_chat_entries_requires_an_anchor():
-    # An entry with no covered user message can never be imported incrementally.
-    pairs = [{"question": "Q", "answer": "A"}]
-    assert _pending_chat_entries(pairs, [[]], existing=set()) == []
+class _RebuildResult:
+    def __init__(self, messages, existing_ids):
+        self._messages = messages
+        self._existing_ids = existing_ids
+
+    def scalars(self):
+        return _RebuildScalars(self._messages)
+
+    def all(self):
+        return self._existing_ids
+
+
+class _RebuildScalars:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _RebuildSession:
+    def __init__(self, messages, existing_ids):
+        self.messages = messages
+        self.existing_ids = existing_ids
+        self.committed = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, stmt, params=None):
+        return _RebuildResult(self.messages, self.existing_ids)
+
+    async def commit(self):
+        self.committed.append(True)
+
+
+class _RebuildFactory:
+    def __init__(self, messages, existing_ids):
+        self.messages = messages
+        self.existing_ids = existing_ids
+        self.session = None
+
+    def __call__(self):
+        self.session = _RebuildSession(self.messages, self.existing_ids)
+        return self.session
+
+
+class _RebuildStore:
+    def __init__(self):
+        self.events = []
+
+    async def mark_running(self, uid):
+        self.events.append(("running", uid))
+
+    async def mark_succeeded(self, uid, result):
+        self.events.append(("succeeded", uid, result))
+
+    async def mark_failed(self, uid, error):
+        self.events.append(("failed", uid, error))
+
+
+class _RebuildRepo:
+    def __init__(self):
+        self.deleted = []
+
+    async def delete_by_source(self, source_type, ids):
+        self.deleted.append((source_type, list(ids)))
+
+
+def _run_session_import(monkeypatch, messages, existing_ids):
+    """Drive chat_session_import end-to-end with scripted segment/build/write fakes."""
+    from rag import config_store
+
+    import apps.worker.tasks as tasks_mod
+
+    async def fake_load(session_factory):
+        return {"pipeline": "test"}
+
+    async def fake_segment(messages, llm):
+        pairs = []
+        for i, m in enumerate(messages):
+            if m.role != "user":
+                continue
+            j = i + 1
+            answer = messages[j].text if j < len(messages) else ""
+            if answer:
+                pairs.append({"question": m.text, "answer": answer, "indices": [i]})
+        return pairs
+
+    async def fake_build(text, cfg, doc_title=None, llm=None):
+        return [Chunk(content_en=f"{doc_title}:{text}")]
+
+    writes = []
+
+    async def fake_write(session_factory, embedder, *, chunks, user_id, source_type, source_id):
+        writes.append((source_id, user_id, source_type, chunks[0].content_en, chunks[0].meta))
+        return {"chunks": len(chunks)}
+
+    repo = _RebuildRepo()
+    bumped = []
+
+    async def fake_bump(redis):
+        bumped.append(redis)
+
+    monkeypatch.setattr(config_store, "load_config", fake_load)
+    monkeypatch.setattr(tasks_mod, "_segment_chat", fake_segment)
+    monkeypatch.setattr(tasks_mod, "build_chunks", fake_build)
+    monkeypatch.setattr(tasks_mod, "write_query_repo_chunks", fake_write)
+    monkeypatch.setattr(tasks_mod, "SqlChunkRepository", lambda sf: repo)
+    monkeypatch.setattr(tasks_mod, "bump_corpus_version", fake_bump)
+
+    factory = _RebuildFactory(messages, existing_ids)
+    ctx = {
+        "session_factory": factory,
+        "job_store": _RebuildStore(),
+        "llm": SimpleNamespace(),
+        "embedder": SimpleNamespace(),
+        "redis": SimpleNamespace(),
+    }
+    res = asyncio.run(
+        tasks_mod.chat_session_import(
+            ctx,
+            "33333333-3333-3333-3333-333333333333",
+            {"user_id": "22222222-2222-2222-2222-222222222222", "session_id": SID},
+        )
+    )
+    return res, writes, repo.deleted, bumped, factory
+
+
+SID = "11111111-1111-1111-1111-111111111111"
+
+
+def test_session_import_skips_flagged_pairs_imports_only_new(monkeypatch):
+    # 4 Q&A turns; the first two are already imported (flagged, flag-era chunks), the last
+    # two are new appends. The import must skip the flagged pairs entirely — never re-embed
+    # already-imported content — and only embed the new ones under their question's id.
+    messages = [
+        _Msg("m0", "user", "Q0", imported_rag=True),
+        _Msg("m1", "assistant", "A0", imported_rag=True),
+        _Msg("m2", "user", "Q1", imported_rag=True),
+        _Msg("m3", "assistant", "A1", imported_rag=True),
+        _Msg("m4", "user", "Q2", imported_rag=False),
+        _Msg("m5", "assistant", "A2", imported_rag=False),
+        _Msg("m6", "user", "Q3", imported_rag=False),
+        _Msg("m7", "assistant", "A3", imported_rag=False),
+    ]
+    existing = []
+    res, writes, deleted, bumped, factory = _run_session_import(monkeypatch, messages, existing)
+
+    assert res == {"chunks": 2, "groups": 4}
+    # Only the two unflagged pairs are written, keyed by their question's message id.
+    assert [w[0] for w in writes] == ["m4", "m6"]
+    # Per-pair idempotent delete-by-source (nothing existed → no-op) + one flag commit.
+    assert deleted == [("chat", ["m4"]), ("chat", ["m6"])]
+    assert bumped
+    assert factory.session.committed == [True]
+    assert writes[0][4]["covered"] == ["m4"]
+    assert writes[0][4]["session_id"] == SID
+
+
+def test_session_import_converts_legacy_session_on_first_reimport(monkeypatch):
+    # A pre-flag whole-session import left positional keys (<session_id>:<i>) and no flags.
+    # Re-importing purges those legacy keys once and re-embeds every pair under stable
+    # message-id keys, so the session moves to the flag model without duplicating content.
+    messages = [
+        _Msg("m0", "user", "Q0"),
+        _Msg("m1", "assistant", "A0"),
+        _Msg("m2", "user", "Q1"),
+        _Msg("m3", "assistant", "A1"),
+    ]
+    existing = [(f"{SID}:0",), (f"{SID}:1",)]
+    res, writes, deleted, _, factory = _run_session_import(monkeypatch, messages, existing)
+
+    assert res == {"chunks": 2, "groups": 2}
+    # Legacy keys purged first, then each pair's old key replaced (idempotent).
+    assert deleted == [("chat", [f"{SID}:0", f"{SID}:1"]), ("chat", ["m0"]), ("chat", ["m2"])]
+    assert [w[0] for w in writes] == ["m0", "m2"]
+    assert factory.session.committed == [True]
+
+
+def test_session_import_reimports_after_answer_regenerated(monkeypatch):
+    # Q0 was imported (question flagged), then its answer was regenerated as a fresh
+    # assistant message id. The span now holds an unflagged assistant, so the pair re-imports
+    # (replace the old chunk keyed by the question id) instead of being skipped.
+    messages = [
+        _Msg("m0", "user", "Q0", imported_rag=True),
+        _Msg("m0a", "assistant", "A0 regenerated", imported_rag=False),
+    ]
+    existing = []
+    res, writes, deleted, _, _ = _run_session_import(monkeypatch, messages, existing)
+
+    assert res == {"chunks": 1, "groups": 1}
+    assert deleted == [("chat", ["m0"])]
+    assert [w[0] for w in writes] == ["m0"]
+    assert "Q0" in writes[0][3] and "A0 regenerated" in writes[0][3]
+
+
+def test_session_import_leaves_dangling_question_unflagged(monkeypatch):
+    # A trailing user question with no answer is not part of any pair, so it is never flagged
+    # (its content is not in the repo) and the all-imported run writes nothing.
+    messages = [
+        _Msg("m0", "user", "Q0", imported_rag=True),
+        _Msg("m1", "assistant", "A0", imported_rag=True),
+        _Msg("m2", "user", "Q1 dangling", imported_rag=False),
+    ]
+    existing = []
+    res, writes, deleted, _, factory = _run_session_import(monkeypatch, messages, existing)
+
+    assert res == {"chunks": 0, "groups": 1}
+    assert writes == []
+    assert deleted == []
+    assert factory.session.committed == []  # nothing new to flag
+
+
+def test_session_import_all_imported_fast_path_skips_llm(monkeypatch):
+    # When every chat message is already flagged, the import must short-circuit BEFORE the
+    # LLM segment call: re-importing a fully-imported session resolves instantly instead of
+    # burning minutes in the model gateway and leaving the job "running".
+    from rag import config_store
+
+    import apps.worker.tasks as tasks_mod
+
+    async def fake_load(session_factory):
+        return {"pipeline": "test"}
+
+    def boom(*args, **kwargs):
+        raise AssertionError("fully-imported fast path must not call the LLM / embed / write")
+
+    monkeypatch.setattr(config_store, "load_config", fake_load)
+    monkeypatch.setattr(tasks_mod, "_segment_chat", boom)
+    monkeypatch.setattr(tasks_mod, "build_chunks", boom)
+    monkeypatch.setattr(tasks_mod, "write_query_repo_chunks", boom)
+    monkeypatch.setattr(tasks_mod, "SqlChunkRepository", lambda sf: _RebuildRepo())
+    monkeypatch.setattr(tasks_mod, "bump_corpus_version", boom)
+
+    messages = [
+        _Msg("m0", "user", "Q0", imported_rag=True),
+        _Msg("m1", "assistant", "A0", imported_rag=True),
+    ]
+    factory = _RebuildFactory(messages, [])
+    ctx = {
+        "session_factory": factory,
+        "job_store": _RebuildStore(),
+        "llm": SimpleNamespace(),
+        "embedder": SimpleNamespace(),
+        "redis": SimpleNamespace(),
+    }
+    res = asyncio.run(
+        tasks_mod.chat_session_import(
+            ctx,
+            "33333333-3333-3333-3333-333333333333",
+            {"user_id": "22222222-2222-2222-2222-222222222222", "session_id": SID},
+        )
+    )
+    assert res == {"chunks": 0, "groups": 0}
+    assert factory.session.committed == []  # no flag writes, no commit
+
+
+def test_pair_spans_cover_question_through_next_user_line():
+    from apps.worker.tasks import _pair_spans
+
+    msgs = [
+        _Msg("a", "user", "Q0"), _Msg("b", "assistant", "A0"),
+        _Msg("c", "user", "Q1"), _Msg("d", "assistant", "A1"),
+        _Msg("e", "user", "Q2 dangling"),  # no answer — must not fall inside a span
+    ]
+    pairs = [{"indices": [0]}, {"indices": [2]}]
+    assert _pair_spans(pairs, msgs) == [(0, 2), (2, 4)]
+
+
+def test_span_imported_requires_whole_span_flagged():
+    from apps.worker.tasks import _span_imported
+
+    msgs = [_Msg("a", "user", "Q"), _Msg("b", "assistant", "A")]
+    assert _span_imported(msgs, (0, 2), {"a": True, "b": True}) is True
+    # A regenerated (unflagged) answer means the pair is not fully imported.
+    assert _span_imported(msgs, (0, 2), {"a": True, "b": False}) is False
 
 
 # ── text-extraction dispatch: .docx and .pdf ──

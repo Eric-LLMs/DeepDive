@@ -25,7 +25,7 @@
     treeData: null,
     sessions: null,
     sessionQuery: "",
-    importedQaIds: new Set(),  // user-message ids already imported into the query repo (active session)
+    importedByMsgId: new Map(),  // message id → true when its content is in the query repo (active session)
     sessionImported: false,    // true when every current user message of the session is covered
     sessionImportedLegacy: false, // legacy pre-coverage whole-session import (no per-message data)
   };
@@ -733,17 +733,6 @@
     import: "Import to Knowledge",
     delete: "Delete",
   };
-  // Walk up the chat log to the user message this assistant reply answers.
-  function boundUserMsgId(div) {
-    const chain = [];
-    for (let n = div.previousElementSibling; n; n = n.previousElementSibling) {
-      chain.push(`{${n.className}|id=${n.dataset ? n.dataset.id : "(none)"}}`);
-      if (n.classList.contains("msg") && n.classList.contains("user") && n.dataset.id) return n.dataset.id;
-    }
-    console.log("[imported] chain null for", div.className, "prevSibs:", chain.join(" "));
-    return null;
-  }
-
   function buildMsgActions(div, role, getText) {
     const actions = document.createElement("div");
     actions.className = "msg-actions";
@@ -758,11 +747,12 @@
     // is already in the repo — the state is fetched on session load and persisted in
     // `state` so it survives session switches and app restarts.
     if (role === "assistant") {
-      const qid = boundUserMsgId(div);
-      // Per-message coverage: only pairs whose user message is actually in the repo are
-      // marked done. Legacy whole-session imports (no per-message data) stay a blanket.
-      const done = (qid && state.importedQaIds.has(qid)) || state.sessionImportedLegacy;
-      console.log("[imported] render qid", qid, "done", done, "known", [...state.importedQaIds]);
+      // The "✓ Imported" state comes from this message's own `imported_rag` row (returned by
+      // GET /sessions/{id}), NOT from the question it happens to bind to — so deleting or
+      // re-grouping the question never spreads the state to siblings or hides it. Legacy
+      // whole-session imports (no per-message data) stay a blanket ✓.
+      const done = state.importedByMsgId.get(div.dataset.id) === true || state.sessionImportedLegacy;
+      console.log("[imported] render msg", div.dataset.id, "done", done, "legacy", state.sessionImportedLegacy);
       items.push(["import", "📥", (b) => importPair(div, b), done]);
     }
     items.push(["delete", "🗑", () => startDeleteSelection(div)]);
@@ -825,7 +815,8 @@
     // twice, and flip the button to its persistent "✓ Imported" state on the spot.
     const fresh = await fetchImportedState(state.sessionId);
     if (fresh && (fresh.session_imported || fresh.qa_source_ids.includes(userEl.dataset.id))) {
-      state.importedQaIds.add(userEl.dataset.id);
+      state.importedByMsgId.set(asstId, true);
+      if (userEl && userEl.dataset.id) state.importedByMsgId.set(userEl.dataset.id, true);
       if (fresh.session_imported) state.sessionImported = true;
       if (btn) { btn.disabled = true; setBtnLabel(btn, "✓ Imported"); }
       Viewer.toast("This Q&A pair is already in the query repo.");
@@ -852,7 +843,10 @@
       }
       const data = await res.json();
       if (btn) setBtnLabel(btn, "✓ Imported");
-      if (userEl && userEl.dataset.id) state.importedQaIds.add(userEl.dataset.id);
+      // Both halves of the pair are now in the repo — mark them so the button renders ✓ and
+      // stays ✓ even if the question it binds to later changes (delete / regroup).
+      state.importedByMsgId.set(asstId, true);
+      if (userEl && userEl.dataset.id) state.importedByMsgId.set(userEl.dataset.id, true);
       Viewer.toast(`✅ Imported ${data.chunks} chunk${data.chunks === 1 ? "" : "s"} into the query repo.`);
     } catch (err) {
       if (btn) {
@@ -949,8 +943,12 @@
         const n = (st.result && st.result.chunks) || 0;
         if (btn) { btn.disabled = true; setBtnLabel(btn, "✓ Imported"); }
         if (isActive) {
-          // Re-fetch per-message coverage: pairs imported just now flip to "✓ Imported",
-          // while any message appended since the job was queued stays importable.
+          // The rebuild re-wrote the whole transcript, so every rendered message is now in the
+          // repo: mark them all and reconcile the buttons (a message appended while the job
+          // was queued was included too — the rebuild covers the whole current session).
+          chatLog.querySelectorAll(".msg.user, .msg.assistant").forEach((el) => {
+            if (el.dataset.id) state.importedByMsgId.set(el.dataset.id, true);
+          });
           await refreshImportedState();
         }
         finishImporting(sessionId);
@@ -992,13 +990,12 @@
     }
   }
 
-  // Refresh the persistent "imported" state for the active session: which Q&A pairs are
-  // already in the query repo, and whether the whole session was imported as session-qa.
-  // Called on session load (before rendering buttons) so an already-imported pair stays
-  // disabled across session switches and app restarts. Non-fatal on network errors — the
-  // buttons just stay enabled and a retry via the toast still works.
+  // Refresh the aggregate imported state for the active session (whole-session coverage +
+  // the legacy pre-coverage blanket flag). Per-message flags come from the session detail
+  // (GET /sessions/{id}); this only fills the session-level view used by the import guards.
+  // Non-fatal on network errors — the buttons just stay enabled and a retry via the toast
+  // still works.
   async function refreshImportedState() {
-    state.importedQaIds = new Set();
     state.sessionImported = false;
     state.sessionImportedLegacy = false;
     if (!state.sessionId) {
@@ -1006,10 +1003,9 @@
     }
     const data = await fetchImportedState(state.sessionId);
     if (!data) return;
-    state.importedQaIds = new Set(data.qa_source_ids || []);
     state.sessionImported = !!data.session_imported;
     state.sessionImportedLegacy = !!data.legacy_session_imported;
-    console.log("[imported] session", state.sessionId, "qaIds", [...state.importedQaIds], "sessionImported", state.sessionImported, "legacy", state.sessionImportedLegacy);
+    console.log("[imported] session", state.sessionId, "sessionImported", state.sessionImported, "legacy", state.sessionImportedLegacy);
     applyImportedStateToDom();
   }
 
@@ -1021,8 +1017,7 @@
   function applyImportedStateToDom() {
     chatLog.querySelectorAll('.msg.assistant .msg-actions button[data-a="import"]').forEach((b) => {
       const div = b.closest(".msg.assistant");
-      const qid = div ? boundUserMsgId(div) : null;
-      const done = (qid && state.importedQaIds.has(qid)) || state.sessionImportedLegacy;
+      const done = (div && state.importedByMsgId.get(div.dataset.id) === true) || state.sessionImportedLegacy;
       if (done) {
         b.disabled = true;
         setBtnLabel(b, "✓ Imported");
@@ -1558,7 +1553,7 @@
   // New chat: drop the active session reference and clear the pane.
   function newChat() {
     state.sessionId = null;
-    state.importedQaIds = new Set();
+    state.importedByMsgId = new Map();
     state.sessionImported = false;
     state.sessionImportedLegacy = false;
     chatLog.innerHTML = "";
@@ -3070,6 +3065,9 @@
     pin: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1z"/></svg>',
     pencil: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>',
     book: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>',
+    mindmap: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v5"/><path d="M12 8l4 4"/><path d="M12 8l-4 4"/><circle cx="6" cy="16" r="2"/><circle cx="12" cy="16" r="2"/><circle cx="18" cy="16" r="2"/></svg>',
+    slides: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="11" rx="1"/><path d="M12 15v4"/><path d="M8 20l4-3 4 3"/></svg>',
+    notes: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 13h6"/><path d="M9 17h4"/></svg>',
     trash: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
   };
 
@@ -3138,6 +3136,12 @@
     if (e.key === "Escape") closeSessionMenu();
   });
 
+  // Placeholder for session features that are planned but not implemented yet; each
+  // menu entry is a link only and reports a "not implemented" toast when clicked.
+  function stubFeature(label) {
+    Viewer.toast(`"${label}" is not implemented yet.`);
+  }
+
   function buildSessionMenu(s, summaryEl) {
     const pinned = isPinned(s.id);
     return [
@@ -3155,6 +3159,21 @@
         iconSvg: SESSION_ICONS.book,
         label: "Import to Knowledge",
         action: () => importSessionFor(s.id),
+      },
+      {
+        iconSvg: SESSION_ICONS.mindmap,
+        label: "Generate Mind Map",
+        action: () => stubFeature("Generate Mind Map"),
+      },
+      {
+        iconSvg: SESSION_ICONS.slides,
+        label: "Generate Slides",
+        action: () => stubFeature("Generate Slides"),
+      },
+      {
+        iconSvg: SESSION_ICONS.notes,
+        label: "Summarize & Save Notes",
+        action: () => stubFeature("Summarize & Save Notes"),
       },
       {
         iconSvg: SESSION_ICONS.trash,
@@ -3259,8 +3278,15 @@
       if (!res.ok) throw new Error(`${res.status}`);
       const data = await res.json();
       state.sessionId = id;
-      // Fetch which pairs are already imported BEFORE rendering so the import buttons
-      // are born with their persistent state (disabled + "✓ Imported").
+      // Per-message import state comes straight from the rows returned by GET /sessions/{id}:
+      // the backend flips imported_rag on import, so a reopened session shows "✓ Imported"
+      // without any re-derivation. Rebuild the map before rendering.
+      state.importedByMsgId = new Map();
+      for (const m of data.messages) {
+        if (m.imported_rag) state.importedByMsgId.set(m.id, true);
+      }
+      // Fetch legacy whole-session blanket state (pre-flag imports) BEFORE rendering so the
+      // import buttons are born with their persistent state (disabled + "✓ Imported").
       await refreshImportedState();
       chatLog.innerHTML = "";
       for (const m of data.messages) {

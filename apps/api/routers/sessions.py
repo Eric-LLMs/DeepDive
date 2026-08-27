@@ -11,12 +11,72 @@ from agent.tools.checkpoints import CheckpointError
 from api.auth import AuthUser, require_user
 from api.deps import get_agent
 from api.schemas import ApprovalResolveRequest, SessionRenameRequest
-from core.infrastructure.db import MessageModel, SessionLocal, SessionModel
+from core.infrastructure.db import ChunkModel, MessageModel, SessionLocal, SessionModel
 from core.infrastructure.memory import list_sessions, load_session_detail
 from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 router = APIRouter(tags=["sessions"])
+
+
+async def _backfill_imported_rag(session_factory, user_id: UUID, session_id: UUID) -> None:
+    """One-time on-read conversion: derive ``imported_rag`` flags from pre-flag chat chunks.
+
+    Before the per-message flag existed, imports were tracked only in chunk meta: single-pair
+    chunks keyed by the user-message id (``kind='qa'`` without ``covered``), whole-session
+    chunks carrying ``meta['covered']``, and the even-older ``kind='session-qa'`` blanket.
+    Reconstructing the flags here lets an already-imported session keep its persistent
+    "✓ Imported" state right after the upgrade, without forcing a re-import. If every current
+    user message is covered (or a legacy blanket chunk exists) the whole transcript is in the
+    repo, so every message gets flagged; otherwise only the covered user messages do (a
+    regenerated assistant reply has no chunk identity to recover, and clicking its button is
+    an idempotent re-import). Idempotent — a message already flagged stays flagged.
+    """
+    async with session_factory() as session:
+        chunk_rows = (
+            await session.execute(
+                select(ChunkModel.source_id, ChunkModel.meta).where(
+                    ChunkModel.source_type == "chat",
+                    ChunkModel.user_id == user_id,
+                    ChunkModel.meta["session_id"].astext == str(session_id),
+                )
+            )
+        ).all()
+        msg_rows = (
+            await session.execute(
+                select(MessageModel.id, MessageModel.role, MessageModel.imported_rag)
+                .where(MessageModel.session_id == session_id)
+            )
+        ).all()
+    covered: set[str] = set()
+    legacy_blanket = False
+    for source_id, meta in chunk_rows:
+        meta = meta or {}
+        kind = meta.get("kind")
+        if kind == "session-qa":
+            legacy_blanket = True
+        elif kind == "qa":
+            cov = meta.get("covered")
+            if isinstance(cov, list) and cov:
+                covered.update(str(c) for c in cov)
+            else:
+                covered.add(source_id)  # legacy single-pair: source_id is the user-message id
+    if not covered and not legacy_blanket:
+        return
+    already = {str(mid) for mid, _, flag in msg_rows if flag}
+    user_ids = [str(mid) for mid, role, _ in msg_rows if role == "user"]
+    if legacy_blanket or covered.issuperset(user_ids):
+        candidates = [str(mid) for mid, _, _ in msg_rows]  # every message is in the repo
+    else:
+        candidates = [mid for mid in covered if mid in user_ids]  # covered user messages only
+    flag_ids = [mid for mid in candidates if mid not in already]
+    if not flag_ids:
+        return
+    async with session_factory() as session:
+        await session.execute(
+            update(MessageModel).where(MessageModel.id.in_(flag_ids)).values(imported_rag=True)
+        )
+        await session.commit()
 
 
 @router.get("/sessions")
@@ -38,6 +98,8 @@ async def get_session_messages(session_id: UUID, user: AuthUser = Depends(requir
         ).scalar_one_or_none()
     if sess is None or sess.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="session not found")
+    # Recover pre-flag imported state onto the message rows so the response below carries it.
+    await _backfill_imported_rag(SessionLocal, user.user_id, session_id)
     detail = await load_session_detail(SessionLocal, session_id)
     return {"session_id": str(session_id), "title": detail["title"], "messages": detail["messages"]}
 

@@ -733,6 +733,12 @@ class MessageModel(Base):
     role: Mapped[str] = mapped_column(String, nullable=False)  # 'user' | 'assistant' | 'tool'
     text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list] = mapped_column(Vector(settings.embedding_dim), nullable=True)
+    # True once this message's content is in the RAG query repository. The message row is the
+    # source of truth for the client's "✓ Imported" state (survives deletes / regrouping, so a
+    # pair's state never spreads to siblings and an imported pair can't be re-imported).
+    imported_rag: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

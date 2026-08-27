@@ -380,8 +380,10 @@ async def _first_matching_text(
 async def load_session_detail(session_factory, session_id: UUID) -> dict:
     """Return a session's title + messages (with ids) for resume.
 
-    Messages carry their ``id`` so the client can delete a single message; the shape of
-    :func:`load_session_messages` (used by the agent kernel) is intentionally untouched.
+    Messages carry their ``id`` so the client can delete a single message, plus the
+    per-message ``imported_rag`` flag so the "✓ Imported" button state comes straight from
+    the row instead of a separate coverage query. The shape of :func:`load_session_messages`
+    (used by the agent kernel) is intentionally untouched.
     """
     async with session_factory() as session:
         sess = (
@@ -401,6 +403,7 @@ async def load_session_detail(session_factory, session_id: UUID) -> dict:
                     "id": str(m.id),
                     "role": m.role,
                     "content": m.text,
+                    "imported_rag": m.imported_rag,
                     "created_at": m.created_at.isoformat() if m.created_at else None,
                 }
                 for m in rows
