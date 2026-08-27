@@ -311,6 +311,16 @@ persistence copy keeps full content. The prompt's dynamic suffix is re-rendered 
 `CacheBoundaryAssembler.refresh_dynamic(context)`; if it is unchanged from the previous step the
 system message is not resent, and the byte-stable static head is reused as-is.
 
+The API's `POST /chat/stream` forwards the agent's events **verbatim** as SSE `data:` lines, so the
+wire protocol is exactly the stream above (`thinking` / `content` / `tool` fragments, a final
+`done`) plus a verbatim **approval frame** when the agent blocks on human-in-the-loop approval.
+The approval frame can never deadlock the stream: a sibling *pump* task consumes `run_stream` into an
+unbounded `asyncio.Queue`, and the `ApprovalStore` sink pushes approval frames into the **same queue**,
+so the generator only ever reads from the queue (a plain `async for` would stall awaiting
+`POST /approvals/{id}`). On client disconnect the pump is cancelled and the loop's `except
+CancelledError` logs `turn-cancelled`; a `done` sentinel guarantees the generator terminates even on
+cancellation.
+
 ### 5.3 System prompt — `CacheBoundaryAssembler` (three-zone, cache-boundary)
 
 Sections register with an `order` plus a `zone` and merge ascending within it. The zones are the
@@ -564,7 +574,10 @@ host granted it or a human approver confirms. `ASK` with no approver degrades to
 **`fs_tools.py`** — the resident filesystem/shell tools: `read_file` (READ), `edit_file` (WRITE),
 `bash` (WRITE + NETWORK). All file access is rooted at `settings.workspace_dir` and path escape is
 rejected (`_resolve`). The desktop workbench's "generate media" flow (`/media/generate` → worker
-`generate_media`) stays a separate HTTP+job pipeline, not an agent tool.
+`generate_media`) stays a separate HTTP+job pipeline, not an agent tool: from a **local video** it
+produces a PPT/PDF "book" — parse the subtitle track (SRT/VTT/LRC) → `ffmpeg` keyframe extraction at
+subtitle timestamps → one slide per (frame, subtitle text) via `build_pptx` / `build_pdf` (CJK text
+via the STSong-Light font), written under `media_output_dir`.
 
 **`bash_sandbox.py`** — where the ``bash`` tool's commands actually run, two backends behind one
 :class:`BashSandbox` protocol (`settings.bash_sandbox` = ``"docker"`` | ``"host"``, **default
@@ -666,6 +679,29 @@ guard as an interactive one — no second, drift-prone kernel construction in th
 lands in the session like a normal chat message and `session_finalize` is deferred exactly as in the
 interactive path (payload: `user_id` / `session_id` / `message`, plus optional `model` / `base_url` /
 `api_key` to pin an LLM channel).
+
+**Job lifecycle under retries** — `WorkerSettings.max_tries` (arq's retry budget) is mirrored to PG by
+the `_run` wrapper (`apps/worker/tasks.py`): a job is marked `running` first, and **FAILED is written
+only on the final attempt** (`attempt >= max_tries`). A non-terminal failure flips the row back to
+`RUNNING` with an `error` note ("attempt N failed — retrying"), so PG never shows a false FAILED while
+arq is still retrying. arq cancels jobs past `job_timeout` with `CancelledError` (a `BaseException`,
+which a bare `except Exception` would swallow — the row would stay `running` forever); the wrapper
+records the honest terminal state before re-raising. Terminal failures are also appended as a
+best-effort **dead-letter marker** — one JSONL line on `audit_log_path` (`event: job_dead_letter`) —
+since there is no `job_events` table.
+
+**Per-asset ingest serialization** — `asset_ingest` jobs for the same asset (upload auto-enqueue,
+cloud-drive "Import to Knowledge", admin reindex) are **serialized per asset** by an in-process
+`asyncio.Lock` (`_asset_ingest_lock`): without it, two jobs' delete-by-asset + incremental insert
+would interleave and delete each other's parent chunks mid-flight (`chunks_parent_chunk_id_fkey`).
+The asset's `rag_status` walks `PARSING → CHUNKING → EMBEDDING → INDEXED/FAILED`; a cancelled or
+failed job marks the asset `FAILED` so the UI never shows a stuck badge (cancellation is a
+`BaseException`, so `except Exception` alone would leave the badge stuck).
+
+**TTS streaming** — besides the `/tts` job, `GET /tts/stream` streams a transcript sentence by
+sentence over SSE: each `segment` event carries a **cached WAV URL** (synthesized in-process against
+the localhost Kokoro container), so the client plays sentence 1 while the later ones are still
+generating; `error` / `done` frames terminate the stream.
 
 ## 9. Retrieval Service (gRPC)
 
@@ -1229,6 +1265,13 @@ Fields below mirror the migration DDL exactly;
   index on `(user_id, created_at)`. Chat usage is priced via `compute_cost` and debited atomically
   (`UPDATE … WHERE balance >= cost`), so insufficient funds never overdraw.
 
+Two auth details worth knowing: **the admin credential is mirrored into `users`** — on every boot the
+startup guard (`apps/api/main.py`, `security.py`) upserts a `users` row matching
+`app_settings['admin']`, so `admin/admin` can also sign in through `/auth/login` (the desktop client),
+not just the stateless `/admin/login`. And **a password reset revokes every login token** for the user
+(`/auth/reset-password` flips all their `login_tokens.is_active` false), so the old password stops
+working immediately.
+
 ### 12.4 Business logic — per-user LLM-key assignment & the disable (Tokens module)
 
 The Tokens page manages **per-user LLM-key access** — two tables, one concern each. `login_tokens`
@@ -1339,6 +1382,13 @@ request-time, and admin-only:
 - `access_tokens` — written at **login** (lazily insert the (user, key) grant the moment a key is
   first assigned to the user) and by **admin** (flip `is_active` to grant/revoke the key; delete
   the row). Nothing here ever blocks a login.
+
+**No-channel is an explicit 503, never a silent fallback** — when the `anonymous` tier has no usable
+channel either, the chat endpoint **blocks with HTTP 503** (message: ask the admin to configure a
+channel) rather than falling back to the legacy global client: a silent fallback would hide a
+misconfiguration behind a paywall that looks like normal usage. A signed-in user whose keys are all
+exhausted still degrades to the anonymous tier, but the response carries a `notice` field telling
+them they are running on the guest quota (and whether they hit `guest_daily_limit`).
 
 ### 12.5 Session & message deletion
 
