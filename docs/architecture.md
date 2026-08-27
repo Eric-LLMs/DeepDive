@@ -49,6 +49,7 @@
   - [12.2 Billing and Logs](#122-billing-and-logs)
   - [12.3 Implemented auth, RBAC & billing schema](#123-implemented-auth-rbac--billing-schema)
   - [12.4 Business logic — per-user LLM-key assignment & the disable (Tokens module)](#124-business-logic--per-user-llm-key-assignment--the-disable-tokens-module)
+  - [12.5 Session & message deletion](#125-session--message-deletion)
 - [13. Multi-Tenancy and Deployment Strategy](#13-multi-tenancy-and-deployment-strategy)
 - [14. Cloud Drive Module](#14-cloud-drive-module)
   - [14.1 Database](#141-database)
@@ -1338,6 +1339,25 @@ request-time, and admin-only:
 - `access_tokens` — written at **login** (lazily insert the (user, key) grant the moment a key is
   first assigned to the user) and by **admin** (flip `is_active` to grant/revoke the key; delete
   the row). Nothing here ever blocks a login.
+
+### 12.5 Session & message deletion
+
+Deleting a session is a **synchronous hard delete** — the request handler issues a single
+`DELETE FROM sessions` (`DELETE /sessions/{id}`, `apps/api/routers/sessions.py`), and the database's
+`ON DELETE CASCADE` (migration `0001_init.sql`) removes that session's `messages` and `session_events`
+in the same statement. Deleting a single message (`DELETE /sessions/{id}/messages/{mid}`) is a plain
+single-row `DELETE FROM messages`; nothing references `messages.id`, so there is no cascade and no
+orphan risk. Because `messages.embedding` lives in the row, a deleted message also vanishes from the
+memory-recall corpus (§5.4) automatically.
+
+**The query repository is not cascaded.** Chat-imported knowledge lives in `chunks` with
+`source_type='chat'` and a `source_id` that is a **plain string with no FK** to `sessions`/`messages`
+(§10.8) — deleting a session or message leaves its imported Q&A chunks in place, still recallable by
+the importing owner. Only `asset_id`-linked file chunks cascade (FK → `assets` `ON DELETE CASCADE`).
+Deleting a chat and removing it from the RAG corpus are therefore separate operations today: a pair
+already imported to knowledge is removed via the admin **RAG → Repository** per-chunk delete
+(`DELETE /admin/rag/repository/{chunk_id}`) or by re-importing a changed source, not by deleting the
+session.
 
 ## 13. Multi-Tenancy and Deployment Strategy
 
