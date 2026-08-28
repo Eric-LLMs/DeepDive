@@ -3,6 +3,7 @@
 Reads from environment variables / .env via pydantic-settings.
 Field names map one-to-one to the environment variables in .env (case-insensitive).
 """
+import os
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -78,6 +79,15 @@ class Settings(BaseSettings):
     web_search_api_key: str = ""
     web_search_engine_id: str = ""        # google Custom Search engine id (cx)
 
+    # ── Reddit social search (search_social plugin) ──
+    # Official OAuth creds from a free *script* app (https://www.reddit.com/prefs/apps).
+    # The plugin reads these from os.environ at call time; export_secret_env() bridges the
+    # .env-loaded values at agent build time. All four must be set to go live.
+    reddit_client_id: str = ""
+    reddit_client_secret: str = ""
+    reddit_username: str = ""
+    reddit_password: str = ""
+
     # Runtime mirror of the generic tools namespace (cfg["tools"]). Populated by apps.api at
     # startup and on /config save; tool code reads its params via get_tool_config().
     tool_configs: dict[str, dict] = {}
@@ -85,8 +95,8 @@ class Settings(BaseSettings):
     # ── Agent ──
     workspace_dir: Path = Path(".")            # root for the agent's read_file/edit_file/bash
     memory_dir: Path = Path("data/memory")     # file memory directory (MEMORY.md index)
-    skills_dir: Path = Path("data/skills")     # *.skill.md skills directory
-    plugins_dir: Path = Path("data/plugins")   # third-party plugin directory (*/plugin.py)
+    skills_dir: Path = Path("skills")          # *.skill.md skills directory (version-controlled)
+    plugins_dir: Path = Path("plugins")        # plugin directory (*/plugin.py) (version-controlled)
     session_summary_enabled: bool = True       # generate an LLM summary on session close
     memory_recall_top_k: int = 5               # proactive recall count for the prompt memory section
     memory_note_max_chars: int = 4000          # memory_save content length cap (guardrail)
@@ -180,6 +190,24 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# Secret Settings fields that standalone plugins (discovered from disk, no access to
+# Settings) read from os.environ at call time. export_secret_env() bridges the .env-loaded
+# values into os.environ at agent build time, so a direct environment variable still wins.
+_SECRET_ENV_FIELDS = {
+    "reddit_client_id": "REDDIT_CLIENT_ID",
+    "reddit_client_secret": "REDDIT_CLIENT_SECRET",
+    "reddit_username": "REDDIT_USERNAME",
+    "reddit_password": "REDDIT_PASSWORD",
+}
+
+
+def export_secret_env() -> None:
+    """Mirror .env-loaded secret Settings into os.environ (existing env vars win)."""
+    for field, env in _SECRET_ENV_FIELDS.items():
+        value = getattr(settings, field)
+        if value:
+            os.environ.setdefault(env, value)
 
 
 def get_tool_config(tool_id: str) -> dict:

@@ -189,6 +189,8 @@ deepdive/
 │   └── shared/proto/retrieval/   # generated protobuf/gRPC stubs (import name `retrieval.v1`)
 ├── data/
 │   └── soul.md                   # agent identity persona (STATIC_PREFIX source)
+├── skills/                       # version-controlled `*.skill.md` (skill catalog, lazy-loaded via the `skill` tool)
+├── plugins/                      # version-controlled `*/plugin.py` (auto-discovered at startup; e.g. `social_search`)
 ├── migrations/                   # numbered SQL migrations (applied by init_db.py; replaces Alembic)
 ├── proto/retrieval/v1/retrieval.proto   # RetrievalService contract
 ├── buf.yaml / buf.gen.yaml             # proto lint / breaking / codegen

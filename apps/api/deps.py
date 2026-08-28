@@ -29,7 +29,7 @@ from api.tools import register_builtin_tools
 from api.tools.toolkit import register_toolkit_plugins
 from core.application.drive_service import DriveService
 from core.application.services import VocabularyService
-from core.config import settings
+from core.config import export_secret_env, settings
 from core.infrastructure.db import SessionLocal
 from core.infrastructure.images import ImageScraper
 from core.infrastructure.jobs import JobStore, TaskQueue
@@ -85,6 +85,9 @@ def _retriever() -> RAGPipeline:
 
 @lru_cache
 def _agent() -> AgentKernel:
+    # Bridge .env-loaded secrets (e.g. reddit OAuth) into os.environ so standalone
+    # plugins discovered from disk can read them; direct env vars still win.
+    export_secret_env()
     runtime = ToolRuntime(approval=get_approval_bridge())
     ctx = Context()
 

@@ -30,6 +30,11 @@ DESKTOP_DIR="apps/desktop"
 WEB_DIR="apps/web"
 LOG_DIR="data"
 UVICORN_LOG="$LOG_DIR/uvicorn.log"
+# Version-controlled asset dirs: skills (*.skill.md) and plugins (*/plugin.py) live at
+# the repo root, NOT under data/ (data/ is runtime state and git-ignored). Point the
+# backend at them explicitly so a launch from any CWD resolves the same files.
+export SKILLS_DIR="$REPO_ROOT/skills"
+export PLUGINS_DIR="$REPO_ROOT/plugins"
 WEB_LOG="$LOG_DIR/web.log"
 PID_FILE="$LOG_DIR/uvicorn.pid"
 WEB_PORT=5273

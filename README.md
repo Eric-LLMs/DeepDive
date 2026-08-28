@@ -604,13 +604,16 @@ The default `admin` / `admin` account is seeded on first boot and ready to sign 
 | `RETRIEVAL_MODE` / `RETRIEVAL_GRPC_ADDR` | `in_process` / `localhost:15051` | capability seam: `in_process` or `grpc` |
 | `WORKSPACE_DIR` | `.` | agent filesystem-tool root (`read_file` / `edit_file` / `bash`; path escape rejected) |
 | `MEMORY_DIR` | `data/memory` | file memory directory (`MEMORY.md` index + one frontmatter `.md` per memory) |
-| `SKILLS_DIR` | `data/skills` | `SKILL.md` skills directory (lazy-loaded via the `skill` tool) |
+| `SKILLS_DIR` | `skills` | `SKILL.md` skills directory at the repo root (version-controlled; lazy-loaded via the `skill` tool) |
+| `PLUGINS_DIR` | `plugins` | plugin directory (`*/plugin.py`, version-controlled; auto-discovered at startup) |
 | `MEMORY_NOTE_MAX_CHARS` | `4000` | `memory_save` content length cap (guardrail) |
 | `MEMORY_RECALL_TOP_K` | `5` | proactive recall hits injected into the prompt memory section |
 | `HISTORY_MAX_MESSAGES` / `HISTORY_KEEP_MESSAGES` | `40` / `20` | chat history length that triggers compaction / most-recent messages kept after compaction |
 | `SESSION_EVENTS_RETENTION_DAYS` / `RETENTION_CRON` | `30` / `17 4 * * *` | daily worker cron purges `session_events` (audit log) older than this many days / its 5-field cron schedule |
 | `WORKER_CONCURRENCY` / `WORKER_JOB_TIMEOUT` | `10` / `3600` | arq worker max concurrent jobs / per-job timeout (seconds); large-file RAG ingest needs a generous budget (PDF parse + embed) |
 | `WEB_SEARCH_PROVIDER` / `WEB_SEARCH_API_KEY` / `WEB_SEARCH_ENGINE_ID` | `tavily` / `""` / `""` | web-search provider (`duckduckgo` \| `tavily` \| `bing` \| `google`) + API key + google engine id; normally managed in admin → **Tools config**, these flat keys mirror that namespace |
+| `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` / `REDDIT_USERNAME` / `REDDIT_PASSWORD` | `""` ×4 | `search_social` plugin reddit OAuth (free *script* app creds from `reddit.com/prefs/apps`); all four set → official `oauth.reddit.com` API, otherwise anonymous `search.json` (often 403) |
+| `X_BEARER_TOKEN` | `""` | `search_social` plugin `x` platform — X API v2 bearer token; without it the `x` adapter raises a clear error |
 | `OBJECT_STORE_ROOT` | `data/objects` | cloud-drive blob store root (SHA-256 content-addressed, ref-counted) |
 | `DRIVE_CHUNK_SIZE` | `8MB` | cloud-drive upload chunk size |
 | `DRIVE_MAX_CHUNKS` | `1024` | max chunks per upload session (cap on single-file size) |
