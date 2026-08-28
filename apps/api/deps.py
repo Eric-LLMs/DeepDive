@@ -26,6 +26,7 @@ from agent.tools.checkpoints import CheckpointStore
 from agent.tools.fs_tools import register_fs_tools
 from agent.tools.project_context import read_project_context
 from api.tools import register_builtin_tools
+from api.tools.toolkit import register_toolkit_plugins
 from core.application.drive_service import DriveService
 from core.application.services import VocabularyService
 from core.config import settings
@@ -157,9 +158,13 @@ def _agent() -> AgentKernel:
     # always sees its full schema in the tools array from step 0 — no tool_search
     # discovery step required before it can retrieve from imported material.
     kernel.gateway.policy.allow("rag_search")
+    # Toolkit content tools are primary user-facing tools: keep them resident too.
+    for _toolkit_name in ("summary_gen", "mindmap_gen", "slides_gen"):
+        kernel.gateway.policy.allow(_toolkit_name)
 
     manager = PluginManager(runtime, skills, ctx)
     register_builtin_plugins(manager)
+    register_toolkit_plugins(manager, ctx, llm)
     manager.discover(settings.plugins_dir)
     return kernel
 

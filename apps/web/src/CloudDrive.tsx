@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { renderMarkdown } from "./markdown";
+import { isMindmapText, renderMindmap } from "./mindmap";
 import FilePreview, { officeKindOf } from "./FilePreview";
 import type {
   DriveFile,
@@ -1410,7 +1411,7 @@ export default function CloudDrive() {
     if (/\.(csv|tsv)$/i.test(name)) return false;
     const mime = (f.mime_type || "").toLowerCase();
     if (mime.startsWith("text/")) return true;
-    return /\.(txt|md|markdown|text|log|json|yaml|yml|toml|ini|xml|html|py|js|ts|jsx|tsx|c|h|cpp|hpp|java|go|rs|sh|bat|sql)$/i.test(
+    return /\.(txt|md|markdown|text|log|json|yaml|yml|toml|ini|xml|html|mmd|py|js|ts|jsx|tsx|c|h|cpp|hpp|java|go|rs|sh|bat|sql)$/i.test(
       name
     );
   };
@@ -1422,7 +1423,9 @@ export default function CloudDrive() {
       setEditing(f);
       setDraft(content);
       setDirty(false);
-      setPreview(false);
+      // A Mermaid mindmap opens straight into the diagram preview (树状图); ✏️ Edit still
+      // shows the .mmd source.
+      setPreview(isMindmapText(content));
     } catch (e) {
       setError(String(e));
     }
@@ -1829,7 +1832,10 @@ export default function CloudDrive() {
                 <button className="ghost" onClick={closeNote} title="Close note">✖</button>
               </div>
               {preview ? (
-                <div className="md-preview" dangerouslySetInnerHTML={{ __html: renderMarkdown(draft) }} />
+                <div
+                  className="md-preview"
+                  dangerouslySetInnerHTML={{ __html: isMindmapText(draft) ? renderMindmap(draft) : renderMarkdown(draft) }}
+                />
               ) : (
                 <textarea
                   className="note-editor-textarea"

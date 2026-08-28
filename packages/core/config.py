@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     # ── Media (desktop workbench: keyframes → PPT / PDF book) ──
     media_output_dir: Path = Path("data/media_output")
 
+    # ── Toolkit content generation (workspace files → slides / mindmap / summary) ──
+    # Output root (relative to the workspace) and input guardrails: text above the token
+    # budget triggers map-reduce; files over the byte cap are refused outright.
+    toolkit_output_dir: Path = Path(".output")
+    toolkit_max_input_tokens: int = 12000
+    toolkit_max_file_bytes: int = 2 * 1024 * 1024
+
     # ── Web search (agent web_search tool) ──
     # provider is free text: duckduckgo (no key) | tavily | bing | google (see web_search.py).
     # These are mirrored from the generic tools namespace (cfg["tools"]["web_search"]) at

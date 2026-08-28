@@ -1,5 +1,6 @@
 """API request/response models."""
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -127,6 +128,14 @@ class MediaGenerateRequest(BaseModel):
     subtitle_path: str | None = None
     format: str = "pptx"             # "pptx" | "pdf"
     title: str | None = None
+
+
+class ToolkitGenerateRequest(BaseModel):
+    tool: Literal["slides", "mindmap", "summary"]
+    paths: list[str] | None = None       # workspace-relative file paths (file mode)
+    output_dir: str | None = None        # workspace-relative output dir override (file mode)
+    session_id: UUID | None = None       # generate from this session's conversation (session mode)
+    folder_path: str | None = None       # Cloud Drive target folder (session mode; None = drive root)
 
 
 class ConfigUpdateRequest(BaseModel):

@@ -1467,6 +1467,16 @@ button.settings-row.on .check {
 .md-preview th { background: var(--panel-raised, var(--panel)); }
 .md-preview hr { border: none; border-top: 1px solid var(--border); margin: 1.2em 0; }
 .md-preview img { max-width: 100%; }
+/* Mermaid mindmap diagram rendered in the note preview (tree of nodes + edges).
+   Rendered at natural 1:1 size — the .md-preview pane scrolls to explore wide trees. */
+.mmd-tree {
+  display: block;
+  max-width: none;
+  background: #eef4ff;
+  border: 1px solid #d5e2fa;
+  border-radius: 8px;
+  margin: 8px 0;
+}
 .drive-tree {
   flex: 0 0 240px;
   max-height: calc(100vh - 220px);

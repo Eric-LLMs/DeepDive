@@ -3,7 +3,10 @@
 The worker never loads models in-process; llm/tts/embedder are HTTP clients to the model
 containers, images is the scraper, and session_factory/job_store talk to PostgreSQL.
 """
+import logging
 from typing import ClassVar
+
+logger = logging.getLogger(__name__)
 
 from arq import cron
 from arq.connections import RedisSettings
@@ -15,6 +18,7 @@ from core.infrastructure.llm import OpenAILLM
 from core.infrastructure.tts import TTSClient
 from core.infrastructure.vector import TEIEmbedder
 
+from apps.api.tools.toolkit.session_source import cleanup_stale_sources
 from apps.worker import tasks
 
 
@@ -27,13 +31,12 @@ async def _active_llm_channel() -> tuple[str | None, str | None, str | None]:
     no active channel the worker falls back to the legacy settings (the litellm gateway), so a
     fresh deploy still boots.
     """
-    from sqlalchemy import select
-
     from core.infrastructure.db import (
         CredentialModelModel,
         LLMCredentialModel,
         LLMModelModel,
     )
+    from sqlalchemy import select
 
     async with SessionLocal() as session:
         credential = (
@@ -75,6 +78,11 @@ async def _active_llm_channel() -> tuple[str | None, str | None, str | None]:
 
 
 async def startup(ctx) -> None:
+    # A worker killed mid-job (OOM / SIGKILL) can leave an orphaned session transcript in
+    # .toolkit_session_src; sweep anything older than 24h so the temp dir never accumulates.
+    removed = cleanup_stale_sources(settings.workspace_dir)
+    if removed:
+        logger.info("cleaned %d stale toolkit session transcripts", removed)
     base_url, api_key, model = await _active_llm_channel()
     ctx["llm"] = OpenAILLM(api_key=api_key, base_url=base_url, model=model)
     ctx["tts"] = TTSClient()
@@ -136,6 +144,7 @@ class WorkerSettings:
         tasks.asset_ingest,
         tasks.learning_import,
         tasks.chat_session_import,
+        tasks.toolkit_generate,
         tasks.run_agent_turn,
     ]
     on_startup = startup

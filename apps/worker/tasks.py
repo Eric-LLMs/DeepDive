@@ -17,10 +17,16 @@ from sqlalchemy import or_, select, update
 logger = logging.getLogger(__name__)
 
 from api.deps import get_agent  # the hardened AgentKernel singleton (worker→api coupling)
-from core.application.drive_service import READY
+from core.application.drive_service import READY, DriveService
 from core.config import settings
 from core.infrastructure import media
-from core.infrastructure.db import ChunkModel, MessageModel, SessionEventModel
+from core.infrastructure.db import (
+    ChunkModel,
+    MessageModel,
+    SessionEventModel,
+    SessionLocal,
+    SessionModel,
+)
 from core.infrastructure.drive_repositories import (
     SqlAssetRepository,
     SqlChunkRepository,
@@ -32,7 +38,11 @@ from core.infrastructure.ingest import (
     write_query_repo_chunks,
 )
 from core.infrastructure.jobs import SESSION_FINALIZE, JobStore, TaskQueue
-from core.infrastructure.memory import SessionMemoryStore, finalize_session
+from core.infrastructure.memory import (
+    SessionMemoryStore,
+    finalize_session,
+    load_session_detail,
+)
 from core.infrastructure.repositories import (
     SqlArticleRepository,
     SqlSentenceRepository,
@@ -237,6 +247,97 @@ async def generate_media(ctx, job_id: str, payload: dict) -> dict:
         return await asyncio.to_thread(_build_media, payload)
 
     return await _run(ctx, job_id, work())
+
+
+async def toolkit_generate(ctx, job_id: str, payload: dict) -> dict:
+    """Generate slides / mindmap / summary (async job path).
+
+    Two modes:
+
+    - **file mode**: generate from workspace files. The payload paths are already confined
+      to the workspace by the router; the pipeline re-checks.
+    - **session mode** (``payload["session_id"]``): generate from a chat session's
+      conversation and write the artifacts into the caller's Cloud Drive
+      (``payload["folder_path"]`` or the drive root).
+    """
+
+    async def work() -> dict:
+        if payload.get("session_id"):
+            return await _generate_from_session(ctx, job_id, payload)
+        from apps.api.tools.toolkit import pipeline_for
+
+        result = await pipeline_for(payload["tool"], ctx["llm"]).run(
+            payload["paths"], output_dir=payload.get("output_dir")
+        )
+        return {"files": result.files, "summary": result.summary}
+
+    return await _run(ctx, job_id, work())
+
+
+async def _generate_from_session(ctx, job_id: str, payload: dict) -> dict:
+    """Session mode: read the chat transcript, generate, and persist artifacts to the drive.
+
+    The job's owner comes from the job row (never from client input); the session's owner is
+    re-checked as defense in depth. A temp transcript is written inside the workspace — the
+    pipeline's ``_resolve`` refuses sources outside it — and always deleted afterwards.
+    """
+    from apps.api.tools.toolkit import pipeline_for
+    from apps.api.tools.toolkit.session_source import (
+        SESSION_SRC_DIR,
+        artifact_plan,
+        build_transcript,
+        sanitize_name,
+    )
+
+    job_row = await ctx["job_store"].get(UUID(job_id))
+    if job_row is None or job_row.user_id is None:
+        raise RuntimeError("job has no owner")
+    user_id = job_row.user_id
+
+    session_id = UUID(payload["session_id"])
+    async with SessionLocal() as session:
+        sess = await session.get(SessionModel, session_id)
+    if sess is None or sess.user_id != user_id:
+        raise RuntimeError("session not found")
+
+    title = sess.title or "session"
+    detail = await load_session_detail(SessionLocal, session_id)
+    transcript = build_transcript(title, detail["messages"])
+
+    src_dir = Path(settings.workspace_dir) / SESSION_SRC_DIR
+    src_dir.mkdir(parents=True, exist_ok=True)
+    tmp_source = src_dir / f"{sanitize_name(title)}_{job_id[:8]}.md"
+    try:
+        tmp_source.write_text(transcript, encoding="utf-8")
+        result = await pipeline_for(payload["tool"], ctx["llm"]).run([str(tmp_source)])
+        plan = artifact_plan(payload["tool"], title)
+        drive = DriveService(SessionLocal)
+        assets = []
+        for path in result.files:
+            entry = plan.get(Path(path).suffix.lower())
+            if entry is None:
+                continue
+            name, mime = entry
+            asset = await drive.save_artifact(
+                user_id,
+                name,
+                mime,
+                Path(path).read_bytes(),
+                folder_path=payload.get("folder_path"),
+            )
+            assets.append(
+                {
+                    "asset_id": str(asset.id),
+                    "name": asset.name,
+                    "folder_path": asset.folder_path,
+                }
+            )
+        return {"tool": payload["tool"], "assets": assets, "summary": result.summary}
+    finally:
+        try:
+            tmp_source.unlink()
+        except OSError:
+            pass
 
 
 async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:

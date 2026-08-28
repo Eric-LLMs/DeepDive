@@ -1094,6 +1094,23 @@ body.resizing-ew { cursor: ew-resize; }
 }
 .overlay.hidden { display: none; }
 
+/* Session-toolkit generation: in-list spinner (non-blocking, mirrors the import status).
+   The session row shows a small spinning indicator under its title while the async job
+   runs; the rest of the app stays interactive. */
+.session-item.session-generating { opacity: 0.75; cursor: default; }
+.session-item.session-generating .session-summary { color: var(--fg-dim); }
+.session-item.session-generating .session-more { opacity: 0; pointer-events: none; }
+.session-item .session-gen-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--accent); font-weight: 600;
+}
+.session-item .session-gen-spinner {
+  width: 11px; height: 11px; border-radius: 50%;
+  border: 2px solid var(--border); border-top-color: var(--accent, #4f8cff);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
 .modal {
   width: 420px;
   max-width: 92vw;
@@ -1688,6 +1705,16 @@ body.resizing-ew { cursor: ew-resize; }
 .md-preview th { background: var(--bg-soft); }
 .md-preview img { max-width: 100%; }
 .md-preview hr { border: none; border-top: 1px solid var(--border); margin: 1.2em 0; }
+/* Mermaid mindmap diagram rendered in the note preview (tree of nodes + edges).
+   Rendered at natural 1:1 size — the .md-preview pane scrolls to explore wide trees. */
+.mmd-tree {
+  display: block;
+  max-width: none;
+  background: #eef4ff;
+  border: 1px solid #d5e2fa;
+  border-radius: 8px;
+  margin: 8px 0;
+}
 
 /* ── Cloud drive parity view (web CloudDrive) ──
    Rendered by viewer.renderCloudBody; all state lives in clouddrive.js. */
@@ -1912,6 +1939,20 @@ body.resizing-ew { cursor: ew-resize; }
 /* Current-location highlight in the cloud sidebar tree. */
 .cd-current { background: var(--bg-soft-2); }
 .cd-current > .cd-name { color: var(--accent); font-weight: 600; }
+
+/* Save-dialog-style folder picker (session → toolkit generation), reusing the drive
+   tree's .cd-row / .cd-kids markup so it looks exactly like the upload panel. */
+.cd-picker-modal { width: 460px; max-width: 94vw; }
+.cd-picker-target {
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+  color: var(--accent); font-size: 13px; font-weight: 600;
+  background: var(--bg-soft-2);
+}
+.cd-picker-tree {
+  max-height: 300px; min-height: 120px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 8px; padding: 4px;
+}
+.cd-picker-tree .cd-kids { display: contents; }
 
 /* ── Cloud drive modals (Move / Share / Workspace manage) ── */
 .modal:has(.cdt-share-list) { width: 480px; }

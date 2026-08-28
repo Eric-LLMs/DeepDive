@@ -14,14 +14,47 @@ from uuid import UUID
 
 from api.auth import AuthUser, require_user
 from api.deps import get_task_queue
-from api.schemas import ExplainRequest, ImageFetchRequest, MediaGenerateRequest, TTSRequest
+from api.schemas import (
+    ExplainRequest,
+    ImageFetchRequest,
+    MediaGenerateRequest,
+    ToolkitGenerateRequest,
+    TTSRequest,
+)
 from core.config import settings
-from core.infrastructure.jobs import EXPLAIN, GENERATE_MEDIA, IMAGE_FETCH, TTS, TaskQueue
+from core.infrastructure.db import SessionLocal, SessionModel
+from core.infrastructure.jobs import (
+    EXPLAIN,
+    GENERATE_MEDIA,
+    IMAGE_FETCH,
+    TOOLKIT_GENERATE,
+    TTS,
+    TaskQueue,
+)
 from core.infrastructure.tts import TTSClient
 from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
 router = APIRouter(tags=["jobs"])
+
+
+def _confined_folder_path(path: str | None) -> str | None:
+    """Return ``path`` if it is a safe Cloud Drive folder path, else raise 400.
+
+    Mirrors :meth:`DriveService._validate_folder_path`: a folder path is ``None`` (drive
+    root) or a ``parent/child`` string with no ``..`` and no leading/trailing slash. An empty
+    string is normalized to ``None`` (root).
+    """
+    if path is None:
+        return None
+    path = path.strip()
+    if not path:
+        return None
+    if any(seg == ".." for seg in path.split("/")):
+        raise HTTPException(status_code=400, detail="folder_path: invalid segment '..'")
+    if path.startswith("/") or path.endswith("/"):
+        raise HTTPException(status_code=400, detail="folder_path: must not start or end with '/'")
+    return path
 
 
 def _confined_path(path: str, *, field: str) -> str:
@@ -87,6 +120,56 @@ async def generate_media(
             "format": body.format,
             "title": body.title,
         },
+        user_id=user.user_id,
+    )
+    return {"job_id": str(job_id)}
+
+
+@router.post("/toolkit/generate")
+async def generate_toolkit(
+    body: ToolkitGenerateRequest,
+    queue: TaskQueue = Depends(get_task_queue),
+    user: AuthUser = Depends(require_user),
+):
+    """Enqueue slides / mindmap / summary generation.
+
+    Two mutually-exclusive modes:
+
+    - **file mode** (``paths``): generate from workspace files. Every path (and the optional
+      output dir) is confined to the workspace by :func:`_confined_path`, so the worker only
+      ever reads files staged in the workspace — never arbitrary server paths.
+    - **session mode** (``session_id``): generate from a chat session's conversation and save
+      the artifacts into the caller's Cloud Drive (``folder_path`` or the drive root).
+    """
+    if body.session_id is not None:
+        if body.paths:
+            raise HTTPException(
+                status_code=400, detail="cannot combine session_id with paths"
+            )
+        async with SessionLocal() as session:
+            sess = await session.get(SessionModel, body.session_id)
+        if sess is None or sess.user_id != user.user_id:
+            raise HTTPException(status_code=404, detail="session not found")
+        job_id = await queue.enqueue(
+            TOOLKIT_GENERATE,
+            {
+                "tool": body.tool,
+                "session_id": str(body.session_id),
+                "folder_path": _confined_folder_path(body.folder_path),
+            },
+            user_id=user.user_id,
+        )
+        return {"job_id": str(job_id)}
+
+    if not body.paths:
+        raise HTTPException(status_code=400, detail="paths: at least one file required")
+    paths = [_confined_path(p, field="paths") for p in body.paths]
+    output_dir = (
+        _confined_path(body.output_dir, field="output_dir") if body.output_dir else None
+    )
+    job_id = await queue.enqueue(
+        TOOLKIT_GENERATE,
+        {"tool": body.tool, "paths": paths, "output_dir": output_dir},
         user_id=user.user_id,
     )
     return {"job_id": str(job_id)}

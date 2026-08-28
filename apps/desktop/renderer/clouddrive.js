@@ -883,7 +883,7 @@
     if (/\.(csv|tsv)$/i.test(name)) return false;
     const mime = String(f.mime_type || "").toLowerCase();
     if (mime.startsWith("text/")) return true;
-    return /\.(txt|md|markdown|text|log|json|yaml|yml|toml|ini|xml|html|py|js|ts|jsx|tsx|c|h|cpp|hpp|java|go|rs|sh|bat|sql)$/i.test(name);
+    return /\.(txt|md|markdown|text|log|json|yaml|yml|toml|ini|xml|html|mmd|py|js|ts|jsx|tsx|c|h|cpp|hpp|java|go|rs|sh|bat|sql)$/i.test(name);
   }
 
   function fmtSize(n) {
@@ -1106,7 +1106,10 @@
       noteSaveBtn.textContent = "💾 Save";
       noteEditor.classList.remove("hidden");
       setStatus("");
-      noteTextarea.focus();
+      // A Mermaid mindmap opens straight into the diagram preview (树状图) instead of raw
+      // indented text; ✏️ Edit still shows the .mmd source.
+      if (/^\s*mindmap\b/.test(res.content || "")) setPreviewMode(true);
+      else noteTextarea.focus();
     } catch (e) {
       setStatus(`Failed to open note: ${e.message}`);
     }
@@ -1141,7 +1144,9 @@
     noteModeEl.textContent = on ? "👁 preview" : "✏️ edit";
     notePreviewBtn.textContent = on ? "✏️ Edit" : "👁 Preview";
     if (on) {
-      notePreviewPane.innerHTML = renderMarkdown(noteTextarea.value);
+      notePreviewPane.innerHTML = /^\s*mindmap\b/.test(noteTextarea.value)
+        ? renderMindmap(noteTextarea.value)
+        : renderMarkdown(noteTextarea.value);
     } else {
       noteTextarea.focus();
     }
@@ -1182,6 +1187,124 @@
     return String(text).replace(/[&<>"']/g, (c) => (
       { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
     ));
+  }
+
+  // ── Mermaid mindmap preview: parse the indented tree and draw an SVG diagram ──
+  // Toolkit mindmaps are saved as Mermaid `mindmap` syntax (indent = nesting depth):
+  //   mindmap
+  //     root((Topic))
+  //       Branch
+  //         Detail
+  // Markdown would only render flat indented lines, so we rebuild the tree and lay it out
+  // as a tidy-tree SVG — the note preview then shows an actual 树状图.
+  function mmTextWidth(label) {
+    const s = String(label || "");
+    let w = 0;
+    for (const ch of s) w += ch.charCodeAt(0) > 0x2e7f ? 13 : 7; // CJK ≈ 13px, ASCII ≈ 7px @12px font
+    return w + 20;
+  }
+  function mmUnquote(label) {
+    const s = String(label).trim();
+    return s.length >= 2 && s.startsWith('"') && s.endsWith('"') ? s.slice(1, -1) : s;
+  }
+  function parseMindmap(text) {
+    const nodes = [];
+    for (const raw of String(text || "").split(/\r?\n/)) {
+      const line = raw.replace(/%%.*$/, "").replace(/\r$/, "");
+      if (!line.trim()) continue;
+      const indent = line.length - line.trimStart().length;
+      const token = line.trim();
+      if (token === "mindmap") continue;
+      if (token.startsWith("root")) {
+        let inner = token.slice("root".length).replace(/^\s*\(\s*/, "").replace(/\s*\)\s*$/, "");
+        while (inner.startsWith("(") && inner.endsWith(")")) inner = inner.slice(1, -1);
+        nodes.push({ indent, label: mmUnquote(inner) || "Mind Map", root: true });
+      } else {
+        nodes.push({ indent, label: mmUnquote(token), root: false });
+      }
+    }
+    if (!nodes.length) return null;
+    const root = { label: nodes[0].label || "Mind Map", children: [] };
+    const stack = [{ node: root, indent: nodes[0].indent }];
+    for (let i = 1; i < nodes.length; i++) {
+      const n = nodes[i];
+      while (stack.length > 1 && n.indent <= stack[stack.length - 1].indent) stack.pop();
+      const child = { label: n.label, children: [] };
+      stack[stack.length - 1].node.children.push(child);
+      stack.push({ node: child, indent: n.indent });
+    }
+    return root;
+  }
+  // Horizontal (root-on-left) layout: branches grow rightwards, siblings stack down, so a
+  // dense tree stays narrow instead of spreading too wide to read. Depth → x, subtree → y.
+  const MM_H_GAP = 56;   // horizontal gap between a parent's right edge and a child's left edge
+  const MM_V_GAP = 40;   // vertical gap between siblings (≥ node height so a parent box fits)
+  const MM_NODE_H = 32;  // node box height
+  function mmNodeBoxW(label) {
+    return Math.max(mmTextWidth(label), 48);
+  }
+  function mmSubtreeHeight(n) {
+    if (n._sh != null) return n._sh;
+    if (!n.children.length) return (n._sh = MM_NODE_H);
+    const kids = n.children.reduce((s, c) => s + mmSubtreeHeight(c), 0) + MM_V_GAP * (n.children.length - 1);
+    return (n._sh = Math.max(MM_NODE_H, kids));
+  }
+  function mmLayout(n, px, y0, depth) {
+    n.depth = depth;
+    n._w = mmNodeBoxW(n.label);
+    n.x = px + n._w / 2;
+    n.y = y0 + mmSubtreeHeight(n) / 2;
+    const nextX = px + n._w + MM_H_GAP;
+    let cy = y0;
+    for (const c of n.children) {
+      mmLayout(c, nextX, cy, depth + 1);
+      cy += mmSubtreeHeight(c) + MM_V_GAP;
+    }
+  }
+  function mmSvgEscape(s) {
+    return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+  function renderMindmap(text) {
+    const tree = parseMindmap(text);
+    if (!tree) return '<p class="cd-hint">Empty or unsupported mind map.</p>';
+    mmLayout(tree, 0, 0, 0);
+    const H = Math.max(mmSubtreeHeight(tree), 200);
+    let W = 0;
+    (function walk(n) {
+      W = Math.max(W, n.x + n._w / 2);
+      n.children.forEach(walk);
+    })(tree);
+    W = Math.max(W, 320);
+    const pad = 24;
+    const parts = [
+      `<svg class="mmd-tree" width="${Math.ceil(W + pad * 2)}" height="${Math.ceil(H + pad * 2)}" viewBox="-${pad} -${pad} ${W + pad * 2} ${H + pad * 2}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mind map">`,
+    ];
+    const edges = [];
+    (function walk(n) {
+      for (const c of n.children) {
+        const sx = n.x + n._w / 2;
+        const ex = c.x - c._w / 2;
+        edges.push(`M ${sx} ${n.y} C ${sx + MM_H_GAP / 2} ${n.y}, ${ex - MM_H_GAP / 2} ${c.y}, ${ex} ${c.y}`);
+      }
+      n.children.forEach(walk);
+    })(tree);
+    parts.push(`<g fill="none" stroke="#a8bce0" stroke-width="1.5"><path d="${edges.join(" ")}"/></g>`);
+    (function walk(n) {
+      if (n.depth === 0) {
+        parts.push(
+          `<rect x="${n.x - n._w / 2}" y="${n.y - MM_NODE_H / 2}" width="${n._w}" height="${MM_NODE_H}" rx="10" fill="#4f8cff" stroke="#3a6fd0" stroke-width="1.5"/>`,
+          `<text x="${n.x}" y="${n.y}" fill="#fff" font-size="13" font-weight="700" text-anchor="middle" dominant-baseline="central">${mmSvgEscape(n.label)}</text>`
+        );
+      } else {
+        parts.push(
+          `<rect x="${n.x - n._w / 2}" y="${n.y - MM_NODE_H / 2}" width="${n._w}" height="${MM_NODE_H}" rx="10" fill="#ffffff" stroke="#c8d6f0" stroke-width="1"/>`,
+          `<text x="${n.x}" y="${n.y}" fill="#33415f" font-size="12" text-anchor="middle" dominant-baseline="central">${mmSvgEscape(n.label)}</text>`
+        );
+      }
+      n.children.forEach(walk);
+    })(tree);
+    parts.push("</svg>");
+    return parts.join("\n");
   }
 
   // ── Main-area handlers + batch operations ──
@@ -2041,6 +2164,159 @@
       closeNote();
     }
   });
+
+  // ── "Choose a Cloud Drive folder" picker (used by session → toolkit generation) ──
+  // A save-dialog-style folder tree that reuses the sidebar's row/kids markup and the
+  // same expansion state, so it looks and behaves like the upload panel. Only My Drive
+  // (personal, workspace_id null) folders are offered — session artifacts always land in
+  // the caller's personal drive. Resolves with the chosen folder path (null = My Drive
+  // root) or undefined when cancelled.
+  window.pickDriveFolderModal = async (title) => {
+    if (!getToken()) { Viewer.toast("Sign in to choose a cloud folder."); return undefined; }
+    try { await loadDrive(); } catch { /* keep whatever folders we already have */ }
+
+    const overlay = document.createElement("div");
+    overlay.className = "overlay";
+    const modal = document.createElement("div");
+    modal.className = "modal cd-picker-modal";
+
+    const header = document.createElement("div");
+    header.className = "modal-header";
+    const h = document.createElement("h3");
+    h.textContent = title;
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "modal-close";
+    close.innerHTML = "&times;";
+    close.title = "Close";
+    header.append(h, close);
+
+    const target = document.createElement("div");
+    target.className = "cd-picker-target";
+
+    const tree = document.createElement("div");
+    tree.className = "cd-picker-tree";
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "Cancel";
+    const okBtn = document.createElement("button");
+    okBtn.type = "button";
+    okBtn.className = "primary";
+    okBtn.textContent = "Save here";
+    actions.append(cancelBtn, okBtn);
+
+    modal.append(header, target, tree, actions);
+    overlay.appendChild(modal);
+
+    let selected = null; // folder path; null = My Drive root
+    let resolveVal;
+    const promise = new Promise((res) => { resolveVal = res; });
+
+    function finish(val) {
+      document.removeEventListener("keydown", onEsc);
+      overlay.remove();
+      resolveVal(val);
+    }
+
+    function label() {
+      return selected ? `My Drive / ${selected.split("/").join(" / ")}` : "Cloud Drive (root)";
+    }
+
+    function refreshTarget() {
+      target.textContent = `☁️ ${label()}`;
+      tree.querySelectorAll(".cd-row.cd-folder").forEach((row) => {
+        row.classList.toggle("cd-current", row.dataset.path === (selected || ""));
+      });
+    }
+
+    function makeRow(path, depth) {
+      const kids = childrenOf(null, path).folderKids;
+      const key = expKey(null, path);
+      const open = drive.expanded.has(key);
+      const row = document.createElement("div");
+      row.className = "cd-row cd-folder" + (path === (selected || "") ? " cd-current" : "");
+      row.dataset.path = path;
+      row.style.paddingLeft = `${6 + depth * 16}px`;
+      const tw = document.createElement("span");
+      tw.className = "cd-tw";
+      tw.textContent = kids.length ? (open ? "▾" : "▸") : "·";
+      row.appendChild(tw);
+      const icon = document.createElement("span");
+      icon.className = "cd-icon";
+      icon.textContent = path === "" ? "☁️" : "📁";
+      row.appendChild(icon);
+      const nm = document.createElement("span");
+      nm.className = "cd-name";
+      nm.textContent = path === "" ? "My Drive" : path.split("/").pop();
+      row.appendChild(nm);
+      row.title = path === "" ? "Cloud Drive root" : `Save to ${path}`;
+      if (kids.length) {
+        tw.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (drive.expanded.has(key)) drive.expanded.delete(key);
+          else drive.expanded.add(key);
+          renderTree();
+        });
+      }
+      row.addEventListener("click", () => {
+        selected = path === "" ? null : path;
+        if (kids.length) {
+          if (drive.expanded.has(key)) drive.expanded.delete(key);
+          else drive.expanded.add(key);
+        }
+        renderTree();
+      });
+      return row;
+    }
+
+    function renderKids(path, depth, container) {
+      const kids = childrenOf(null, path).folderKids;
+      if (!kids.length) {
+        const empty = document.createElement("div");
+        empty.className = "cd-empty";
+        empty.style.padding = "2px 12px";
+        empty.textContent = "Empty.";
+        container.appendChild(empty);
+        return;
+      }
+      for (const d of kids) {
+        container.appendChild(makeRow(d.path, depth));
+        if (drive.expanded.has(expKey(null, d.path))) {
+          const box = document.createElement("div");
+          box.className = "cd-kids";
+          renderKids(d.path, depth + 1, box);
+          container.appendChild(box);
+        }
+      }
+    }
+
+    function renderTree() {
+      tree.innerHTML = "";
+      tree.appendChild(makeRow("", 0));
+      if (drive.expanded.has(expKey(null, ""))) {
+        const box = document.createElement("div");
+        box.className = "cd-kids";
+        renderKids("", 1, box);
+        tree.appendChild(box);
+      }
+      refreshTarget();
+    }
+
+    function onEsc(e) {
+      if (e.key === "Escape") finish(undefined);
+    }
+    cancelBtn.addEventListener("click", () => finish(undefined));
+    okBtn.addEventListener("click", () => finish(selected));
+    close.addEventListener("click", () => finish(undefined));
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) finish(undefined); });
+    document.addEventListener("keydown", onEsc);
+    document.body.appendChild(overlay);
+    renderTree();
+    return promise;
+  };
 
   // If a cloud drive is already visible (e.g. re-opened window), refresh it.
   if (!cloudEl.classList.contains("hidden")) loadDrive();

@@ -28,6 +28,7 @@ GENERATE_MEDIA = "generate_media"
 ASSET_INGEST = "asset_ingest"
 LEARNING_IMPORT = "learning_import"        # Learning-Platform sentences/articles → query repo
 CHAT_SESSION_IMPORT = "chat_session_import"  # a whole chat session → query repo Q&A chunks
+TOOLKIT_GENERATE = "toolkit_generate"        # workspace files → slides / mindmap / summary
 
 # Job status values.
 QUEUED = "queued"
@@ -103,7 +104,7 @@ class TaskQueue:
         # and re-raise for the caller to surface as a 5xx.
         try:
             await self.redis.enqueue_job(type_, str(job.id), payload)
-        except Exception as exc:  # noqa: BLE001 - delivery is the failure surface here
+        except Exception as exc:
             await self.job_store.mark_failed(job.id, f"enqueue failed: {exc}")
             raise
         return job.id

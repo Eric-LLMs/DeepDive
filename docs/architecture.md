@@ -81,7 +81,7 @@
 | Retrieval | config-driven node pipeline (rewrite → recall → RRF → rerank, plus optional parent-expand / CRAG nodes; CJK + contextual + parent-child indexing); `in_process` default, gRPC service available (`AuthGuard` token gate / per-peer rate limit / tenant binding); admin RAG console + golden-set eval (Recall@k / Precision@k / MRR); Redis **query cache** (keyed by query/filters/top_k + config + corpus version); `POST /rag/feedback` golden-dataset recorder |
 | Query repository | unified multi-source corpus: cloud-drive files (`source_type='file'`) + Learning-Platform sentences/articles (`'learning'`) + chat Q&A pairs / LLM-grouped whole-session imports (`'chat'`); `chunks.asset_id` nullable + `source_type`/`source_id`, source-aware recall (both recallers `LEFT JOIN assets`); PDF tool chain (body text + tables rendered to PNG → vision LLM, per-table skip on failure); admin RAG → **Repository** tab lists non-file chunks with delete |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
-| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the API's `AgentKernel` singleton for scheduled background turns |
+| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the API's `AgentKernel` singleton for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output, session mode → caller's Cloud Drive) |
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
@@ -90,7 +90,7 @@
 | Admin console | single-file SPA at `/admin` with 5 modules (Providers / Roles / Users / Tokens / **Tools config**): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint). The **Tools config** module edits the generic `tools` namespace (web-search provider, SMTP, free-form key/value params) with a one-click *Test email*; the Chat Test user picker is a fuzzy-autocomplete text box; a **RAG** module adds live pipeline testing (per-node trace), chunking preview, node-topology editing, and golden-set eval |
 | Billing | `llm_models` (per-1k pricing) + `user_wallets` + `wallet_transactions` + `llm_credentials` + `credential_models`; cost calc + atomic wallet deduct |
 | Settings in DB | `app_settings` key/value JSONB (admin credential + LLM provider config + tiers + the generic `tools` namespace for web search / SMTP + the `rag` pipeline config), written by the admin console |
-| Cloud drive | per-user My Drive + shared workspaces: `global_objects` (SHA-256 dedup, ref-counted physical store) + logical `assets` + first-class `folders` (per scope) + `workspace_members` roles + `asset_acl` sharing + chunked `upload_sessions` + RAG `chunks` + no-FK `workspace_activity` audit; trash with 30-day lazy retention; roles owner > admin > editor > viewer; **text-note editing** (`GET/PUT /files/{id}/content` — read/in-place overwrite with re-dedup + RAG re-index), **collision-safe naming** (`name (1)` auto-suffix across files+folders), and **personal-scope `user_id` filtering** on every My Drive folder/asset operation; full file manager with an in-page Markdown note editor in the web console (see §14) |
+| Cloud drive | per-user My Drive + shared workspaces: `global_objects` (SHA-256 dedup, ref-counted physical store) + logical `assets` + first-class `folders` (per scope) + `workspace_members` roles + `asset_acl` sharing + chunked `upload_sessions` + RAG `chunks` + no-FK `workspace_activity` audit; trash with 30-day lazy retention; roles owner > admin > editor > viewer; **text-note editing** (`GET/PUT /files/{id}/content` — read/in-place overwrite with re-dedup + RAG re-index), **collision-safe naming** (`name (1)` auto-suffix across files+folders), and **personal-scope `user_id` filtering** on every My Drive folder/asset operation; full file manager with an in-page Markdown note editor in the web console (see §14) that also previews Mermaid mind-map (`.mmd`) notes as an SVG tree |
 | Guest access | anonymous chat via the `anonymous` role's channels, with per-day Redis limit (`guest_daily_limit`), 429 → prompt login |
 
 ### Designed, not yet implemented
@@ -153,7 +153,7 @@ deepdive/
 │   │   └── schemas.py            # Pydantic request/response models
 │   ├── worker/                   # arq worker (executes async enrichment jobs)
 │   │   ├── settings.py           # WorkerSettings (functions / redis / startup clients)
-│   │   ├── tasks.py              # tts / image_fetch / explain / generate_media / ... job functions
+│   │   ├── tasks.py              # tts / image_fetch / explain / generate_media / toolkit_generate / ... job functions
 │   │   └── main.py               # run_worker entrypoint
 │   ├── retrieval/                # retrieval service (gRPC), run: python -m apps.retrieval.main
 │   │   ├── server.py             # RetrievalService servicer (proto -> RAGPipeline)
@@ -578,6 +578,22 @@ rejected (`_resolve`). The desktop workbench's "generate media" flow (`/media/ge
 produces a PPT/PDF "book" — parse the subtitle track (SRT/VTT/LRC) → `ffmpeg` keyframe extraction at
 subtitle timestamps → one slide per (frame, subtitle text) via `build_pptx` / `build_pdf` (CJK text
 via the STSong-Light font), written under `media_output_dir`.
+
+The sibling **toolkit pipeline** (`apps/api/tools/toolkit/`) powers the workbench's
+**Generate Mind Map / Generate Slides / Summarize** — `POST /toolkit/generate` → worker
+`toolkit_generate`. Every tool (`summary` / `mindmap` / `slides`) runs the same five stages:
+**validate** (workspace-confined sources, existence, per-file size cap) → **ingest** (text
+extraction + token-budget map-reduce) → **generate** (structured JSON via JSON mode, jsonschema
+validated, one corrective retry) → **render** (JSON → Mermaid `.mmd` / Marp `.md` / summary
+Markdown / `.pptx`, never raw model-written markup) → **persist** (atomic, collision-proof
+names). The endpoint has two modes. **File mode** (`paths` + optional `output_dir`) generates
+from workspace files into the configured output dir. **Session mode** (`session_id` +
+`folder_path`): the worker reads the session's conversation (`load_session_detail` →
+`build_transcript`, user/assistant messages only), stages it as a temp source inside the
+workspace, runs the pipeline, then drops each artifact into the caller's Cloud Drive via
+`DriveService.save_artifact` (SHA-256 object-store put + asset row; `folder_path` or drive
+root; name `<safe title>_<tool>.<ext>`, auto-suffixed on collision). The temp transcript is
+deleted in `finally`, and stale ones are swept at worker startup.
 
 **`bash_sandbox.py`** — where the ``bash`` tool's commands actually run, two backends behind one
 :class:`BashSandbox` protocol (`settings.bash_sandbox` = ``"docker"`` | ``"host"``, **default
@@ -1563,7 +1579,9 @@ list, a chunked upload with progress, and modals for Move / Share / Rename / New
 Manage. A **right-click context menu** offers New text file / New folder / Upload / Delete,
 and a **note editor** opens any text file in place — a `textarea` (✏ Edit) with a **👁 Preview**
 toggle that renders Markdown through the XSS-safe `renderMarkdown` (`markdown-it` with
-`html:false` + a `validateLink` that blocks `javascript:`/`data:` schemes), **💾 Save**
+`html:false` + a `validateLink` that blocks `javascript:`/`data:` schemes), or — for a Mermaid
+mind-map note (`.mmd`, or text starting with `mindmap`) — an **SVG tree diagram** of nodes +
+edges via `renderMindmap` (`apps/web/src/mindmap.ts`), **💾 Save**
 (`Ctrl+S`, disabled while clean), and a dirty-confirm on close. Saving calls
 `PUT /files/{id}/content` and refreshes the row in place. In the **web console** Office documents
 preview **in the browser page** instead of downloading: `apps/web/src/FilePreview.tsx` fetches the
@@ -1654,7 +1672,9 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     video, and audio play in window.
   - **Note editor** — an overlay with a **✏ Edit / 👁 Preview** toggle and **💾 Save**
     (`Ctrl+S`). Edit mode is a monospace `textarea`; Preview renders the draft through the
-    vendored `markdown-it` + `katex` chat renderer (`renderMarkdown`, XSS-safe `validateLink`).
+    vendored `markdown-it` + `katex` chat renderer (`renderMarkdown`, XSS-safe `validateLink`),
+    or — for a Mermaid mind-map note (`.mmd` / `mindmap`-prefixed text) — as an **SVG tree of
+    nodes + edges** via `renderMindmap` (same layout as the web's `mindmap.ts`).
     Save calls `PUT /files/{id}/content` and closes the dirty flag; a dirty close asks to
     discard. Because the server is the source of truth, a note saved here shows up in the web
     console (and vice versa) on refresh.
@@ -1693,8 +1713,13 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     currently-open cloud asset by id, or capture a **window screenshot** (`capture-window` IPC →
     base64 → uploaded); the API prefixes an `[Attached: …]` note to the user message so the
     agent's document tools can fetch the bytes by `asset_id`. The chat-header also carries a
-    **⋯** session menu (pin / rename / **Import to Knowledge** / delete) and a **hide** toggle
-    that collapses the chat into a floating restore icon.
+    **⋯** session menu (pin / rename / **Import to Knowledge** / delete, plus **Generate Mind
+    Map / Generate Slides / Summarize & Save Notes**) and a **hide** toggle
+    that collapses the chat into a floating restore icon. The three generation entries call
+    `POST /toolkit/generate` in **session mode** (see §6): the user picks a Cloud Drive folder
+    (default root), the session row shows an in-list spinner while the job runs (the UI stays
+    usable), and on completion every produced artifact is listed with its folder and the drive
+    tree refreshes.
   - **Chat bubbles & message management** — every user/assistant bubble renders through the
     vendored `markdown-it` (`renderMarkdown`, `html:false` + XSS-safe `validateLink`) with a
     **KaTeX math plugin** (`$...$` inline, `$$...$$` display — block rule registered before

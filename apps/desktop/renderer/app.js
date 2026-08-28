@@ -499,6 +499,12 @@
       if (ctx.isDir) {
         localCtxEl.appendChild(mk("🗑 Delete folder", () => deleteLocalFolder(ctx.targetPath)));
       } else {
+        localCtxEl.appendChild(mk("🧠 Generate Mind Map", () => generateToolkit("mindmap", ctx.targetPath)));
+        localCtxEl.appendChild(mk("🎞 Generate Slides", () => generateToolkit("slides", ctx.targetPath)));
+        localCtxEl.appendChild(mk("📝 Summarize", () => generateToolkit("summary", ctx.targetPath)));
+        const sepGen = document.createElement("div");
+        sepGen.className = "drive-ctxmenu-sep";
+        localCtxEl.appendChild(sepGen);
         localCtxEl.appendChild(mk("🗑 Delete file", () => deleteFileFromWorkspace(ctx.targetPath)));
       }
     }
@@ -1705,6 +1711,170 @@
       Viewer.toast(`Generation failed: ${err.message}`);
     }
   };
+
+  // ── Toolkit generation (workspace file → slides / mind map / summary) ──
+  // Sends the selected workspace file (as a workspace-relative path) to the async job
+  // endpoint; unlike generateMedia this path carries the auth header. On success a small
+  // modal offers "open" actions for each produced artifact.
+  const TOOLKIT_LABELS = { slides: "Slides", mindmap: "Mind Map", summary: "Summary" };
+
+  window.generateToolkit = async (tool, absPath) => {
+    if (!state.workspaceDir) { Viewer.toast("Pick a workspace folder first (💻 Local in the sidebar)."); return; }
+    const label = TOOLKIT_LABELS[tool] || tool;
+    Viewer.toast(`Generating ${label} from workspace file…`);
+    try {
+      const res = await fetch("/api/toolkit/generate", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ tool, paths: [relFromAbs(absPath)] }),
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const { job_id } = await res.json();
+      pollToolkitJob(job_id, label);
+    } catch (err) {
+      Viewer.toast(`Generation failed: ${err.message}`);
+    }
+  };
+
+  async function pollToolkitJob(jobId, label) {
+    for (let i = 0; i < 900; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const res = await fetch(`/api/jobs/${jobId}`, { headers: authHeaders() });
+      if (res.status === 401) { Viewer.toast("Session expired; log in again."); return; }
+      const job = await res.json();
+      if (job.status === "succeeded") {
+        const files = (job.result && job.result.files) || [];
+        showToolkitResult(label, files);
+        return;
+      }
+      if (job.status === "failed") {
+        Viewer.toast(`${label} generation failed: ${job.error}`);
+        return;
+      }
+    }
+    Viewer.toast(`${label} generation timed out; check the output folder later.`);
+  }
+
+  function showToolkitResult(label, files) {
+    if (!files.length) { Viewer.toast(`${label} generated (no files reported).`); return; }
+    const overlay = document.createElement("div");
+    overlay.className = "overlay";
+    const rows = files.map((f) => {
+      const name = String(f).replace(/\\/g, "/").split("/").filter(Boolean).pop() || f;
+      return `<div style="margin:4px 0"><button type="button" class="primary" data-open="${escapeHtml(f)}">📂 Open ${escapeHtml(name)}</button></div>`;
+    }).join("");
+    overlay.innerHTML = `
+      <div class="modal cd-prompt-modal">
+        <div class="modal-header"><h3></h3></div>
+        <p class="cd-confirm-msg"></p>
+        ${rows}
+        <div class="modal-actions"><button type="button" class="cd-confirm-ok primary">Done</button></div>
+      </div>`;
+    overlay.querySelector("h3").textContent = `${label} generated`;
+    overlay.querySelector(".cd-confirm-msg").textContent = "Open a generated artifact:";
+    overlay.querySelectorAll("[data-open]").forEach((b) => {
+      b.addEventListener("click", () => window.desktopAPI.openExternal(b.dataset.open));
+    });
+    overlay.querySelector(".cd-confirm-ok").addEventListener("click", () => overlay.remove());
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
+  }
+
+  // ── Session → toolkit artifact (chat transcript → Cloud Drive) ──
+  // Wires the "Generate Mind Map / Slides / Summary" session-menu entries: pick a Cloud
+  // Drive folder (default = drive root), submit the async job, then show an in-list spinner
+  // on that session row while it runs (non-blocking — the rest of the app stays usable),
+  // and finally list every produced artifact with its location + refresh the drive tree.
+  const SESSION_TOOL_ASSETS = {
+    mindmap: { label: "Mind Map" },
+    slides: { label: "Slides" },
+    summary: { label: "Summary" },
+  };
+  // sessionId -> tool label, for the in-sidebar spinner; mirrors importingSessions.
+  const generatingSessions = new Map();
+  function finishGenerating(sessionId) {
+    generatingSessions.delete(String(sessionId));
+    loadSessions();
+  }
+
+  window.generateSessionArtifact = async (tool, s) => {
+    if (!state.token) { Viewer.toast("Sign in to generate from a session."); return; }
+    const info = SESSION_TOOL_ASSETS[tool] || { label: tool };
+    if (generatingSessions.has(String(s.id))) {
+      Viewer.toast("Already generating from this session.");
+      return;
+    }
+    let folderPath = null;
+    try {
+      folderPath = await window.pickDriveFolderModal(`Save ${info.label} to`);
+      if (folderPath === undefined) return; // cancelled
+    } catch (err) {
+      Viewer.toast(`Could not load cloud folders: ${err.message}`);
+      return;
+    }
+    let jobId;
+    try {
+      const res = await fetch("/api/toolkit/generate", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ tool, session_id: s.id, folder_path: folderPath || null }),
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      ({ job_id: jobId } = await res.json());
+    } catch (err) {
+      Viewer.toast(`Generation failed: ${err.message}`);
+      return;
+    }
+    // Job queued: mark the session row and poll in the background — the UI stays usable.
+    generatingSessions.set(String(s.id), info.label);
+    loadSessions();
+    const result = await pollSessionJob(jobId);
+    finishGenerating(s.id);
+    if (result) showSessionArtifactResult(info, result);
+  };
+
+  // Poll the job every 2s with an auth header; resolve the result dict, or null on
+  // failure / timeout (capped at ~3 minutes). Non-blocking: only the sidebar row is marked.
+  async function pollSessionJob(jobId) {
+    const deadline = Date.now() + 3 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const res = await fetch(`/api/jobs/${jobId}`, { headers: authHeaders() });
+      if (res.status === 401) { Viewer.toast("Session expired; log in again."); return null; }
+      const job = await res.json();
+      if (job.status === "succeeded") return job.result || {};
+      if (job.status === "failed") { Viewer.toast(`Generation failed: ${job.error}`); return null; }
+    }
+    Viewer.toast("Generation timed out; check your Cloud Drive later.");
+    return null;
+  }
+
+  function showSessionArtifactResult(info, result) {
+    if (window.loadCloudDrive) { try { window.loadCloudDrive(); } catch { /* best-effort */ } }
+    const assets = (result && result.assets) || [];
+    if (!assets.length) {
+      Viewer.toast(`${info.label} generated — but no files were reported.`);
+      return;
+    }
+    const overlay = document.createElement("div");
+    overlay.className = "overlay";
+    const rows = assets.map((a) => {
+      const where = a.folder_path ? `in ${a.folder_path}` : "in your Cloud Drive root";
+      return `<div style="margin:6px 0"><div class="cd-asset-row">📄 ${escapeHtml(a.name)}</div><div class="cd-hint" style="color:var(--fg-dim);font-size:12px">${escapeHtml(where)}</div></div>`;
+    }).join("");
+    overlay.innerHTML = `
+      <div class="modal cd-prompt-modal">
+        <div class="modal-header"><h3></h3></div>
+        <p class="cd-confirm-msg"></p>
+        ${rows}
+        <div class="modal-actions"><button type="button" class="cd-confirm-ok primary">Done</button></div>
+      </div>`;
+    overlay.querySelector("h3").textContent = `${info.label} generated`;
+    overlay.querySelector(".cd-confirm-msg").textContent = "Saved to your Cloud Drive:";
+    overlay.querySelector(".cd-confirm-ok").addEventListener("click", () => overlay.remove());
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
+  }
 
   // ── User menu + profile modal + preferences + login modal ──
   const userMenu = document.getElementById("user-menu");
@@ -3136,12 +3306,6 @@
     if (e.key === "Escape") closeSessionMenu();
   });
 
-  // Placeholder for session features that are planned but not implemented yet; each
-  // menu entry is a link only and reports a "not implemented" toast when clicked.
-  function stubFeature(label) {
-    Viewer.toast(`"${label}" is not implemented yet.`);
-  }
-
   function buildSessionMenu(s, summaryEl) {
     const pinned = isPinned(s.id);
     return [
@@ -3163,17 +3327,17 @@
       {
         iconSvg: SESSION_ICONS.mindmap,
         label: "Generate Mind Map",
-        action: () => stubFeature("Generate Mind Map"),
+        action: () => generateSessionArtifact("mindmap", s),
       },
       {
         iconSvg: SESSION_ICONS.slides,
         label: "Generate Slides",
-        action: () => stubFeature("Generate Slides"),
+        action: () => generateSessionArtifact("slides", s),
       },
       {
         iconSvg: SESSION_ICONS.notes,
         label: "Summarize & Save Notes",
-        action: () => stubFeature("Summarize & Save Notes"),
+        action: () => generateSessionArtifact("summary", s),
       },
       {
         iconSvg: SESSION_ICONS.trash,
@@ -3222,7 +3386,9 @@
       const item = document.createElement("div");
       item.className = "session-item";
       const importing = importingSessions.has(String(s.id));
+      const genLabel = generatingSessions.get(String(s.id));
       if (importing) item.classList.add("session-importing");
+      else if (genLabel) item.classList.add("session-generating");
       const row = document.createElement("div");
       row.className = "session-row";
       const summary = document.createElement("span");
@@ -3235,7 +3401,7 @@
       more.className = "session-more";
       more.title = "Session actions";
       more.innerHTML = SESSION_ICONS.more;
-      more.disabled = importing;
+      more.disabled = importing || genLabel;
       more.addEventListener("click", (e) => {
         e.stopPropagation();
         openSessionMenu(more, buildSessionMenu(s, summary));
@@ -3253,6 +3419,11 @@
       if (importing) {
         time.className = "session-import-status";
         time.textContent = "⏳ Importing…";
+      } else if (genLabel) {
+        time.className = "session-gen-status";
+        const spin = document.createElement("span");
+        spin.className = "session-gen-spinner";
+        time.append(spin, document.createTextNode(` Generating ${genLabel}…`));
       } else {
         time.className = "session-time";
         time.textContent = s.created_at ? new Date(s.created_at).toLocaleString() : "";
@@ -3266,6 +3437,7 @@
       }
       item.addEventListener("click", () => {
         if (importing) return; // locked while the import job is running
+        if (genLabel) return; // locked while an artifact job is running
         resumeSession(s.id);
       });
       sessionsList.appendChild(item);

@@ -104,6 +104,43 @@ class OpenAILLM:
         )
         return (resp.choices[0].message.content or "").strip()
 
+    async def complete_json(
+        self,
+        prompt: str,
+        system_prompt: str = "You are a helpful assistant.",
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> dict:
+        """Structured completion: ask the provider for a JSON object.
+
+        Uses JSON mode (``response_format={"type": "json_object"}``) — the prompt must
+        contain the word "json" for some providers to honour the mode. Returns the parsed
+        JSON object. A provider that rejects JSON mode raises (the caller can fall back to
+        ``complete`` + a tolerant JSON parse).
+        """
+        client = self.client
+        if base_url or api_key:
+            client = AsyncOpenAI(
+                base_url=base_url or settings.llm_base_url,
+                api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+                timeout=settings.llm_timeout_seconds,
+            )
+        try:
+            resp = await client.chat.completions.create(
+                model=model or self.model,
+                messages=self._messages(prompt, system_prompt),
+                response_format={"type": "json_object"},
+                temperature=0.3,
+            )
+        except Exception as exc:
+            raise raise_classified(exc) from exc
+        content = resp.choices[0].message.content
+        try:
+            return json.loads(content)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"model did not return valid JSON: {exc}") from exc
+
     async def complete_stream(
         self,
         prompt: str,
