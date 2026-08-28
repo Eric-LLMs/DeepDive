@@ -264,12 +264,9 @@ async def toolkit_generate(ctx, job_id: str, payload: dict) -> dict:
     async def work() -> dict:
         if payload.get("session_id"):
             return await _generate_from_session(ctx, job_id, payload)
-        from apps.api.tools.toolkit import pipeline_for
-
-        result = await pipeline_for(payload["tool"], ctx["llm"]).run(
-            payload["paths"], output_dir=payload.get("output_dir")
-        )
-        return {"files": result.files, "summary": result.summary}
+        if payload.get("file_ids") or payload.get("paths"):
+            return await _generate_from_files(ctx, job_id, payload)
+        raise RuntimeError("no sources to generate from")
 
     return await _run(ctx, job_id, work())
 
@@ -300,7 +297,7 @@ async def _generate_from_session(ctx, job_id: str, payload: dict) -> dict:
     if sess is None or sess.user_id != user_id:
         raise RuntimeError("session not found")
 
-    title = sess.title or "session"
+    title = payload.get("name") or sess.title or "session"
     detail = await load_session_detail(SessionLocal, session_id)
     transcript = build_transcript(title, detail["messages"])
 
@@ -309,7 +306,9 @@ async def _generate_from_session(ctx, job_id: str, payload: dict) -> dict:
     tmp_source = src_dir / f"{sanitize_name(title)}_{job_id[:8]}.md"
     try:
         tmp_source.write_text(transcript, encoding="utf-8")
-        result = await pipeline_for(payload["tool"], ctx["llm"]).run([str(tmp_source)])
+        result = await pipeline_for(payload["tool"], ctx["llm"]).run(
+            [str(tmp_source)], prompt=payload.get("prompt")
+        )
         plan = artifact_plan(payload["tool"], title)
         drive = DriveService(SessionLocal)
         assets = []
@@ -338,6 +337,91 @@ async def _generate_from_session(ctx, job_id: str, payload: dict) -> dict:
             tmp_source.unlink()
         except OSError:
             pass
+
+
+async def _generate_from_files(ctx, job_id: str, payload: dict) -> dict:
+    """Generate from workspace files and/or Cloud Drive files.
+
+    ``paths`` are already router-confined absolute paths inside the workspace. When at least
+    one ``file_ids`` is present (cloud-file or mixed mode), every cloud file is ownership-
+    checked again here (defense in depth) and its raw bytes downloaded into temp files inside
+    the workspace — keeping the original extension so text/PDF/doc extraction works — then all
+    sources are merged into a single pipeline run and the artifacts are saved back into the
+    caller's Cloud Drive (``assets``). With only ``paths`` the legacy workspace-only behavior
+    is kept: write into ``output_dir`` and return the local ``files``.
+    """
+    from apps.api.tools.toolkit import pipeline_for
+    from apps.api.tools.toolkit.session_source import (
+        SESSION_SRC_DIR,
+        artifact_plan,
+        sanitize_name,
+    )
+
+    sources: list[str] = list(payload.get("paths") or [])
+    tmp_files: list[Path] = []
+    drive_mode = bool(payload.get("file_ids"))
+
+    if drive_mode:
+        job_row = await ctx["job_store"].get(UUID(job_id))
+        if job_row is None or job_row.user_id is None:
+            raise RuntimeError("job has no owner")
+        user_id = job_row.user_id
+
+        drive = DriveService(SessionLocal)
+        src_dir = Path(settings.workspace_dir) / SESSION_SRC_DIR
+        src_dir.mkdir(parents=True, exist_ok=True)
+        first_name: str | None = None
+        for fid in payload["file_ids"]:
+            _mime, name, data = await drive.download(user_id, UUID(fid))
+            if not data:
+                raise RuntimeError(f"file has no readable content: {name}")
+            if first_name is None:
+                first_name = Path(name).stem or name
+            ext = Path(name).suffix.lower()
+            tmp = src_dir / f"{sanitize_name(name)}_{job_id[:8]}{ext}"
+            tmp.write_bytes(data)
+            tmp_files.append(tmp)
+            sources.append(str(tmp))
+
+    if not sources:
+        raise RuntimeError("no sources to generate from")
+
+    try:
+        result = await pipeline_for(payload["tool"], ctx["llm"]).run(
+            sources,
+            output_dir=payload.get("output_dir"),
+            prompt=payload.get("prompt"),
+        )
+        if not drive_mode:
+            return {"files": result.files, "summary": result.summary}
+        plan = artifact_plan(payload["tool"], payload.get("name") or first_name or "files")
+        assets = []
+        for path in result.files:
+            entry = plan.get(Path(path).suffix.lower())
+            if entry is None:
+                continue
+            name, mime = entry
+            asset = await drive.save_artifact(
+                user_id,
+                name,
+                mime,
+                Path(path).read_bytes(),
+                folder_path=payload.get("folder_path"),
+            )
+            assets.append(
+                {
+                    "asset_id": str(asset.id),
+                    "name": asset.name,
+                    "folder_path": asset.folder_path,
+                }
+            )
+        return {"tool": payload["tool"], "assets": assets, "summary": result.summary}
+    finally:
+        for path in tmp_files:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:

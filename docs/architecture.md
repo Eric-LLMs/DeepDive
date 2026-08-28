@@ -81,7 +81,7 @@
 | Retrieval | config-driven node pipeline (rewrite → recall → RRF → rerank, plus optional parent-expand / CRAG nodes; CJK + contextual + parent-child indexing); `in_process` default, gRPC service available (`AuthGuard` token gate / per-peer rate limit / tenant binding); admin RAG console + golden-set eval (Recall@k / Precision@k / MRR); Redis **query cache** (keyed by query/filters/top_k + config + corpus version); `POST /rag/feedback` golden-dataset recorder |
 | Query repository | unified multi-source corpus: cloud-drive files (`source_type='file'`) + Learning-Platform sentences/articles (`'learning'`) + chat Q&A pairs / LLM-grouped whole-session imports (`'chat'`); `chunks.asset_id` nullable + `source_type`/`source_id`, source-aware recall (both recallers `LEFT JOIN assets`); PDF tool chain (body text + tables rendered to PNG → vision LLM, per-table skip on failure); admin RAG → **Repository** tab lists non-file chunks with delete |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
-| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the API's `AgentKernel` singleton for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output, session mode → caller's Cloud Drive) |
+| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the API's `AgentKernel` singleton for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output; session / cloud-file modes → caller's Cloud Drive, with a custom `prompt` + `name`) |
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
@@ -583,17 +583,57 @@ The sibling **toolkit pipeline** (`apps/api/tools/toolkit/`) powers the workbenc
 **Generate Mind Map / Generate Slides / Summarize** — `POST /toolkit/generate` → worker
 `toolkit_generate`. Every tool (`summary` / `mindmap` / `slides`) runs the same five stages:
 **validate** (workspace-confined sources, existence, per-file size cap) → **ingest** (text
-extraction + token-budget map-reduce) → **generate** (structured JSON via JSON mode, jsonschema
-validated, one corrective retry) → **render** (JSON → Mermaid `.mmd` / Marp `.md` / summary
-Markdown / `.pptx`, never raw model-written markup) → **persist** (atomic, collision-proof
-names). The endpoint has two modes. **File mode** (`paths` + optional `output_dir`) generates
-from workspace files into the configured output dir. **Session mode** (`session_id` +
-`folder_path`): the worker reads the session's conversation (`load_session_detail` →
-`build_transcript`, user/assistant messages only), stages it as a temp source inside the
-workspace, runs the pipeline, then drops each artifact into the caller's Cloud Drive via
-`DriveService.save_artifact` (SHA-256 object-store put + asset row; `folder_path` or drive
-root; name `<safe title>_<tool>.<ext>`, auto-suffixed on collision). The temp transcript is
-deleted in `finally`, and stale ones are swept at worker startup.
+extraction + token-budget map-reduce: a single over-budget file is split into line-tracked
+chunks, digest calls run under a concurrency cap of 4, and the chunk bound — 64 chunks ×
+12000 chars per file — fails loudly instead of burning the worker timeout on serial LLM calls)
+→ **generate** (structured JSON via JSON mode, jsonschema-validated, one corrective retry that
+carries the concrete schema errors back into the prompt) → **render** (JSON → Mermaid `.mmd` /
+Marp `.md` / summary Markdown / `.pptx`, never raw model-written markup) → **persist** (atomic,
+collision-proof names). The endpoint accepts three modes, plus two per-run options — `name`
+(output-stem override) and `prompt` (a per-task custom prompt **appended to** — never replacing
+— the tool's default system prompt in stage 3, so the JSON/schema constraints stay intact):
+
+```
+┌─ Electron workbench ──────────────┐        ┌─ FastAPI gateway ────────────┐
+│ Generate dialog                   │        │ POST /toolkit/generate        │
+│  source tab: session | cloud files│        │   validate + ownership-check  │
+│  output folder · prompt · name    │─enqueue─▶   enqueue TOOLKIT_GENERATE   │
+│ pickCloudFiles (greys over-limit) │        │ GET /toolkit/prompts · /config│
+└───────────────────────────────────┘        └──────────────┬───────────────┘
+                                                            ▼ Redis (arq)
+                             ┌──────────────────────────────┴──────────────┐
+                             │ docker worker · toolkit_generate             │
+                             │  stage temp sources → 5-stage pipeline       │
+                             │  → DriveService.save_artifact                 │
+                             └──────────────────────────────┬──────────────┘
+                       ┌─────────────────────────────────────▼──────────────┐
+                       │ file mode → workspace output_dir                    │
+                       │ session / cloud-file mode → caller's Cloud Drive    │
+                       └────────────────────────────────────────────────────┘
+```
+
+- **File mode** (`paths` + optional `output_dir`) generates from workspace files into the
+  configured output dir.
+- **Session mode** (`session_id` + `folder_path`): the worker reads the session's conversation
+  (`load_session_detail` → `build_transcript`, user/assistant messages only), stages it as a
+  temp source inside the workspace, runs the pipeline, then drops each artifact into the
+  caller's Cloud Drive via `DriveService.save_artifact` (SHA-256 object-store put + asset row;
+  `folder_path` or drive root; name `<name|safe title>_<tool>.<ext>`, auto-suffixed on
+  collision). The temp transcript is deleted in `finally`, and stale ones are swept at worker
+  startup.
+- **Cloud-file mode** (`file_ids` + `folder_path`): the router ownership-checks every id
+  (`DriveService.ensure_asset_readable`) and rejects files over the per-file size cap up front;
+  the worker re-checks (defense in depth), downloads each file's bytes into a temp file inside
+  the workspace — the **original extension preserved** so text/PDF/doc extraction works — then
+  merges them with any `paths` into a **single pipeline run** (multiple files are ingested
+  together and produce one combined artifact). Artifacts are saved back to the caller's Cloud
+  Drive; temp files are deleted in `finally`.
+
+Two read-only endpoints surface the pipeline's knobs to the clients: `GET /toolkit/prompts`
+returns the default system prompts (the generate dialog shows them as the prompt placeholder)
+and `GET /toolkit/config` returns the per-file size cap plus the supported-extensions set so
+the desktop picker can grey out files a job would refuse. The frontend dialog and its
+poll-until-terminal progress model are described in §15.
 
 **`bash_sandbox.py`** — where the ``bash`` tool's commands actually run, two backends behind one
 :class:`BashSandbox` protocol (`settings.bash_sandbox` = ``"docker"`` | ``"host"``, **default
@@ -718,6 +758,13 @@ failed job marks the asset `FAILED` so the UI never shows a stuck badge (cancell
 sentence over SSE: each `segment` event carries a **cached WAV URL** (synthesized in-process against
 the localhost Kokoro container), so the client plays sentence 1 while the later ones are still
 generating; `error` / `done` frames terminate the stream.
+
+**Toolkit generation jobs** — `toolkit_generate` legitimately runs many minutes (a large PDF's
+map-reduce, then JSON generation) and is bounded by `WORKER_JOB_TIMEOUT` (1 h), so a generation
+job is **never transient**. The desktop client reflects that: the generate dialog keeps its
+Generate button disabled and polls `GET /jobs/{id}` every 2 s **until a terminal state** — it
+imposes no client-side deadline — so a job that outlives the dialog keeps running and reports its
+result when the user reopens the dialog or when the poll completes in the background.
 
 ## 9. Retrieval Service (gRPC)
 
@@ -1577,11 +1624,11 @@ and **🗑 Trash**), list and grid views with folder rows (double-click to enter
 search with a scope dropdown (all files / a single workspace) and an autocomplete suggestion
 list, a chunked upload with progress, and modals for Move / Share / Rename / New folder /
 Manage. A **right-click context menu** offers New text file / New folder / Upload / Delete,
-and a **note editor** opens any text file in place — a `textarea` (✏ Edit) with a **👁 Preview**
-toggle that renders Markdown through the XSS-safe `renderMarkdown` (`markdown-it` with
+and a **note editor** opens any text file in place — an **Edit / Preview** toggle over a
+`textarea`, with Preview rendering Markdown through the XSS-safe `renderMarkdown` (`markdown-it` with
 `html:false` + a `validateLink` that blocks `javascript:`/`data:` schemes), or — for a Mermaid
 mind-map note (`.mmd`, or text starting with `mindmap`) — an **SVG tree diagram** of nodes +
-edges via `renderMindmap` (`apps/web/src/mindmap.ts`), **💾 Save**
+edges via `renderMindmap` (`apps/web/src/mindmap.ts`), **Save**
 (`Ctrl+S`, disabled while clean), and a dirty-confirm on close. Saving calls
 `PUT /files/{id}/content` and refreshes the row in place. In the **web console** Office documents
 preview **in the browser page** instead of downloading: `apps/web/src/FilePreview.tsx` fetches the
@@ -1670,7 +1717,7 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     `.md`/`.txt`/code row opens the in-window **note editor** (`#note-editor`); any other file is
     cached via `cloud-cache` and rendered by `Viewer.render` on the temp path, so PDFs, images,
     video, and audio play in window.
-  - **Note editor** — an overlay with a **✏ Edit / 👁 Preview** toggle and **💾 Save**
+  - **Note editor** — an overlay with an **Edit / Preview** icon-button toggle and **Save**
     (`Ctrl+S`). Edit mode is a monospace `textarea`; Preview renders the draft through the
     vendored `markdown-it` + `katex` chat renderer (`renderMarkdown`, XSS-safe `validateLink`),
     or — for a Mermaid mind-map note (`.mmd` / `mindmap`-prefixed text) — as an **SVG tree of
@@ -1707,19 +1754,29 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     floating-window drags use **pointer events + `setPointerCapture`**, so drag tracking continues
     even when the pointer passes over the `<video>` element. Sign-in / register / password-reset
     and profile/avatar editing are modal dialogs against `/auth/*`. The **input box** is a
-    Gemini-style row — a **＋ attach** button, the text field, inline **🎤 / 🔊** buttons, and
-    Send — with an attachment preview strip above it. Attach stages a pending attachment that
-    rides on the next send: pick a file (OS picker → uploaded to the cloud drive), attach the
-    currently-open cloud asset by id, or capture a **window screenshot** (`capture-window` IPC →
-    base64 → uploaded); the API prefixes an `[Attached: …]` note to the user message so the
-    agent's document tools can fetch the bytes by `asset_id`. The chat-header also carries a
-    **⋯** session menu (pin / rename / **Import to Knowledge** / delete, plus **Generate Mind
-    Map / Generate Slides / Summarize & Save Notes**) and a **hide** toggle
-    that collapses the chat into a floating restore icon. The three generation entries call
-    `POST /toolkit/generate` in **session mode** (see §6): the user picks a Cloud Drive folder
-    (default root), the session row shows an in-list spinner while the job runs (the UI stays
-    usable), and on completion every produced artifact is listed with its folder and the drive
-    tree refreshes.
+    Gemini-style row — a **＋ attach** button, a **multi-line `<textarea>`** (3 rows by default;
+    **Enter sends** the message, **Shift+Enter** inserts a new line), inline **🎤 / 🔊**
+    buttons, and Send — with an attachment preview strip above it. Attach stages a pending
+    attachment that rides on the next send: pick a file (OS picker → uploaded to the cloud
+    drive), attach the currently-open cloud asset by id, or capture a **window screenshot**
+    (`capture-window` IPC → base64 → uploaded); the API prefixes an `[Attached: …]` note to the
+    user message so the agent's document tools can fetch the bytes by `asset_id`. The chat-header
+    also carries a **⋯** session menu (pin / rename / **Import to Knowledge** / delete, plus
+    **Generate Mind Map / Generate Slides / Summarize & Save Notes**) and a **hide** toggle that
+    collapses the chat into a floating restore icon; a **Generate** toolbar above the input
+    exposes the same three entries as one-click buttons.
+
+    Every generation entry opens the **generate dialog** (see §6): pick the source — **this
+    conversation** or **Cloud Drive files** (a checkbox-tree picker, `pickCloudFiles`, that greys
+    out files over the `/toolkit/config` per-file cap or in an unsupported format) — then the
+    output folder, an optional custom prompt, and an optional file name. Submit enqueues
+    `POST /toolkit/generate` in session or cloud-file mode. While the job runs the dialog's
+    Generate button greys out and the toolbar button becomes a steady **⏳**; the job is tracked
+    in `toolkitJobs[tool]` and polled every 2 s until a terminal state (see §8.1), so closing the
+    dialog never aborts the run — the status box live-updates while open and the toolbar recovers
+    when the job finishes. On completion every produced artifact is listed with its folder, a
+    **view output** link navigates the Cloud Drive to that folder (`openCloudFolder`), and the
+    drive tree refreshes.
   - **Chat bubbles & message management** — every user/assistant bubble renders through the
     vendored `markdown-it` (`renderMarkdown`, `html:false` + XSS-safe `validateLink`) with a
     **KaTeX math plugin** (`$...$` inline, `$$...$$` display — block rule registered before

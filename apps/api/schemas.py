@@ -135,7 +135,10 @@ class ToolkitGenerateRequest(BaseModel):
     paths: list[str] | None = None       # workspace-relative file paths (file mode)
     output_dir: str | None = None        # workspace-relative output dir override (file mode)
     session_id: UUID | None = None       # generate from this session's conversation (session mode)
-    folder_path: str | None = None       # Cloud Drive target folder (session mode; None = drive root)
+    file_ids: list[UUID] | None = None   # generate from these Cloud Drive files (cloud-file mode)
+    folder_path: str | None = None       # Cloud Drive target folder (session/cloud mode; None = drive root)
+    name: str | None = None              # output file name stem; None = auto-named from the session title / first file
+    prompt: str | None = None            # per-task custom prompt appended to the default system prompt
 
 
 class ConfigUpdateRequest(BaseModel):

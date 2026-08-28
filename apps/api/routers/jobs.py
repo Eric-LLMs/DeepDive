@@ -21,6 +21,7 @@ from api.schemas import (
     ToolkitGenerateRequest,
     TTSRequest,
 )
+from core.application.drive_service import DriveError, DriveService
 from core.config import settings
 from core.infrastructure.db import SessionLocal, SessionModel
 from core.infrastructure.jobs import (
@@ -133,18 +134,21 @@ async def generate_toolkit(
 ):
     """Enqueue slides / mindmap / summary generation.
 
-    Two mutually-exclusive modes:
+    Three mutually-exclusive modes:
 
     - **file mode** (``paths``): generate from workspace files. Every path (and the optional
       output dir) is confined to the workspace by :func:`_confined_path`, so the worker only
       ever reads files staged in the workspace — never arbitrary server paths.
     - **session mode** (``session_id``): generate from a chat session's conversation and save
       the artifacts into the caller's Cloud Drive (``folder_path`` or the drive root).
+    - **cloud-file mode** (``file_ids``): generate from the caller's Cloud Drive files; every
+      id is ownership-checked here so a caller cannot name another user's file. Artifacts are
+      saved back into the caller's Cloud Drive (``folder_path`` or the drive root).
     """
     if body.session_id is not None:
-        if body.paths:
+        if body.paths or body.file_ids:
             raise HTTPException(
-                status_code=400, detail="cannot combine session_id with paths"
+                status_code=400, detail="cannot combine session_id with paths or file_ids"
             )
         async with SessionLocal() as session:
             sess = await session.get(SessionModel, body.session_id)
@@ -156,6 +160,46 @@ async def generate_toolkit(
                 "tool": body.tool,
                 "session_id": str(body.session_id),
                 "folder_path": _confined_folder_path(body.folder_path),
+                "name": body.name,
+                "prompt": body.prompt,
+            },
+            user_id=user.user_id,
+        )
+        return {"job_id": str(job_id)}
+
+    if body.file_ids:
+        if body.paths:
+            raise HTTPException(
+                status_code=400, detail="cannot combine file_ids with paths"
+            )
+        max_mb = settings.toolkit_max_file_bytes // (1024 * 1024)
+        drive = DriveService(SessionLocal)
+        over = []
+        for fid in body.file_ids:
+            try:
+                asset = await drive.ensure_asset_readable(user.user_id, fid)
+            except DriveError as exc:
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=f"file not readable: {fid} ({exc.message})",
+                ) from exc
+            if getattr(asset, "size", 0) > settings.toolkit_max_file_bytes:
+                over.append(asset.name)
+        if over:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"file too large (max {max_mb} MB): {', '.join(over)}"
+                ),
+            )
+        job_id = await queue.enqueue(
+            TOOLKIT_GENERATE,
+            {
+                "tool": body.tool,
+                "file_ids": [str(f) for f in body.file_ids],
+                "folder_path": _confined_folder_path(body.folder_path),
+                "name": body.name,
+                "prompt": body.prompt,
             },
             user_id=user.user_id,
         )
@@ -164,15 +208,57 @@ async def generate_toolkit(
     if not body.paths:
         raise HTTPException(status_code=400, detail="paths: at least one file required")
     paths = [_confined_path(p, field="paths") for p in body.paths]
+    over = [Path(p).name for p in paths if Path(p).stat().st_size > settings.toolkit_max_file_bytes]
+    if over:
+        max_mb = settings.toolkit_max_file_bytes // (1024 * 1024)
+        raise HTTPException(
+            status_code=400,
+            detail=f"file too large (max {max_mb} MB): {', '.join(over)}",
+        )
     output_dir = (
         _confined_path(body.output_dir, field="output_dir") if body.output_dir else None
     )
     job_id = await queue.enqueue(
         TOOLKIT_GENERATE,
-        {"tool": body.tool, "paths": paths, "output_dir": output_dir},
+        {
+            "tool": body.tool,
+            "paths": paths,
+            "output_dir": output_dir,
+            "name": body.name,
+            "prompt": body.prompt,
+        },
         user_id=user.user_id,
     )
     return {"job_id": str(job_id)}
+
+
+@router.get("/toolkit/prompts")
+async def toolkit_prompts(_: AuthUser = Depends(require_user)) -> dict:
+    """Return the default system prompts for the toolkit tools.
+
+    The desktop client shows these as the light-gray placeholder in the generation dialog;
+    a user-supplied prompt is appended to the tool's default (see the toolkit pipeline).
+    """
+    from api.tools.toolkit.prompts import SYSTEM_PROMPTS
+
+    return dict(SYSTEM_PROMPTS)
+
+
+@router.get("/toolkit/config")
+async def toolkit_config(_: AuthUser = Depends(require_user)) -> dict:
+    """Surface the toolkit generation limits.
+
+    The desktop client shows these (e.g. the per-file size cap, the supported formats) as
+    hints in the picker / generate dialog so a user learns about a limit before submitting,
+    not from a failed job.
+    """
+    from core.infrastructure.ingest import supported_extensions
+
+    return {
+        "max_file_bytes": settings.toolkit_max_file_bytes,
+        "max_input_tokens": settings.toolkit_max_input_tokens,
+        "supported_extensions": sorted(supported_extensions()),
+    }
 
 
 @router.post("/tts")

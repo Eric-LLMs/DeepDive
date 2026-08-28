@@ -138,7 +138,8 @@ class ToolKitPipeline:
             if not path.is_file():
                 raise SourceError(f"not a file: {raw}")
             if path.stat().st_size > settings.toolkit_max_file_bytes:
-                raise SourceError(f"file too large (>{settings.toolkit_max_file_bytes} bytes): {raw}")
+                max_mb = settings.toolkit_max_file_bytes // (1024 * 1024)
+                raise SourceError(f"file too large (max {max_mb} MB): {raw}")
             resolved.append(path)
 
         target = self.output_dir if output_dir is None else Path(output_dir)
@@ -155,8 +156,17 @@ class ToolKitPipeline:
 
     # ── stage 3: generate ──
     async def stage_generate(self, sources: list[WorkspaceSource], params: dict) -> dict:
-        """Structured JSON generation with schema validation and one corrective retry."""
+        """Structured JSON generation with schema validation and one corrective retry.
+
+        A per-task custom prompt (``params["prompt"]``, from the generation dialog) is
+        appended to the tool's default system prompt, never replacing it — the default
+        carries the JSON/schema constraints that keep the pipeline working, and the user's
+        own requirements layer on top. An empty/missing prompt uses the default alone.
+        """
         system = SYSTEM_PROMPTS[self.tool]
+        custom = (params.get("prompt") or "").strip()
+        if custom:
+            system = f"{system}\n\n{custom}"
         prompt = build_user_prompt(self.tool, sources, params)
         data = await self._complete_json(prompt, system)
 

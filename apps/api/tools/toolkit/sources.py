@@ -22,9 +22,11 @@ from .errors import SourceError
 # Map-reduce guardrails: a single over-budget file is split into line-tracked chunks; the
 # digest calls run under a concurrency cap, and the chunk count is bounded so a pathological
 # file fails loudly instead of burning the whole worker timeout on serial LLM calls.
+# 64 chunks x 12000 chars ≈ 770k chars of extracted text per file — enough for a large
+# survey/book PDF (a ~10 MB paper extracts to ~240k chars), while still capping digest calls.
 _MAP_CONCURRENCY = 4
-_MAX_MAP_CHUNKS = 24
-_CHUNK_CHARS = 9000
+_MAX_MAP_CHUNKS = 64
+_CHUNK_CHARS = 12000
 
 _MAP_SYSTEM = (
     "You are an excerpt summarizer for a map-reduce pipeline. Condense the excerpt into a "
@@ -184,7 +186,8 @@ async def load_sources(workspace: Path, paths: list[Path], llm) -> list[Workspac
         if not p.is_file():
             raise SourceError(f"not a file: {p}")
         if p.stat().st_size > settings.toolkit_max_file_bytes:
-            raise SourceError(f"file too large (>{settings.toolkit_max_file_bytes} bytes): {p.name}")
+            max_mb = settings.toolkit_max_file_bytes // (1024 * 1024)
+            raise SourceError(f"file too large (max {max_mb} MB): {p.name}")
 
         data = await asyncio.to_thread(p.read_bytes)
         try:

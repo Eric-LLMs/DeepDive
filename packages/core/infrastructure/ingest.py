@@ -37,6 +37,15 @@ class UnsupportedFileType(ValueError):
     """Raised when no text extractor exists for the uploaded file type."""
 
 
+def supported_extensions() -> set[str]:
+    """The file extensions :func:`extract_text` / :func:`extract_document_text` can read.
+
+    Single source of truth for the clients: the toolkit config endpoint surfaces these so
+    the desktop picker can grey out files a generation job would refuse.
+    """
+    return _TEXT_EXTS | _SUBTITLE_EXTS | {".pdf", ".docx"}
+
+
 @dataclass
 class Chunk:
     """A prepared RAG chunk carrying every column the worker persists."""

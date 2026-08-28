@@ -157,6 +157,15 @@
   // reloads from the server; it also toggles this panel's .hidden class itself.
   window.loadCloudDrive = loadDrive;
 
+  // Open the Cloud Drive main view at a My Drive folder path ("" = root). Used by the
+  // toolkit generate dialog's "view output" link so the user can see where a generated
+  // artifact landed instead of hunting for it.
+  window.openCloudFolder = async (folderPath) => {
+    try { await loadDrive(); } catch { /* keep whatever list we already have */ }
+    const rel = (folderPath || "").replace(/^\/+|\/+$/g, "");
+    navigate(rel ? { kind: "folder", ws: null, path: rel } : { kind: "root" });
+  };
+
   // ── Browse / navigate ──
   function setStatus(msg) {
     cdStatusEl.textContent = msg || "";
@@ -1089,6 +1098,12 @@
   }
 
   // ── Note editor ──
+  // Icon buttons carry an SVG + a label span; only the label changes at runtime.
+  function noteBtn(btn, text) {
+    const el = btn.querySelector(".note-btn-label");
+    if (el) el.textContent = text; else btn.textContent = text;
+  }
+
   async function openNote(f) {
     if (!getToken()) { Viewer.toast("Sign in to open cloud notes."); return; }
     if (note.dirty && !(await window.confirmModal("Discard unsaved changes to the current note?"))) return;
@@ -1103,7 +1118,7 @@
       noteTitleEl.textContent = f.folder_path ? `${f.folder_path}/${f.name}` : f.name;
       setPreviewMode(false);
       noteSaveBtn.disabled = true;
-      noteSaveBtn.textContent = "💾 Save";
+      noteBtn(noteSaveBtn, "Save");
       noteEditor.classList.remove("hidden");
       setStatus("");
       // A Mermaid mindmap opens straight into the diagram preview (树状图) instead of raw
@@ -1118,7 +1133,7 @@
   async function saveNote() {
     if (!note.asset) return;
     noteSaveBtn.disabled = true;
-    noteSaveBtn.textContent = "💾 Saving…";
+    noteBtn(noteSaveBtn, "Saving…");
     try {
       const res = await apiFetch(`/files/${note.asset.id}/content`, {
         method: "PUT",
@@ -1126,13 +1141,13 @@
       });
       note.asset = { ...note.asset, size: res.asset?.size ?? note.asset.size, updated_at: res.asset?.updated_at ?? note.asset.updated_at };
       note.dirty = false;
-      noteSaveBtn.textContent = "💾 Saved ✓";
-      setTimeout(() => { noteSaveBtn.textContent = "💾 Save"; }, 1500);
+      noteBtn(noteSaveBtn, "Saved ✓");
+      setTimeout(() => { noteBtn(noteSaveBtn, "Save"); }, 1500);
       loadDrive(); // refresh size/updated_at in the sidebar list
       setStatus("Note saved. Re-indexing in background…");
     } catch (e) {
       noteSaveBtn.disabled = false;
-      noteSaveBtn.textContent = "💾 Save";
+      noteBtn(noteSaveBtn, "Save");
       setStatus(`Save failed: ${e.message}`);
     }
   }
@@ -1141,8 +1156,8 @@
     note.preview = on;
     notePreviewPane.classList.toggle("hidden", !on);
     noteTextarea.classList.toggle("hidden", on);
-    noteModeEl.textContent = on ? "👁 preview" : "✏️ edit";
-    notePreviewBtn.textContent = on ? "✏️ Edit" : "👁 Preview";
+    noteModeEl.textContent = on ? "Preview" : "Edit";
+    noteBtn(notePreviewBtn, on ? "Edit" : "Preview");
     if (on) {
       notePreviewPane.innerHTML = /^\s*mindmap\b/.test(noteTextarea.value)
         ? renderMindmap(noteTextarea.value)
@@ -1160,7 +1175,7 @@
     noteTextarea.value = "";
     notePreviewPane.innerHTML = "";
     noteSaveBtn.disabled = false;
-    noteSaveBtn.textContent = "💾 Save";
+    noteBtn(noteSaveBtn, "Save");
   }
 
   // Markdown rendering, XSS-safe: html:false escapes raw HTML and the link validator
@@ -2165,13 +2180,15 @@
     }
   });
 
-  // ── "Choose a Cloud Drive folder" picker (used by session → toolkit generation) ──
+  // ── "Choose a Cloud Drive folder" picker (used by session → toolkit generation and the
+  // generate dialog's output-folder picker) ──
   // A save-dialog-style folder tree that reuses the sidebar's row/kids markup and the
   // same expansion state, so it looks and behaves like the upload panel. Only My Drive
   // (personal, workspace_id null) folders are offered — session artifacts always land in
   // the caller's personal drive. Resolves with the chosen folder path (null = My Drive
-  // root) or undefined when cancelled.
-  window.pickDriveFolderModal = async (title) => {
+  // root) or undefined when cancelled. With ``prompt: false`` the prompt textarea is
+  // omitted (pure folder selection, ok label overridable via ``okLabel``).
+  window.pickDriveFolderModal = async (title, { defaultPrompt = "", prompt = true, okLabel = "Generate" } = {}) => {
     if (!getToken()) { Viewer.toast("Sign in to choose a cloud folder."); return undefined; }
     try { await loadDrive(); } catch { /* keep whatever folders we already have */ }
 
@@ -2197,6 +2214,13 @@
     const tree = document.createElement("div");
     tree.className = "cd-picker-tree";
 
+    const promptEl = prompt ? document.createElement("textarea") : null;
+    if (promptEl) {
+      promptEl.className = "cd-prompt-input cd-picker-prompt";
+      promptEl.rows = 6;
+      promptEl.placeholder = defaultPrompt || "Optional: write your own requirements here…";
+    }
+
     const actions = document.createElement("div");
     actions.className = "modal-actions";
     const cancelBtn = document.createElement("button");
@@ -2205,10 +2229,12 @@
     const okBtn = document.createElement("button");
     okBtn.type = "button";
     okBtn.className = "primary";
-    okBtn.textContent = "Save here";
+    okBtn.textContent = okLabel;
     actions.append(cancelBtn, okBtn);
 
-    modal.append(header, target, tree, actions);
+    modal.append(header, target, tree);
+    if (promptEl) modal.append(promptEl);
+    modal.append(actions);
     overlay.appendChild(modal);
 
     let selected = null; // folder path; null = My Drive root
@@ -2309,12 +2335,234 @@
       if (e.key === "Escape") finish(undefined);
     }
     cancelBtn.addEventListener("click", () => finish(undefined));
-    okBtn.addEventListener("click", () => finish(selected));
+    okBtn.addEventListener("click", () =>
+      finish({ folderPath: selected, prompt: promptEl ? promptEl.value.trim() || null : null })
+    );
     close.addEventListener("click", () => finish(undefined));
     overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) finish(undefined); });
     document.addEventListener("keydown", onEsc);
     document.body.appendChild(overlay);
     renderTree();
+    return promise;
+  };
+
+  // ── "Pick Cloud Drive files" picker (multi-select) ──
+  // Used by the chat toolkit dialog ("Add cloud file"): a checkbox tree over My Drive +
+  // every workspace. Resolves with an array of file objects { id, name, folder_path,
+  // workspace_id, size } ([] when cancelled).
+  // Toolkit generation config (per-file size cap + supported formats), fetched once from
+  // /toolkit/config so the picker can mark files a generation job would refuse: oversized
+  // files and file types with no text extractor.
+  let toolkitCfg = null;
+  async function toolkitLimits() {
+    if (toolkitCfg === null) {
+      try {
+        const c = await apiFetch("/toolkit/config");
+        toolkitCfg = {
+          maxFileBytes: c.max_file_bytes || 0,
+          extensions: new Set(c.supported_extensions || []),
+        };
+      } catch { toolkitCfg = { maxFileBytes: 0, extensions: new Set() }; }
+    }
+    return toolkitCfg;
+  }
+  window.pickCloudFiles = async ({ title = "Pick cloud files", okLabel = "Add" } = {}) => {
+    if (!getToken()) { Viewer.toast("Sign in to pick cloud files."); return []; }
+    try { await loadDrive(); } catch { /* keep whatever files we already have */ }
+    const cfg = await toolkitLimits();
+    const maxBytes = cfg.maxFileBytes;
+    const extSet = cfg.extensions;
+
+    const overlay = document.createElement("div");
+    overlay.className = "overlay";
+    const modal = document.createElement("div");
+    modal.className = "modal cd-picker-modal";
+
+    const header = document.createElement("div");
+    header.className = "modal-header";
+    const h = document.createElement("h3");
+    h.textContent = title;
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "modal-close";
+    close.innerHTML = "&times;";
+    close.title = "Close";
+    header.append(h, close);
+
+    const tree = document.createElement("div");
+    tree.className = "cd-picker-tree";
+
+    const footer = document.createElement("div");
+    footer.className = "cd-pick-count";
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "Cancel";
+    const okBtn = document.createElement("button");
+    okBtn.type = "button";
+    okBtn.className = "primary";
+    okBtn.textContent = okLabel;
+    actions.append(cancelBtn, okBtn);
+
+    modal.append(header, tree, footer, actions);
+    overlay.appendChild(modal);
+
+    const selected = new Map(); // file id -> file object
+
+    function refreshFooter() {
+      footer.textContent = selected.size
+        ? `${selected.size} file${selected.size === 1 ? "" : "s"} selected`
+        : "No files selected";
+    }
+    refreshFooter();
+
+    let resolveVal;
+    const promise = new Promise((res) => { resolveVal = res; });
+    function finish(val) {
+      document.removeEventListener("keydown", onEsc);
+      overlay.remove();
+      resolveVal(val);
+    }
+
+    function makeFileRow(f, scope, depth) {
+      const row = document.createElement("div");
+      row.className = "cd-row cd-file cd-pick-file";
+      row.dataset.id = f.id;
+      row.style.paddingLeft = `${6 + depth * 16}px`;
+      const dot = (f.name || "").lastIndexOf(".");
+      const ext = dot > 0 ? f.name.slice(dot).toLowerCase() : "";
+      const badType = extSet.size > 0 && !extSet.has(ext);
+      const tooBig = maxBytes > 0 && (f.size || 0) > maxBytes;
+      const blocked = badType || tooBig;
+      if (blocked) row.classList.add("cd-pick-over");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.className = "cd-pick-check";
+      box.checked = selected.has(f.id);
+      box.disabled = blocked;
+      const icon = document.createElement("span");
+      icon.className = "cd-icon";
+      icon.textContent = "📄";
+      const nm = document.createElement("span");
+      nm.className = "cd-name";
+      nm.textContent = f.name;
+      nm.title = f.folder_path ? `${f.folder_path}/${f.name}` : f.name;
+      const toggle = () => {
+        if (blocked) return;
+        if (selected.has(f.id)) selected.delete(f.id);
+        else selected.set(f.id, { id: f.id, name: f.name, folder_path: f.folder_path || "", workspace_id: scope, size: f.size || 0 });
+        box.checked = selected.has(f.id);
+        refreshFooter();
+      };
+      row.addEventListener("click", toggle);
+      box.addEventListener("click", (e) => { e.stopPropagation(); toggle(); });
+      row.append(box, icon, nm);
+      if (badType) {
+        const tag = document.createElement("span");
+        tag.className = "cd-pick-over-tag";
+        tag.textContent = "unsupported format";
+        row.append(tag);
+      } else if (tooBig) {
+        const tag = document.createElement("span");
+        tag.className = "cd-pick-over-tag";
+        tag.textContent = `over limit (>${Math.round(maxBytes / (1024 * 1024))}MB)`;
+        row.append(tag);
+      }
+      const size = document.createElement("span");
+      size.className = "cd-pick-size";
+      size.textContent = fmtSize(f.size || 0);
+      row.append(size);
+      return row;
+    }
+
+    function makeFolderRow(scope, path, depth) {
+      const key = expKey(scope, path);
+      const open = drive.expanded.has(key);
+      const row = document.createElement("div");
+      row.className = "cd-row cd-folder";
+      row.style.paddingLeft = `${6 + depth * 16}px`;
+      const tw = document.createElement("span");
+      tw.className = "cd-tw";
+      const hasKids = childrenOf(scope, path).folderKids.length > 0;
+      tw.textContent = hasKids ? (open ? "▾" : "▸") : "·";
+      const icon = document.createElement("span");
+      icon.className = "cd-icon";
+      icon.textContent = path === "" ? "☁️" : "📁";
+      const nm = document.createElement("span");
+      nm.className = "cd-name";
+      nm.textContent = path === "" ? "My Drive" : path.split("/").pop();
+      row.append(tw, icon, nm);
+      const expand = () => {
+        if (drive.expanded.has(key)) drive.expanded.delete(key);
+        else drive.expanded.add(key);
+        render();
+      };
+      tw.addEventListener("click", (e) => { e.stopPropagation(); expand(); });
+      row.addEventListener("dblclick", (e) => { e.stopPropagation(); expand(); });
+      return row;
+    }
+
+    function renderScopeChildren(scope, path, depth, container) {
+      const kids = childrenOf(scope, path);
+      for (const d of kids.folderKids) {
+        container.appendChild(makeFolderRow(scope, d.path, depth));
+        if (drive.expanded.has(expKey(scope, d.path))) {
+          const box = document.createElement("div");
+          box.className = "cd-kids";
+          renderScopeChildren(scope, d.path, depth + 1, box);
+          container.appendChild(box);
+        }
+      }
+      for (const f of kids.fileKids) container.appendChild(makeFileRow(f, scope, depth));
+    }
+
+    function render() {
+      tree.innerHTML = "";
+      for (const scope of [null, ...drive.workspaces.map((w) => w.id)]) {
+        const key = expKey(scope, "");
+        const open = drive.expanded.has(key);
+        const root = document.createElement("div");
+        root.className = "cd-row cd-folder";
+        const tw = document.createElement("span");
+        tw.className = "cd-tw";
+        const hasKids = childrenOf(scope, "").folderKids.length > 0;
+        tw.textContent = hasKids ? (open ? "▾" : "▸") : "·";
+        const icon = document.createElement("span");
+        icon.className = "cd-icon";
+        icon.textContent = scope == null ? "☁️" : "🗂";
+        const nm = document.createElement("span");
+        nm.className = "cd-name";
+        nm.textContent = scope == null ? "My Drive" : wsName(scope);
+        const expand = () => {
+          if (drive.expanded.has(key)) drive.expanded.delete(key);
+          else drive.expanded.add(key);
+          render();
+        };
+        tw.addEventListener("click", (e) => { e.stopPropagation(); expand(); });
+        root.addEventListener("dblclick", (e) => { e.stopPropagation(); expand(); });
+        root.append(tw, icon, nm);
+        tree.appendChild(root);
+        if (open) {
+          const box = document.createElement("div");
+          box.className = "cd-kids";
+          renderScopeChildren(scope, "", 1, box);
+          tree.appendChild(box);
+        }
+      }
+    }
+
+    function onEsc(e) {
+      if (e.key === "Escape") finish([]);
+    }
+    cancelBtn.addEventListener("click", () => finish([]));
+    okBtn.addEventListener("click", () => finish([...selected.values()]));
+    close.addEventListener("click", () => finish([]));
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) finish([]); });
+    document.addEventListener("keydown", onEsc);
+    document.body.appendChild(overlay);
+    render();
     return promise;
   };
 

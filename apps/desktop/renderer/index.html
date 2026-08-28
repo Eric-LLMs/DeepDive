@@ -87,9 +87,15 @@
           <div id="chat-log"></div>
           <form id="chat-form">
             <div id="chat-attach-bar" class="chat-attach-bar hidden"></div>
+            <div id="chat-toolbar" class="chat-toolbar" title="Generate from this conversation or workspace files">
+              <span class="chat-toolbar-label">Generate:</span>
+              <button id="chat-gen-mindmap" type="button" class="chat-tool-btn" title="Generate a mind map from this conversation or workspace files">🧠 Mind Map</button>
+              <button id="chat-gen-slides" type="button" class="chat-tool-btn" title="Generate slides from this conversation or workspace files">🎞 Slides</button>
+              <button id="chat-gen-summary" type="button" class="chat-tool-btn" title="Generate a summary from this conversation or workspace files">📝 Summary</button>
+            </div>
             <div class="chat-input-box">
               <button id="chat-attach-pick" type="button" class="chat-input-btn" title="Attach a file">＋</button>
-              <input id="chat-input" type="text" placeholder="Ask about the current material, or just chat…" autocomplete="off" />
+              <textarea id="chat-input" rows="3" placeholder="Ask about the current material, or just chat…" autocomplete="off"></textarea>
               <button id="chat-mic" type="button" class="chat-input-btn" title="Voice input (talk to the assistant)"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
               <button id="chat-speak" type="button" class="chat-input-btn" title="Speak replies aloud"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3.5" y="10" width="3" height="6" rx="1.5"/><rect x="9" y="4" width="3" height="18" rx="1.5"/><rect x="14.5" y="7" width="3" height="12" rx="1.5"/><rect x="20" y="9.5" width="3" height="7" rx="1.5"/></svg></button>
               <button id="chat-send" type="submit">Send</button>
@@ -101,10 +107,18 @@
           <div class="note-editor-toolbar">
             <span id="note-title" class="note-editor-title">note.md</span>
             <span class="spacer"></span>
-            <span id="note-mode" class="note-mode">✏️ edit</span>
-            <button id="note-preview" type="button" title="Toggle edit / preview">👁 Preview</button>
-            <button id="note-save" type="button" title="Save to cloud (Ctrl+S)">💾 Save</button>
-            <button id="note-close" type="button" title="Close">✕</button>
+            <span id="note-mode" class="note-mode">Edit</span>
+            <button id="note-preview" class="note-icon-btn" type="button" title="Toggle edit / preview">
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+              <span class="note-btn-label">Preview</span>
+            </button>
+            <button id="note-save" class="note-icon-btn" type="button" title="Save to cloud (Ctrl+S)">
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zM12 19a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm1-10H6V5h7v4z"/></svg>
+              <span class="note-btn-label">Save</span>
+            </button>
+            <button id="note-close" class="note-icon-btn note-icon-only" type="button" title="Close">
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+            </button>
           </div>
           <textarea id="note-textarea" class="note-editor-textarea" spellcheck="false" placeholder="Start writing…"></textarea>
           <div id="note-preview-pane" class="md-preview hidden"></div>

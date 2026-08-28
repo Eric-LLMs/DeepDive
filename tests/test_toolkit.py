@@ -22,6 +22,7 @@ from apps.api.tools.toolkit import outputs, sources
 from apps.api.tools.toolkit.errors import GenerationError, SourceError
 from apps.api.tools.toolkit.pipeline import ToolKitPipeline
 from apps.api.tools.toolkit.plugins import build_toolkit_plugin
+from apps.api.tools.toolkit.prompts import SYSTEM_PROMPTS
 
 SUMMARY_DATA = {
     "title": "Deep Dive",
@@ -217,6 +218,24 @@ async def test_schema_failure_retries_with_error_feedback(tmp_path):
     retry_prompt = llm.complete_json_calls[1][0]
     assert "conform to the schema" in retry_prompt
     assert "key_points" in retry_prompt  # the concrete error was carried back
+
+
+async def test_custom_prompt_appended_to_default_system(tmp_path):
+    _doc(tmp_path)
+    llm = _FakeLLM([SUMMARY_DATA])
+    pipe = ToolKitPipeline(llm, "summary", workspace=tmp_path)
+    await pipe.run(["doc.md"], prompt="Make it bilingual (en/zh).")
+    system = llm.complete_json_calls[0][1]
+    assert system.startswith(SYSTEM_PROMPTS["summary"])
+    assert system.endswith("Make it bilingual (en/zh).")
+
+
+async def test_blank_custom_prompt_uses_default_system(tmp_path):
+    _doc(tmp_path)
+    llm = _FakeLLM([SUMMARY_DATA])
+    pipe = ToolKitPipeline(llm, "summary", workspace=tmp_path)
+    await pipe.run(["doc.md"], prompt="   ")
+    assert llm.complete_json_calls[0][1] == SYSTEM_PROMPTS["summary"]
 
 
 async def test_persistent_schema_failure_raises(tmp_path):

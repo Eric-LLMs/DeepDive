@@ -499,12 +499,6 @@
       if (ctx.isDir) {
         localCtxEl.appendChild(mk("🗑 Delete folder", () => deleteLocalFolder(ctx.targetPath)));
       } else {
-        localCtxEl.appendChild(mk("🧠 Generate Mind Map", () => generateToolkit("mindmap", ctx.targetPath)));
-        localCtxEl.appendChild(mk("🎞 Generate Slides", () => generateToolkit("slides", ctx.targetPath)));
-        localCtxEl.appendChild(mk("📝 Summarize", () => generateToolkit("summary", ctx.targetPath)));
-        const sepGen = document.createElement("div");
-        sepGen.className = "drive-ctxmenu-sep";
-        localCtxEl.appendChild(sepGen);
         localCtxEl.appendChild(mk("🗑 Delete file", () => deleteFileFromWorkspace(ctx.targetPath)));
       }
     }
@@ -1718,66 +1712,40 @@
   // modal offers "open" actions for each produced artifact.
   const TOOLKIT_LABELS = { slides: "Slides", mindmap: "Mind Map", summary: "Summary" };
 
-  window.generateToolkit = async (tool, absPath) => {
-    if (!state.workspaceDir) { Viewer.toast("Pick a workspace folder first (💻 Local in the sidebar)."); return; }
-    const label = TOOLKIT_LABELS[tool] || tool;
-    Viewer.toast(`Generating ${label} from workspace file…`);
-    try {
-      const res = await fetch("/api/toolkit/generate", {
-        method: "POST",
-        headers: authHeaders(),
-        body: JSON.stringify({ tool, paths: [relFromAbs(absPath)] }),
-      });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const { job_id } = await res.json();
-      pollToolkitJob(job_id, label);
-    } catch (err) {
-      Viewer.toast(`Generation failed: ${err.message}`);
+  // Default prompts for the 3 toolkit tools, cached from GET /api/toolkit/prompts so the
+  // generate dialogs can show them as light-gray placeholders without re-fetching.
+  let toolkitDefaultPrompts = null;
+  async function fetchToolkitDefaultPrompt(tool) {
+    if (toolkitDefaultPrompts === null) {
+      toolkitDefaultPrompts = {};
+      try {
+        const res = await fetch("/api/toolkit/prompts", { headers: authHeaders() });
+        if (res.ok) toolkitDefaultPrompts = await res.json();
+      } catch { /* fall back to empty defaults */ }
     }
-  };
-
-  async function pollToolkitJob(jobId, label) {
-    for (let i = 0; i < 900; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      const res = await fetch(`/api/jobs/${jobId}`, { headers: authHeaders() });
-      if (res.status === 401) { Viewer.toast("Session expired; log in again."); return; }
-      const job = await res.json();
-      if (job.status === "succeeded") {
-        const files = (job.result && job.result.files) || [];
-        showToolkitResult(label, files);
-        return;
-      }
-      if (job.status === "failed") {
-        Viewer.toast(`${label} generation failed: ${job.error}`);
-        return;
-      }
-    }
-    Viewer.toast(`${label} generation timed out; check the output folder later.`);
+    return toolkitDefaultPrompts[tool] || "";
   }
 
-  function showToolkitResult(label, files) {
-    if (!files.length) { Viewer.toast(`${label} generated (no files reported).`); return; }
-    const overlay = document.createElement("div");
-    overlay.className = "overlay";
-    const rows = files.map((f) => {
-      const name = String(f).replace(/\\/g, "/").split("/").filter(Boolean).pop() || f;
-      return `<div style="margin:4px 0"><button type="button" class="primary" data-open="${escapeHtml(f)}">📂 Open ${escapeHtml(name)}</button></div>`;
-    }).join("");
-    overlay.innerHTML = `
-      <div class="modal cd-prompt-modal">
-        <div class="modal-header"><h3></h3></div>
-        <p class="cd-confirm-msg"></p>
-        ${rows}
-        <div class="modal-actions"><button type="button" class="cd-confirm-ok primary">Done</button></div>
-      </div>`;
-    overlay.querySelector("h3").textContent = `${label} generated`;
-    overlay.querySelector(".cd-confirm-msg").textContent = "Open a generated artifact:";
-    overlay.querySelectorAll("[data-open]").forEach((b) => {
-      b.addEventListener("click", () => window.desktopAPI.openExternal(b.dataset.open));
-    });
-    overlay.querySelector(".cd-confirm-ok").addEventListener("click", () => overlay.remove());
-    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) overlay.remove(); });
-    document.body.appendChild(overlay);
+  // Toolkit generation limits (e.g. the per-file size cap), cached from GET /api/toolkit/config
+  // so the generate dialog can warn about oversized files before a job is submitted.
+  let toolkitLimits = null;
+  async function fetchToolkitLimit() {
+    if (toolkitLimits === null) {
+      toolkitLimits = {};
+      try {
+        const res = await fetch("/api/toolkit/config", { headers: authHeaders() });
+        if (res.ok) toolkitLimits = await res.json();
+      } catch { /* limits stay unknown; the server still guards the size cap */ }
+    }
+    return toolkitLimits;
+  }
+
+  // Compact human-readable byte size (mirrors fmtSize in clouddrive.js).
+  function fmtBytes(n) {
+    if (!n && n !== 0) return "";
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / (1024 * 1024)).toFixed(1) + " MB";
   }
 
   // ── Session → toolkit artifact (chat transcript → Cloud Drive) ──
@@ -1796,6 +1764,41 @@
     generatingSessions.delete(String(sessionId));
     loadSessions();
   }
+  // tool -> { jobId, status, result, error } for the LAST submitted toolkit job. Kept so the
+  // generate dialog can show the previous submission's status + produced files when reopened,
+  // and to disable "Generate" while a job is still running (one job per tool at a time).
+  const toolkitJobs = {};
+  // tool -> { src, cloudFiles, folderPath, name, prompt } — the dialog's submitted inputs,
+  // kept across close/reopen so the window shows exactly what was submitted while the job runs.
+  const genDialogState = {};
+  // Toolbar "Generate <tool>" buttons, filled when they are bound; the running one pulses.
+  const genButtons = {};
+  // Tools whose generate dialog is currently open — while open, the in-dialog status box shows
+  // the result instead of popping the separate "Saved to Cloud Drive" modal.
+  const openGenDialogs = new Set();
+  function updateToolbarGenState() {
+    for (const tool of ["mindmap", "slides", "summary"]) {
+      const btn = genButtons[tool];
+      if (!btn) continue;
+      const l = toolkitJobs[tool];
+      const running = l && (l.status === "queued" || l.status === "running");
+      btn.classList.toggle("gen-running", running);
+      if (running) {
+        // Running: swap to a steady hourglass indicator + label (no blink). The button stays
+        // clickable so the user can reopen the dialog and watch the progress / details.
+        if (!btn.dataset.idle) btn.dataset.idle = btn.innerHTML;
+        btn.innerHTML = `⏳ ${TOOLKIT_LABELS[tool] || tool}`;
+        btn.title = `${TOOLKIT_LABELS[tool] || tool} is generating… — click to view progress`;
+      } else {
+        // Idle / finished: restore the original label and return to a normal button.
+        if (btn.dataset.idle) {
+          btn.innerHTML = btn.dataset.idle;
+          delete btn.dataset.idle;
+        }
+        btn.title = `Generate a ${TOOLKIT_LABELS[tool] || tool} from this conversation or workspace files`;
+      }
+    }
+  }
 
   window.generateSessionArtifact = async (tool, s) => {
     if (!state.token) { Viewer.toast("Sign in to generate from a session."); return; }
@@ -1804,10 +1807,12 @@
       Viewer.toast("Already generating from this session.");
       return;
     }
-    let folderPath = null;
+    let picked;
     try {
-      folderPath = await window.pickDriveFolderModal(`Save ${info.label} to`);
-      if (folderPath === undefined) return; // cancelled
+      picked = await window.pickDriveFolderModal(`Generate ${info.label} — choose save location`, {
+        defaultPrompt: await fetchToolkitDefaultPrompt(tool),
+      });
+      if (picked === undefined) return; // cancelled
     } catch (err) {
       Viewer.toast(`Could not load cloud folders: ${err.message}`);
       return;
@@ -1817,7 +1822,12 @@
       const res = await fetch("/api/toolkit/generate", {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({ tool, session_id: s.id, folder_path: folderPath || null }),
+        body: JSON.stringify({
+          tool,
+          session_id: s.id,
+          folder_path: picked.folderPath || null,
+          prompt: picked.prompt || null,
+        }),
       });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       ({ job_id: jobId } = await res.json());
@@ -1828,25 +1838,47 @@
     // Job queued: mark the session row and poll in the background — the UI stays usable.
     generatingSessions.set(String(s.id), info.label);
     loadSessions();
-    const result = await pollSessionJob(jobId);
+    const result = await pollSessionJob(jobId, tool);
     finishGenerating(s.id);
     if (result) showSessionArtifactResult(info, result);
   };
 
-  // Poll the job every 2s with an auth header; resolve the result dict, or null on
-  // failure / timeout (capped at ~3 minutes). Non-blocking: only the sidebar row is marked.
-  async function pollSessionJob(jobId) {
-    const deadline = Date.now() + 3 * 60 * 1000;
-    while (Date.now() < deadline) {
+  // Poll the job every 2s with an auth header; resolve the result dict, or null on failure /
+  // auth expiry. Generation genuinely takes a while (map-reduce of a large file + the final
+  // generate call can exceed 20 minutes; the worker's own timeout is 1h), so keep polling
+  // until the job reaches a terminal state instead of giving up early — the toolbar button
+  // stays on the hourglass (and Generate stays disabled) until the job really finishes.
+  // When ``tool`` is given, the live status is recorded into toolkitJobs[tool] so the
+  // generate dialog can reflect the running job when reopened.
+  async function pollSessionJob(jobId, tool) {
+    const entry = { jobId, status: "queued", result: null, error: null, startedAt: Date.now() };
+    if (tool) { toolkitJobs[tool] = entry; updateToolbarGenState(); }
+    for (;;) {
       await new Promise((r) => setTimeout(r, 2000));
-      const res = await fetch(`/api/jobs/${jobId}`, { headers: authHeaders() });
-      if (res.status === 401) { Viewer.toast("Session expired; log in again."); return null; }
-      const job = await res.json();
-      if (job.status === "succeeded") return job.result || {};
-      if (job.status === "failed") { Viewer.toast(`Generation failed: ${job.error}`); return null; }
+      let res;
+      try {
+        res = await fetch(`/api/jobs/${jobId}`, { headers: authHeaders() });
+      } catch { continue; }  // transient network hiccup — keep waiting
+      if (res.status === 401) {
+        Viewer.toast("Session expired; log in again.");
+        if (tool) { entry.status = "failed"; entry.error = "Session expired; log in again."; updateToolbarGenState(); }
+        return null;
+      }
+      if (!res.ok) continue;  // transient server error — keep waiting
+      let job;
+      try { job = await res.json(); } catch { continue; }
+      if (tool) { entry.status = job.status; updateToolbarGenState(); }
+      if (job.status === "succeeded") {
+        const result = job.result || {};
+        if (tool) { entry.status = "succeeded"; entry.result = result; updateToolbarGenState(); }
+        return result;
+      }
+      if (job.status === "failed") {
+        Viewer.toast(`Generation failed: ${job.error}`);
+        if (tool) { entry.status = "failed"; entry.error = job.error; updateToolbarGenState(); }
+        return null;
+      }
     }
-    Viewer.toast("Generation timed out; check your Cloud Drive later.");
-    return null;
   }
 
   function showSessionArtifactResult(info, result) {
@@ -1875,6 +1907,440 @@
     overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) overlay.remove(); });
     document.body.appendChild(overlay);
   }
+
+  // Submit a session-mode toolkit job; returns the job id (throws on HTTP error).
+  async function submitSessionJob(tool, sessionId, prompt, folderPath = null, name = null) {
+    const res = await fetch("/api/toolkit/generate", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ tool, session_id: sessionId, folder_path: folderPath, name: name || null, prompt: prompt || null }),
+    });
+    if (!res.ok) throw new Error(await apiErrorDetail(res));
+    return (await res.json()).job_id;
+  }
+
+  // Submit a cloud-file-mode toolkit job; returns the job id (throws on HTTP error).
+  async function submitCloudFilesJob(tool, fileIds, prompt, folderPath = null, name = null) {
+    const res = await fetch("/api/toolkit/generate", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ tool, file_ids: fileIds, folder_path: folderPath, name: name || null, prompt: prompt || null }),
+    });
+    if (!res.ok) throw new Error(await apiErrorDetail(res));
+    return (await res.json()).job_id;
+  }
+
+  // Extract FastAPI's {"detail": "..."} error body so a rejected request (e.g. an oversized
+  // file refused at enqueue) shows a readable reason instead of just "400 Bad Request".
+  async function apiErrorDetail(res) {
+    try {
+      const b = await res.json();
+      if (b && b.detail) return String(b.detail);
+    } catch { /* response body is not JSON */ }
+    return `${res.status} ${res.statusText}`;
+  }
+
+  // Open the Cloud Drive view at the folder where a generated artifact landed (the "view
+  // output" link in the success status). "" opens the drive root.
+  function openOutputInDrive(folderPath) {
+    const src = document.getElementById("workspace-source");
+    if (src && src.value !== "cloud") src.value = "cloud";
+    setCloudMode(true);
+    const tabFiles = document.getElementById("tab-files");
+    if (tabFiles && !tabFiles.classList.contains("active")) tabFiles.click();
+    if (window.openCloudFolder) window.openCloudFolder(folderPath || "");
+  }
+
+  // ── Toolbar generate: one clean dialog (session or cloud files + output folder + prompt) ──
+  // Picking a tool opens a single modal: choose "this conversation" or Cloud Drive files, pick
+  // an output folder (default = Cloud Drive root), drop in an optional prompt, then Generate /
+  // Cancel. Local files are not a source — upload them to your Cloud Drive first. The job runs
+  // in the background (toast), so the modal closes right away and the rest of the app stays usable.
+  async function openGenerateDialog(tool) {
+    const label = TOOLKIT_LABELS[tool] || tool;
+    const hasSession = !!state.sessionId;
+    const defaultPrompt = await fetchToolkitDefaultPrompt(tool);
+    const saved = genDialogState[tool] || {};
+    const limits = await fetchToolkitLimit();
+    const maxBytes = limits.max_file_bytes || 0;
+
+    const overlay = document.createElement("div");
+    overlay.className = "overlay";
+    const modal = document.createElement("div");
+    modal.className = "modal cd-gen-modal";
+
+    const header = document.createElement("div");
+    header.className = "modal-header";
+    const h = document.createElement("h3");
+    h.textContent = `Generate ${label}`;
+    const close = document.createElement("button");
+    close.type = "button"; close.className = "modal-close"; close.innerHTML = "&times;"; close.title = "Cancel";
+    header.append(h, close);
+
+    const body = document.createElement("div");
+    body.className = "cd-gen-body";
+
+    // Source: session or cloud files — mutually exclusive, one section visible at a time.
+    const srcLabel = document.createElement("div");
+    srcLabel.className = "cd-gen-label";
+    srcLabel.textContent = "Source";
+    const srcRow = document.createElement("div");
+    srcRow.className = "cd-gen-sources";
+    const sessionBtn = document.createElement("button");
+    sessionBtn.type = "button";
+    sessionBtn.className = "cd-src-option";
+    sessionBtn.innerHTML = hasSession
+      ? "<b>💬 This conversation</b><span>Generate a " + label + " from the current chat</span>"
+      : "<b>💬 This conversation</b><span>Send a message first, then come back</span>";
+    sessionBtn.disabled = !hasSession;
+    const filesBtn = document.createElement("button");
+    filesBtn.type = "button";
+    filesBtn.className = "cd-src-option";
+    filesBtn.innerHTML = "<b>☁️ Cloud files</b><span>Generate from files in your Cloud Drive</span>";
+    srcRow.append(sessionBtn, filesBtn);
+    body.append(srcLabel, srcRow);
+
+    // Cloud file selection (shown only in "files" mode).
+    const fileSection = document.createElement("div");
+    fileSection.className = "cd-gen-files hidden";
+    const filesLabel = document.createElement("div");
+    filesLabel.className = "cd-gen-label";
+    filesLabel.textContent = "Selected files";
+    const chips = document.createElement("div");
+    chips.className = "cd-gen-chips";
+    const addRow = document.createElement("div");
+    addRow.className = "cd-gen-adds";
+    const addCloud = document.createElement("button");
+    addCloud.type = "button";
+    addCloud.className = "cd-gen-add";
+    addCloud.textContent = "＋ Add cloud file";
+    addRow.append(addCloud);
+    // Warning shown when a selected file exceeds the per-file size cap for generation.
+    const sizeWarn = document.createElement("div");
+    sizeWarn.className = "cd-gen-size-warn hidden";
+    fileSection.append(filesLabel, chips, sizeWarn, addRow);
+    body.append(fileSection);
+
+    // Output folder — both modes save to the Cloud Drive (default = drive root).
+    const dirLabel = document.createElement("div");
+    dirLabel.className = "cd-gen-label";
+    dirLabel.textContent = "Output folder";
+    const dirRow = document.createElement("div");
+    dirRow.className = "cd-gen-dir";
+    const dirVal = document.createElement("span");
+    dirVal.className = "cd-gen-dir-val";
+    const dirBtn = document.createElement("button");
+    dirBtn.type = "button";
+    dirBtn.className = "cd-gen-add";
+    dirBtn.textContent = "Choose folder…";
+    dirRow.append(dirVal, dirBtn);
+    body.append(dirLabel, dirRow);
+
+    // Output file name — optional; blank auto-names from the session title / first file.
+    const nameLabel = document.createElement("div");
+    nameLabel.className = "cd-gen-label";
+    nameLabel.textContent = "File name (optional)";
+    const nameInput = document.createElement("input");
+    nameInput.className = "cd-gen-name";
+    nameInput.type = "text";
+    nameInput.spellcheck = false;
+    const nameHint = document.createElement("div");
+    nameHint.className = "cd-gen-name-hint";
+    body.append(nameLabel, nameInput, nameHint);
+
+    const promptLabel = document.createElement("div");
+    promptLabel.className = "cd-gen-label";
+    promptLabel.textContent = "Prompt";
+    const promptEl = document.createElement("textarea");
+    promptEl.className = "cd-gen-prompt";
+    promptEl.rows = 5;
+    promptEl.spellcheck = false;
+    promptEl.placeholder = defaultPrompt || "Optional: write your own requirements here…";
+    body.append(promptLabel, promptEl);
+
+    // Restore the previous submission's inputs so the window shows exactly what was submitted.
+    nameInput.value = saved.name || "";
+    promptEl.value = saved.prompt || "";
+
+    // Status of the previous submission for this tool (running / succeeded files / failure).
+    const statusBox = document.createElement("div");
+    statusBox.className = "cd-gen-status hidden";
+    body.append(statusBox);
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const resetBtn = document.createElement("button");
+    resetBtn.type = "button";
+    resetBtn.className = "cd-gen-reset";
+    resetBtn.textContent = "Reset";
+    resetBtn.title = "Clear this window back to the initial state";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "cd-gen-cancel";
+    cancelBtn.textContent = "Cancel";
+    const okBtn = document.createElement("button");
+    okBtn.type = "button";
+    okBtn.className = "primary cd-gen-ok";
+    okBtn.textContent = "Generate";
+    okBtn.disabled = true;
+    actions.append(resetBtn, cancelBtn, okBtn);
+
+    modal.append(header, body, actions);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    openGenDialogs.add(tool);
+
+    // Default to the session when one exists; "files" is the fallback. A saved state from a
+    // previous open (kept across close) restores exactly what was submitted.
+    let src = saved.src || (hasSession ? "session" : "files");
+    let folderPath = saved.folderPath ?? null;   // null = Cloud Drive root
+    let sessionTitle = "";   // filled async from GET /sessions/{id} when a session is active
+    const cloudFiles = (saved.cloudFiles || []).map((f) => ({ ...f }));   // { id, name }
+
+    // Mirror the worker's sanitize_name + artifact_plan so the "default name" hint tells the
+    // user exactly which files will land in the Cloud Drive.
+    function sanitizeLike(title) {
+      let s = (title || "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, " ").trim();
+      if (!s) return "session";
+      return s.length > 80 ? s.slice(0, 80) : s;
+    }
+    // Mirrors Path.stem: drop the last extension so "chapter.pdf" → "chapter" (the output name
+    // must not embed ".pdf" in the middle, e.g. chapter_mindmap.mmd).
+    function stemLike(name) {
+      const i = (name || "").lastIndexOf(".");
+      return i > 0 ? name.slice(0, i) : name;
+    }
+    function defaultArtifactNames(toolName, title) {
+      const safe = sanitizeLike(title);
+      if (toolName === "mindmap") return [`${safe}_mindmap.mmd`];
+      if (toolName === "summary") return [`${safe}_summary.md`];
+      return [`${safe}_slides.md`, `${safe}_slides.pptx`];
+    }
+
+    function refresh() {
+      chips.innerHTML = "";
+      const empty = cloudFiles.length === 0;
+      // No selected files → hide the whole list (label + chips) so no empty box shows.
+      filesLabel.classList.toggle("hidden", empty);
+      chips.classList.toggle("hidden", empty);
+      const over = maxBytes > 0 ? cloudFiles.filter((f) => (f.size || 0) > maxBytes) : [];
+      for (const f of cloudFiles) {
+        const chip = document.createElement("span");
+        chip.className = "cd-gen-chip" + (over.includes(f) ? " cd-gen-chip-over" : "");
+        chip.textContent = f.name + (f.size != null ? `  ·  ${fmtBytes(f.size)}` : "");
+        const x = document.createElement("button");
+        x.type = "button";
+        x.className = "cd-gen-chip-x";
+        x.textContent = "×";
+        x.title = "Remove";
+        x.addEventListener("click", () => {
+          cloudFiles.splice(cloudFiles.indexOf(f), 1);
+          refresh();
+        });
+        chip.appendChild(x);
+        chips.appendChild(chip);
+      }
+      // Turn the list into a fixed ~4-row scroll region only once it would actually
+      // overflow — a handful of files render as plain chips with no surrounding box.
+      if (!empty) {
+        const total = [...chips.children].reduce((sum, c) => sum + c.offsetHeight + 6, -6);
+        chips.classList.toggle("cd-gen-chips-overflow", total > 136);
+      } else {
+        chips.classList.remove("cd-gen-chips-overflow");
+      }
+      sizeWarn.classList.toggle("hidden", over.length === 0);
+      if (over.length) {
+        const maxMb = Math.round(maxBytes / (1024 * 1024));
+        sizeWarn.innerHTML = `⚠️ Too large for generation (max ${maxMb}MB): ${over.map((f) => escapeHtml(f.name)).join(", ")} — remove ${over.length > 1 ? "them" : "it"} to continue.`;
+      }
+      fileSection.classList.toggle("hidden", src !== "files");
+      sessionBtn.classList.toggle("cd-active", src === "session");
+      filesBtn.classList.toggle("cd-active", src === "files");
+      dirVal.textContent = folderPath
+        ? `☁️ My Drive / ${folderPath.split("/").join(" / ")}`
+        : "☁️ Cloud Drive (root)";
+      const pending = (() => {
+        const l = toolkitJobs[tool];
+        return l && (l.status === "queued" || l.status === "running");
+      })();
+      okBtn.disabled = pending || (src === "session" ? !hasSession : cloudFiles.length === 0) || over.length > 0;
+      resetBtn.disabled = pending;   // do not clear state mid-run
+      renderStatus();
+
+      const currentTitle = src === "session" ? sessionTitle : stemLike(cloudFiles[0]?.name || "");
+      const typed = nameInput.value.trim();
+      const baseTitle = typed || currentTitle;
+      const names = defaultArtifactNames(tool, baseTitle || "session");
+      nameHint.textContent = (typed ? "Will create: " : "Default: ") + names.join(" / ");
+      nameInput.placeholder = defaultArtifactNames(tool, currentTitle || "session")[0].replace(/\.\w+$/, "");
+    }
+
+    // Show the previous submission's status for this tool; while a job is still running the
+    // Generate button stays disabled so two runs of the same tool can't overlap.
+    function renderStatus() {
+      const last = toolkitJobs[tool];
+      if (!last) { statusBox.classList.add("hidden"); return; }
+      statusBox.classList.remove("hidden");
+      if (last.status === "queued" || last.status === "running") {
+        const secs = last.startedAt ? Math.max(1, Math.round((Date.now() - last.startedAt) / 1000)) : 0;
+        statusBox.className = "cd-gen-status";
+        statusBox.textContent = `⏳ ${label} is generating… (${secs}s) — you can close this dialog; it continues in the background, reopen anytime.`;
+      } else if (last.status === "succeeded") {
+        const assets = (last.result && last.result.assets) || [];
+        statusBox.className = "cd-gen-status cd-gen-status-ok";
+        if (assets.length) {
+          const rows = assets.map((a) =>
+            `📄 ${escapeHtml(a.name)} <span class="cd-gen-status-where">${escapeHtml(a.folder_path ? "in " + a.folder_path : "in Cloud Drive root")}</span> <a href="#" class="cd-gen-open" data-folder="${escapeHtml(a.folder_path || "")}">view output</a>`
+          ).join("<br>");
+          statusBox.innerHTML = `✓ ${label} generated:<br>${rows}`;
+        } else {
+          statusBox.textContent = `✓ ${label} generated — no files were reported.`;
+        }
+      } else {
+        statusBox.className = "cd-gen-status cd-gen-status-err";
+        statusBox.textContent = `✗ ${label} failed: ${last.error || "unknown error"}`;
+      }
+    }
+
+    // While the dialog is open and a job for this tool is still running, poll it so the status
+    // box updates live and the Generate button re-enables the moment it finishes.
+    let statusTimer = null;
+    function startStatusPolling() {
+      stopStatusPolling();
+      const last = toolkitJobs[tool];
+      if (!last || (last.status !== "queued" && last.status !== "running")) return;
+      statusTimer = setInterval(async () => {
+        const cur = toolkitJobs[tool];
+        if (!cur) { stopStatusPolling(); return; }
+        let job;
+        try {
+          const res = await fetch(`/api/jobs/${cur.jobId}`, { headers: authHeaders() });
+          if (!res.ok) { stopStatusPolling(); return; }
+          job = await res.json();
+        } catch { return; }
+        cur.status = job.status;
+        updateToolbarGenState();
+        if (job.status === "succeeded") { cur.result = job.result || {}; cur.status = "succeeded"; stopStatusPolling(); }
+        else if (job.status === "failed") { cur.error = job.error; cur.status = "failed"; stopStatusPolling(); }
+        refresh();
+      }, 2000);
+    }
+    function stopStatusPolling() {
+      if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+    }
+
+    sessionBtn.addEventListener("click", () => { src = "session"; refresh(); });
+    filesBtn.addEventListener("click", () => { src = "files"; refresh(); });
+    nameInput.addEventListener("input", refresh);
+
+    addCloud.addEventListener("click", async () => {
+      const picked = await window.pickCloudFiles({ title: `Add cloud files — ${label}`, okLabel: "Add" });
+      for (const f of picked) if (!cloudFiles.some((x) => x.id === f.id)) cloudFiles.push(f);
+      if (picked.length) src = "files";
+      refresh();
+    });
+
+    dirBtn.addEventListener("click", async () => {
+      const picked = await window.pickDriveFolderModal("Choose output folder", { prompt: false, okLabel: "Select" });
+      if (picked === undefined) return; // cancelled
+      folderPath = picked.folderPath || null;
+      refresh();
+    });
+
+    // Keep whatever was submitted/filled so reopening the dialog restores it while a job runs.
+    function saveDialogState() {
+      genDialogState[tool] = {
+        src,
+        cloudFiles: cloudFiles.map((f) => ({ ...f })),
+        folderPath,
+        name: nameInput.value,
+        prompt: promptEl.value,
+      };
+    }
+
+    function finish() {
+      stopStatusPolling();
+      saveDialogState();
+      openGenDialogs.delete(tool);
+      document.removeEventListener("keydown", onEsc);
+      overlay.remove();
+    }
+    function onEsc(e) {
+      if (e.key !== "Escape") return;
+      const overlays = document.querySelectorAll(".overlay");
+      if (overlays.length && overlays[overlays.length - 1] !== overlay) return; // a child picker is open
+      finish();
+    }
+    // One-click clear: back to the initial state — drop the selected files / folder / name /
+    // prompt and forget the previous job + result (toolbar button returns to normal).
+    resetBtn.addEventListener("click", () => {
+      cloudFiles.length = 0;
+      folderPath = null;
+      nameInput.value = "";
+      promptEl.value = "";
+      src = hasSession ? "session" : "files";
+      delete genDialogState[tool];
+      delete toolkitJobs[tool];
+      updateToolbarGenState();
+      stopStatusPolling();
+      refresh();
+    });
+    // "view output" link in the success status → open the Cloud Drive at that folder.
+    statusBox.addEventListener("click", (e) => {
+      const a = e.target.closest(".cd-gen-open");
+      if (!a) return;
+      e.preventDefault();
+      openOutputInDrive(a.dataset.folder || "");
+    });
+    cancelBtn.addEventListener("click", () => finish());
+    close.addEventListener("click", () => finish());
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) finish(); });
+    document.addEventListener("keydown", onEsc);
+
+    okBtn.addEventListener("click", () => {
+      const prompt = promptEl.value.trim() || null;
+      const name = nameInput.value.trim() || null;
+      const info = SESSION_TOOL_ASSETS[tool] || { label };
+      saveDialogState();
+      Viewer.toast(`Generating ${label}…`);
+      // Keep the dialog open: inputs stay as submitted, Generate greys out, the status box
+      // shows progress. Close/reopen restores this exact state; Generate releases on done.
+      okBtn.disabled = true;
+      (async () => {
+        try {
+          const jobId = src === "session"
+            ? await submitSessionJob(tool, state.sessionId, prompt, folderPath, name)
+            : await submitCloudFilesJob(tool, cloudFiles.map((f) => f.id), prompt, folderPath, name);
+          // Record the job now so the open dialog's status box + toolbar show "running" and the
+          // dialog's own poll loop drives the live progress; pollSessionJob keeps the background
+          // completion path (result modal / failure toast) alive too.
+          toolkitJobs[tool] = { jobId, status: "queued", result: null, error: null, startedAt: Date.now() };
+          updateToolbarGenState();
+          refresh();
+          startStatusPolling();
+          const result = await pollSessionJob(jobId, tool);
+          if (result && !openGenDialogs.has(tool)) showSessionArtifactResult(info, result);
+        } catch (err) {
+          Viewer.toast(`Generation failed: ${err.message}`);
+          toolkitJobs[tool] = { jobId: null, status: "failed", result: null, error: err.message, startedAt: Date.now() };
+          updateToolbarGenState();
+          refresh();
+        }
+      })();
+    });
+
+    // Fetch the session title so the default-name hint is accurate in session mode.
+    if (hasSession) {
+      fetch(`/api/sessions/${state.sessionId}`, { headers: authHeaders() })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (d && d.title) { sessionTitle = d.title; refresh(); } })
+        .catch(() => {});
+    }
+
+    refresh();
+    startStatusPolling();
+  }
+
 
   // ── User menu + profile modal + preferences + login modal ──
   const userMenu = document.getElementById("user-menu");
@@ -3482,4 +3948,27 @@
     chatInput.value = "";
     sendChat(message);
   });
+
+  // Enter sends the message; Shift+Enter inserts a newline. A <textarea> does not submit on
+  // Enter the way a text <input> inside a form did, so forward the key to the form.
+  chatInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      chatForm.requestSubmit();
+    }
+  });
+
+  // ── Toolbar: generate summary / mindmap / slides from the current conversation ──
+  const chatGenTools = [
+    ["mindmap", "chat-gen-mindmap"],
+    ["slides", "chat-gen-slides"],
+    ["summary", "chat-gen-summary"],
+  ];
+  for (const [tool, id] of chatGenTools) {
+    const btn = document.getElementById(id);
+    if (!btn) continue;
+    genButtons[tool] = btn;
+    btn.addEventListener("click", () => openGenerateDialog(tool));
+  }
+  updateToolbarGenState();
 })();

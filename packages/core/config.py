@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     # budget triggers map-reduce; files over the byte cap are refused outright.
     toolkit_output_dir: Path = Path(".output")
     toolkit_max_input_tokens: int = 12000
-    toolkit_max_file_bytes: int = 2 * 1024 * 1024
+    toolkit_max_file_bytes: int = 20 * 1024 * 1024
 
     # ── Web search (agent web_search tool) ──
     # provider is free text: duckduckgo (no key) | tavily | bing | google (see web_search.py).

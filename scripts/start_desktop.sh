@@ -21,6 +21,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 BACKEND_URL="http://localhost:8300"
+BACKEND_PORT=8300
 BACKEND_HEALTH="$BACKEND_URL/health"
 PG_PORT=15432
 REDIS_PORT=16379
@@ -54,6 +55,22 @@ backend_up() { curl -fsS --max-time 2 "$BACKEND_HEALTH" >/dev/null 2>&1; }
 # True when something is listening on localhost:$1 (netstat LISTENING state).
 port_open() {
   netstat -ano 2>/dev/null | grep -Eq "TCP\s+\S*:$1\s+\S+\s+LISTENING"
+}
+
+# True when the backend's DB infra (postgres + redis) is actually listening.
+# A backend that answers /health without these is a degraded zombie, not "up".
+infra_up() { port_open "$PG_PORT" && port_open "$REDIS_PORT"; }
+
+# Kill whatever is holding :$BACKEND_PORT. The PID_FILE is unreliable on Windows
+# (it records the git-bash wrapper PID, not the real listener), so find it by port.
+kill_backend() {
+  local pid
+  pid="$(netstat -ano 2>/dev/null | grep -E "TCP\s+\S*:$BACKEND_PORT\s+\S+\s+LISTENING" | awk '{print $NF}' | head -1)"
+  if [ -n "${pid:-}" ]; then
+    taskkill //F //PID "$pid" >/dev/null 2>&1 || true
+    warn "Stopped stale backend pid $pid (answered /health without live infra)."
+  fi
+  rm -f "$PID_FILE"
 }
 
 # True when the docker CLI is on PATH.
@@ -214,10 +231,16 @@ echo "  DeepDive launcher (Windows desktop)"
 echo "=============================================="
 
 step "Checking backend at $BACKEND_URL"
-if backend_up; then
-  ok "Backend already running."
+# A backend is only "already up" when /health answers AND postgres/redis are
+# listening. Otherwise it's a degraded zombie — restart it after infra is up.
+if backend_up && infra_up; then
+  ok "Backend already running with live infrastructure."
   N=$((TOTAL - 2))   # steps 2-6 skipped — web + desktop launch remain
 else
+  if backend_up; then
+    warn "Backend answers /health but postgres/redis are DOWN — restarting cleanly."
+    kill_backend || true
+  fi
   step "Checking Docker"
   ensure_docker || true
   step "Waiting for the Docker daemon"
