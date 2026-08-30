@@ -10,7 +10,7 @@
 
 **DeepDive** is a **production-grade, multi-tenant AI learning platform** — a persistent tutor that learns from your materials, remembers how you learn, and helps you understand, research, and create.
 
-Dive deeper: [**What you can do**](#-what-you-can-do) explores the product, [**Engineering highlights**](#-engineering-highlights) breaks down the system, and [docs/architecture.md](docs/architecture.md) documents the full design.
+Dive deeper: [**What you can do**](#what-you-can-do) explores the product, [**Engineering highlights**](#-engineering-highlights) breaks down the system, and [docs/architecture.md](docs/architecture.md) documents the full design.
 
 ## What is DeepDive?
 
