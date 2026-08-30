@@ -22,10 +22,8 @@ DeepDive is a **multi-tenant AI learning platform** — a persistent tutor, your
 - **Your material is the starting point, not the boundary** — when your sources aren't enough, the tutor autonomously searches the web and academic sources to expand your understanding.
 - **Learning insights become persistent knowledge** — important insights become durable memory, while discussions turn into summaries, mind maps, and slides that flow back into your searchable workspace, so you can pick up where you left off on any device.
 
-**The learning loop:**
-
-> `Read / Watch → Ask & Discuss → Understand → Research → Remember → Create → Pick up later`
-> `Material → indexed → retrieved → transformed → artifact → searchable again`
+> **The Learning Loop:** `Read / Watch → Ask & Discuss → Understand → Research → Remember → Create → Pick up later`  
+> **The Data Flywheel:** `Material → indexed → retrieved → transformed → artifact → searchable again`
 
 ## What you can do
 
