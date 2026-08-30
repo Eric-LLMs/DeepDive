@@ -68,6 +68,9 @@
   - [16.6 Deferred tool loading (defer_loading stubs)](#166-deferred-tool-loading-defer_loading-stubs)
   - [16.7 Per-step process](#167-per-step-process)
   - [16.8 Configuration](#168-configuration)
+- [17. Research OS Module](#17-research-os-module)
+
+[↑ Back to top](#table-of-contents)
 
 ## Implementation Status
 
@@ -106,6 +109,8 @@
 | Retrieval-feedback UI | `POST /rag/feedback` + `rag_feedback` table exist (tests green), but no workbench/web UI calls the endpoint yet |
 | Research OS | contract suite frozen in [docs/research/](research/) — 8 entities, 10-stage state machine, 4 hard gates (DESIGN/EVIDENCE/CLAIM/QUALITY), three-layer storage, 6 research tools; a Cordis plugin (`plugins/research/`) + spike tests landed (`tests/test_research_plugin.py`), but no Phase 1 MVP yet |
 
+[↑ Back to top](#table-of-contents)
+
 ## 1. Product Positioning
 
 DeepDive is an "AI learning workbench" unified by a single abstraction:
@@ -114,6 +119,8 @@ DeepDive is an "AI learning workbench" unified by a single abstraction:
 - **Video / document learning**: media → timestamped/paginated text chunks → searchable, annotatable
 - **AI chat assistant**: interactive Q&A with tool use (RAG + vocabulary lookup + sandboxed file/network tools)
 - **Unifying principle: everything is a text chunk**
+
+[↑ Back to top](#table-of-contents)
 
 ## 2. Tech Stack
 
@@ -137,6 +144,8 @@ DeepDive is an "AI learning workbench" unified by a single abstraction:
 
 **Language boundary**: backend in Python (AI deps), frontend in TypeScript. The boundary is
 API-only: REST/SSE at the edge, gRPC between internal services, HTTP to model services.
+
+[↑ Back to top](#table-of-contents)
 
 ## 3. Repository Structure (Monorepo)
 
@@ -219,6 +228,8 @@ deepdive/
 > Generated proto stubs live under `packages/shared/proto` and are imported as
 > `retrieval.v1.retrieval_pb2` (a real package on the editable-install path, no `sys.path` hack).
 
+[↑ Back to top](#table-of-contents)
+
 ## 4. Layered Architecture (Hexagonal + Capability Seam)
 
 ```
@@ -240,6 +251,8 @@ packages/core/infrastructure    → concrete implementations (postgres / openai 
   interfaces; `infrastructure` implements them; `apps/api` injects them in `deps.py`.
 - **Capability seam**: cross-cutting capabilities (retrieval) are provided by *name* and required
   by *name*; the provider (in-process vs gRPC) is chosen at assembly time, invisible to consumers.
+
+[↑ Back to top](#table-of-contents)
 
 ## 5. Agent Module
 
@@ -487,6 +500,8 @@ roll the workspace back to a known-good state after a bad batch of agent file ed
 is initialized once with ignore rules in ``info/exclude`` (never a ``.gitignore`` in the user's
 workspace); large media and derived artifacts never enter a snapshot, keeping each commit small.
 
+[↑ Back to top](#table-of-contents)
+
 ## 6. Tool Runtime
 
 The Agent core implements a plugin-based tool runtime in Python. The essentials:
@@ -651,6 +666,8 @@ poll-until-terminal progress model are described in §15.
   security boundary** — only a best-effort workspace-escape guard (:func:`assert_no_escape`),
   a hard timeout, and an output cap.
 
+[↑ Back to top](#table-of-contents)
+
 ## 7. Capability Seam (Definition / Provider / Consumer)
 
 ```
@@ -670,6 +687,8 @@ registers the concrete provider via `ctx.provide("retrieval", …)` based on `se
 | `grpc` | `GrpcRetriever` | thin gRPC client → retrieval service |
 
 Switching modes never touches the tool code — it only changes what `ctx.provide()` injects.
+
+[↑ Back to top](#table-of-contents)
 
 ## 8. Distributed Topology
 
@@ -770,6 +789,8 @@ Generate button disabled and polls `GET /jobs/{id}` every 2 s **until a terminal
 imposes no client-side deadline — so a job that outlives the dialog keeps running and reports its
 result when the user reopens the dialog or when the poll completes in the background.
 
+[↑ Back to top](#table-of-contents)
+
 ## 9. Retrieval Service (gRPC)
 
 Contract (`proto/retrieval/v1/retrieval.proto`, `package retrieval.v1`):
@@ -806,6 +827,8 @@ the pipeline:
 ``Health`` is deliberately unauthenticated (a liveness probe that leaks no data). On the client
 side, `GrpcRetriever` stringifies the filter values (UUIDs → str) and attaches the same Bearer
 token as metadata, normalizing a guest `user_id=None` to the ``guest=1`` marker on the wire.
+
+[↑ Back to top](#table-of-contents)
 
 ## 10. RAG Module (Config-Node Pipeline)
 
@@ -1117,6 +1140,8 @@ version bumps, dropping stale query-cache hits immediately.
 dataset** for future fine-tuning / eval without re-running retrieval. The endpoint and table are
 implemented (with tests); a rating UI that calls it is not wired up yet.
 
+[↑ Back to top](#table-of-contents)
+
 ## 11. Feature → Mechanism Map
 
 | Feature | Mechanism |
@@ -1139,8 +1164,10 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Lazy-load a skill body | `skill` meta-tool over `SkillCatalog.render()` compressed index |
 | Reconfigure retrieval at runtime | `app_settings["rag"]` + `rag.config_store` (validated against the registry, cached; a save clears the retriever lru_cache) |
 | Measure retrieval quality | `rag.eval` golden-set regression (asset-level Recall@k / Precision@k / MRR); admin **Eval** tab or `scripts/eval_rag.py` |
-| Mount the research OS plugin | factory-built `plugins/research/` Cordis plugin (`build_research_plugin(ctx)`), lazy capability resolution over `drive` / `research_scratch`; 6 tools: `research_project` / `artifact` / `state` / `evidence` / `gate` / `run` |
-| Govern a research stage | mechanical `research_gate` checks (deterministic, no LLM judgment); a FAIL override always spawns a PENDING `ResearchApproval` that only a human resolves (never self-approve) — see docs/research/ |
+| Mount the research OS plugin | factory-built `plugins/research/` Cordis plugin (`build_research_plugin(ctx)`), lazy capability resolution over `drive` / `research_scratch`; 6 tools: `research_project` / `artifact` / `state` / `evidence` / `gate` / `run` — see [docs/research/](research/) |
+| Govern a research stage | mechanical `research_gate` checks (deterministic, no LLM judgment); a FAIL override always spawns a PENDING `ResearchApproval` that only a human resolves (never self-approve) — see [docs/research/](research/) |
+
+[↑ Back to top](#table-of-contents)
 
 ## 12. Data Model
 
@@ -1478,6 +1505,8 @@ already imported to knowledge is removed via the admin **RAG → Repository** pe
 (`DELETE /admin/rag/repository/{chunk_id}`) or by re-importing a changed source, not by deleting the
 session.
 
+[↑ Back to top](#table-of-contents)
+
 ## 13. Multi-Tenancy and Deployment Strategy
 
 | Scenario | Strategy |
@@ -1489,6 +1518,8 @@ session.
 | Model scaling | separate model services (TEI/Kokoro/LiteLLM), independent scale-out |
 
 ---
+
+[↑ Back to top](#table-of-contents)
 
 ## 14. Cloud Drive Module
 
@@ -1673,6 +1704,8 @@ without leaking state.
 Trash retention is a code constant — `TRASH_RETENTION_DAYS = 30` in `drive_service.py`,
 enforced lazily on `list_trash`.
 
+[↑ Back to top](#table-of-contents)
+
 ## 15. Desktop Workbench (Electron)
 
 The desktop app (`apps/desktop/`) is a standalone learning workbench with its **own vanilla-JS
@@ -1805,6 +1838,8 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
   - **Settings** — a modal with five tabs: **Appearance** (theme), **Window & Display** (font
     size), **Updates** (GitHub release check), **Help & Feedback**, and **About**.
 
+[↑ Back to top](#table-of-contents)
+
 ## 16. Prompt Module
 
 This chapter gives a single, systematic overview of the prompt module — the three concerns the
@@ -1914,3 +1949,33 @@ permission guard (a READ-only session cannot gain write tools by mounting them).
 | `prompt_message_max_chars` | `8_000` | per-message snip cap on the request snapshot |
 | `project_context_files` | `["DEEPDIVE.md"]` | convention files tried in order |
 | `project_context_max_chars` | `8_000` | cap on the project-context zone, with truncation marker |
+
+[↑ Back to top](#table-of-contents)
+
+## 17. Research OS Module
+
+Research OS is a **capability / workflow layer** for governed research projects: a domain
+(8 entities, a 10-stage DAG state machine, four hard gates, a provenance graph, and a
+human approval flow) that sits *above* the agent kernel and orchestrates several existing
+modules — not a sub-module of the Agent Module.
+
+**Physically**, it is mounted through the agent plugin mechanism (`plugins/research/` →
+`PluginManager`, registered from `apps/api/deps.py`). **Conceptually**, it is not
+agent-owned: the Agent Module (§5 / §6) supplies only generic base machinery (loop, Cordis
+DI, prompt boundary, tool lifecycle/sandbox) and must not couple to any specific
+research-domain rule; Research OS adds exactly that domain layer.
+
+| Research OS needs | Reused from |
+|---|---|
+| 6 research tools mounted via a Cordis plugin (`Context`/`Fiber`, lazy capability resolution) | [§5.1 DI](#51-di-state-machine--context--fiber), [§6.3 Plugins](#63-plugins) |
+| Tool lifecycle + permission/sandbox gating | [§6 Tool Runtime](#6-tool-runtime) |
+| Three-layer storage: scratch → Cloud Drive → RAG projection | [§14 Cloud Drive](#14-cloud-drive-module), [§10 RAG](#10-rag-module-config-node-pipeline) |
+| Tenant isolation (`request_user` ContextVar) | [§13 Multi-Tenancy](#13-multi-tenancy-and-deployment-strategy) |
+| Immutable execution audit rows | [§6 tool result observers](#6-tool-runtime) |
+
+**Status:** the contract suite is design-frozen in [docs/research/](research/) (23 files: the
+6 tool contracts, state machine, gate policy, diagrams); a Cordis plugin + spike tests landed
+(`plugins/research/`, `tests/test_research_plugin.py`), but there is no Phase 1 MVP yet — see
+[Implementation Status §Designed](#designed-not-yet-implemented).
+
+[↑ Back to top](#table-of-contents)
