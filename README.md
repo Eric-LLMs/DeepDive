@@ -31,7 +31,7 @@ Material → indexed → retrieved → transformed → artifact → searchable a
 | Capability | What it lets you do |
 |---|---|
 | **Learn** | • Ask questions while reading or watching — PDFs, Office docs, video, audio, images, and more (all openable in the desktop client)<br>• Get step-by-step explanations and concept breakdowns<br>• Discuss a specific moment — select a passage, page, or video moment as context |
-| **Research** | • Search across your files, notes, conversations, and sources<br>• **Go beyond your material** — search the web and academic sources for newer research, papers, and supporting evidence<br>• Synthesize multiple sources into a grounded answer |
+| **Research** | • Search across your files, notes, conversations, and sources<br>• Go beyond your material — search the web and academic sources for newer research, papers, and supporting evidence<br>• Synthesize multiple sources into a grounded answer |
 | **Remember** | • Save durable insights and recall them in later sessions<br>• Keep long-term memory separate from conversation history<br>• Revisit bookmarks, notes, and saved spots |
 | **Create** | • Summarize sessions, notes, and documents<br>• Generate mind maps and slide decks<br>• Turn conversations into reusable knowledge that flows back into search |
 | **Collaborate** | • Share files and knowledge in workspaces<br>• Study the same material as a team with roles and permissions |
