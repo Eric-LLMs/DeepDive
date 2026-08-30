@@ -10,7 +10,7 @@
 
 **DeepDive** is a **production-grade, multi-tenant AI learning platform** — a persistent tutor that learns from your materials, remembers how you learn, and helps you understand, research, and create.
 
-Dive deeper: [**What you can do**](#-what-you-can-do) walks through the product, [**Engineering highlights**](#-engineering-highlights) the system, and [docs/architecture.md](docs/architecture.md) documents the full design.
+Dive deeper: [**What you can do**](#-what-you-can-do) explores the product, [**Engineering highlights**](#-engineering-highlights) breaks down the system, and [docs/architecture.md](docs/architecture.md) documents the full design.
 
 ## What is DeepDive?
 
@@ -30,7 +30,7 @@ Material → indexed → retrieved → transformed → artifact → searchable a
 
 | Capability | What it lets you do |
 |---|---|
-| **Learn** | • Ask questions while reading or watching — PDFs, Office docs, video, audio, images, and more<br>• Get step-by-step explanations and concept breakdowns<br>• Discuss a selected passage, page, or moment |
+| **Learn** | • Ask questions while reading or watching — PDFs, Office docs, video, audio, images, and more (all openable in the desktop client)<br>• Get step-by-step explanations and concept breakdowns<br>• Discuss a selected passage, page, or moment |
 | **Research** | • Search across your files, notes, conversations, and sources<br>• Go to the web when your material isn't enough<br>• Synthesize multiple sources into a grounded answer |
 | **Remember** | • Save durable insights and recall them in later sessions<br>• Keep long-term memory separate from conversation history<br>• Revisit bookmarks, notes, and saved spots |
 | **Create** | • Summarize sessions, notes, and documents<br>• Generate mind maps and slide decks<br>• Turn conversations into reusable knowledge that flows back into search |
@@ -46,7 +46,7 @@ Material → indexed → retrieved → transformed → artifact → searchable a
 
 DeepDive implements a controllable agent runtime rather than delegating orchestration to a rigid framework. Core architectural decisions and their production-grade implementations:
 
-- **Agent orchestration is explicit and controllable.** A `ReactLoopAgent` step loop orchestrates model invocations and tool execution through a hot-reloadable skill catalog and plugin runtime; a typed sandbox strictly gates every tool execution across `READ` / `WRITE` / `NETWORK` permissions.
+- **Agent orchestration is explicit and controllable.** A `ReactLoopAgent` step loop orchestrates model invocations and tool execution through a hot-reloadable, dependency-injected skill catalog and plugin runtime; a typed sandbox strictly gates every tool execution across `READ` / `WRITE` / `NETWORK` permissions.
 - **Durable memory is decoupled from session history.** Two independent tracks share a single prompt boundary: the agent writes durable long-term memory via file-backed storage, while the system manages episodic session memory in PostgreSQL (`tsvector` + `pgvector` fused via RRF with recency decay). Hierarchical history compaction (flat token window) keeps context bounded without losing it.
 - **Reliability is built-in, not bolted on.** Hard timeouts and exponential-backoff retries absorb transient upstream LLM errors, bounded by a per-turn cost budget. Tool safety is enforced via a Redis pub/sub human-approval gate (deny on timeout), plan mode, bounded subagents, shadow-git checkpoints for state rollback, and a resource-capped, network-isolated Docker sandbox.
 - **Retrieval is configuration, not code.** A modular node pipeline — vector + keyword recall, RRF fusion, cross-encoder rerank, parent expansion, and CRAG relevance checks — can be reconfigured, reordered, or toggled live via the admin console without service restarts. It includes chunking previews, golden-set evaluation (`Recall@k`, `Precision@k`, `MRR`), Redis query caching (keyed by query + config + corpus version, auto-invalidated on re-index), and vision-LLM transcription for PDF tables. A single node failing degrades to the surviving channels instead of breaking the chat, and user feedback is logged to a golden evaluation dataset.
