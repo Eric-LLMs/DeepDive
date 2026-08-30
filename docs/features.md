@@ -1,0 +1,135 @@
+# ✨ Key Features
+
+## 🖥️ Desktop Workbench (Local Client)
+- **Workspace file tree**: open any local folder as your workspace (the last one is restored on the next launch); add files from anywhere, create folders and text files, delete files & folders with a right-click (permanent, workspace-bounded), and fuzzy-search the tree with live suggestions that jump straight to a match.
+- **Cloud Drive in the app**: the sidebar's **☁️ Cloud** source is a full cloud-file manager aligned with the web console — a tree (**My Drive**, every **workspace**, and **🗑 Trash**) plus a main-area **list / grid** toggle with a five-column table (`Name | Size | RAG Status | Query Repo | Updated`), per-folder **search**, **✏ Edit** mode with a **batch bar** (Download / Open / Share / Rename / Move / Trash; Restore / Delete permanently / Empty Trash in the Trash), role-gated **⚙ Manage** (workspace members + activity logs), New folder / New text / Upload, and a **Query Repo** status column (`✓ In Knowledge` / Importing / Processing with ETA / **＋ Import to Knowledge**). `.md`/`.txt`/code rows open in the built-in Markdown editor (**Edit / Preview** toggle, **Save** — synced straight back to the server; a Mermaid `mindmap` note previews as an SVG tree of nodes + edges); other files stream into the in-window viewer via a temp-cache download. Anything you save shows up in the web console on refresh.
+- **Summarize**: condense a document/video into a summary or key-point outline.
+- **Generate slides, mind maps & summaries**: turn the current material — the open conversation, workspace files, or any Cloud Drive files (multiple files merge into one artifact) — into slide decks, mind maps, and summaries through a single dialog: pick the source and output folder, add an optional custom prompt and file name; the artifact is generated in the background (Generate stays greyed while it runs) and saved to your Cloud Drive.
+- **Edit the material**: modify the loaded document in place.
+- **Clip & discuss**: select a passage in the viewer, clip it, and start a discussion with the AI tutor about that selection.
+- **Bookmarks**: mark pages, sections, or words to revisit — jump back to any saved spot anytime.
+- **Learning notes**: capture and organize your notes alongside the material as you study, ready when you review.
+- **Sessions search**: search your chat history by content — matching snippets are highlighted in the results.
+- **Multi-format viewer**: video (with subtitles), audio, images, PDF (with annotations), and text/code. Word/Excel/PowerPoint (`.docx`/`.xlsx`/`.xls`/`.pptx`) preview **in-window** with pure-JS renderers — **mammoth** (Word), **SheetJS** (Excel), **JSZip** slide deck (PowerPoint) — no external apps required; older binary formats (`.doc`/`.ppt`) fall back to your OS default app. One-click video **screenshots** and **Generate PPT / Generate Book**. A toolbar **✕** (or **Esc**) dismisses the current document back to the empty state.
+- **Subtitles**: a sibling `.srt`/`.vtt`/`.lrc` is auto-detected, or pick one manually; enable/disable and style it (size, color, background, position), and your settings are remembered.
+- **Streaming chat**: answers stream in with a collapsible **💭 thinking** panel; dock the chat to the bottom or side, or float it as a window. Messages render **Markdown + math** (`$...$` / `$$...$$` formulas via KaTeX), and every bubble has **Copy / Read / Delete / Edit / Import to Knowledge** actions — **Read** speaks the message aloud via streaming Kokoro TTS (with a stop button); **Edit** (on a user question) re-asks it, dropping that turn and everything after before streaming a fresh answer; **Import to Knowledge** writes the Q&A pair into the query repository and flips to **✓ Imported** once covered. Sessions can be **renamed** (click the title), **pinned** / imported / **deleted** from a header **⋯** menu — which also **Generates a Mind Map / Slides / Summary** of the conversation or of Cloud Drive files: a dialog picks the source (**this conversation** / **Cloud Drive files**, a checkbox picker that greys out oversized / unsupported files), the output folder, and an optional custom prompt and file name; a **Generate** toolbar above the input adds one-click entries. The async job runs in the background (the toolbar button becomes a steady ⏳ and the session row spins while it runs; Generate stays greyed until the job actually finishes), and the finished `<name>_<tool>` artifact (`.mmd` / `.md` / `.md`+`.pptx`) lands in the chosen folder — a **view output** link jumps straight to it — auto-suffixed on name collision. The input box is Gemini-style — a **＋ attach** button (pick a file, attach the open cloud asset, or capture a window screenshot), a multi-line textarea (Enter sends, Shift+Enter for a new line), and inline **🎤 / 🔊** toggles — attachments ride on the next send.
+- **Native menus & settings**: everything you'd expect — open/switch workspaces, zoom & font size, fullscreen, Help & Feedback, About. ⚙️ Settings covers theme, display, updates, help, and about.
+
+## 💬 AI Chat Assistant
+- **Agentic Kernel** (`AgentKernel`): a composition root wiring a cache-boundary prompt assembler, deferred tool loading, dual-track memory, a skill catalog, and a read-only sandbox around a `ReactLoopAgent` step loop.
+- **Cache-Boundary Prompt**: the system prompt is partitioned into three zones — a byte-stable static prefix (SOUL.md + compact tool/skill catalog), project context, and a per-step dynamic suffix — so the provider's prefix cache reuses the stable head across steps. Project conventions are loaded from the workspace's `DEEPDIVE.md` into their own stable zone; `snapshot_key()` makes the cache identity measurable.
+- **Deferred Tool Loading**: the prompt carries only a compact `name + blurb` catalog plus the resident `tool_search` meta-tool; matched tools appear in the visible set as stable `name + description` stubs (defer_loading style) so the cached tools array never churns, and each tool's full schema is returned in the `tool_search` result. The prompt window is also bounded by a per-message snip plus a token-aware autocompact that fires on a character budget.
+- **Dual-Track Memory**: session recall fuses PostgreSQL tsvector (keyword) + pgvector (semantic) via RRF, recency-weighted so newer messages win near-ties; when the embedding service is offline it degrades to tsvector-only — never a silent empty. `memory_search` / `memory_save` are tools; `memory_save` writes guardrailed notes (kebab-case key, length-capped content, closed type taxonomy) to the local memory directory while the session stays read-only. Proactive recall injects top hits for your question into the prompt, and long conversations are auto-compacted into an LLM summary (bounded token window).
+- **Skill Catalog**: skills (SKILL.md) are advertised as a one-line compressed index; the full instructions are lazy-loaded through the `skill` meta-tool.
+- **Read-Only Sandbox**: every tool call is gated by session permissions (READ / WRITE / NETWORK); file tools are rooted at the workspace dir and path escape is rejected. Writes and network access need an explicit grant or human approval. The `bash` tool runs behind a sandbox backend — **Docker by default** (one-shot container, workspace mounted read-write, network disabled by default, resource-capped) or a host sandbox (explicit opt-in for local development only, not a security boundary).
+- **Reliable LLM calls & per-turn budget**: every model call goes through a timeout/retry guard — a hard 90 s timeout (streams bound only the first token), exponential-backoff retries for transient errors only (timeout / 429 / 5xx), and an error taxonomy that never swallows cancellation; an SSE disconnect aborts the request at once and the turn closes cleanly. Each turn accumulates usage, is priced against `max_budget_usd`, and aborts the loop when the cap is crossed — accounting is per-turn, so concurrent turns never share it.
+- **Human-in-the-loop approvals**: a tool gated to **ASK** routes through a process-global approval bridge that emits an `approval-request` SSE event and blocks on your decision (`POST /approvals/{id}`; timeout → deny). In multi-node setups approvals resolve over Redis Pub/Sub; with no approver bound the tool is denied — safe by default.
+- **Plan mode, subagents & checkpoints**: the `plan` meta-tool streams an explicit step breakdown before acting; `run_subagent` spawns a bounded child turn (empty history, filtered tool set, depth/step-capped) that returns its final answer as the tool result; before each turn the workspace is snapshotted into an out-of-tree shadow git repo, so `revert_to_checkpoint` can roll back a bad batch of agent edits.
+- **RAG Retrieval**: a config-driven node pipeline — query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank, extensible with CJK segmentation, contextual enrichment, parent/child indexing, and domain filtering. Full feature walk-through in **RAG & Query Repository** below.
+- **Query Repository**: one search corpus for cloud-drive files (PDF tables transcribed via vision), Learning-Platform sentences/articles, and chat Q&A.
+- **SSE Streaming**: Real-time token streaming to the frontend.
+
+## 🔎 RAG & Query Repository
+- **Plug-and-play retrieval pipeline**: the retrieval flow is a composable list of stages. Default chain:
+  *query rewrite → vector recall + keyword recall → RRF fusion → cross-encoder rerank*, plus two optional
+  stages — *parent-expand* (widen a leaf hit to its parent chunk) and *relevance check* (drop chunks the
+  LLM judges irrelevant). From admin **RAG → Nodes** you add / remove / reorder / enable / disable any
+  stage and edit its parameters live — no code, no restart — [design: architecture.md §10.6](architecture.md#106-nodes).
+- **Three input channels, one searchable corpus**: cloud-drive files, Learning-Platform sentences &
+  articles, and chat Q&A all feed a single query repository, so one query retrieves across all of them.
+  Each entry is tagged by source; learning / chat content stays visible to the user who imported it,
+  while files keep their usual sharing / ACL rules — [design: §10.8](architecture.md#108-query-repository-multi-source-import).
+- **Import content & multiple text formats**: files get a **＋ Import to Knowledge** button and an
+  "in knowledge" badge once indexed. Supported formats: plain text (`.txt` / `.md` / `.log` / `.json` /
+  `.csv`), subtitles (`.srt` / `.vtt` / `.lrc`), Word (`.docx`), and PDF (`.pdf`). PDFs extract body text
+  *and* detect tables, rendering each to an image the vision LLM transcribes (a failing table is skipped,
+  never fatal). The Learning Platform lets you import saved sentences and write articles; chat lets you
+  import a single reply (bound to its question) or organize a whole session — the LLM merges the same
+  question's follow-up turns into one entry and splits distinct questions. Imported chat entries show a
+  persistent **✓ Imported** state — [design: §10.8](architecture.md#108-query-repository-multi-source-import).
+- **Configurable chunking**: pick a split strategy — `fixed` sliding window, `paragraph`, `sentence`, or
+  `semantic` — and set chunk size / overlap. Optionally enable **contextual** enrichment (an LLM-written
+  context prefix per chunk), **parent/child** indexing, and **CJK** keyword search (jieba). All of it is
+  driven from the admin console and applied on re-index; a **Chunking preview** tab shows exactly how a
+  strategy splits your text before you commit — [design: §10.7](architecture.md#107-ingest-side-runtime-configured-chunking).
+- **Parent/child (small-to-big), an input/output pair**: turn on parent/child **indexing** under chunking
+  to store leaf chunks plus larger parent windows (retrieval searches the leaves), then add the
+  **parent_expand** stage so a leaf hit returns its parent's fuller text. The admin **RAG → Repository**
+  tab lists every imported non-file chunk with a source badge and per-chunk delete — [design: §10.6](architecture.md#106-nodes).
+- **Test before you ship**: the admin RAG module has a **Test** tab that runs the configured pipeline
+  stage by stage and shows a per-node trace, and a golden-set **Eval** regression that scores
+  Recall@k / Precision@k / MRR against your expected answers — [design: §10.10](architecture.md#1010-admin-console).
+- **Domain-scoped search**: the `rag_search` tool takes an optional `domain` argument — retrieval
+  narrows to assets in that knowledge domain (file chunks only) — [design: §10.6](architecture.md#106-nodes).
+- **Re-index & safe re-import**: an admin **Reindex** button re-ingests every ready file under the
+  latest chunking config; re-importing a source replaces its old chunks first — no duplicates. Rebuilds
+  are atomic per asset (old chunks replaced in one step), so a worker timeout preserves already-committed
+  chunks; on completion the corpus version bumps, dropping stale cache hits immediately — [design: §10.12](architecture.md#1012-query-cache--retrieval-feedback).
+- **Query cache**: repeated queries short-circuit through a Redis cache keyed on (query, filters,
+  top_k, config version, corpus version) — a topology change or a re-index invalidates automatically.
+  The cache is a pure accelerator: any failure falls through to the pipeline — [design: §10.12](architecture.md#1012-query-cache--retrieval-feedback).
+- **Retrieval feedback loop**: a 👍/👎 rating for the chunks behind an answer is recorded via
+  `POST /rag/feedback` — each entry snapshots the query, the retrieved hits, and an optional reason
+  into `rag_feedback`, growing a golden dataset for eval and fine-tuning — [design: §10.12](architecture.md#1012-query-cache--retrieval-feedback).
+  (The recording endpoint is live; the workbench UI that calls it is not wired up yet.)
+- **Degrade, never break the chat**: when the retrieval stack is unavailable, the assistant answers
+  from its own knowledge with a notice instead of erroring or retrying — [design: §10](architecture.md#10-rag-module-config-node-pipeline).
+
+## 🤖 AI-Powered Interactive Study
+- **Seamless Navigation**: Switch instantly between words using **"⬅️ Prev"** and **"Next ➡️"** buttons without closing the dialog.
+- **Hybrid Search Engine**: Combines PostgreSQL full-text search (exact keyword) and pgvector (semantic). If an exact sentence isn't found, it finds the most semantically similar sentence (e.g. searching "GQA" finds sentences about "Group Query Attention").
+- **Context-Aware Explanations**: Uses LLMs to translate sentences and explain *exactly* what a term means within that specific context.
+- **Auto-Fetch Definitions**: If a term lacks a definition, the system automatically calls the LLM in the background to fetch a precise English definition and Chinese translation.
+- **Visual Context for Professional Vocabulary**:
+  - **Multi-Dimensional Image Search**: Grasp complex or abstract terms instantly. The system automatically scrapes Google Images (with Bing as a seamless fallback) using a combined 3-tier strategy: *Term alone*, *Term + Definition*, and *Term + Contextual Sentence*.
+  - **Asynchronous Loading & Randomized Regeneration**: Images load via a non-blocking UI mechanism so you can study text while images fetch in the background. Click **Regenerate** to sample a new set from a broader candidate pool.
+  - **Local Image Caching**: Once saved, images are downloaded to a local cache and linked via relative paths for zero-latency loads and offline availability.
+- **Built-in Mic Widget**: Record your own voice directly in the browser and compare it with the generated TTS audio for pronunciation practice.
+- **Audio & Pronunciation**: Generate high-quality TTS audio for words and full sentences on the fly, with local audio caching to save API costs and speed up loading.
+- **Importance Rating**: Rate terms from 1 to 5 stars (⭐⭐⭐⭐⭐) to prioritize your learning.
+
+## ☁️ Cloud Drive (Personal & Shared File Storage)
+- **My Drive + shared workspaces**: every user gets a private **My Drive**, plus shared **workspaces** (owner / admin / editor / viewer roles) for team files. Files are stored in a per-user object store with **SHA-256 content-addressing**, so identical files deduplicate to a single physical blob (ref-counted, freed only when the last reference is purged).
+- **Instant upload & resumable chunks**: uploading an already-stored file short-circuits to **instant upload** (no bytes transferred); large files stream in **8 MB chunks** (`upload_sessions` tracks received chunks) with a progress bar and safe re-upload.
+- **Notes & Markdown editing**: text files (`.md`, `.txt`, code, data) open in an in-page **note editor** — an **Edit / Preview** toggle renders Markdown live, and **Save** (`Ctrl+S`) rewrites the file in place (the bytes are re-deduplicated and RAG indexing re-runs). Mermaid mind-map files (`.mmd`, or any note whose text starts with `mindmap`) preview as an **SVG tree diagram** — nodes and connecting edges — in both the desktop and web note editors. Rendering is XSS-safe: raw HTML is escaped and `javascript:`-style links are blocked.
+- **In-window Office previews — web console and desktop**: both the **web console Cloud Drive** and the **desktop app** render Word/Excel/PowerPoint files in-window (`.docx`; `.xlsx`/`.xls`/`.csv`/`.tsv`; `.pptx`/`.ppsx`/`.potx`/… slide decks) with the same pure-JS renderers (**mammoth** for Word, **SheetJS** for spreadsheets — one tab per sheet — and a **JSZip**-based slide deck for PowerPoint). Clicking never downloads: only the **⬇ Download** button fetches the bytes. `.doc`/`.ppt` have no browser parser and show a **can't-preview** panel (Download / Open in new tab), while images, PDF, video, and audio open in a new tab.
+- **Push files into the query repository**: text-bearing files (`.txt`/`.md`/`.pdf`/`.docx`/…; audio/video/slides excluded) show a **＋ Import to Knowledge** button — click it to ingest (or re-ingest under the latest RAG config), and an **In Knowledge** badge marks files already in the corpus.
+- **First-class folders**: multi-level folders (`folders` rows with full `/`-paths) live side by side with files, and the file manager tree combines them. Create/rename/move/delete folders; renaming or deleting a folder rewrites the path prefix of every file and sub-folder beneath it.
+- **Context menu & collision-safe naming**: right-click a file or folder for **📄 New text file**, **📁 New folder**, **📤 Upload**, and **🗑 Delete** (deleting a folder trashes its files first). Files and folders share one namespace per directory, so creating/moving/renaming into a busy spot auto-suffixes `(1)`, `(2)`, … before the extension (`docs` → `docs(1)`, `a.docx` → `a(1).docx`) instead of failing.
+- **Move anywhere**: files move across workspaces / My Drive freely (drag-and-drop is the planned UX; the API + batch bar support it today).
+- **Fuzzy search with suggestions**: a client-side, case-insensitive fuzzy matcher (prefix > substring > folder-path > subsequence scoring) with a live suggestion dropdown; you can scope a search to a workspace or search all of My Drive.
+- **Trash & retention**: deleting a file moves it to the trash — bytes are kept (no ref-count release) until you **Restore**, **Delete permanently**, or **Empty Trash**. Trash auto-purges entries older than **30 days** (lazy sweep on list). Deleting a workspace trashes all its files and moves assets to My Drive trash.
+- **Sharing & permissions**: per-file ACLs — grant read/write to specific users or create a **public link** (shareable without an account). Visibility is computed with three channels (ownership, workspace membership, ACL) so owner/admin/editor/viewer each see exactly what they should.
+- **Member management & audit**: workspace owners/admin add/edit/remove members and grant the `admin` role (**only the owner** can grant admin/owner); every mutation is recorded in an append-only **activity log** (workspace members can read it; admin/owner manage it).
+
+## 👥 Multi-User, Roles & Billing
+- **Admin console** (`/admin`): a self-contained single-file SPA with five modules — **Providers** (credentials + model catalog + routing weights), **Roles**, **Users**, **Tokens**, and **Tools config** (web-search provider, SMTP, free-form key/value tool params, test email). A default `admin`/`admin` credential is seeded into the DB on first boot; console login is stateless (a signed session token, never persisted), so it never pollutes the tokens table.
+- **Per-role LLM channels**: every role binds the provider channels it may use (`role_credentials`); each login pins one random active channel to the token, and chat routes through it per-request with failover.
+- **LLM key management**: Tokens → LLM Keys manages the per-user key-grant matrix — which user may use which provider key; keys are shown masked (`sk-***`) with one-click copy, and a user's access to a key can be revoked or restored independently of their login.
+- **Self-service accounts**: users **register** themselves (username + email + password); an **email-verification** link gates the first sign-in, and **forgot-password** sends a one-time reset link. After signing in, users edit their profile (display name, username, contact email, phone, avatar) and change their password — all from the web and desktop clients. Admins can still create accounts directly.
+- **Email & SMTP**: verification / reset mail is sent over SMTP configured in the admin **Tools config** page. When SMTP is not configured, the one-time link is returned to the client instead and shown inline (dev mode), so registration still works locally.
+- **User accounts**: users (and the web/desktop console) log in to receive an opaque token. Roles (`regular` / `pro` / `vip` / `admin` / `anonymous`) carry per-role quota (daily/monthly requests, tokens, RPM, cost) and an optional default model.
+- **Server-managed config**: LLM provider keys, the model catalog, and the admin credential live in PostgreSQL (`app_settings`) — not `.env` or repo files — and are edited from the admin console.
+- **Pay-as-you-go billing**: per-model pricing (prompt/completion per 1k tokens), a cash wallet per user, and an append-only ledger with a `balance_after` snapshot. Usage is **free first** (within the role's daily/monthly/token quota); once the free quota is exhausted, overflow is charged to the wallet — a drained balance returns **402**. Every usage log records the **serving channel** too, so the admin can aggregate cost per provider key.
+- **Guest access**: anonymous users can chat without an account, identified by a **signed server token** (a client-supplied id is never trusted) and capped per day (`guest_daily_limit`, default 10); exceeding the cap prompts them to sign in.
+
+## 📥 Smart Data Ingestion
+- **Domain Management**: Organize your learning materials into isolated domains.
+- **Flexible Import**: Import vocabulary (with frequencies) and contextual sentences via CSV/Excel/TXT uploads or manual entry.
+- **Intelligent Deduplication**: Automatically skips existing terms during import (case-insensitive) to maintain a clean database.
+- **Vector Indexing**: One-click generation of embeddings for your corpus using the industrial-grade **BGE-M3** model (stored in pgvector) to enable semantic search.
+- **Query Repository import**: push saved sentences and written articles (Articles & Query Repo tab) into the unified search corpus alongside cloud-drive files and chat Q&A.
+
+## 📖 Minimalist & Powerful Study Mode
+- **Client-side Pagination & Sorting**: Lightning-fast UI with in-memory pagination. Sort vocabulary by Word (A-Z), Frequency, or Importance Level (Stars).
+- **Advanced Filtering**: Filter your study list by specific domains or star levels.
+- **Real-time Search**: Instantly find terms in your current list with a responsive search bar.
+- **View Definitions**: Clean UI using a "📖 View" popover to see definitions without leaving the list.
+
+## 🛠️ Efficient Library Governance
+- **Efficient Toggles**: Instantly enable/disable terms with visual feedback.
+- **Click-to-Edit**: Definitions display as clean labels and expand into editors only when clicked, preventing accidental edits.
+- **Unified Visuals**: Star levels are managed via intuitive icon pickers (⭐) instead of raw numbers.
+- **Transactional Page Commits**: Commit all modifications on a single page with one click for high-speed bulk updates while maintaining data integrity.
+- **Global Operation Flow**: Perform global sorting across the entire database and save changes page-by-page.
+- **Self-Healing Logic**: Automatically deduplicates duplicate matches to keep the UI stable.
