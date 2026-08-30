@@ -446,6 +446,7 @@ kernel, wrapping any ``AgentLLMPort``):
   ``SystemExit``) is passed through unchanged and **never caught by a retry loop**.
 - **cancellation** — an SSE disconnect aborts the underlying request at once; the loop logs
   ``turn-cancelled``, closes session memory, and re-raises, so a dropped client never leaks state.
+- **cross-talk-safe streams** — the stream generator is returned through the retry wrapper and bound only to the coroutine's local frame (never a ``self._gen`` slot), so two overlapping turns each own their generator and concurrent SSE streams cannot overwrite each other's deltas. Regression test: ``test_reliable_llm_concurrent_streams_do_not_cross_talk`` (``tests/test_loop_stream.py``).
 
 The loop also enforces a **hard per-turn budget** (:class:`AgentTurn.max_budget_usd`, default
 ``settings.max_budget_per_turn_usd``). Each step accumulates ``usage`` on the turn; after the step
