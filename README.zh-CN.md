@@ -98,6 +98,7 @@ DeepDive 自研了高可控的 Agent 运行时，拒绝将核心编排委托给�
 
 * **[`docs/architecture.md`](docs/architecture.md)** —— 完整系统架构设计（单一真实数据源 SSOT）：涵盖技术栈、代码目录、Agent 内核、工具运行时、数据模型、部署架构及已实现 vs 已设计矩阵。
 * **[`docs/architecture-diagrams.md`](docs/architecture-diagrams.md)** —— 模块架构图与 Mermaid 原图源码。
+* **[`docs/research/`](docs/research/)** —— 研究操作系统（Research OS）契约套件（设计已冻结）：实体、状态机、四道硬 Gate、三层存储与 6 个研究工具契约。
 * **[`docs/getting-started.md`](docs/getting-started.md)** —— 手动部署指南、一键启动脚本与各端（桌面端/Web/管理后台）走查。
 * **[`docs/configuration.md`](docs/configuration.md)** —— 环境变量全量参考手册。
 * **[`docs/features.md`](docs/features.md)** —— 全功能详解（桌面工作台、聊天助手、RAG 与查询知识库、学习模式、云盘、权限与计费）。

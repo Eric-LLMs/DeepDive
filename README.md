@@ -102,6 +102,7 @@ How the monorepo is laid out and what each module owns — see [docs/architectur
 
 - [docs/architecture.md](docs/architecture.md) — full system design (single source of truth): tech stack, repository layout, agent-kernel internals, tool runtime, data model, deployment, and the implemented-vs-designed matrix.
 - [docs/architecture-diagrams.md](docs/architecture-diagrams.md) — per-module architecture diagrams and mermaid source.
+- [docs/research/](docs/research/) — Research OS contract suite (design-frozen): entities, state machine, four hard gates, three-layer storage, and the 6 research tool contracts.
 - [docs/getting-started.md](docs/getting-started.md) — full manual setup, one-click launchers, and the desktop/web/admin walkthrough.
 - [docs/configuration.md](docs/configuration.md) — environment-variable reference.
 - [docs/features.md](docs/features.md) — full feature walk-through (desktop workbench, chat assistant, RAG & query repository, study mode, cloud drive, roles & billing).

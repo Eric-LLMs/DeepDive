@@ -104,6 +104,7 @@
 | GraphRAG node | graph-of-communities `graph_rag` node (LLM entity/relation extraction → community summaries → global/local search) designed only, see §10.6 |
 | Edge gateway | Traefik skeleton only; dev runs FastAPI directly on the host |
 | Retrieval-feedback UI | `POST /rag/feedback` + `rag_feedback` table exist (tests green), but no workbench/web UI calls the endpoint yet |
+| Research OS | contract suite frozen in [docs/research/](research/) — 8 entities, 10-stage state machine, 4 hard gates (DESIGN/EVIDENCE/CLAIM/QUALITY), three-layer storage, 6 research tools; a Cordis plugin (`plugins/research/`) + spike tests landed (`tests/test_research_plugin.py`), but no Phase 1 MVP yet |
 
 ## 1. Product Positioning
 
@@ -1138,6 +1139,8 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Lazy-load a skill body | `skill` meta-tool over `SkillCatalog.render()` compressed index |
 | Reconfigure retrieval at runtime | `app_settings["rag"]` + `rag.config_store` (validated against the registry, cached; a save clears the retriever lru_cache) |
 | Measure retrieval quality | `rag.eval` golden-set regression (asset-level Recall@k / Precision@k / MRR); admin **Eval** tab or `scripts/eval_rag.py` |
+| Mount the research OS plugin | factory-built `plugins/research/` Cordis plugin (`build_research_plugin(ctx)`), lazy capability resolution over `drive` / `research_scratch`; 6 tools: `research_project` / `artifact` / `state` / `evidence` / `gate` / `run` |
+| Govern a research stage | mechanical `research_gate` checks (deterministic, no LLM judgment); a FAIL override always spawns a PENDING `ResearchApproval` that only a human resolves (never self-approve) — see docs/research/ |
 
 ## 12. Data Model
 
