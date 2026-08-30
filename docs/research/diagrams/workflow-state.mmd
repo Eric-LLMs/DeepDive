@@ -1,0 +1,23 @@
+flowchart TD
+    IB[Research Inbox] -->|promote| P[research_project create]
+    P --> S0[DISCOVER<br/>RAG + Web + personal knowledge]
+    S0 --> S1[FRAME<br/>question / scope / profile]
+    S1 --> S2[EVIDENCE<br/>sources verified / lit matrix]
+    S2 --> S3[DESIGN<br/>estimand / identification]
+    S3 --> G1{DESIGN GATE}
+    G1 -- FAIL -->|"back to DESIGN"| S3
+    G1 -- PASS --> S4[EXECUTE<br/>reasoning or sandbox]
+    S4 --> G2{EVIDENCE GATE}
+    G2 -- FAIL -->|"back to EVIDENCE / DESIGN per profile"| S2
+    G2 -- PASS --> S5[EXPLAIN<br/>mechanisms / bounds]
+    S5 --> S6[WRITE<br/>claim-governed draft]
+    S6 --> G3{CLAIM GATE}
+    G3 -- FAIL -->|"back to WRITE / EXECUTE per profile"| S6
+    G3 -- PASS --> S7[REVIEW<br/>adversarial referee]
+    S7 --> G4{QUALITY GATE}
+    G4 -- FAIL -->|"back to REVIEW / WRITE per profile"| S7
+    G4 -- PASS --> S8[REPRODUCE<br/>replication pack]
+    S8 --> S9[PUBLISH]
+    S9 --> DR[(Cloud Drive<br/>research/project_id)]
+    DR --> RG[RAG index]
+    S3 -.->|"skip via profile (only DESIGN)"| S4

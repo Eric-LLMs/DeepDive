@@ -97,6 +97,7 @@ class Settings(BaseSettings):
     memory_dir: Path = Path("data/memory")     # file memory directory (MEMORY.md index)
     skills_dir: Path = Path("skills")          # *.skill.md skills directory (version-controlled)
     plugins_dir: Path = Path("plugins")        # plugin directory (*/plugin.py) (version-controlled)
+    research_scratch_dir: Path = Path("data/research_scratch")  # research scratch root (spike)
     session_summary_enabled: bool = True       # generate an LLM summary on session close
     memory_recall_top_k: int = 5               # proactive recall count for the prompt memory section
     memory_note_max_chars: int = 4000          # memory_save content length cap (guardrail)

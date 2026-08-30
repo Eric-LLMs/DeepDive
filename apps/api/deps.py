@@ -28,6 +28,7 @@ from agent.tools.project_context import read_project_context
 from api.tools import register_builtin_tools
 from api.tools.toolkit import register_toolkit_plugins
 from core.application.drive_service import DriveService
+from plugins.research.plugin import register_research_plugins
 from core.application.services import VocabularyService
 from core.config import export_secret_env, settings
 from core.infrastructure.db import SessionLocal
@@ -115,6 +116,9 @@ def _agent() -> AgentKernel:
     # bytes via the shared object storage + a DB session.
     ctx.provide("storage", get_storage())
     ctx.provide("session_factory", SessionLocal)
+    # Research OS capabilities: the research plugin injects both before it may mount.
+    ctx.provide("drive", get_drive_service())
+    ctx.provide("research_scratch", settings.research_scratch_dir)
 
     # Domain tools first (the kernel registers the core meta-tools on top).
     register_builtin_tools(runtime, ctx, llm)
@@ -168,6 +172,7 @@ def _agent() -> AgentKernel:
     manager = PluginManager(runtime, skills, ctx)
     register_builtin_plugins(manager)
     register_toolkit_plugins(manager, ctx, llm)
+    register_research_plugins(manager, ctx)
     manager.discover(settings.plugins_dir)
     return kernel
 

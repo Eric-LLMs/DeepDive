@@ -1,0 +1,49 @@
+flowchart LR
+    subgraph QuestionLayer["Question / Frame"]
+        Q[Question]
+        H[Hypothesis]
+    end
+    subgraph EvidenceLayer["Evidence"]
+        S[Source]
+        D[Dataset]
+        V[Variable]
+    end
+    subgraph ProcessLayer["Process"]
+        DG[Design]
+        EX[Execution]
+        AN[Analysis]
+        R[Result]
+        E[Evidence]
+    end
+    subgraph ClaimLayer["Claims / Writing"]
+        C[Claim]
+        T[Table]
+        F[Figure]
+        P[Paragraph]
+    end
+    subgraph GovernanceLayer["Governance"]
+        DEC[Decision]
+        RISK[Risk]
+        G[Gate]
+    end
+
+    Q -->|motivates| DG
+    Q -->|motivates| H
+    C -->|cites| S
+    D -->|uses| V
+    DG -->|depends_on| V
+    D -->|transformed_by| EX
+    EX -->|"generated_by (Execution produces Analysis)"| AN
+    AN -->|produces| R
+    EX -->|derived_from| D
+    R -->|derived_from| AN
+    R -->|supports| E
+    E -->|supports| C
+    C -->|appears_in| P
+    T -->|appears_in| P
+    F -->|appears_in| P
+    DEC -->|overrides| DG
+    DEC -->|overrides| AN
+    RISK -->|invalidates| E
+    G -->|tests| R
+    D -->|depends_on| S
