@@ -8,7 +8,7 @@
 [![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**DeepDive 是一个支持多租户的 AI 学习与研究平台**——它是一个具备持久记忆的 AI 导师，能够吸收你的学习资料、记住你的认知习惯，并在你的个人知识库中协助你进行深度理解、课题研究与内容创作。
+**DeepDive 是一个支持多租户的 AI 学习与研究平台**——它是一个具备持久记忆的 AI 导师，能够吸收你的已有资料、记住你的认知习惯，主动为你搜集材料并探究课题，并在你的个人知识库中协助你进行深度理解、研究与内容创作。
 
 它同时也是一个全能的文档与影音工作区：PDF、Office 文档、视频、音频与图片均可直接在 DeepDive 内打开，随时划选段落或音视频片段即时提问，无需切换外部播放器与阅读器。一个平台，一套技术栈：聚合文件网盘、对话与记忆、RAG 检索及深度研究空间——全部支持私有化部署，核心数据不出你的基础设施。
 

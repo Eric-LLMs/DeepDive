@@ -8,7 +8,7 @@
 [![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**DeepDive** is a **multi-tenant AI learning and research platform** — a persistent AI tutor that learns from your materials, remembers how you learn, and helps you understand, research, and create.
+**DeepDive** is a **multi-tenant AI learning and research platform** — a persistent AI tutor that learns from your materials, remembers how you learn, actively gathers sources and investigates topics for you, and helps you understand, research, and create.
 
 It is a document and media workspace too: PDFs, Office documents, video, audio, and images open directly in DeepDive — select a passage or a frame and ask in context, no external viewer needed. One platform, one stack: files & cloud drive, chat & memory, RAG search, and a research workspace — all self-hosted, so your data stays on your own infrastructure.
 
