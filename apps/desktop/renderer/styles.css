@@ -28,6 +28,10 @@
 
 html, body, #app { height: 100%; margin: 0; }
 
+/* The workbench is a fixed 100%-height app shell: the main window itself must never
+   scroll. Internal panels (#tree, #chat-log, viewers, …) scroll on their own. */
+html, body { overflow: hidden; }
+
 body {
   background: var(--bg);
   color: var(--fg);
@@ -35,9 +39,13 @@ body {
   font-size: var(--ui-fs, 14px);
 }
 
+/* The app shell fills the viewport once the body zoom is taken into account: body
+   zoom scales the painted size, so dividing by --ui-zoom makes the painted height
+   exactly (100vh - 12px) — the Send button / sidebar footer stay clear of the
+   window's bottom edge instead of being clipped by the zoom overflow. */
 #app {
   display: flex;
-  height: 100vh;
+  height: calc((100vh - 12px) / var(--ui-zoom, 1));
   overflow: hidden;
 }
 
@@ -695,7 +703,7 @@ pre.text-viewer {
 /* Hidden chat: collapses to the floating DeepDive logo mini-icon (#chat-mini). */
 #chat.minimized { display: none; }
 
-#chat-log { flex: 1; overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+#chat-log { flex: 1; min-height: 0; overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
 
 .msg { max-width: 80%; display: flex; flex-direction: column; gap: 2px; position: relative; }
 .msg.user { align-self: flex-end; align-items: flex-end; }
@@ -853,26 +861,67 @@ pre.text-viewer {
   line-height: 1.5;
 }
 
-#chat-form { display: flex; flex-direction: column; gap: 6px; padding: 10px; border-top: 1px solid var(--border); }
+#chat-form {
+  flex-shrink: 0;   /* never let the Generate area + input box compress or get pushed out */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-top: 1px solid var(--border);
+}
 
-/* Gemini/ChatGPT-style input: a single rounded box with the attach ＋ on the left
-   and voice input 🎤 + Send on the right, all inside the box. */
+/* Gemini/ChatGPT-style input: the textarea spans the full width, with the attach ＋ /
+   voice 🎤 / speak 🔊 / Send buttons in their own row underneath — so typed text has
+   the whole box to itself instead of wrapping early against the buttons. */
+/* Composer, adaptive to the dock side (see the #app:not(.chat-right) block below):
+   the right column stacks the textarea above the buttons; the wide bottom bar collapses
+   to a single line with ＋ on the left and mic / speak / Send on the right. */
 .chat-input-box {
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
   gap: 4px;
-  padding: 4px 4px 4px 10px;
+  padding: 6px;
   background: var(--bg-soft);
   border: 1px solid var(--border);
   border-radius: 14px;
 }
 .chat-input-box:focus-within { border-color: var(--accent); }
 
-/* Multi-line chat input: a fixed 3-row textarea that scrolls internally once the draft
-   exceeds three lines, instead of growing the box. Buttons align to the bottom edge. */
-#chat-input {
+.chat-input-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* Bottom-docked chat is a wide bar: collapse the composer into one line. The actions
+   row is flattened (display: contents) so its buttons become direct flex items, then
+   flex order arranges them — ＋ leftmost, the input stretching in the middle, and the
+   Generate toolbar / 🎤 / 🔊 / Send clustered at the right. */
+#app:not(.chat-right) .chat-input-box {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+#app:not(.chat-right) .chat-input-actions { display: contents; }
+#app:not(.chat-right) #chat-input {
   flex: 1;
   min-width: 0;
+  width: auto;
+  order: 1;
+}
+#app:not(.chat-right) #chat-attach-pick { order: 0; }
+#app:not(.chat-right) #chat-mic { order: 2; }
+#app:not(.chat-right) #chat-speak { order: 3; }
+#app:not(.chat-right) #chat-send {
+  order: 4;
+  margin-left: 0;   /* keep 🎤 🔊 Send clustered, not Send shoved to the far edge */
+}
+
+/* Multi-line chat input: a fixed 3-row textarea that scrolls internally once the draft
+   exceeds three lines, instead of growing the box. */
+#chat-input {
+  flex: none;
+  width: 100%;
   padding: 7px 4px;
   background: transparent;
   color: var(--fg);
@@ -915,6 +964,7 @@ pre.text-viewer {
 
 #chat-send {
   flex: none;
+  margin-left: auto;   /* keep Send anchored to the right edge of the actions row */
   padding: 7px 14px;
   background: var(--accent);
   color: #fff;
@@ -948,14 +998,31 @@ pre.text-viewer {
   padding: 0;
 }
 
-/* Generate-toolbar row above the chat input: the summary / mindmap / slides entry points. */
+/* Generate-toolbar row: the summary / mindmap / slides entry points. Sits at the top of
+   the chat panel when docked right; JS moves it inline into the composer's button row
+   (between ＋ and 🎤) when the chat is docked as a wide bottom bar. */
 .chat-toolbar {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 4px;
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
 }
 .chat-toolbar-label { font-size: 11px; color: var(--fg-dim); margin-right: 2px; }
+/* When the chat is docked as a wide bottom bar the toolbar sits in the header, right
+   after the "Chat" title (.has-tools is toggled by syncDock): inline, no border, with
+   the window-control actions pushed to the far right. */
+#chat-header.has-tools { justify-content: flex-start; }
+#chat-header.has-tools #chat-title { flex: 0 1 auto; }
+#chat-header.has-tools #chat-toolbar {
+  flex: 0 0 auto;
+  padding: 0;
+  border: none;
+  margin-left: 8px;
+}
+#chat-header.has-tools .chat-header-actions { margin-left: auto; }
 .chat-tool-btn {
   flex: none;
   padding: 3px 9px;

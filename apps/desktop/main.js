@@ -4,7 +4,7 @@
 // protocol, proxies /api to the FastAPI backend, and gives the renderer access to
 // local files through a `local://` protocol + a small IPC surface (folder pick,
 // file tree, open-with-OS-default, text read, screenshot save).
-const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, Menu, desktopCapturer } = require("electron");
+const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, Menu, desktopCapturer, screen } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -808,11 +808,27 @@ function setupMenu() {
 function createWindow() {
   const saved = readPrefs().window || {};
   const remember = saved.rememberBounds !== false;
+  const savedX = remember && Number.isInteger(saved.x) ? saved.x : 0;
+  const savedY = remember && Number.isInteger(saved.y) ? saved.y : 0;
+
+  // Clamp the window to the display it would land on: a restored/default size larger
+  // than the work area would push the bottom edge (chat input, sidebar footer) off
+  // the screen. The window always opens fully inside the visible work area.
+  const wa = screen.getDisplayNearestPoint({ x: savedX, y: savedY }).workArea;
+  const width = Math.min(remember && saved.width ? saved.width : 1440, wa.width);
+  const height = Math.min(remember && saved.height ? saved.height : 860, wa.height);
+  const x = remember && Number.isInteger(saved.x)
+    ? Math.min(Math.max(savedX, wa.x), wa.x + wa.width - width)
+    : undefined;
+  const y = remember && Number.isInteger(saved.y)
+    ? Math.min(Math.max(savedY, wa.y), wa.y + wa.height - height)
+    : undefined;
+
   const win = new BrowserWindow({
-    width: remember && saved.width ? saved.width : 1440,
-    height: remember && saved.height ? saved.height : 860,
-    x: remember && Number.isInteger(saved.x) ? saved.x : undefined,
-    y: remember && Number.isInteger(saved.y) ? saved.y : undefined,
+    width,
+    height,
+    x,
+    y,
     icon: path.join(__dirname, "deepdive.ico"),
     webPreferences: {
       contextIsolation: true,

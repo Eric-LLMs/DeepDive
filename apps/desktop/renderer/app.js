@@ -2463,7 +2463,13 @@
   function applyUiScale() {
     const fsPx = parseInt(localStorage.getItem(FONT_SIZE_KEY), 10) || 14;
     const uiZoom = parseFloat(localStorage.getItem(ZOOM_KEY)) || 1;
-    document.body.style.zoom = String(uiZoom * (fsPx / 14));
+    const z = uiZoom * (fsPx / 14);
+    document.body.style.zoom = String(z);
+    // Expose the zoom factor so the CSS shell can compensate: body zoom scales the
+    // painted size, so a plain `100vh` app shell would overflow past the bottom edge
+    // and clip the chat form / sidebar footer. #app divides its height by --ui-zoom
+    // to land exactly inside the viewport with a small bottom clearance.
+    document.body.style.setProperty("--ui-zoom", String(z));
   }
   function applyFontSize(px) {
     if (fontSizeSelect) fontSizeSelect.value = String(px);
@@ -3273,7 +3279,24 @@
   const appEl = document.getElementById("app");
   const chatDock = document.getElementById("chat-dock");
   function syncDock() {
-    chatDock.textContent = appEl.classList.contains("chat-right") ? "Dock bottom" : "Dock right";
+    const right = appEl.classList.contains("chat-right");
+    chatDock.textContent = right ? "Dock bottom" : "Dock right";
+    // Match the input to the docked shape: a wide bottom bar gets a compact 1-line
+    // input; the narrow right column gets a taller 4-line one so long prompts have room.
+    chatInput.rows = right ? 4 : 1;
+    // The Generate toolbar follows the dock shape: in the tall right column it lives at
+    // the top of the panel, under the header; in the wide bottom bar it moves into the
+    // header right after the "Chat" title, so the composer stays a single lean line
+    // (＋ textarea … 🎤 🔊 Send) with its right side freed up.
+    const header = document.getElementById("chat-header");
+    const toolbar = document.getElementById("chat-toolbar");
+    if (right) {
+      header.after(toolbar);
+      header.classList.remove("has-tools");
+    } else {
+      chatTitle.after(toolbar);
+      header.classList.add("has-tools");
+    }
   }
   chatDock.addEventListener("click", () => {
     chatEl.classList.remove("floating");

@@ -84,21 +84,23 @@
               <button id="chat-dock" type="button" title="Move chat to the right column">Dock right</button>
             </div>
           </div>
+          <div id="chat-toolbar" class="chat-toolbar" title="Generate from this conversation or workspace files">
+            <span class="chat-toolbar-label">Generate:</span>
+            <button id="chat-gen-mindmap" type="button" class="chat-tool-btn" title="Generate a mind map from this conversation or workspace files">🧠 Mind Map</button>
+            <button id="chat-gen-slides" type="button" class="chat-tool-btn" title="Generate slides from this conversation or workspace files">🎞 Slides</button>
+            <button id="chat-gen-summary" type="button" class="chat-tool-btn" title="Generate a summary from this conversation or workspace files">📝 Summary</button>
+          </div>
           <div id="chat-log"></div>
           <form id="chat-form">
             <div id="chat-attach-bar" class="chat-attach-bar hidden"></div>
-            <div id="chat-toolbar" class="chat-toolbar" title="Generate from this conversation or workspace files">
-              <span class="chat-toolbar-label">Generate:</span>
-              <button id="chat-gen-mindmap" type="button" class="chat-tool-btn" title="Generate a mind map from this conversation or workspace files">🧠 Mind Map</button>
-              <button id="chat-gen-slides" type="button" class="chat-tool-btn" title="Generate slides from this conversation or workspace files">🎞 Slides</button>
-              <button id="chat-gen-summary" type="button" class="chat-tool-btn" title="Generate a summary from this conversation or workspace files">📝 Summary</button>
-            </div>
             <div class="chat-input-box">
-              <button id="chat-attach-pick" type="button" class="chat-input-btn" title="Attach a file">＋</button>
-              <textarea id="chat-input" rows="3" placeholder="Ask about the current material, or just chat…" autocomplete="off"></textarea>
-              <button id="chat-mic" type="button" class="chat-input-btn" title="Voice input (talk to the assistant)"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
-              <button id="chat-speak" type="button" class="chat-input-btn" title="Speak replies aloud"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3.5" y="10" width="3" height="6" rx="1.5"/><rect x="9" y="4" width="3" height="18" rx="1.5"/><rect x="14.5" y="7" width="3" height="12" rx="1.5"/><rect x="20" y="9.5" width="3" height="7" rx="1.5"/></svg></button>
-              <button id="chat-send" type="submit">Send</button>
+              <textarea id="chat-input" rows="1" placeholder="Ask about the current material, or just chat…" autocomplete="off"></textarea>
+              <div class="chat-input-actions">
+                <button id="chat-attach-pick" type="button" class="chat-input-btn" title="Attach a file">＋</button>
+                <button id="chat-mic" type="button" class="chat-input-btn" title="Voice input (talk to the assistant)"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
+                <button id="chat-speak" type="button" class="chat-input-btn" title="Speak replies aloud"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3.5" y="10" width="3" height="6" rx="1.5"/><rect x="9" y="4" width="3" height="18" rx="1.5"/><rect x="14.5" y="7" width="3" height="12" rx="1.5"/><rect x="20" y="9.5" width="3" height="7" rx="1.5"/></svg></button>
+                <button id="chat-send" type="submit">Send</button>
+              </div>
             </div>
           </form>
         </section>
