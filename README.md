@@ -8,25 +8,34 @@
 [![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**DeepDive** is a **production-grade, multi-tenant AI learning platform** — a persistent AI tutor that learns from your materials, remembers how you learn, and helps you understand, research, and create.
+**DeepDive** is a **multi-tenant AI learning and research platform** — a persistent AI tutor that learns from your materials, remembers how you learn, and helps you understand, research, and create.
+
+It is a document and media workspace too: PDFs, Office documents, video, audio, and images open directly in DeepDive — select a passage or a frame and ask in context, no external viewer needed. One platform, one stack: files & cloud drive, chat & memory, RAG search, and a research workspace — all self-hosted, so your data stays on your own infrastructure.
 
 Dive deeper: [**What you can do**](#what-you-can-do) explores the product, [**Engineering highlights**](#-engineering-highlights) breaks down the system, and [docs/architecture.md](docs/architecture.md) documents the full design.
 
 ## What is DeepDive?
 
-DeepDive is a **multi-tenant AI learning platform** — a persistent tutor, your personal memory, and a searchable knowledge base in one self-hostable system.
+DeepDive is a persistent AI tutor that helps you deeply understand your materials, investigate complex topics, and continuously build your own knowledge base — all within one self-hostable workspace.
 
 **Why it's different:**
 
-- **Learn with your material, not beside it** — select and discuss passages while reading or watching, with grounded explanations and step-by-step breakdowns.
-- **Your material is the starting point, not the boundary** — when your sources aren't enough, the AI tutor autonomously searches the web and community discussions (Reddit, X, Zhihu) for fresh context to expand your understanding.
-- **Learning insights become persistent knowledge** — important insights become durable memory, while discussions turn into summaries, mind maps, and slides that flow back into your searchable workspace, so you can pick up where you left off on any device.
+- **Learn with your material, not beside it.** Select and discuss passages while reading or watching, ask questions in context, and get grounded explanations and step-by-step breakdowns.
+
+- **Your material is the starting point, not the boundary.** When your sources aren't enough, DeepDive's Research OS helps you investigate further across your own materials and external sources, so research can build on what you already know.
+
+- **Learning insights become persistent knowledge.** Important insights become durable memory, while discussions and research can become summaries, mind maps, and slides that flow back into your searchable workspace, so you can pick up where you left off.
+
+- **Built for individuals and teams.** Keep your materials and knowledge in your own workspace, or collaborate in shared workspaces with controlled access.
 
 > **The Learning Loop**  
 > `Read / Watch → Ask & Discuss → Understand → Research → Remember → Create → Pick up later`  
 >  
+> **The Research Loop**  
+> `Question → Plan → Retrieve → Investigate → Evaluate → Synthesize → Record → Revisit`  
+>  
 > **The Data Flywheel**  
-> `Material → indexed → retrieved → transformed → artifact → searchable again`
+> `Material → Index → Retrieve → Transform → Artifact → Search again`
 
 ## What you can do
 
