@@ -22,7 +22,7 @@ DeepDive is a persistent AI tutor that helps you deeply understand your material
 
 - **Learn with your material, not beside it.** Select and discuss passages while reading or watching, ask questions in context, and get grounded explanations and step-by-step breakdowns.
 
-- **Your material is the starting point, not the boundary.** When your sources aren't enough, DeepDive's Research OS helps you investigate further across your own materials and external sources, so research can build on what you already know.
+- **Your material is the starting point, not the boundary.** When your sources aren't enough, DeepDive's Research OS automatically helps you investigate further across your own materials and external sources, so research can build on what you already know.
 
 - **Learning insights become persistent knowledge.** Important insights become durable memory, while discussions and research can become summaries, mind maps, and slides that flow back into your searchable workspace, so you can pick up where you left off.
 
@@ -41,11 +41,11 @@ DeepDive is a persistent AI tutor that helps you deeply understand your material
 
 | Capability | What it lets you do |
 |---|---|
-| **Learn** | • Ask questions while reading or watching — PDFs, Office docs, video, audio, images, and more (all openable in the desktop client)<br>• Get step-by-step explanations and concept breakdowns<br>• Discuss a specific moment — select a passage, page, or video moment as context |
-| **Research** | • Search across your files, notes, conversations, and sources<br>• Go beyond your material — search the web and community discussions (Reddit, X, Zhihu) for newer research and supporting evidence<br>• Synthesize multiple sources into a grounded answer |
+| **Learn** | • Ask questions while reading or watching — PDFs, Office docs, video, audio, images, and more (view and discuss directly in DeepDive)<br>• Get step-by-step explanations and concept breakdowns<br>• Discuss a specific moment — select a passage, page, or video moment as context |
+| **Research** | • Search across your files, notes, conversations, and sources<br>• Go beyond your material — search the web and community discussions for newer research and supporting evidence<br>• Synthesize multiple sources into grounded, structured answers |
 | **Remember** | • Save durable insights and recall them in later sessions<br>• Keep long-term memory separate from conversation history<br>• Revisit bookmarks, notes, and saved spots |
 | **Create** | • Summarize sessions, notes, and documents<br>• Generate mind maps and slide decks<br>• Turn conversations into reusable knowledge that flows back into search |
-| **Collaborate** | • Share files and knowledge in workspaces<br>• Study the same material as a team with roles and permissions |
+| **Collaborate** | • Share files and knowledge in workspaces<br>• Study and discuss the same material as a team with role-based access control |
 
 ## Demo
 
