@@ -53,6 +53,12 @@ DeepDive is a persistent AI tutor that helps you deeply understand your material
 
 ---
 
+## 🏗️ Architecture at a glance
+
+![Platform architecture — tenants & workspaces, access layer, core application (agent runtime · dual-track memory · configurable RAG · cloud workspace · processing), self-hosted data & AI services](./docs/images/deepdive-architecture-platform-diagram.png)
+
+---
+
 ## 🔧 Engineering highlights
 
 DeepDive implements a controllable agent runtime rather than delegating orchestration to a rigid framework. Core architectural decisions and their production-grade implementations:
@@ -84,12 +90,6 @@ Full design: [docs/architecture.md](docs/architecture.md).
 | Self-hosted AI Services | ✅ Supported |
 
 See [docs/architecture.md §Implementation Status](docs/architecture.md#implementation-status) for the full matrix and planned capabilities.
-
----
-
-## 🏗️ Architecture at a glance
-
-![Platform architecture — tenants & workspaces, access layer, core application (agent runtime · dual-track memory · configurable RAG · cloud workspace · processing), self-hosted data & AI services](./docs/images/deepdive-architecture-platform-diagram.png)
 
 ---
 

@@ -54,6 +54,16 @@ DeepDive 是一位具备持久记忆的 AI 导师，帮助你深度理解材料�
 
 ---
 
+## 🏗️ 架构一览
+
+![平台架构 —— 租户与工作区、访问层、核心应用（agent 运行时 · 双轨记忆 · 可配置 RAG · 云工作区 · 处理）、自托管数据与 AI 服务](./docs/images/deepdive-architecture-platform-diagram.png)
+
+* **各模块架构与流程图**（Agent 内核 · 记忆 · Prompt · RAG）：请参阅 [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md)。
+* **技术选型考量**：请参阅 [`docs/architecture.md §2 Tech Stack`](docs/architecture.md#2-tech-stack)。
+* **Monorepo 仓库结构**：请参阅 [`docs/architecture.md §3`](docs/architecture.md#3-repository-structure-monorepo)。
+
+---
+
 ## 🔧 工程亮点
 
 DeepDive 自研了高可控的 Agent 运行时，拒绝将核心编排委托给僵化的第三方框架。以下是系统的核心架构决策及生产级实现：
@@ -87,16 +97,6 @@ DeepDive 自研了高可控的 Agent 运行时，拒绝将核心编排委托给�
 | **自托管 AI 服务 (Self-hosted AI Services)** | ✅ 已支持 |
 
 > 完整功能矩阵与规划能力见 [`docs/architecture.md § Implementation Status`](docs/architecture.md#implementation-status)。
-
----
-
-## 🏗️ 架构一览
-
-![平台架构 —— 租户与工作区、访问层、核心应用（agent 运行时 · 双轨记忆 · 可配置 RAG · 云工作区 · 处理）、自托管数据与 AI 服务](./docs/images/deepdive-architecture-platform-diagram.png)
-
-* **各模块架构与流程图**（Agent 内核 · 记忆 · Prompt · RAG）：请参阅 [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md)。
-* **技术选型考量**：请参阅 [`docs/architecture.md §2 Tech Stack`](docs/architecture.md#2-tech-stack)。
-* **Monorepo 仓库结构**：请参阅 [`docs/architecture.md §3`](docs/architecture.md#3-repository-structure-monorepo)。
 
 ---
 
