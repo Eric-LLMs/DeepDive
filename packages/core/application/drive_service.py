@@ -920,6 +920,50 @@ class DriveService:
         )
         return self._asset_dict(moved)
 
+    async def copy_to_folder(self, user_id: UUID, asset_id: UUID, folder_path: str) -> AssetModel:
+        """Copy an asset into ``folder_path`` as a NEW asset row sharing the same object bytes.
+
+        The original asset is left untouched; the copy references the same ``object_sha256`` so
+        the physical blob is shared (``global_objects.ref_count`` + 1). Used when a chat
+        screenshot joins RAG: the temporary ``chat/temp`` copy stays and a stable ``RAG/images``
+        copy is created for the corpus, so emptying ``chat/temp`` never removes an image the
+        repo still references. Re-running is a no-op — a live copy with the same content in that
+        folder is reused instead of duplicating rows.
+        """
+        asset = await self.ensure_asset_readable(user_id, asset_id)
+        if asset.object_sha256 is None:
+            raise DriveError("asset has no stored object", 409)
+        folder_path = self._validate_folder_path(folder_path)
+        existing = await self.assets.get_by_folder_content(
+            user_id, asset.workspace_id, folder_path, asset.object_sha256
+        )
+        if existing is not None:
+            return existing
+        digest = asset.object_sha256
+        await self.objects.upsert_and_increment(
+            digest,
+            asset.size or 0,
+            object_key(digest),
+            asset.mime_type or "application/octet-stream",
+        )
+        name = await self._unique_name(user_id, asset.workspace_id, folder_path, asset.name)
+        copy = await self.assets.create(
+            user_id,
+            name,
+            workspace_id=asset.workspace_id,
+            folder_path=folder_path,
+            mime_type=asset.mime_type,
+            size=asset.size,
+            object_sha256=digest,
+            file_status=READY,
+            rag_status=RAG_NOT_STARTED,
+        )
+        await self._log(
+            user_id, asset.workspace_id, "file.copy", "file", copy.id, copy.name,
+            f"copied to {folder_path} for RAG archive",
+        )
+        return copy
+
     # ── Trash ───────────────────────────────────────────────────────────────────
 
     async def list_trash(self, user_id: UUID) -> list[dict]:

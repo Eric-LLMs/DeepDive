@@ -815,10 +815,10 @@ def _pair_covered_ids(pair: dict, messages) -> list[str]:
 def _pair_image_ids(pair: dict, messages) -> list[str]:
     """Cloud-drive screenshot assets owned by the user messages a Q&A entry covers.
 
-    A chat Q&A imported into RAG keeps the screenshots it was built around: the asset ids go
-    into the chunk's ``meta.image_ids`` so retrieval returns them for the vision tool, and the
-    covered messages' ``imported_rag`` flag is what gates the session/message delete cascade
-    from removing them.
+    Returns the owned ``chat/temp`` asset ids (one per covered user message with a screenshot).
+    The caller mirrors each into a stable ``RAG/images`` copy and puts the *copy* ids into the
+    chunk's ``meta.image_ids`` so retrieval returns them for the vision tool; the covered
+    messages' ``imported_rag`` flag gates the session/message delete cascade.
     """
     ids: list[str] = []
     for i in pair.get("indices") or []:
@@ -919,13 +919,27 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
 
         total = 0
         flag_ids: set[str] = set()
-        rag_image_ids: set[str] = set()  # screenshot assets that just joined the repo
+        rag_copy: dict[str, str] = {}  # chat/temp asset id → stable RAG/images copy id
         chunks_repo = SqlChunkRepository(ctx["session_factory"])
+        drive = DriveService(ctx["session_factory"])
         for pair, (start, end) in zip(pairs, spans):
             if _span_imported(messages, (start, end), flagged):
                 continue  # already in the repo — never re-embed
             covered = _pair_covered_ids(pair, messages)
             image_ids = _pair_image_ids(pair, messages)
+            # Each owned screenshot stays in chat/temp AND gets a stable RAG/images copy sharing
+            # the same object bytes (so emptying chat/temp never loses a repo-referenced image).
+            # The chunk meta references the copy; best-effort, falling back to the owned asset.
+            rag_image_ids = []
+            for aid in image_ids:
+                if aid not in rag_copy:
+                    try:
+                        rag_copy[aid] = str(
+                            (await drive.copy_to_folder(user_id, UUID(aid), "RAG/images")).id
+                        )
+                    except DriveError:
+                        rag_copy[aid] = aid  # degraded: reference the owned chat/temp copy
+                rag_image_ids.append(rag_copy[aid])
             key = covered[0] if covered else f"{session_id}:{start}"
             text = f"{pair['question']}\n\n{pair['answer']}"
             title = pair["question"].strip()[:60] or f"Chat Q{start + 1}"
@@ -941,8 +955,8 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
                 # A Q&A entry that covers a message owning a screenshot keeps that image: it
                 # rides the chunk meta so retrieval returns it for the vision tool, and the
                 # imported_rag flags gate the delete cascade from removing it later.
-                if image_ids:
-                    c.meta["image_ids"] = image_ids
+                if rag_image_ids:
+                    c.meta["image_ids"] = rag_image_ids
             # Idempotent: replace any chunk already keyed by this question (e.g. a prior
             # single-pair import, or a re-import after the answer was regenerated).
             await chunks_repo.delete_by_source("chat", [key])
@@ -957,7 +971,6 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
             for j in range(start, end):
                 if messages[j].role in ("user", "assistant"):
                     flag_ids.add(str(messages[j].id))
-            rag_image_ids.update(image_ids)
 
         if flag_ids:
             async with ctx["session_factory"]() as session:
@@ -967,18 +980,6 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
                     .values(imported_rag=True)
                 )
                 await session.commit()
-
-        # Newly imported Q&A pairs keep their screenshots out of the temporary chat/temp
-        # folder: move each to RAG/images so a user emptying chat/temp never deletes an image
-        # the corpus still references. Best-effort — a stale/trashed asset must not fail
-        # the import. The imported_rag delete-gate is the second line of defence.
-        if rag_image_ids:
-            drive = DriveService(ctx["session_factory"])
-            for aid in rag_image_ids:
-                try:
-                    await drive.move_file(user_id, UUID(aid), None, "RAG/images")
-                except DriveError:
-                    pass
 
         await bump_corpus_version(ctx["redis"])  # corpus changed → drop stale query-cache hits
         return {"chunks": total, "groups": len(pairs)}

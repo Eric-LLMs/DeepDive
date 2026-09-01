@@ -235,6 +235,32 @@ class SqlAssetRepository:
                 )
             ).scalar_one_or_none()
 
+    async def get_by_folder_content(
+        self,
+        user_id: UUID,
+        workspace_id: UUID | None,
+        folder_path: str | None,
+        object_sha256: str,
+    ) -> AssetModel | None:
+        """Active asset matching (folder, content hash) — RAG-copy dedupe key.
+
+        A chat screenshot that joins RAG is copied into ``RAG/images`` (keeping the original
+        ``chat/temp`` row intact). Re-importing the same Q&A reuses the existing copy instead
+        of duplicating rows, keyed on the physical content hash since both copies share it.
+        """
+        async with self.session_factory() as session:
+            return (
+                await session.execute(
+                    select(AssetModel).where(
+                        AssetModel.user_id == user_id,
+                        AssetModel.workspace_id == workspace_id,
+                        AssetModel.folder_path == folder_path,
+                        AssetModel.object_sha256 == object_sha256,
+                        AssetModel.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+
     async def soft_delete(self, asset_id: UUID) -> AssetModel | None:
         async with self.session_factory() as session:
             obj = await session.get(AssetModel, asset_id)

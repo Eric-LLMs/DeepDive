@@ -108,18 +108,28 @@ async def chat_import_pair(
 
     from rag.config_store import load_config  # lazy: rag is a sibling package
 
+    # A chat Q&A that joins RAG keeps its screenshot in BOTH folders: the temporary chat/temp
+    # copy stays (the message's imported_rag flag gates the delete cascade), and a stable
+    # RAG/images copy is created for the corpus sharing the same object bytes — so emptying
+    # chat/temp never removes an image the repo still references. The chunk meta references
+    # the stable copy; best-effort, falling back to the owned chat/temp asset if copying fails.
+    rag_image_id: str | None = None
+    if user_msg.attach_asset_id is not None:
+        try:
+            rag_image_id = str(
+                (await drive.copy_to_folder(user.user_id, user_msg.attach_asset_id, "RAG/images")).id
+            )
+        except DriveError:
+            rag_image_id = str(user_msg.attach_asset_id)
+
     content = f"{user_msg.text}\n\n{asst_msg.text}"
     cfg = await load_config(SessionLocal)
     title = user_msg.text.strip()[:60] or "Chat Q&A"
     chunks = await build_chunks(content, cfg, doc_title=title, llm=llm)
     for c in chunks:
         c.meta = {**c.meta, "title": title, "kind": "qa", "session_id": str(user_msg.session_id)}
-    # A chat Q&A that joins RAG keeps its screenshot: reference the owned cloud-drive asset in
-    # the chunk meta (image_ids) so retrieval hands it to the vision tool. The message's
-    # imported_rag flag is what gates the session/message delete cascade from removing it.
-    if user_msg.attach_asset_id is not None:
-        for c in chunks:
-            c.meta["image_ids"] = [str(user_msg.attach_asset_id)]
+        if rag_image_id is not None:
+            c.meta["image_ids"] = [rag_image_id]
     chunks_repo = SqlChunkRepository(SessionLocal)
     await chunks_repo.delete_by_source("chat", [str(user_msg.id)])
     res = await write_query_repo_chunks(
@@ -139,14 +149,6 @@ async def chat_import_pair(
             if row is not None:
                 row.imported_rag = True
         await session.commit()
-    # A Q&A now in the repo keeps its screenshot out of the temporary chat/temp folder:
-    # move it to RAG/images so a user emptying chat/temp never deletes an image the corpus
-    # still references. Best-effort — a stale/trashed asset must not fail the import.
-    if user_msg.attach_asset_id is not None:
-        try:
-            await drive.move_file(user.user_id, user_msg.attach_asset_id, None, "RAG/images")
-        except DriveError:
-            pass
     return {"chunks": res["chunks"]}
 
 
