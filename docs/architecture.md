@@ -6,6 +6,9 @@
 > **Implementation status:** this document is the SSOT, but not every part is implemented yet.
 > The status tables below mark what runs today versus what is designed-only, so it is clear what
 > to fill in when extending the business.
+>
+> **Going forward:** [Evolution Roadmap](evolution-roadmap.md) is the 3–5 year scaling path
+> (modular → service extraction, multi-tenancy hardening, async HA, observability/evals).
 
 ## Table of Contents
 
@@ -85,7 +88,7 @@
 | Retrieval | config-driven node pipeline (query rewrite → recall → RRF → rerank, plus optional parent-expand / CRAG nodes; CJK + contextual + parent-child indexing); `in_process` default, gRPC service available (`AuthGuard` token gate / per-peer rate limit / tenant binding); admin RAG console + golden-set eval (Recall@k / Precision@k / MRR); Redis **query cache** (keyed by query/filters/top_k + config + corpus version); `POST /rag/feedback` golden-dataset recorder |
 | Query repository | unified multi-source corpus: cloud-drive files (`source_type='file'`) + Learning-Platform sentences/articles (`'learning'`) + chat Q&A pairs / LLM-grouped whole-session imports (`'chat'`); `chunks.asset_id` nullable + `source_type`/`source_id`, source-aware recall (both recallers `LEFT JOIN assets`); PDF tool chain (body text + tables rendered to PNG → vision LLM, per-table skip on failure); admin RAG → **Repository** tab lists non-file chunks with delete |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
-| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the API's `AgentKernel` singleton for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output; session / cloud-file modes → caller's Cloud Drive, with a custom `prompt` + `name`) |
+| Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the shared `AgentKernel` composition (`apps/api/agent_factory.py`) for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output; session / cloud-file modes → caller's Cloud Drive, with a custom `prompt` + `name`) |
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
@@ -159,7 +162,8 @@ deepdive/
 │   │   ├── auth.py               # opaque-token auth (require_admin / require_user + stateless console session signing)
 │   │   ├── account_email.py      # email / verification helpers shared by auth + config routes
 │   │   ├── admin/                # admin console SPA (single-file index.html: Providers / Roles / Users / Tokens / Tools / RAG)
-│   │   ├── deps.py               # DI assembly (capability seam + agent kernel wiring + plugins)
+│   │   ├── agent_factory.py      # shared composition root: AgentKernel + capability singletons (used by api AND worker)
+│   │   ├── deps.py               # FastAPI DI getters (vocab / task queue / agent accessor), re-exports from agent_factory
 │   │   ├── routers/              # functional routers: drive (files/folders/trash/users/workspaces), auth, admin, rag_admin, config, vocab, chat, sessions, jobs
 │   │   ├── tools/                # gateway tools, auto-discovered by `_tool.py` modules (rag_search / translate / web_search)
 │   │   └── schemas.py            # Pydantic request/response models
@@ -423,7 +427,10 @@ visible-tool stubs).
   `SkillRegistry` (`register` / `relevant(query)` keyword scoring / `from_dir` for `*.skill.md`).
   `SkillCatalog.render()` emits a compressed one-line directory (name + truncated description,
   XML-escaped, within a character budget) into the STATIC_PREFIX; the `skill` meta-tool
-  lazy-loads the full SKILL.md body on demand and reports `allowed_tools`.
+  lazy-loads the full SKILL.md body on demand and reports `allowed_tools`. `SkillScopeEnforcer`
+  (a `ToolRuntime` guard) hard-enforces those `allowed_tools` as a scoped allowlist for the
+  rest of the turn: tools outside the union of the active skills' allowlists (plus a small core
+  meta-tool set) are denied, with the reason fed back to the model.
 - **Sessions** — `SessionLog` is an append-only event stream
   (`session-start` / `session-end` / `llm-call` / `tool-call` / `tool-result`), serializable to
   JSONL for audit. Long conversations are **compacted** at the `/chat` boundary: histories over
@@ -677,11 +684,12 @@ ports/retrieval.py  Retriever Protocol (retrieve(query, top_k, filters) -> [{id,
         ▲                              ▲
         │ ctx.provide("retrieval", …)  │ implement
         │                              │
-   deps.py (assembly)          RAGPipeline (in-process)  |  GrpcRetriever (gRPC client)
+   agent_factory.py (assembly)   RAGPipeline (in-process)  |  GrpcRetriever (gRPC client)
 ```
 
-The `rag_search` tool calls `ctx.resolve("retrieval")` (a `Context` capability seam). `deps.py`
-registers the concrete provider via `ctx.provide("retrieval", …)` based on `settings.retrieval_mode`:
+The `rag_search` tool calls `ctx.resolve("retrieval")` (a `Context` capability seam). The
+composition root (`apps/api/agent_factory.py`) registers the concrete provider via
+`ctx.provide("retrieval", …)` based on `settings.retrieval_mode`:
 
 | `retrieval_mode` | provider | notes |
 |---|---|---|
@@ -754,9 +762,10 @@ A daily retention cron (`prune_session_events`, registered in `WorkerSettings.cr
 `messages` (the recall corpus) and `sessions` (summaries) are deliberately kept.
 
 **Background agent turns** — the `run_agent_turn` job (cron / scheduled activity) runs one agent
-turn for a user/session in the worker. It **reuses the API's hardened `AgentKernel` singleton**, so
-a scheduled turn gets exactly the same prompt assembly, recall, approvals, telemetry, and budget
-guard as an interactive one — no second, drift-prone kernel construction in the worker. The answer
+turn for a user/session in the worker. It **reuses the shared `AgentKernel` composition** built by
+`apps/api/agent_factory.py` (the worker never touches FastAPI's `deps.py`), so a scheduled turn
+gets exactly the same prompt assembly, recall, approvals, telemetry, and budget guard as an
+interactive one — no second, drift-prone kernel construction in the worker. The answer
 lands in the session like a normal chat message and `session_finalize` is deferred exactly as in the
 interactive path (payload: `user_id` / `session_id` / `message`, plus optional `model` / `base_url` /
 `api_key` to pin an LLM channel).
@@ -1946,8 +1955,9 @@ existing convention file (`DEEPDIVE.md` by default) under the agent's workspace,
 `settings.project_context_max_chars` (appending a
 `…(truncated)` marker), and returns `""` when none exists. The kernel registers a non-empty result
 into `PromptZone.PROJECT_CONTEXT`; an empty zone renders nothing, keeping the prompt byte-identical
-to the no-context case. The loader runs in `apps/api/deps.py` and feeds the value into the kernel,
-so project rules reach the model on every turn and feed `snapshot_key()`.
+to the no-context case. The loader runs in the shared composition root `apps/api/agent_factory.py`
+and feeds the value into the kernel, so project rules reach the model on every turn and feed
+`snapshot_key()`.
 
 ### 16.5 Compression pipeline
 
@@ -2011,7 +2021,9 @@ human approval flow) that sits *above* the agent kernel and orchestrates several
 modules — not a sub-module of the Agent Module.
 
 **Physically**, it is mounted through the agent plugin mechanism (`plugins/research/` →
-`PluginManager`, registered from `apps/api/deps.py`). **Conceptually**, it is not
+`PluginManager`, registered from the shared composition root `apps/api/agent_factory.py` —
+the same composition the worker reuses, so both processes see the research tools).
+**Conceptually**, it is not
 agent-owned: the Agent Module (§5 / §6) supplies only generic base machinery (loop, Cordis
 DI, prompt boundary, tool lifecycle/sandbox) and must not couple to any specific
 research-domain rule; Research OS adds exactly that domain layer.
@@ -2028,6 +2040,14 @@ research-domain rule; Research OS adds exactly that domain layer.
 6 tool contracts, state machine, gate policy, diagrams); a Cordis plugin + spike tests landed
 (`plugins/research/`, `tests/test_research_plugin.py`), but there is no Phase 1 MVP yet — see
 [Implementation Status §Designed](#designed-not-yet-implemented).
+
+**User-facing entry point:** the `deep_research` skill ([skills/deep_research.skill.md](../skills/deep_research.skill.md))
+now orchestrates the full workflow as the agent's one-command entry point (clarify → plan →
+discover → frame → evidence → cross-verify → synthesize → write → review → publish). Its
+`allowed_tools` is scoped to the six research tools plus search and enforced by
+`SkillScopeEnforcer` (§5.4), so a research run stays inside the governed workflow; the lighter
+`fact_check` skill covers single-claim verification. Research stays *designed*, not yet an MVP —
+the skill is an agent behavior layered on the spike, not a user-facing product surface.
 
 ## 18. Image Handling (screenshots & document images)
 
@@ -2150,8 +2170,9 @@ The `vision` tool (`apps/api/tools/vision_tool.py`) reads an attached image by `
 asks a vision-capable model. `_resolve_vision_channel` resolves `tools.vision.model` (admin
 Tools config) → catalog model → its routing → credential; an empty name falls back to the first
 active catalog model. The request is OpenAI-compatible (`image_url` with a `data:` URL; images
-in the `user` message). The vision tool is **not** allowlisted in the gateway (deps.py allows
-`rag_search` + the toolkit generators), so the model reaches it through a `tool_search`
-discovery hop when an `[Attached: …]` note calls for it — see [§5.2](#52-agent-loop--reactloopagent).
+in the `user` message). The vision tool is **not** allowlisted in the gateway (the composition
+root in `agent_factory.py` allows `rag_search` + the toolkit generators), so the model reaches
+it through a `tool_search` discovery hop when an `[Attached: …]` note calls for it — see
+[§5.2](#52-agent-loop--reactloopagent).
 
 [↑ Back to top](#table-of-contents)

@@ -42,7 +42,7 @@ from agent.prompt.system_prompt import (
     PromptZone,
 )
 from agent.security.sandbox import Sandbox
-from agent.skills.registry import SkillCatalog, SkillRegistry, skill_tool
+from agent.skills.registry import SkillCatalog, SkillRegistry, SkillScopeEnforcer, skill_tool
 from agent.tools.checkpoints import CheckpointStore, revert_to_checkpoint_tool
 from agent.tools.plan_tool import plan_tool
 from agent.tools.subagent import run_subagent_tool
@@ -122,9 +122,11 @@ class AgentKernel:
 
     def _install_guard(self) -> None:
         """PreToolUse gate: sandbox denies high-risk tools the session lacks permission for,
-        and surfaces ASK decisions through the pre-execute approval path (human-in-the-loop)."""
+        and surfaces ASK decisions through the pre-execute approval path (human-in-the-loop).
+        The skill scope guard then hard-enforces an active skill's allowed_tools allowlist."""
         self.runtime.guard(self.sandbox.guard())
         self.runtime.events.on("tools/pre-execute", self.sandbox.ask_listener())
+        self.runtime.guard(SkillScopeEnforcer(self.skills).guard())
 
     def _assemble_sections(self, *, soul: str, project_context: str = "") -> None:
         if soul:

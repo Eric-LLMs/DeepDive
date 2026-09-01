@@ -84,6 +84,18 @@ class AgentTurn:
     # ── approval (human-in-the-loop) ──
     approvals: Any | None = None              # ApprovalStore (see agent.security.approvals)
 
+    # ── skill scope (allowed_tools enforcement) ──
+    active_skills: list[str] = field(default_factory=list)  # skills loaded this turn (call order)
+
+    def activate_skill(self, name: str) -> None:
+        """Record a skill as active for the rest of the turn (idempotent).
+
+        The :class:`~agent.skills.registry.SkillScopeEnforcer` reads this to apply the
+        skill's ``allowed_tools`` as a hard scoped allowlist for subsequent tool calls.
+        """
+        if name not in self.active_skills:
+            self.active_skills.append(name)
+
     def inject(self, text: str, *, name: str | None = None) -> None:
         """Append durable dynamic content to the prompt suffix for this turn."""
         self.injected.append((name or f"inject:{len(self.injected)}", text))

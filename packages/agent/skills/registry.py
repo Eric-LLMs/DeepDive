@@ -4,10 +4,12 @@ Modeled after claude-code skills: a skill is a block of Markdown instructions + 
 The Agent loads relevant skill instructions into context on demand and then follows them.
 ``allowed_tools`` is an optional sandbox hint: which tools the skill is permitted to use.
 """
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent.engine.decisions import ToolExecution, text_block
+from agent.engine.context import current_turn
+from agent.engine.decisions import Guard, ToolExecution, text_block
 from agent.frontmatter import parse_frontmatter
 from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
 
@@ -136,8 +138,9 @@ def skill_tool(registry: SkillRegistry) -> ToolDefinition:
     """The builtin ``skill`` meta-tool: lazily load a skill's full instructions.
 
     The model sees only the catalog in the prompt; calling this reads the complete
-    SKILL.md body on demand (and reports the skill's ``allowed_tools`` so the sandbox can
-    apply a scoped allowlist).
+    SKILL.md body on demand (and reports the skill's ``allowed_tools``). Loading a skill
+    also marks it active for the turn, so :class:`SkillScopeEnforcer` applies its
+    ``allowed_tools`` as a hard scoped allowlist for subsequent tool calls.
     """
 
     async def execute(args: dict, exec: ToolExecution) -> dict:
@@ -145,6 +148,9 @@ def skill_tool(registry: SkillRegistry) -> ToolDefinition:
         skill = registry.get(name)
         if skill is None:
             raise KeyError(f"unknown skill: {name}")
+        turn = current_turn()
+        if turn is not None:
+            turn.activate_skill(name)
         return {
             "name": skill.name,
             "description": skill.description,
@@ -181,3 +187,66 @@ def skill_tool(registry: SkillRegistry) -> ToolDefinition:
         execute=execute,
         is_concurrency_safe=True,
     )
+
+
+class SkillScopeEnforcer:
+    """Hard-enforce a skill's declared ``allowed_tools`` as a scoped allowlist.
+
+    Once a turn loads a skill via the ``skill`` meta-tool, tools outside the union of that
+    skill's ``allowed_tools`` are denied for the rest of the turn — except a small core set
+    (the ``skill`` meta-tool itself, tool discovery, memory, and planning) that the agent
+    needs to navigate regardless of scope. A skill that declares no ``allowed_tools``
+    imposes no restriction, so legacy skills keep working untouched.
+
+    Installed in :class:`~agent.engine.kernel.AgentKernel` as a monotonic
+    :class:`~agent.engine.runtime.ToolRuntime` guard; the deny reason is fed back to the
+    model so it can pick a permitted tool, or the skill author can widen the allowlist.
+    """
+
+    def __init__(self, registry: SkillRegistry, core_tools: set[str] | None = None) -> None:
+        self._registry = registry
+        # Everything outside this set must be declared in a skill's allowed_tools while
+        # that skill is active.
+        self._core = core_tools if core_tools is not None else {
+            "skill", "tool_search", "memory_search", "memory_save", "plan",
+        }
+
+    def _declared(self, skills: list[str]) -> list[Skill]:
+        """The active skills that actually declare an ``allowed_tools`` allowlist."""
+        declared: list[Skill] = []
+        for name in skills:
+            skill = self._registry.get(name)
+            if skill is not None and skill.allowed_tools:
+                declared.append(skill)
+        return declared
+
+    def _allowed(self, skills: list[str]) -> set[str]:
+        allowed = set(self._core)
+        for skill in self._declared(skills):
+            allowed.update(skill.allowed_tools)
+        return allowed
+
+    def guard(self) -> Guard:
+        """A monotonic guard: deny reason string, or ``None`` to pass."""
+
+        async def _guard(exec: ToolExecution) -> str | None:
+            turn = current_turn()
+            if turn is None or not turn.active_skills:
+                return None
+            declared = self._declared(turn.active_skills)
+            # Unknown skill names (not resolvable in the registry) can't be trusted to
+            # carry an allowlist, so they impose a core-only scope (fail closed).
+            unknown = [n for n in turn.active_skills if self._registry.get(n) is None]
+            if not declared and not unknown:
+                return None  # every active skill is known and declares no scope
+            allowed = self._allowed(turn.active_skills)
+            if exec.name in allowed:
+                return None
+            scoped = [s.name for s in declared] + unknown
+            return (
+                f"skill scope: '{exec.name}' is not in the active skill "
+                f"[{', '.join(scoped)}] allowed_tools "
+                f"[{', '.join(sorted(allowed))}]"
+            )
+
+        return _guard

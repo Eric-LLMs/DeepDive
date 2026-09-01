@@ -80,7 +80,7 @@ def _ctx():
 async def test_run_agent_turn_runs_kernel_and_defers_finalize(monkeypatch):
     user_id, session_id = uuid4(), uuid4()
     kernel = _FakeKernel()
-    monkeypatch.setattr(tasks, "get_agent", lambda: kernel)
+    monkeypatch.setattr(tasks, "get_agent_kernel", lambda: kernel)
     monkeypatch.setattr(tasks, "SessionMemoryStore", _FakeSessionMemory)
     ctx = _ctx()
 
@@ -128,7 +128,7 @@ async def test_run_agent_turn_runs_kernel_and_defers_finalize(monkeypatch):
 async def test_run_agent_turn_omits_channel_when_absent(monkeypatch):
     user_id, session_id = uuid4(), uuid4()
     kernel = _FakeKernel()
-    monkeypatch.setattr(tasks, "get_agent", lambda: kernel)
+    monkeypatch.setattr(tasks, "get_agent_kernel", lambda: kernel)
     monkeypatch.setattr(tasks, "SessionMemoryStore", _FakeSessionMemory)
     ctx = _ctx()
 

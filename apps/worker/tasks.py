@@ -17,7 +17,7 @@ from sqlalchemy import or_, select, update
 
 logger = logging.getLogger(__name__)
 
-from api.deps import get_agent  # the hardened AgentKernel singleton (worker→api coupling)
+from api.agent_factory import get_agent_kernel  # shared AgentKernel composition (api + worker)
 from core.application.drive_service import READY, DriveError, DriveService
 from core.config import settings
 from core.infrastructure import media
@@ -991,11 +991,11 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
 async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
     """Run one agent turn for a user/session in the background (cron / scheduled activity).
 
-    Reuses the API's hardened :class:`AgentKernel` singleton, so a scheduled turn gets the
-    exact same prompt assembly, recall, approvals, telemetry, and budget guard as an
-    interactive one — no second, drift-prone kernel construction in the worker. The answer
-    lands in the session like a normal chat message and ``session_finalize`` is deferred
-    exactly as in the interactive path.
+    Reuses the shared :class:`AgentKernel` composition (:mod:`api.agent_factory`), so a
+    scheduled turn gets the exact same prompt assembly, recall, approvals, telemetry, and
+    budget guard as an interactive one — no second, drift-prone kernel construction in the
+    worker. The answer lands in the session like a normal chat message and
+    ``session_finalize`` is deferred exactly as in the interactive path.
 
     Payload: ``user_id``, ``session_id``, ``message`` (+ optional ``model`` / ``base_url`` /
     ``api_key`` to pin an LLM channel, mirroring the chat endpoint).
@@ -1008,7 +1008,7 @@ async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
             ctx["session_factory"], ctx["embedder"], ctx["llm"], session_id, user_id
         )
         history = await session_memory.load_messages()
-        result = await get_agent().run(
+        result = await get_agent_kernel().run(
             message,
             history,
             session_memory=session_memory,

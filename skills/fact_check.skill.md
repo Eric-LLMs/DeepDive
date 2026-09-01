@@ -24,9 +24,9 @@ anything a user might act on.
    correct the premise before verifying.
 
 2. **Search multiple independent sources.** Use `web_search` for official/recent
-   documentation and `reddit_search` for lived experience and recent community reports.
-   Independent sources sharing the same specific detail are far stronger than one source
-   repeated by many mirrors.
+   documentation and `search_social` (platform: `"reddit"`) for lived experience and recent
+   community reports. Independent sources sharing the same specific detail are far stronger
+   than one source repeated by many mirrors.
 
 3. **Look for disagreement deliberately.** Ask "who would contradict this?" and search for
    that too. Absence of a source that disagrees is weaker evidence than an active search
