@@ -817,8 +817,9 @@ def _pair_image_ids(pair: dict, messages) -> list[str]:
 
     Returns the owned ``chat/temp`` asset ids (one per covered user message with a screenshot).
     The caller mirrors each into a stable ``RAG/images`` copy and puts the *copy* ids into the
-    chunk's ``meta.image_ids`` so retrieval returns them for the vision tool; the covered
-    messages' ``imported_rag`` flag gates the session/message delete cascade.
+    chunk's ``meta.image_ids`` so retrieval returns them for the vision tool; the stable copy is
+    a separate asset row that survives the session/message delete cascade (the ``chat/temp``
+    original dies with its chat).
     """
     ids: list[str] = []
     for i in pair.get("indices") or []:
@@ -953,8 +954,8 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
                     "covered": covered,
                 }
                 # A Q&A entry that covers a message owning a screenshot keeps that image: it
-                # rides the chunk meta so retrieval returns it for the vision tool, and the
-                # imported_rag flags gate the delete cascade from removing it later.
+                # rides the chunk meta so retrieval returns it for the vision tool; the stable
+                # RAG/images copy is what survives the later session/message delete.
                 if rag_image_ids:
                     c.meta["image_ids"] = rag_image_ids
             # Idempotent: replace any chunk already keyed by this question (e.g. a prior

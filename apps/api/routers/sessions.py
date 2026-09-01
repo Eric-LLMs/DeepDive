@@ -131,10 +131,11 @@ async def delete_session(
     """Delete a session (cascade removes its messages + events) if it belongs to the user.
 
     Chat screenshots owned by the session's messages (``MessageModel.attach_asset_id``) are
-    soft-deleted too, **except** screenshots of messages already imported into RAG — a chat
-    Q&A in the query repository keeps its image (the chunk's ``meta.image_ids`` references
-    it), so those assets survive. The link is folder-agnostic: the ``chat/temp`` folder is
-    UI-only, so a screenshot the user moved elsewhere is still cleaned up.
+    soft-deleted too. A screenshot is temporary — it dies with its chat — while the stable
+    ``RAG/images`` copy that an imported Q&A references is a separate asset row the delete
+    never touches, so the query-repo text keeps its image. The link is folder-agnostic: the
+    ``chat/temp`` folder is UI-only, so a screenshot the user moved elsewhere is still cleaned
+    up.
     """
     async with SessionLocal() as session:
         sess = (
@@ -144,7 +145,7 @@ async def delete_session(
             raise HTTPException(status_code=404, detail="session not found")
         owned_rows = (
             await session.execute(
-                select(MessageModel.attach_asset_id, MessageModel.imported_rag).where(
+                select(MessageModel.attach_asset_id).where(
                     MessageModel.session_id == session_id,
                     MessageModel.attach_asset_id.is_not(None),
                 )
@@ -152,8 +153,7 @@ async def delete_session(
         ).all()
         await session.delete(sess)
         await session.commit()
-    # Drop only screenshots of messages that are NOT part of RAG; imported pairs keep theirs.
-    owned = [aid for aid, imported in owned_rows if aid is not None and not imported]
+    owned = [aid for (aid,) in owned_rows if aid is not None]
     for asset_id in owned:
         # Best-effort: an asset may already be trashed from the drive → skip, never fail the
         # session delete because of an orphaned cleanup.
@@ -175,11 +175,11 @@ async def delete_session_message(
     """Delete a single message (no truncation) if its session belongs to the user.
 
     When ``delete_assets`` is true (default) and the message owns a screenshot
-    (``attach_asset_id``), that asset is soft-deleted too — folder-agnostic — unless the
-    message was imported into RAG (``imported_rag``): a chat Q&A in the query repository keeps
-    its image, so the asset survives. The client's edit-and-regenerate flow passes
-    ``delete_assets=0`` so re-asking a question does not destroy the screenshot it was built
-    around.
+    (``attach_asset_id``), that asset is soft-deleted too — folder-agnostic. A screenshot is
+    temporary and dies with its chat; the stable ``RAG/images`` copy an imported Q&A references
+    is a separate asset row this delete never touches. The client's edit-and-regenerate flow
+    passes ``delete_assets=0`` so re-asking a question does not destroy the screenshot it was
+    built around.
     """
     async with SessionLocal() as session:
         sess = (
@@ -192,13 +192,9 @@ async def delete_session_message(
         ).scalar_one_or_none()
         if message is None or message.session_id != session_id:
             raise HTTPException(status_code=404, detail="message not found")
-        # A message imported into RAG keeps its screenshot: the delete cascade never removes
-        # an asset that a query-repo chunk still references (chunk meta.image_ids).
-        owned = (
-            message.attach_asset_id
-            if (delete_assets and not message.imported_rag)
-            else None
-        )
+        # A screenshot is temporary and dies with its chat; the stable RAG/images copy an
+        # imported Q&A references is a separate asset row this delete never touches.
+        owned = message.attach_asset_id if delete_assets else None
         await session.delete(message)
         await session.commit()
     if owned is not None:

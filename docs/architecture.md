@@ -89,7 +89,7 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
-| Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete; RAG import **copies** the asset to `RAG/images/` keeping the `chat/temp/` copy + gates the cascade via `imported_rag`) and RAG document images (PDF/DOCX embedded images → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
+| Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX embedded images → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
 | Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload). Auth endpoints are Redis **rate-limited per client IP** (login/register/recovery, fixed window, fail-open); `enforce_secure_secrets` fails fast at startup when the legacy `JWT_SECRET` default is untouched |
 | Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover. The Tokens page disables a user's access to a key per (user, channel); a user with no usable key degrades to the anonymous tier (guest quota) instead of losing login |
 | Admin console | single-file SPA at `/admin` with 5 modules (Providers / Roles / Users / Tokens / **Tools config**): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint). The **Tools config** module edits the generic `tools` namespace (web-search provider, SMTP, free-form key/value params) with a one-click *Test email*; the Chat Test user picker is a fuzzy-autocomplete text box; a **RAG** module adds live pipeline testing (per-node trace), chunking preview, node-topology editing, and golden-set eval |
@@ -1173,7 +1173,7 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Measure retrieval quality | `rag.eval` golden-set regression (asset-level Recall@k / Precision@k / MRR); admin **Eval** tab or `scripts/eval_rag.py` |
 | Mount the research OS plugin | factory-built `plugins/research/` Cordis plugin (`build_research_plugin(ctx)`), lazy capability resolution over `drive` / `research_scratch`; 6 tools: `research_project` / `artifact` / `state` / `evidence` / `gate` / `run` — see [docs/research/](research/) |
 | Govern a research stage | mechanical `research_gate` checks (deterministic, no LLM judgment); a FAIL override always spawns a PENDING `ResearchApproval` that only a human resolves (never self-approve) — see [docs/research/](research/) |
-| Delete a message's owned screenshot | `messages.attach_asset_id` → cascade soft-delete by id (folder-agnostic); `?delete_assets=0` on edit-reask keeps it; `imported_rag` gate preserves images of Q&A already in the query repo (§18.2) |
+| Delete a message's owned screenshot | `messages.attach_asset_id` → cascade soft-delete by id (folder-agnostic); `?delete_assets=0` on edit-reask keeps it; the stable `RAG/images` copy an imported Q&A references is a separate asset row that survives the delete (§18.2) |
 | Save a derived asset with its source | `assets.source_asset_id` (FK `ON DELETE CASCADE`) + content-hash dedup (`get_by_source_content`) |
 | Attach document images to RAG chunks | page/para markers → chunk `meta.pages` / `meta.image_ids` (union across pages, state machine covers unmarked blocks) |
 | Route the vision tool to a model | `tools.vision.model` → catalog model → route → credential (`_resolve_vision_channel`) |
@@ -1524,13 +1524,14 @@ at will. `DELETE /sessions/{id}` and
 asset **by id, not by folder**, so the file is cleaned up wherever the user moved it; a
 referential attachment (🔗 cloud asset / 📎 local file) that was never `owned` is never touched.
 The edit-reask flow passes `?delete_assets=0` so re-generating an answer does not destroy the
-screenshot it was built around. A screenshot is **temporary**: it dies with its chat — the one
-exception is a Q&A pair **imported into RAG**: the import **copies** the asset to `RAG/images/`
-while **keeping the `chat/temp/` copy** (logical soft-delete + content-addressed storage means
-two rows sharing one blob cost nothing extra), so emptying `chat/temp/` can't remove it; the
-`imported_rag` flag gates the delete cascade, and the chunk `meta.image_ids` keeps the stable
-`RAG/images/` copy referenced by the query-repo text instead of deleted. See
-[§18.2](#182-chat-screenshot-pipeline).
+screenshot it was built around. A screenshot is **temporary**: it dies with its chat (deleting
+the message/session soft-deletes the owned `chat/temp/` asset by id, folder-agnostic). A Q&A
+pair **imported into RAG** is the one that outlives the chat: the import **copies** the asset
+to `RAG/images/` while **keeping the `chat/temp/` copy** (content-addressed storage means two
+rows sharing one blob cost nothing extra), so clearing `chat/temp/` can't remove the corpus
+image; deleting the chat afterwards still removes the `chat/temp/` copy while the stable
+`RAG/images/` copy — a separate asset row referenced by the chunk `meta.image_ids` — survives.
+See [§18.2](#182-chat-screenshot-pipeline).
 
 [↑ Back to top](#table-of-contents)
 
@@ -2042,10 +2043,11 @@ differs is how each one is *bound*:
 A folder is pure UI organization: deletion and lifecycle decisions key off these bindings,
 never off a folder path, so moving a file in the drive never breaks cleanup. `chat/temp/` is
 deliberately **temporary** (a scratch zone the user may empty at will). A chat screenshot
-**imported into RAG lives in both folders**: the `chat/temp/` copy stays (its `imported_rag`
-flag gates the message/session delete cascade), and a stable `RAG/images/` copy is created
-sharing the same object bytes — so clearing `chat/temp/` can never orphan an image the
-query-repo text still references.
+**imported into RAG lives in both folders**: the `chat/temp/` copy stays until its chat is
+deleted (deleting the session/message removes it), and a stable `RAG/images/` copy is created
+sharing the same object bytes — a separate asset row the chat delete never touches, so the
+query-repo text keeps referencing an image that survives both clearing `chat/temp/` and
+deleting the chat.
 
 ### 18.1 Asset relationship model (save/delete backbone)
 
@@ -2089,14 +2091,15 @@ Three columns carry the image semantics (migrations `0015_messages_attach.sql` +
 6. **Delete** — deleting the message/session soft-deletes the owned asset **by
    `attach_asset_id`, regardless of folder**; the edit-reask flow sends `?delete_assets=0` so
    re-generating an answer keeps the screenshot (§12.5). A chat screenshot is **temporary**: it
-   dies with its message/session. The one exception is a Q&A pair **imported into RAG** — the
-   import **copies** the owned asset to `RAG/images/` via `DriveService.copy_to_folder` and
-   references that **stable copy** in the chunk `meta.image_ids` (single-pair and whole-session
-   imports both); the `chat/temp/` copy is **kept** (its `imported_rag` message flag gates the
-   delete cascade), so the image is preserved with the query-repo text instead of removed. Both
-   rows share one `object_sha256` (the blob is content-addressed — the copy only bumps the
-   object's `ref_count`), and `get_by_folder_content(user, "RAG/images", hash)` dedupes a
-   re-import so no second copy row is created (§18.3).
+   dies with its message/session — even after the Q&A is imported into RAG, deleting the chat
+   still removes the `chat/temp/` copy. What survives is the stable **`RAG/images/` copy** the
+   import created via `DriveService.copy_to_folder` (single-pair and whole-session imports
+   both): it is a **separate asset row** referenced by the chunk `meta.image_ids`, so the
+   session/message delete — which only follows `attach_asset_id` — never touches it and the
+   image stays with the query-repo text. Both rows share one `object_sha256` (the blob is
+   content-addressed — the copy only bumps the object's `ref_count`), and
+   `get_by_folder_content(user, "RAG/images", hash)` dedupes a re-import so no second copy row
+   is created (§18.3).
 
 ### 18.3 RAG document-image pipeline (extraction & meta annotation)
 

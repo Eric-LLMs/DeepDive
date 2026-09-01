@@ -109,7 +109,7 @@ async def chat_import_pair(
     from rag.config_store import load_config  # lazy: rag is a sibling package
 
     # A chat Q&A that joins RAG keeps its screenshot in BOTH folders: the temporary chat/temp
-    # copy stays (the message's imported_rag flag gates the delete cascade), and a stable
+    # copy stays (it dies with its chat when the session/message is deleted), and a stable
     # RAG/images copy is created for the corpus sharing the same object bytes — so emptying
     # chat/temp never removes an image the repo still references. The chunk meta references
     # the stable copy; best-effort, falling back to the owned chat/temp asset if copying fails.
