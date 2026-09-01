@@ -69,6 +69,7 @@
   - [16.7 Per-step process](#167-per-step-process)
   - [16.8 Configuration](#168-configuration)
 - [17. Research OS Module](#17-research-os-module)
+- [18. Image Handling (screenshots & document images)](#18-image-handling-screenshots--document-images)
 
 [↑ Back to top](#table-of-contents)
 
@@ -88,6 +89,7 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
+| Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete; RAG import **moves** the asset to `RAG/images/` + gates the cascade via `imported_rag`) and RAG document images (PDF/DOCX embedded images → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
 | Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload). Auth endpoints are Redis **rate-limited per client IP** (login/register/recovery, fixed window, fail-open); `enforce_secure_secrets` fails fast at startup when the legacy `JWT_SECRET` default is untouched |
 | Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover. The Tokens page disables a user's access to a key per (user, channel); a user with no usable key degrades to the anonymous tier (guest quota) instead of losing login |
 | Admin console | single-file SPA at `/admin` with 5 modules (Providers / Roles / Users / Tokens / **Tools config**): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint). The **Tools config** module edits the generic `tools` namespace (web-search provider, SMTP, free-form key/value params) with a one-click *Test email*; the Chat Test user picker is a fuzzy-autocomplete text box; a **RAG** module adds live pipeline testing (per-node trace), chunking preview, node-topology editing, and golden-set eval |
@@ -993,6 +995,11 @@ change takes effect on the next `POST /admin/rag/reindex` (re-ingests every READ
   `chunks.content_search` and matched with `to_tsvector('simple', content_search) @@
   plainto_tsquery('simple', <segmented query>)` (GIN-indexed). English queries keep the original
   `english` FTS path unchanged.
+- **Embedded images** — for PDF/DOCX the ingest extracts embedded raster images into the Cloud
+  Drive (`RAG 图片/<doc>/`, `assets.source_asset_id`), threads page/paragraph markers through
+  extraction, and a page/para state machine annotates each chunk's `meta` with the pages it
+  spans plus the deduped **union** of the images on those pages (`image_ids`) — the agent reads
+  them with the `vision` tool on retrieval. Details in [§18.3](#183-rag-document-image-pipeline-extraction--meta-annotation).
 
 ### 10.8 Query Repository — multi-source import
 
@@ -1166,6 +1173,10 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Measure retrieval quality | `rag.eval` golden-set regression (asset-level Recall@k / Precision@k / MRR); admin **Eval** tab or `scripts/eval_rag.py` |
 | Mount the research OS plugin | factory-built `plugins/research/` Cordis plugin (`build_research_plugin(ctx)`), lazy capability resolution over `drive` / `research_scratch`; 6 tools: `research_project` / `artifact` / `state` / `evidence` / `gate` / `run` — see [docs/research/](research/) |
 | Govern a research stage | mechanical `research_gate` checks (deterministic, no LLM judgment); a FAIL override always spawns a PENDING `ResearchApproval` that only a human resolves (never self-approve) — see [docs/research/](research/) |
+| Delete a message's owned screenshot | `messages.attach_asset_id` → cascade soft-delete by id (folder-agnostic); `?delete_assets=0` on edit-reask keeps it; `imported_rag` gate preserves images of Q&A already in the query repo (§18.2) |
+| Save a derived asset with its source | `assets.source_asset_id` (FK `ON DELETE CASCADE`) + content-hash dedup (`get_by_source_content`) |
+| Attach document images to RAG chunks | page/para markers → chunk `meta.pages` / `meta.image_ids` (union across pages, state machine covers unmarked blocks) |
+| Route the vision tool to a model | `tools.vision.model` → catalog model → route → credential (`_resolve_vision_channel`) |
 
 [↑ Back to top](#table-of-contents)
 
@@ -1505,6 +1516,20 @@ already imported to knowledge is removed via the admin **RAG → Repository** pe
 (`DELETE /admin/rag/repository/{chunk_id}`) or by re-importing a changed source, not by deleting the
 session.
 
+**Image attachments are folder-agnostic.** A user message that created a chat screenshot carries
+`messages.attach_asset_id` (migration `0015_messages_attach.sql`) — the asset the message *owns*,
+stored under the purely-UI `chat/temp/` folder — the **temporary** chat zone a user may empty
+at will. `DELETE /sessions/{id}` and
+`DELETE /sessions/{id}/messages/{mid}` (with `?delete_assets=1`, the default) soft-delete that
+asset **by id, not by folder**, so the file is cleaned up wherever the user moved it; a
+referential attachment (🔗 cloud asset / 📎 local file) that was never `owned` is never touched.
+The edit-reask flow passes `?delete_assets=0` so re-generating an answer does not destroy the
+screenshot it was built around. A screenshot is **temporary**: it dies with its chat — the one
+exception is a Q&A pair **imported into RAG**: the import **moves** the asset out of the
+temporary zone to `RAG/images/` (so emptying `chat/temp/` can't remove it), its `imported_rag`
+flag gates the delete cascade, and the chunk `meta.image_ids` keeps it referenced by the
+query-repo text instead of deleted. See [§18.2](#182-chat-screenshot-pipeline).
+
 [↑ Back to top](#table-of-contents)
 
 ## 13. Multi-Tenancy and Deployment Strategy
@@ -1607,6 +1632,19 @@ Sources: `migrations/0004_drive_objects.sql`, `0006_folders.sql`, `0007_workspac
 - **Workspace lifecycle** — deleting a workspace trashes every asset, nullifies their
   `workspace_id` (so the `assets` FK does not block the drop), then removes the workspace row;
   members and folders cascade. Trashed assets of a deleted workspace restore into My Drive.
+- **Derived assets & cascade lifecycle** — an asset can record `source_asset_id`
+  (migration `0016_assets_source.sql`, FK → `assets.id` `ON DELETE CASCADE`): RAG images
+  derived from a PDF/DOCX point back to the source document. `delete_asset` soft-deletes the
+  derived images into the trash too (`list_by_source`); `_purge_asset` recurses derived-first
+  so each derived `global_objects` ref-count is released exactly once; `restore_trash` restores
+  the derived set with the source. Dedup on ingest (`get_by_source_content`) reuses an existing
+  derived asset by `(source_asset_id, object_sha256)`, so re-ingesting a document never
+  duplicates images — see [§18.4](#184-derived-image-lifecycle-delete--trash--purge--restore).
+- **Message-owned assets** — a chat message that created a screenshot stores
+  `messages.attach_asset_id` → `assets.id` (`ON DELETE SET NULL`); the `sessions.py` delete
+  handlers soft-delete that asset by id when the message/session goes away, independent of the
+  folder it sits in — **unless the message was imported into RAG**, whose `imported_rag` gate
+  keeps the image alongside the query-repo text — see [§18.2](#182-chat-screenshot-pipeline).
 - **Audit trail** — every mutation calls `_log(...)` writing who / what / when / target. The
   row has no FKs so it survives its subjects; the API lists it with actor/target fuzzy search,
   date bounds, and pagination (admin / owner only).
@@ -1797,9 +1835,14 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     **Enter sends** the message, **Shift+Enter** inserts a new line), inline **🎤 / 🔊**
     buttons, and Send — with an attachment preview strip above it. Attach stages a pending
     attachment that rides on the next send: pick a file (OS picker → uploaded to the cloud
-    drive), attach the currently-open cloud asset by id, or capture a **window screenshot**
-    (`capture-window` IPC → base64 → uploaded); the API prefixes an `[Attached: …]` note to the
-    user message so the agent's document tools can fetch the bytes by `asset_id`. The chat-header
+    drive), attach the currently-open cloud asset by id, or capture a **window screenshot** —
+    the `capture-window` IPC grabs the app's own window via `webContents.capturePage()`, then
+    the renderer overlays a **drag-to-select region** (double-click = whole frame, Esc =
+    cancel) and crops the selection. The PNG is uploaded with a real MIME type to the
+    `chat/temp/` folder (temporary — a Q&A imported into RAG is moved to `RAG/images/` instead,
+    §18.2) and marked **owned**; the API prefixes an `[Attached: …]` note to the
+    user message so the agent's document tools and the `vision` tool (§18.5) can fetch the
+    bytes by `asset_id`. The chat-header
     also carries a **⋯** session menu (pin / rename / **Import to Knowledge** / delete, plus
     **Generate Mind Map / Generate Slides / Summarize & Save Notes**) and a **hide** toggle that
     collapses the chat into a floating restore icon; a **Generate** toolbar above the input
@@ -1831,9 +1874,13 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     + DOM, then the question is re-sent through the stream so a fresh answer regenerates (there
     is no server-side message-edit endpoint; the client rewrites the history). **Import to
     Knowledge** writes the Q&A pair to the query repository (§10.8) and flips to a disabled
-    **✓ Imported** once covered, driven by `GET /chat/imported` per user message. Sessions are
-    **renamed** inline (click the chat-header title or a sidebar row → `PATCH /sessions/{id}`;
-    empty title resets auto-naming) or **deleted** from the sidebar (`DELETE /sessions/{id}`);
+    **✓ Imported** once covered, driven by `GET /chat/imported` per user message. A message that
+    created a screenshot carries `messages.attach_asset_id`, returned as `attach` on
+    `GET /sessions/{id}`; `appendMessage` renders it as an **inline image thumbnail** in the
+    bubble (blob fetch via `/api/files/{id}/download`, CSS-bounded), with a `📎` chip fallback
+    for non-image or unreadable assets (§18.2). Sessions are **renamed** inline (click the
+    chat-header title or a sidebar row → `PATCH /sessions/{id}`; empty title resets
+    auto-naming) or **deleted** from the sidebar (`DELETE /sessions/{id}`);
     `GET /sessions/{id}/messages` reloads a session's bubbles.
   - **Settings** — a modal with five tabs: **Appearance** (theme), **Window & Display** (font
     size), **Updates** (GitHub release check), **Help & Feedback**, and **About**.
@@ -1977,5 +2024,123 @@ research-domain rule; Research OS adds exactly that domain layer.
 6 tool contracts, state machine, gate policy, diagrams); a Cordis plugin + spike tests landed
 (`plugins/research/`, `tests/test_research_plugin.py`), but there is no Phase 1 MVP yet — see
 [Implementation Status §Designed](#designed-not-yet-implemented).
+
+## 18. Image Handling (screenshots & document images)
+
+Two image classes flow through the system, sharing one storage and lifecycle backbone. Both are
+**Cloud Drive assets** (§14), so they inherit dedup, sharing, trash, and the RAG corpus; what
+differs is how each one is *bound*:
+
+| Class | Origin | Folder | Binding |
+|---|---|---|---|
+| Chat screenshots | desktop 📷 region capture | `chat/temp/` (temporary — user may empty) → `RAG/images/` on RAG import | `messages.attach_asset_id` — the message **owns** it |
+| RAG document images | PDF/DOCX embedded images at ingest | `RAG 图片/<doc>/` | `assets.source_asset_id` — derived from the document |
+
+A folder is pure UI organization: deletion and lifecycle decisions key off these bindings,
+never off a folder path, so moving a file in the drive never breaks cleanup. `chat/temp/` is
+deliberately **temporary** (a scratch zone the user may empty at will); promoting an imported
+chat image to `RAG/images/` keeps it out of that zone, so clearing `chat/temp/` can never orphan
+an image the query-repo text still references.
+
+### 18.1 Asset relationship model (save/delete backbone)
+
+Three columns carry the image semantics (migrations `0015_messages_attach.sql` +
+`0016_assets_source.sql`):
+
+- **`messages.attach_asset_id`** (UUID NULL → `assets.id`, `ON DELETE SET NULL`) — set only on a
+  `user` message whose turn created a chat attachment (📷 screenshot). It answers "which cloud
+  asset does this message own?", and the delete handlers cascade on it. Referential attaches
+  (🔗 cloud asset / 📎 local file) never set it, so deleting a message can never touch a
+  document the user merely referenced.
+- **`assets.source_asset_id`** (UUID NULL → `assets.id`, `ON DELETE CASCADE`) — a derived asset
+  (RAG image) points back to the document it was extracted from. The FK cascades the hard
+  delete; the service layer mirrors that cascade for the soft-delete (trash) path so derived
+  images move with their source (§18.4).
+- **`assets.object_sha256`** (pre-existing) — the content hash doubles as the dedup key:
+  `get_by_source_content(source_asset_id, object_sha256)` returns an existing active derived
+  image, so re-ingesting the same document reuses images instead of duplicating rows.
+
+### 18.2 Chat screenshot pipeline
+
+1. **Capture** — the `capture-window` IPC captures the app's own window via
+   `webContents.capturePage()` (unambiguous — a desktopCapturer window walk can select an
+   unrelated window on Windows). The renderer overlays the frozen frame with a **drag-to-select
+   region** (double-click = whole frame, Esc = cancel) and crops the selection from the
+   full-resolution image client-side.
+2. **Upload** — the cropped PNG is uploaded with a real MIME (`image/png`) to the `chat/temp/`
+   folder — the **temporary** chat scratch zone the user may empty at will. The stored MIME fixes
+   the download `Content-Type`, which the bubble renderer relies on.
+3. **Stage** — the asset becomes the pending attachment marked **owned**
+   (`setPendingAttach({kind:"asset", asset_id, name, owned:true})`) and rides on the next send —
+   never auto-sent.
+4. **Persist** — `SessionMemoryStore.append_message` writes `attach_asset_id` for a `user`
+   message; `GET /sessions/{id}` LEFT JOINs the asset so `load_session_detail` returns
+   `attach {asset_id, name, mime}` per message.
+5. **Render** — the desktop bubble shows the image as an **inline thumbnail** (blob fetch via
+   `/api/files/{id}/download`, CSS-bounded) above the text — a Gemini/ChatGPT-style image list.
+   A non-image or unreadable asset falls back to a `📎` chip; an `application/octet-stream`
+   Content-Type (older assets stored without a MIME) is still accepted when the name looks like
+   an image.
+6. **Delete** — deleting the message/session soft-deletes the owned asset **by
+   `attach_asset_id`, regardless of folder**; the edit-reask flow sends `?delete_assets=0` so
+   re-generating an answer keeps the screenshot (§12.5). A chat screenshot is **temporary**: it
+   dies with its message/session. The one exception is a Q&A pair **imported into RAG** — the
+   import writes the asset into the chunk `meta.image_ids` (single-pair and whole-session
+   imports both), **moves** it out of the temporary zone to `RAG/images/` (so emptying
+   `chat/temp/` can't remove it), and the `imported_rag` message flag gates the delete cascade
+   so the image is preserved with the query-repo text instead of removed (§18.3).
+
+### 18.3 RAG document-image pipeline (extraction & meta annotation)
+
+The worker's `asset_ingest` job extracts embedded images alongside the text:
+
+1. **Scan** — `scan_embedded_images(data, name)` walks the document: for PDF, each page's
+   `page.get_images(full=True)` → `page.extract_image(xref)` (raster formats only, cross-page
+   xref deduped); for DOCX, the package image parts (`doc.part.rels`) are matched to the
+   paragraph that references each `a:blip` `r:embed`, giving a paragraph anchor (DOCX has no
+   native page numbers — the image rides the chunk its paragraph lands in, the same intent).
+2. **Save (dedup + bind)** — each image is uploaded to `RAG 图片/<doc>/` via
+   `save_artifact(..., source_asset_id=<document id>)`; `get_by_source_content` reuses an
+   existing active derived image for the same `(source, hash)`, so repeat ingests produce no
+   duplicates.
+3. **Markers** — extraction re-runs with markers on: `extract_pdf_document(page_markers=True)`
+   inserts `[[PAGE:n]]` at each page start, `extract_text(para_markers=True)` inserts
+   `[[PARA:n]]` per DOCX body paragraph. Both kwargs default **off**, so existing callers
+   (document_tools, toolkit, tasks) are unaffected.
+4. **State machine** — `build_chunks(..., on_split=...)` runs a per-chunk annotator *before*
+   contextualize/CJK enrichment and strips the markers. For each chunk it reads the markers it
+   contains, maintains a running page/paragraph, and writes:
+   - `meta["pages"]` (or `meta["paras"]`) — the page numbers a chunk spans; a chunk with no
+     marker of its own inherits the running page/paragraph, so unmarked middle blocks are
+     covered.
+   - `meta["image_ids"]` — the deduped **union** of the images on every page the chunk covers
+     (cross-page chunks keep all pages' images). Table transcriptions are appended without
+     markers and fall to the running page (known limitation).
+5. **Retrieval & reading** — the chunk `meta` flows untouched through `rag_search` to the agent
+   (§10.8); when the model needs the visual content it calls the `vision` tool with an image
+   `asset_id` (§18.5). No retrieval-side change.
+
+### 18.4 Derived-image lifecycle (delete / trash / purge / restore)
+
+The service mirrors the FK cascade for every soft path (`drive_service.py`):
+
+- **`delete_asset`** — after soft-deleting a source, `list_by_source(source)` soft-deletes each
+  derived image into the trash too (by `source_asset_id`, folder-agnostic).
+- **`_purge_asset`** — recurses `list_by_source(source, include_deleted=True)` **before**
+  dropping the source, so every derived image's `global_objects` ref-count is released exactly
+  once and no bytes leak.
+- **`restore_trash`** — restoring a source also restores its derived images.
+- **Idempotent ingest** — re-ingesting an already-ingested document finds every derived image
+  via `get_by_source_content` and reuses it.
+
+### 18.5 Vision routing
+
+The `vision` tool (`apps/api/tools/vision_tool.py`) reads an attached image by `asset_id` and
+asks a vision-capable model. `_resolve_vision_channel` resolves `tools.vision.model` (admin
+Tools config) → catalog model → its routing → credential; an empty name falls back to the first
+active catalog model. The request is OpenAI-compatible (`image_url` with a `data:` URL; images
+in the `user` message). The vision tool is **not** allowlisted in the gateway (deps.py allows
+`rag_search` + the toolkit generators), so the model reaches it through a `tool_search`
+discovery hop when an `[Attached: …]` note calls for it — see [§5.2](#52-agent-loop--reactloopagent).
 
 [↑ Back to top](#table-of-contents)

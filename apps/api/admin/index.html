@@ -1485,6 +1485,14 @@
             test: { label: "Test email", endpoint: "/config/test-email" },
           },
           {
+            id: "vision",
+            title: "Vision (image recognition)",
+            desc: "Backing model for the agent's vision tool — pick a catalog model registered under Model Catalog. Empty falls back to the default model.",
+            fields: [
+              { key: "model", label: "Model (catalog display name or provider id)", ph: "e.g. qwen-vl-max / gpt-4o" },
+            ],
+          },
+          {
             id: "amap",
             title: "高德 (Amap)",
             desc: "Map & location search — to be integrated. Config fields will appear here once ready.",

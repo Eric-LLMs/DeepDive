@@ -82,6 +82,7 @@ async def _attach_note(body: ChatRequest, drive: DriveService, user_id) -> str |
 async def chat_import_pair(
     body: ChatImportRequest,
     user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
 ):
     """Import one chat Q&A pair (user message + assistant reply) as a query-repo chunk.
 
@@ -113,6 +114,12 @@ async def chat_import_pair(
     chunks = await build_chunks(content, cfg, doc_title=title, llm=llm)
     for c in chunks:
         c.meta = {**c.meta, "title": title, "kind": "qa", "session_id": str(user_msg.session_id)}
+    # A chat Q&A that joins RAG keeps its screenshot: reference the owned cloud-drive asset in
+    # the chunk meta (image_ids) so retrieval hands it to the vision tool. The message's
+    # imported_rag flag is what gates the session/message delete cascade from removing it.
+    if user_msg.attach_asset_id is not None:
+        for c in chunks:
+            c.meta["image_ids"] = [str(user_msg.attach_asset_id)]
     chunks_repo = SqlChunkRepository(SessionLocal)
     await chunks_repo.delete_by_source("chat", [str(user_msg.id)])
     res = await write_query_repo_chunks(
@@ -132,6 +139,14 @@ async def chat_import_pair(
             if row is not None:
                 row.imported_rag = True
         await session.commit()
+    # A Q&A now in the repo keeps its screenshot out of the temporary chat/temp folder:
+    # move it to RAG/images so a user emptying chat/temp never deletes an image the corpus
+    # still references. Best-effort — a stale/trashed asset must not fail the import.
+    if user_msg.attach_asset_id is not None:
+        try:
+            await drive.move_file(user.user_id, user_msg.attach_asset_id, None, "RAG/images")
+        except DriveError:
+            pass
     return {"chunks": res["chunks"]}
 
 
@@ -263,12 +278,22 @@ async def chat(
             )
 
     user_text = body.message
+    # Only attaches the client flagged ``owned`` (a 📷 screenshot created for this message)
+    # own a drive asset. Referential attaches (🔗 drive file / local file) leave the link
+    # NULL so deleting the message never touches a referenced document — the chat/temp
+    # folder is UI-only; the delete decision keys off this owned link.
+    owned_asset_id = (
+        body.attach.get("asset_id") if body.attach and body.attach.get("owned") else None
+    )
     if body.attach:
         note = await _attach_note(body, drive, user_id)
         if note:
             user_text = f"{note}\n\n{body.message}"
     session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
-    session_memory = SessionMemoryStore(SessionLocal, _embedder(), llm, session_id, user_id)
+    session_memory = SessionMemoryStore(
+        SessionLocal, _embedder(), llm, session_id, user_id,
+        attach_asset_id=owned_asset_id,
+    )
     history = body.history or await session_memory.load_messages()
     history = await compact_history(
         history,
@@ -385,12 +410,22 @@ async def chat_stream(
         )
 
     user_text = body.message
+    # Only attaches the client flagged ``owned`` (a 📷 screenshot created for this message)
+    # own a drive asset. Referential attaches (🔗 drive file / local file) leave the link
+    # NULL so deleting the message never touches a referenced document — the chat/temp
+    # folder is UI-only; the delete decision keys off this owned link.
+    owned_asset_id = (
+        body.attach.get("asset_id") if body.attach and body.attach.get("owned") else None
+    )
     if body.attach:
         note = await _attach_note(body, drive, user_id)
         if note:
             user_text = f"{note}\n\n{body.message}"
     session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
-    session_memory = SessionMemoryStore(SessionLocal, _embedder(), llm, session_id, user_id)
+    session_memory = SessionMemoryStore(
+        SessionLocal, _embedder(), llm, session_id, user_id,
+        attach_asset_id=owned_asset_id,
+    )
     history = body.history or await session_memory.load_messages()
     history = await compact_history(
         history,

@@ -9,8 +9,9 @@ from uuid import UUID
 from agent.security.approvals import get_approval_bridge
 from agent.tools.checkpoints import CheckpointError
 from api.auth import AuthUser, require_user
-from api.deps import get_agent
+from api.deps import get_agent, get_drive_service
 from api.schemas import ApprovalResolveRequest, SessionRenameRequest
+from core.application.drive_service import DriveError, DriveService
 from core.infrastructure.db import ChunkModel, MessageModel, SessionLocal, SessionModel
 from core.infrastructure.memory import list_sessions, load_session_detail
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -122,24 +123,64 @@ async def rename_session(
 
 
 @router.delete("/sessions/{session_id}")
-async def delete_session(session_id: UUID, user: AuthUser = Depends(require_user)):
-    """Delete a session (cascade removes its messages + events) if it belongs to the user."""
+async def delete_session(
+    session_id: UUID,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+):
+    """Delete a session (cascade removes its messages + events) if it belongs to the user.
+
+    Chat screenshots owned by the session's messages (``MessageModel.attach_asset_id``) are
+    soft-deleted too, **except** screenshots of messages already imported into RAG — a chat
+    Q&A in the query repository keeps its image (the chunk's ``meta.image_ids`` references
+    it), so those assets survive. The link is folder-agnostic: the ``chat/temp`` folder is
+    UI-only, so a screenshot the user moved elsewhere is still cleaned up.
+    """
     async with SessionLocal() as session:
         sess = (
             await session.execute(select(SessionModel).where(SessionModel.id == session_id))
         ).scalar_one_or_none()
         if sess is None or sess.user_id != user.user_id:
             raise HTTPException(status_code=404, detail="session not found")
+        owned_rows = (
+            await session.execute(
+                select(MessageModel.attach_asset_id, MessageModel.imported_rag).where(
+                    MessageModel.session_id == session_id,
+                    MessageModel.attach_asset_id.is_not(None),
+                )
+            )
+        ).all()
         await session.delete(sess)
         await session.commit()
+    # Drop only screenshots of messages that are NOT part of RAG; imported pairs keep theirs.
+    owned = [aid for aid, imported in owned_rows if aid is not None and not imported]
+    for asset_id in owned:
+        # Best-effort: an asset may already be trashed from the drive → skip, never fail the
+        # session delete because of an orphaned cleanup.
+        try:
+            await drive.delete_asset(user.user_id, asset_id)
+        except DriveError:
+            pass
     return Response(status_code=204)
 
 
 @router.delete("/sessions/{session_id}/messages/{message_id}")
 async def delete_session_message(
-    session_id: UUID, message_id: UUID, user: AuthUser = Depends(require_user)
+    session_id: UUID,
+    message_id: UUID,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+    delete_assets: bool = True,
 ):
-    """Delete a single message (no truncation) if its session belongs to the user."""
+    """Delete a single message (no truncation) if its session belongs to the user.
+
+    When ``delete_assets`` is true (default) and the message owns a screenshot
+    (``attach_asset_id``), that asset is soft-deleted too — folder-agnostic — unless the
+    message was imported into RAG (``imported_rag``): a chat Q&A in the query repository keeps
+    its image, so the asset survives. The client's edit-and-regenerate flow passes
+    ``delete_assets=0`` so re-asking a question does not destroy the screenshot it was built
+    around.
+    """
     async with SessionLocal() as session:
         sess = (
             await session.execute(select(SessionModel).where(SessionModel.id == session_id))
@@ -151,8 +192,20 @@ async def delete_session_message(
         ).scalar_one_or_none()
         if message is None or message.session_id != session_id:
             raise HTTPException(status_code=404, detail="message not found")
+        # A message imported into RAG keeps its screenshot: the delete cascade never removes
+        # an asset that a query-repo chunk still references (chunk meta.image_ids).
+        owned = (
+            message.attach_asset_id
+            if (delete_assets and not message.imported_rag)
+            else None
+        )
         await session.delete(message)
         await session.commit()
+    if owned is not None:
+        try:
+            await drive.delete_asset(user.user_id, owned)
+        except DriveError:
+            pass
     return Response(status_code=204)
 
 

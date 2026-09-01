@@ -54,15 +54,31 @@ class FakeAssets:
         self.workspaces = workspaces
 
     async def create(self, user_id, name, *, workspace_id=None, folder_path=None,
-                     mime_type=None, size=None, object_sha256=None,
+                     mime_type=None, size=None, object_sha256=None, source_asset_id=None,
                      file_status="uploading", rag_status="pending"):
         obj = AssetModel(
             id=uuid4(), user_id=user_id, name=name, workspace_id=workspace_id,
             folder_path=folder_path, mime_type=mime_type, size=size,
-            object_sha256=object_sha256, file_status=file_status, rag_status=rag_status,
+            object_sha256=object_sha256, source_asset_id=source_asset_id,
+            file_status=file_status, rag_status=rag_status,
         )
         self.rows[obj.id] = obj
         return obj
+
+    async def list_by_source(self, source_asset_id, *, include_deleted=False):
+        return [
+            o for o in self.rows.values()
+            if o.source_asset_id == source_asset_id
+            and (include_deleted or o.deleted_at is None)
+        ]
+
+    async def get_by_source_content(self, source_asset_id, object_sha256):
+        for o in self.rows.values():
+            if (o.source_asset_id == source_asset_id
+                    and o.object_sha256 == object_sha256
+                    and o.deleted_at is None):
+                return o
+        return None
 
     async def get(self, asset_id):
         return self.rows.get(asset_id)

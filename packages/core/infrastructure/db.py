@@ -274,6 +274,12 @@ class AssetModel(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     folder_path: Mapped[str | None] = mapped_column(String)
     mime_type: Mapped[str | None] = mapped_column(String)
+    # The source document (PDF/DOCX) this asset was derived from during RAG image extraction.
+    # Enables re-ingest dedupe (same source + object_sha256 = content hash) and lifecycle
+    # cascade (deleting the source cleans up its derived image assets).
+    source_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("assets.id", ondelete="CASCADE"), nullable=True
+    )
     size: Mapped[int | None] = mapped_column(BigInteger)
     file_status: Mapped[str] = mapped_column(String, nullable=False, default="uploading")
     rag_status: Mapped[str] = mapped_column(String, nullable=False, default="not_started")
@@ -738,6 +744,13 @@ class MessageModel(Base):
     # pair's state never spreads to siblings and an imported pair can't be re-imported).
     imported_rag: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False
+    )
+    # The cloud-drive asset this message OWNS (a 📷 chat screenshot). Only set for attaches
+    # flagged ``owned`` — referential attaches (🔗 drive file / local file) leave it NULL so
+    # deleting the message never touches a referenced document. Cascade deletes of the
+    # message/session soft-delete this asset (folder-agnostic; the chat/temp folder is UI).
+    attach_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

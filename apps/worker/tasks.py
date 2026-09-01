@@ -8,6 +8,7 @@ task drives its own status transitions via :class:`JobStore`.
 import asyncio
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from uuid import UUID
@@ -17,7 +18,7 @@ from sqlalchemy import or_, select, update
 logger = logging.getLogger(__name__)
 
 from api.deps import get_agent  # the hardened AgentKernel singleton (worker→api coupling)
-from core.application.drive_service import READY, DriveService
+from core.application.drive_service import READY, DriveError, DriveService
 from core.config import settings
 from core.infrastructure import media
 from core.infrastructure.db import (
@@ -49,6 +50,15 @@ from core.infrastructure.repositories import (
 )
 from core.infrastructure.storage import get_storage, object_key
 from rag.query_cache import bump_corpus_version
+
+from apps.worker.rag_images import save_images, scan_embedded_images
+
+# Image-attribution sentinels inserted by ``extract_document_text(page_markers=True)`` (PDF
+# → ``[[PAGE:n]]``, DOCX → ``[[PARA:n]]``). The annotator below strips them from stored
+# chunk content and records the page/paragraph span + image_ids on ``meta``.
+_PAGE_MARKER = re.compile(r"\[\[PAGE:(\d+)\]\]")
+_PARA_MARKER = re.compile(r"\[\[PARA:(\d+)\]\]")
+_MARKER_STRIP = re.compile(r"\[\[PAGE:\d+\]\]|\[\[PARA:\d+\]\]")
 
 
 def _record_dead_letter(job_id, attempt: int, error: str) -> None:
@@ -452,9 +462,59 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
 
         # PDF runs the async path (body + vision-transcribed tables via the PDF tools);
         # every other extension goes through the sync ``extract_text`` dispatch.
-        text = await extract_document_text(data, asset.name, ctx["llm"])
+        #
+        # When the document embeds images (PDF/DOCX), each image is persisted as a
+        # cloud-drive asset (source-bound to this PDF/DOCX, deduped on re-ingest) and the
+        # extracted text is chunked with page/paragraph markers so every chunk's ``meta``
+        # carries the image_ids of the pages it covers — the agent then sees those ids in
+        # ``rag_search`` results and reads them with the ``vision`` tool.
         await assets.set_status(asset_id, rag_status="CHUNKING")
-        chunks = await build_chunks(text, cfg, doc_title=asset.name, llm=ctx["llm"])
+        scans = await asyncio.to_thread(scan_embedded_images, data, asset.name)
+        if scans:
+            drive = DriveService(ctx["session_factory"])
+            page_images = await save_images(
+                scans, asset.name, asset.user_id, asset.workspace_id, asset.id, drive
+            )
+            text = await extract_document_text(
+                data, asset.name, ctx["llm"], page_markers=True
+            )
+
+            state = {"page": None, "para": None}  # running anchor for markerless middle blocks
+
+            def on_split(chunks):
+                for c in chunks:
+                    pages = [int(m) for m in _PAGE_MARKER.findall(c.content_en)]
+                    paras = [int(m) for m in _PARA_MARKER.findall(c.content_en)]
+                    c.content_en = _MARKER_STRIP.sub("", c.content_en)
+                    if pages:  # union: [running page] ∪ every page marker inside the chunk
+                        cover = sorted(set(([state["page"]] if state["page"] else []) + pages))
+                        state["page"] = pages[-1]
+                        meta_key = "pages"
+                    elif paras:
+                        cover = sorted(set(([state["para"]] if state["para"] else []) + paras))
+                        state["para"] = paras[-1]
+                        meta_key = "paras"
+                    elif state["page"] is not None:  # no marker → still on the running page
+                        cover, meta_key = [state["page"]], "pages"
+                    elif state["para"] is not None:
+                        cover, meta_key = [state["para"]], "paras"
+                    else:
+                        cover, meta_key = [], "pages"
+                    if cover:
+                        c.meta[meta_key] = cover
+                        ids: list[str] = []
+                        for anchor in cover:  # deduped union across every covered page/para
+                            for i in page_images.get(anchor, []):
+                                if i not in ids:
+                                    ids.append(i)
+                        c.meta["image_ids"] = ids
+
+            chunks = await build_chunks(
+                text, cfg, doc_title=asset.name, llm=ctx["llm"], on_split=on_split
+            )
+        else:
+            text = await extract_document_text(data, asset.name, ctx["llm"])
+            chunks = await build_chunks(text, cfg, doc_title=asset.name, llm=ctx["llm"])
 
         await assets.set_status(asset_id, rag_status="EMBEDDING")
         # Drop previous chunks up front, then embed + insert incrementally per batch so a
@@ -752,6 +812,23 @@ def _pair_covered_ids(pair: dict, messages) -> list[str]:
     return cov
 
 
+def _pair_image_ids(pair: dict, messages) -> list[str]:
+    """Cloud-drive screenshot assets owned by the user messages a Q&A entry covers.
+
+    A chat Q&A imported into RAG keeps the screenshots it was built around: the asset ids go
+    into the chunk's ``meta.image_ids`` so retrieval returns them for the vision tool, and the
+    covered messages' ``imported_rag`` flag is what gates the session/message delete cascade
+    from removing them.
+    """
+    ids: list[str] = []
+    for i in pair.get("indices") or []:
+        if i < len(messages) and messages[i].role == "user":
+            aid = messages[i].attach_asset_id
+            if aid is not None and str(aid) not in ids:
+                ids.append(str(aid))
+    return ids
+
+
 def _pair_spans(pairs: list[dict], messages) -> list[tuple[int, int]]:
     """Transcript ``[start, end)`` index spans each Q&A entry covers.
 
@@ -842,11 +919,13 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
 
         total = 0
         flag_ids: set[str] = set()
+        rag_image_ids: set[str] = set()  # screenshot assets that just joined the repo
         chunks_repo = SqlChunkRepository(ctx["session_factory"])
         for pair, (start, end) in zip(pairs, spans):
             if _span_imported(messages, (start, end), flagged):
                 continue  # already in the repo — never re-embed
             covered = _pair_covered_ids(pair, messages)
+            image_ids = _pair_image_ids(pair, messages)
             key = covered[0] if covered else f"{session_id}:{start}"
             text = f"{pair['question']}\n\n{pair['answer']}"
             title = pair["question"].strip()[:60] or f"Chat Q{start + 1}"
@@ -859,6 +938,11 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
                     "session_id": str(session_id),
                     "covered": covered,
                 }
+                # A Q&A entry that covers a message owning a screenshot keeps that image: it
+                # rides the chunk meta so retrieval returns it for the vision tool, and the
+                # imported_rag flags gate the delete cascade from removing it later.
+                if image_ids:
+                    c.meta["image_ids"] = image_ids
             # Idempotent: replace any chunk already keyed by this question (e.g. a prior
             # single-pair import, or a re-import after the answer was regenerated).
             await chunks_repo.delete_by_source("chat", [key])
@@ -873,6 +957,7 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
             for j in range(start, end):
                 if messages[j].role in ("user", "assistant"):
                     flag_ids.add(str(messages[j].id))
+            rag_image_ids.update(image_ids)
 
         if flag_ids:
             async with ctx["session_factory"]() as session:
@@ -882,6 +967,18 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
                     .values(imported_rag=True)
                 )
                 await session.commit()
+
+        # Newly imported Q&A pairs keep their screenshots out of the temporary chat/temp
+        # folder: move each to RAG/images so a user emptying chat/temp never deletes an image
+        # the corpus still references. Best-effort — a stale/trashed asset must not fail
+        # the import. The imported_rag delete-gate is the second line of defence.
+        if rag_image_ids:
+            drive = DriveService(ctx["session_factory"])
+            for aid in rag_image_ids:
+                try:
+                    await drive.move_file(user_id, UUID(aid), None, "RAG/images")
+                except DriveError:
+                    pass
 
         await bump_corpus_version(ctx["redis"])  # corpus changed → drop stale query-cache hits
         return {"chunks": total, "groups": len(pairs)}

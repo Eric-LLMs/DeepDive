@@ -24,7 +24,13 @@ from sqlalchemy import or_, select
 logger = logging.getLogger(__name__)
 
 from core.config import settings
-from core.infrastructure.db import MessageModel, SessionEventModel, SessionModel, UserModel
+from core.infrastructure.db import (
+    AssetModel,
+    MessageModel,
+    SessionEventModel,
+    SessionModel,
+    UserModel,
+)
 from core.infrastructure.vector import TEIEmbedder
 
 
@@ -36,12 +42,16 @@ class SessionMemoryStore:
         llm,
         session_id: UUID,
         user_id: UUID,
+        attach_asset_id: UUID | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.embedder = embedder
         self.llm = llm
         self.session_id = session_id
         self.user_id = user_id
+        # Cloud-drive asset the current turn's user message OWNS (📷 screenshot). None for
+        # referential attaches. Written to MessageModel.attach_asset_id on append_message.
+        self._attach_asset_id = attach_asset_id
         self._events: list[tuple[str, dict]] = []
 
     def record_event(self, type_: str, payload: dict) -> None:
@@ -49,11 +59,22 @@ class SessionMemoryStore:
         self._events.append((type_, payload or {}))
 
     async def append_message(self, role: str, text: str) -> None:
-        """Persist one message (text only; embedding is backfilled on close)."""
+        """Persist one message (text only; embedding is backfilled on close).
+
+        The user message of a turn records ``attach_asset_id`` — the cloud-drive asset the
+        message OWNS (a 📷 chat screenshot). It is written only for ``role == "user"`` and
+        only when the store was built with a value, so assistant/tool messages and
+        referential attaches never populate it. Deleting the message/session later cascades a
+        soft-delete of that asset (folder-agnostic).
+        """
         async with self.session_factory() as session:
             session.add(
                 MessageModel(
-                    user_id=self.user_id, session_id=self.session_id, role=role, text=text
+                    user_id=self.user_id,
+                    session_id=self.session_id,
+                    role=role,
+                    text=text,
+                    attach_asset_id=self._attach_asset_id if role == "user" else None,
                 )
             )
             await session.commit()
@@ -382,8 +403,10 @@ async def load_session_detail(session_factory, session_id: UUID) -> dict:
 
     Messages carry their ``id`` so the client can delete a single message, plus the
     per-message ``imported_rag`` flag so the "✓ Imported" button state comes straight from
-    the row instead of a separate coverage query. The shape of :func:`load_session_messages`
-    (used by the agent kernel) is intentionally untouched.
+    the row instead of a separate coverage query. A user message that created a chat
+    attachment carries ``attach`` (``{asset_id, name, mime}``) so the client can render the
+    image/file inline in the bubble. The shape of :func:`load_session_messages` (used by the
+    agent kernel) is intentionally untouched.
     """
     async with session_factory() as session:
         sess = (
@@ -391,11 +414,12 @@ async def load_session_detail(session_factory, session_id: UUID) -> dict:
         ).scalar_one_or_none()
         rows = (
             await session.execute(
-                select(MessageModel)
+                select(MessageModel, AssetModel)
+                .outerjoin(AssetModel, AssetModel.id == MessageModel.attach_asset_id)
                 .where(MessageModel.session_id == session_id)
                 .order_by(MessageModel.created_at)
             )
-        ).scalars().all()
+        ).all()
         return {
             "title": sess.title if sess is not None else None,
             "messages": [
@@ -405,8 +429,17 @@ async def load_session_detail(session_factory, session_id: UUID) -> dict:
                     "content": m.text,
                     "imported_rag": m.imported_rag,
                     "created_at": m.created_at.isoformat() if m.created_at else None,
+                    "attach": (
+                        {
+                            "asset_id": str(asset.id),
+                            "name": asset.name,
+                            "mime": asset.mime_type,
+                        }
+                        if asset is not None
+                        else None
+                    ),
                 }
-                for m in rows
+                for m, asset in rows
             ],
         }
 

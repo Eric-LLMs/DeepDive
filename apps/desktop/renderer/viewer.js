@@ -7,6 +7,10 @@ const Viewer = (() => {
   // receives "file" (attach the currently-open file) or "screenshot" (capture the window).
   let attachHandler = null;
   function setAttachHandler(fn) { attachHandler = fn; }
+  // app.js registers this so the subtitle overlay's copy button can drop the caption
+  // text straight into the chat input.
+  let subtitleCopyHandler = null;
+  function setSubtitleCopyHandler(fn) { subtitleCopyHandler = fn; }
 
   const VIDEO_EXT = new Set(["mp4", "webm", "mov", "m4v"]);
   const AUDIO_EXT = new Set(["mp3", "wav", "m4a", "flac", "ogg"]);
@@ -334,7 +338,8 @@ const Viewer = (() => {
   // at parse time, so only the plain caption text is ever displayed.
   function setSubtitleText(overlay, text) {
     overlay._text = text || "";
-    overlay.textContent = overlay._text;
+    if (overlay._textEl) overlay._textEl.textContent = overlay._text;
+    if (overlay._copyBtn) overlay._copyBtn.style.display = overlay._text ? "" : "none";
     overlay.style.display = subStyle.enabled && overlay._text ? "" : "none";
   }
 
@@ -453,6 +458,17 @@ const Viewer = (() => {
     video.src = localUrl(filePath);
     const overlay = document.createElement("div");
     overlay.className = "subtitle-overlay";
+    const textEl = document.createElement("span");
+    textEl.className = "subtitle-text";
+    overlay._textEl = textEl;
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "subtitle-copy";
+    copyBtn.textContent = "📋";
+    copyBtn.title = "Copy subtitle to chat input";
+    copyBtn.style.display = "none";
+    overlay._copyBtn = copyBtn;
+    copyBtn.onclick = () => { if (overlay._text && subtitleCopyHandler) subtitleCopyHandler(overlay._text); };
+    overlay.append(textEl, copyBtn);
     applySubtitleStyle(overlay);
     overlay.style.display = "none";
     wrap.appendChild(video);
@@ -1594,5 +1610,5 @@ const Viewer = (() => {
     return state.path != null && state.kind !== "folder";
   }
 
-  return { render, renderFolder, kindFor, localUrl, toast, close, setAttachHandler, isOpen };
+  return { render, renderFolder, kindFor, localUrl, toast, close, setAttachHandler, setSubtitleCopyHandler, isOpen };
 })();

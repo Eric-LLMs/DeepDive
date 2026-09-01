@@ -67,8 +67,12 @@ def _decode(content: bytes) -> str:
         return content.decode("latin-1")
 
 
-def extract_text(content: bytes, name: str) -> str:
-    """Return searchable plain text for a file's bytes, dispatching on extension."""
+def extract_text(content: bytes, name: str, *, para_markers: bool = False) -> str:
+    """Return searchable plain text for a file's bytes, dispatching on extension.
+
+    ``para_markers=True`` emits a ``[[PARA:n]]`` sentinel before each DOCX body paragraph so
+    RAG chunks can be attributed to the paragraph they cover (see ``build_chunks(on_split=)``).
+    """
     ext = Path(name).suffix.lower()
     text = _decode(content)
     if ext == ".vtt":
@@ -80,20 +84,29 @@ def extract_text(content: bytes, name: str) -> str:
     elif ext in _TEXT_EXTS:
         return text
     elif ext == ".docx":
-        return _extract_docx(content)
+        return _extract_docx(content, para_markers=para_markers)
     else:
         raise UnsupportedFileType(f"no text extractor for '{ext or name}'")
     return "\n".join(c.text for c in cues if c.text)
 
 
-def _extract_docx(content: bytes) -> str:
-    """Extract paragraphs + table cells from a .docx (``python-docx``)."""
+def _extract_docx(content: bytes, *, para_markers: bool = False) -> str:
+    """Extract paragraphs + table cells from a .docx (``python-docx``).
+
+    With ``para_markers`` every body paragraph (including empty ones — the marker keeps the
+    index aligned with the image scan, which walks ``document.paragraphs`` identically) is
+    prefixed with ``[[PARA:n]]``. Images in headers/footers/text boxes/table cells are out of
+    scope for extraction and for the image scan.
+    """
     import io
 
     import docx as docx_lib
 
     doc = docx_lib.Document(io.BytesIO(content))
-    parts = [p.text for p in doc.paragraphs]
+    if para_markers:
+        parts = [f"[[PARA:{i}]]\n{p.text}" for i, p in enumerate(doc.paragraphs)]
+    else:
+        parts = [p.text for p in doc.paragraphs]
     for table in doc.tables:
         for row in table.rows:
             cells = [c.text for c in row.cells]
@@ -101,21 +114,28 @@ def _extract_docx(content: bytes) -> str:
     return "\n".join(p for p in parts if p)
 
 
-async def extract_document_text(content: bytes, name: str, llm=None) -> str:
+async def extract_document_text(
+    content: bytes, name: str, llm=None, *, page_markers: bool = False
+) -> str:
     """Async dispatch for the ingest worker: PDF (body + vision tables) vs plain extract.
 
     PDF extraction needs the async LLM (table images → text), so it cannot live in the
     sync ``extract_text``; every other extension delegates there unchanged. Control
     characters are stripped on the way out so a NUL from a broken PDF font cannot fail the
     downstream chunk insert.
+
+    ``page_markers`` enables image attribution sentinels: PDF gets ``[[PAGE:n]]`` per page
+    (threaded into :func:`extract_pdf_document`), DOCX gets ``[[PARA:n]]`` per paragraph
+    (threaded into :func:`extract_text`). Both are stripped by ``build_chunks(on_split=...)``
+    before a chunk is stored, so callers that keep the default (False) are unchanged.
     """
     ext = Path(name).suffix.lower()
     if ext == ".pdf":
         from core.infrastructure.pdf import extract_pdf_document
 
-        text = await extract_pdf_document(content, llm)
+        text = await extract_pdf_document(content, llm, page_markers=page_markers)
     else:
-        text = extract_text(content, name)
+        text = extract_text(content, name, para_markers=page_markers)
     return _strip_control_chars(text)
 
 
@@ -256,13 +276,21 @@ def _merge_units(units: list[str], chunk_chars: int, overlap: int, separator: st
     return chunks
 
 
-async def build_chunks(text: str, config, *, doc_title: str, llm) -> list[Chunk]:
+async def build_chunks(
+    text: str, config, *, doc_title: str, llm, on_split=None
+) -> list[Chunk]:
     """Prepare RAG chunks from raw text under a runtime pipeline config.
 
     Composes the chosen chunking strategy with the P1/P2 enrichments:
     parent/child hierarchy → Anthropic-style context prefixes → CJK ``content_search``.
     ``config`` is a :class:`RagPipelineConfig` (duck-typed so this module does not import
     the rag package at module scope).
+
+    ``on_split``, when given, is called immediately after the raw split (before the
+    contextualize / CJK enrichments) with the just-produced chunks. The RAG-image worker
+    uses it to strip ``[[PAGE:n]]`` / ``[[PARA:n]]`` markers, record ``meta["pages"]`` /
+    ``meta["paras"]``, and attach ``meta["image_ids"]`` — stripping here keeps the marker
+    sentinels out of ``meta["raw"]``, ``content_en`` and the CJK ``content_search`` index.
     """
     from rag.query.cjk import segment  # lazy: rag is a sibling package
 
@@ -276,6 +304,8 @@ async def build_chunks(text: str, config, *, doc_title: str, llm) -> list[Chunk]
                 text, chunking.chunk_chars, chunking.overlap, chunking.strategy
             )
         ]
+    if on_split is not None:
+        on_split(chunks)
     if config.contextual:
         chunks = await contextualize_chunks(chunks, doc_title, llm)
     if config.cjk:

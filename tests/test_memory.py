@@ -105,6 +105,9 @@ class _DetailResult:
     def scalars(self):
         return _DetailScalars(self._value)
 
+    def all(self):
+        return self._value
+
 
 class _DetailScalars:
     def __init__(self, rows):
@@ -131,14 +134,22 @@ class _DetailSession:
 async def test_load_session_detail_carries_imported_rag_flag():
     mid1, mid2 = uuid.uuid4(), uuid.uuid4()
     sess = SimpleNamespace(title="Chat", imported_rag=None)  # title read only
+    # (message, asset) rows: the join resolves the attachment asset; messages without an
+    # attach_asset_id come back with a NULL asset.
     msgs = [
-        SimpleNamespace(
-            id=mid1, role="user", text="Q", imported_rag=True,
-            created_at=SimpleNamespace(isoformat=lambda: "2026-08-28T10:00:00+00:00"),
+        (
+            SimpleNamespace(
+                id=mid1, role="user", text="Q", imported_rag=True,
+                created_at=SimpleNamespace(isoformat=lambda: "2026-08-28T10:00:00+00:00"),
+            ),
+            None,
         ),
-        SimpleNamespace(
-            id=mid2, role="assistant", text="A", imported_rag=False,
-            created_at=SimpleNamespace(isoformat=lambda: "2026-08-28T10:00:01+00:00"),
+        (
+            SimpleNamespace(
+                id=mid2, role="assistant", text="A", imported_rag=False,
+                created_at=SimpleNamespace(isoformat=lambda: "2026-08-28T10:00:01+00:00"),
+            ),
+            None,
         ),
     ]
     detail = await load_session_detail(lambda: _DetailSession(sess, msgs), uuid.uuid4())
@@ -146,3 +157,4 @@ async def test_load_session_detail_carries_imported_rag_flag():
     assert detail["messages"][0]["imported_rag"] is True
     assert detail["messages"][1]["imported_rag"] is False
     assert detail["messages"][0]["id"] == str(mid1)
+    assert detail["messages"][0]["attach"] is None  # no attachment on these messages

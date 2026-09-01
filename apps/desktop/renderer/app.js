@@ -1029,7 +1029,12 @@
   // additionally get an edit button (edit + regenerate); assistant bubbles don't —
   // regenerating an assistant message isn't supported by the API, only editing a user
   // question is.
-  function appendMessage(id, role, text) {
+  //
+  // ``attach`` (optional) is ``{asset_id, name, mime}`` for the cloud-drive asset a user
+  // message created (a 📷 screenshot or an attached file). When present, the media is
+  // rendered inside the bubble above the text — images show as an inline thumbnail, other
+  // files as a chip — mirroring how Gemini/ChatGPT display sent images.
+  function appendMessage(id, role, text, attach) {
     if (role !== "user" && role !== "assistant") return appendMsg(role, text);
     const div = document.createElement("div");
     div.className = `msg ${role}`;
@@ -1037,7 +1042,11 @@
     div.dataset.raw = text; // markdown source, kept for edit + copy of raw text
     const bubble = document.createElement("div");
     bubble.className = "msg-bubble";
-    bubble.innerHTML = renderMarkdown(text);
+    const media = attach && attach.asset_id ? buildAttachMedia(attach) : null;
+    if (media) bubble.appendChild(media);
+    const body = document.createElement("div");
+    body.innerHTML = renderMarkdown(text);
+    bubble.appendChild(body);
     div.appendChild(bubble);
     // Append to the log BEFORE building the action row: buildMsgActions binds an
     // assistant reply to the question above it via previousElementSibling, which only
@@ -1047,6 +1056,48 @@
     div.appendChild(buildMsgActions(div, role, () => text));
     chatLog.scrollTop = chatLog.scrollHeight;
     return div;
+  }
+
+  // Build the inline media element for a message attachment. Images are fetched from the
+  // cloud drive and shown as a bounded thumbnail; anything else (or an unreadable/expired
+  // asset) falls back to a plain file chip. The blob URL is released when the element leaves
+  // the DOM to avoid leaking object URLs on long chats.
+  function buildAttachMedia(attach) {
+    const wrap = document.createElement("div");
+    wrap.className = "msg-attach";
+    const name = attach.name || "attachment";
+    const mime = (attach.mime || "").toLowerCase();
+    const looksImage = mime.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name);
+    const chip = () => {
+      wrap.innerHTML = "";
+      const c = document.createElement("span");
+      c.className = "msg-attach-chip";
+      c.textContent = `📎 ${name}`;
+      wrap.appendChild(c);
+    };
+    if (!looksImage) { chip(); return wrap; }
+    const img = document.createElement("img");
+    img.className = "msg-attach-img";
+    img.alt = name;
+    fetch(`/api/files/${attach.asset_id}/download`, { headers: authHeaders() })
+      .then((r) => {
+        if (!r.ok) throw new Error(String(r.status));
+        const ct = (r.headers.get("Content-Type") || "").toLowerCase();
+        // A generic octet-stream (assets stored without a mime_type, e.g. older screenshots)
+        // is fine — trust the name-based looksImage. Only an explicitly non-image type (say
+        // a text error page) downgrades to the chip.
+        if (ct && !ct.startsWith("image/") && ct !== "application/octet-stream") { chip(); return null; }
+        return r.blob();
+      })
+      .then((blob) => {
+        if (!blob) return;
+        img.src = URL.createObjectURL(blob);
+        const release = () => { if (img.src) URL.revokeObjectURL(img.src); };
+        img.addEventListener("load", release, { once: true });
+      })
+      .catch(() => chip());
+    wrap.appendChild(img);
+    return wrap;
   }
 
   // Streaming assistant message: same DOM as appendMessage, but the copy/speak buttons close
@@ -1395,11 +1446,14 @@
       cur = cur.nextElementSibling;
     }
     let failed = false;
+    // delete_assets=0: this edit-and-regenerate flow removes the old question (and everything
+    // after it) then re-sends it — the screenshot the question was built around must NOT be
+    // deleted with it. The explicit multi-select delete keeps the default cascade.
     for (const el of toRemove) {
       const id = el.dataset.id;
       if (!state.sessionId || !id) continue;
       try {
-        const res = await fetch(`/api/sessions/${state.sessionId}/messages/${id}`, {
+        const res = await fetch(`/api/sessions/${state.sessionId}/messages/${id}?delete_assets=0`, {
           method: "DELETE",
           headers: authHeaders(),
         });
@@ -1423,7 +1477,10 @@
   }
 
   async function sendChat(message) {
-    const userMsgEl = appendMessage(null, "user", message);
+    // Render the user message with the staged attachment (if any) so the image/file shows
+    // inline immediately; the pendingAttach payload is consumed below for the request.
+    const pending = pendingAttach;
+    const userMsgEl = appendMessage(null, "user", message, pending);
     const hadSession = !!state.sessionId;
     chatSend.disabled = true;
     const payload = { message, session_id: state.sessionId ?? undefined };
@@ -3492,14 +3549,31 @@
     return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
+  // Map a file extension to its MIME type so uploads store a real type instead of NULL —
+  // the download endpoint falls back to application/octet-stream on NULL, which the chat
+  // attachment renderer would otherwise reject as "not an image" and downgrade to a chip.
+  function mimeForName(name) {
+    const ext = String(name || "").split(".").pop().toLowerCase();
+    const map = {
+      png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+      webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
+      pdf: "application/pdf", txt: "text/plain", md: "text/markdown",
+      mp4: "video/mp4", webm: "video/webm", mp3: "audio/mpeg", wav: "audio/wav",
+    };
+    return map[ext] || null;
+  }
+
   // Upload raw bytes into the cloud drive (the same init → chunked PUT → complete flow the
   // cloud panel uses) and return the created file row { id, name }.
-  async function uploadBytesToCloud(bytes, name) {
+  async function uploadBytesToCloud(bytes, name, folder_path = null, mime_type = null) {
     const hex = await sha256Hex(bytes);
     const init = await fetch("/api/files/init-upload", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ sha256: hex, size: bytes.length, name, folder_path: null, mime_type: null }),
+      body: JSON.stringify({
+        sha256: hex, size: bytes.length, name, folder_path,
+        mime_type: mime_type ?? mimeForName(name),
+      }),
     });
     if (init.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
     if (!init.ok) throw new Error(`Upload init failed (${init.status})`);
@@ -3526,8 +3600,110 @@
     return created;
   }
 
+  // Frozen-window region selection: show the captured frame fitted (centered, aspect kept) in
+  // the window, let the user drag a rectangle over it, and crop that region from the original
+  // data URL via canvas. Double-click selects the whole frame; Esc (or a click without a drag)
+  // cancels and returns null. This lets a screenshot target just the video playback area
+  // instead of grabbing the entire window / desktop.
+  function selectRegionFromImage(imageUrl) {
+    return new Promise((resolve) => {
+      const overlay = document.createElement("div");
+      overlay.className = "snip-overlay";
+      const img = document.createElement("img");
+      img.className = "snip-bg";
+      img.src = imageUrl;
+      const box = document.createElement("div");
+      box.className = "snip-box";
+      const hint = document.createElement("div");
+      hint.className = "snip-hint";
+      hint.textContent = "Drag to select the region · double-click = whole frame · Esc = cancel";
+      overlay.appendChild(img);
+      overlay.appendChild(box);
+      overlay.appendChild(hint);
+      document.body.appendChild(overlay);
+
+      // Fit the frame into the window while preserving aspect ratio; the element box then
+      // matches the visible image so selection coordinates are exact (no object-fit letterbox).
+      const fit = () => {
+        const iw = img.naturalWidth, ih = img.naturalHeight;
+        if (!iw || !ih) return;
+        const s = Math.min(window.innerWidth / iw, window.innerHeight / ih);
+        img.style.width = Math.round(iw * s) + "px";
+        img.style.height = Math.round(ih * s) + "px";
+      };
+      img.addEventListener("load", fit);
+
+      let start = null;
+      let done = false;
+      const cleanup = () => {
+        overlay.removeEventListener("mousedown", onDown);
+        overlay.removeEventListener("dblclick", onDbl);
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        window.removeEventListener("keydown", onKey);
+        overlay.remove();
+      };
+      const finish = (dataUrl) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve(dataUrl);
+      };
+      const rel = (e) => {
+        const r = img.getBoundingClientRect();
+        return { x: e.clientX - r.left, y: e.clientY - r.top };
+      };
+      const onDown = (e) => {
+        if (e.button !== 0) return;
+        const p = rel(e);
+        start = p;
+        box.style.left = p.x + "px";
+        box.style.top = p.y + "px";
+        box.style.width = "0px";
+        box.style.height = "0px";
+        e.preventDefault();
+      };
+      const onMove = (e) => {
+        if (!start) return;
+        const p = rel(e);
+        box.style.left = Math.min(start.x, p.x) + "px";
+        box.style.top = Math.min(start.y, p.y) + "px";
+        box.style.width = Math.abs(p.x - start.x) + "px";
+        box.style.height = Math.abs(p.y - start.y) + "px";
+      };
+      const onUp = (e) => {
+        if (!start) return;
+        const p = rel(e);
+        const r = img.getBoundingClientRect();
+        const x0 = Math.max(0, Math.min(start.x, p.x));
+        const y0 = Math.max(0, Math.min(start.y, p.y));
+        const w = Math.min(Math.abs(p.x - start.x), r.width - x0);
+        const h = Math.min(Math.abs(p.y - start.y), r.height - y0);
+        start = null;
+        if (w < 4 || h < 4) { finish(null); return; } // a plain click cancels the attach
+        const sx = img.naturalWidth / r.width;
+        const sy = img.naturalHeight / r.height;
+        const cw = Math.round(w * sx), ch = Math.round(h * sy);
+        const canvas = document.createElement("canvas");
+        canvas.width = cw;
+        canvas.height = ch;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, x0 * sx, y0 * sy, cw, ch, 0, 0, cw, ch);
+        finish(canvas.toDataURL("image/png"));
+      };
+      const onDbl = () => finish(img.src);
+      const onKey = (e) => { if (e.key === "Escape") finish(null); };
+
+      overlay.addEventListener("mousedown", onDown);
+      overlay.addEventListener("dblclick", onDbl);
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      window.addEventListener("keydown", onKey);
+    });
+  }
+
   // The attach action shared by the viewer toolbar (🔗 / 📷) and the chat 📎 button.
-  // mode: "file" (attach the currently-open file) | "screenshot" (window capture).
+  // mode: "file" (attach the currently-open file) | "screenshot" (region selection).
   async function attachCurrent(mode, file) {
     if (!state.token) {
       appendMsg("error", "Sign in to attach files to the chat.");
@@ -3539,11 +3715,22 @@
       if (mode === "screenshot") {
         const shot = await window.desktopAPI.captureWindow();
         if (!shot || !shot.ok) { appendMsg("error", (shot && shot.error) || "Screenshot failed."); return; }
-        const b64 = String(shot.data).replace(/^data:image\/png;base64,/, "");
+        // Let the user pick the region (e.g. just the video playback area) instead of the
+        // whole window; cancel (Esc / click-without-drag) aborts the attach.
+        const region = await selectRegionFromImage(shot.data);
+        if (!region) return;
+        const b64 = region.replace(/^data:image\/png;base64,/, "");
         const bin = atob(b64);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        created = await uploadBytesToCloud(bytes, `screenshot_${Date.now()}.png`);
+        created = await uploadBytesToCloud(bytes, `screenshot_${Date.now()}.png`, "chat/temp", "image/png");
+        // A screenshot is staged as a pending attachment and rides on the NEXT message the
+        // user actively sends — never auto-sent. ``owned`` marks the asset as created FOR
+        // this message: the server records it on the message so deleting the message/session
+        // cleans it up (folder-agnostic). The "chat/temp" folder is UI organization only —
+        // the delete decision keys off the owned link.
+        setPendingAttach({ kind: "asset", asset_id: created.id, name: created.name, owned: true });
+        return;
       } else {
         // A cloud asset opened in the viewer attaches directly by id; a local file is
         // uploaded to the cloud drive first (the agent works on drive assets).
@@ -3565,6 +3752,15 @@
   }
 
   Viewer.setAttachHandler(attachCurrent);
+
+  // The subtitle overlay's 📋 button drops the caption text into the chat input, ready
+  // to edit or send — a quick way to ask the agent about a specific subtitle line.
+  Viewer.setSubtitleCopyHandler((text) => {
+    if (!text) return;
+    chatInput.value = text;
+    chatInput.focus();
+    chatInput.scrollTop = chatInput.scrollHeight;
+  });
 
   // The chat input ＋ button: open an OS file picker, upload the chosen file to the
   // cloud drive, and stage it as the pending attachment (rides on the next send).
@@ -3952,7 +4148,7 @@
       chatLog.innerHTML = "";
       for (const m of data.messages) {
         if (m.role === "tool") continue;
-        appendMessage(m.id, m.role === "assistant" ? "assistant" : "user", m.content);
+        appendMessage(m.id, m.role === "assistant" ? "assistant" : "user", m.content, m.attach);
       }
       chatTitle.textContent = data.title || (data.messages[0] ? data.messages[0].content.slice(0, 30) : "Chat");
       // Reconciliation: the buttons were rendered from state above, but re-apply so a

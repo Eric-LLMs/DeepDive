@@ -220,11 +220,12 @@ def test_segment_chat_degrades_to_default_grouping_on_llm_failure():
 
 # ── chat_session_import: incremental, flag-driven (no delete-and-rebuild) ──
 class _Msg:
-    def __init__(self, id, role, text, imported_rag=False):
+    def __init__(self, id, role, text, imported_rag=False, attach_asset_id=None):
         self.id = id
         self.role = role
         self.text = text
         self.imported_rag = imported_rag
+        self.attach_asset_id = attach_asset_id
 
 
 class _RebuildResult:
@@ -538,7 +539,7 @@ def test_extract_document_text_routes_pdf_to_pdf_extractor(monkeypatch):
 
     calls = {}
 
-    async def fake_extract(content, llm):
+    async def fake_extract(content, llm, *, page_markers=False):
         calls["content"] = content
         calls["llm"] = llm
         return "pdf text"

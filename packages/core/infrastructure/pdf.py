@@ -23,10 +23,20 @@ log = logging.getLogger(__name__)
 MAX_TABLES = 20
 
 
-def extract_pdf_text(content: bytes) -> str:
-    """Return the plain-text body of a PDF, pages newline-joined."""
+def extract_pdf_text(content: bytes, *, page_markers: bool = False) -> str:
+    """Return the plain-text body of a PDF, pages newline-joined.
+
+    With ``page_markers=True`` each page is prefixed with a ``[[PAGE:n]]`` sentinel so the
+    RAG chunker can later map a chunk back to the page(s) it covers. Markers are stripped
+    before a chunk is stored (see ``build_chunks(on_split=...)``); the sentinel text is
+    unlikely to collide with real content and survives whitespace collapsing.
+    """
     doc = pymupdf.open(stream=content, filetype="pdf")
     try:
+        if page_markers:
+            return "".join(
+                f"\n[[PAGE:{i + 1}]]\n{doc[i].get_text('text')}" for i in range(doc.page_count)
+            )
         return "\n".join(doc[i].get_text("text") for i in range(doc.page_count))
     finally:
         doc.close()
@@ -83,10 +93,20 @@ async def pdf_table_to_text(png: bytes, llm, prompt: str | None = None) -> str:
 
 
 async def extract_pdf_document(
-    content: bytes, llm, *, max_concurrency: int = 4, max_tables: int = MAX_TABLES
+    content: bytes,
+    llm,
+    *,
+    max_concurrency: int = 4,
+    max_tables: int = MAX_TABLES,
+    page_markers: bool = False,
 ) -> str:
-    """Body text + transcribed tables, joined into one document text for chunking."""
-    body = extract_pdf_text(content)
+    """Body text + transcribed tables, joined into one document text for chunking.
+
+    With ``page_markers=True`` each page's text is preceded by a ``[[PAGE:n]]`` sentinel so
+    chunks can be attributed to the page(s) they cover (tables stay appended at the end
+    without a marker and fall back to the running page).
+    """
+    body = extract_pdf_text(content, page_markers=page_markers)
     tables = detect_tables(content, max_tables=max_tables)
     if not tables:
         return body

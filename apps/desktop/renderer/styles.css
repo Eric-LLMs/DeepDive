@@ -476,6 +476,21 @@ video, audio, img { max-width: 100%; max-height: 100%; outline: none; }
   pointer-events: none;
   z-index: 3;
 }
+.subtitle-text { pointer-events: none; }
+.subtitle-copy {
+  pointer-events: auto;
+  margin-left: 8px;
+  padding: 0 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  background: rgba(0,0,0,0.6);
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.35);
+  border-radius: 4px;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.subtitle-copy:hover { background: rgba(255,255,255,0.25); }
 
 .subtitle-controls {
   flex-shrink: 0;
@@ -815,6 +830,64 @@ pre.text-viewer {
 .msg.user .msg-bubble blockquote { border-left-color: rgba(255, 255, 255, 0.7); color: rgba(255, 255, 255, 0.9); }
 .msg.user .msg-bubble th, .msg.user .msg-bubble td { border-color: rgba(255, 255, 255, 0.45); }
 .msg.user .msg-bubble hr { border-top-color: rgba(255, 255, 255, 0.35); }
+/* Inline message attachments (📷 screenshots / attached files) rendered inside the bubble,
+   above the text — mirrors the image lists Gemini/ChatGPT show on sent messages. */
+.msg-attach { margin-bottom: 6px; }
+.msg-attach-img {
+  display: block;
+  max-width: 100%;
+  max-height: 260px;
+  border-radius: 8px;
+  object-fit: contain;
+  border: 1px solid var(--border);
+  background: var(--bg-soft-2);
+}
+.msg-attach-chip {
+  display: inline-block;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.18);
+}
+.msg.user .msg-attach-chip { background: rgba(255, 255, 255, 0.22); }
+
+/* Screenshot region-selection overlay: frozen frame + drag-to-select box. The overlay
+   dims the window, the frame sits centered at full opacity, the box marks the selection. */
+.snip-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 1000;
+  cursor: crosshair;
+  user-select: none;
+}
+.snip-bg {
+  border-radius: 4px;
+  box-shadow: 0 0 40px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+.snip-box {
+  position: absolute;
+  border: 1.5px solid var(--accent, #4a9eff);
+  background: rgba(74, 158, 255, 0.12);
+  pointer-events: none;
+}
+.snip-hint {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  pointer-events: none;
+  white-space: nowrap;
+}
 /* Inline edit UI (✏️ on user messages): textarea + Send / Cancel. */
 .msg-editor { display: flex; flex-direction: column; gap: 6px; width: 100%; max-width: 100%; }
 .msg-edit-input {

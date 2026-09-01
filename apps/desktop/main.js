@@ -4,7 +4,7 @@
 // protocol, proxies /api to the FastAPI backend, and gives the renderer access to
 // local files through a `local://` protocol + a small IPC surface (folder pick,
 // file tree, open-with-OS-default, text read, screenshot save).
-const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, Menu, desktopCapturer, screen } = require("electron");
+const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, Menu, screen } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -682,21 +682,21 @@ function registerIpcHandlers() {
   });
 
   // Capture this app's own window as a PNG data URL, so the renderer can one-click attach
-  // a screenshot of the current main-window content to the chat. Returns
-  // { ok, data } | { ok: false, error }.
+  // a screenshot of the current main-window content (video player / document) to the chat.
+  // Returns { ok, data } | { ok: false, error }.
+  //
+  // We capture the window's own webContents directly instead of walking
+  // desktopCapturer.getSources({types:["window"]}). On Windows the desktopCapturer source
+  // id does NOT match BrowserWindow.id, so the old fallback picked sources[0] — whatever
+  // window the OS listed first (often the IDE/terminal), producing screenshots of the wrong
+  // window. capturePage() is unambiguous: it captures exactly what this app's window shows.
   ipcMain.handle("capture-window", async (event) => {
     try {
       const win = BrowserWindow.fromWebContents(event.sender);
-      const sources = await desktopCapturer.getSources({
-        types: ["window"],
-        thumbnailSize: { width: 1600, height: 1000 },
-      });
-      const id = win ? win.id.toString() : "";
-      const src = sources.find((s) => s.id === `window:${id}`) || sources[0];
-      if (!src || src.thumbnail.isEmpty()) {
-        return { ok: false, error: "capture returned no image" };
-      }
-      return { ok: true, data: src.thumbnail.toDataURL() };
+      if (!win || win.isDestroyed()) return { ok: false, error: "no window to capture" };
+      const image = await win.webContents.capturePage();
+      if (image.isEmpty()) return { ok: false, error: "capture returned no image" };
+      return { ok: true, data: image.toDataURL() };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err) };
     }

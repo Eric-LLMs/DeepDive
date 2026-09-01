@@ -117,6 +117,7 @@ class SqlAssetRepository:
         mime_type: str | None = None,
         size: int | None = None,
         object_sha256: str | None = None,
+        source_asset_id: UUID | None = None,
         file_status: str = "uploading",
         rag_status: str = "pending",
     ) -> AssetModel:
@@ -129,6 +130,7 @@ class SqlAssetRepository:
                 folder_path=folder_path,
                 mime_type=mime_type,
                 size=size,
+                source_asset_id=source_asset_id,
                 file_status=file_status,
                 rag_status=rag_status,
             )
@@ -199,6 +201,39 @@ class SqlAssetRepository:
                 )
             ).scalars().all()
             return list(rows)
+
+    async def list_by_source(
+        self, source_asset_id: UUID, *, include_deleted: bool = False
+    ) -> list[AssetModel]:
+        """Assets derived from ``source_asset_id`` (RAG image extractions of a PDF/DOCX).
+
+        ``include_deleted=False`` returns only live rows (used for soft-delete cascade);
+        ``True`` also returns trashed rows (used for hard-purge cascade so refcounts
+        decrement before the source row drops).
+        """
+        async with self.session_factory() as session:
+            conditions = [AssetModel.source_asset_id == source_asset_id]
+            if not include_deleted:
+                conditions.append(AssetModel.deleted_at.is_(None))
+            rows = (
+                await session.execute(select(AssetModel).where(*conditions))
+            ).scalars().all()
+            return list(rows)
+
+    async def get_by_source_content(
+        self, source_asset_id: UUID, object_sha256: str
+    ) -> AssetModel | None:
+        """Active derived asset matching (source, content hash) — re-ingest dedupe key."""
+        async with self.session_factory() as session:
+            return (
+                await session.execute(
+                    select(AssetModel).where(
+                        AssetModel.source_asset_id == source_asset_id,
+                        AssetModel.object_sha256 == object_sha256,
+                        AssetModel.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
 
     async def soft_delete(self, asset_id: UUID) -> AssetModel | None:
         async with self.session_factory() as session:
