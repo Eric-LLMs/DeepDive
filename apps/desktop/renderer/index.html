@@ -25,6 +25,7 @@
         <div id="sidebar-tabs">
           <button id="tab-files" class="active" type="button">Files</button>
           <button id="tab-sessions" type="button">Sessions</button>
+          <button id="tab-research" type="button" title="Research OS tasks">🔬 Research</button>
         </div>
         <div class="search-wrap">
           <input id="file-search" type="text" class="sidebar-search" placeholder="Search files…" autocomplete="off" />
@@ -58,6 +59,18 @@
           </div>
           <div id="sessions-list"></div>
         </div>
+        <div id="research" class="research hidden">
+          <div id="research-tasks" class="research-section research-tasks">
+            <div class="research-section-title">Tasks</div>
+            <div id="research-tasks-list"></div>
+          </div>
+          <div id="research-status" class="research-section research-status">
+            <div class="research-section-title">Status</div>
+            <div id="research-status-body" class="research-status-body">
+              <div class="research-status-empty">Select a task to see its progress.</div>
+            </div>
+          </div>
+        </div>
         <div id="sidebar-footer">
           <button id="user-menu-trigger" type="button" title="Account menu">
             <span id="user-avatar" class="user-avatar">👤</span>
@@ -74,14 +87,47 @@
           <div id="viewer-empty" class="empty">Select a file on the left to begin</div>
         </section>
 
+        <!-- Minimal guide shown while the Research sidebar tab is active (the console is a
+             read-only monitor; tasks are created and driven in the chat). -->
+        <section id="research-guide" class="research-guide hidden">
+          <div class="research-guide-card">
+            <h2 class="research-guide-title">Investigate questions with your AI agent</h2>
+            <p class="research-guide-sub">
+              Click <b>＋ Research</b> in the chat header to create a research task, or select a
+              task on the left to watch its progress. The agent drives each task through
+              <b>DISCOVER → … → PUBLISH</b> in the chat.
+            </p>
+          </div>
+        </section>
+
+        <!-- Selected task's working-directory view: the task's cloud folder (materials/,
+             outputs/, task_spec.json, session_history.json) with clickable files. Shown in
+             the main pane when a research task is selected; the guide card covers the empty
+             state. -->
+        <section id="research-task-view" class="research-task-view hidden"></section>
+
         <section id="chat">
           <div id="chat-resize"></div>
           <div id="chat-header">
-            <span id="chat-title">Chat</span>
-            <div class="chat-header-actions">
-              <button id="chat-hide" type="button" title="Hide chat (restore from the DeepDive logo)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
-              <button id="chat-float" type="button" title="Float the chat window"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
-              <button id="chat-dock" type="button" title="Move chat to the right column">Dock right</button>
+            <!-- Top bar: global controls only (session title, New chat / ＋ Research, window
+                 controls). The session title is hidden in Research mode — the sub bar below
+                 carries the full task context instead of a truncated title. -->
+            <div id="chat-topbar" class="chat-topbar">
+              <span id="chat-title">Chat</span>
+              <div class="chat-header-actions">
+                <button id="chat-new-chat" type="button" title="New chat — start a fresh session">＋ New chat</button>
+                <button id="chat-new-research" type="button" title="New Research — create a research task the agent drives in this chat">＋ Research</button>
+                <button id="chat-hide" type="button" title="Hide chat (restore from the DeepDive logo)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+                <button id="chat-float" type="button" title="Float the chat window"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
+                <button id="chat-dock" type="button" title="Move chat to the right column">Dock right</button>
+              </div>
+            </div>
+            <!-- Sub bar: current-session context, shown only while a Research task session is
+                 active — full task title + stage, full width so nothing truncates. Clicking it
+                 jumps to the task's working-directory view. -->
+            <div id="chat-research-bar" class="chat-research-bar hidden" title="Research task session — every message here drives this task">
+              <span class="crc-title"></span>
+              <span class="crc-stage hidden"></span>
             </div>
           </div>
           <div id="chat-toolbar" class="chat-toolbar" title="Generate from this conversation or workspace files">
@@ -89,6 +135,12 @@
             <button id="chat-gen-mindmap" type="button" class="chat-tool-btn" title="Generate a mind map from this conversation or workspace files">🧠 Mind Map</button>
             <button id="chat-gen-slides" type="button" class="chat-tool-btn" title="Generate slides from this conversation or workspace files">🎞 Slides</button>
             <button id="chat-gen-summary" type="button" class="chat-tool-btn" title="Generate a summary from this conversation or workspace files">📝 Summary</button>
+            <span id="chat-gen-more-wrap" class="tools-wrap">
+              <button id="chat-gen-more" type="button" class="chat-tool-btn" title="More generation tools (coming soon)">⋯</button>
+              <div id="chat-gen-more-menu" class="tools-menu hidden">
+                <button type="button" disabled title="More generation tools are on the way">More tools coming soon</button>
+              </div>
+            </span>
           </div>
           <div id="chat-log"></div>
           <form id="chat-form">
@@ -519,5 +571,6 @@
     <script src="viewer.js"></script>
     <script src="app.js"></script>
     <script src="clouddrive.js"></script>
+    <script src="research.js"></script>
   </body>
 </html>

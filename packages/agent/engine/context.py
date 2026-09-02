@@ -59,6 +59,13 @@ class AgentTurn:
     api_key: str | None = None
     turn_id: str = field(default_factory=lambda: str(uuid4()))
 
+    # ── structured handoff / context (sunk, not just prompt text) ──
+    # The API may attach machine-readable context to a turn (e.g. ``{"handoff": {...}}``
+    # when the client resumes a Research OS project). Tools read it at runtime via
+    # ``current_turn().context`` — it survives in the runtime even if the prose that
+    # prompted it is compacted or re-worded by the model.
+    context: dict | None = None
+
     # ── per-turn mutable state (moved off the singletons) ──
     recall_hits: list | None = None          # proactive memory recall, computed once per turn
     injected: list[tuple[str, str]] = field(default_factory=list)  # agent.inject() content

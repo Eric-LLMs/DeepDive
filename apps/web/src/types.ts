@@ -204,3 +204,60 @@ export interface InitUploadResult {
   num_chunks?: number;
   received?: number[];
 }
+
+// ── Research OS console (mirror the converged /research/tasks API) ──
+export type TaskStatus = "ACTIVE" | "COMPLETE" | "PUBLISHED";
+
+export interface ResearchTask {
+  task_id: string;
+  name: string;
+  owner_id: string;
+  stage: string;
+  status: TaskStatus;
+  gates: Record<string, string>;
+  session_id?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface GraphNode {
+  id: string;
+  type: string; // Source | Claim | Evidence | ...
+  label: string;
+  status?: string;
+  [k: string]: unknown;
+}
+
+export interface GraphEdge {
+  src: string;
+  dst: string;
+  kind: string;
+}
+
+export interface ResearchArtifact {
+  artifact_id: string;
+  task_id: string;
+  version: number;
+  status: string; // DRAFT | PROMOTED
+  drive_asset_id?: string | null;
+  drive_path?: string | null;
+  rag_status?: string | null;
+  updated_at?: string;
+}
+
+export interface ResearchTaskDetail extends ResearchTask {
+  description: string;
+  graph: { nodes: GraphNode[]; edges: GraphEdge[] };
+  nodes: Record<string, GraphNode[]>;
+  artifacts: ResearchArtifact[];
+  materials: string[];
+  outputs: string[];
+}
+
+export interface ResearchArtifactContent {
+  artifact_id: string;
+  task_id: string;
+  version: number;
+  status: string;
+  content: string;
+}

@@ -117,6 +117,12 @@ class ChatRequest(BaseModel):
     attach: dict | None = None       # optional: { kind: "asset", asset_id, name } — a cloud
                                      #   file the user wants the agent to troubleshoot; its
                                      #   name + asset_id are prefixed to the message context.
+    handoff: dict | None = None      # optional: machine-readable turn context (e.g. the
+                                     #   desktop "Resume Research in Chat" button resumes a
+                                     #   project with { kind: "research", project_id,
+                                     #   mode: "research_resume" }). Formatted into a
+                                     #   structured instruction prefix AND sunk into the
+                                     #   turn context so tools read it at runtime.
 
 
 class ApprovalResolveRequest(BaseModel):

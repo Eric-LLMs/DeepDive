@@ -27,21 +27,29 @@ Design notes (spike decisions, all auditable):
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+import shutil
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
+from agent.engine.context import current_turn
 from agent.engine.decisions import ToolExecution, text_block
 from agent.plugins.base import Plugin
 from agent.tools.definition import ToolOutput, define_tool
 from agent.tools.tool_permissions import ToolPermission
+from core.application.drive_service import DriveError
 from core.infrastructure.request_context import get_request_user_id
 
 # ── stage / gate vocabulary (frozen in docs/research/07 + 10) ─────────────────
+# INBOX is deliberately gone: a project/task is born in DISCOVER (no ghost intake
+# state). The agent drives DISCOVER -> ... -> PUBLISH through the six research tools.
 _STAGES = [
-    "INBOX",
     "DISCOVER",
     "FRAME",
     "EVIDENCE",
@@ -56,7 +64,6 @@ _STAGES = [
 
 # Legal transitions (spike subset of the 10-stage DAG).
 _LEGAL_NEXT: dict[str, str] = {
-    "INBOX": "DISCOVER",
     "DISCOVER": "FRAME",
     "FRAME": "EVIDENCE",
     "EVIDENCE": "DESIGN",
@@ -108,6 +115,13 @@ def _current_user() -> uuid.UUID:
     return user
 
 
+def _safe_filename(name: str) -> str:
+    """Strip path/control characters so a user-supplied asset name stays a single filename."""
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name or "file").strip()
+    cleaned = cleaned.rstrip(". ")
+    return (cleaned or "file")[:120]
+
+
 # ── ResearchService: spike-grade domain logic ─────────────────────────────────
 class ResearchService:
     """Thin, file-backed implementation of the six research tool actions.
@@ -123,8 +137,24 @@ class ResearchService:
         self.scratch_root = Path(scratch_root)
 
     # ── file helpers ──────────────────────────────────────────────────────
+    def _owner_root(self, owner_id: uuid.UUID) -> Path:
+        return self.scratch_root / str(owner_id)
+
+    def _resolve_owned_path(self, owner_id: uuid.UUID, *parts: str) -> Path:
+        """Join ``*parts`` under the owner's scratch root, rejecting any escape.
+
+        Every user-influenced segment (``project_id``, ``artifact_id``) is resolved
+        against the owner root: a ``..`` / absolute-path segment that lands outside
+        the owner directory is a ``ValueError`` (traversal denied).
+        """
+        root = self._owner_root(owner_id).resolve()
+        path = root.joinpath(*parts).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError("path escapes the owner's research scratch root")
+        return path
+
     def _project_dir(self, owner_id: uuid.UUID, project_id: str) -> Path:
-        return self.scratch_root / str(owner_id) / project_id
+        return self._resolve_owned_path(owner_id, project_id)
 
     @staticmethod
     def _load_json(path: Path, default: Any) -> Any:
@@ -161,7 +191,7 @@ class ResearchService:
         self._save_json(self._project_dir(owner_id, project_id) / "graph.json", graph)
 
     def _artifact_dir(self, owner_id: uuid.UUID, project_id: str, artifact_id: str) -> Path:
-        return self._project_dir(owner_id, project_id) / "artifacts" / artifact_id
+        return self._resolve_owned_path(owner_id, project_id, "artifacts", artifact_id)
 
     def _artifact(self, owner_id: uuid.UUID, project_id: str, artifact_id: str, version: int) -> dict:
         path = self._artifact_dir(owner_id, project_id, artifact_id) / f"v{version}"
@@ -197,7 +227,7 @@ class ResearchService:
             "name": name,
             "profile": profile,
             "status": "ACTIVE",
-            "stage": "INBOX",
+            "stage": "DISCOVER",
             "gates": {gate: "NOT_RUN" for gate in _GATES},
             "idempotency_key": idempotency_key,
             "created_at": _now_iso(),
@@ -209,7 +239,7 @@ class ResearchService:
             "project_id": project["id"],
             "name": name,
             "owner_id": str(owner_id),
-            "stage": "INBOX",
+            "stage": "DISCOVER",
             "status": "ACTIVE",
             "profile": profile,
             "idempotent": False,
@@ -218,7 +248,7 @@ class ResearchService:
     def _find_by_idempotency(
         self, owner_id: uuid.UUID, kind: str, idempotency_key: str
     ) -> dict | None:
-        owner_dir = self.scratch_root / str(owner_id)
+        owner_dir = self._owner_root(owner_id)
         if not owner_dir.is_dir():
             return None
         for project_dir in owner_dir.iterdir():
@@ -306,9 +336,14 @@ class ResearchService:
             "idempotency_key": idempotency_key,
             "generated_by_execution": generated_by_execution,
             "created_by": str(owner_id),
+            "cloud_output_asset_id": None,
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
+        # Project the draft into the task's cloud outputs/ (best-effort; scratch is the
+        # authority). The created cloud asset id is persisted with the record so a later
+        # version/promote updates it in place instead of exploding assets.
+        await self._mirror_output(owner_id, project, record, content)
         self._save_json(
             self._artifact_dir(owner_id, project_id, artifact_id) / "v1", record
         )
@@ -323,8 +358,26 @@ class ResearchService:
         }
 
     async def promote_to_drive(
-        self, owner_id: uuid.UUID, project_id: str, *, artifact_id: str
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        artifact_id: str,
+        promote_idempotency_key: str | None = None,
     ) -> dict:
+        """Promote the latest artifact version to the Drive + RAG queue.
+
+        Idempotent: a record already marked ``PROMOTED`` is returned as ``idempotent=True``
+        without touching the Drive. ``promote_idempotency_key`` is recorded for auditability
+        (the router derives it as ``research:{project_id}:{artifact_id}:{version}``).
+
+        Two promote shapes:
+        - **Cloud task folder** (created via ``create_task``): the artifact is already
+          projected into the task folder's cloud ``outputs/<id>.md``; promotion just flips
+          that asset to RAG pending (no upload, no asset explosion).
+        - **Skill project** (created via ``research_project``): the report is uploaded to
+          ``research/<project_id>/`` and mirrored into a scratch ``outputs/`` projection.
+        """
         project = self._load_project(owner_id, project_id)
         version_paths = sorted(
             (self._artifact_dir(owner_id, project_id, artifact_id)).glob("v*"),
@@ -337,6 +390,22 @@ class ResearchService:
             raise ValueError(f"artifact not found: {artifact_id}")
         if record.get("status") == "PROMOTED" and record.get("drive_asset_id"):
             return self._promoted_view(record, idempotent=True)
+        if project.get("cloud_folder_id"):
+            # Task path: the report lives in the cloud outputs/ projection already.
+            if not record.get("cloud_output_asset_id"):
+                await self._mirror_output(owner_id, project, record, record["content"])
+            cloud_asset_id = record["cloud_output_asset_id"]
+            await self.drive.mark_rag_pending(uuid.UUID(cloud_asset_id))
+            record["status"] = "PROMOTED"
+            record["drive_asset_id"] = cloud_asset_id
+            record["drive_path"] = (
+                f"{project['cloud_folder_path']}/outputs/{_safe_filename(artifact_id)}.md"
+            )
+            record["rag_status"] = "PENDING"
+            record["promote_idempotency_key"] = promote_idempotency_key
+            record["updated_at"] = _now_iso()
+            self._save_json(version_paths[-1], record)
+            return self._promoted_view(record, idempotent=False)
         asset = await self.drive.save_artifact(
             owner_id,
             name=f"{artifact_id}.md",
@@ -349,8 +418,17 @@ class ResearchService:
         record["drive_asset_id"] = str(asset.id)
         record["drive_path"] = f"research/{project_id}/{asset.name}"
         record["rag_status"] = "PENDING"
+        record["promote_idempotency_key"] = promote_idempotency_key
         record["updated_at"] = _now_iso()
         self._save_json(version_paths[-1], record)
+        # Derived projection: mirror the promoted report into outputs/ so the task
+        # folder carries a stable, tenant-scoped copy of what went to the drive + RAG.
+        # (artifacts/ is the epistemic authority; outputs/ is a projection.)
+        outputs_dir = self._project_dir(owner_id, project_id) / "outputs"
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        (outputs_dir / f"{_safe_filename(artifact_id)}.md").write_text(
+            record["content"], encoding="utf-8"
+        )
         return self._promoted_view(record, idempotent=False)
 
     @staticmethod
@@ -363,6 +441,7 @@ class ResearchService:
             "drive_asset_id": record.get("drive_asset_id"),
             "drive_path": record.get("drive_path"),
             "rag_status": record.get("rag_status"),
+            "promote_idempotency_key": record.get("promote_idempotency_key"),
             "idempotent": idempotent,
         }
 
@@ -397,12 +476,15 @@ class ResearchService:
                     "version": existing["version"],
                     "idempotent": True,
                 }
+        project = self._load_project(owner_id, project_id)
         artifact_dir = self._artifact_dir(owner_id, project_id, artifact_id)
         next_version = 1
         if artifact_dir.is_dir():
             next_version = max((int(p.name[1:]) for p in artifact_dir.glob("v*")), default=0) + 1
         previous = self._artifact(owner_id, project_id, artifact_id, next_version - 1)
         record = dict(previous)
+        # ``cloud_output_asset_id`` is intentionally carried over from the previous version so
+        # the cloud outputs/<id>.md projection is updated in place, never re-created.
         record.update(
             {
                 "artifact_id": artifact_id,
@@ -417,6 +499,7 @@ class ResearchService:
                 "updated_at": _now_iso(),
             }
         )
+        await self._mirror_output(owner_id, project, record, content)
         self._save_json(artifact_dir / f"v{next_version}", record)
         return {
             "artifact_id": artifact_id,
@@ -438,6 +521,470 @@ class ResearchService:
         b = self._artifact(owner_id, project_id, artifact_id, to_version)
         changed = [k for k in ("content", "status", "drive_path") if a.get(k) != b.get(k)]
         return {"artifact_id": artifact_id, "from": from_version, "to": to_version, "changed": changed}
+
+    # ── chat-driven tasks (the console read-only surface) ──────────────────
+    # A "research task" is a project folder created atomically from the chat (+ Research
+    # button) rather than from an inbox. Everything below is tenant-scoped by owner;
+    # task/asset ids are resolved through ``_resolve_owned_path`` so a ``..``/absolute
+    # segment cannot escape the owner root.
+
+    @staticmethod
+    def _task_view(project: dict) -> dict:
+        return {
+            "task_id": project["id"],
+            "name": project["name"],
+            "owner_id": project["owner_id"],
+            "stage": project["stage"],
+            "status": project["status"],
+            "gates": project["gates"],
+            "session_id": project.get("session_id"),
+            "cloud_folder_id": project.get("cloud_folder_id"),
+            "cloud_folder_path": project.get("cloud_folder_path"),
+            "deletion_requested": project.get("deletion_requested", False),
+            "is_running": project.get("active_run") is not None,
+            "created_at": project.get("created_at"),
+            "updated_at": project.get("updated_at"),
+        }
+
+    def list_tasks(self, owner_id: uuid.UUID) -> list[dict]:
+        """Every task under the owner's scratch root (skips non-task dirs)."""
+        root = self._owner_root(owner_id)
+        if not root.is_dir():
+            return []
+        tasks: dict[str, dict] = {}
+        for task_dir in root.iterdir():
+            if not task_dir.is_dir():
+                continue
+            project = self._load_json(task_dir / "project.json", None)
+            if project is None:
+                continue
+            view = self._task_view(project)
+            # One scratch dir per task, so duplicates shouldn't exist — but a crash mid-create
+            # could leave a stray dir claiming a task_id. Dedup by task_id so the monitor
+            # never renders the same task twice (the frontend clears its container, but the
+            # list source itself must be unique).
+            tasks.setdefault(view["task_id"], view)
+        return sorted(tasks.values(), key=lambda t: t["updated_at"] or "", reverse=True)
+
+    async def create_task(
+        self,
+        owner_id: uuid.UUID,
+        *,
+        title: str,
+        description: str = "",
+        parent_folder_path: str = "",
+        material_asset_ids: list[str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """Atomically create a research task folder + its cloud-drive projection, in one call.
+
+        One request does everything: a cloud task folder under ``parent_folder_path`` (My
+        Drive) named after the title, the authoritative scratch state (``project.json`` born
+        in DISCOVER / ACTIVE, ``graph.json``, ``task_spec.json``, ``session_history.json``),
+        mirrors of the two JSON files into the cloud folder, and each material copied into the
+        cloud ``materials/`` folder (provenance recorded in ``project.json["materials"]``).
+        A failing material copy rolls the whole thing back — cloud folder soft-deleted into
+        Trash, scratch removed — so a rejected create leaves no half-built task.
+        """
+        if idempotency_key:
+            existing = self._find_by_idempotency(owner_id, "project", idempotency_key)
+            if existing is not None:
+                return {
+                    **self._task_view(existing),
+                    "idempotent": True,
+                    "materials": existing.get("materials", []),
+                }
+        task_id = str(uuid.uuid4())
+        # The task folder (entity) is a cloud folder: user-visible under the chosen working
+        # directory. ``cloud_folder_id`` is the authoritative binding; ``cloud_folder_path``
+        # is the display cache (create_folder auto-suffixes busy names).
+        cloud_folder = await self.drive.create_folder(
+            owner_id,
+            None,  # My Drive (personal scope)
+            parent_folder_path.strip() or None,
+            _safe_filename(title.strip()) or f"task-{task_id[:8]}",
+        )
+        cloud_folder_id = cloud_folder["id"]
+        project = {
+            "id": task_id,
+            "owner_id": str(owner_id),
+            "name": title.strip(),
+            "profile": "research_task",
+            "status": "ACTIVE",
+            "stage": "DISCOVER",
+            "gates": {gate: "NOT_RUN" for gate in _GATES},
+            "idempotency_key": idempotency_key,
+            "cloud_folder_id": cloud_folder_id,
+            "cloud_folder_path": cloud_folder["path"],
+            "materials": [],
+            "cloud_mirrors": {},
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+        try:
+            # The user-visible task folder always carries the two work folders, even before
+            # any material is copied or artifact promoted, so the working-directory layout is
+            # stable from the moment the task exists (a task with no materials/outputs yet
+            # still shows both folders in the drive).
+            await self.drive.create_folder(owner_id, None, cloud_folder["path"], "materials")
+            await self.drive.create_folder(owner_id, None, cloud_folder["path"], "outputs")
+            self._save_project(project)
+            self._save_graph(owner_id, task_id, {"nodes": [], "edges": []})
+            task_spec = {
+                "title": title.strip(),
+                "description": (description or "").strip(),
+                "created_at": _now_iso(),
+                "created_by": str(owner_id),
+            }
+            session_history = {"session_id": None, "turns": []}
+            self._save_json(self._project_dir(owner_id, task_id) / "task_spec.json", task_spec)
+            self._save_json(
+                self._project_dir(owner_id, task_id) / "session_history.json", session_history
+            )
+            await self._mirror_cloud(
+                owner_id, project, "task_spec.json", json.dumps(task_spec, ensure_ascii=False, indent=2)
+            )
+            await self._mirror_cloud(
+                owner_id,
+                project,
+                "session_history.json",
+                json.dumps(session_history, ensure_ascii=False, indent=2),
+            )
+            copied: list[dict] = []
+            if material_asset_ids:
+                for asset_id in material_asset_ids:
+                    copied.append(await self._copy_material(owner_id, project, asset_id))
+            project["materials"] = copied
+            self._save_project(project)
+        except Exception:
+            # Roll back atomically: soft-delete the cloud task folder and hard-delete the
+            # scratch state. A rejected create never leaves a half-materialized task behind
+            # (the router surfaces the underlying DriveError).
+            try:
+                await self.drive.delete_folder(owner_id, uuid.UUID(cloud_folder_id))
+            except Exception:
+                pass
+            shutil.rmtree(self._project_dir(owner_id, task_id), ignore_errors=True)
+            raise
+        return {**self._task_view(project), "idempotent": False, "materials": copied}
+
+    async def _copy_material(self, owner_id: uuid.UUID, project: dict, asset_id: str) -> dict:
+        """Copy one cloud-drive asset into the task's cloud ``materials/`` folder.
+
+        ``drive.download`` enforces the ownership/visibility gate (``ensure_asset_readable``
+        → 403/404 for a cross-tenant asset), so a user can never smuggle another user's file
+        into a task folder. The copy lands in My Drive (``workspace_id=None``) under the task
+        folder's ``materials/`` subfolder, named ``<asset_id>__<safe_name>`` so two assets
+        sharing a display name never overwrite each other. Returns the provenance row recorded
+        in ``project.json["materials"]``.
+        """
+        mime, name, data = await self.drive.download(owner_id, uuid.UUID(asset_id))
+        if data is None:
+            raise DriveError("material bytes missing", 404)
+        cloud_asset = await self.drive.save_artifact(
+            owner_id,
+            name=f"{asset_id}__{_safe_filename(name)}",
+            mime_type=mime,
+            content=data,
+            folder_path=f"{project['cloud_folder_path']}/materials",
+            workspace_id=None,
+        )
+        return {
+            "asset_id": asset_id,
+            "name": name,
+            "cloud_asset_id": str(cloud_asset.id),
+            "mime": mime,
+        }
+
+    async def _mirror_cloud(self, owner_id: uuid.UUID, project: dict, name: str, content: str) -> bool:
+        """Mirror one text file into the task's cloud folder (create once, update in place).
+
+        Best-effort: scratch / the DB remain authoritative, so a cloud failure only logs and
+        never fails the caller's authoritative write. Returns ``True`` when a new cloud asset
+        was created — the caller should then persist the updated ``project["cloud_mirrors"]``.
+        """
+        cloud_folder_path = project.get("cloud_folder_path")
+        if not cloud_folder_path:
+            return False
+        mirrors = project.setdefault("cloud_mirrors", {})
+        asset_id = mirrors.get(name)
+        try:
+            if asset_id:
+                await self.drive.update_content(owner_id, uuid.UUID(asset_id), content)
+                return False
+            asset = await self.drive.save_artifact(
+                owner_id,
+                name=name,
+                mime_type="application/json" if name.endswith(".json") else "text/markdown",
+                content=content.encode("utf-8"),
+                folder_path=cloud_folder_path,
+                workspace_id=None,
+            )
+            mirrors[name] = str(asset.id)
+            return True
+        except Exception:
+            logger.exception("research cloud mirror failed for %s", name)
+            return False
+
+    async def _mirror_output(self, owner_id: uuid.UUID, project: dict, record: dict, content: str) -> bool:
+        """Project one artifact into the task's cloud ``outputs/<artifact_id>.md``.
+
+        Best-effort like :meth:`_mirror_cloud`: scratch ``artifacts/`` is the authority. The
+        created asset id is stored on ``record["cloud_output_asset_id"]`` so a later version
+        or promote updates it in place. Returns ``True`` when a new cloud asset was created.
+        """
+        cloud_folder_path = project.get("cloud_folder_path")
+        if not cloud_folder_path:
+            return False
+        asset_id = record.get("cloud_output_asset_id")
+        try:
+            if asset_id:
+                await self.drive.update_content(owner_id, uuid.UUID(asset_id), content)
+                return False
+            asset = await self.drive.save_artifact(
+                owner_id,
+                name=f"{_safe_filename(record['artifact_id'])}.md",
+                mime_type="text/markdown",
+                content=content.encode("utf-8"),
+                folder_path=f"{cloud_folder_path}/outputs",
+                workspace_id=None,
+            )
+            record["cloud_output_asset_id"] = str(asset.id)
+            return True
+        except Exception:
+            logger.exception("research cloud output mirror failed for %s", record["artifact_id"])
+            return False
+
+    # ── session <-> task binding (one session, one task) ────────────────────
+    # The owner-level ``_session_index.json`` maps session_id -> task_id. It is a routing
+    # index only: the authoritative conversation data stays in the DB ``SessionModel``, and
+    # ``session_history.json`` is the task-local mirror for the console.
+
+    def _session_index_path(self, owner_id: uuid.UUID) -> Path:
+        return self._resolve_owned_path(owner_id, "_session_index.json")
+
+    def _load_session_index(self, owner_id: uuid.UUID) -> dict:
+        return self._load_json(self._session_index_path(owner_id), {})
+
+    def _save_session_index(self, owner_id: uuid.UUID, index: dict) -> None:
+        self._save_json(self._session_index_path(owner_id), index)
+
+    def bind_session(self, owner_id: uuid.UUID, task_id: str, session_id) -> dict:
+        """Bind a chat session to a task (idempotent for the same pair).
+
+        One session may drive one task only: binding an already-bound session to a different
+        task raises ``ValueError`` (→ Conflict) so chat turns can never fan out across tasks.
+        """
+        self._load_project(owner_id, task_id)  # raises if the task is missing
+        index = self._load_session_index(owner_id)
+        prev = index.get(str(session_id))
+        if prev is not None and prev != task_id:
+            raise ValueError(f"session already bound to a different research task: {prev}")
+        index[str(session_id)] = task_id
+        self._save_session_index(owner_id, index)
+        project = self._load_project(owner_id, task_id)
+        project["session_id"] = str(session_id)
+        self._save_project(project)
+        mirror = self._project_dir(owner_id, task_id) / "session_history.json"
+        data = self._load_json(mirror, {"session_id": None, "turns": []})
+        data["session_id"] = str(session_id)
+        self._save_json(mirror, data)
+        return {"task_id": task_id, "session_id": str(session_id)}
+
+    def task_id_for_session(self, owner_id: uuid.UUID, session_id) -> str | None:
+        return self._load_session_index(owner_id).get(str(session_id))
+
+    def bound_session_ids(self, owner_id: uuid.UUID) -> set[str]:
+        """Every chat session id bound to one of this owner's research tasks.
+
+        Research sessions are a different kind from normal chats (one per task, driven from
+        the Research monitor), so the chat sidebar hides them; this is the filter set.
+        """
+        return set(self._load_session_index(owner_id).keys())
+
+    async def append_session_turn(
+        self, owner_id: uuid.UUID, session_id, role: str, content: str, ts: str | None = None
+    ) -> None:
+        """Mirror one chat turn into the bound task's scratch + cloud ``session_history.json``.
+
+        Best-effort and non-authoritative: the DB ``SessionModel`` remains the source of
+        truth. A session that is not bound to any task is a no-op.
+        """
+        task_id = self.task_id_for_session(owner_id, session_id)
+        if task_id is None:
+            return
+        mirror = self._project_dir(owner_id, task_id) / "session_history.json"
+        data = self._load_json(mirror, {"session_id": str(session_id), "turns": []})
+        data.setdefault("turns", []).append(
+            {"role": role, "content": content, "ts": ts or _now_iso()}
+        )
+        self._save_json(mirror, data)
+        project = self._load_project(owner_id, task_id)
+        created = await self._mirror_cloud(
+            owner_id,
+            project,
+            "session_history.json",
+            json.dumps(data, ensure_ascii=False, indent=2),
+        )
+        if created:
+            self._save_project(project)
+
+    # ── task status / artifact reads ────────────────────────────────────────
+    def list_artifacts(self, owner_id: uuid.UUID, task_id: str) -> list[dict]:
+        """Latest version of every artifact in the task, newest first."""
+        artifacts_dir = self._resolve_owned_path(owner_id, task_id, "artifacts")
+        if not artifacts_dir.is_dir():
+            return []
+        artifacts: list[dict] = []
+        for artifact_dir in artifacts_dir.iterdir():
+            if not artifact_dir.is_dir():
+                continue
+            versions = sorted(
+                (p for p in artifact_dir.glob("v*") if p.name[1:].isdigit()),
+                key=lambda p: int(p.name[1:]),
+            )
+            if not versions:
+                continue
+            record = self._load_json(versions[-1], None)
+            if record is None:
+                continue
+            artifacts.append(
+                {
+                    "artifact_id": artifact_dir.name,
+                    "task_id": task_id,
+                    "version": record["version"],
+                    "status": record["status"],
+                    "drive_asset_id": record.get("drive_asset_id"),
+                    "drive_path": record.get("drive_path"),
+                    "rag_status": record.get("rag_status"),
+                    "updated_at": record.get("updated_at"),
+                }
+            )
+        return sorted(artifacts, key=lambda a: a["updated_at"] or "", reverse=True)
+
+    async def get_task_status(self, owner_id: uuid.UUID, task_id: str) -> dict:
+        """Task + gates + grouped graph nodes + artifacts + material/output listings.
+
+        Task state and artifacts come from scratch (the authority); materials/outputs are the
+        user-visible cloud projection (listed from the task folder in the drive). The monitor
+        is low-frequency, so a per-call ``list_files`` is acceptable.
+        """
+        project = self._load_project(owner_id, task_id)
+        graph = self._load_graph(owner_id, task_id)
+        nodes_by_type: dict[str, list[dict]] = {}
+        for node in graph["nodes"]:
+            nodes_by_type.setdefault(node["type"], []).append(node)
+        cloud_path = project.get("cloud_folder_path")
+        if cloud_path:
+            files = await self.drive.list_files(owner_id)
+            materials = sorted(
+                a["name"] for a in files if a["folder_path"] == f"{cloud_path}/materials"
+            )
+            outputs = sorted(
+                a["name"] for a in files if a["folder_path"] == f"{cloud_path}/outputs"
+            )
+            # The full working-directory projection: every file inside the task's cloud folder
+            # (root mirrors task_spec.json / session_history.json + materials/ + outputs/), so
+            # the monitor can show exactly what the task folder holds.
+            cloud_files = [
+                {
+                    "id": a["id"],
+                    "name": a["name"],
+                    "folder_path": a["folder_path"] or "",
+                    "mime_type": a["mime_type"],
+                    "size": a["size"],
+                    "rag_status": a["rag_status"],
+                    "updated_at": a["updated_at"],
+                }
+                for a in files
+                if (a["folder_path"] or "") == cloud_path
+                or (a["folder_path"] or "").startswith(f"{cloud_path}/")
+            ]
+        else:
+            materials, outputs, cloud_files = [], [], []
+        return {
+            **self._task_view(project),
+            "description": self._load_json(
+                self._project_dir(owner_id, task_id) / "task_spec.json", {}
+            ).get("description", ""),
+            "graph": graph,
+            "nodes": nodes_by_type,
+            "artifacts": self.list_artifacts(owner_id, task_id),
+            "materials": materials,
+            "outputs": outputs,
+            "cloud_files": cloud_files,
+            # The bound research session's conversation (task-local mirror of the chat that
+            # drives this task; the DB SessionModel stays the authoritative chat record).
+            "session": self._load_json(
+                self._project_dir(owner_id, task_id) / "session_history.json",
+                {"session_id": None, "turns": []},
+            ),
+        }
+
+    async def delete_task(self, owner_id: uuid.UUID, task_id: str) -> dict:
+        """Delete a research task: 409-guarded, cloud folder soft-deleted, scratch removed.
+
+        Two P0 guards block deletion: a task with a RUNNING execution (mutex with the agent)
+        and a report the knowledge base already indexed (remove it from RAG first). The
+        request is recorded in ``project.json`` *before* teardown so a crash mid-delete is
+        auditable. The cloud folder goes to Trash (soft delete); restoring it does NOT
+        resurrect the task — scratch is hard-deleted, so the task state is gone.
+        """
+        project = self._load_project(owner_id, task_id)  # 404 if missing / traversal
+
+        # P0: never delete while the agent is mid-execution. Both the higher-level server-owned
+        # run slot (``active_run``) and any per-tool RUNNING execution block deletion; the slot
+        # is the authority for a live server-side run even when no execution record is mid-flight.
+        if project.get("active_run") and project["active_run"].get("status") == "RUNNING":
+            raise ValueError("Research task is currently running")
+        executions = self._load_json(
+            self._project_dir(owner_id, task_id) / "executions.json", {"executions": []}
+        )
+        if any(e.get("status") == "RUNNING" for e in executions["executions"]):
+            raise ValueError("Research task is currently running")
+
+        # P0: never delete a report the knowledge base already indexed. Check both the scratch
+        # artifact record (promote snapshot) and the cloud outputs asset (the worker's truth).
+        artifacts_dir = self._resolve_owned_path(owner_id, task_id, "artifacts")
+        if artifacts_dir.is_dir():
+            for artifact_dir in artifacts_dir.iterdir():
+                if not artifact_dir.is_dir():
+                    continue
+                versions = sorted(
+                    (p for p in artifact_dir.glob("v*") if p.name[1:].isdigit()),
+                    key=lambda p: int(p.name[1:]),
+                )
+                if not versions:
+                    continue
+                record = self._load_json(versions[-1], None)
+                if record and record.get("rag_status") == "INDEXED":
+                    raise ValueError("Please remove from Knowledge Base first")
+        if project.get("cloud_folder_path"):
+            cloud_path = project["cloud_folder_path"]
+            for f in await self.drive.list_files(owner_id):
+                if f["folder_path"] == f"{cloud_path}/outputs" and f["rag_status"] == "INDEXED":
+                    raise ValueError("Please remove from Knowledge Base first")
+
+        # Mark the deletion request before teardown so an interrupted delete is auditable.
+        project["deletion_requested"] = True
+        self._save_project(project)
+
+        # Cloud folder: soft-delete the whole subtree into Trash (files + folder rows). If it
+        # is already gone from the drive, scratch cleanup below is still the source of truth.
+        if project.get("cloud_folder_id"):
+            try:
+                await self.drive.delete_folder(owner_id, uuid.UUID(project["cloud_folder_id"]))
+            except DriveError:
+                pass
+
+        # Scratch is runtime state: clear the session routing index, then hard-delete the
+        # task directory. Restoring the Trash folder cannot resurrect the task.
+        index = self._load_session_index(owner_id)
+        cleaned = {k: v for k, v in index.items() if v != task_id}
+        if len(cleaned) != len(index):
+            self._save_session_index(owner_id, cleaned)
+        shutil.rmtree(self._project_dir(owner_id, task_id), ignore_errors=True)
+        return {"deleted": True}
 
     # ── research_state ────────────────────────────────────────────────────
     def get_state(self, owner_id: uuid.UUID, project_id: str) -> dict:
@@ -805,7 +1352,7 @@ class ResearchService:
         # Locate the approval across the owner's projects.
         approval = None
         project = None
-        owner_dir = self.scratch_root / str(owner_id)
+        owner_dir = self._owner_root(owner_id)
         if owner_dir.is_dir():
             for project_dir in owner_dir.iterdir():
                 approvals = self._load_json(project_dir / "approvals.json", {"approvals": []})
@@ -842,6 +1389,65 @@ class ResearchService:
         }
 
     # ── research_run ──────────────────────────────────────────────────────
+    def begin_run(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        session_id: str | None = None,
+        stale_after_seconds: int = 7200,
+    ) -> dict:
+        """Acquire the single active-run slot for a task (mutex over concurrent turns).
+
+        One task may hold at most one live run at a time (T4 invariant #2: concurrent
+        Task A/Task B runs are fine, but a single task never runs two turns in parallel).
+        A RUNNING slot older than ``stale_after_seconds`` is presumed dead — the owning
+        process crashed before ``end_run`` — and is adopted: any RUNNING executions it
+        left behind are flipped to ABORTED so the delete guard never blocks forever.
+
+        Raises ``ValueError`` for a live conflict; the router maps it to a 409.
+        """
+        project = self._load_project(owner_id, project_id)
+        active = project.get("active_run")
+        if active and active.get("status") == "RUNNING":
+            started = active.get("started_at")
+            # ``_now_iso`` is fixed-width UTC, so lexicographic comparison is chronological.
+            cutoff = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(time.time() - stale_after_seconds),
+            )
+            stale = not started or started < cutoff
+            if not stale:
+                raise ValueError("Research task is already running")
+            logger.warning("research begin_run adopted stale active_run: %s", active)
+            # The dead process's RUNNING executions are stale too — unblock the delete guard.
+            exec_path = self._project_dir(owner_id, project_id) / "executions.json"
+            data = self._load_json(exec_path, {"executions": []})
+            changed = False
+            for execution in data["executions"]:
+                if execution.get("status") == "RUNNING":
+                    execution["status"] = "ABORTED"
+                    execution["result"] = {"aborted": True, "reason": "stale run adopted"}
+                    execution["finished_at"] = _now_iso()
+                    changed = True
+            if changed:
+                self._save_json(exec_path, data)
+        project["active_run"] = {
+            "run_id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "started_at": _now_iso(),
+            "status": "RUNNING",
+        }
+        self._save_project(project)
+        return dict(project["active_run"])
+
+    def end_run(self, owner_id: uuid.UUID, project_id: str) -> dict:
+        """Release the active-run slot (idempotent: a missing slot is a no-op)."""
+        project = self._load_project(owner_id, project_id)
+        active = project.pop("active_run", None)
+        self._save_project(project)
+        return {"run_id": active["run_id"] if active else None, "status": "IDLE"}
+
     def record_execution(
         self, owner_id: uuid.UUID, project_id: str, *, tool: str, args: dict
     ) -> dict:
@@ -974,6 +1580,22 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
     def user() -> uuid.UUID:
         return _current_user()
 
+    def _handoff_project_id() -> str | None:
+        """The project id sunk into this turn's context, or ``None``.
+
+        The desktop "Start deep research" button resumes a Research OS project via a
+        structured handoff (``ChatRequest.handoff``); the API sinks it into
+        ``current_turn().context`` so a ``resume`` tool call still targets the right
+        project even if the model omits ``project_id`` from its args.
+        """
+        turn = current_turn()
+        if turn is None or not turn.context:
+            return None
+        handoff = turn.context.get("handoff") or {}
+        if handoff.get("kind") != "research":
+            return None
+        return handoff.get("project_id")
+
     async def _project(args: dict, exec: ToolExecution) -> dict:
         svc = service()
         action = args["action"]
@@ -984,12 +1606,15 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 profile=args.get("profile", "literature"),
                 idempotency_key=args.get("idempotency_key"),
             )
-        if action == "resume":
-            return svc.resume_project(user(), args["project_id"])
-        if action == "snapshot":
-            return svc.snapshot_project(user(), args["project_id"])
-        if action == "archive":
-            return svc.archive_project(user(), args["project_id"])
+        if action in ("resume", "snapshot", "archive"):
+            project_id = args.get("project_id") or _handoff_project_id()
+            if not project_id:
+                raise ValueError(f"research_project {action} requires project_id")
+            if action == "resume":
+                return svc.resume_project(user(), project_id)
+            if action == "snapshot":
+                return svc.snapshot_project(user(), project_id)
+            return svc.archive_project(user(), project_id)
         raise ValueError(f"unknown research_project action: {action}")
 
     async def _artifact(args: dict, exec: ToolExecution) -> dict:

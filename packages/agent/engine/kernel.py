@@ -219,6 +219,7 @@ class AgentKernel:
         base_url: str | None,
         api_key: str | None,
         progress_sink: Callable[[dict], None] | None = None,
+        context: dict | None = None,
     ) -> AgentTurn:
         """Build the per-turn :class:`AgentTurn`, load its memory brief, and bind it.
 
@@ -235,6 +236,7 @@ class AgentKernel:
             base_url=base_url,
             api_key=api_key,
             max_budget_usd=settings.max_budget_per_turn_usd,
+            context=context,
         )
         if progress_sink is not None:
             turn.progress_sink = progress_sink
@@ -263,15 +265,19 @@ class AgentKernel:
         base_url: str | None = None,
         api_key: str | None = None,
         progress_sink: Callable[[dict], None] | None = None,
+        context: dict | None = None,
     ) -> AgentResult:
         """Run one turn through the assembled kernel (assemble → step loop → session-end).
 
         ``base_url`` / ``api_key`` optionally route every model call in this turn through a
         specific LLM channel (the credential pinned on the caller's access token).
         ``progress_sink`` receives structured turn events (plan / tool progress) for streaming.
+        ``context`` carries machine-readable turn context (e.g. a handoff payload) that tools
+        read at runtime via ``current_turn().context``.
         """
         turn = self._build_turn(
-            user_msg, history, memory_keys, session_memory, model, base_url, api_key, progress_sink
+            user_msg, history, memory_keys, session_memory, model, base_url, api_key,
+            progress_sink, context,
         )
         await self._snapshot_workspace(turn)
         return await self.loop.run(
@@ -296,10 +302,12 @@ class AgentKernel:
         base_url: str | None = None,
         api_key: str | None = None,
         progress_sink: Callable[[dict], None] | None = None,
+        context: dict | None = None,
     ):
         """Streaming variant of :meth:`run` (same signature; see :meth:`ReactLoopAgent.run_stream`)."""
         turn = self._build_turn(
-            user_msg, history, memory_keys, session_memory, model, base_url, api_key, progress_sink
+            user_msg, history, memory_keys, session_memory, model, base_url, api_key,
+            progress_sink, context,
         )
         await self._snapshot_workspace(turn)
         async for evt in self.loop.run_stream(

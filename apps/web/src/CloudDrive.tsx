@@ -1423,9 +1423,10 @@ export default function CloudDrive() {
       setEditing(f);
       setDraft(content);
       setDirty(false);
-      // A Mermaid mindmap opens straight into the diagram preview (树状图); ✏️ Edit still
-      // shows the .mmd source.
-      setPreview(isMindmapText(content));
+      // Open in the review (rendered) view by default — editing is opt-in via the
+      // "✏ Edit" button, which toggles back to "👁 Preview" to close the editor.
+      // A Mermaid mindmap renders as its diagram either way.
+      setPreview(true);
     } catch (e) {
       setError(String(e));
     }

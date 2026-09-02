@@ -157,6 +157,10 @@
   // reloads from the server; it also toggles this panel's .hidden class itself.
   window.loadCloudDrive = loadDrive;
 
+  // Shared authenticated fetch (research.js reuses it). Prefixes /api and injects the
+  // bearer token, so the research panel never reaches for its own auth plumbing.
+  window.apiFetch = apiFetch;
+
   // Open the Cloud Drive main view at a My Drive folder path ("" = root). Used by the
   // toolkit generate dialog's "view output" link so the user can see where a generated
   // artifact landed instead of hunting for it.
@@ -1116,15 +1120,14 @@
       note.preview = false;
       noteTextarea.value = res.content || "";
       noteTitleEl.textContent = f.folder_path ? `${f.folder_path}/${f.name}` : f.name;
-      setPreviewMode(false);
+      // Open in the review (rendered) view by default — editing is opt-in via the
+      // "Edit" button, and toggling back to "Preview" closes the editor. A Mermaid
+      // mindmap renders as its diagram either way.
+      setPreviewMode(true);
       noteSaveBtn.disabled = true;
       noteBtn(noteSaveBtn, "Save");
       noteEditor.classList.remove("hidden");
       setStatus("");
-      // A Mermaid mindmap opens straight into the diagram preview (树状图) instead of raw
-      // indented text; ✏️ Edit still shows the .mmd source.
-      if (/^\s*mindmap\b/.test(res.content || "")) setPreviewMode(true);
-      else noteTextarea.focus();
     } catch (e) {
       setStatus(`Failed to open note: ${e.message}`);
     }

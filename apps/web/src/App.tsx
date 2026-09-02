@@ -3,11 +3,12 @@ import * as XLSX from "xlsx";
 import { api, clearToken, getToken, setToken, type AuthActionResponse } from "./api";
 import CloudDrive from "./CloudDrive";
 import MicRecorder from "./MicRecorder";
+import Research from "./Research";
 import { useJob } from "./useJob";
 import type { Article, Domain, Me, Model, Sentence, Term, UsageReport } from "./types";
 
 type Page = "home" | "import" | "study" | "manage";
-type Tab = "learn" | "me" | "drive";
+type Tab = "learn" | "me" | "drive" | "research";
 
 type AuthState =
   | { status: "loading" }
@@ -121,6 +122,9 @@ export default function App() {
         <button className={tab === "me" ? "tab active" : "tab"} onClick={() => setTab("me")}>
           My Account
         </button>
+        <button className={tab === "research" ? "tab active" : "tab"} onClick={() => setTab("research")}>
+          🔬 Research
+        </button>
       </div>
       <div className="topbar">
         <SettingsMenu />
@@ -140,6 +144,12 @@ export default function App() {
         <div className="layout" style={{ flex: 1, minHeight: 0 }}>
           <main className="content" style={{ paddingTop: 32 }}>
             <MyAccount user={auth.user} />
+          </main>
+        </div>
+      ) : tab === "research" ? (
+        <div className="layout" style={{ flex: 1, minHeight: 0 }}>
+          <main className="content" style={{ paddingTop: 32 }}>
+            <Research />
           </main>
         </div>
       ) : (

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from uuid import UUID
 
 from agent.security.approvals import (
@@ -50,10 +51,13 @@ from core.infrastructure.memory import (
 from core.infrastructure.request_context import set_request_user
 from core.infrastructure.security import authorize_usage, get_role
 from fastapi import APIRouter, Depends, HTTPException, Request
+from plugins.research.plugin import ResearchService
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
 router = APIRouter(tags=["chat"])
+
+logger = logging.getLogger(__name__)
 
 
 async def _attach_note(body: ChatRequest, drive: DriveService, user_id) -> str | None:
@@ -76,6 +80,73 @@ async def _attach_note(body: ChatRequest, drive: DriveService, user_id) -> str |
         raise HTTPException(status_code=403, detail=f"no access to the attached file: {exc}")
     name = attach.get("name") or "document"
     return f"[Attached: {name} (asset_id {asset_id})]"
+
+
+def _handoff_note(body: ChatRequest) -> str | None:
+    """Build a structured instruction prefix for a handoff payload, or ``None``.
+
+    Handoffs are machine-readable context attached to the first message of a turn (e.g. the
+    desktop "Resume Research in Chat" button resuming a Research OS project). The note is
+    prefixed to the user text so the agent reliably receives the project id and the resume
+    directive instead of having to infer them from prose; the same payload is sunk into the
+    turn context (``current_turn().context["handoff"]``) so tools can act on it directly.
+    """
+    handoff = body.handoff
+    if not handoff or not isinstance(handoff, dict):
+        return None
+    kind = handoff.get("kind")
+    if kind != "research":
+        return None
+    project_id = handoff.get("project_id")
+    if not project_id:
+        return None
+    mode = handoff.get("mode") or "research_resume"
+    return (
+        "[Research handoff: resume project {pid} via research_project (action resume), "
+        "mode {mode}. Do NOT create a new project — the project already exists. Continue "
+        "it through the deep_research skill stages and advance to PUBLISH.]"
+    ).format(pid=project_id, mode=mode)
+
+
+def _resolve_research_context(drive, user, session_id, body_handoff):
+    """Durable research handoff resolution shared by ``/chat`` and ``/chat/stream``.
+
+    Returns ``(service, bound_task_id, effective_handoff, notice)`` where ``service`` is
+    ``None`` when this session is not a research session. The client sends the handoff once
+    (the first turn of a research session); a session already bound to a task re-synthesizes
+    it here, so later turns keep the research grant (WRITE + NETWORK, see
+    :meth:`Sandbox._effective_permissions`) and the agent keeps targeting the same task
+    instead of creating a duplicate project. A binding conflict is surfaced as a non-fatal
+    in-stream notice — it never breaks the chat.
+    """
+    if user is None:
+        return None, None, None, None
+    service: ResearchService | None = None
+    effective_handoff: dict | None = None
+    if body_handoff and body_handoff.get("kind") == "research":
+        effective_handoff = body_handoff
+    else:
+        candidate = ResearchService(drive, settings.research_scratch_dir)
+        known_task = candidate.task_id_for_session(user.user_id, session_id)
+        if known_task:
+            service = candidate
+            effective_handoff = {
+                "kind": "research",
+                "project_id": known_task,
+                "mode": "research_resume",
+            }
+    bound_task_id: str | None = None
+    notice: str | None = None
+    if effective_handoff and effective_handoff.get("project_id"):
+        service = service or ResearchService(drive, settings.research_scratch_dir)
+        try:
+            bound_task_id = service.bind_session(
+                user.user_id, effective_handoff["project_id"], session_id
+            )["task_id"]
+        except Exception as exc:  # noqa: BLE001 — a binding hiccup never breaks the chat
+            logger.warning("research bind_session failed: %s", exc)
+            notice = f"⚠️ Research: session/task binding failed — {exc}"
+    return service, bound_task_id, effective_handoff, notice
 
 
 @router.post("/chat/import")
@@ -291,7 +362,28 @@ async def chat(
         note = await _attach_note(body, drive, user_id)
         if note:
             user_text = f"{note}\n\n{body.message}"
+    handoff_note = _handoff_note(body)
+    if handoff_note:
+        user_text = f"{handoff_note}\n\n{user_text}"
     session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
+    # Chat-driven research: bind this session to the handoff's task (mirror + grant), same
+    # durable resolution as /chat/stream. The single-task run mutex (T4 invariant #2) is
+    # shared with /chat/stream so a non-streaming turn and a streaming turn for the same task
+    # can never overlap.
+    research_service, bound_task_id, effective_handoff, research_notice = _resolve_research_context(
+        drive, user, session_id, body.handoff
+    )
+    research_turn = research_service is not None and bound_task_id is not None
+    if research_turn:
+        try:
+            research_service.begin_run(user_id, bound_task_id, session_id=str(session_id))
+        except ValueError as exc:
+            msg = str(exc)
+            if "already running" in msg:
+                raise HTTPException(status_code=409, detail=msg) from exc
+            if "not found" in msg:
+                raise HTTPException(status_code=404, detail=msg) from exc
+            raise
     session_memory = SessionMemoryStore(
         SessionLocal, _embedder(), llm, session_id, user_id,
         attach_asset_id=owned_asset_id,
@@ -307,14 +399,24 @@ async def chat(
         base_url=base_url or None,
         api_key=api_key or None,
     )
-    result = await get_agent().run(
-        user_text,
-        history,
-        session_memory=session_memory,
-        model=model,
-        base_url=base_url or None,
-        api_key=api_key or None,
-    )
+    try:
+        result = await get_agent().run(
+            user_text,
+            history,
+            session_memory=session_memory,
+            model=model,
+            base_url=base_url or None,
+            api_key=api_key or None,
+            context={"handoff": effective_handoff} if effective_handoff else None,
+        )
+    finally:
+        # /chat owns the run for the lifetime of this request — release the slot so a later
+        # turn (stream or not) for the same task can start.
+        if research_turn:
+            try:
+                research_service.end_run(user_id, bound_task_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("research end_run failed: %s", exc)
     # close() (inside run) already flushed events; defer the expensive embed+summary work.
     await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
     if log_user is not None:
@@ -339,6 +441,17 @@ async def chat(
                 user_message_id = str(m_id)
             elif role == "assistant" and text == result.final_answer:
                 assistant_message_id = str(m_id)
+    # Mirror this turn into the bound task's session_history.json (best-effort; the DB
+    # SessionModel is the authority — a write failure only logs, it never fails the turn).
+    if research_service is not None and bound_task_id is not None:
+        try:
+            await research_service.append_session_turn(user_id, session_id, "user", body.message)
+            if result.final_answer:
+                await research_service.append_session_turn(
+                    user_id, session_id, "assistant", result.final_answer
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("research session_history mirror failed: %s", exc)
     resp = {
         "answer": result.final_answer,
         "messages": result.messages,
@@ -349,6 +462,8 @@ async def chat(
     }
     if guest_token:
         resp["guest_token"] = guest_token
+    if research_notice:
+        notice = f"{notice}\n{research_notice}" if notice else research_notice
     if notice:
         resp["notice"] = notice
     return resp
@@ -423,7 +538,39 @@ async def chat_stream(
         note = await _attach_note(body, drive, user_id)
         if note:
             user_text = f"{note}\n\n{body.message}"
+    handoff_note = _handoff_note(body)
+    if handoff_note:
+        user_text = f"{handoff_note}\n\n{user_text}"
     session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
+    # Chat-driven research: bind this session to the handoff's task so every subsequent turn
+    # mirrors into the task's ``session_history.json`` (a task-local projection — the DB
+    # SessionModel stays the authoritative conversation record). A binding conflict (one
+    # session may drive one task only) is surfaced as a non-fatal in-stream notice.
+    #
+    # ``effective_handoff`` is the research context for THIS turn. The client only sends the
+    # handoff once (the first message of a research session), so for a session that is already
+    # bound to a task we re-synthesize it here — the turn keeps its research grant (WRITE +
+    # NETWORK, see Sandbox._effective_permissions) and the agent keeps targeting the same
+    # task instead of silently creating a duplicate project.
+    research_service, bound_task_id, effective_handoff, research_notice = _resolve_research_context(
+        drive, user, session_id, body.handoff
+    )
+    # Single active-run mutex per task (T4 invariant #2): a second concurrent trigger for a
+    # task that is already running is a 409 conflict. The slot is released by ``end_run`` in
+    # ``gen()``'s finally, so a client disconnect cannot strand it; a crashed process's slot
+    # is adopted by ``begin_run`` after the stale window. A bound session whose task vanished
+    # degrades to a 404 rather than silently running against a dead task.
+    research_turn = research_service is not None and bound_task_id is not None
+    if research_turn:
+        try:
+            research_service.begin_run(user_id, bound_task_id, session_id=str(session_id))
+        except ValueError as exc:
+            msg = str(exc)
+            if "already running" in msg:
+                raise HTTPException(status_code=409, detail=msg) from exc
+            if "not found" in msg:
+                raise HTTPException(status_code=404, detail=msg) from exc
+            raise
     session_memory = SessionMemoryStore(
         SessionLocal, _embedder(), llm, session_id, user_id,
         attach_asset_id=owned_asset_id,
@@ -441,6 +588,10 @@ async def chat_stream(
     )
 
     async def gen():
+        # ``notice`` lives in the enclosing ``chat_stream`` scope (set to None above); the
+        # research handoff may append to it below, so bind it nonlocal to avoid shadowing it
+        # with an unbound local (UnboundLocalError killed the stream when no notice fired).
+        nonlocal notice
         # The agent may block on a human-in-the-loop approval (awaiting POST /approvals/{id}),
         # so a plain `async for` over run_stream would deadlock — the stream can't advance while
         # the approval-request frame sits unyielded. Pump the stream into a queue in a sibling
@@ -470,6 +621,7 @@ async def chat_stream(
                     model=model,
                     base_url=base_url or None,
                     api_key=api_key or None,
+                    context={"handoff": effective_handoff} if effective_handoff else None,
                     progress_sink=lambda evt: frames.put_nowait(("agent", evt)),
                 ):
                     frames.put_nowait(("agent", evt))
@@ -480,6 +632,75 @@ async def chat_stream(
 
         pump_task = asyncio.create_task(pump())
         final = None
+
+        def collect_done_payload() -> dict | None:
+            """Disconnect path: pull the done payload the drained pump left in the queue (the
+            ``run_stream`` event, not the None sentinel) when the loop never saw it."""
+            try:
+                while True:
+                    kind, data = frames.get_nowait()
+                    if (
+                        kind == "agent"
+                        and isinstance(data, dict)
+                        and data.get("type") == "done"
+                        and data.get("data") is not None
+                    ):
+                        return data["data"]
+            except asyncio.QueueEmpty:
+                return None
+
+        async def finalize_turn(final_payload: dict | None) -> dict:
+            """Post-run bookkeeping shared by the normal path and the research disconnect path:
+            session-finalize enqueue, usage logging, message-id resolution, and the task's
+            ``session_history.json`` mirror. The DB SessionModel stays the authoritative chat
+            record; the mirror is a task-local projection and failures only log."""
+            nonlocal notice
+            await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
+            if log_user is not None:
+                await _log_usage(
+                    log_user, business_name, "chat_stream",
+                    final_payload["usage"] if final_payload else None,
+                    credential_id=credential_id, paid=(tier == "paid"),
+                )
+            # Resolve this turn's user/assistant message ids (same scan as /chat: ascending,
+            # last row matching each text) so the client can delete a single message.
+            answer = (final_payload or {}).get("answer", "")
+            user_message_id = assistant_message_id = None
+            async with SessionLocal() as session:
+                rows = (
+                    await session.execute(
+                        select(MessageModel.id, MessageModel.role, MessageModel.text)
+                        .where(MessageModel.session_id == session_id)
+                        .order_by(MessageModel.created_at)
+                    )
+                ).all()
+                for m_id, role, text in rows:
+                    if role == "user" and text == user_text:
+                        user_message_id = str(m_id)
+                    elif role == "assistant" and answer and text == answer:
+                        assistant_message_id = str(m_id)
+            if research_service is not None and bound_task_id is not None:
+                try:
+                    await research_service.append_session_turn(user_id, session_id, "user", body.message)
+                    if answer:
+                        await research_service.append_session_turn(user_id, session_id, "assistant", answer)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("research session_history mirror failed: %s", exc)
+            done = {
+                "answer": answer,
+                "session_id": str(session_id),
+                "user_id": str(user_id),
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+            }
+            if guest_token:
+                done["guest_token"] = guest_token
+            if research_notice:
+                notice = f"{notice}\n{research_notice}" if notice else research_notice
+            if notice:
+                done["notice"] = notice
+            return done
+
         try:
             while True:
                 kind, data = await frames.get()
@@ -492,50 +713,34 @@ async def chat_stream(
                     break
                 yield {"data": json.dumps(data, ensure_ascii=False)}
         finally:
-            # Client disconnect / generator close: stop the pump so the turn's awaits
-            # (wait_for/tenacity/gather) re-raise CancelledError and unwind cleanly.
             set_request_approval(None)
-            pump_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pump_task
+            if research_turn:
+                # Server-owned research run (T4 invariant #3): a client disconnect must never
+                # cancel an active run. Let the pump drain to completion so the agent's turn
+                # and its tool executions finish server-side, then still finalize the turn and
+                # release the single-task run slot.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pump_task
+                if final is None:
+                    # The loop was abandoned (client disconnect) before the done frame; run the
+                    # same post-turn bookkeeping even though no client is left to stream to.
+                    with contextlib.suppress(Exception):  # noqa: BLE001
+                        await finalize_turn(collect_done_payload())
+                if research_service is not None and bound_task_id is not None:
+                    try:
+                        research_service.end_run(user_id, bound_task_id)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("research end_run failed: %s", exc)
+            else:
+                # Non-research turn: the run is owned by the SSE pipe. Client disconnect stops
+                # it so the turn's awaits (wait_for/tenacity/gather) re-raise CancelledError
+                # and unwind cleanly.
+                pump_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pump_task
 
-        # Defer the expensive embed+summary work exactly like /chat; log usage now that the
-        # turn's token counts are known.
-        await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
-        if log_user is not None:
-            await _log_usage(
-                log_user, business_name, "chat_stream",
-                final["usage"] if final else None,
-                credential_id=credential_id, paid=(tier == "paid"),
-            )
-        # Resolve this turn's user/assistant message ids (same scan as /chat: ascending,
-        # last row matching each text) so the client can delete a single message.
-        answer = (final or {}).get("answer", "")
-        user_message_id = assistant_message_id = None
-        async with SessionLocal() as session:
-            rows = (
-                await session.execute(
-                    select(MessageModel.id, MessageModel.role, MessageModel.text)
-                    .where(MessageModel.session_id == session_id)
-                    .order_by(MessageModel.created_at)
-                )
-            ).all()
-            for m_id, role, text in rows:
-                if role == "user" and text == user_text:
-                    user_message_id = str(m_id)
-                elif role == "assistant" and answer and text == answer:
-                    assistant_message_id = str(m_id)
-        done = {
-            "answer": answer,
-            "session_id": str(session_id),
-            "user_id": str(user_id),
-            "user_message_id": user_message_id,
-            "assistant_message_id": assistant_message_id,
-        }
-        if guest_token:
-            done["guest_token"] = guest_token
-        if notice:
-            done["notice"] = notice
+        # Normal completion path: the loop broke on the run's done frame.
+        done = await finalize_turn(final)
         yield {"data": json.dumps({"type": "done", "data": done}, ensure_ascii=False)}
 
     return EventSourceResponse(gen())

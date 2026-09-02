@@ -11,6 +11,24 @@ const Viewer = (() => {
   // text straight into the chat input.
   let subtitleCopyHandler = null;
   function setSubtitleCopyHandler(fn) { subtitleCopyHandler = fn; }
+  // app.js registers this so the subtitle menu can run session-scoped actions:
+  // { importRepo, mindmap, slides } — import the whole session to the query repo, or
+  // generate a mind map / slide deck from the active conversation.
+  let subtitleActions = null;
+  function setSubtitleActions(fn) { subtitleActions = fn; }
+  // app.js registers this so document toolbars can offer Upload / Import / Generate:
+  // fn({ path, name }) returns { upload?, importRepo?, generate(tool)? } or null.
+  let docActions = null;
+  function setDocumentActions(fn) { docActions = fn; }
+  // app.js registers this so the subtitle "Generate … from Subtitles" items can grey out
+  // while a background generation job is running (mirrors the session-sidebar lock). The
+  // predicate receives a toolkit tool id ("mindmap"/"slides") and returns busy-or-not.
+  let subtitleBusy = null;
+  function setSubtitleBusy(fn) { subtitleBusy = fn; }
+  // app.js registers this so the document toolbar's "Generate" dropdown greys out exactly the
+  // item whose background job is running (each entry locks itself, never the chat toolbar).
+  let docGenerateBusy = null;
+  function setDocGenerateBusy(fn) { docGenerateBusy = fn; }
 
   const VIDEO_EXT = new Set(["mp4", "webm", "mov", "m4v"]);
   const AUDIO_EXT = new Set(["mp3", "wav", "m4a", "flac", "ogg"]);
@@ -258,18 +276,21 @@ const Viewer = (() => {
 
     if (opts.zoom) {
       const out = document.createElement("button");
+      out.className = "zoom-tools";
       out.textContent = "−";
       out.title = "Zoom out";
       out.onclick = () => setZoom(-1);
       bar.appendChild(out);
 
       const pct = document.createElement("button");
+      pct.className = "zoom-tools";
       pct.textContent = `${Math.round(state.zoom * 100)}%`;
       pct.title = "Reset zoom";
       pct.onclick = () => setZoom(0);
       bar.appendChild(pct);
 
       const inn = document.createElement("button");
+      inn.className = "zoom-tools";
       inn.textContent = "+";
       inn.title = "Zoom in";
       inn.onclick = () => setZoom(1);
@@ -285,26 +306,110 @@ const Viewer = (() => {
       bar.appendChild(fs);
     }
 
-    // "Attach to chat" buttons: only meaningful while a real file is open (folder browse
-    // has nothing to attach, and app.js must have registered an attach handler).
-    if (attachHandler && state.kind !== "folder") {
-      const attachBtn = document.createElement("button");
-      attachBtn.textContent = "🔗";
-      attachBtn.title = "Attach current file to chat";
-      attachBtn.onclick = () => attachHandler("file", { path: state.openPath || state.path, name: state.name });
-      bar.appendChild(attachBtn);
-
-      const shotBtn = document.createElement("button");
-      shotBtn.textContent = "📷";
-      shotBtn.title = "Screenshot this window and attach to chat";
-      shotBtn.onclick = () => attachHandler("screenshot");
-      bar.appendChild(shotBtn);
+    // Document actions (pdf/docx/doc/text/sheet/pptx): Upload / Import / Generate. Local
+    // files are uploaded to the Cloud Drive on demand; cloud files act on the existing
+    // drive asset directly. app.js registers docActions; opening a file never uploads it.
+    const DOC_KINDS = new Set(["pdf", "docx", "doc", "text", "sheet", "pptx"]);
+    if (docActions && DOC_KINDS.has(state.kind)) {
+      const acts = docActions({ path: state.openPath || state.path, name: state.name });
+      if (acts) {
+        if (acts.upload) {
+          const upBtn = document.createElement("button");
+          upBtn.textContent = "⬆ Upload";
+          upBtn.title = "Upload this file to your Cloud Drive";
+          // Re-entry guard: lock the button while the picker + upload are in flight so a
+          // double-click can never enqueue two copies of the same file.
+          upBtn.onclick = () => {
+            if (upBtn.disabled) return;
+            upBtn.disabled = true;
+            upBtn.textContent = "⏳ Uploading…";
+            const p = acts.upload();
+            Promise.resolve(p)
+              .catch(() => {})
+              .finally(() => { upBtn.disabled = false; upBtn.textContent = "⬆ Upload"; });
+          };
+          bar.appendChild(upBtn);
+        }
+        if (acts.importRepo) {
+          const impBtn = document.createElement("button");
+          impBtn.textContent = "📥 Import to Repo";
+          impBtn.title = "Import this file into the knowledge repository (RAG)";
+          impBtn.onclick = () => acts.importRepo();
+          bar.appendChild(impBtn);
+        }
+        if (acts.generate) {
+          const genWrap = document.createElement("span");
+          genWrap.className = "tools-wrap";
+          const genBtn = document.createElement("button");
+          genBtn.textContent = "⚡ Generate";
+          const genMenu = document.createElement("div");
+          genMenu.className = "tools-menu hidden";
+          const genItems = {};
+          genBtn.onclick = (e) => {
+            e.stopPropagation();
+            refreshDocGenBusy();
+            genMenu.classList.toggle("hidden");
+          };
+          document.addEventListener("click", () => genMenu.classList.add("hidden"));
+          function genItem(label, tool) {
+            const b = document.createElement("button");
+            b.textContent = label;
+            b.onclick = () => {
+              genMenu.classList.add("hidden");
+              acts.generate(tool);
+            };
+            genMenu.appendChild(b);
+            genItems[tool] = b;
+            return b;
+          }
+          genItem("Mind Map", "mindmap");
+          genItem("Slides", "slides");
+          genItem("Summary", "summary");
+          // The clicked item locks while ITS background job runs; re-evaluated on every open.
+          function refreshDocGenBusy() {
+            for (const tool of Object.keys(genItems)) {
+              const busy = docGenerateBusy ? docGenerateBusy(tool) : false;
+              genItems[tool].disabled = busy;
+              genItems[tool].title = busy ? "A generation for this is already running in the background." : "";
+            }
+          }
+          genWrap.append(genBtn, genMenu);
+          bar.appendChild(genWrap);
+        }
+      }
     }
 
-    const openBtn = document.createElement("button");
-    openBtn.textContent = "Open in OS";
-    openBtn.onclick = () => window.desktopAPI.openExternal(filePath);
-    bar.appendChild(openBtn);
+    // "Tools" dropdown: content-kind items (renderVideo appends Screenshot / PPT / Book)
+    // plus the shared "Open in OS" entry. Hidden entirely when there is nothing to offer
+    // (e.g. a cloud folder browse with no local OS path).
+    const toolsWrap = document.createElement("span");
+    toolsWrap.className = "tools-wrap";
+    const toolsBtn = document.createElement("button");
+    toolsBtn.textContent = "🛠 Tools";
+    const toolsMenu = document.createElement("div");
+    toolsMenu.className = "tools-menu hidden";
+    toolsBtn.onclick = (e) => {
+      e.stopPropagation();
+      toolsMenu.classList.toggle("hidden");
+    };
+    document.addEventListener("click", () => toolsMenu.classList.add("hidden"));
+    function toolItem(label, onClick) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.onclick = () => {
+        toolsMenu.classList.add("hidden");
+        onClick();
+      };
+      toolsMenu.appendChild(b);
+      return b;
+    }
+    if (filePath) toolItem("Open in OS", () => window.desktopAPI.openExternal(filePath));
+    if (toolsMenu.childElementCount) {
+      toolsWrap.append(toolsBtn, toolsMenu);
+      bar.appendChild(toolsWrap);
+    }
+    bar._toolItem = toolItem;
+    bar._toolsMenu = toolsMenu;
 
     const closeBtn = document.createElement("button");
     closeBtn.textContent = "✕";
@@ -430,24 +535,11 @@ const Viewer = (() => {
     const subMenu = document.createElement("div");
     subMenu.className = "tools-menu hidden";
     subWrap.append(subBtn, subMenu);
+    // Subtitles sits before the close ✕ (right after the Tools/actions group).
     bar.insertBefore(subWrap, bar.lastChild);
 
-    // "Tools" dropdown: Screenshot / Generate PPT / Generate Book.
-    const toolsWrap = document.createElement("span");
-    toolsWrap.className = "tools-wrap";
-    const toolsBtn = document.createElement("button");
-    toolsBtn.textContent = "🛠 Tools";
-    const toolsMenu = document.createElement("div");
-    toolsMenu.className = "tools-menu hidden";
-    toolsWrap.append(toolsBtn, toolsMenu);
-    bar.insertBefore(toolsWrap, bar.lastChild);
-
-    toolsBtn.onclick = (e) => {
-      e.stopPropagation();
-      toolsMenu.classList.toggle("hidden");
-    };
-    document.addEventListener("click", () => toolsMenu.classList.add("hidden"));
-
+    // Video-kind tools are appended into the shared "🛠 Tools" dropdown built by
+    // makeToolbar (which already holds "Open in OS"); no second dropdown here.
     const body = document.createElement("div");
     body.className = "viewer-body";
     const wrap = document.createElement("div");
@@ -463,8 +555,8 @@ const Viewer = (() => {
     overlay._textEl = textEl;
     const copyBtn = document.createElement("button");
     copyBtn.className = "subtitle-copy";
-    copyBtn.textContent = "📋";
-    copyBtn.title = "Copy subtitle to chat input";
+    copyBtn.textContent = "📋 To chat";
+    copyBtn.title = "Add this subtitle line to the chat input";
     copyBtn.style.display = "none";
     overlay._copyBtn = copyBtn;
     copyBtn.onclick = () => { if (overlay._text && subtitleCopyHandler) subtitleCopyHandler(overlay._text); };
@@ -486,6 +578,7 @@ const Viewer = (() => {
         onClick();
       };
       subMenu.appendChild(b);
+      return b;
     }
     subMenuItem("Enable Subtitles", () => {
       subStyle.enabled = true;
@@ -501,8 +594,31 @@ const Viewer = (() => {
     subMenuItem("Subtitle Settings", () => {
       controls.style.display = controls.style.display === "none" ? "flex" : "none";
     });
+    const subGenItems = [];
+    if (subtitleActions) {
+      subMenuItem("Import Subtitles to Repository", () => subtitleActions.importRepo(filePath));
+      subGenItems.push({
+        btn: subMenuItem("Generate Mind Map from Subtitles", () => subtitleActions.mindmap(filePath)),
+        tool: "mindmap",
+      });
+      subGenItems.push({
+        btn: subMenuItem("Generate Slides from Subtitles", () => subtitleActions.slides(filePath)),
+        tool: "slides",
+      });
+    }
+    // While a background toolkit job for the same tool runs, grey the generate item out
+    // (the sidebar session rows lock the same way) so two runs can't overlap. The chat
+    // toolbar "Mind Map" entry is unaffected — that is a different, non-subtitle entry.
+    function refreshSubtitleBusy() {
+      for (const { btn, tool } of subGenItems) {
+        const busy = subtitleBusy ? subtitleBusy(tool) : false;
+        btn.disabled = busy;
+        btn.title = busy ? "A generation for this is already running in the background." : "";
+      }
+    }
     subBtn.onclick = (e) => {
       e.stopPropagation();
+      refreshSubtitleBusy();
       subMenu.classList.toggle("hidden");
     };
     document.addEventListener("click", () => subMenu.classList.add("hidden"));
@@ -554,14 +670,9 @@ const Viewer = (() => {
       if (auto) await loadSubtitleFrom(auto);
     })();
 
+    // Append into the shared Tools dropdown (closes it on click, like makeToolbar items).
     function menuItem(label, onClick) {
-      const b = document.createElement("button");
-      b.textContent = label;
-      b.onclick = () => {
-        toolsMenu.classList.add("hidden");
-        onClick();
-      };
-      toolsMenu.appendChild(b);
+      bar._toolItem(label, onClick);
     }
 
     menuItem("📷 Screenshot", async () => {
@@ -914,6 +1025,27 @@ const Viewer = (() => {
       };
 
       const spacer = bar.querySelector(".spacer");
+      // PDF opens in "clean" mode: the annotation/zoom tools are collapsed so the toolbar
+      // only shows Edit / Fullscreen / Attach / Tools / Screenshot. "✏ Edit" or a right-click
+      // on the page reveals the full tool set again.
+      for (const node of [selectBtn, drawBtn, eraseBtn, noteBtn, colorInput, widthInput, exportBtn, clearBtn]) {
+        node.classList.add("pdf-tool");
+      }
+      const editBtn = document.createElement("button");
+      editBtn.title = "Show / hide annotation & zoom tools";
+      const togglePdfTools = () => {
+        const clean = bar.classList.toggle("pdf-clean");
+        editBtn.textContent = clean ? "✏ Edit" : "✕ Close edit";
+      };
+      editBtn.onclick = togglePdfTools;
+      bar.insertBefore(editBtn, spacer);
+      bar.classList.add("pdf-clean");
+      editBtn.textContent = "✏ Edit";
+      container.addEventListener("contextmenu", (e) => {
+        if (e.target.closest("button, input, textarea")) return;
+        e.preventDefault();
+        togglePdfTools();
+      });
       bar.insertBefore(clearBtn, spacer);
       bar.insertBefore(exportBtn, spacer);
       bar.insertBefore(widthInput, spacer);
@@ -1243,14 +1375,9 @@ const Viewer = (() => {
     // The cloud drive view renders its own toolbar (view toggle / search / actions),
     // so the plain local-file toolbar is skipped there.
     if (!opts.cloudTable) {
-      const bar = makeToolbar(state.name, localPath);
-      if (!localPath) {
-        const osBtn = Array.from(bar.querySelectorAll("button")).find(
-          (b) => b.textContent === "Open in OS"
-        );
-        if (osBtn) osBtn.remove();
-      }
-      el.appendChild(bar);
+      // makeToolbar builds the "🛠 Tools" dropdown (with "Open in OS") only when a local
+      // OS path exists — a cloud browse passes null, so no Open-in-OS entry is offered.
+      el.appendChild(makeToolbar(state.name, localPath));
     }
 
     // Breadcrumb: root crumb + each ancestor segment; clicking navigates up.
@@ -1610,5 +1737,5 @@ const Viewer = (() => {
     return state.path != null && state.kind !== "folder";
   }
 
-  return { render, renderFolder, kindFor, localUrl, toast, close, setAttachHandler, setSubtitleCopyHandler, isOpen };
+  return { render, renderFolder, kindFor, localUrl, toast, close, setAttachHandler, setSubtitleCopyHandler, setSubtitleActions, setSubtitleBusy, setDocGenerateBusy, setDocumentActions, isOpen };
 })();

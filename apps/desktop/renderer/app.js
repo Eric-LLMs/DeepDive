@@ -28,7 +28,17 @@
     importedByMsgId: new Map(),  // message id → true when its content is in the query repo (active session)
     sessionImported: false,    // true when every current user message of the session is covered
     sessionImportedLegacy: false, // legacy pre-coverage whole-session import (no per-message data)
+    // Research session state machine (T4): every task owns exactly one chat session (bound at
+    // creation), opened silently on selection. ``activeResearch`` is the task whose session the
+    // chat is currently in (session_id may be null before the first typed message binds it);
+    // ``neutralSessionId`` is the normal chat session restored when the user leaves Research.
+    activeResearch: null,      // { task_id, name, session_id } | null
+    neutralSessionId: null,    // normal session id to restore on leaving the Research tab
   };
+  // session_id → { task_id, name, stage, status } for every chat session bound to one of this
+  // user's research tasks (hidden from the Sessions sidebar). Populated by research.js from
+  // task statuses and by app.js when a research turn's session is created.
+  window.researchSessions = window.researchSessions || new Map();
   try { state.token = localStorage.getItem("deepdive_token"); } catch { /* ignore */ }
   try { state.guestId = localStorage.getItem("deepdive_guest_id"); } catch { /* ignore */ }
   // Restore cached identity so the bottom bar shows the username immediately,
@@ -45,6 +55,14 @@
       state.avatar = cachedUser.avatar ?? null;
     }
   } catch { /* ignore */ }
+
+  // Open a local file in the viewer, clearing any cloud-asset marker first so the doc
+  // toolbar's Upload / Import / Generate act on THIS local file (uploading it on demand)
+  // rather than a stale cloud asset from an earlier cloud open.
+  function openLocalFile(path, name) {
+    window.__setViewerCloudFile?.(null);
+    Viewer.render(path, name);
+  }
 
   // ── File tree ──
   // expandPaths: an optional Set of absolute dir paths that must render open (used to
@@ -72,7 +90,7 @@
         deleteFileFromWorkspace(node.path);
       });
       row.appendChild(del);
-      row.addEventListener("click", () => Viewer.render(node.path, node.name));
+      row.addEventListener("click", () => openLocalFile(node.path, node.name));
       return row;
     }
     const wrapper = document.createElement("div");
@@ -240,7 +258,7 @@
   // its row in the tree (expands only the ancestor chain) and flashes it.
   function openLocalSearchHit(node) {
     clearLocalSearch();
-    Viewer.render(node.path, node.name);
+    openLocalFile(node.path, node.name);
   }
 
   function revealLocalDir(dirPath) {
@@ -311,7 +329,7 @@
         rootName: workspaceDisplayName(state.workspaceDir),
         path: rel,
         read: readLocalDir,
-        open: (entry) => Viewer.render(entry.path, entry.name),
+        open: (entry) => openLocalFile(entry.path, entry.name),
         localPath: res.localPath,
       });
     } catch (err) {
@@ -351,7 +369,7 @@
   // false silently), so both are replaced by small overlay modals using the app's
   // modal styles. Exposed on window because clouddrive.js (a separate IIFE loaded
   // after this file) reuses them for the cloud note editor.
-  window.promptModal = ({ title, placeholder = "", initial = "", multiline = false, okLabel = "Create" } = {}) => {
+  window.promptModal = ({ title, placeholder = "", initial = "", multiline = false, okLabel = "Create", size = "", hint = "" } = {}) => {
     return new Promise((resolve) => {
       const overlay = document.createElement("div");
       overlay.className = "overlay";
@@ -359,12 +377,13 @@
         ? '<textarea class="cd-prompt-input" rows="5"></textarea>'
         : '<input class="cd-prompt-input" type="text" />';
       overlay.innerHTML = `
-        <div class="modal cd-prompt-modal">
+        <div class="modal cd-prompt-modal${size === "lg" ? " lg" : ""}">
           <div class="modal-header">
             <h3></h3>
             <button type="button" class="modal-close" title="Cancel">×</button>
           </div>
           <label></label>
+          <p class="cd-prompt-hint"></p>
           <div class="modal-actions">
             <button type="button" class="cd-prompt-cancel">Cancel</button>
             <button type="button" class="primary cd-prompt-ok"></button>
@@ -375,6 +394,9 @@
       const input = overlay.querySelector(".cd-prompt-input");
       input.placeholder = placeholder;
       input.value = initial;
+      const hintEl = overlay.querySelector(".cd-prompt-hint");
+      if (hint) hintEl.textContent = hint;
+      else hintEl.remove();
       overlay.querySelector(".cd-prompt-ok").textContent = okLabel;
       const done = (val) => { overlay.remove(); resolve(val); };
       overlay.querySelector(".modal-close").addEventListener("click", () => done(null));
@@ -1476,14 +1498,23 @@
     return headers;
   }
 
-  async function sendChat(message) {
+  async function sendChat(message, extra = {}, opts = {}) {
     // Render the user message with the staged attachment (if any) so the image/file shows
     // inline immediately; the pendingAttach payload is consumed below for the request.
     const pending = pendingAttach;
     const userMsgEl = appendMessage(null, "user", message, pending);
     const hadSession = !!state.sessionId;
     chatSend.disabled = true;
-    const payload = { message, session_id: state.sessionId ?? undefined };
+    // A message sent while a research task's session is active drives THAT task: attach the
+    // research handoff so the agent targets the task and gets the research tool grant. The
+    // server re-synthesizes the same handoff for an already-bound session, so sending it on
+    // every message is safe — it never forks a new task or session. Opening a task's session
+    // is side-effect free; only a typed message here actually runs the task.
+    const research = state.activeResearch;
+    if (research) {
+      extra = { ...extra, handoff: { kind: "research", project_id: research.task_id, mode: "research_resume" } };
+    }
+    const payload = { message, session_id: state.sessionId ?? undefined, ...extra };
     if (!state.token) payload.user_id = state.guestId ?? undefined;
     if (pendingAttach) {
       payload.attach = pendingAttach;
@@ -1527,6 +1558,20 @@
           gotDone = true;
           if (statusBar) statusBar.done(); // settle the label even on tool-only rounds
           state.sessionId = evt.data.session_id ?? state.sessionId;
+          // A research turn that just created/bound its session: record it so the session is
+          // recognized as a task's dedicated chat (hidden from the sidebar, chip shown) and
+          // remember it on the active research context for the next open. research.js also
+          // records ids from task statuses, so this just covers the first-turn seed.
+          if (research && state.sessionId) {
+            (window.researchSessions = window.researchSessions || new Map()).set(state.sessionId, {
+              task_id: research.task_id,
+              name: research.name,
+              stage: null,
+              status: null,
+            });
+            research.session_id = state.sessionId;
+          }
+          if (state.activeResearch) updateResearchChip();
           if (!state.token && evt.data.user_id) {
             state.guestId = evt.data.user_id;
             try { localStorage.setItem("deepdive_guest_id", evt.data.user_id); } catch { /* ignore */ }
@@ -1561,6 +1606,15 @@
         body: JSON.stringify(payload),
       });
       if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
+      if (res.status === 409) {
+        // Research run conflict (task already RUNNING, or the report is in the Knowledge
+        // Base): the turn was rejected before any message was persisted — drop the optimistic
+        // user bubble and surface the server's reason instead.
+        const body = await res.json().catch(() => ({}));
+        userMsgEl.remove();
+        appendMsg("error", body.detail || "The research task is currently running.");
+        return;
+      }
       if (res.status === 429) {
         const body = await res.json().catch(() => ({}));
         if (!state.token) {
@@ -1825,6 +1879,12 @@
   // generate dialog can show the previous submission's status + produced files when reopened,
   // and to disable "Generate" while a job is still running (one job per tool at a time).
   const toolkitJobs = {};
+  // Per-source background-job trackers for the document / subtitle file-generation flows.
+  // Kept apart from toolkitJobs so a file-generated job locks ONLY the entry that started it
+  // (the document's Generate → Mind Map item, or the subtitle "Generate Mind Map from
+  // Subtitles") while the chat-toolbar buttons stay independent.
+  const docGenJobs = {};
+  const subtitleGenJobs = {};
   // tool -> { src, cloudFiles, folderPath, name, prompt } — the dialog's submitted inputs,
   // kept across close/reopen so the window shows exactly what was submitted while the job runs.
   const genDialogState = {};
@@ -1900,6 +1960,238 @@
     if (result) showSessionArtifactResult(info, result);
   };
 
+  // ── Research session switching (T4) ──────────────────────────────────────
+  // A research task owns exactly one chat session, bound at creation. Selecting a task is
+  // side-effect free: it only opens that session's history in the chat (the model stays
+  // silent); running the task is the user typing an instruction in the session. Switching
+  // between tasks swaps the chat to each task's own session — never a forked one — and
+  // leaving the Research tab restores the last normal chat.
+
+  function isResearchSession(sessionId) {
+    return !!sessionId && !!window.researchSessions && window.researchSessions.has(sessionId);
+  }
+
+  // Research-mode chat header: a full-width sub bar (below the top control bar) carries the
+  // task title + live stage while the active chat is a task's dedicated session, and the
+  // truncated session title in the top bar is hidden (the sub bar has the full name). Clicking
+  // the sub bar jumps to the task's working-directory view.
+  function updateResearchChip() {
+    const bar = document.getElementById("chat-research-bar");
+    const header = document.getElementById("chat-header");
+    const info = state.activeResearch;
+    if (!info) {
+      bar.classList.add("hidden");
+      header.classList.remove("research-mode");
+      return;
+    }
+    const meta = info.session_id ? window.researchSessions.get(info.session_id) : null;
+    const stage = (meta && meta.stage) || "";
+    const title = bar.querySelector(".crc-title");
+    const st = bar.querySelector(".crc-stage");
+    if (title) title.textContent = `🔬 Research · ${info.name || info.task_id}`;
+    if (st) {
+      if (stage) { st.textContent = stage; st.classList.remove("hidden"); }
+      else st.classList.add("hidden");
+    }
+    bar.classList.remove("hidden");
+    header.classList.add("research-mode"); // hides the truncated #chat-title in the top bar
+  }
+  window.updateResearchChip = updateResearchChip;
+  const researchBarEl = document.getElementById("chat-research-bar");
+  if (researchBarEl) {
+    researchBarEl.addEventListener("click", () => {
+      if (!state.activeResearch) return;
+      switchTab("research");
+      if (window.selectResearchTask) {
+        window.selectResearchTask(state.activeResearch.task_id, state.activeResearch.name);
+      }
+    });
+  }
+
+  // Live stage for the 🔬 chip: while a research session is active, refresh the task's stage/
+  // status from the lightweight task list so the badge stays current during a run (the heavy
+  // per-task status with cloud_files is only fetched on selection).
+  let researchChipTimer = null;
+  function startResearchChipPoll() {
+    stopResearchChipPoll();
+    researchChipTimer = setInterval(async () => {
+      const info = state.activeResearch;
+      if (!info || !state.token) return;
+      try {
+        const res = await fetch("/api/research/tasks", { headers: authHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        const t = (data.tasks || []).find((x) => x.task_id === info.task_id);
+        if (t && t.session_id) {
+          window.researchSessions.set(t.session_id, {
+            task_id: t.task_id, name: t.name || t.task_id, stage: t.stage, status: t.status,
+          });
+          updateResearchChip();
+        }
+      } catch { /* transient — keep polling */ }
+    }, 10000);
+  }
+  function stopResearchChipPoll() {
+    if (researchChipTimer) { clearInterval(researchChipTimer); researchChipTimer = null; }
+  }
+
+  // Restore the neutral (non-research) chat after leaving the Research tab.
+  function openNeutralSession() {
+    const sid = state.neutralSessionId;
+    if (sid) {
+      if (state.sessionId !== sid) resumeSession(sid);
+    } else {
+      newChat();
+    }
+  }
+
+  // Open a research task's dedicated session in the chat — silent, no message is sent. This
+  // is the only way the chat enters a research session, and it always reuses the task's bound
+  // session_id, so repeated opens never fork a new session. The 🔬 chip turns on; the user
+  // drives the task by typing a run instruction (sendChat attaches the research handoff).
+  window.openResearchSession = async (taskId, name, sessionId) => {
+    // Already showing this task's session? Just refresh the badge — no reload, and no toast
+    // even while a run streams in it (re-selecting the task during a run is harmless).
+    if (sessionId && state.sessionId === sessionId) {
+      state.activeResearch = { task_id: taskId, name: name || taskId, session_id: sessionId };
+      window.researchSessions.set(sessionId, {
+        task_id: taskId, name: name || taskId, stage: null, status: null,
+      });
+      updateResearchChip();
+      startResearchChipPoll();
+      return;
+    }
+    // Switching to a different session mid-stream would reload history under an in-flight
+    // run — block the switch (the status pane still shows the clicked task, though).
+    if (chatSend.disabled) {
+      Viewer.toast("A research run is in progress — wait for it to finish.");
+      return;
+    }
+    state.activeResearch = { task_id: taskId, name: name || taskId, session_id: sessionId || null };
+    startResearchChipPoll();
+    if (sessionId) {
+      window.researchSessions.set(sessionId, {
+        task_id: taskId, name: name || taskId, stage: null, status: null,
+      });
+      updateResearchChip();
+      await resumeSession(sessionId);
+    } else {
+      // No bound session yet (rare — session creation failed at task creation): a fresh chat;
+      // the first typed message creates and binds it via the research handoff.
+      updateResearchChip();
+      newChat();
+    }
+  };
+
+  // "＋ Research" in the chat header: create a research task atomically (folder + materials
+  // in one POST), then start a fresh chat that drives it via the deep_research skill. The
+  // left Research sidebar refreshes immediately so the new task shows up at the top.
+  async function openResearchTaskDialog() {
+    if (!state.token) { Viewer.toast("Sign in to create a research task."); openAccount(); return; }
+    const overlay = document.createElement("div");
+    overlay.className = "overlay";
+    overlay.innerHTML = `
+      <div class="modal cd-prompt-modal lg">
+        <div class="modal-header">
+          <h3>New Research</h3>
+          <button type="button" class="modal-close" title="Cancel">×</button>
+        </div>
+        <label>Working directory
+          <div class="rq-workdir">
+            <button type="button" class="ghost" id="rq-pick-dir">📁 Choose folder…</button>
+            <span class="rq-workdir-path" id="rq-workdir-path">Cloud Drive (root)</span>
+          </div>
+        </label>
+        <label>Task title
+          <input class="cd-prompt-input" id="rq-title" type="text" placeholder="e.g. How do vector DBs compare on recall vs latency?" />
+        </label>
+        <label>Description
+          <textarea class="cd-prompt-input" id="rq-desc" rows="4" placeholder="Optional context for the agent…"></textarea>
+        </label>
+        <div class="rq-files">
+          <button type="button" class="ghost" id="rq-add-files">＋ Add files</button>
+          <div id="rq-files-list" class="rq-files-list"></div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="cd-prompt-cancel">Cancel</button>
+          <button type="button" class="primary" id="rq-create">Create task</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const closeModal = () => overlay.remove();
+    overlay.querySelector(".modal-close").addEventListener("click", closeModal);
+    overlay.querySelector(".cd-prompt-cancel").addEventListener("click", closeModal);
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeModal(); });
+    const filesListEl = overlay.querySelector("#rq-files-list");
+    const workdirPathEl = overlay.querySelector("#rq-workdir-path");
+    const chosen = [];
+    let parentFolderPath = ""; // cloud My Drive working directory; "" = root
+    overlay.querySelector("#rq-pick-dir").addEventListener("click", async () => {
+      const picked = await window.pickDriveFolderModal("Select working directory", {
+        prompt: false,
+        okLabel: "Select",
+      });
+      if (!picked) return; // cancel keeps the previous selection
+      parentFolderPath = picked.folderPath || "";
+      workdirPathEl.textContent = parentFolderPath
+        ? `My Drive / ${parentFolderPath.split("/").join(" / ")}`
+        : "Cloud Drive (root)";
+    });
+    overlay.querySelector("#rq-add-files").addEventListener("click", async () => {
+      const picked = await window.pickCloudFiles({ title: "Add research materials", okLabel: "Add" });
+      for (const f of picked) {
+        if (!chosen.some((c) => c.id === f.id)) chosen.push({ id: f.id, name: f.name || "file" });
+      }
+      filesListEl.innerHTML = "";
+      for (const c of chosen) {
+        const row = document.createElement("div");
+        row.className = "rq-file";
+        row.textContent = `📎 ${c.name}`;
+        filesListEl.appendChild(row);
+      }
+    });
+    const createBtn = overlay.querySelector("#rq-create");
+    createBtn.addEventListener("click", async () => {
+      const title = overlay.querySelector("#rq-title").value.trim();
+      if (!title) { Viewer.toast("Task title is required."); return; }
+      const description = overlay.querySelector("#rq-desc").value.trim();
+      createBtn.disabled = true;
+      createBtn.textContent = "Creating…";
+      try {
+        const res = await fetch("/api/research/tasks", {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({
+            title,
+            description,
+            parent_folder_path: parentFolderPath,
+            material_asset_ids: chosen.map((c) => c.id),
+          }),
+        });
+        if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `${res.status} ${res.statusText}`);
+        const created = await res.json();
+        closeModal();
+        // Jump to the Research monitor so the new task is highlighted, then open its
+        // dedicated session in the chat. Opening is side-effect free: the model stays silent
+        // until the user types a run instruction — creating a task never auto-starts it.
+        switchTab("research");
+        // Jump to the Research monitor so the new task is highlighted, then open its
+        // dedicated session in the chat. (selectResearchTask handles the list + status +
+        // working-directory render; a separate loadResearch here would double-render.)
+        if (window.selectResearchTask) window.selectResearchTask(created.task_id, title);
+        if (window.openResearchSession) {
+          window.openResearchSession(created.task_id, title, created.session_id || null);
+        }
+      } catch (err) {
+        Viewer.toast(`Create failed: ${err.message}`);
+        createBtn.disabled = false;
+        createBtn.textContent = "Create task";
+      }
+    });
+    overlay.querySelector("#rq-title").focus();
+  }
+
   // Poll the job every 2s with an auth header; resolve the result dict, or null on failure /
   // auth expiry. Generation genuinely takes a while (map-reduce of a large file + the final
   // generate call can exceed 20 minutes; the worker's own timeout is 1h), so keep polling
@@ -1933,6 +2225,40 @@
       if (job.status === "failed") {
         Viewer.toast(`Generation failed: ${job.error}`);
         if (tool) { entry.status = "failed"; entry.error = job.error; updateToolbarGenState(); }
+        return null;
+      }
+    }
+  }
+
+  // Same background polling as pollSessionJob but for document / subtitle file-generation
+  // jobs: the live status is recorded into the given per-source map (never toolkitJobs), so
+  // the entry that started the job can lock itself while the chat-toolbar buttons stay
+  // unaffected. Returns the result dict on success, null on failure/cancel.
+  async function pollFileJob(jobId, tool, jobsMap) {
+    const entry = { jobId, status: "queued", result: null, error: null, startedAt: Date.now() };
+    if (tool && jobsMap) jobsMap[tool] = entry;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 2000));
+      let res;
+      try {
+        res = await fetch(`/api/jobs/${jobId}`, { headers: authHeaders() });
+      } catch { continue; }  // transient network hiccup — keep waiting
+      if (res.status === 401) {
+        Viewer.toast("Session expired; log in again.");
+        if (tool && jobsMap) { entry.status = "failed"; entry.error = "Session expired; log in again."; }
+        return null;
+      }
+      if (!res.ok) continue;  // transient server error — keep waiting
+      let job;
+      try { job = await res.json(); } catch { continue; }
+      if (tool) entry.status = job.status;
+      if (job.status === "succeeded") {
+        if (tool) { entry.status = "succeeded"; entry.result = job.result || {}; }
+        return job.result || {};
+      }
+      if (job.status === "failed") {
+        Viewer.toast(`Generation failed: ${job.error}`);
+        if (tool) { entry.status = "failed"; entry.error = job.error; }
         return null;
       }
     }
@@ -3346,13 +3672,14 @@
     // header right after the "Chat" title, so the composer stays a single lean line
     // (＋ textarea … 🎤 🔊 Send) with its right side freed up.
     const header = document.getElementById("chat-header");
+    const topbar = document.getElementById("chat-topbar") || header;
     const toolbar = document.getElementById("chat-toolbar");
     if (right) {
       header.after(toolbar);
-      header.classList.remove("has-tools");
+      topbar.classList.remove("has-tools");
     } else {
       chatTitle.after(toolbar);
-      header.classList.add("has-tools");
+      topbar.classList.add("has-tools");
     }
   }
   chatDock.addEventListener("click", () => {
@@ -3762,6 +4089,311 @@
     chatInput.scrollTop = chatInput.scrollHeight;
   });
 
+  // ── File actions: upload / import / generate for documents & subtitles ──
+  // All operate on the CURRENT open file and never on a chat session. The toolkit worker is
+  // containerized and can't read host paths, so local files are uploaded to the Cloud Drive
+  // first (cloud-file mode); cloud assets are used directly and never re-uploaded.
+
+  // Read a local file and upload it to the Cloud Drive; returns the drive asset.
+  async function readLocalToAsset(path, name, folder_path = null) {
+    const read = await window.desktopAPI.readFileBytes(path);
+    if (!read.ok) throw new Error(read.error || "Cannot read the file");
+    Viewer.toast("Uploading to your Cloud Drive…");
+    return await uploadBytesToCloud(read.data, name, folder_path, "text/plain");
+  }
+
+  // Whether a live file with this exact name already sits in the folder (root = null). The
+  // server would otherwise auto-suffix the duplicate ("name (2).pdf"), so this bails before
+  // a redundant copy is created.
+  async function findCloudFile(folderPath, name) {
+    const res = await fetch("/api/files", { headers: authHeaders() });
+    if (!res.ok) return null;
+    const { files = [] } = await res.json();
+    const target = folderPath || null;
+    return files.find((f) => (f.folder_path || null) === target && f.name === name) || null;
+  }
+
+  // Explicit "Upload" button (local documents only): pick the target Cloud Drive folder
+  // (default root), skip the upload if a file with the same name is already there, and guard
+  // against double-clicks so one click can never enqueue two copies.
+  async function uploadCurrentToCloud({ path, name }) {
+    if (!state.token) { Viewer.toast("Sign in to upload."); return; }
+    let folderPath = null;
+    try {
+      const picked = await window.pickDriveFolderModal("Upload to Cloud Drive — choose folder", {
+        prompt: false, okLabel: "Upload here",
+      });
+      if (picked === undefined) return; // cancelled
+      folderPath = picked.folderPath || null;
+    } catch (err) {
+      Viewer.toast(`Could not load cloud folders: ${err.message}`);
+      return;
+    }
+    try {
+      const dup = await findCloudFile(folderPath, name);
+      if (dup) {
+        Viewer.toast(`"${name}" already exists in ${folderPath ? `"${folderPath}"` : "Cloud Drive root"} — not uploading again.`);
+        return;
+      }
+    } catch { /* best-effort duplicate check — proceed */ }
+    try {
+      const asset = await readLocalToAsset(path, name, folderPath);
+      Viewer.toast(`✅ "${asset.name}" uploaded to your Cloud Drive${folderPath ? ` (${folderPath})` : ""}.`);
+      if (window.loadCloudDrive) { try { window.loadCloudDrive(); } catch { /* best-effort */ } }
+    } catch (err) {
+      Viewer.toast(`Upload failed: ${err.message}`);
+    }
+  }
+
+  // Import the open document/subtitle into the query repository (RAG). import-rag is the
+  // drive's manual "Import to Knowledge" job; the ingest pipeline parses .pdf/.docx/.txt/
+  // .srt/… and chunks the text into the repository.
+  async function importFileToRepo({ path, name, cloud }) {
+    if (!state.token) { Viewer.toast("Sign in to import."); return; }
+    try {
+      const asset = cloud && cloud.id ? cloud : await readLocalToAsset(path, name);
+      const res = await fetch(`/api/files/${asset.id}/import-rag`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `${res.status}`);
+      }
+      const data = await res.json();
+      Viewer.toast(`⏳ "${asset.name}" queued for the repository (job ${String(data.job_id || "").slice(0, 8)}…)`);
+    } catch (err) {
+      Viewer.toast(`Import failed: ${err.message}`);
+    }
+  }
+
+  // Generate dialog for the open document/subtitle: the source is fixed to that file (the
+  // uploaded drive asset, or the existing asset for cloud files), with a Cloud Drive output-
+  // folder picker, an optional file name, and an optional prompt.
+  async function openFileGenerateDialog(tool, { path, name, cloud, sourceLabel, jobsMap }) {
+    const label = TOOLKIT_LABELS[tool] || tool;
+    let asset;
+    try {
+      asset = cloud && cloud.id ? cloud : await readLocalToAsset(path, name);
+    } catch (err) {
+      Viewer.toast(`Upload failed: ${err.message}`);
+      return;
+    }
+    const defaultPrompt = await fetchToolkitDefaultPrompt(tool);
+
+    function sanitizeLike(title) {
+      const s = (title || "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, " ").trim();
+      if (!s) return "source";
+      return s.length > 80 ? s.slice(0, 80) : s;
+    }
+    function stemLike(nm) {
+      const i = (nm || "").lastIndexOf(".");
+      return i > 0 ? nm.slice(0, i) : nm;
+    }
+    function defaultArtifactNames(toolName, title) {
+      const safe = sanitizeLike(title);
+      if (toolName === "mindmap") return [`${safe}_mindmap.mmd`];
+      if (toolName === "summary") return [`${safe}_summary.md`];
+      return [`${safe}_slides.md`, `${safe}_slides.pptx`];
+    }
+
+    const overlay = document.createElement("div");
+    overlay.className = "overlay";
+    const modal = document.createElement("div");
+    modal.className = "modal cd-gen-modal";
+    const header = document.createElement("div");
+    header.className = "modal-header";
+    const h = document.createElement("h3");
+    h.textContent = `Generate ${label}`;
+    const close = document.createElement("button");
+    close.type = "button"; close.className = "modal-close"; close.innerHTML = "&times;"; close.title = "Cancel";
+    header.append(h, close);
+
+    const body = document.createElement("div");
+    body.className = "cd-gen-body";
+
+    const srcLabel = document.createElement("div");
+    srcLabel.className = "cd-gen-label";
+    srcLabel.textContent = "Source";
+    const srcRow = document.createElement("div");
+    srcRow.className = "cd-gen-sources";
+    const srcCard = document.createElement("button");
+    srcCard.type = "button";
+    srcCard.className = "cd-src-option cd-active";
+    srcCard.innerHTML = `<b>📄 ${escapeHtml(asset.name)}</b><span>${escapeHtml(sourceLabel || "The currently open file")}</span>`;
+    srcRow.append(srcCard);
+    body.append(srcLabel, srcRow);
+
+    const dirLabel = document.createElement("div");
+    dirLabel.className = "cd-gen-label";
+    dirLabel.textContent = "Output folder";
+    const dirRow = document.createElement("div");
+    dirRow.className = "cd-gen-dir";
+    const dirVal = document.createElement("span");
+    dirVal.className = "cd-gen-dir-val";
+    const dirBtn = document.createElement("button");
+    dirBtn.type = "button";
+    dirBtn.className = "cd-gen-add";
+    dirBtn.textContent = "Choose folder…";
+    dirRow.append(dirVal, dirBtn);
+    body.append(dirLabel, dirRow);
+
+    const nameLabel = document.createElement("div");
+    nameLabel.className = "cd-gen-label";
+    nameLabel.textContent = "File name (optional)";
+    const nameInput = document.createElement("input");
+    nameInput.className = "cd-gen-name";
+    nameInput.type = "text";
+    nameInput.spellcheck = false;
+    const nameHint = document.createElement("div");
+    nameHint.className = "cd-gen-name-hint";
+    body.append(nameLabel, nameInput, nameHint);
+
+    const promptLabel = document.createElement("div");
+    promptLabel.className = "cd-gen-label";
+    promptLabel.textContent = "Prompt";
+    const promptEl = document.createElement("textarea");
+    promptEl.className = "cd-gen-prompt";
+    promptEl.rows = 5;
+    promptEl.spellcheck = false;
+    promptEl.placeholder = defaultPrompt || "Optional: write your own requirements here…";
+    body.append(promptLabel, promptEl);
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "cd-gen-cancel";
+    cancelBtn.textContent = "Cancel";
+    const okBtn = document.createElement("button");
+    okBtn.type = "button";
+    okBtn.className = "primary cd-gen-ok";
+    okBtn.textContent = "Generate";
+    actions.append(cancelBtn, okBtn);
+
+    modal.append(header, body, actions);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    let folderPath = null;
+    const stem = stemLike(asset.name);
+
+    function refresh() {
+      dirVal.textContent = folderPath
+        ? `☁️ My Drive / ${folderPath.split("/").join(" / ")}`
+        : "☁️ Cloud Drive (root)";
+      const typed = nameInput.value.trim();
+      const baseTitle = typed || stem;
+      const names = defaultArtifactNames(tool, baseTitle || "source");
+      nameHint.textContent = (typed ? "Will create: " : "Default: ") + names.join(" / ");
+      nameInput.placeholder = defaultArtifactNames(tool, stem || "source")[0].replace(/\.\w+$/, "");
+    }
+
+    function finish() {
+      document.removeEventListener("keydown", onEsc);
+      overlay.remove();
+    }
+    function onEsc(e) {
+      if (e.key !== "Escape") return;
+      const overlays = document.querySelectorAll(".overlay");
+      if (overlays.length && overlays[overlays.length - 1] !== overlay) return;
+      finish();
+    }
+
+    dirBtn.addEventListener("click", async () => {
+      const picked = await window.pickDriveFolderModal("Choose output folder", { prompt: false, okLabel: "Select" });
+      if (picked === undefined) return;
+      folderPath = picked.folderPath || null;
+      refresh();
+    });
+    nameInput.addEventListener("input", refresh);
+    cancelBtn.addEventListener("click", finish);
+    close.addEventListener("click", finish);
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) finish(); });
+    document.addEventListener("keydown", onEsc);
+
+    okBtn.addEventListener("click", () => {
+      const prompt = promptEl.value.trim() || null;
+      const name = nameInput.value.trim() || null;
+      finish();
+      Viewer.toast(`Generating ${label}…`);
+      (async () => {
+        try {
+          const jobId = await submitCloudFilesJob(tool, [asset.id], prompt, folderPath, name);
+          // Track into the source-specific map so only the entry that started this job locks
+          // (the chat toolbar buttons are driven by toolkitJobs and stay independent).
+          const result = await pollFileJob(jobId, tool, jobsMap);
+          if (result) showSessionArtifactResult({ label }, result);
+        } catch (err) {
+          Viewer.toast(`Generation failed: ${err.message}`);
+          if (tool && jobsMap) {
+            jobsMap[tool] = { jobId: null, status: "failed", result: null, error: err.message, startedAt: Date.now() };
+          }
+        }
+      })();
+    });
+
+    refresh();
+  }
+
+  // The video's whole subtitle file, always a local sibling; no chat session, no upload
+  // here — return the source (path + name) or null with a prompt when none exists.
+  async function subtitleSource(filePath) {
+    if (!state.token) { Viewer.toast("Sign in first."); return null; }
+    if (!filePath) { Viewer.toast("No file open."); return null; }
+    const subtitle = await window.desktopAPI.findSubtitle(filePath);
+    if (!subtitle) {
+      Viewer.toast("No subtitle file found for this video — nothing to work from.");
+      return null;
+    }
+    return { path: subtitle, name: String(subtitle).split(/[\\/]/).pop() || "subtitle.srt" };
+  }
+
+  Viewer.setSubtitleActions({
+    importRepo: async (filePath) => {
+      const src = await subtitleSource(filePath);
+      if (src) importFileToRepo({ ...src, cloud: null });
+    },
+    mindmap: async (filePath) => {
+      const src = await subtitleSource(filePath);
+      if (src) openFileGenerateDialog("mindmap", { ...src, cloud: null, sourceLabel: "The current video's whole subtitle file", jobsMap: subtitleGenJobs });
+    },
+    slides: async (filePath) => {
+      const src = await subtitleSource(filePath);
+      if (src) openFileGenerateDialog("slides", { ...src, cloud: null, sourceLabel: "The current video's whole subtitle file", jobsMap: subtitleGenJobs });
+    },
+  });
+
+  // Grey out the subtitle "Generate … from Subtitles" items while a background subtitle
+  // generation job for the same tool is still running (one run per tool at a time, like the
+  // sidebar session rows lock during a background generation). Document-generated jobs and
+  // the chat toolbar buttons are tracked separately and stay unaffected.
+  Viewer.setSubtitleBusy((tool) => {
+    const l = subtitleGenJobs[tool];
+    return !!(l && (l.status === "queued" || l.status === "running"));
+  });
+
+  // Document viewer actions (pdf/docx/doc/text/sheet/pptx): Upload / Import / Generate.
+  // Cloud assets act on the existing drive asset (no re-upload); local files upload on demand.
+  Viewer.setDocumentActions(({ path, name }) => {
+    const cloud = window.__cloudDriveActive === true ? (window.__getViewerCloudFile?.() || null) : null;
+    return {
+      upload: cloud && cloud.id ? null : () => uploadCurrentToCloud({ path, name }),
+      importRepo: () => importFileToRepo({ path, name, cloud }),
+      generate: (tool) => openFileGenerateDialog(tool, { path, name, cloud, sourceLabel: "The currently open file", jobsMap: docGenJobs }),
+    };
+  });
+
+  // The document toolbar's "Generate" dropdown greys out the specific item whose background
+  // file-generation job is still running — and ONLY that entry. Chat-toolbar buttons and the
+  // subtitle menu track their own jobs, so a document mind map locks the document's Mind Map
+  // item, never the chat window's.
+  Viewer.setDocGenerateBusy((tool) => {
+    const l = docGenJobs[tool];
+    return !!(l && (l.status === "queued" || l.status === "running"));
+  });
+
   // The chat input ＋ button: open an OS file picker, upload the chosen file to the
   // cloud drive, and stage it as the pending attachment (rides on the next send).
   const chatAttachPick = document.getElementById("chat-attach-pick");
@@ -3780,39 +4412,91 @@
     }
   });
 
-  // ── Sidebar tabs (Files / Sessions) ──
+  // ── Sidebar tabs (Files / Sessions / Research) ──
   const tabFiles = document.getElementById("tab-files");
   const tabSessions = document.getElementById("tab-sessions");
+  const tabResearch = document.getElementById("tab-research");
   const sessionsEl = document.getElementById("sessions");
   const sessionsList = document.getElementById("sessions-list");
+  const researchEl = document.getElementById("research");
   const fileSearch = document.getElementById("file-search");
   const sessionSearch = document.getElementById("session-search");
   const fileSearchClear = document.getElementById("file-search-clear");
   const sessionSearchClear = document.getElementById("session-search-clear");
   let sessionSearchTimer = null;
-  newChatBtn.addEventListener("click", newChat);
+  newChatBtn.addEventListener("click", () => {
+    // "New Chat" leaves research mode too: drop the 🔬 badge and any pending research handoff.
+    state.activeResearch = null;
+    updateResearchChip();
+    stopResearchChipPoll();
+    newChat();
+  });
+  // Chat-header "＋ New chat" (top bar, left of ＋ Research): same as the sidebar button.
+  const chatNewChat = document.getElementById("chat-new-chat");
+  if (chatNewChat) chatNewChat.addEventListener("click", () => {
+    state.activeResearch = null;
+    updateResearchChip();
+    stopResearchChipPoll();
+    newChat();
+  });
 
   function switchTab(name) {
     const isSessions = name === "sessions";
-    tabFiles.classList.toggle("active", !isSessions);
+    const isResearch = name === "research";
+    // Session state machine (T4): entering Research remembers the normal chat and (via
+    // research.js loadResearch) reopens the selected task's dedicated session; leaving
+    // Research drops the research mode and restores the neutral chat. Each task's session is
+    // 1:1 and reused on every open, so switching tabs/tasks never forks a new session.
+    const wasResearch = !!state.activeResearch;
+    if (isResearch) {
+      if (!wasResearch) {
+        state.neutralSessionId = isResearchSession(state.sessionId) ? null : state.sessionId;
+      }
+    } else if (wasResearch) {
+      state.activeResearch = null;
+      updateResearchChip();
+      stopResearchChipPoll();
+      // A research turn streaming in the chat can't be yanked out from under the run — the
+      // neutral chat restores on the next successful switch once the turn finishes.
+      if (!chatSend.disabled) openNeutralSession();
+    }
+    tabFiles.classList.toggle("active", !isSessions && !isResearch);
     tabSessions.classList.toggle("active", isSessions);
+    if (tabResearch) tabResearch.classList.toggle("active", isResearch);
     // The Files tab shows either the local tree or the cloud drive, depending on the
     // workspace-source dropdown (clouddrive.js writes window.__cloudDriveActive). The
-    // cloud panel must also be hidden on the Sessions tab, like the tree + search are.
+    // cloud panel must also be hidden on the Sessions/Research tabs, like tree + search.
     const cloudActive = window.__cloudDriveActive === true;
-    const showLocal = !isSessions && !cloudActive;
+    const showLocal = !isSessions && !isResearch && !cloudActive;
     treeEl.style.display = showLocal ? "" : "none";
     if (fileSearch) fileSearch.style.display = showLocal ? "" : "none";
     if (!showLocal) hideLocalSuggest();
     const cloudEl = document.getElementById("clouddrive");
-    if (cloudEl) cloudEl.classList.toggle("hidden", isSessions || !cloudActive);
+    if (cloudEl) cloudEl.classList.toggle("hidden", isSessions || isResearch || !cloudActive);
     const localCreate = document.getElementById("local-create");
     if (localCreate) localCreate.style.display = showLocal ? "" : "none";
     sessionsEl.classList.toggle("hidden", !isSessions);
+    if (researchEl) researchEl.classList.toggle("hidden", !isResearch);
     if (isSessions) loadSessions();
+    if (isResearch) window.loadResearch?.();
+    // On the Research tab the main pane shows the selected task's working-directory view
+    // (research.js fills it), or the read-only guide card when no task is selected; the
+    // document viewer is hidden so it never keeps showing a file from another tab.
+    const guideEl = document.getElementById("research-guide");
+    const viewerEl = document.getElementById("viewer");
+    const taskViewEl = document.getElementById("research-task-view");
+    const hasTask = !!window.currentResearchTask;
+    if (guideEl) guideEl.classList.toggle("hidden", !isResearch || hasTask);
+    if (taskViewEl) taskViewEl.classList.toggle("hidden", !isResearch || !hasTask);
+    if (viewerEl) viewerEl.style.display = isResearch ? "none" : "";
   }
   tabFiles.addEventListener("click", () => switchTab("files"));
   tabSessions.addEventListener("click", () => switchTab("sessions"));
+  if (tabResearch) tabResearch.addEventListener("click", () => switchTab("research"));
+  // "＋ Research" in the chat header: create a research task atomically, then the dialog
+  // opens a fresh chat that drives it via the deep_research skill.
+  const researchNewBtn = document.getElementById("chat-new-research");
+  if (researchNewBtn) researchNewBtn.addEventListener("click", openResearchTaskDialog);
   if (fileSearch) fileSearch.addEventListener("input", (e) => {
     applyFileSearch(e.target.value);
     renderLocalSuggest(e.target.value.trim());
@@ -4188,6 +4872,16 @@
     if (!btn) continue;
     genButtons[tool] = btn;
     btn.addEventListener("click", () => openGenerateDialog(tool));
+  }
+  // "⋯ More" affordance: a placeholder dropdown for future generation tools.
+  const genMoreBtn = document.getElementById("chat-gen-more");
+  const genMoreMenu = document.getElementById("chat-gen-more-menu");
+  if (genMoreBtn && genMoreMenu) {
+    genMoreBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      genMoreMenu.classList.toggle("hidden");
+    });
+    document.addEventListener("click", () => genMoreMenu.classList.add("hidden"));
   }
   updateToolbarGenState();
 })();

@@ -407,6 +407,19 @@ body {
   font-size: 12px;
 }
 .viewer-toolbar button:hover { background: #3a3a55; }
+.viewer-toolbar button.shot-btn { display: inline-flex; align-items: center; gap: 6px; }
+/* PDF clean mode: annotation + zoom tools collapse behind "✏ Edit" / right-click. */
+.viewer-toolbar.pdf-clean .pdf-tool,
+.viewer-toolbar.pdf-clean .zoom-tools { display: none !important; }
+.viewer-toolbar button.shot-btn .cam-ico {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 .viewer-toolbar button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .viewer-toolbar button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 .viewer-toolbar input[type="color"] {
@@ -1087,15 +1100,15 @@ pre.text-viewer {
 /* When the chat is docked as a wide bottom bar the toolbar sits in the header, right
    after the "Chat" title (.has-tools is toggled by syncDock): inline, no border, with
    the window-control actions pushed to the far right. */
-#chat-header.has-tools { justify-content: flex-start; }
-#chat-header.has-tools #chat-title { flex: 0 1 auto; }
-#chat-header.has-tools #chat-toolbar {
+.chat-topbar.has-tools { justify-content: flex-start; }
+.chat-topbar.has-tools #chat-title { flex: 0 1 auto; }
+.chat-topbar.has-tools #chat-toolbar {
   flex: 0 0 auto;
   padding: 0;
   border: none;
   margin-left: 8px;
 }
-#chat-header.has-tools .chat-header-actions { margin-left: auto; }
+.chat-topbar.has-tools .chat-header-actions { margin-left: auto; }
 .chat-tool-btn {
   flex: none;
   padding: 3px 9px;
@@ -1111,16 +1124,25 @@ pre.text-viewer {
    glow — the running state is conveyed only by the hourglass icon swapped in by
    updateToolbarGenState(), so the button keeps its normal resting look. */
 
-/* ── Chat header + docking ── */
+/* ── Chat header + docking ──
+   Two-layer header: a top control bar (session title, New chat / ＋ Research, window
+   controls) and a Research-mode sub bar (full task title + stage, full width). The sub bar
+   shows only while a research task session is active and replaces the truncated title. */
 #chat-header {
   flex-shrink: 0;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 10px;
+  flex-direction: column;
   border-bottom: 1px solid var(--border);
   font-size: 12px;
   color: var(--fg-dim);
+}
+.chat-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  min-width: 0;
 }
 #chat-title {
   flex: 1;
@@ -1134,6 +1156,46 @@ pre.text-viewer {
   margin-left: -4px;
 }
 #chat-title:hover { background: var(--bg-soft-2); color: var(--fg); }
+/* Research mode: the sub bar carries the full task name, so the truncated session title in
+   the top bar is redundant — hide it (the chat stays functional; it is that task's session).
+   With the title gone the top bar holds only the actions, so push them back to the right
+   edge (otherwise justify-content: space-between left-aligns the only remaining child). */
+#chat-header.research-mode #chat-title { display: none; }
+#chat-header.research-mode .chat-header-actions { margin-left: auto; }
+/* Research context sub bar: a full-width accent strip under the top bar. Clicking it jumps
+   to the task's working-directory view. */
+#chat-research-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 3px 12px;
+  font-size: 11px;
+  color: var(--accent);
+  background: rgba(124, 130, 255, 0.10);
+  border-top: 1px solid rgba(124, 130, 255, 0.22);
+  cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
+}
+#chat-research-bar .crc-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  font-weight: 500;
+}
+#chat-research-bar .crc-stage {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 6px;
+  background: var(--bg-soft);
+}
+#chat-research-bar:hover { background: rgba(124, 130, 255, 0.16); }
+#chat-research-bar.hidden { display: none; }
 .chat-title-input {
   flex: 1;
   min-width: 0;
@@ -1155,7 +1217,12 @@ pre.text-viewer {
 }
 #chat-header button:hover { background: #3a3a55; }
 #chat-header button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
-.chat-header-actions { display: flex; gap: 4px; align-items: center; }
+/* "＋ New chat" is a plain secondary action; "＋ Research" is the header's primary action,
+   outlined in the accent so it reads as a create-new button (a dialog, not a mode toggle). */
+#chat-new-chat { color: var(--fg); }
+#chat-new-research { border-color: var(--accent); color: var(--accent); }
+#chat-new-research:hover { background: var(--accent); color: #fff; }
+.chat-header-actions { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
 
 /* Floating chat window (draggable overlay, resizable via the bottom-right corner).
    ``resize: both`` needs ``overflow`` other than ``visible``; the message list scrolls
@@ -1355,6 +1422,9 @@ body.resizing-ew { cursor: ew-resize; }
 }
 .modal textarea:focus { outline: none; border-color: var(--accent); }
 .cd-prompt-modal { width: 380px; }
+.cd-prompt-modal.lg { width: 500px; max-width: 92vw; }
+.cd-prompt-modal.lg .cd-prompt-input { font-size: 13px; }
+.cd-prompt-hint { margin: 0; font-size: 11px; color: var(--fg-dim); line-height: 1.5; }
 .cd-confirm-msg { margin: 0; font-size: 13px; color: var(--fg); }
 .modal label.remember { flex-direction: row; align-items: center; gap: 8px; }
 .modal label.remember input { width: auto; }
@@ -2398,3 +2468,252 @@ body.resizing-ew { cursor: ew-resize; }
 .cdt-log-who { font-size: 12px; color: var(--fg); }
 .cdt-log-when { font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
 .cdt-log-action { margin-top: 2px; font-size: 12px; color: var(--fg-dim); }
+
+/* ── Research OS console (two-layer read-only monitor) ── */
+#tab-research { padding: 6px 10px; }
+#research {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow: hidden;
+  padding: 6px 8px;
+}
+#research.hidden { display: none; }
+/* Top = task list, bottom = selected task status; each scrolls independently. */
+.research-tasks { flex: 1; min-height: 0; overflow: auto; }
+.research-status {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.research-section-title { font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 4px; }
+.research-section { margin-bottom: 12px; }
+.research-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 4px;
+  background: var(--bg-soft);
+  cursor: pointer;
+}
+.research-row.selected { border-color: var(--accent); background: rgba(124, 108, 255, 0.08); }
+.research-row-main { flex: 1; min-width: 0; }
+.research-row-del {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  opacity: 0.55;
+}
+.research-row-del:hover { color: #ff6b6b; background: rgba(255, 107, 107, 0.12); opacity: 1; }
+.research-row-title { font-size: 12px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.research-row-sub { font-size: 11px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.research-empty { font-size: 12px; color: var(--fg-dim); padding: 8px; }
+.research-mini-btn {
+  padding: 3px 8px;
+  font-size: 11px;
+  background: var(--bg-soft-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.research-mini-btn:hover { background: #3a3a55; }
+
+/* Status head (task name + state) and Resume-in-Chat footer. */
+.research-status-head { margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px; }
+.research-status-name { font-size: 14px; font-weight: 600; color: var(--fg); line-height: 1.3; word-break: break-word; }
+.research-status-sub { font-size: 11px; color: var(--fg-dim); line-height: 1.4; }
+.research-status-empty { font-size: 12px; color: var(--fg-dim); padding: 8px 0; }
+.research-status-resume { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.research-status-resume .primary { font-size: 12px; padding: 6px 12px; }
+
+/* Discrete stage ladder: DISCOVER ✓ ➔ FRAME ● ➔ … ○ */
+.research-stage-bar { display: flex; gap: 3px; flex-wrap: wrap; align-items: center; }
+.research-stage-arrow { font-size: 11px; color: var(--fg-dim); }
+.research-stage-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft-2);
+  color: var(--fg-dim);
+}
+.research-stage-mark { font-size: 10px; line-height: 1; }
+.research-stage-pill.done { color: var(--fg); border-color: var(--accent); }
+.research-stage-pill.current { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+
+.research-gates { display: flex; gap: 6px; flex-wrap: wrap; }
+.research-gate-chip { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); color: var(--fg-dim); }
+.research-gate-chip.pass { color: #34d399; border-color: #34d399; }
+
+.research-graph { display: flex; flex-direction: column; gap: 8px; }
+.research-graph-group { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.research-graph-group-title { font-size: 11px; color: var(--fg-dim); width: 70px; }
+.research-node { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg-soft-2); color: var(--fg); }
+.research-node-source { border-color: #60a5fa; }
+.research-node-evidence { border-color: #fbbf24; }
+.research-node-claim { border-color: #34d399; }
+
+.research-artifacts-list { display: flex; flex-direction: column; gap: 4px; }
+.research-artifact-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+.research-artifact-content { font-size: 13px; color: var(--fg); line-height: 1.6; }
+.research-artifact-content pre { background: var(--bg-soft-2); padding: 8px; border-radius: 6px; overflow: auto; }
+.research-artifact-content table { border-collapse: collapse; }
+.research-artifact-content td, .research-artifact-content th { border: 1px solid var(--border); padding: 4px 8px; }
+
+.research-inventory { display: flex; gap: 12px; flex-wrap: wrap; }
+.research-inventory-item { flex: 1; min-width: 0; }
+.research-inventory-label { font-size: 11px; color: var(--fg-dim); margin-bottom: 2px; }
+.research-inventory-file { font-size: 11px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Bound research session transcript (the chat driving the task) ── */
+/* ── Main pane: selected task's working-directory view ──
+   The task view fills the whole main pane (no max-width) so there is never a dead band of
+   blank space to its right — in both dock shapes the card and tree stretch edge to edge. */
+.research-task-view { flex: 1; min-height: 0; overflow: auto; padding: 20px 24px 24px; width: 100%; }
+/* Card header: task title, status (ACTIVE) + stage badges, description and the working-directory
+   meta sit on one card, with the primary actions on the right. */
+.rtv-card {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 18px;
+  margin-bottom: 14px;
+}
+.rtv-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.rtv-title-row { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rtv-title { font-size: 17px; font-weight: 600; color: var(--fg); line-height: 1.3; word-break: break-word; min-width: 0; }
+.rtv-chip { flex: none; font-size: 10px; color: var(--fg-dim); border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; text-transform: uppercase; letter-spacing: 0.3px; }
+.rtv-chip.active { color: var(--accent); border-color: var(--accent); }
+.rtv-chip.stage { color: var(--fg); }
+.rtv-desc { font-size: 12px; color: var(--fg-dim); line-height: 1.5; margin-top: 2px; }
+.rtv-actions { flex: none; display: flex; gap: 8px; align-items: center; }
+.rtv-actions .primary { font-size: 12px; padding: 6px 12px; }
+.rtv-actions .ghost { font-size: 12px; padding: 6px 12px; }
+.rtv-del:hover { color: var(--danger); border-color: var(--danger); }
+.rtv-meta {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--fg-dim);
+  border-top: 1px dashed var(--border);
+  margin-top: 12px;
+  padding-top: 10px;
+}
+.rtv-meta-item { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rtv-meta-item .path { color: var(--fg); }
+.rtv-file-detail { margin-top: 12px; border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--bg-soft); }
+.rtv-file-detail-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.rtv-file-detail-title { font-size: 12px; font-weight: 600; color: var(--fg); }
+.rtv-file-detail-body { font-size: 13px; color: var(--fg); line-height: 1.6; }
+.rtv-file-detail-body pre { background: var(--bg-soft-2); padding: 8px; border-radius: 6px; overflow: auto; }
+.rtv-file-detail-body table { border-collapse: collapse; }
+.rtv-file-detail-body td, .rtv-file-detail-body th { border: 1px solid var(--border); padding: 4px 8px; }
+
+/* Working-directory tree, VS Code / Explorer style: a bordered, soft-background container
+   holding a vertical tree. Rows reuse the Cloud Drive .cd-* classes; children nest in
+   .rtv-kids, whose dotted border-left is the per-level indent guide (16px per level). */
+.rtv-tree-box {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  padding: 6px 4px;
+  overflow: auto;
+}
+.rtv-tree { min-width: max-content; }
+.rtv-tree .cd-row { font-size: 12px; gap: 6px; padding: 4px 8px; border-radius: 6px; }
+.rtv-tree .cd-name { font-size: 12px; }
+.rtv-tree-file { border-radius: 6px; }
+.rtv-tree-file:hover { background: var(--bg-soft-2); }
+.rtv-tree-file .cd-name { color: var(--fg); flex: 1; }
+.rtv-tree-file .cd-meta { font-variant-numeric: tabular-nums; }
+/* Nesting container: one dotted indent-guide per level; the 16px per level comes from the
+   margin + padding below (6 + 10). */
+.rtv-kids {
+  margin-left: 6px;
+  padding-left: 10px;
+  border-left: 1px dotted var(--border);
+  display: flex;
+  flex-direction: column;
+}
+/* Folder rows stay on one line: name + (count) + optional (empty) tag hang inline, and the
+   name must not stretch so the count sits right beside it (not pushed to the far edge). */
+.rtv-folder-row .cd-name { flex: 0 1 auto; }
+.rtv-count { flex: none; font-size: 11px; color: var(--fg-dim); }
+.rtv-empty-tag { flex: none; font-size: 10px; color: var(--fg-dim); opacity: 0.7; font-style: italic; }
+.rtv-rag-tag { flex: none; font-size: 9px; color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0 5px; }
+.rtv-rag-tag.pending { color: var(--fg-dim); border-color: var(--border); }
+
+.research-session { display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow: auto; }
+.research-session-turn { display: flex; gap: 8px; align-items: flex-start; }
+.research-session-role { flex: 0 0 62px; font-size: 11px; color: var(--fg-dim); padding-top: 1px; }
+.research-session-turn.user .research-session-role { color: var(--accent); }
+.research-session-body { font-size: 12px; color: var(--fg); line-height: 1.55; min-width: 0; word-break: break-word; }
+.research-session-body pre { background: var(--bg-soft-2); padding: 6px; border-radius: 6px; overflow: auto; }
+.research-session-body table { border-collapse: collapse; }
+.research-session-body td, .research-session-body th { border: 1px solid var(--border); padding: 3px 6px; }
+
+/* ── Research guide card (main pane while the Research tab is active) ── */
+.research-guide { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.research-guide.hidden { display: none; }
+.research-guide-card {
+  width: 100%;
+  max-width: 560px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 28px;
+  text-align: center;
+}
+.research-guide-title { margin: 0 0 8px; font-size: 18px; font-weight: 600; color: var(--fg); }
+.research-guide-sub { margin: 0; font-size: 12px; color: var(--fg-dim); line-height: 1.6; }
+.research-guide-sub b { color: var(--fg); }
+
+/* ── New Research dialog (chat header ＋ Research) ── */
+.rq-workdir { display: flex; align-items: center; gap: 8px; }
+.rq-workdir-path {
+  font-size: 12px;
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rq-files { margin-top: 10px; }
+.rq-files-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.rq-file {
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--bg-soft-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

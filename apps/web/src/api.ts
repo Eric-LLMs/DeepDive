@@ -10,6 +10,9 @@ import type {
   JobInfo,
   Me,
   Model,
+  ResearchArtifactContent,
+  ResearchTask,
+  ResearchTaskDetail,
   Sentence,
   ShareEntry,
   Term,
@@ -427,5 +430,34 @@ export const api = {
     return request<{ total: number; items: WorkspaceActivity[] }>(
       `/workspaces/${workspaceId}/activity?${sp.toString()}`,
     );
+  },
+
+  // ── Research OS console (read-only task monitor; tasks are created in the desktop chat) ──
+  research: {
+    listTasks: () => request<{ tasks: ResearchTask[] }>("/research/tasks"),
+    createTask: (body: { title: string; description?: string; material_asset_ids?: string[] }) =>
+      request<ResearchTask & { idempotent?: boolean; materials?: unknown[] }>("/research/tasks", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+    getTask: (taskId: string) =>
+      request<ResearchTaskDetail>(`/research/tasks/${encodeURIComponent(taskId)}`),
+    // Artifacts ride inside getTask (detail.artifacts); the standalone route is read-only.
+    getArtifact: (taskId: string, artifactId: string, version?: number) =>
+      request<ResearchArtifactContent>(
+        `/research/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}?version=${version ?? 1}`
+      ),
+    promoteArtifact: (taskId: string, artifactId: string) =>
+      request<{
+        artifact_id: string;
+        task_id: string;
+        version: number;
+        status: string;
+        drive_path?: string;
+        rag_status?: string;
+        idempotent: boolean;
+      }>(`/research/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}/promote`, {
+        method: "POST",
+      }),
   },
 };

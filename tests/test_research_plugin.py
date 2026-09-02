@@ -17,6 +17,7 @@ import pytest
 
 from agent import Context, PluginManager, SkillRegistry, ToolRuntime
 from agent.engine.decisions import ToolExecution
+from core.application.drive_service import DriveError
 from core.infrastructure.request_context import set_request_user
 from plugins.research.plugin import ResearchService, build_research_plugin, register_research_plugins
 from tests._drive_fakes import make_drive
@@ -79,9 +80,10 @@ async def _create_project(runtime: ToolRuntime, project_name: str = "spike", **e
 
 async def _walk_to(runtime: ToolRuntime, pid: str, stage: str) -> None:
     """Advance the state machine step-by-step through ``stage`` (gate guards honored)."""
-    current = "INBOX"
+    # Projects are born in DISCOVER, so the walk starts from the second stage onward.
+    current = "DISCOVER"
     order = ["DISCOVER", "FRAME", "EVIDENCE", "DESIGN", "EXECUTE", "EXPLAIN", "WRITE"]
-    for target in order:
+    for target in order[1:]:
         if order.index(target) > order.index(stage):
             break
         if target == "EXECUTE":
@@ -159,7 +161,7 @@ class TestProjectPersistence:
         project = ResearchService._load_json(project_dir / "project.json", None)
         assert project["name"] == "lit review"
         assert project["profile"] == "literature"
-        assert project["stage"] == "INBOX"
+        assert project["stage"] == "DISCOVER"
         assert project["status"] == "ACTIVE"
 
     async def test_crash_resume_via_fresh_service(self, env):
@@ -171,7 +173,7 @@ class TestProjectPersistence:
         fresh = ResearchService(drive=env.drive, scratch_root=env.scratch)
         resumed = fresh.resume_project(USER, pid)
         assert resumed["project_id"] == pid
-        assert resumed["stage"] == "INBOX"
+        assert resumed["stage"] == "DISCOVER"
         lineage = fresh.query_lineage(USER, pid, node_id="S")
         assert lineage["node"]["label"] == "source"
 
@@ -217,6 +219,12 @@ class TestThreeLayerStorage:
         assert len(assets) == 1
         assert assets[0].folder_path == f"research/{pid}"
         assert assets[0].rag_status == "PENDING"
+
+        # Promotion also mirrors the report into the task folder's outputs/ projection.
+        outputs = list((env.scratch / str(USER) / pid / "outputs").glob("*.md"))
+        assert len(outputs) == 1
+        assert outputs[0].name == "report.md"
+        assert outputs[0].read_text(encoding="utf-8") == "# Report\n\nDraft body."
 
         # Re-promote is idempotent: same asset, no second drive write.
         again = await _run(
@@ -440,3 +448,305 @@ class TestIdempotencyAndExecution:
         )
         assert result.is_error is True
         assert "immutable" in result.error.message
+
+
+# ── 7. Chat-driven tasks: atomic create, materials tenancy, session binding ──
+class TestChatTasks:
+    async def test_create_task_atomic_folder_layout(self, env):
+        asset = await env.drive.save_artifact(
+            USER, name="paper.pdf", mime_type="application/pdf", content=b"%PDF"
+        )
+        svc = ResearchService(env.drive, env.scratch)
+        created = await svc.create_task(
+            USER,
+            title="VecDB compare",
+            description="recall vs latency",
+            material_asset_ids=[str(asset.id)],
+        )
+        task_id = created["task_id"]
+        assert created["stage"] == "DISCOVER"
+        assert created["status"] == "ACTIVE"
+        assert created["idempotent"] is False
+        assert created["cloud_folder_path"] == "VecDB compare"
+        assert created["materials"][0]["asset_id"] == str(asset.id)
+
+        # Scratch state is authoritative and complete.
+        task_dir = env.scratch / str(USER) / task_id
+        for f in ("project.json", "graph.json", "task_spec.json", "session_history.json"):
+            assert (task_dir / f).is_file(), f
+        project = ResearchService._load_json(task_dir / "project.json", None)
+        assert project["cloud_folder_id"]
+        assert project["cloud_folder_path"] == "VecDB compare"
+        assert project["materials"][0]["cloud_asset_id"]
+        assert project["materials"][0]["mime"] == "application/pdf"
+        assert project["materials"][0]["name"] == "paper.pdf"
+        spec = ResearchService._load_json(task_dir / "task_spec.json", None)
+        assert spec["title"] == "VecDB compare"
+        assert spec["description"] == "recall vs latency"
+        assert spec["created_by"] == str(USER)
+        mirror = ResearchService._load_json(task_dir / "session_history.json", None)
+        assert mirror == {"session_id": None, "turns": []}
+
+        # Cloud projection: the task folder + material asset (name <asset_id>__<safe_name>).
+        folders = [f["name"] for f in await env.drive.list_folders(USER)]
+        assert "VecDB compare" in folders
+        files = await env.drive.list_files(USER)
+        mats = [a for a in files if a["folder_path"] == "VecDB compare/materials"]
+        assert len(mats) == 1
+        assert mats[0]["name"] == f"{asset.id}__paper.pdf"
+        # get_task_status lists materials from the cloud projection.
+        status = await svc.get_task_status(USER, task_id)
+        assert status["materials"] == [f"{asset.id}__paper.pdf"]
+
+        listed = svc.list_tasks(USER)
+        assert [t["task_id"] for t in listed] == [task_id]
+        assert listed[0]["stage"] == "DISCOVER"
+
+    async def test_create_task_with_parent_folder(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        created = await svc.create_task(USER, title="nested", parent_folder_path="Projects")
+        project = ResearchService._load_json(
+            env.scratch / str(USER) / created["task_id"] / "project.json", None
+        )
+        # The working directory is honored: the task folder lands under Projects/.
+        assert project["cloud_folder_path"] == "Projects/nested"
+        folders = [f["path"] for f in await env.drive.list_folders(USER)]
+        assert "Projects/nested" in folders
+
+    async def test_create_task_rolls_back_on_material_failure(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        with pytest.raises(DriveError) as exc:
+            await svc.create_task(USER, title="t", material_asset_ids=[str(uuid.uuid4())])
+        assert exc.value.status_code == 404
+        assert svc.list_tasks(USER) == []  # atomic: no half-built task folder left behind
+        assert await env.drive.list_folders(USER) == []  # cloud folder rolled back too
+
+    async def test_create_task_cross_user_material_denied(self, env):
+        asset = await env.drive.save_artifact(
+            USER, name="secret.txt", mime_type="text/plain", content=b"top secret"
+        )
+        svc = ResearchService(env.drive, env.scratch)
+        with pytest.raises(DriveError) as exc:
+            await svc.create_task(USER_B, title="sneak", material_asset_ids=[str(asset.id)])
+        assert exc.value.status_code == 403
+        assert svc.list_tasks(USER_B) == []
+        assert await env.drive.list_folders(USER_B) == []  # no leftover cloud task folder
+
+    async def test_create_task_idempotent(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        first = await svc.create_task(USER, title="t", idempotency_key="task-k1")
+        second = await svc.create_task(USER, title="t2", idempotency_key="task-k1")
+        assert first["task_id"] == second["task_id"]
+        assert second["idempotent"] is True
+
+    async def test_list_tasks_dedups_stray_scratch_dirs(self, env):
+        # A crash mid-create could leave a stray scratch dir claiming a task_id that another
+        # dir owns. list_tasks must return each task exactly once so the monitor never renders
+        # a task twice (the frontend clears its container, but the list source must be unique).
+        svc = ResearchService(env.drive, env.scratch)
+        created = await svc.create_task(USER, title="dup")
+        task_id = created["task_id"]
+        task_dir = env.scratch / str(USER) / task_id
+        stray = env.scratch / str(USER) / f"{task_id}-stray"
+        stray.mkdir(parents=True)
+        (stray / "project.json").write_text((task_dir / "project.json").read_text(), encoding="utf-8")
+        listed = svc.list_tasks(USER)
+        assert [t["task_id"] for t in listed] == [task_id]
+
+    async def test_bind_session_one_session_one_task(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        a = (await svc.create_task(USER, title="A"))["task_id"]
+        b = (await svc.create_task(USER, title="B"))["task_id"]
+        session = uuid.uuid4()
+        assert svc.bind_session(USER, a, session)["task_id"] == a
+        assert svc.bind_session(USER, a, session)["task_id"] == a  # same pair is idempotent
+        with pytest.raises(ValueError) as exc:
+            svc.bind_session(USER, b, session)
+        assert "already bound" in str(exc.value)
+        assert svc.task_id_for_session(USER, session) == a
+        assert svc.bound_session_ids(USER) == {str(session)}  # chat sidebar filter set
+        mirror = ResearchService._load_json(
+            env.scratch / str(USER) / a / "session_history.json", None
+        )
+        assert mirror["session_id"] == str(session)
+
+    async def test_append_session_turn_mirrors_into_bound_task(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        a = (await svc.create_task(USER, title="A"))["task_id"]
+        session = uuid.uuid4()
+        svc.bind_session(USER, a, session)
+        await svc.append_session_turn(USER, session, "user", "hello")
+        await svc.append_session_turn(USER, session, "assistant", "world")
+        mirror = ResearchService._load_json(
+            env.scratch / str(USER) / a / "session_history.json", None
+        )
+        assert [t["role"] for t in mirror["turns"]] == ["user", "assistant"]
+        assert mirror["turns"][0]["content"] == "hello"
+        # get_task_status surfaces the bound session transcript for the monitor.
+        status = await svc.get_task_status(USER, a)
+        assert status["session"]["session_id"] == str(session)
+        assert [t["content"] for t in status["session"]["turns"]] == ["hello", "world"]
+        # The turn is also mirrored into the cloud folder's session_history.json, in place.
+        files = await env.drive.list_files(USER)
+        mirror_assets = [a for a in files if a["name"] == "session_history.json"]
+        assert len(mirror_assets) == 1  # updated in place, not re-created per turn
+
+    async def test_get_task_status_groups_nodes_and_counts(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        a = (await svc.create_task(USER, title="A", description="desc"))["task_id"]
+        svc.record_node(USER, a, node={"id": "S", "type": "Source", "label": "s"})
+        svc.record_node(USER, a, node={"id": "C", "type": "Claim", "label": "c"})
+        status = await svc.get_task_status(USER, a)
+        assert status["description"] == "desc"
+        assert status["stage"] == "DISCOVER"
+        assert sorted(status["nodes"]) == ["Claim", "Source"]
+        assert status["materials"] == []
+        assert status["outputs"] == []
+        # The two work folders exist even with nothing in them, so the working-directory
+        # layout is visible from the start.
+        folders = [f["path"] for f in await env.drive.list_folders(USER)]
+        assert f"{status['cloud_folder_path']}/materials" in folders
+        assert f"{status['cloud_folder_path']}/outputs" in folders
+        # Only the two root mirrors exist — nothing in materials/ or outputs/ yet.
+        assert {f["name"] for f in status["cloud_files"]} == {"task_spec.json", "session_history.json"}
+        assert {f["folder_path"] for f in status["cloud_files"]} == {status["cloud_folder_path"]}
+        assert status["task_id"] == a
+
+
+# ── 8. Cascade delete: 409 guards + soft cloud delete + hard scratch delete ──
+class TestDeleteTask:
+    async def test_delete_running_task_is_blocked(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        task_id = (await svc.create_task(USER, title="busy"))["task_id"]
+        svc.record_execution(USER, task_id, tool="research_run.execute_sandbox_script", args={})
+        with pytest.raises(ValueError) as exc:
+            await svc.delete_task(USER, task_id)
+        assert "currently running" in str(exc.value)
+        assert svc.list_tasks(USER)  # the 409 guard leaves the task in place
+
+    async def test_delete_indexed_report_is_blocked(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        task_id = (await svc.create_task(USER, title="kb"))["task_id"]
+        await svc.write_scratch(USER, task_id, artifact_id="report", content="# R")
+        await svc.promote_to_drive(USER, task_id, artifact_id="report")
+        # The RAG worker indexed the outputs asset → deletion is blocked.
+        report = next(a for a in env.drive.assets.rows.values() if a.name == "report.md")
+        await env.drive.assets.set_status(report.id, rag_status="INDEXED")
+        with pytest.raises(ValueError) as exc:
+            await svc.delete_task(USER, task_id)
+        assert "Knowledge Base" in str(exc.value)
+        assert svc.list_tasks(USER)
+
+    async def test_delete_marks_request_then_cascades(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        task_id = (await svc.create_task(USER, title="doomed"))["task_id"]
+        project = ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "project.json", None
+        )
+        cloud_id = project["cloud_folder_id"]
+
+        # Simulate a crash between "mark" and "teardown": a non-DriveError cloud failure
+        # propagates (delete_task swallows DriveError only), leaving the marked project.json.
+        original_delete = env.drive.delete_folder
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("cloud unavailable")
+
+        env.drive.delete_folder = boom
+        with pytest.raises(RuntimeError):
+            await svc.delete_task(USER, task_id)
+        env.drive.delete_folder = original_delete
+
+        marked = ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "project.json", None
+        )
+        assert marked["deletion_requested"] is True
+
+        # Happy path: cloud folder soft-deleted, scratch state hard-deleted.
+        await svc.delete_task(USER, task_id)
+        assert not (env.scratch / str(USER) / task_id).exists()
+        assert svc.list_tasks(USER) == []
+        assert [f for f in env.drive.folders.rows.values() if f.id == uuid.UUID(cloud_id)] == []
+        assert [a for a in env.drive.assets.rows.values() if a.deleted_at is None] == []
+
+    async def test_delete_traversal_is_rejected(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        with pytest.raises(ValueError):
+            await svc.delete_task(USER, "../evil")
+
+    async def test_delete_active_run_is_blocked(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        task_id = (await svc.create_task(USER, title="busy"))["task_id"]
+        # A live server-owned run (not just a per-tool execution) blocks deletion too.
+        run = svc.begin_run(USER, task_id, session_id="sess-1")
+        assert run["status"] == "RUNNING"
+        with pytest.raises(ValueError) as exc:
+            await svc.delete_task(USER, task_id)
+        assert "currently running" in str(exc.value)
+        assert svc.list_tasks(USER)  # the 409 guard leaves the task in place
+
+
+# ── 9. Single-task run mutex (begin_run/end_run + stale-window crash recovery) ──
+class TestRunMutex:
+    async def test_begin_conflict_then_end_releases(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        task_id = (await svc.create_task(USER, title="A"))["task_id"]
+        assert svc.list_tasks(USER)[0]["is_running"] is False
+
+        run = svc.begin_run(USER, task_id, session_id="sess-1")
+        assert run["status"] == "RUNNING"
+        assert run["session_id"] == "sess-1"
+        assert svc.list_tasks(USER)[0]["is_running"] is True
+
+        # A second concurrent trigger for the SAME task is a conflict.
+        with pytest.raises(ValueError) as exc:
+            svc.begin_run(USER, task_id, session_id="sess-2")
+        assert "already running" in str(exc.value)
+        assert (await svc.get_task_status(USER, task_id))["is_running"] is True
+
+        # Release, then re-acquire works — the mutex is per-run, not permanent.
+        released = svc.end_run(USER, task_id)
+        assert released["status"] == "IDLE"
+        assert svc.list_tasks(USER)[0]["is_running"] is False
+        again = svc.begin_run(USER, task_id, session_id="sess-3")
+        assert again["run_id"] != run["run_id"]
+        svc.end_run(USER, task_id)
+
+    async def test_two_tasks_run_concurrently(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        a = (await svc.create_task(USER, title="A"))["task_id"]
+        b = (await svc.create_task(USER, title="B"))["task_id"]
+        # T4 invariant #2: Task A and Task B may both hold a live run at once.
+        ra = svc.begin_run(USER, a)
+        rb = svc.begin_run(USER, b)
+        assert ra["run_id"] != rb["run_id"]
+        assert {t["task_id"]: t["is_running"] for t in svc.list_tasks(USER)} == {a: True, b: True}
+        svc.end_run(USER, a)
+        svc.end_run(USER, b)
+
+    async def test_stale_run_adopted_and_stale_executions_aborted(self, env):
+        svc = ResearchService(env.drive, env.scratch)
+        task_id = (await svc.create_task(USER, title="crashed"))["task_id"]
+        svc.record_execution(USER, task_id, tool="research_run.execute_sandbox_script", args={})
+        # Simulate a process that died mid-run: the slot is RUNNING and old, with an execution
+        # still marked RUNNING (the kill happened before finish_execution).
+        project_path = env.scratch / str(USER) / task_id / "project.json"
+        project = ResearchService._load_json(project_path, None)
+        project["active_run"] = {
+            "run_id": "dead-run",
+            "session_id": "sess-dead",
+            # 3 hours ago — comfortably past the default 2h stale window.
+            "started_at": "1970-01-01T00:00:00Z",
+            "status": "RUNNING",
+        }
+        ResearchService._save_json(project_path, project)
+
+        adopted = svc.begin_run(USER, task_id, session_id="sess-fresh")
+        assert adopted["status"] == "RUNNING"
+        assert adopted["run_id"] != "dead-run"
+        # The dead process's RUNNING execution is ABORTED so the delete guard can't block forever.
+        executions = ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "executions.json", {"executions": []}
+        )["executions"]
+        assert all(e["status"] == "ABORTED" for e in executions)
+        svc.end_run(USER, task_id)

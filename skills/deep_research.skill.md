@@ -12,6 +12,13 @@ verifying multiple sources — not a single lookup. The workflow runs inside a R
 project, so every source, claim, and artifact is persisted, auditable, and (on publish)
 retrievable later through RAG.
 
+> **Resuming an existing task?** If this turn carries a research handoff — you are told the
+> task already exists, or you already have a `project_id` — **do NOT create a new project**.
+> Call `research_project` with `action: "resume"` and that `project_id` first, then continue
+> from the project's current stage through to PUBLISH. Creating a second project for an
+> existing task is the single most common mistake; the task's `project_id` is the one you
+> must keep using for every `research_*` call.
+
 ## Core loop
 
 ```text
@@ -29,8 +36,10 @@ create the project with `profile: "empirical"` and use `research_run execute_san
    correct it first. Break a broad ask into sub-questions — one focused search per
    sub-question beats one vague query.
 
-2. **Create the project.** `research_project` with `action: "create"`, a `name`, and a
-   `profile` (default `"literature"`). Keep the returned `project_id` for every later call.
+2. **Create the project — only if none exists yet.** `research_project` with
+   `action: "create"`, a `name`, and a `profile` (default `"literature"`). Keep the returned
+   `project_id` for every later call. Skip this step entirely when resuming (see the note
+   above) and use `action: "resume"` with the existing `project_id` instead.
 
 3. **DISCOVER — collect candidate sources.** Search in parallel across channels:
    - `rag_search` — the user's own imported corpus (papers, notes, documents).

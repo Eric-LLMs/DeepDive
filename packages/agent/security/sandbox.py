@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from agent.engine.context import current_turn
 from agent.engine.decisions import Guard, PreToolDecision, ToolExecution
 from agent.tools.definition import ToolDefinition, classify_permissions
 from agent.tools.tool_permissions import ToolPermission, permission_names
@@ -43,9 +44,28 @@ class Sandbox:
         self._rules: dict[ToolPermission, SandboxDecision] = {}
 
     # ── session permission level ──
+    def _effective_permissions(self) -> set[ToolPermission]:
+        """The granted permission classes for this turn.
+
+        The base set is the session default (READ). A turn that carries a research handoff
+        (a session driving a Research OS task) additionally grants WRITE + NETWORK, so the
+        agent can advance the task's state machine, write scratch artifacts, and run its
+        search tools (``web_search`` / ``search_social``) without a human approval for every
+        call. The handoff is sunk into ``current_turn().context`` by the chat router and is
+        durable: it is re-synthesized for a session already bound to a task, so turns after
+        the first keep the grant.
+        """
+        perms: set[ToolPermission] = set(self._permissions)
+        turn = current_turn()
+        if turn is not None:
+            handoff = (turn.context or {}).get("handoff") or {}
+            if handoff.get("kind") == "research":
+                perms.update((ToolPermission.WRITE, ToolPermission.NETWORK))
+        return perms
+
     def session_permissions(self) -> set[ToolPermission]:
         """The permission classes the current session has been granted."""
-        return set(self._permissions)
+        return self._effective_permissions()
 
     def grant(self, permission: ToolPermission) -> None:
         self._permissions.add(permission)
@@ -72,7 +92,7 @@ class Sandbox:
             return self._rules[permission]
         return (
             SandboxDecision.ALLOW
-            if permission in self._permissions
+            if permission in self._effective_permissions()
             else SandboxDecision.ASK
         )
 
@@ -107,7 +127,7 @@ class Sandbox:
                 return None
             if self.check(tool, exec.arguments) is SandboxDecision.DENY:
                 tag = ",".join(permission_names(classify_permissions(tool)))
-                return f"sandbox denied: {exec.name} needs [{tag}] but the session has [{','.join(permission_names(self._permissions))}]"
+                return f"sandbox denied: {exec.name} needs [{tag}] but the session has [{','.join(permission_names(self._effective_permissions()))}]"
             return None
 
         return _guard
