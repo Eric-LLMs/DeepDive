@@ -92,6 +92,7 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
+| Research OS (chat-driven) | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent (`materials/`, `outputs/`, live `task_spec.json` / `session_history.json` mirrors) over authoritative scratch state; session isolation (research sessions bound 1:1 to a task and hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module) |
 | Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX embedded images → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
 | Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload). Auth endpoints are Redis **rate-limited per client IP** (login/register/recovery, fixed window, fail-open); `enforce_secure_secrets` fails fast at startup when the legacy `JWT_SECRET` default is untouched |
 | Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover. The Tokens page disables a user's access to a key per (user, channel); a user with no usable key degrades to the anonymous tier (guest quota) instead of losing login |
@@ -112,7 +113,7 @@
 | GraphRAG node | graph-of-communities `graph_rag` node (LLM entity/relation extraction → community summaries → global/local search) designed only, see §10.6 |
 | Edge gateway | Traefik skeleton only; dev runs FastAPI directly on the host |
 | Retrieval-feedback UI | `POST /rag/feedback` + `rag_feedback` table exist (tests green), but no workbench/web UI calls the endpoint yet |
-| Research OS | contract suite frozen in [docs/research/](research/) — 8 entities, 10-stage state machine, 4 hard gates (DESIGN/EVIDENCE/CLAIM/QUALITY), three-layer storage, 6 research tools; a Cordis plugin (`plugins/research/`) + spike tests landed (`tests/test_research_plugin.py`), but no Phase 1 MVP yet |
+| Research OS (Phase 1) | the file-backed spike is now a live user surface (chat-created tasks, §17), but the real repositories (PostgreSQL-backed projects/sources/claims/artifacts) and a research admin console are still Phase 1; the skill-driven `research_project` path coexists with chat-created tasks |
 
 [↑ Back to top](#table-of-contents)
 
@@ -1806,6 +1807,21 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     `.md`/`.txt`/code row opens the in-window **note editor** (`#note-editor`); any other file is
     cached via `cloud-cache` and rendered by `Viewer.render` on the temp path, so PDFs, images,
     video, and audio play in window.
+  - **Research tab** (`research.js`) — a **Research** tab joins the sidebar (the chat header also
+    gains a **＋ Research** button, §17). A task list shows stage, status, updated time, a live
+    **RUNNING** badge (`is_running` from the API), and a **🗑** delete that confirms first and
+    surfaces a 409's reason verbatim; selecting a task opens its dedicated session in the chat
+    silently (§17 session isolation — side-effect free, no message sent). The bottom **status
+    pane** (`loadStatus`) renders the stage DAG, gates, artifacts, the working-directory tree and
+    the bound session; the main **task view** (`renderTaskView`) is a card (title + ACTIVE / Stage
+    badges + cloud working path) over the task folder's `materials/` / `outputs/` /
+    `task_spec.json` / `session_history.json` drawn as a **VS Code-style vertical tree**
+    (`.rtv-kids` nested containers with dotted `border-left` indent guides, single-line folder rows
+    with `(n)` counts / `(empty)` tags, file rows with right-aligned sizes and `KB` RAG tags). The
+    **chat header** is two-layer: a top control bar (`#chat-topbar`: **New chat** / **＋ Research**
+    + window controls) and, only in a research session, a full-width **research context bar**
+    (`#chat-research-bar`: `🔬 Research · <task title> · [<stage>]`) that hides the truncated chat
+    title (`#chat-header.research-mode`).
   - **Note editor** — an overlay with an **Edit / Preview** icon-button toggle and **Save**
     (`Ctrl+S`). Edit mode is a monospace `textarea`; Preview renders the draft through the
     vendored `markdown-it` + `katex` chat renderer (`renderMarkdown`, XSS-safe `validateLink`),
@@ -2036,18 +2052,66 @@ research-domain rule; Research OS adds exactly that domain layer.
 | Tenant isolation (`request_user` ContextVar) | [§13 Multi-Tenancy](#13-multi-tenancy-and-deployment-strategy) |
 | Immutable execution audit rows | [§6 tool result observers](#6-tool-runtime) |
 
-**Status:** the contract suite is design-frozen in [docs/research/](research/) (23 files: the
-6 tool contracts, state machine, gate policy, diagrams); a Cordis plugin + spike tests landed
-(`plugins/research/`, `tests/test_research_plugin.py`), but there is no Phase 1 MVP yet — see
-[Implementation Status §Designed](#designed-not-yet-implemented).
+**Status:** now a **live user surface**, not just a design-frozen contract. From the desktop
+chat (**＋ Research**) a user creates a **research task** in one atomic request; the task is a
+real cloud-drive folder (the user-visible projection) over authoritative server scratch state,
+and the whole lifecycle — create, drive through a dedicated chat session, promote to RAG,
+cascade-delete — is wired end to end (`apps/api/routers/research.py`, desktop monitor
+`apps/desktop/renderer/research.js`, read-only web console mirror). The frozen contracts in
+[docs/research/](research/) (23 files: the 6 tool contracts, state machine, gate policy,
+diagrams) remain the domain semantics; the file-backed spike is the Phase 1 stand-in, and the
+real repositories (PostgreSQL-backed projects / sources / claims / artifacts) plus a research
+admin console are the remaining Phase 1 work — see [Implementation Status
+§Designed](#designed-not-yet-implemented).
 
-**User-facing entry point:** the `deep_research` skill ([skills/deep_research.skill.md](../skills/deep_research.skill.md))
-now orchestrates the full workflow as the agent's one-command entry point (clarify → plan →
-discover → frame → evidence → cross-verify → synthesize → write → review → publish). Its
+**Storage mapping — task = cloud task folder (projection) + scratch (authority).** A task's
+authoritative state lives in server scratch (`<research_scratch>/<owner>/<task_id>/`):
+`project.json` (stage/gates, `cloud_folder_id` — the unique task↔folder binding, `cloud_folder_path`
+— a display-only cache, the `materials` provenance table `{asset_id, name, cloud_asset_id, mime}`,
+`active_run`, `deletion_requested`), `graph.json`, `executions.json`, `approvals.json`,
+`artifacts/<id>/v<N>` (versioned), `task_spec.json` / `session_history.json` (also mirrored to the
+cloud), and `_session_index.json` (the session→task routing map). The user-visible **cloud task
+folder** lives in My Drive under the parent the user picked: `materials/` (copies of selected
+cloud assets, named `<asset_id>__<safe_name>`), `outputs/<id>.md` (each agent artifact's latest
+version projected and updated in place — no asset explosion), plus the two JSON mirrors. Promoting
+a report to RAG just flips the cloud `outputs/<id>.md` asset to RAG-pending (the skill-driven
+`research_project` path still uploads to `research/<project_id>/`). A failing create rolls the
+whole thing back (cloud folder → Trash, scratch removed), so no half-built task is ever left
+behind; the cloud folder is created with the Drive's collision-safe naming and the `drive.download`
+permission gate doubles as the material tenancy check.
+
+**Session isolation.** Every task binds a single dedicated chat session (1:1, `bind_session`).
+Research sessions are a different kind than a normal chat: `GET /sessions` filters them out via
+`bound_session_ids`, so the chat sidebar never shows them, and opening a task's session is
+side-effect free — navigation never creates an execution, opening never starts a run; only a typed
+message drives the task (the first one auto-resumes the `deep_research` skill).
+
+**Run lifecycle — server-owned + single-task mutex.** A research run belongs to the server, not
+the SSE pipe: `/chat/stream` no longer cancels the pump for a research turn, so a client
+disconnect (navigate away, close the chat, drop the network) lets the run finish server-side and
+still finalize the turn (usage logging + `SESSION_FINALIZE` enqueue + `session_history.json`
+mirror) before releasing the slot. Each task allows one live run at a time: `begin_run`/`end_run`
+keep an `active_run` record in `project.json`; a concurrent trigger for the same task is a **409
+conflict**, while a RUNNING slot older than the stale window (2 h) is presumed crashed and adopted
+with its orphaned RUNNING executions flipped to ABORTED (so the delete guard can never block
+forever). `is_running` is surfaced in every task view.
+
+**Cascade delete.** `DELETE /research/tasks/{id}` (the desktop confirms first) records
+`deletion_requested` in `project.json`, soft-deletes the whole cloud task folder into the Trash,
+clears the session routing index, and hard-removes scratch — restoring the Trash folder never
+resurrects the task. Two **409** guards refuse deletion: a task with a live run (`active_run` or a
+RUNNING execution) and a report the Knowledge Base has already indexed ("Please remove from
+Knowledge Base first").
+
+**User-facing entry point:** two ways in — the chat-created **task** (＋ Research → pick a My
+Drive parent folder + title/description + cloud materials → the task's dedicated session
+auto-opens and resumes the `deep_research` skill) and the skill-driven **project**
+(`research_project` under the `deep_research` skill,
+[skills/deep_research.skill.md](../skills/deep_research.skill.md) — clarify → plan → discover →
+frame → evidence → cross-verify → synthesize → write → review → publish). The skill's
 `allowed_tools` is scoped to the six research tools plus search and enforced by
 `SkillScopeEnforcer` (§5.4), so a research run stays inside the governed workflow; the lighter
-`fact_check` skill covers single-claim verification. Research stays *designed*, not yet an MVP —
-the skill is an agent behavior layered on the spike, not a user-facing product surface.
+`fact_check` skill covers single-claim verification.
 
 ## 18. Image Handling (screenshots & document images)
 
