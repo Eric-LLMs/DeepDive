@@ -11,10 +11,18 @@ Platform reality (honest):
   ``REDDIT_USERNAME``, ``REDDIT_PASSWORD`` — a free *script* app from
   https://www.reddit.com/prefs/apps), the adapter transparently switches to the official
   ``oauth.reddit.com`` API, which is the reliable live path.
-- ``x`` — the free public API is gone; this adapter only works when a ``X_BEARER_TOKEN``
-  env var is set (X API v2 recent search). Without it, it raises a clear error.
-- ``zhihu`` — no public API and aggressive anti-bot; there is no reliable free path. The
-  adapter raises a clear error until a cookie-authenticated scraper is added.
+- ``x`` — the free public API is gone. With an ``X_BEARER_TOKEN`` env var set (X API v2
+  recent search) the official API is used; without a token, the adapter *degrades* to a
+  site-scoped aggregate web search (``site:x.com`` + ``site:twitter.com``) instead of
+  failing — search engines still index much of what is posted there.
+- ``zhihu`` — no public API and aggressive anti-bot. The adapter degrades to a
+  site-scoped aggregate web search (``site:zhihu.com``) so answers and articles remain
+  reachable through the engines that index them.
+
+The x / zhihu degrade path runs through the same keyless multi-engine aggregate as the
+``web_search`` tool (``core.infrastructure.web_search_aggregate``): concurrent engines,
+tolerance degradation, real-URL decode, dedup/fusion/quality filter — a single code path
+for "no key, no login, still get results".
 
 ``platform="auto"`` runs every adapter that is actually configured (reddit always, x only
 when a token exists) concurrently and merges the results.
@@ -34,16 +42,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
-
 from agent.engine.decisions import text_block
 from agent.plugins.base import Plugin
 from agent.tools.definition import ToolOutput, define_tool
 from agent.tools.tool_permissions import ToolPermission
+from core.infrastructure.web_search_aggregate import site_limited_web_search
 
 _USER_AGENT = "deepdive-social-search/0.1 (learning-workbench assistant)"
 _TIMEOUT = httpx.Timeout(15.0)
@@ -72,6 +81,36 @@ def _item(platform, *, title, content, url, author="", metrics=None, published_u
         "url": url,
         "published_utc": published_utc,
     }
+
+
+def _web_degrade_to_items(platform: str, hosts: list[str], query: str, limit: int) -> list[dict]:
+    """Degrade path for platforms with no key/login: site-scoped aggregate web search.
+
+    Runs ``site:<host> <query>`` through the keyless multi-engine aggregate for each
+    host, then dedupes and caps to ``limit``. The aggregate already dedupes/filters by
+    quality; here we additionally guarantee every returned URL lives on the platform's
+    own host, so an off-site hit can never masquerade as social content.
+    """
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    per_host = max(1, math.ceil(limit / len(hosts)))
+    for host in hosts:
+        for hit in site_limited_web_search(host, query, top_k=per_host):
+            key = (urlparse(hit["url"]).hostname or "", hit["title"].strip().lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                _item(
+                    platform,
+                    title=hit["title"],
+                    content=hit["snippet"][:_SNIPPET_CHARS],
+                    url=hit["url"],
+                )
+            )
+            if len(out) >= limit:
+                return out
+    return out
 
 
 # ── reddit adapter ───────────────────────────────────────────────────────────
@@ -195,12 +234,15 @@ async def _reddit(query: str, limit: int, subreddit: str | None) -> list[dict]:
     return _parse_reddit_listing(payload)
 
 
-# ── x adapter (X API v2 recent search, needs a bearer token) ────────────────
+# ── x adapter (X API v2 recent search; degrades to site-scoped web without a token) ─
 async def _x(query: str, limit: int, subreddit: str | None) -> list[dict]:
     token = os.environ.get("X_BEARER_TOKEN")
     if not token:
-        raise RuntimeError(
-            "x is not configured: set X_BEARER_TOKEN (X API v2) to enable the x adapter"
+        # Degrade, never fail: without an API token, ask the keyless aggregate for
+        # x.com / twitter.com pages the engines still index. Runs in a thread because
+        # the aggregate does blocking HTTP internally.
+        return await asyncio.to_thread(
+            _web_degrade_to_items, "x", ["x.com", "twitter.com"], query, limit
         )
     headers = {"Authorization": f"Bearer {token}", "User-Agent": _USER_AGENT}
     params = {
@@ -234,11 +276,10 @@ async def _x(query: str, limit: int, subreddit: str | None) -> list[dict]:
     return out
 
 
-# ── zhihu adapter (no public API; blocked without a scraper) ────────────────
+# ── zhihu adapter (no public API; degrades to site-scoped web search) ─────────
 async def _zhihu(query: str, limit: int, subreddit: str | None) -> list[dict]:
-    raise RuntimeError(
-        "zhihu is not supported: it has no public API and blocks scraping; add a "
-        "cookie-authenticated scraper to enable the zhihu adapter"
+    return await asyncio.to_thread(
+        _web_degrade_to_items, "zhihu", ["zhihu.com"], query, limit
     )
 
 
@@ -246,7 +287,10 @@ _ADAPTERS = {"reddit": _reddit, "x": _x, "zhihu": _zhihu}
 
 
 def _available() -> list[str]:
-    """Platforms that can actually run in this environment right now."""
+    """Platforms merged by ``auto``: reddit always, plus official-API platforms whose
+    keys are configured. x / zhihu degrade paths are *always* available, but running two
+    extra site-scoped aggregate searches on every ``auto`` call is slow, so they are
+    opt-in via an explicit ``platform`` argument rather than part of ``auto``."""
     available = ["reddit"]
     if os.environ.get("X_BEARER_TOKEN"):
         available.append("x")
@@ -295,11 +339,13 @@ PLUGIN = Plugin(
             name="search_social",
             description=(
                 "Search social sources for a query and return unified structured items "
-                "(title, content, author, metrics, url). Platforms: reddit (needs "
-                "REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD for the live OAuth API; "
-                "anonymous JSON may 403), x (needs X_BEARER_TOKEN), zhihu (unsupported). "
-                "Use it to find community opinions, first-hand experiences, or current "
-                "discussion on a topic."
+                "(title, content, author, metrics, url). Platforms: reddit (anonymous "
+                "JSON first; REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD enables the live "
+                "OAuth API), x (X_BEARER_TOKEN enables the official API; otherwise it "
+                "degrades to a keyless site-scoped web search of x.com/twitter.com), "
+                "zhihu (no public API; degrades to a keyless site-scoped web search of "
+                "zhihu.com). Use it to find community opinions, first-hand experiences, "
+                "or current discussion on a topic."
             ),
             parameters={
                 "type": "object",

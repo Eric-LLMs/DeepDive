@@ -39,6 +39,11 @@
   // user's research tasks (hidden from the Sessions sidebar). Populated by research.js from
   // task statuses and by app.js when a research turn's session is created.
   window.researchSessions = window.researchSessions || new Map();
+  // Auto-start instruction sent when a research task's Run button is pressed. It rides the
+  // research handoff (sendChat attaches it for an active research session), so the agent
+  // targets the task and drives it through the remaining stages to completion.
+  const RESEARCH_RUN_PROMPT =
+    "Run this research task now — resume from its current stage and drive it through every remaining stage to completion.";
   try { state.token = localStorage.getItem("deepdive_token"); } catch { /* ignore */ }
   try { state.guestId = localStorage.getItem("deepdive_guest_id"); } catch { /* ignore */ }
   // Restore cached identity so the bottom bar shows the username immediately,
@@ -1513,6 +1518,10 @@
     const research = state.activeResearch;
     if (research) {
       extra = { ...extra, handoff: { kind: "research", project_id: research.task_id, mode: "research_resume" } };
+      // A message in a research session IS the run trigger (whether typed by the user or
+      // auto-sent by the Run control): announce the run so Run / Delete Task disable and the
+      // Run button switches to its running style on every research surface.
+      if (window.researchRunActive) window.researchRunActive(research.task_id, true);
     }
     const payload = { message, session_id: state.sessionId ?? undefined, ...extra };
     if (!state.token) payload.user_id = state.guestId ?? undefined;
@@ -1529,6 +1538,8 @@
     let gotDone = false;
 
     const handleEvent = (evt) => {
+      // Mirror the run's live events into the Activity feed (research.js filters content).
+      if (research && window.researchActivityEvent) window.researchActivityEvent(evt);
       switch (evt.type) {
         case "notice":
           appendMsg("notice", evt.data);
@@ -1658,6 +1669,10 @@
       appendMsg("error", `Request failed: ${err.message}`);
     } finally {
       chatSend.disabled = false;
+      // The stream ended — the turn (and therefore the research run) is over. Re-enable the
+      // Run / Delete Task controls; the server's is_running poll may re-assert if the worker
+      // is still chaining a run.
+      if (research && window.researchRunActive) window.researchRunActive(research.task_id, false);
     }
   }
 
@@ -2027,6 +2042,11 @@
             task_id: t.task_id, name: t.name || t.task_id, stage: t.stage, status: t.status,
           });
           updateResearchChip();
+          // Server truth wins: if the task is RUNNING (e.g. the worker kept chaining) keep the
+          // Run / Delete controls disabled even after the local stream ended. Never force them
+          // open here — the local sendChat finally is what clears a finished turn.
+          if (t.is_running && window.researchRunActive) window.researchRunActive(t.task_id, true);
+          if (window.researchActivityMeta) window.researchActivityMeta(t.status, t.stage);
         }
       } catch { /* transient — keep polling */ }
     }, 10000);
@@ -2081,6 +2101,20 @@
       updateResearchChip();
       newChat();
     }
+  };
+
+  // Run control: start (or resume) a task's research run in one click. Opens the task's
+  // dedicated session (reusing its bound session_id — never forks), then auto-sends the run
+  // instruction. sendChat detects the research context and announces the run as active, so the
+  // Run / Delete Task controls disable and the Run button shows its running style until the
+  // turn finishes (the desktop Run and the chat-driven run share this one path).
+  window.startResearchRun = async (taskId, name, sessionId) => {
+    if (!state.token) { Viewer.toast("Sign in to run a research task."); openAccount(); return; }
+    if (chatSend.disabled) { Viewer.toast("A research run is already in progress."); return; }
+    await openResearchSession(taskId, name, sessionId);
+    const active = state.activeResearch;
+    if (active && active.task_id === taskId) sendChat(RESEARCH_RUN_PROMPT);
+    else Viewer.toast("Could not bind the task's session — select the task first.");
   };
 
   // "＋ Research" in the chat header: create a research task atomically (folder + materials

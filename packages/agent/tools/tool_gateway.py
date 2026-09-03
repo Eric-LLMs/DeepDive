@@ -24,6 +24,35 @@ def _blurb(tool: ToolDefinition, max_chars: int = 120) -> str:
     return desc if len(desc) <= max_chars else desc[: max_chars - 1].rstrip() + "…"
 
 
+# Hard capacity ceiling for the combined tool + skill index that lives in the static prompt
+# prefix. The full (untruncated) catalog is always emitted; when it overflows this ceiling the
+# agent runtime refuses to start instead of silently dropping tools/skills from the model's
+# view. Tuned well above the real catalog so healthy growth never trips it; a pathological
+# explosion fails loudly rather than going quiet.
+CATALOG_CAPACITY_CHARS = 16_000
+CAPACITY_REFUSAL_MSG = "工具与技能超出容量限制,存在丢失风险,拒绝启动"
+
+
+def check_index_capacity(
+    tool_index: str,
+    skill_index: str,
+    *,
+    capacity: int = CATALOG_CAPACITY_CHARS,
+) -> None:
+    """Refuse to run when the full tool + skill index overflows ``capacity``.
+
+    Called once at agent-runtime startup (after every plugin/skill is discovered), so a tool or
+    skill can never silently vanish from the prompt's index. ``tool_index`` / ``skill_index``
+    must already be the *complete* rendered catalogs (no internal truncation).
+    """
+    total = len(tool_index) + len(skill_index)
+    if total > capacity:
+        raise RuntimeError(
+            f"{CAPACITY_REFUSAL_MSG} (tool index {len(tool_index)} chars + skill index "
+            f"{len(skill_index)} chars > capacity {capacity})"
+        )
+
+
 # Deferred-loading stub description cap. A stub's description is longer than the compact catalog
 # blurb so the model can form arguments; the full schema still arrives via the tool_search result.
 STUB_DESC_MAX = 400
@@ -54,35 +83,16 @@ class ToolCatalog:
             for tool in self._runtime.all()
         ]
 
-    def render_index(
-        self,
-        *,
-        limit: int = 100,
-        budget_chars: int = 500,
-        blurb_chars: int = 60,
-    ) -> str:
-        """One ``- name: blurb`` line per tool, truncated to a character budget.
+    def render_index(self) -> str:
+        """One ``- name: blurb`` line per tool — every registered tool, never silently dropped.
 
-        This is what lives in the static prompt prefix. Each line's blurb is capped at
-        ``blurb_chars`` (compact — the full 120-char blurb still reaches the model via
-        ``tool_search``), so the whole catalog advertises far more tools within the budget.
+        This is what lives in the static prompt prefix. Earlier versions truncated the catalog
+        to a small character budget, so tools past the cap silently vanished from the model's
+        tool index. Now the complete catalog is emitted and startup is refused (via
+        :func:`check_index_capacity`, called by ``AgentKernel.ensure_capacity``) when the
+        combined tool + skill index overflows the hard capacity ceiling.
         """
-        lines: list[str] = []
-        used = 0
-        for entry in self.entries():
-            if len(lines) >= limit:
-                break
-            blurb = (
-                entry.blurb
-                if len(entry.blurb) <= blurb_chars
-                else entry.blurb[: blurb_chars - 1].rstrip() + "…"
-            )
-            line = f"- {entry.name}: {blurb}"
-            if used and used + len(line) > budget_chars:
-                break
-            lines.append(line)
-            used += len(line) + 1
-        return "\n".join(lines)
+        return "\n".join(f"- {entry.name}: {entry.blurb}" for entry in self.entries())
 
     async def search(self, query: str, limit: int = 10) -> list[ToolIndexEntry]:
         """Deterministic scoring over name + blurb + permission tags (word-level).

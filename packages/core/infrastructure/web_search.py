@@ -1,6 +1,8 @@
 """Web search providers, selected by the ``web_search_provider`` config string.
 
 Provider name is free text (case-insensitive); supported values:
+- ``aggregate`` / ``keyless`` — no API key: concurrent Bing + DDG + best-effort Google
+  and Baidu scrape, tolerant of any single engine being blocked (the default).
 - ``duckduckgo`` / ``ddg`` — free, no API key required.
 - ``tavily`` — AI-oriented, needs ``WEB_SEARCH_API_KEY``.
 - ``bing`` — Bing Web Search API v7, needs an Azure subscription key.
@@ -93,6 +95,28 @@ class BingSearch:
         ]
 
 
+class AggregateSearch:
+    """Keyless multi-engine aggregate (Bing / DDG / Google / Baidu HTML scrape).
+
+    The no-API-key default: runs several free engines concurrently and tolerates each
+    one failing on its own (a blocked engine contributes nothing; the survivors still
+    return results). See ``core.infrastructure.web_search_aggregate`` for the engine
+    details. Optional per-call overrides let callers restrict engines (e.g. a site-scoped
+    degrade query only needs the reliable engines).
+    """
+
+    def __init__(self, engines: tuple[str, ...] | None = None):
+        from core.infrastructure import web_search_aggregate
+
+        self._mod = web_search_aggregate
+        self._engines = engines
+
+    def search(self, query: str, top_k: int = 5) -> list[dict]:
+        return self._mod.aggregate_web_search(
+            query, top_k, engines=self._engines
+        )
+
+
 class GoogleSearch:
     """Google Custom Search JSON API — needs an API key + Search Engine ID (cx)."""
 
@@ -145,6 +169,8 @@ def get_web_search_provider():
     engine_id = tc.get("engine_id")
     if engine_id is None:
         engine_id = settings.web_search_engine_id
+    if name in ("aggregate", "keyless"):
+        return AggregateSearch()
     if name in ("duckduckgo", "ddg"):
         return DuckDuckGoSearch()
     if name == "tavily":

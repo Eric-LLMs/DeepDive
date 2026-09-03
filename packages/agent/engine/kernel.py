@@ -19,6 +19,7 @@ only supply the domain tools (rag_search/translate/web_search/fs …) and the LL
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -46,7 +47,14 @@ from agent.skills.registry import SkillCatalog, SkillRegistry, SkillScopeEnforce
 from agent.tools.checkpoints import CheckpointStore, revert_to_checkpoint_tool
 from agent.tools.plan_tool import plan_tool
 from agent.tools.subagent import run_subagent_tool
-from agent.tools.tool_gateway import ToolGateway, tool_search_tool
+from agent.tools.tool_gateway import (
+    CATALOG_CAPACITY_CHARS,
+    ToolGateway,
+    check_index_capacity,
+    tool_search_tool,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -173,6 +181,24 @@ class AgentKernel:
                 self._memory_recall_section,
                 zone=PromptZone.DYNAMIC_SUFFIX,
             )
+
+    def ensure_capacity(self) -> None:
+        """Refuse to run when the full tool + skill index overflows the capacity ceiling.
+
+        Called once at agent-runtime startup after every plugin/skill is discovered (see
+        ``agent_factory.get_agent_kernel``). The catalog sections no longer truncate — the full
+        tool + skill index is always emitted — so the only way to "lose" a tool would be to
+        overflow the hard capacity. If that ever happens, startup fails loudly instead of
+        silently hiding tools from the model.
+        """
+        tool_index = self._catalog.render_index()
+        skill_index = SkillCatalog(self.skills).render()
+        logger.info(
+            "catalog capacity: tools=%d chars, skills=%d chars, total=%d/%d",
+            len(tool_index), len(skill_index), len(tool_index) + len(skill_index),
+            CATALOG_CAPACITY_CHARS,
+        )
+        check_index_capacity(tool_index, skill_index)
 
     def _memory_brief(self, context: dict) -> str:
         """The turn's short-term memory brief (MEMORY.md head, loaded once per turn)."""

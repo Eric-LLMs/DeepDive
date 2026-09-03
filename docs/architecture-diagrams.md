@@ -166,7 +166,7 @@ flowchart TB
     end
 
     subgraph zones["Design · cache-boundary zones"]
-        SP["STATIC_PREFIX · byte-identical across requests<br/>SOUL.md identity + compact tool catalog<br/>+ compressed skill catalog"]
+        SP["STATIC_PREFIX · byte-identical across requests<br/>SOUL.md identity + full tool catalog<br/>+ complete skill catalog · never truncated<br/>(overflow → startup refused, 16 KB ceiling)"]
         PC["PROJECT_CONTEXT · stable per project<br/>DEEPDIVE.md via read_project_context<br/>capped at 8k chars · empty → zone dropped"]
         DS["DYNAMIC_SUFFIX · re-rendered per step<br/>memory brief · Lane-1 always on<br/>recalled memory · gated by should_recall<br/>+ agent.inject content"]
         SP --> HEAD["stable head"]

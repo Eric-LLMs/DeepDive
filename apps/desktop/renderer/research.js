@@ -1,10 +1,12 @@
 /* Research OS monitor (desktop).
  *
- * Read-only two-layer console: the sidebar lists tasks (top) and shows the selected task's
- * live status (bottom). Tasks are created and driven entirely in the chat — "＋ Research"
- * POSTs /research/tasks atomically, then the deep_research skill drives the stage machine.
- * This panel never writes: stage transitions, gate overrides, scratch writes and Promote all
- * happen agent-side in the chat, so the monitor just reflects whatever the agent produced.
+ * Two-layer console: the sidebar lists tasks (top) and shows the selected task's live status
+ * (bottom). Tasks are created in the chat — "＋ Research" POSTs /research/tasks atomically,
+ * then the deep_research skill drives the stage machine. The panel starts/resumes a run with
+ * its Run control (which sends the run message through the task's bound session); every other
+ * stage transition, gate override, scratch write and Promote happens agent-side in the chat,
+ * so the monitor reflects whatever the agent produced. While a run is in flight, Run + Delete
+ * Task are disabled and a live Activity feed below the working directory mirrors the events.
  */
 (() => {
   "use strict";
@@ -38,6 +40,14 @@
   const GATE_NAMES = { EVIDENCE_GATE: "Evidence Gate", CLAIM_GATE: "Claim Gate" };
 
   let selectedTask = null; // { task_id, name }
+  // Research run state: a run is in flight when the desktop auto-started it (Run) or the user
+  // activated it by typing in the task's session (sendChat attaches the research handoff).
+  // While running, the Run + Delete Task controls stay disabled and the Run button shows its
+  // running style; the Activity feed below mirrors the live run events.
+  let researchRunning = false;
+  let runningTaskId = null;      // task the in-flight run belongs to (blocks deleting it)
+  let activityEl = null;         // live Activity section (survives same-task pane re-renders)
+  let activityForTask = null;    // task_id the current activity feed belongs to
 
   function escapeHtml(text) {
     return String(text ?? "").replace(/[&<>"']/g, (c) => (
@@ -79,6 +89,107 @@
     box.appendChild(el("div", "research-section-title", title));
     return box;
   }
+
+  // ── run controls + live Activity feed ─────────────────────────────────────
+  // The run state is shared with app.js: sendChat announces start/end via researchRunActive and
+  // mirrors each streamed event via researchActivityEvent; the 10s status poll re-asserts a run
+  // that is already RUNNING server-side. Starting a run always funnels through
+  // window.startResearchRun (app.js), which opens the session then auto-sends the run message.
+  function runStartText() { return researchRunning ? "● Running…" : "▶ Run"; }
+
+  function syncRunCtl() {
+    document.querySelectorAll(".run-ctl").forEach((btn) => {
+      btn.disabled = researchRunning;
+      if (btn.classList.contains("run-start")) {
+        btn.textContent = runStartText();
+        btn.classList.toggle("running", researchRunning);
+      }
+    });
+  }
+
+  // Research runs that are already RUNNING on the server (adopted when a task view renders).
+  function adoptRunState(detail) {
+    if (detail && detail.is_running) {
+      researchRunning = true;
+      runningTaskId = detail.task_id;
+    }
+  }
+
+  window.researchRunActive = (taskId, on) => {
+    researchRunning = !!(taskId && on);
+    if (on && taskId) runningTaskId = taskId;
+    syncRunCtl();
+    if (activityEl) {
+      activityEl.classList.toggle("running", researchRunning);
+      const meta = activityEl._meta;
+      if (researchRunning && meta && meta.dataset.hold !== "true") meta.textContent = "Running…";
+    }
+  };
+
+  // Activity header meta (status · stage) refreshed from the server status poll.
+  window.researchActivityMeta = (status, stage) => {
+    if (!activityEl) return;
+    const parts = [];
+    if (status) parts.push(status);
+    if (stage) parts.push(`Stage ${stage}`);
+    const meta = activityEl._meta;
+    if (meta) {
+      meta.textContent = parts.join(" · ") || "Idle";
+      meta.dataset.hold = parts.length ? "true" : "false";
+    }
+  };
+
+  function buildActivity() {
+    const box = el("div", "research-section rtv-activity");
+    const head = el("div", "rtv-activity-head");
+    head.appendChild(el("span", "rtv-activity-dot"));
+    head.appendChild(el("span", "rtv-activity-title", "Activity"));
+    const meta = el("span", "rtv-activity-meta", "Idle");
+    meta.dataset.hold = "false";
+    head.appendChild(meta);
+    box.appendChild(head);
+    const body = el("div", "rtv-activity-body");
+    body.appendChild(
+      el("div", "rtv-activity-empty",
+        "No run in progress — press ▶ Run or send a message in the task's session to start.")
+    );
+    box.appendChild(body);
+    box._body = body;
+    box._meta = meta;
+    return box;
+  }
+
+  function ensureActivity(taskId) {
+    if (!activityEl || activityForTask !== taskId) {
+      activityEl = buildActivity();
+      activityForTask = taskId;
+    }
+    return activityEl;
+  }
+
+  function clipText(s, n) {
+    s = String(s ?? "");
+    return s.length > n ? s.slice(0, n - 1) + "…" : s;
+  }
+
+  window.researchActivityEvent = (evt) => {
+    if (!activityEl) return;
+    if (!evt || evt.type === "content") return; // final prose belongs to the chat
+    const body = activityEl._body;
+    if (!body) return;
+    const empty = body.querySelector(".rtv-activity-empty");
+    if (empty) empty.remove();
+    const row = el("div", "rtv-activity-line");
+    if (evt.type === "notice") { row.classList.add("info"); row.textContent = clipText(evt.data, 220); }
+    else if (evt.type === "thinking") { row.classList.add("think"); row.textContent = `💭 ${clipText(evt.data, 180)}`; }
+    else if (evt.type === "tool") { row.classList.add("tool"); row.textContent = `⚙️ ${(evt.data && evt.data.name) || "tool"}`; }
+    else if (evt.type === "step-answer") { row.classList.add("boundary"); row.textContent = "—"; }
+    else if (evt.type === "done") { row.classList.add("ok"); row.textContent = "✓ Run turn finished."; }
+    else return;
+    body.appendChild(row);
+    if (body.children.length > 200) body.firstChild.remove();
+    body.scrollTop = body.scrollHeight;
+  };
 
   // ── top layer: task list (read-only, newest first) ───────────────────────
   // Render guard: two rapid loadTasks() calls (e.g. the create flow fires loadResearch() then
@@ -137,6 +248,10 @@
   // removed. A 409 (task RUNNING, or the report is in the Knowledge Base) keeps the task and
   // surfaces the server's reason verbatim.
   async function deleteTask(t) {
+    if (researchRunning && t && t.task_id === runningTaskId) {
+      toast("A research run is in progress — wait for it to finish before deleting the task.");
+      return;
+    }
     if (!window.confirmModal) return;
     const ok = await window.confirmModal({
       title: "Delete research task?",
@@ -178,6 +293,7 @@
       statusBody.appendChild(el("div", "research-status-empty", `Status unavailable: ${e.message}`));
       return;
     }
+    adoptRunState(detail);
     recordResearchSession(detail);
     // Open this task's dedicated session in the chat — silent, no message sent. This is what
     // makes task selection side-effect free (app.js openResearchSession); a repeated open of
@@ -201,6 +317,7 @@
     if (sess) statusBody.appendChild(sess);
     statusBody.appendChild(renderInventory(detail));
     statusBody.appendChild(renderResume(detail));
+    syncRunCtl(); // reflect any run state on the freshly rendered Run control
   }
 
   // Discrete stage nodes: done ✓ / current ● / pending ○, chained with arrows.
@@ -380,14 +497,14 @@
   }
 
   function renderResume(detail) {
-    if (!window.openResearchSession) return el("div");
+    if (!window.openResearchSession || !window.startResearchRun) return el("div");
     const row = el("div", "research-status-resume");
-    const btn = el("button", "primary", "▶ Open Chat");
-    // Opens the task's dedicated session (silent — nothing is sent). The task is driven by
-    // typing a run instruction in that session; repeated clicks reopen the SAME conversation
-    // (1:1 binding) instead of forking a parallel session per click.
+    // Run starts (or resumes) the task's run: opens its dedicated session, then auto-sends the
+    // run message through the research handoff. While a run is in flight every Run / Delete
+    // control is disabled and the Run button shows its running style.
+    const btn = el("button", "run-ctl run-start", runStartText());
     btn.addEventListener("click", () =>
-      window.openResearchSession(detail.task_id, detail.name || detail.task_id, detail.session_id)
+      window.startResearchRun(detail.task_id, detail.name || detail.task_id, detail.session_id)
     );
     row.appendChild(btn);
     return row;
@@ -395,9 +512,10 @@
 
   // ── main pane: selected task's working-directory view ────────────────────
   // Clicking a task in the left list switches the middle main pane to that task's cloud
-  // folder: title + details, an "Open Chat" entry into its dedicated session, and the full
-  // working-directory file list (task_spec.json / session_history.json at the root,
-  // materials/, outputs/), each file clickable to view its content and material status.
+  // folder: title + details, a Run action into its dedicated session (auto-starts the run),
+  // and the full working-directory file list (task_spec.json / session_history.json at the
+  // root, materials/, outputs/), each file clickable to view its content and material status.
+  // A live Activity feed sits below the tree while a run is in progress.
   async function renderTaskView() {
     const pane = document.getElementById("research-task-view");
     const guide = document.getElementById("research-guide");
@@ -421,6 +539,7 @@
       pane.appendChild(el("div", "research-status-empty", `Task unavailable: ${e.message}`));
       return;
     }
+    adoptRunState(detail);
     recordResearchSession(detail);
     pane.innerHTML = "";
 
@@ -434,12 +553,15 @@
     titleRow.appendChild(el("span", "rtv-chip stage", `Stage ${detail.stage}`));
     head.appendChild(titleRow);
     const actions = el("div", "rtv-actions");
-    const openBtn = el("button", "primary", "▶ Open Chat");
+    // Run starts (or resumes) the task's run in one click; Delete cascades the cloud folder +
+    // state. Both are disabled while a run is in flight (researchRunning), and Run switches to
+    // its running style so the in-flight state is visible everywhere at once.
+    const openBtn = el("button", "run-ctl run-start", runStartText());
     openBtn.addEventListener("click", () =>
-      window.openResearchSession(detail.task_id, detail.name || detail.task_id, detail.session_id)
+      window.startResearchRun(detail.task_id, detail.name || detail.task_id, detail.session_id)
     );
     actions.appendChild(openBtn);
-    const delBtn = el("button", "ghost rtv-del", "🗑 Delete task");
+    const delBtn = el("button", "ghost rtv-del run-ctl", "🗑 Delete task");
     delBtn.addEventListener("click", () => deleteTask({ task_id: detail.task_id, name: detail.name || detail.task_id }));
     actions.appendChild(delBtn);
     head.appendChild(actions);
@@ -458,14 +580,18 @@
     pane.appendChild(card);
 
     pane.appendChild(renderWorkingDir(detail));
+    // Live Activity feed sits below the working-directory tree; it survives same-task re-renders
+    // (ensureActivity keeps the existing node) so an in-flight run's events are never wiped.
+    pane.appendChild(ensureActivity(detail.task_id));
+    syncRunCtl(); // reflect any run state on the freshly rendered Run / Delete controls
   }
 
   // The task folder as a standard VS Code / Explorer-style vertical tree: rows reuse the Cloud
   // Drive .cd-* classes, children nest in .rtv-kids containers whose dotted border-left is the
   // per-level indent guide. The task folder row opens into its subfolders (materials/, outputs/,
   // any extra) and the root mirrors (task_spec.json / session_history.json). Folders start
-  // expanded so the whole working directory reads; ▸/▾ toggles collapse/expand in place and
-  // each file row opens a preview. Folder rows stay on one line (name + (count) + "(empty)").
+  // collapsed so the main pane stays converged; ▸/▾ toggles expand in place and each file row
+  // opens a preview. Folder rows stay on one line (name + (count) + "(empty)").
   function renderWorkingDir(detail) {
     const box = section("Working directory");
     const wrap = el("div", "rtv-tree-box");
@@ -481,8 +607,9 @@
     const roots = groups.get("") || [];
     const extra = Array.from(groups.keys()).filter((k) => k && k !== "materials" && k !== "outputs");
     const segs = ["materials", "outputs", ...extra];
-    // The task folder and its work folders start open so the whole working directory reads.
-    const open = new Set(["", "materials", "outputs", ...segs]);
+    // Converged by default: the task folder row is expanded one level (so the work folders and
+    // root mirrors are visible) but every subfolder starts collapsed; ▸/▾ expands in place.
+    const open = new Set([""]);
 
     function toggle(seg) {
       if (open.has(seg)) open.delete(seg);

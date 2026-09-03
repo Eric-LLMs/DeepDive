@@ -30,7 +30,6 @@ from agent.tools.project_context import read_project_context
 from api.tools import register_builtin_tools
 from api.tools.toolkit import register_toolkit_plugins
 from core.application.drive_service import DriveService
-from plugins.research.plugin import register_research_plugins
 from core.config import export_secret_env, settings
 from core.infrastructure.db import SessionLocal
 from core.infrastructure.llm import OpenAILLM
@@ -41,6 +40,8 @@ from core.infrastructure.vector import PgVectorStore, TEIEmbedder
 from core.infrastructure.web_search import get_web_search_provider
 from rag import RAGPipeline, build_pipeline
 from rag.query_cache import wrap_retriever
+
+from plugins.research.plugin import register_research_plugins
 
 # Lightweight singletons
 llm = OpenAILLM()
@@ -188,4 +189,9 @@ def get_agent_kernel() -> AgentKernel:
     register_toolkit_plugins(manager, ctx, llm)
     register_research_plugins(manager, ctx)
     manager.discover(settings.plugins_dir)
+
+    # Now that every plugin/skill is discovered and registered, refuse to start when the full
+    # tool + skill index overflows the hard capacity ceiling (a tool/skill can never silently
+    # vanish from the model's prompt index).
+    kernel.ensure_capacity()
     return kernel

@@ -351,7 +351,7 @@ Sections register with an `order` plus a `zone` and merge ascending within it. T
 
 | zone | content | stability |
 |---|---|---|
-| `PromptZone.STATIC_PREFIX` | SOUL.md identity (`data/soul.md`) + compact tool catalog + compressed skill catalog | byte-identical across requests → the provider reuses its prefix cache |
+| `PromptZone.STATIC_PREFIX` | SOUL.md identity (`data/soul.md`) + complete tool catalog + full skill catalog (never truncated) | byte-identical across requests → the provider reuses its prefix cache |
 | `PromptZone.PROJECT_CONTEXT` | the first existing `DEEPDIVE.md` under `settings.workspace_dir` (read by `read_project_context`, capped at `settings.project_context_max_chars`) | stable per project; empty when absent |
 | `PromptZone.DYNAMIC_SUFFIX` | per-step session memory brief + any `inject()` content | re-rendered every step |
 
@@ -426,9 +426,12 @@ visible-tool stubs).
     memory-seeking turns; every turn still gets the always-on Lane-1 brief.
 - **Skills** — `Skill` (Markdown instructions + frontmatter + keywords) registered in a
   `SkillRegistry` (`register` / `relevant(query)` keyword scoring / `from_dir` for `*.skill.md`).
-  `SkillCatalog.render()` emits a compressed one-line directory (name + truncated description,
-  XML-escaped, within a character budget) into the STATIC_PREFIX; the `skill` meta-tool
-  lazy-loads the full SKILL.md body on demand and reports `allowed_tools`. `SkillScopeEnforcer`
+  `SkillCatalog.render()` emits the complete one-line directory — **every** skill, name + full
+  XML-escaped description, never dropped — into the STATIC_PREFIX; the `skill` meta-tool
+  lazy-loads the full SKILL.md body on demand and reports `allowed_tools`. The directory is never
+  truncated: when the full tool + skill index would overflow the hard capacity ceiling (16 KB),
+  agent-runtime startup is **refused** (see §6.5) instead of silently hiding a skill.
+  `SkillScopeEnforcer`
   (a `ToolRuntime` guard) hard-enforces those `allowed_tools` as a scoped allowlist for the
   rest of the turn: tools outside the union of the active skills' allowlists (plus a small core
   meta-tool set) are denied, with the reason fed back to the model.
@@ -581,9 +584,15 @@ DeepDive uses a small `EventBus` + `SessionLog` (append-only session events) and
 `ToolDefinition.permissions` is the effective (post-classify) class.
 
 **`tool_gateway.py`** — deferred tool loading for the 1000-tool scaling problem (prompt bloat):
-- `ToolCatalog` — a compact `name + blurb` index (no schemas); `render_index()` emits `- name:
-  blurb` lines within a character budget (blurbs truncated per-line); `search(query)` does
-  word-level scoring over name/blurb/permission tags.
+- `ToolCatalog` — a compact `name + blurb` index (no schemas); `render_index()` emits the
+  **complete** catalog — every registered tool, `- name: blurb` (each blurb one-line, ≤120 chars) —
+  with **no silent truncation**: earlier versions dropped tools past a character budget, which is
+  how a tool could vanish from the model's index without anyone noticing. The whole tool + skill
+  index now lives in the static prefix, bounded by a hard ceiling
+  (`CATALOG_CAPACITY_CHARS` = 16 KB) that **refuses agent-runtime startup** when overflowed
+  (`check_index_capacity`, raised from `AgentKernel.ensure_capacity`, called once after every
+  plugin/skill is discovered) — a pathological catalog explodes loudly at boot instead of quietly
+  hiding tools. `search(query)` does word-level scoring over name/blurb/permission tags.
 - `ToolVisibilityPolicy` — per-request scope: `allow(name)` / `deny(name)` / `present_as(mode,
   names)`, each returning a disposer for rollback; `deny` beats both `allow` and a mounted tool.
 - `ToolGateway` — `core_schemas()` (resident tools: `tool_search` / `skill` / `memory_search` /
@@ -1170,6 +1179,9 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Rewrite args / augment result | `tools/post-execute` returns `PostToolDecision.accept(value=..., content=...)` |
 | Observe results without blocking | `EventBus.observe("tools/result", ...)` (serial) / `emit` (fire-and-forget) |
 | Swap retrieval provider | `Context.provide("retrieval", …)` + `settings.retrieval_mode` |
+| Swap web-search provider | `Context.provide("web_search", get_web_search_provider())` + `settings.web_search_provider`; default `aggregate` — keyless concurrent Bing + Google + Baidu (`web_search_aggregate.py`), with DDG added as a second chance when the primary engines return empty |
+| Refuse to silently hide a tool / skill | full catalog render + `check_index_capacity` hard ceiling (16 KB), raised at startup from `AgentKernel.ensure_capacity` after every plugin/skill is discovered |
+| Social degrade when a platform has no API / login | x / zhihu adapters → `site_limited_web_search` (site-scoped keyless aggregate, host-filtered, deduped/fused) instead of failing |
 | Session extension points | `agent/session-start` / `agent/session-end` observers in the loop |
 | Stable prompt head for prefix cache | `CacheBoundaryAssembler` zones (internal `CACHE_BOUNDARY` separator, never rendered) + `snapshot_key()` |
 | Load a tool schema on demand | `tool_search` meta-tool → `ToolGateway.mount(name)` (defer_loading stub) + `schema_of(name)` in the result |
@@ -1817,11 +1829,22 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     badges + cloud working path) over the task folder's `materials/` / `outputs/` /
     `task_spec.json` / `session_history.json` drawn as a **VS Code-style vertical tree**
     (`.rtv-kids` nested containers with dotted `border-left` indent guides, single-line folder rows
-    with `(n)` counts / `(empty)` tags, file rows with right-aligned sizes and `KB` RAG tags). The
-    **chat header** is two-layer: a top control bar (`#chat-topbar`: **New chat** / **＋ Research**
-    + window controls) and, only in a research session, a full-width **research context bar**
-    (`#chat-research-bar`: `🔬 Research · <task title> · [<stage>]`) that hides the truncated chat
-    title (`#chat-header.research-mode`).
+    with `(n)` counts / `(empty)` tags, file rows with right-aligned sizes and `KB` RAG tags) —
+    collapsed by default (only the root opens one level). Card actions are a green **Run** button
+    (`.run-start`; "▶ Run" → "● Running…" while active) and **🗑 Delete task**: **Run is click-to-run**
+    — it opens the task's dedicated session and auto-sends the run instruction, so research starts
+    in one click instead of two. While a run is active the **Run and Delete buttons are disabled**
+    (dimmed, `.run-ctl`) until the run ends, and the card's running state is reconciled two ways:
+    locally when *this* chat starts a run (`window.researchRunActive`), and from the server's
+    `is_running` poll on every refresh — so a run started by typing in the chat conversation also
+    syncs the buttons to disabled + running style. Below the working-directory tree an **Activity
+    section** (`ensureActivity`) streams the bound run's live turn events — info / thinking / tool /
+    stage-boundary / done lines, kept across same-task re-renders (`researchActivityEvent`,
+    `researchActivityMeta`) — giving the main window a real-time status stream of what the research
+    is doing right now. The **chat header** is two-layer: a top control bar (`#chat-topbar`:
+    **New chat** / **＋ Research** + window controls) and, only in a research session, a full-width
+    **research context bar** (`#chat-research-bar`: `🔬 Research · <task title> · [<stage>]`) that
+    hides the truncated chat title (`#chat-header.research-mode`).
   - **Note editor** — an overlay with an **Edit / Preview** icon-button toggle and **Save**
     (`Ctrl+S`). Edit mode is a monospace `textarea`; Preview renders the draft through the
     vendored `markdown-it` + `katex` chat renderer (`renderMarkdown`, XSS-safe `validateLink`),
@@ -1943,7 +1966,7 @@ merged ascending by `order` within each zone:
 
 | zone | content | stability |
 |---|---|---|
-| `STATIC_PREFIX` | SOUL.md identity (`soul` section, `PERSONA_ORDER=0`) + compact tool catalog + compressed skill catalog (`HARNESS_IDENTITY_ORDER=-100` / `SKILLS_ORDER=250`) | byte-identical across requests → prefix-cache reuse |
+| `STATIC_PREFIX` | SOUL.md identity (`soul` section, `PERSONA_ORDER=0`) + complete tool catalog + full skill catalog (never truncated) (`HARNESS_IDENTITY_ORDER=-100` / `SKILLS_ORDER=250`) | byte-identical across requests → prefix-cache reuse |
 | `PROJECT_CONTEXT` | workspace `DEEPDIVE.md` conventions (`PROJECT_CONTEXT_ORDER=-90`) | stable per project; renders nothing when absent |
 | `DYNAMIC_SUFFIX` | session memory brief + proactive recall (`MEMORY_ORDER=200` / `+10`) + `inject()` content | re-rendered per step |
 

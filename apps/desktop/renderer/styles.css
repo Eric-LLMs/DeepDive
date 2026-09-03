@@ -2717,3 +2717,76 @@ body.resizing-ew { cursor: ew-resize; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ── Run control (research task view / sidebar status) ──
+   Run is green by default and switches to an amber running style while a run is in flight;
+   Run and Delete Task (both .run-ctl) are disabled during a run. */
+#research-task-view button.run-start,
+#research-status button.run-start {
+  background: #1f9d55;
+  border: 1px solid #1f9d55;
+  color: #fff;
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 6px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+#research-task-view button.run-start:hover:not(:disabled),
+#research-status button.run-start:hover:not(:disabled) { filter: brightness(1.08); }
+#research-task-view button.run-start.running,
+#research-status button.run-start.running { background: #c98a1b; border-color: #c98a1b; }
+#research-task-view button.run-ctl:disabled,
+#research-status button.run-ctl:disabled { opacity: 0.55; cursor: not-allowed; filter: none; }
+#research-task-view button.run-ctl:disabled:hover,
+#research-status button.run-ctl:disabled:hover { color: var(--fg-dim); border-color: var(--border); }
+
+/* ── Activity feed: live run stream below the working-directory tree ── */
+.rtv-activity {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  overflow: hidden;
+}
+.rtv-activity-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.rtv-activity-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+  opacity: 0.6;
+  flex: none;
+}
+.rtv-activity.running .rtv-activity-dot {
+  background: #34d399;
+  opacity: 1;
+  box-shadow: 0 0 6px #34d399;
+  animation: rtv-pulse 1.4s ease-in-out infinite;
+}
+@keyframes rtv-pulse { 50% { opacity: 0.3; } }
+.rtv-activity-title { font-size: 12px; font-weight: 600; color: var(--fg); }
+.rtv-activity-meta { margin-left: auto; font-size: 11px; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.rtv-activity-body {
+  max-height: 300px;
+  min-height: 56px;
+  overflow: auto;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+}
+.rtv-activity-empty { color: var(--fg-dim); padding: 6px 0; }
+.rtv-activity-line { color: var(--fg); line-height: 1.45; word-break: break-word; }
+.rtv-activity-line.info { color: #e0b54f; }
+.rtv-activity-line.think { color: var(--fg-dim); font-style: italic; }
+.rtv-activity-line.tool { color: var(--accent); font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+.rtv-activity-line.boundary { align-self: stretch; text-align: center; color: var(--fg-dim); opacity: 0.5; }
+.rtv-activity-line.ok { color: #34d399; }

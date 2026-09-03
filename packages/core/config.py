@@ -72,10 +72,13 @@ class Settings(BaseSettings):
     toolkit_max_file_bytes: int = 20 * 1024 * 1024
 
     # ── Web search (agent web_search tool) ──
-    # provider is free text: duckduckgo (no key) | tavily | bing | google (see web_search.py).
+    # provider is free text: aggregate/keyless (no key) | duckduckgo (no key) | tavily |
+    # bing | google (see web_search.py). Defaults to the keyless multi-engine aggregate so
+    # the agent's web_search works out of the box with no API key; a keyed provider is
+    # used only when explicitly selected.
     # These are mirrored from the generic tools namespace (cfg["tools"]["web_search"]) at
     # startup / config save, so they stay the source of truth for the flat read path.
-    web_search_provider: str = "tavily"
+    web_search_provider: str = "aggregate"
     web_search_api_key: str = ""
     web_search_engine_id: str = ""        # google Custom Search engine id (cx)
 

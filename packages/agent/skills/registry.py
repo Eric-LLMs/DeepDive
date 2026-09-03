@@ -4,7 +4,6 @@ Modeled after claude-code skills: a skill is a block of Markdown instructions + 
 The Agent loads relevant skill instructions into context on demand and then follows them.
 ``allowed_tools`` is an optional sandbox hint: which tools the skill is permitted to use.
 """
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -110,28 +109,18 @@ class SkillCatalog:
     def __init__(self, registry: SkillRegistry) -> None:
         self._registry = registry
 
-    def render(
-        self,
-        *,
-        limit_chars: int = 500,
-        desc_chars: int = 80,
-    ) -> str:
-        """Sorted one-line entries (``- name: description``) truncated to a budget.
+    def render(self) -> str:
+        """Sorted one-line entries (``- name: description``) — every skill, never dropped.
 
-        Each description is capped at ``desc_chars`` so the directory advertises far more
-        skills within the budget; the full body is fetched lazily via the ``skill()`` tool.
+        Earlier versions truncated the directory to a character budget, so skills past the cap
+        silently vanished from the prompt. Now the complete directory is emitted; startup is
+        refused (``AgentKernel.ensure_capacity`` → :func:`agent.tools.tool_gateway.check_index_capacity`)
+        when the combined tool + skill index overflows the hard capacity ceiling.
         """
-        lines: list[str] = []
-        used = 0
-        for skill in sorted(self._registry.all(), key=lambda s: s.name):
-            desc = _escape_xml(skill.description)
-            desc = desc if len(desc) <= desc_chars else desc[: desc_chars - 1].rstrip() + "…"
-            line = f"- {skill.name}: {desc}"
-            if used and used + len(line) > limit_chars:
-                break
-            lines.append(line)
-            used += len(line) + 1
-        return "\n".join(lines)
+        return "\n".join(
+            f"- {skill.name}: {_escape_xml(skill.description)}"
+            for skill in sorted(self._registry.all(), key=lambda s: s.name)
+        )
 
 
 def skill_tool(registry: SkillRegistry) -> ToolDefinition:

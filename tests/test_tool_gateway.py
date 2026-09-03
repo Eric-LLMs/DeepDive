@@ -1,12 +1,14 @@
 """Tests for the deferred tool-loading gateway (catalog blurb, mount, allow/deny)."""
 import pytest
+from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
 from agent.tools.tool_gateway import (
+    CAPACITY_REFUSAL_MSG,
     ToolCatalog,
     ToolGateway,
     ToolVisibilityPolicy,
+    check_index_capacity,
     tool_search_tool,
 )
-from agent.tools.definition import ToolDefinition, ToolOutput, define_tool
 
 
 def _def(name: str, description: str, params: dict | None = None) -> ToolDefinition:
@@ -44,9 +46,21 @@ async def test_catalog_carries_blurbs_not_full_schemas(runtime):
         assert len(entry.blurb) <= 120
         assert "parameters" not in entry.__dict__  # no full schema leaked
 
-    index = catalog.render_index(budget_chars=300)
+    # The catalog index is complete: every registered tool appears, nothing is truncated.
+    index = catalog.render_index()
     assert "- rag_search:" in index
     assert "- edit_file:" in index
+    assert index.count("- ") == len(catalog.entries())
+
+
+async def test_check_index_capacity_refuses_overflow(runtime):
+    # A healthy catalog (here, two tools) passes silently…
+    index = ToolCatalog(runtime).render_index()
+    check_index_capacity(index, "", capacity=1000)
+
+    # …but overflowing the ceiling refuses startup with the mandated message.
+    with pytest.raises(RuntimeError, match=CAPACITY_REFUSAL_MSG):
+        check_index_capacity(index, index, capacity=len(index) + 10)
 
 
 async def test_tool_search_mounts_schema_for_next_step(runtime):
