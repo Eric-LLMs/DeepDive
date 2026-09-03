@@ -1127,6 +1127,10 @@
       noteSaveBtn.disabled = true;
       noteBtn(noteSaveBtn, "Save");
       noteEditor.classList.remove("hidden");
+      // The note takes the Files document area (chat stays visible); syncMainPanes hides the
+      // viewer now and keeps visibility consistent across tabs.
+      window.__cloudNoteOpen = true;
+      if (window.__syncMainPanes) window.__syncMainPanes();
       setStatus("");
     } catch (e) {
       setStatus(`Failed to open note: ${e.message}`);
@@ -1175,6 +1179,9 @@
     note.asset = null;
     note.dirty = false;
     noteEditor.classList.add("hidden");
+    // Hand the document area back to #viewer (chat stays visible the whole time).
+    window.__cloudNoteOpen = false;
+    if (window.__syncMainPanes) window.__syncMainPanes();
     noteTextarea.value = "";
     notePreviewPane.innerHTML = "";
     noteSaveBtn.disabled = false;

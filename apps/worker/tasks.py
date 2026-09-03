@@ -6,6 +6,7 @@ enrichment work the gateway used to do in-process. arq calls every task as
 task drives its own status transitions via :class:`JobStore`.
 """
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -17,7 +18,10 @@ from sqlalchemy import or_, select, update
 
 logger = logging.getLogger(__name__)
 
-from api.agent_factory import get_agent_kernel  # shared AgentKernel composition (api + worker)
+from api.agent_factory import (  # shared kernel + drive (api + worker)
+    get_agent_kernel,
+    get_drive_service,
+)
 from core.application.drive_service import READY, DriveError, DriveService
 from core.config import settings
 from core.infrastructure import media
@@ -49,6 +53,7 @@ from core.infrastructure.repositories import (
     SqlSentenceRepository,
 )
 from core.infrastructure.storage import get_storage, object_key
+from core.logger import reset_log_context, set_log_context
 from rag.query_cache import bump_corpus_version
 
 from apps.worker.rag_images import save_images, scan_embedded_images
@@ -96,27 +101,34 @@ async def _run(ctx, job_id: str, work) -> dict:
     attempt = int(ctx.get("job_try") or 1)
     max_tries = settings.worker_max_tries
     terminal = max_tries <= 1 or attempt >= max_tries
+    # Tag every log line this job emits with the job id. arq runs each job in a fresh task,
+    # so the ContextVar set here never bleeds across jobs; the reset keeps the tag from
+    # surviving if the task is ever reused (tests, nested arq).
+    log_tokens = set_log_context(request_id=f"job:{job_id}")
     try:
-        result = await work
-    except asyncio.CancelledError:
-        # arq cancels jobs past job_timeout (CancelledError is a BaseException, so a
-        # bare ``except Exception`` would swallow nothing — the job row would stay
-        # "running" forever). Record the honest terminal state before re-raising.
-        if terminal:
-            await store.mark_failed(uid, "job cancelled: worker job timeout exceeded")
-            _record_dead_letter(uid, attempt, "job cancelled: worker job timeout exceeded")
-        else:
-            await store.mark_running(uid, error=f"attempt {attempt} failed: job cancelled — retrying")
-        raise
-    except Exception as exc:
-        if terminal:
-            await store.mark_failed(uid, str(exc))
-            _record_dead_letter(uid, attempt, str(exc))
-        else:
-            await store.mark_running(uid, error=f"attempt {attempt} failed: {exc} — retrying")
-        raise
-    await store.mark_succeeded(uid, result)
-    return result
+        try:
+            result = await work
+        except asyncio.CancelledError:
+            # arq cancels jobs past job_timeout (CancelledError is a BaseException, so a
+            # bare ``except Exception`` would swallow nothing — the job row would stay
+            # "running" forever). Record the honest terminal state before re-raising.
+            if terminal:
+                await store.mark_failed(uid, "job cancelled: worker job timeout exceeded")
+                _record_dead_letter(uid, attempt, "job cancelled: worker job timeout exceeded")
+            else:
+                await store.mark_running(uid, error=f"attempt {attempt} failed: job cancelled — retrying")
+            raise
+        except Exception as exc:
+            if terminal:
+                await store.mark_failed(uid, str(exc))
+                _record_dead_letter(uid, attempt, str(exc))
+            else:
+                await store.mark_running(uid, error=f"attempt {attempt} failed: {exc} — retrying")
+            raise
+        await store.mark_succeeded(uid, result)
+        return result
+    finally:
+        reset_log_context(log_tokens)
 
 
 # Serialize asset_ingest per asset. Upload auto-enqueue (complete_upload), the manual
@@ -1004,28 +1016,232 @@ async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
         user_id = UUID(payload["user_id"])
         session_id = UUID(payload["session_id"])
         message = payload["message"]
-        session_memory = SessionMemoryStore(
-            ctx["session_factory"], ctx["embedder"], ctx["llm"], session_id, user_id
+        log_tokens = set_log_context(
+            user_id=str(user_id), session_id=str(session_id), request_id=f"job:{job_id}"
         )
-        history = await session_memory.load_messages()
-        result = await get_agent_kernel().run(
-            message,
-            history,
-            session_memory=session_memory,
-            model=payload.get("model"),
-            base_url=payload.get("base_url"),
-            api_key=payload.get("api_key"),
-        )
-        # run() already closed session_memory (flushed events); defer the expensive
-        # embed + summary work to session_finalize, like the interactive chat path.
-        await TaskQueue(ctx["redis"], ctx["job_store"]).enqueue(
-            SESSION_FINALIZE, {"session_id": str(session_id)}
-        )
-        return {
-            "final_answer": result.final_answer,
-            "steps": len(result.messages),
-            "usage": result.usage,
-            "cost_usd": result.cost_usd,
-        }
+        try:
+            session_memory = SessionMemoryStore(
+                ctx["session_factory"], ctx["embedder"], ctx["llm"], session_id, user_id
+            )
+            history = await session_memory.load_messages()
+            result = await get_agent_kernel().run(
+                message,
+                history,
+                session_memory=session_memory,
+                model=payload.get("model"),
+                base_url=payload.get("base_url"),
+                api_key=payload.get("api_key"),
+            )
+            # run() already closed session_memory (flushed events); defer the expensive
+            # embed + summary work to session_finalize, like the interactive chat path.
+            await TaskQueue(ctx["redis"], ctx["job_store"]).enqueue(
+                SESSION_FINALIZE, {"session_id": str(session_id)}
+            )
+            return {
+                "final_answer": result.final_answer,
+                "steps": len(result.messages),
+                "usage": result.usage,
+                "cost_usd": result.cost_usd,
+            }
+        finally:
+            reset_log_context(log_tokens)
 
     return await _run(ctx, job_id, work())
+
+
+async def research_drive(ctx, job_id: str, payload: dict) -> dict:
+    """Run one auto-continue worker turn of a Research OS task run (the T0 chain).
+
+    One job = one :class:`~plugins.research.driver.ResearchRunDriver.auto_turn` execution
+    (one ``execution_id``). The driver owns every state transition under the single-flight
+    CAS (claim, ledger, ``last_block``, slot release); this task supplies the LLM turn, then
+    mirrors the model's answer into the task's session mirror, schedules the *next* auto turn
+    when the driver says continue, and publishes the wake-up event so the desktop monitor
+    refetches.
+
+    Payload: ``user_id``, ``task_id``, ``run_id``, ``turn_index`` (+ optional ``session_id``
+    and ``model`` / ``base_url`` / ``api_key`` pinning the interactive run's LLM channel).
+    Never raises for a graded stop (finish / blocked / stalled / cancelled / drop): those are
+    honest outcomes recorded in the driver state. Only an unexpected bug escapes (after the
+    slot is released) so the job row fails truthfully.
+    """
+    async def work() -> dict:
+        from agent.security.approvals import (
+            ApprovalStore,
+            get_approval_bridge,
+            set_request_approval,
+        )
+        from core.infrastructure.request_context import set_request_user
+
+        from plugins.research.driver import ResearchRunDriver, RunTurnResult
+        from plugins.research.plugin import ResearchService
+
+        user_id = UUID(payload["user_id"])
+        set_request_user(user_id)
+        task_id = payload["task_id"]
+        run_id = payload["run_id"]
+        turn_index = int(payload["turn_index"])
+        session_id = payload.get("session_id")
+        model = payload.get("model")
+        base_url = payload.get("base_url")
+        api_key = payload.get("api_key")
+        # The _run wrapper already tagged the job id; add the research run's owner/task/run so
+        # driver and settle log lines carry ``task_id:run_id`` like the interactive turn does.
+        log_tokens = set_log_context(
+            user_id=str(user_id),
+            session_id=str(session_id) if session_id else None,
+            task_id=task_id,
+            run_id=run_id,
+        )
+
+        # The driver mirror (append_session_turn) keys off the DB session id; the task keeps
+        # its own task-local session_history.json projection. The session must be bound to this
+        # task (chat binds it when the user started the run) for the mirror to land.
+        service = ResearchService(get_drive_service(), settings.research_scratch_dir)
+        driver = ResearchRunDriver()
+
+        # History for the model = the real DB conversation (the interactive human turns). We
+        # deliberately do NOT pass SessionMemoryStore as the kernel's session_memory: the auto
+        # driver prompt is synthetic and would otherwise be persisted as a fake user message in
+        # the DB session. The assistant answers still reach the task-local mirror below.
+        history: list[dict] = []
+        if session_id:
+            store = SessionMemoryStore(
+                ctx["session_factory"], ctx["embedder"], ctx["llm"],
+                UUID(session_id), user_id,
+            )
+            history = await store.load_messages()
+
+        # Bind an approval store so the bridge never DENYs an ASK'd tool for lack of a bound
+        # store; resolutions route through the shared Redis broker (configured at startup).
+        set_request_approval(ApprovalStore(get_approval_bridge().broker, user_id=str(user_id)))
+
+        async def run_turn(prompt: str) -> RunTurnResult:
+            result = await get_agent_kernel().run(
+                prompt,
+                history,
+                session_memory=None,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                context={
+                    "handoff": {
+                        "kind": "research",
+                        "project_id": task_id,
+                        "mode": "research_resume",
+                    }
+                },
+                max_steps=settings.research_driver_turn_max_steps,
+            )
+            return RunTurnResult(
+                final_answer=result.final_answer or "",
+                cost_usd=float(result.cost_usd or 0.0),
+            )
+
+        try:
+            outcome = await driver.auto_turn(
+                service,
+                owner_id=user_id,
+                task_id=task_id,
+                run_id=run_id,
+                turn_index=turn_index,
+                run_turn=run_turn,
+            )
+            return await _settle_research_outcome(
+                ctx, service, driver,
+                owner_id=user_id,
+                task_id=task_id,
+                session_id=session_id,
+                outcome=outcome,
+                channel=(model, base_url, api_key),
+            )
+        finally:
+            set_request_approval(None)
+            reset_log_context(log_tokens)
+
+    return await _run(ctx, job_id, work())
+
+
+async def _settle_research_outcome(
+    ctx,
+    service,
+    driver,
+    *,
+    owner_id: UUID,
+    task_id: str,
+    session_id: str | None,
+    outcome,
+    channel: tuple[str | None, str | None, str | None],
+) -> dict:
+    """Act on a driver outcome: mirror, schedule the next turn, publish the wake-up event.
+
+    Kept as a plain helper so the mirror/enqueue/publish ordering is testable without arq.
+    """
+    from core.infrastructure.jobs import RESEARCH_DRIVE
+
+    if outcome.dropped:
+        # A stale/duplicate job: nothing changed on disk, nothing to mirror or enqueue.
+        return {"action": outcome.action, "reason": outcome.reason, "dropped": True}
+
+    # Mirror the model's answer (and a compact auto-run marker) into the task's session mirror
+    # so the desktop research panel shows what each background turn produced.
+    if outcome.final_answer and session_id:
+        marker = f"[auto-run · turn {outcome.turn_index}] continuing the research task."
+        with contextlib.suppress(Exception):
+            await service.append_session_turn(
+                owner_id, session_id, "user", marker
+            )
+            await service.append_session_turn(
+                owner_id, session_id, "assistant", outcome.final_answer
+            )
+
+    model, base_url, api_key = channel
+    if outcome.action == "continue":
+        try:
+            await TaskQueue(ctx["redis"], ctx["job_store"]).enqueue(
+                RESEARCH_DRIVE,
+                {
+                    "user_id": str(owner_id),
+                    "task_id": task_id,
+                    "run_id": outcome.run_id,
+                    "session_id": session_id,
+                    "turn_index": outcome.next_turn_index,
+                    "model": model,
+                    "base_url": base_url,
+                    "api_key": api_key,
+                },
+                user_id=owner_id,
+            )
+        except Exception as exc:
+            # The chain cannot continue — release the slot with an honest error record and
+            # surface the failure, never leaving active_run held with no job behind it.
+            err = driver.abort_run(
+                service, owner_id, task_id,
+                run_id=outcome.run_id, execution_id=outcome.execution_id,
+                reason=f"could not schedule the next auto turn: {exc}",
+            )
+            with contextlib.suppress(Exception):
+                await service.publish_change(owner_id, task_id, kind=err.publish_kind)
+            raise
+        # A wake-up so the desktop monitor refetches the fresh snapshot + mirrored turn.
+        with contextlib.suppress(Exception):
+            await service.publish_change(owner_id, task_id, kind=outcome.publish_kind)
+        return {
+            "action": "continue",
+            "turn_index": outcome.turn_index,
+            "next_turn_index": outcome.next_turn_index,
+            "execution_id": outcome.execution_id,
+            "cost_usd": outcome.cumulative_cost_usd,
+        }
+
+    # Graded terminal (finished / blocked / stalled / cancelled / error-from-retry-exhaustion).
+    with contextlib.suppress(Exception):
+        await service.publish_change(owner_id, task_id, kind=outcome.publish_kind)
+    return {
+        "action": outcome.action,
+        "reason": outcome.reason,
+        "state": outcome.state.value,
+        "turn_index": outcome.turn_index,
+        "execution_id": outcome.execution_id,
+        "cost_usd": outcome.cumulative_cost_usd,
+    }

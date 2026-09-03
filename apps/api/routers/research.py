@@ -17,6 +17,9 @@ so a duplicate POST is a safe no-op.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import logging
 import uuid
 
@@ -27,7 +30,11 @@ from core.application.drive_service import DriveError, DriveService
 from core.config import settings
 from core.infrastructure.db import SessionLocal
 from core.infrastructure.memory import create_session
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
+
+from plugins.research.monitor import task_channel
 from plugins.research.plugin import ResearchService
 
 router = APIRouter(prefix="/research", tags=["research"])
@@ -63,7 +70,7 @@ async def _make_task_session(user_id: uuid.UUID, title: str) -> str | None:
     """
     try:
         return str(await create_session(SessionLocal, user_id, title=title))
-    except Exception:  # noqa: BLE001 — the task itself is still valid without a session
+    except Exception:
         logger.exception("research: failed to create the task's chat session")
         return None
 
@@ -99,7 +106,7 @@ async def create_task(
             _service(drive).bind_session(user.user_id, created["task_id"], session_id)
             created["session_id"] = session_id
         return created
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - map every domain error to its HTTP status
         raise _http_error(exc)
 
 
@@ -135,6 +142,153 @@ async def delete_task(
         raise _not_found(exc)
     except DriveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_task(
+    task_id: str,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+):
+    """Request a stop for a task's auto-continue run.
+
+    Sets ``driver.cancel_requested`` (idempotent). The stop is cooperative: a turn that is
+    mid-execution ends its current step, then the driver releases the slot and publishes
+    ``run.cancelled``; a Stop between turns is honoured by the next job's claim. The task is
+    never forcibly killed mid-write.
+    """
+    service = _service(drive)
+    try:
+        service.read_project(user.user_id, task_id)  # 404 if missing / traversal
+        checkpoint = service.request_cancel(user.user_id, task_id)
+    except ValueError as exc:
+        raise _not_found(exc)
+    project = service.read_project(user.user_id, task_id)
+    return {
+        "task_id": task_id,
+        "cancel_requested": checkpoint["cancel_requested"],
+        "is_running": project.get("active_run") is not None,
+    }
+
+
+class _ApproveBody(BaseModel):
+    approve: bool
+
+
+@router.post("/tasks/{task_id}/approvals/{approval_id}")
+async def resolve_gate_override(
+    task_id: str,
+    approval_id: str,
+    body: _ApproveBody,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+):
+    """Approve / reject a research gate override — the human-in-the-loop gate decision.
+
+    The research state machine runs agent-side, but a gate override is a *human* call: this
+    endpoint records the verdict (``approver_user_id`` = the signed-in user) and, when
+    approved, flips the gate to ``OVERRIDE`` atomically. The client then resumes the run via
+    its normal chat trigger so the agent drives past the gate; on reject the gate stays FAIL
+    and the agent is asked to propose a different approach. A non-``PENDING`` approval is 409.
+    """
+    service = _service(drive)
+    try:
+        service.read_project(user.user_id, task_id)  # ownership + existence gate (404)
+    except ValueError as exc:
+        raise _not_found(exc)
+    try:
+        return service.resolve_override(
+            user.user_id, approval_id, approve=body.approve, project_id=task_id
+        )
+    except ValueError as exc:
+        if "already resolved" in str(exc):
+            raise HTTPException(status_code=409, detail=str(exc))
+        raise _not_found(exc)
+
+
+@router.get("/tasks/{task_id}/monitor")
+async def monitor_task(
+    task_id: str,
+    request: Request,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+):
+    """SSE stream of a task's authoritative revision changes (subscribe-before-snapshot).
+
+    The desktop holds one such stream per open task panel. Frames:
+
+    - ``{"type":"snapshot","project_revision":N}`` immediately on connect — the task's current
+      authoritative version (rendered once, *after* this process subscribed, so no change in
+      the subscribe→snapshot gap is missed).
+    - ``{"type":"change","project_revision","kind","ts"}`` for each later wake-up whose
+      revision exceeds the last one sent (older / out-of-order hints are dropped).
+
+    This stream is an **invalidation hint, not the data**: the client throttles a refetch of
+    ``GET /research/tasks/{task_id}`` (the authoritative snapshot) when a change arrives. A
+    ``: keep-alive`` comment is emitted every 20s so intermediaries do not drop the socket.
+    """
+    service = _service(drive)
+    try:
+        service.read_project(user.user_id, task_id)  # ownership + existence gate (404)
+    except ValueError as exc:
+        raise _not_found(exc)
+
+    redis = request.app.state.redis
+
+    async def events():
+        pubsub = redis.pubsub()
+        await pubsub.subscribe(task_channel(task_id))
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def reader():
+            try:
+                async for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue  # subscribe/unsubscribe bookkeeping
+                    try:
+                        data = json.loads(msg["data"])
+                    except (TypeError, ValueError):
+                        continue
+                    queue.put_nowait(data)
+            except asyncio.CancelledError:
+                pass
+
+        reader_task = asyncio.create_task(reader())
+        try:
+            # Subscribe first, *then* read the authoritative revision for the snapshot, so a
+            # change committing between subscribe and snapshot is still queued behind us.
+            last_revision = service.read_project_revision(user.user_id, task_id)
+            yield {
+                "data": json.dumps(
+                    {"type": "snapshot", "project_revision": last_revision},
+                    ensure_ascii=False,
+                )
+            }
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=20.0)
+                except TimeoutError:
+                    yield {"comment": "keep-alive"}
+                    continue
+                try:
+                    revision = int(data.get("project_revision") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if revision <= last_revision:
+                    continue  # stale / duplicate hint — the client already has this revision
+                last_revision = revision
+                yield {
+                    "data": json.dumps(
+                        {"type": "change", **data}, ensure_ascii=False
+                    )
+                }
+        finally:
+            reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reader_task
+            await pubsub.aclose()
+
+    return EventSourceResponse(events())
 
 
 @router.get("/tasks/{task_id}/artifacts/{artifact_id}")

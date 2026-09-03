@@ -23,8 +23,6 @@ from api.deps import (
     get_task_queue,
     llm,
 )
-from api.schemas import ChatImportRequest, ChatRequest, ChatSessionImportRequest
-from core.application.drive_service import DriveError, DriveService
 from api.routers._shared import (
     _guest_quota,
     _log_usage,
@@ -32,6 +30,7 @@ from api.routers._shared import (
     resolve_guest_identity,
 )
 from api.schemas import ChatImportRequest, ChatRequest, ChatSessionImportRequest
+from core.application.drive_service import DriveError, DriveService
 from core.config import settings
 from core.infrastructure.db import (
     ChunkModel,
@@ -42,7 +41,12 @@ from core.infrastructure.db import (
 )
 from core.infrastructure.drive_repositories import SqlChunkRepository
 from core.infrastructure.ingest import build_chunks, write_query_repo_chunks
-from core.infrastructure.jobs import CHAT_SESSION_IMPORT, SESSION_FINALIZE, TaskQueue
+from core.infrastructure.jobs import (
+    CHAT_SESSION_IMPORT,
+    RESEARCH_DRIVE,
+    SESSION_FINALIZE,
+    TaskQueue,
+)
 from core.infrastructure.memory import (
     SessionMemoryStore,
     compact_history,
@@ -50,10 +54,12 @@ from core.infrastructure.memory import (
 )
 from core.infrastructure.request_context import set_request_user
 from core.infrastructure.security import authorize_usage, get_role
+from core.logger import reset_log_context, set_log_context
 from fastapi import APIRouter, Depends, HTTPException, Request
-from plugins.research.plugin import ResearchService
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
+
+from plugins.research.plugin import ResearchService
 
 router = APIRouter(tags=["chat"])
 
@@ -102,10 +108,10 @@ def _handoff_note(body: ChatRequest) -> str | None:
         return None
     mode = handoff.get("mode") or "research_resume"
     return (
-        "[Research handoff: resume project {pid} via research_project (action resume), "
-        "mode {mode}. Do NOT create a new project — the project already exists. Continue "
+        f"[Research handoff: resume project {project_id} via research_project (action resume), "
+        f"mode {mode}. Do NOT create a new project — the project already exists. Continue "
         "it through the deep_research skill stages and advance to PUBLISH.]"
-    ).format(pid=project_id, mode=mode)
+    )
 
 
 def _resolve_research_context(drive, user, session_id, body_handoff):
@@ -147,6 +153,98 @@ def _resolve_research_context(drive, user, session_id, body_handoff):
             logger.warning("research bind_session failed: %s", exc)
             notice = f"⚠️ Research: session/task binding failed — {exc}"
     return service, bound_task_id, effective_handoff, notice
+
+
+async def _maybe_continue_research(
+    service: ResearchService,
+    queue: TaskQueue,
+    *,
+    user_id: UUID,
+    task_id: str,
+    run_id: str,
+    session_id: str | None,
+    channel: tuple[str | None, str | None, str | None],
+) -> bool:
+    """Hand an interactive research turn's run to the worker chain, or release it.
+
+    Called right after the first (interactive) turn of a run completes, *before* ``end_run``.
+    Returns ``True`` when the run was handed to ``RESEARCH_DRIVE`` (the slot stays live and
+    the worker keeps driving until PUBLISH / a gate / a stop); ``False`` when the run must be
+    released here (reached PUBLISH, a human gate override is pending, Stop was requested, or
+    the continuation could not be scheduled — the slot is never stranded).
+
+    The interactive turn is the "free" turn 0: the driver's no-progress / caps / cost grading
+    starts with auto-turn 1. ``channel`` pins the same LLM channel the interactive turn used.
+    """
+    from plugins.research.driver import ResearchRunDriver, iso_now
+
+    async def _publish_async(kind: str) -> None:
+        with contextlib.suppress(Exception):
+            await service.publish_change(user_id, task_id, kind=kind)
+
+    ledger = service.get_driver_checkpoint(user_id, task_id)
+    if ledger.get("cancel_requested"):
+        await _publish_async("run.cancelled")
+        return False
+    project = service.read_project(user_id, task_id)
+    if project.get("stage") == "PUBLISH":
+        await _publish_async("run.finished")
+        return False
+    if service.pending_overrides(user_id, task_id):
+        await _publish_async("run.blocked")
+        return False
+
+    # Persist the interactive turn (turn 0) as the chain's starting ledger, then schedule
+    # auto-turn 1. The driver CAS-checks on arrival; a duplicate run of turn 0 is impossible
+    # (this is the only site that schedules turn_index 1).
+    try:
+        service.set_driver_checkpoint(
+            user_id, task_id,
+            patch={
+                "run_id": run_id,
+                "turn_index": 0,
+                "turn_attempt": 1,
+                "turn_state": "done",
+                "execution_id": f"{run_id}:0:1",
+                "updated_at": iso_now(),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - treat as a schedule failure below
+        logger.warning("research continuation ledger failed: %s", exc)
+        ResearchRunDriver().abort_run(
+            service, user_id, task_id,
+            run_id=run_id, execution_id=f"{run_id}:0:1",
+            reason=f"could not record the run ledger: {exc}",
+        )
+        return False
+
+    model, base_url, api_key = channel
+    try:
+        await queue.enqueue(
+            RESEARCH_DRIVE,
+            {
+                "user_id": str(user_id),
+                "task_id": task_id,
+                "run_id": run_id,
+                "session_id": session_id,
+                "turn_index": 1,
+                "model": model,
+                "base_url": base_url,
+                "api_key": api_key,
+            },
+            user_id=user_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - never strand a RUNNING slot
+        logger.warning("research continuation enqueue failed: %s", exc)
+        ResearchRunDriver().abort_run(
+            service, user_id, task_id,
+            run_id=run_id, execution_id=f"{run_id}:0:1",
+            reason=f"could not schedule the first auto turn: {exc}",
+        )
+        return False
+
+    await _publish_async("run.turn")
+    return True
 
 
 @router.post("/chat/import")
@@ -366,6 +464,9 @@ async def chat(
     if handoff_note:
         user_text = f"{handoff_note}\n\n{user_text}"
     session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
+    # Tag every log line this turn emits (research run, mirror, RAG recall) with the user +
+    # session it belongs to; reset once the response is built.
+    log_tokens = set_log_context(user_id=str(user_id), session_id=str(session_id))
     # Chat-driven research: bind this session to the handoff's task (mirror + grant), same
     # durable resolution as /chat/stream. The single-task run mutex (T4 invariant #2) is
     # shared with /chat/stream so a non-streaming turn and a streaming turn for the same task
@@ -399,6 +500,7 @@ async def chat(
         base_url=base_url or None,
         api_key=api_key or None,
     )
+    research_continuing = False
     try:
         result = await get_agent().run(
             user_text,
@@ -410,13 +512,32 @@ async def chat(
             context={"handoff": effective_handoff} if effective_handoff else None,
         )
     finally:
-        # /chat owns the run for the lifetime of this request — release the slot so a later
-        # turn (stream or not) for the same task can start.
-        if research_turn:
+        # /chat owns the run for the lifetime of this request. Hand the finished interactive
+        # turn to the worker chain unless it hit a stop condition (PUBLISH / pending gate
+        # override / cancel / enqueue failure); the single-task run slot is released only when
+        # the run is NOT handed off, so the driver chain keeps owning it across turns.
+        if research_turn and research_service is not None and bound_task_id is not None:
             try:
-                research_service.end_run(user_id, bound_task_id)
+                project = research_service.read_project(user_id, bound_task_id)
+                active_run = project.get("active_run") or {}
+                run_id = active_run.get("run_id")
+                if run_id:
+                    research_continuing = await _maybe_continue_research(
+                        research_service,
+                        queue,
+                        user_id=user_id,
+                        task_id=bound_task_id,
+                        run_id=run_id,
+                        session_id=str(session_id),
+                        channel=(model, base_url or None, api_key or None),
+                    )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("research end_run failed: %s", exc)
+                logger.warning("research continuation decision failed: %s", exc)
+            if not research_continuing:
+                try:
+                    research_service.end_run(user_id, bound_task_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("research end_run failed: %s", exc)
     # close() (inside run) already flushed events; defer the expensive embed+summary work.
     await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
     if log_user is not None:
@@ -452,6 +573,7 @@ async def chat(
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("research session_history mirror failed: %s", exc)
+    reset_log_context(log_tokens)
     resp = {
         "answer": result.final_answer,
         "messages": result.messages,
@@ -462,6 +584,8 @@ async def chat(
     }
     if guest_token:
         resp["guest_token"] = guest_token
+    if research_continuing:
+        resp["research_continuing"] = True
     if research_notice:
         notice = f"{notice}\n{research_notice}" if notice else research_notice
     if notice:
@@ -592,6 +716,10 @@ async def chat_stream(
         # research handoff may append to it below, so bind it nonlocal to avoid shadowing it
         # with an unbound local (UnboundLocalError killed the stream when no notice fired).
         nonlocal notice
+        # Tag every log line the stream emits (agent turns, research tools, finalize) with the
+        # user + session it belongs to. Set inside gen() (not chat_stream) because the SSE
+        # generator runs after chat_stream returns — the sibling pump task inherits it.
+        log_tokens = set_log_context(user_id=str(user_id), session_id=str(session_id))
         # The agent may block on a human-in-the-loop approval (awaiting POST /approvals/{id}),
         # so a plain `async for` over run_stream would deadlock — the stream can't advance while
         # the approval-request frame sits unyielded. Pump the stream into a queue in a sibling
@@ -632,6 +760,9 @@ async def chat_stream(
 
         pump_task = asyncio.create_task(pump())
         final = None
+        # Set when the interactive research turn hands the run to the worker chain (the slot
+        # stays live); the done frame then tells the client the run is still active.
+        research_continuing = False
 
         def collect_done_payload() -> dict | None:
             """Disconnect path: pull the done payload the drained pump left in the queue (the
@@ -724,13 +855,35 @@ async def chat_stream(
                 if final is None:
                     # The loop was abandoned (client disconnect) before the done frame; run the
                     # same post-turn bookkeeping even though no client is left to stream to.
-                    with contextlib.suppress(Exception):  # noqa: BLE001
+                    with contextlib.suppress(Exception):
                         await finalize_turn(collect_done_payload())
                 if research_service is not None and bound_task_id is not None:
+                    # Hand the finished interactive turn to the worker chain unless it hit a
+                    # stop condition (PUBLISH / pending gate override / cancel / enqueue
+                    # failure). ``research_continuing`` is set here and read on the normal path
+                    # to tag the done frame; the single-task run slot is released only when the
+                    # run is NOT handed off, so the driver chain keeps owning it across turns.
                     try:
-                        research_service.end_run(user_id, bound_task_id)
+                        project = research_service.read_project(user_id, bound_task_id)
+                        active_run = project.get("active_run") or {}
+                        run_id = active_run.get("run_id")
+                        if run_id:
+                            research_continuing = await _maybe_continue_research(
+                                research_service,
+                                queue,
+                                user_id=user_id,
+                                task_id=bound_task_id,
+                                run_id=run_id,
+                                session_id=str(session_id),
+                                channel=(model, base_url or None, api_key or None),
+                            )
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("research end_run failed: %s", exc)
+                        logger.warning("research continuation decision failed: %s", exc)
+                    if not research_continuing:
+                        try:
+                            research_service.end_run(user_id, bound_task_id)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("research end_run failed: %s", exc)
             else:
                 # Non-research turn: the run is owned by the SSE pipe. Client disconnect stops
                 # it so the turn's awaits (wait_for/tenacity/gather) re-raise CancelledError
@@ -738,9 +891,15 @@ async def chat_stream(
                 pump_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await pump_task
+            # Release the request-scoped log context: this generator may be closed (client
+            # disconnect) at any yield point, so the user/session tags set at gen() start must
+            # not leak into the next unit of work handled by this worker.
+            reset_log_context(log_tokens)
 
         # Normal completion path: the loop broke on the run's done frame.
         done = await finalize_turn(final)
+        if research_continuing:
+            done["research_continuing"] = True
         yield {"data": json.dumps({"type": "done", "data": done}, ensure_ascii=False)}
 
     return EventSourceResponse(gen())

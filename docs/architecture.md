@@ -1820,32 +1820,50 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     cached via `cloud-cache` and rendered by `Viewer.render` on the temp path, so PDFs, images,
     video, and audio play in window.
   - **Research tab** (`research.js`) — a **Research** tab joins the sidebar (the chat header also
-    gains a **＋ Research** button, §17). A task list shows stage, status, updated time, a live
-    **RUNNING** badge (`is_running` from the API), and a **🗑** delete that confirms first and
-    surfaces a 409's reason verbatim; selecting a task opens its dedicated session in the chat
-    silently (§17 session isolation — side-effect free, no message sent). The bottom **status
-    pane** (`loadStatus`) renders the stage DAG, gates, artifacts, the working-directory tree and
-    the bound session; the main **task view** (`renderTaskView`) is a card (title + ACTIVE / Stage
-    badges + cloud working path) over the task folder's `materials/` / `outputs/` /
-    `task_spec.json` / `session_history.json` drawn as a **VS Code-style vertical tree**
-    (`.rtv-kids` nested containers with dotted `border-left` indent guides, single-line folder rows
-    with `(n)` counts / `(empty)` tags, file rows with right-aligned sizes and `KB` RAG tags) —
-    collapsed by default (only the root opens one level). Card actions are a green **Run** button
-    (`.run-start`; "▶ Run" → "● Running…" while active) and **🗑 Delete task**: **Run is click-to-run**
-    — it opens the task's dedicated session and auto-sends the run instruction, so research starts
-    in one click instead of two. While a run is active the **Run and Delete buttons are disabled**
-    (dimmed, `.run-ctl`) until the run ends, and the card's running state is reconciled two ways:
-    locally when *this* chat starts a run (`window.researchRunActive`), and from the server's
-    `is_running` poll on every refresh — so a run started by typing in the chat conversation also
-    syncs the buttons to disabled + running style. Below the working-directory tree an **Activity
-    section** (`ensureActivity`) streams the bound run's live turn events — info / thinking / tool /
-    stage-boundary / done lines, kept across same-task re-renders (`researchActivityEvent`,
-    `researchActivityMeta`) — giving the main window a real-time status stream of what the research
-    is doing right now. The **chat header** is two-layer: a top control bar (`#chat-topbar`:
-    **New chat** / **＋ Research** + window controls) and, only in a research session, a full-width
-    **research context bar** (`#chat-research-bar`: `🔬 Research · <task title> · [<stage>]`) that
-    hides the truncated chat title (`#chat-header.research-mode`).
-  - **Note editor** — an overlay with an **Edit / Preview** icon-button toggle and **Save**
+    gains a **＋ Research** button, §17). The sidebar holds the **task list** — stage, status,
+    updated time, a live **RUNNING** badge (`is_running` from the API), and a **🗑** delete that
+    confirms first and surfaces a 409's reason verbatim — above a slimmed **status pane**
+    (`loadStatus`) that renders name/status, the stage-DAG nodes, gates, and any terminal
+    **`last_block` banner** (`.rtv-banner`); selecting a task opens its dedicated session in the
+    chat silently (§17 session isolation — side-effect free, no message sent). The main **task
+    view** (`renderTaskView`) is a **two-zone workbench** (`.rtv-workbench`): a working-directory
+    **tree column** (`.rtv-col.rtv-tree-col`) beside a **file preview column**
+    (`.rtv-col.rtv-preview-col`). The tree renders the task folder's `materials/` / `outputs/` /
+    `task_spec.json` / `session_history.json` as a **VS Code-style vertical tree** (`.rtv-kids`
+    nested containers with dotted `border-left` indent guides, single-line folder rows with `(n)`
+    counts / `(empty)` tags, file rows with right-aligned sizes and KB RAG tags), collapsed by
+    default; clicking a file opens it in the **persistent preview column**, which survives SSE
+    re-renders and live-refreshes an open file when the agent rewrites it. The bottom **Activity
+    bar** (`ensureActivity`) is a pinned, collapsible (▾/▸) strip that streams the bound run's
+    *normalized* lines — `notice` info (clipped), `tool` mapped to short human phrases via
+    `activityToolLabel` (raw tool names never shown), `done` ("✓ Turn finished.") — and
+    auto-expands on a run start (`researchActivityEvent`). The whole view stays live through **one
+    SSE stream per task** (`startMonitor`/`stopMonitor` → `GET /research/tasks/{id}/monitor`,
+    Bearer token, `AbortController`): the server's `snapshot` then `change` frames carry only a
+    `project_revision`, a revision strictly newer than the last applied schedules one coalesced
+    refetch (~300 ms, `refreshTaskNow`), and terminal run kinds
+    (`run.finished`/`blocked`/`stalled`/`cancelled`/`error`) additionally drop an Activity notice.
+    Card actions are a green **▶ Run** button (`.run-start`; "▶ Run" → "● Running…" while active), a
+    **⏹ Stop** button (`.run-ctl.run-stop`) shown while a run is in flight — `requestStop` →
+    `POST …/cancel`, "Stop requested — finishing the current step…" — and **🗑 Delete task**. **Run
+    is click-to-run** — it opens the task's dedicated session and auto-sends the run instruction.
+    The controls stay disabled for the whole background chain: `syncRunCtl` mirrors Stop off Run,
+    the chat `done` frame's `research_continuing` keeps Run/Delete disabled until a turn really
+    ends, task-refresh `is_running` disables them, and `researchReleaseIfIdle` re-enables once the
+    chain drops to idle. A run parked on an un-clearable gate renders **Approve / Reject** cards
+    (`.research-gate-card`, `rga-*`) in the task's chat under the agent's ask
+    (`showResearchGateCard`): Approve `POST …/approvals/{id}` then auto-resumes the run, Reject
+    keeps the gate FAIL and asks the agent for a different approach. The **chat header** is
+    two-layer: a top control bar (`#chat-topbar`: session actions + window controls — **New chat**
+    now lives in the sidebar's Chats list) and, only in a research session, a full-width
+    **research context bar** (`#chat-research-bar`: `🔬 Research · <task title> · [<stage>]`, a chip
+    that jumps to the task's working-directory view) that hides the truncated chat title
+    (`#chat-header.research-mode`).
+  - **Note editor** — an **in-flow document panel** (not an overlay): in the Files layout it takes
+    the document area above the docked chat, swapping with `#viewer` while a cloud
+    `.md`/`.txt`/code note is open, so the chat is never covered; a note opened on Files stays open
+    across a tab round-trip (other tabs just hide it, `syncMainPanes`/`__cloudNoteOpen`). It carries
+    an **Edit / Preview** icon-button toggle and **Save**
     (`Ctrl+S`). Edit mode is a monospace `textarea`; Preview renders the draft through the
     vendored `markdown-it` + `katex` chat renderer (`renderMarkdown`, XSS-safe `validateLink`),
     or — for a Mermaid mind-map note (`.mmd` / `mindmap`-prefixed text) — as an **SVG tree of
@@ -1882,9 +1900,10 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     floating-window drags use **pointer events + `setPointerCapture`**, so drag tracking continues
     even when the pointer passes over the `<video>` element. Sign-in / register / password-reset
     and profile/avatar editing are modal dialogs against `/auth/*`. The **input box** is a
-    Gemini-style row — a **＋ attach** button, a **multi-line `<textarea>`** (3 rows by default;
-    **Enter sends** the message, **Shift+Enter** inserts a new line), inline **🎤 / 🔊**
-    buttons, and Send — with an attachment preview strip above it. Attach stages a pending
+    Gemini-style row — a **＋ attach** button, a **multi-line `<textarea>`** (its height follows
+    the dock: 1 row in the Files bottom bar, 4 rows docked right or when the **Chats** tab fills
+    the whole pane; **Enter sends** the message, **Shift+Enter** inserts a new line), inline
+    **🎤 / 🔊** buttons, and Send — with an attachment preview strip above it. Attach stages a pending
     attachment that rides on the next send: pick a file (OS picker → uploaded to the cloud
     drive), attach the currently-open cloud asset by id, or capture a **window screenshot** —
     the `capture-window` IPC grabs the app's own window via `webContents.capturePage()`, then
@@ -2109,15 +2128,60 @@ Research sessions are a different kind than a normal chat: `GET /sessions` filte
 side-effect free — navigation never creates an execution, opening never starts a run; only a typed
 message drives the task (the first one auto-resumes the `deep_research` skill).
 
-**Run lifecycle — server-owned + single-task mutex.** A research run belongs to the server, not
-the SSE pipe: `/chat/stream` no longer cancels the pump for a research turn, so a client
-disconnect (navigate away, close the chat, drop the network) lets the run finish server-side and
-still finalize the turn (usage logging + `SESSION_FINALIZE` enqueue + `session_history.json`
-mirror) before releasing the slot. Each task allows one live run at a time: `begin_run`/`end_run`
-keep an `active_run` record in `project.json`; a concurrent trigger for the same task is a **409
-conflict**, while a RUNNING slot older than the stale window (2 h) is presumed crashed and adopted
-with its orphaned RUNNING executions flipped to ABORTED (so the delete guard can never block
-forever). `is_running` is surfaced in every task view.
+**Run lifecycle — server-owned, worker-driven to PUBLISH.** A research run belongs to the server,
+not the SSE pipe: closing the chat, navigating away, or dropping the network never cancels an
+active run. Each run starts from a **chat-handoff turn** (`/chat` or `/chat/stream`); once that
+interactive turn ends, the API decides whether to hand the run to a **`research_drive` worker
+job** — one arq job per agent turn (`apps/worker/tasks.py` `research_drive`: it runs the driver's
+`auto_turn` for one `execution_id`, then mirrors the answer into the session and enqueues the next
+turn when the driver says `continue`) — so a single chat prompt can drive a task **all the way to
+PUBLISH with no client attached**. Worker turns run `research_driver_turn_max_steps` (25) vs the
+interactive 5, under caps: `research_driver_max_turns` (8), `research_driver_max_no_progress_turns`
+(2), `research_driver_max_attempts` (3), and an optional `research_driver_max_cost_usd`. A
+`RunState` driver (`plugins/research/driver.py`) derives `idle | running | finished | blocked |
+stalled | cancelled | error` from the persisted run slot; after each successful turn a fixed
+grading chain fixes the state — cancel requested → CANCELLED, stage PUBLISH → FINISHED,
+`pending_overrides` > 0 → BLOCKED, consecutive no-progress over the cap → STALLED, turn/cost cap →
+BLOCKED, else the run continues. Terminal states are recorded in `last_block` (`{kind, reason, at,
+run_id, execution_id}`), the slot is released via `end_run`, and the terminal message is mirrored
+to the session. `begin_run`/`end_run` keep the `active_run` record in `project.json`; a task
+allows one live run at a time, **`is_running` stays true across the whole background chain**
+(surfaced in every task view), a fresh chat-triggered run while one is active is a **409
+conflict**, and the chat `done` frame carries `research_continuing: true` when the worker keeps
+chaining, so a client keeps run controls disabled.
+
+**One-writer atomicity across processes.** Task state mutations go through
+`ResearchService.atomic_update_project` — a single-writer primitive (a cross-process `portalocker`
+lock on `project.lock`, 5 s non-blocking timeout) that re-reads fresh inside the lock, applies an
+optional **compare-and-swap** against the monotonic `project_revision`, bumps it, and persists
+durably (`.tmp` → `fsync` → `os.replace`). A CAS miss raises `RevisionConflictError`; a lock
+timeout is graded transient. **Runs survive crashes**: the driver heartbeat refreshes every 20 s; a
+`running` ledger older than 150 s is treated as a crashed predecessor and **re-run idempotently**
+on the same turn (`turn_attempt + 1`), a fresh `running` ledger is a live twin and is dropped, and
+`begin_run` adopts an `active_run` older than the 2 h stale window and ABORTs its orphaned
+executions — so the delete guard can never block forever.
+
+**Cooperative Stop & human gate decisions.** `POST /research/tasks/{id}/cancel` requests a
+**cooperative stop** — it sets `driver.cancel_requested`, never kills a mid-write, is idempotent,
+and returns `cancel_requested` + `is_running`. When the agent can't clear a stage gate it calls
+`research_gate request_override`, which writes a **PENDING** row to `approvals.json` and parks the
+run BLOCKED while any override is pending; a human resolves it via
+`POST /research/tasks/{id}/approvals/{approval_id}` with `{"approve": bool}` (a non-PENDING id is
+a 409). Approve atomically flips the gate to OVERRIDE and the run resumes; reject leaves the gate
+FAIL and the agent proposes a different approach (resumed by another chat message). Task views
+expose the terminal `last_block` banner and `pending_overrides` (`{approval_id, gate_name,
+reason}`), so a blocked run tells the user exactly what it's waiting on.
+
+**Live monitor & per-process logs.** `GET /research/tasks/{id}/monitor` is an SSE stream that
+subscribes to the Redis channel `research:monitor:{task_id}` *before* emitting a `snapshot`, then
+pushes `change` frames carrying only `project_revision` (20 s keep-alives) — an **invalidation
+hint, not a payload**: the desktop refetches the task on a newer revision. Server processes log to
+**per-role rotating files** (`logs/api.log`, `logs/worker.log`, 10 MiB × 5 backups) via
+`packages/core/logger.py`; a `ContextFilter` stamps every record from the ContextVars `user_id /
+session_id / request_id / task_id / run_id`, the API through per-request middleware
+(`apps/api/main.py`), the worker per job (`request_id="job:{id}"`). Change hints flow over the
+publish-only Redis bus (`packages/core/infrastructure/redis_bus.py`, wired in the worker;
+publishing is best-effort and a no-op when no bus is installed).
 
 **Cascade delete.** `DELETE /research/tasks/{id}` (the desktop confirms first) records
 `deletion_requested` in `project.json`, soft-deletes the whole cloud task folder into the Trash,

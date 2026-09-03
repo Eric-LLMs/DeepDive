@@ -292,6 +292,7 @@ class AgentKernel:
         api_key: str | None = None,
         progress_sink: Callable[[dict], None] | None = None,
         context: dict | None = None,
+        max_steps: int | None = None,
     ) -> AgentResult:
         """Run one turn through the assembled kernel (assemble → step loop → session-end).
 
@@ -300,6 +301,8 @@ class AgentKernel:
         ``progress_sink`` receives structured turn events (plan / tool progress) for streaming.
         ``context`` carries machine-readable turn context (e.g. a handoff payload) that tools
         read at runtime via ``current_turn().context``.
+        ``max_steps`` overrides the kernel loop's step cap for this turn (the research driver
+        raises it per-turn; the interactive path keeps the default).
         """
         turn = self._build_turn(
             user_msg, history, memory_keys, session_memory, model, base_url, api_key,
@@ -316,6 +319,7 @@ class AgentKernel:
             api_key=api_key,
             turn=turn,
             progress_sink=progress_sink,
+            max_steps=max_steps,
         )
 
     async def run_stream(
@@ -329,6 +333,7 @@ class AgentKernel:
         api_key: str | None = None,
         progress_sink: Callable[[dict], None] | None = None,
         context: dict | None = None,
+        max_steps: int | None = None,
     ):
         """Streaming variant of :meth:`run` (same signature; see :meth:`ReactLoopAgent.run_stream`)."""
         turn = self._build_turn(
@@ -346,5 +351,6 @@ class AgentKernel:
             api_key=api_key,
             turn=turn,
             progress_sink=progress_sink,
+            max_steps=max_steps,
         ):
             yield evt

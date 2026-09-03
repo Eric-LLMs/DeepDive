@@ -3,6 +3,7 @@
 Start: uvicorn api.main:app --reload
 """
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from core.application.services import VocabError
 from core.config import settings
 from core.infrastructure.db import SessionLocal, init_db
 from core.infrastructure.security import ensure_admin_user, ensure_default_admin
+from core.logger import configure_logging, reset_log_context, set_log_context
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -39,8 +41,32 @@ from rag.query_cache import configure_query_cache
 logger = logging.getLogger("uvicorn.error")
 
 
+class RequestLogContext:
+    """Pure-ASGI middleware: tag every HTTP request with a fresh ``request_id``.
+
+    A pure ASGI wrapper (not BaseHTTPMiddleware) so the ``ContextVar`` stays set while a
+    streaming response body is sent — the chat / research SSE generators and the approval
+    tool handlers run inside this ``await``, so their log lines carry the request id. The
+    context is reset only when the whole response (including the stream) has finished.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        tokens = set_log_context(request_id=uuid.uuid4().hex[:12])
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_log_context(tokens)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Route root loggers → logs/api.log (rotating) before anything logs.
+    configure_logging(settings, app="api")
     if settings.bash_sandbox == "host":
         logger.warning(
             "bash_sandbox=\"host\": the agent bash tool runs directly on the host process. "
@@ -89,6 +115,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Per-request request_id log context (pure ASGI, so it covers SSE bodies too).
+app.add_middleware(RequestLogContext)
 
 # Serve cached TTS audio / images (paths produced by TTS and image scraping).
 for _dir in (settings.audio_cache_path, settings.image_cache_path):

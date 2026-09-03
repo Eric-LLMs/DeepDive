@@ -2,24 +2,18 @@
 
 Each tool is one plugin that owns exactly one :class:`ToolDefinition` (``summary_gen`` /
 ``mindmap_gen`` / ``slides_gen``). The plugin wires a fresh :class:`ToolKitPipeline` for its
-tool, exports the pipeline as a named service (``provides``), and attaches a ``tools/result``
-observer for audit logging — the plugin lifecycle (mount via the manager, dispose via
-unregister, hooks via the shared EventBus) is exactly the Cordis pattern the kernel already
-uses.
+tool and exports the pipeline as a named service (``provides``) — the plugin lifecycle (mount
+via the manager, dispose via unregister, hooks via the shared EventBus) is exactly the Cordis
+pattern the kernel already uses.
 """
 from __future__ import annotations
 
-import logging
-
 from agent.engine.decisions import ToolExecution, text_block
 from agent.plugins.base import Plugin
-from agent.plugins.hooks import TOOL_RESULT, observe
 from agent.tools.definition import ToolOutput, define_tool
 from agent.tools.tool_permissions import ToolPermission
 
 from .pipeline import ToolKitPipeline
-
-logger = logging.getLogger(__name__)
 
 _DESCRIPTIONS = {
     "summary": (
@@ -99,12 +93,6 @@ def build_toolkit_plugin(tool: str, llm, events=None, workspace=None) -> Plugin:
         permission={ToolPermission.READ, ToolPermission.WRITE},
     )
 
-    async def log_outcome(payload: dict) -> None:
-        exec_ = payload.get("exec")
-        result = payload.get("result")
-        state = "error" if getattr(result, "is_error", False) else "ok"
-        logger.info("toolkit %s tool=%s -> %s", exec_.name if exec_ else tool, tool, state)
-
     return Plugin(
         name=f"toolkit_{tool}",
         description=_PLUGIN_DESCRIPTIONS[tool],
@@ -112,5 +100,4 @@ def build_toolkit_plugin(tool: str, llm, events=None, workspace=None) -> Plugin:
         # Unique capability name per tool (the Context rejects duplicate providers, and all
         # three pipelines would otherwise collide on a shared "pipeline" capability).
         provides={f"{tool}_pipeline": pipeline},
-        listeners=[observe(TOOL_RESULT, log_outcome)],
     )

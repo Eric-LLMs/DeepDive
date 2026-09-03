@@ -36,6 +36,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import portalocker
+
 logger = logging.getLogger(__name__)
 
 from agent.engine.context import current_turn
@@ -95,6 +97,27 @@ _INVALIDATES = {"invalidates"}
 
 _VERIFIED = "verified"
 _ALLOWED_CLAIM_STRENGTH = {"asserted", "supported", "confident", "contested"}
+
+
+class RevisionConflictError(ValueError):
+    """Optimistic-concurrency CAS failure.
+
+    The on-disk ``project_revision`` no longer matches the ``expected_revision`` a caller
+    read earlier (another process committed first). The caller must re-read and retry,
+    never blind-overwrite — this is the single-writer discipline's backstop.
+    """
+
+
+class ProjectLockError(RuntimeError):
+    """Transient: could not acquire the cross-process ``project.json`` lock in time.
+
+    Distinct from a CAS conflict so the driver can grade it Transient (retry with
+    backoff) rather than Terminal.
+    """
+
+
+# Seconds to wait for the exclusive project.json lock before raising ProjectLockError.
+_PROJECT_LOCK_TIMEOUT = 5.0
 
 
 def _utc_ms() -> int:
@@ -164,12 +187,28 @@ class ResearchService:
 
     @staticmethod
     def _save_json(path: Path, data: Any) -> None:
+        """Durably persist ``data``: write ``.tmp`` -> ``fsync`` -> ``os.replace``.
+
+        The tmp + atomic-replace ordering survives a power loss mid-write (either the old
+        file or the fully written new file is present, never a torn one); ``fsync`` before
+        the rename flushes the bytes to disk. The parent-directory ``fsync`` is best-effort
+        (it needs ``O_DIRECTORY``, which Windows lacks).
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
-        )
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_DIRECTORY)  # type: ignore[attr-defined]
+        except (AttributeError, OSError):
+            return  # Windows / non-posix: no directory fd to fsync
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
     def _load_project(self, owner_id: uuid.UUID, project_id: str) -> dict:
         path = self._project_dir(owner_id, project_id) / "project.json"
@@ -179,9 +218,221 @@ class ResearchService:
         return project
 
     def _save_project(self, project: dict) -> None:
+        """Persist a *brand-new* task's ``project.json`` (single writer by construction).
+
+        Only the create paths call this — the task does not exist yet, so no other process
+        can be racing on it. Every mutation of an *existing* task's state must go through
+        :meth:`atomic_update_project` (the single-writer discipline; see the driver spec).
+        """
         project["updated_at"] = _now_iso()
         path = self._project_dir(uuid.UUID(project["owner_id"]), project["id"]) / "project.json"
         self._save_json(path, project)
+
+    def _project_json_path(self, owner_id: uuid.UUID, project_id: str) -> Path:
+        return self._project_dir(owner_id, project_id) / "project.json"
+
+    def atomic_update_project(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        mutate_fn,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict:
+        """Atomically mutate an existing task's ``project.json`` (single-writer primitive).
+
+        Every visible change to a task's authoritative state goes through this method — never
+        a blind ``load -> modify -> save``. A cross-process exclusive file lock (portalocker)
+        serializes the API and worker processes; inside the critical section the file is
+        re-read fresh, CAS-verified against ``expected_revision`` (when given), mutated by
+        ``mutate_fn``, stamped with a new monotonic ``project_revision``, and durably
+        persisted (``.tmp`` -> ``fsync`` -> ``os.replace``).
+
+        Raises:
+            ValueError: the project does not exist.
+            RevisionConflictError: on-disk revision != ``expected_revision``.
+            ProjectLockError: the lock was not acquired within the timeout (Transient).
+        """
+        project_dir = self._project_dir(owner_id, project_id)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = project_dir / ".project.lock"
+        path = project_dir / "project.json"
+        project: dict | None = None
+        try:
+            # LOCK_EX | LOCK_NB: non-blocking attempts retried by portalocker until
+            # ``timeout`` elapses (a purely blocking lock ignores the timeout — portalocker
+            # warns "timeout has no effect in blocking mode" and blocks forever).
+            with portalocker.Lock(
+                str(lock_path),
+                timeout=_PROJECT_LOCK_TIMEOUT,
+                check_interval=0.1,
+                flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
+            ):
+                project = self._load_json(path, None)
+                if project is None:
+                    raise ValueError(f"project not found: {project_id}")
+                if (
+                    expected_revision is not None
+                    and project.get("project_revision", 0) != expected_revision
+                ):
+                    raise RevisionConflictError(
+                        f"project {project_id} revision changed: expected {expected_revision}, "
+                        f"got {project.get('project_revision', 0)}"
+                    )
+                mutate_fn(project)
+                project["updated_at"] = _now_iso()
+                project["project_revision"] = project.get("project_revision", 0) + 1
+                self._save_json(path, project)
+        except portalocker.exceptions.AlreadyLocked as exc:
+            raise ProjectLockError(
+                f"could not lock project {project_id} within {_PROJECT_LOCK_TIMEOUT:.0f}s"
+            ) from exc
+        return dict(project)
+
+    # ── driver checkpoint (project.json["driver"], read/written atomically) ──
+    @staticmethod
+    def _empty_driver() -> dict:
+        return {
+            "run_id": None,             # run_id currently driving (mirrors active_run)
+            "turn_index": 0,            # business turn index (0 = interactive first turn)
+            "turn_attempt": 1,          # retry count for the current execution (starts at 1)
+            "turn_state": "done",       # pending | running | done (see plugins/research/driver.py)
+            "execution_id": None,       # "run_id:turn_index:turn_attempt"
+            "consecutive_no_progress": 0,
+            "cumulative_cost_usd": 0.0,
+            "cancel_requested": False,
+            "started_at": None,
+            "updated_at": None,
+            "next_scheduled": None,
+        }
+
+    def get_driver_checkpoint(self, owner_id: uuid.UUID, project_id: str) -> dict:
+        """The task's driver checkpoint (or the empty default when none is recorded yet)."""
+        project = self._load_project(owner_id, project_id)
+        driver = project.get("driver")
+        if not isinstance(driver, dict):
+            return self._empty_driver()
+        return {**self._empty_driver(), **driver}
+
+    def set_driver_checkpoint(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        patch: dict,
+        expected_revision: int | None = None,
+    ) -> dict:
+        """Merge ``patch`` into the driver checkpoint and persist atomically.
+
+        ``expected_revision`` enables optimistic CAS (see the driver: a stale job's write
+        must fail rather than clobber a newer one). Returns the fresh driver checkpoint.
+        """
+        def mutate(project: dict) -> None:
+            base = project.get("driver")
+            if not isinstance(base, dict):
+                base = self._empty_driver()
+            merged = {**base, **patch, "updated_at": _now_iso()}
+            project["driver"] = merged
+
+        project = self.atomic_update_project(
+            owner_id, project_id, mutate, expected_revision=expected_revision
+        )
+        return dict(project["driver"])
+
+    def request_cancel(
+        self, owner_id: uuid.UUID, project_id: str, expected_revision: int | None = None
+    ) -> dict:
+        """Set ``driver.cancel_requested`` (idempotent) so the loop stops at its next safe point."""
+        return self.set_driver_checkpoint(
+            owner_id, project_id, patch={"cancel_requested": True},
+            expected_revision=expected_revision,
+        )
+
+    def read_project_revision(self, owner_id: uuid.UUID, project_id: str) -> int:
+        return self._load_project(owner_id, project_id).get("project_revision", 0)
+
+    async def publish_change(
+        self, owner_id: uuid.UUID, project_id: str, *, kind: str = "state"
+    ) -> int | None:
+        """Bump the task's revision and publish a wake-up hint (best-effort, never fatal).
+
+        Called after a mutation that did not itself go through :meth:`atomic_update_project`
+        (graph / artifact / execution writes) and by the run driver / chat continuation for
+        lifecycle changes. Returns the new ``project_revision``, or ``None`` if the hint
+        could not be emitted (the caller's success is never masked).
+        """
+        from plugins.research.monitor import publish_task_event
+
+        try:
+            project = self.atomic_update_project(owner_id, project_id, lambda p: None)
+        except Exception as exc:  # noqa: BLE001 - advisory path, never mask the caller
+            logger.debug("research publish_change bump failed for %s: %s", project_id, exc)
+            return None
+        revision = int(project["project_revision"])
+        try:
+            await publish_task_event(
+                project_id, project_revision=revision, kind=kind, ts=_now_iso()
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory path
+            logger.debug("research publish_change event failed for %s: %s", project_id, exc)
+        return revision
+
+    # ── read-only helpers for the run driver (plugins/research/driver.py) ──
+    def read_project(self, owner_id: uuid.UUID, project_id: str) -> dict:
+        """The task's authoritative ``project.json`` (read-only convenience)."""
+        return self._load_project(owner_id, project_id)
+
+    def pending_overrides(self, owner_id: uuid.UUID, project_id: str) -> list[dict]:
+        """Gate overrides awaiting a human decision (approvals.json ``PENDING``).
+
+        A pending override blocks the auto-run chain (constraint ② of the driver spec):
+        the agent requests an override, the driver parks the run until a human resolves it
+        instead of silently pressing past the gate.
+        """
+        approvals = self._load_json(
+            self._project_dir(owner_id, project_id) / "approvals.json", {"approvals": []}
+        )
+        return [a for a in approvals["approvals"] if a.get("status") == "PENDING"]
+
+    async def project_fingerprint(self, owner_id: uuid.UUID, project_id: str) -> dict:
+        """Cheap monotone fingerprint of *visible* task progress, for the driver's no-progress gate.
+
+        Compares equal when a turn advanced nothing a user can see: same stage, same passed
+        gates, same artifact set (id/version/drive binding), same graph shape, same execution
+        count. Cloud-file names are folded in best-effort (a drive outage must never look like
+        "progress" or, worse, like a stall — failures just drop the dimension).
+        """
+        project = self._load_project(owner_id, project_id)
+        graph = self._load_graph(owner_id, project_id)
+        executions = self._load_json(
+            self._project_dir(owner_id, project_id) / "executions.json", {"executions": []}
+        )
+        fingerprint = {
+            "stage": project.get("stage"),
+            "gates": {
+                k: v for k, v in (project.get("gates") or {}).items()
+                if v in ("PASS", "OVERRIDE")
+            },
+            "artifacts": sorted(
+                (a["artifact_id"], a["version"], a.get("drive_asset_id"))
+                for a in self.list_artifacts(owner_id, project_id)
+            ),
+            "nodes": len(graph.get("nodes", [])),
+            "edges": len(graph.get("edges", [])),
+            "executions": len(executions.get("executions", [])),
+        }
+        cloud = project.get("cloud_folder_path")
+        if cloud:
+            try:
+                files = await self.drive.list_files(owner_id)
+                fingerprint["cloud_files"] = sorted(
+                    f["name"]
+                    for f in files
+                    if (f["folder_path"] or "").startswith(f"{cloud}/")
+                )
+            except Exception:  # noqa: BLE001 - best-effort dimension, never fatal
+                logger.debug("research fingerprint cloud listing failed for %s", project_id)
+        return fingerprint
 
     def _load_graph(self, owner_id: uuid.UUID, project_id: str) -> dict:
         path = self._project_dir(owner_id, project_id) / "graph.json"
@@ -230,6 +481,9 @@ class ResearchService:
             "stage": "DISCOVER",
             "gates": {gate: "NOT_RUN" for gate in _GATES},
             "idempotency_key": idempotency_key,
+            "project_revision": 0,      # monotonic version; bumped by every atomic commit
+            "driver": None,             # driver checkpoint (materialized on first run)
+            "last_block": None,         # terminal-stop record {kind, reason, at, execution_id}
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
@@ -293,9 +547,10 @@ class ResearchService:
         }
 
     def archive_project(self, owner_id: uuid.UUID, project_id: str) -> dict:
-        project = self._load_project(owner_id, project_id)
-        project["status"] = "ARCHIVED"
-        self._save_project(project)
+        def mutate(project: dict) -> None:
+            project["status"] = "ARCHIVED"
+
+        project = self.atomic_update_project(owner_id, project_id, mutate)
         return {"project_id": project["id"], "status": "ARCHIVED"}
 
     # ── research_artifact ─────────────────────────────────────────────────
@@ -322,6 +577,21 @@ class ResearchService:
                     "created_by": existing.get("created_by"),
                     "idempotent": True,
                 }
+        # Crash-rerun overwrite-not-append: an identical v1 draft already recorded (from a
+        # turn re-executed after a hard kill) is returned as-is, so the re-run neither rewrites
+        # the file nor mirrors a duplicate cloud output asset.
+        v1_path = self._artifact_dir(owner_id, project_id, artifact_id) / "v1"
+        v1 = self._load_json(v1_path, None)
+        if v1 is not None and v1.get("content") == content:
+            return {
+                "artifact_id": v1["artifact_id"],
+                "project_id": project_id,
+                "version": v1["version"],
+                "status": v1["status"],
+                "generated_by_execution": v1.get("generated_by_execution"),
+                "created_by": v1.get("created_by"),
+                "idempotent": True,
+            }
         # Producer invariant (docs/research/04 §5): agent output carries a non-null
         # generated_by_execution; user intake carries a non-null created_by and a null
         # generated_by_execution.
@@ -481,6 +751,19 @@ class ResearchService:
         next_version = 1
         if artifact_dir.is_dir():
             next_version = max((int(p.name[1:]) for p in artifact_dir.glob("v*")), default=0) + 1
+        # Crash-rerun overwrite-not-append: replaying an identical latest version returns it
+        # instead of minting a new one (a hard kill mid-turn can re-run the same produce
+        # call with byte-identical content). First-write / genuinely-new-content behaviour is
+        # unchanged.
+        if next_version > 1:
+            latest = self._load_json(artifact_dir / f"v{next_version - 1}", None)
+            if latest is not None and latest.get("content") == content:
+                return {
+                    "artifact_id": artifact_id,
+                    "project_id": project_id,
+                    "version": latest["version"],
+                    "idempotent": True,
+                }
         previous = self._artifact(owner_id, project_id, artifact_id, next_version - 1)
         record = dict(previous)
         # ``cloud_output_asset_id`` is intentionally carried over from the previous version so
@@ -544,6 +827,9 @@ class ResearchService:
             "is_running": project.get("active_run") is not None,
             "created_at": project.get("created_at"),
             "updated_at": project.get("updated_at"),
+            # The most recent terminal run outcome (finished/blocked/stalled/cancelled/error);
+            # the desktop renders it as a status-panel banner until the next run starts.
+            "last_block": project.get("last_block"),
         }
 
     def list_tasks(self, owner_id: uuid.UUID) -> list[dict]:
@@ -618,6 +904,9 @@ class ResearchService:
             "cloud_folder_path": cloud_folder["path"],
             "materials": [],
             "cloud_mirrors": {},
+            "project_revision": 0,      # monotonic version; bumped by every atomic commit
+            "driver": None,             # driver checkpoint (materialized on first run)
+            "last_block": None,         # terminal-stop record {kind, reason, at, execution_id}
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
@@ -654,16 +943,20 @@ class ResearchService:
             if material_asset_ids:
                 for asset_id in material_asset_ids:
                     copied.append(await self._copy_material(owner_id, project, asset_id))
-            project["materials"] = copied
-            self._save_project(project)
+            materials = copied
+
+            def mutate(project: dict) -> None:
+                project["materials"] = materials
+
+            self.atomic_update_project(owner_id, task_id, mutate)
         except Exception:
             # Roll back atomically: soft-delete the cloud task folder and hard-delete the
             # scratch state. A rejected create never leaves a half-materialized task behind
             # (the router surfaces the underlying DriveError).
             try:
                 await self.drive.delete_folder(owner_id, uuid.UUID(cloud_folder_id))
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - best-effort cleanup, never mask the create
+                logger.debug("research create rollback: folder delete failed: %s", exc)
             shutil.rmtree(self._project_dir(owner_id, task_id), ignore_errors=True)
             raise
         return {**self._task_view(project), "idempotent": False, "materials": copied}
@@ -782,9 +1075,11 @@ class ResearchService:
             raise ValueError(f"session already bound to a different research task: {prev}")
         index[str(session_id)] = task_id
         self._save_session_index(owner_id, index)
-        project = self._load_project(owner_id, task_id)
-        project["session_id"] = str(session_id)
-        self._save_project(project)
+
+        def mutate(project: dict) -> None:
+            project["session_id"] = str(session_id)
+
+        self.atomic_update_project(owner_id, task_id, mutate)
         mirror = self._project_dir(owner_id, task_id) / "session_history.json"
         data = self._load_json(mirror, {"session_id": None, "turns": []})
         data["session_id"] = str(session_id)
@@ -827,7 +1122,13 @@ class ResearchService:
             json.dumps(data, ensure_ascii=False, indent=2),
         )
         if created:
-            self._save_project(project)
+            # Persist the new mirror binding atomically (best-effort mirror path).
+            mirrors = project.get("cloud_mirrors") or {}
+
+            def mutate(project: dict) -> None:
+                project.setdefault("cloud_mirrors", {}).update(mirrors)
+
+            self.atomic_update_project(owner_id, task_id, mutate)
 
     # ── task status / artifact reads ────────────────────────────────────────
     def list_artifacts(self, owner_id: uuid.UUID, task_id: str) -> list[dict]:
@@ -904,6 +1205,9 @@ class ResearchService:
             materials, outputs, cloud_files = [], [], []
         return {
             **self._task_view(project),
+            # Domain-authoritative monotonic version: every atomic commit bumps it; the
+            # monitor/SSE layer uses it to order snapshots and drop out-of-order events.
+            "project_revision": project.get("project_revision", 0),
             "description": self._load_json(
                 self._project_dir(owner_id, task_id) / "task_spec.json", {}
             ).get("description", ""),
@@ -919,6 +1223,16 @@ class ResearchService:
                 self._project_dir(owner_id, task_id) / "session_history.json",
                 {"session_id": None, "turns": []},
             ),
+            # Gate overrides awaiting a human decision — surfaced to the desktop so the user
+            # can Approve / Reject them as an interactive card in the task's chat.
+            "pending_overrides": [
+                {
+                    "approval_id": a["id"],
+                    "gate_name": a.get("gate_name"),
+                    "reason": a.get("reason", ""),
+                }
+                for a in self.pending_overrides(owner_id, task_id)
+            ],
         }
 
     async def delete_task(self, owner_id: uuid.UUID, task_id: str) -> dict:
@@ -966,8 +1280,10 @@ class ResearchService:
                     raise ValueError("Please remove from Knowledge Base first")
 
         # Mark the deletion request before teardown so an interrupted delete is auditable.
-        project["deletion_requested"] = True
-        self._save_project(project)
+        def mutate(project: dict) -> None:
+            project["deletion_requested"] = True
+
+        self.atomic_update_project(owner_id, task_id, mutate)
 
         # Cloud folder: soft-delete the whole subtree into Trash (files + folder rows). If it
         # is already gone from the drive, scratch cleanup below is still the source of truth.
@@ -1024,9 +1340,12 @@ class ResearchService:
                 "reason": f"transition {current} -> {target} guarded by {gate}: "
                 f"not passed (current {project['gates'].get(gate)})",
             }
-        project["stage"] = target
-        self._save_project(project)
-        return {"requested": target, "granted": True, "stage": target, "gate": gate}
+
+        def mutate(project: dict) -> None:
+            project["stage"] = target
+
+        project = self.atomic_update_project(owner_id, project_id, mutate)
+        return {"requested": target, "granted": True, "stage": project["stage"], "gate": gate}
 
     def get_handoff(self, owner_id: uuid.UUID, project_id: str) -> dict:
         project = self._load_project(owner_id, project_id)
@@ -1041,12 +1360,19 @@ class ResearchService:
     def record_node(
         self, owner_id: uuid.UUID, project_id: str, *, node: dict
     ) -> dict:
+        """Append a graph node, idempotent by ``node.id``.
+
+        A crash-rerun that replays an already-recorded node returns the existing node instead
+        of raising (the driver re-executes a turn after a hard kill and must not duplicate
+        graph writes). First-write behavior is unchanged; the extra ``idempotent`` flag tells
+        the caller whether it created the node or found it.
+        """
         graph = self._load_graph(owner_id, project_id)
         node_id = node["id"]
         node_type = node["type"]
-        for existing in graph["nodes"]:
-            if existing["id"] == node_id:
-                raise ValueError(f"node already exists: {node_id}")
+        existing = next((n for n in graph["nodes"] if n["id"] == node_id), None)
+        if existing is not None:
+            return {"node": existing, "idempotent": True}
         record = {
             "id": node_id,
             "type": node_type,
@@ -1056,19 +1382,30 @@ class ResearchService:
         }
         graph["nodes"].append(record)
         self._save_graph(owner_id, project_id, graph)
-        return {"node": record}
+        return {"node": record, "idempotent": False}
 
     def link_edge(
         self, owner_id: uuid.UUID, project_id: str, *, src: str, dst: str, kind: str
     ) -> dict:
+        """Link two recorded nodes, deduplicated by ``(src, dst, kind)``.
+
+        Re-linking an existing ``(src, dst, kind)`` tuple is a no-op that returns the existing
+        edge (crash reruns must not fan out duplicate dependency edges).
+        """
         graph = self._load_graph(owner_id, project_id)
         ids = {n["id"] for n in graph["nodes"]}
         if src not in ids or dst not in ids:
             raise ValueError(f"edge endpoints must be recorded nodes: {src} -> {dst}")
         edge = {"src": src, "dst": dst, "kind": kind}
+        existing = next(
+            (e for e in graph["edges"] if e["src"] == src and e["dst"] == dst and e["kind"] == kind),
+            None,
+        )
+        if existing is not None:
+            return {"edge": existing, "idempotent": True}
         graph["edges"].append(edge)
         self._save_graph(owner_id, project_id, graph)
-        return {"edge": edge}
+        return {"edge": edge, "idempotent": False}
 
     def _cascade(
         self, graph: dict, start_id: str, *, to_invalid: bool
@@ -1265,8 +1602,11 @@ class ResearchService:
             checks = self._quality_checks(project)
         ok = all(c["ok"] for c in checks)
         status = "PASS" if ok else "FAIL"
-        project["gates"][gate_name] = status
-        self._save_project(project)
+
+        def mutate(project: dict) -> None:
+            project["gates"][gate_name] = status
+
+        self.atomic_update_project(owner_id, project_id, mutate)
         return {"status": status, "gate_name": gate_name, "checks": checks}
 
     @staticmethod
@@ -1320,7 +1660,7 @@ class ResearchService:
     ) -> dict:
         if gate_name not in _GATES:
             raise ValueError(f"unknown gate: {gate_name}")
-        project = self._load_project(owner_id, project_id)
+        self._load_project(owner_id, project_id)  # existence check (ValueError when missing)
         approval = {
             "id": str(uuid.uuid4()),
             "project_id": project_id,
@@ -1347,22 +1687,33 @@ class ResearchService:
         }
 
     def resolve_override(
-        self, owner_id: uuid.UUID, approval_id: str, *, approve: bool
+        self,
+        owner_id: uuid.UUID,
+        approval_id: str,
+        *,
+        approve: bool,
+        project_id: str | None = None,
     ) -> dict:
-        # Locate the approval across the owner's projects.
+        # Locate the approval across the owner's projects (or restrict to one project when the
+        # caller — the human-approval API — already resolved the task id from the URL).
         approval = None
         project = None
-        owner_dir = self._owner_root(owner_id)
-        if owner_dir.is_dir():
-            for project_dir in owner_dir.iterdir():
-                approvals = self._load_json(project_dir / "approvals.json", {"approvals": []})
-                for a in approvals["approvals"]:
-                    if a["id"] == approval_id:
-                        approval = a
-                        project = self._load_json(project_dir / "project.json", None)
-                        break
-                if approval is not None:
+        if project_id is not None:
+            dirs = [self._project_dir(owner_id, project_id)]
+        else:
+            owner_dir = self._owner_root(owner_id)
+            dirs = list(owner_dir.iterdir()) if owner_dir.is_dir() else []
+        for project_dir in dirs:
+            if not project_dir.is_dir():
+                continue
+            approvals = self._load_json(project_dir / "approvals.json", {"approvals": []})
+            for a in approvals["approvals"]:
+                if a["id"] == approval_id:
+                    approval = a
+                    project = self._load_json(project_dir / "project.json", None)
                     break
+            if approval is not None:
+                break
         if approval is None:
             raise ValueError(f"approval not found: {approval_id}")
         if approval["status"] != "PENDING":
@@ -1378,8 +1729,10 @@ class ResearchService:
                 a.update(approval)
         self._save_json(self._project_dir(owner_id, project["id"]) / "approvals.json", approvals)
         if approve and project is not None:
-            project["gates"][approval["gate_name"]] = "OVERRIDE"
-            self._save_project(project)
+            def mutate(project: dict) -> None:
+                project["gates"][approval["gate_name"]] = "OVERRIDE"
+
+            self.atomic_update_project(owner_id, project["id"], mutate)
         return {
             "approval_id": approval_id,
             "status": approval["status"],
@@ -1407,55 +1760,94 @@ class ResearchService:
 
         Raises ``ValueError`` for a live conflict; the router maps it to a 409.
         """
-        project = self._load_project(owner_id, project_id)
-        active = project.get("active_run")
-        if active and active.get("status") == "RUNNING":
-            started = active.get("started_at")
-            # ``_now_iso`` is fixed-width UTC, so lexicographic comparison is chronological.
-            cutoff = time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ",
-                time.gmtime(time.time() - stale_after_seconds),
-            )
-            stale = not started or started < cutoff
-            if not stale:
-                raise ValueError("Research task is already running")
-            logger.warning("research begin_run adopted stale active_run: %s", active)
-            # The dead process's RUNNING executions are stale too — unblock the delete guard.
-            exec_path = self._project_dir(owner_id, project_id) / "executions.json"
-            data = self._load_json(exec_path, {"executions": []})
-            changed = False
-            for execution in data["executions"]:
-                if execution.get("status") == "RUNNING":
-                    execution["status"] = "ABORTED"
-                    execution["result"] = {"aborted": True, "reason": "stale run adopted"}
-                    execution["finished_at"] = _now_iso()
-                    changed = True
-            if changed:
-                self._save_json(exec_path, data)
-        project["active_run"] = {
-            "run_id": str(uuid.uuid4()),
-            "session_id": session_id,
-            "started_at": _now_iso(),
-            "status": "RUNNING",
-        }
-        self._save_project(project)
+        run_id = str(uuid.uuid4())
+
+        def mutate(project: dict) -> None:
+            active = project.get("active_run")
+            if active and active.get("status") == "RUNNING":
+                started = active.get("started_at")
+                # ``_now_iso`` is fixed-width UTC, so lexicographic comparison is chronological.
+                cutoff = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(time.time() - stale_after_seconds),
+                )
+                stale = not started or started < cutoff
+                if not stale:
+                    raise ValueError("Research task is already running")
+                logger.warning("research begin_run adopted stale active_run: %s", active)
+                # The dead process's RUNNING executions are stale too — unblock the delete guard.
+                exec_path = self._project_dir(owner_id, project_id) / "executions.json"
+                data = self._load_json(exec_path, {"executions": []})
+                changed = False
+                for execution in data["executions"]:
+                    if execution.get("status") == "RUNNING":
+                        execution["status"] = "ABORTED"
+                        execution["result"] = {"aborted": True, "reason": "stale run adopted"}
+                        execution["finished_at"] = _now_iso()
+                        changed = True
+                if changed:
+                    self._save_json(exec_path, data)
+            project["active_run"] = {
+                "run_id": run_id,
+                "session_id": session_id,
+                "started_at": _now_iso(),
+                "status": "RUNNING",
+            }
+            # Reset the driver ledger for this run: a new run = a new run_id, and the old
+            # run's turn/cost/no-progress state must never leak into it.
+            project["driver"] = {
+                **self._empty_driver(),
+                "run_id": run_id,
+                "turn_state": "done",
+                "started_at": _now_iso(),
+                "updated_at": _now_iso(),
+            }
+
+        project = self.atomic_update_project(owner_id, project_id, mutate)
         return dict(project["active_run"])
 
     def end_run(self, owner_id: uuid.UUID, project_id: str) -> dict:
         """Release the active-run slot (idempotent: a missing slot is a no-op)."""
-        project = self._load_project(owner_id, project_id)
-        active = project.pop("active_run", None)
-        self._save_project(project)
-        return {"run_id": active["run_id"] if active else None, "status": "IDLE"}
+        holder: dict[str, Any] = {}
+
+        def mutate(project: dict) -> None:
+            active = project.pop("active_run", None)
+            holder["run_id"] = active["run_id"] if active else None
+
+        self.atomic_update_project(owner_id, project_id, mutate)
+        return {"run_id": holder.get("run_id"), "status": "IDLE"}
 
     def record_execution(
-        self, owner_id: uuid.UUID, project_id: str, *, tool: str, args: dict
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        tool: str,
+        args: dict,
+        execution_id: str | None = None,
     ) -> dict:
+        """Append one tool-execution audit row, idempotent by ``execution_id``.
+
+        A crash rerun can hand a deterministic ``execution_id`` (e.g. the driver's
+        ``run_id:turn_index:turn_attempt``) so re-recording the same execution is a no-op
+        instead of a second RUNNING row. Without it the behaviour is unchanged: a fresh uuid
+        and one appended row.
+        """
         self._load_project(owner_id, project_id)
         path = self._project_dir(owner_id, project_id) / "executions.json"
         data = self._load_json(path, {"executions": []})
+        if execution_id is not None:
+            existing = next(
+                (e for e in data["executions"] if e["execution_id"] == execution_id), None
+            )
+            if existing is not None:
+                return {
+                    "execution_id": existing["execution_id"],
+                    "status": existing["status"],
+                    "idempotent": True,
+                }
         execution = {
-            "execution_id": str(uuid.uuid4()),
+            "execution_id": execution_id or str(uuid.uuid4()),
             "project_id": project_id,
             "tool": tool,
             "args": args,
@@ -1465,7 +1857,7 @@ class ResearchService:
         }
         data["executions"].append(execution)
         self._save_json(path, data)
-        return {"execution_id": execution["execution_id"], "status": "RUNNING"}
+        return {"execution_id": execution["execution_id"], "status": "RUNNING", "idempotent": False}
 
     def finish_execution(
         self, owner_id: uuid.UUID, project_id: str, *, execution_id: str, result: Any
@@ -1568,6 +1960,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
     fiber) before the API provides its capabilities. This mirrors the toolkit factory pattern
     and keeps ``discover()`` compatibility (no module-level ``PLUGIN``).
     """
+    from plugins.research.monitor import MUTATING_ACTIONS
 
     def service() -> ResearchService:
         if ctx is None:
@@ -1595,6 +1988,28 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
         if handoff.get("kind") != "research":
             return None
         return handoff.get("project_id")
+
+    def _monitor_wrap(tool_name: str, handler):
+        """Post-success publish hook for a research tool router.
+
+        After a *mutating* action returns, emit a revision wake-up so the desktop monitor
+        refetches the task snapshot. Best-effort: a publish failure (no Redis bus, no owner
+        context, transient lock error) must never turn a successful tool call into an error.
+        """
+
+        async def _wrapped(args: dict, exec: ToolExecution) -> dict:
+            result = await handler(args, exec)
+            action = args.get("action")
+            if action in MUTATING_ACTIONS.get(tool_name, set()):
+                try:
+                    project_id = args.get("project_id") or _handoff_project_id()
+                    if project_id:
+                        await service().publish_change(user(), project_id, kind=action)
+                except Exception:
+                    logger.debug("research monitor publish skipped (best-effort)", exc_info=True)
+            return result
+
+        return _wrapped
 
     async def _project(args: dict, exec: ToolExecution) -> dict:
         svc = service()
@@ -1718,7 +2133,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             },
             required=[],
         ),
-        handler=_project,
+        handler=_monitor_wrap("research_project", _project),
         permission={ToolPermission.READ, ToolPermission.WRITE},
     )
 
@@ -1740,7 +2155,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             },
             required=[],
         ),
-        handler=_artifact,
+        handler=_monitor_wrap("research_artifact", _artifact),
         permission={ToolPermission.READ, ToolPermission.WRITE},
     )
 
@@ -1755,7 +2170,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             {"target": {"type": "string", "description": "Requested next stage."}},
             required=[],
         ),
-        handler=_state,
+        handler=_monitor_wrap("research_state", _state),
         permission={ToolPermission.READ},
     )
 
@@ -1785,7 +2200,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             },
             required=[],
         ),
-        handler=_evidence,
+        handler=_monitor_wrap("research_evidence", _evidence),
         permission={ToolPermission.READ, ToolPermission.WRITE},
     )
 
@@ -1807,7 +2222,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             },
             required=[],
         ),
-        handler=_gate,
+        handler=_monitor_wrap("research_gate", _gate),
         permission={ToolPermission.READ, ToolPermission.WRITE},
     )
 
@@ -1827,7 +2242,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             },
             required=[],
         ),
-        handler=_run,
+        handler=_monitor_wrap("research_run", _run),
         permission={ToolPermission.READ, ToolPermission.WRITE},
     )
 

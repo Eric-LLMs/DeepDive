@@ -7,6 +7,7 @@ that args are validated before the body runs and the output is validated/rendere
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -33,6 +34,40 @@ def _validate(schema: dict, instance: Any) -> list[str]:
     return [
         f"{'->'.join(map(str, e.absolute_path)) or '<root>'}: {e.message}" for e in errors
     ]
+
+
+def _decode_stringified(schema: dict, value: Any) -> Any:
+    """Best-effort decode of JSON-string-encoded object/array tool parameters.
+
+    Some model providers / tool-call harnesses double-encode a nested ``object`` (or
+    ``array``) parameter into a JSON *string* — ``"node": "{\"id\": ...}"``. A single
+    top-level ``json.loads`` cannot recover that, so an object-typed parameter reaches the
+    schema validator as a string and is wrongly rejected (``... is not of type 'object'``) —
+    the failure that froze research's ``record_node`` on an empty graph. Walk the tool's
+    parameter schema and decode any string the schema declares as object/array back into a
+    structure *before* validation. A string that does not parse is left untouched so the
+    validator still reports a precise error instead of masking it.
+    """
+    if not schema:
+        return value
+    raw_type = schema.get("type")
+    types = raw_type if isinstance(raw_type, list) else [raw_type]
+    if isinstance(value, str) and ("object" in types or "array" in types):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return value
+        return _decode_stringified(schema, parsed)
+    if isinstance(value, dict):
+        props = schema.get("properties") or {}
+        return {
+            key: _decode_stringified(props.get(key, {}) or {}, item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        item_schema = schema.get("items") or {}
+        return [_decode_stringified(item_schema, item) for item in value]
+    return value
 
 
 def _empty_render(args: dict, value: Any) -> list[ContentBlock]:
@@ -143,6 +178,7 @@ def define_tool(
     """
 
     async def _execute(args: dict, exec: ToolExecution) -> Any:
+        args = _decode_stringified(parameters, args)
         arg_errors = _validate(parameters, args)
         if arg_errors:
             raise ToolArgsError("; ".join(arg_errors))

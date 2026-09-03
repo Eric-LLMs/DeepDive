@@ -8,6 +8,7 @@ from typing import ClassVar
 
 logger = logging.getLogger(__name__)
 
+from agent.security.approvals import configure_approval_broker
 from arq import cron
 from arq.connections import RedisSettings
 from core.config import settings
@@ -15,8 +16,10 @@ from core.infrastructure.db import SessionLocal
 from core.infrastructure.images import ImageScraper
 from core.infrastructure.jobs import JobStore
 from core.infrastructure.llm import OpenAILLM
+from core.infrastructure.redis_bus import set_bus
 from core.infrastructure.tts import TTSClient
 from core.infrastructure.vector import TEIEmbedder
+from core.logger import configure_logging
 
 from apps.api.tools.toolkit.session_source import cleanup_stale_sources
 from apps.worker import tasks
@@ -78,11 +81,18 @@ async def _active_llm_channel() -> tuple[str | None, str | None, str | None]:
 
 
 async def startup(ctx) -> None:
+    # Route worker loggers to logs/worker.log (rotating) before any job logs. arq runs jobs in
+    # a fresh task per invocation, so set_log_context inside each job is concurrency-safe.
+    configure_logging(settings, app="worker")
     # A worker killed mid-job (OOM / SIGKILL) can leave an orphaned session transcript in
     # .toolkit_session_src; sweep anything older than 24h so the temp dir never accumulates.
     removed = cleanup_stale_sources(settings.workspace_dir)
     if removed:
         logger.info("cleaned %d stale toolkit session transcripts", removed)
+    # Distributed approval resolutions (research auto-run ASK tools resolve via the API) and
+    # the research monitor's wake-up bus both publish on the shared Redis client arq hands us.
+    configure_approval_broker(ctx["redis"])
+    set_bus(ctx["redis"])
     base_url, api_key, model = await _active_llm_channel()
     ctx["llm"] = OpenAILLM(api_key=api_key, base_url=base_url, model=model)
     ctx["tts"] = TTSClient()
@@ -146,6 +156,7 @@ class WorkerSettings:
         tasks.chat_session_import,
         tasks.toolkit_generate,
         tasks.run_agent_turn,
+        tasks.research_drive,
     ]
     on_startup = startup
     on_shutdown = shutdown

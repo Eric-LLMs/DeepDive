@@ -101,6 +101,22 @@ class Settings(BaseSettings):
     skills_dir: Path = Path("skills")          # *.skill.md skills directory (version-controlled)
     plugins_dir: Path = Path("plugins")        # plugin directory (*/plugin.py) (version-controlled)
     research_scratch_dir: Path = Path("data/research_scratch")  # research scratch root (spike)
+
+    # ── Research auto-run driver (T0) ──
+    # The driver chains background agent turns ("one-click run to PUBLISH") behind a
+    # single-flight run_id. These knobs bound how far a chain may go before it must stop
+    # and hand control back to a human — never a silent infinite loop.
+    research_driver_max_turns: int = 8         # max chained worker turns per run_id
+    research_driver_max_no_progress_turns: int = 2  # consecutive no-progress turns → STALLED
+    research_driver_turn_max_steps: int = 25   # per worker-turn LLM step cap (interactive stays at 5)
+    research_driver_max_attempts: int = 3      # transient retries per turn_index (turn_attempt cap)
+    research_driver_max_cost_usd: float | None = None  # cumulative auto-run cost cap (None = unlimited)
+
+    # ── Runtime logging (core.logger) ──
+    log_level: str = "INFO"                    # root logger level (DEBUG/INFO/WARNING/ERROR/CRITICAL)
+    log_dir: Path = Path("logs")               # rotating log directory (api.log / worker.log)
+    log_file_max_bytes: int = 10 * 1024 * 1024  # single log file cap before rotation
+    log_file_backups: int = 5                  # rotated files kept
     session_summary_enabled: bool = True       # generate an LLM summary on session close
     memory_recall_top_k: int = 5               # proactive recall count for the prompt memory section
     memory_note_max_chars: int = 4000          # memory_save content length cap (guardrail)

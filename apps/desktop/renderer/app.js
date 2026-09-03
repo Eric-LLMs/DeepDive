@@ -1536,6 +1536,7 @@
     let streamMsg = null;      // { el, add, reset }
     let stepChanged = false;   // a new agent step began → restart the bubble on next content
     let gotDone = false;
+    let researchContinuing = false; // done frame carried research_continuing → worker still driving
 
     const handleEvent = (evt) => {
       // Mirror the run's live events into the Activity feed (research.js filters content).
@@ -1567,6 +1568,7 @@
           break;
         case "done":
           gotDone = true;
+          researchContinuing = !!evt.data.research_continuing;
           if (statusBar) statusBar.done(); // settle the label even on tool-only rounds
           state.sessionId = evt.data.session_id ?? state.sessionId;
           // A research turn that just created/bound its session: record it so the session is
@@ -1669,10 +1671,13 @@
       appendMsg("error", `Request failed: ${err.message}`);
     } finally {
       chatSend.disabled = false;
-      // The stream ended — the turn (and therefore the research run) is over. Re-enable the
-      // Run / Delete Task controls; the server's is_running poll may re-assert if the worker
-      // is still chaining a run.
-      if (research && window.researchRunActive) window.researchRunActive(research.task_id, false);
+      // The stream ended. A turn that handed its run to the worker chain (research_continuing)
+      // keeps the run slot held server-side — leave Run / Delete disabled; the live monitor or
+      // the chip poll re-enables them once the worker reports is_running=false. Only a turn that
+      // fully ended releases the controls here.
+      if (research && !researchContinuing && window.researchRunActive) {
+        window.researchRunActive(research.task_id, false);
+      }
     }
   }
 
@@ -2042,10 +2047,16 @@
             task_id: t.task_id, name: t.name || t.task_id, stage: t.stage, status: t.status,
           });
           updateResearchChip();
-          // Server truth wins: if the task is RUNNING (e.g. the worker kept chaining) keep the
-          // Run / Delete controls disabled even after the local stream ended. Never force them
-          // open here — the local sendChat finally is what clears a finished turn.
-          if (t.is_running && window.researchRunActive) window.researchRunActive(t.task_id, true);
+          // Server truth wins: a task still RUNNING (the worker kept chaining) keeps Run / Delete
+          // disabled even after the local stream ended; once the server reports the slot
+          // released, a chained run whose turn ended with research_continuing re-enables here
+          // (sendChat skips clearing when the turn handed off). researchReleaseIfIdle only ever
+          // clears a run that belongs to this task, never another task's in-flight run.
+          if (t.is_running) {
+            if (window.researchRunActive) window.researchRunActive(t.task_id, true);
+          } else if (window.researchReleaseIfIdle) {
+            window.researchReleaseIfIdle(t.task_id);
+          }
           if (window.researchActivityMeta) window.researchActivityMeta(t.status, t.stage);
         }
       } catch { /* transient — keep polling */ }
@@ -2054,6 +2065,105 @@
   function stopResearchChipPoll() {
     if (researchChipTimer) { clearInterval(researchChipTimer); researchChipTimer = null; }
   }
+
+  // ── research gate override: inline Approve / Reject card in the task's chat ──
+  // The left status banner explains a pause ("N gate override(s) awaiting a human decision");
+  // the *decision* itself lives here as a card right under the agent's ask in the chat.
+  // research.js calls showResearchGateCard on every status refresh with the task's pending
+  // overrides; this appends a card for each PENDING one (Approve / Reject), drops cards whose
+  // approval is no longer pending, and hides everything when the chat is not showing that task.
+  // Approve records the verdict and auto-resumes the run so the state machine advances past
+  // the now-OVERRIDE gate; Reject records the verdict and leaves the gate FAIL (the agent is
+  // then asked to propose a different approach).
+  async function resolveGateOverride(taskId, approvalId, approve, sessionId, name) {
+    try {
+      await apiFetch(
+        `/research/tasks/${encodeURIComponent(taskId)}/approvals/${encodeURIComponent(approvalId)}`,
+        { method: "POST", body: JSON.stringify({ approve }) }
+      );
+    } catch (e) {
+      Viewer.toast(`Gate decision failed: ${e.message}`);
+      return false;
+    }
+    // Ensure the verdict is delivered while this task's session is the one on screen, so the
+    // approve path can resume the run in the right session.
+    const active = state.activeResearch;
+    if (!(active && active.task_id === taskId && state.sessionId === sessionId)) {
+      await window.openResearchSession(taskId, name || (active && active.name) || taskId, sessionId);
+    }
+    return true;
+  }
+
+  window.showResearchGateCard = (ctx) => {
+    if (!chatLog) return;
+    const active = state.activeResearch;
+    const onScreen = !!(
+      active && active.task_id === ctx.task_id && ctx.session_id && state.sessionId === ctx.session_id
+    );
+    const live = onScreen ? ctx.pending_overrides || [] : [];
+    const liveIds = new Set(live.map((o) => o.approval_id));
+    // Drop cards that are stale (task switched, or the approval was resolved since).
+    chatLog.querySelectorAll(".research-gate-card").forEach((card) => {
+      if (card.dataset.gateTask === ctx.task_id && !liveIds.has(card.dataset.gateApproval)) {
+        card.remove();
+      }
+    });
+    if (!onScreen) return;
+    for (const o of live) {
+      if (!o.approval_id) continue;
+      if (
+        chatLog.querySelector(
+          `.research-gate-card[data-gate-task="${ctx.task_id}"][data-gate-approval="${o.approval_id}"]`
+        )
+      ) continue;
+      const card = document.createElement("div");
+      card.className = "research-gate-card";
+      card.dataset.gateTask = ctx.task_id;
+      card.dataset.gateApproval = o.approval_id;
+      const title = document.createElement("div");
+      title.className = "rga-title";
+      title.textContent = `Gate override awaiting your decision${o.gate_name ? ` · ${o.gate_name}` : ""}`;
+      const reason = document.createElement("div");
+      reason.className = "rga-reason";
+      reason.textContent = o.reason || "The agent could not pass a deterministic gate on its own.";
+      const actions = document.createElement("div");
+      actions.className = "rga-actions";
+      const approveBtn = document.createElement("button");
+      approveBtn.className = "rga-btn approve";
+      approveBtn.textContent = "✓ Approve";
+      const rejectBtn = document.createElement("button");
+      rejectBtn.className = "rga-btn reject";
+      rejectBtn.textContent = "✕ Reject";
+      const setBusy = (busy) => {
+        approveBtn.disabled = rejectBtn.disabled = busy;
+        approveBtn.textContent = busy ? "Resolving…" : "✓ Approve";
+        rejectBtn.textContent = busy ? "…" : "✕ Reject";
+      };
+      approveBtn.addEventListener("click", async () => {
+        setBusy(true);
+        const ok = await resolveGateOverride(ctx.task_id, o.approval_id, true, ctx.session_id, ctx.name);
+        if (!ok) { setBusy(false); return; }
+        card.remove();
+        // Drive the state machine forward past the now-OVERRIDE gate.
+        if (window.startResearchRun) await window.startResearchRun(ctx.task_id, ctx.name, ctx.session_id);
+        else sendChat(RESEARCH_RUN_PROMPT);
+      });
+      rejectBtn.addEventListener("click", async () => {
+        setBusy(true);
+        const ok = await resolveGateOverride(ctx.task_id, o.approval_id, false, ctx.session_id, ctx.name);
+        if (!ok) { setBusy(false); return; }
+        card.remove();
+        Viewer.toast("Override rejected — the task stays at its gate. Tell the agent a different approach.");
+      });
+      actions.appendChild(approveBtn);
+      actions.appendChild(rejectBtn);
+      card.appendChild(title);
+      card.appendChild(reason);
+      card.appendChild(actions);
+      chatLog.appendChild(card);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+  };
 
   // Restore the neutral (non-research) chat after leaving the Research tab.
   function openNeutralSession() {
@@ -3697,10 +3807,12 @@
   const chatDock = document.getElementById("chat-dock");
   function syncDock() {
     const right = appEl.classList.contains("chat-right");
+    const fills = appEl.classList.contains("chat-fills");
     chatDock.textContent = right ? "Dock bottom" : "Dock right";
-    // Match the input to the docked shape: a wide bottom bar gets a compact 1-line
-    // input; the narrow right column gets a taller 4-line one so long prompts have room.
-    chatInput.rows = right ? 4 : 1;
+    // Match the input to the docked shape: a wide bottom bar gets a compact 1-line input;
+    // the narrow right column (and the full-pane Chats tab) gets a taller 4-line one so
+    // long prompts have room. Chats pins 4 rows regardless of the saved dock side.
+    chatInput.rows = (right || fills) ? 4 : 1;
     // The Generate toolbar follows the dock shape: in the tall right column it lives at
     // the top of the panel, under the header; in the wide bottom bar it moves into the
     // header right after the "Chat" title, so the composer stays a single lean line
@@ -4458,21 +4570,34 @@
   const fileSearchClear = document.getElementById("file-search-clear");
   const sessionSearchClear = document.getElementById("session-search-clear");
   let sessionSearchTimer = null;
-  newChatBtn.addEventListener("click", () => {
-    // "New Chat" leaves research mode too: drop the 🔬 badge and any pending research handoff.
+  // Sidebar "＋ New chat" — the single entry point for a fresh conversation (the chat-header
+  // duplicate was removed). It leaves any research context, activates/highlights the Chats
+  // tab, resets the right pane to a blank conversation, refreshes the left session list, and
+  // focuses the composer. A blank unsent chat has no session row yet, so it becomes a
+  // selectable (highlighted) row in the list once its first message persists a session.
+  newChatBtn.addEventListener("click", startNewChat);
+
+  function startNewChat() {
+    // Never tear a live stream out from under the send loop: a research turn (or any message)
+    // still in flight keeps Send disabled — wait for it to settle before blanking the pane.
+    if (chatSend.disabled) {
+      Viewer.toast("Wait for the current message to finish, then start a new chat.");
+      return;
+    }
+    // The composer needs the chat pane visible: restore it if it was hidden to the floating
+    // mini DeepDive icon.
+    if (chatEl.classList.contains("minimized")) {
+      chatEl.classList.remove("minimized");
+      chatMini.classList.add("hidden");
+    }
+    // Leave research mode: drop the 🔬 badge and any pending research handoff.
     state.activeResearch = null;
     updateResearchChip();
     stopResearchChipPoll();
-    newChat();
-  });
-  // Chat-header "＋ New chat" (top bar, left of ＋ Research): same as the sidebar button.
-  const chatNewChat = document.getElementById("chat-new-chat");
-  if (chatNewChat) chatNewChat.addEventListener("click", () => {
-    state.activeResearch = null;
-    updateResearchChip();
-    stopResearchChipPoll();
-    newChat();
-  });
+    newChat();                 // drop the active session ref and clear the pane
+    switchTab("sessions");     // activate/highlight the Chats tab + refresh its list
+    chatInput.focus();         // land the cursor in the bottom-right composer
+  }
 
   function switchTab(name) {
     const isSessions = name === "sessions";
@@ -4517,13 +4642,38 @@
     // (research.js fills it), or the read-only guide card when no task is selected; the
     // document viewer is hidden so it never keeps showing a file from another tab.
     const guideEl = document.getElementById("research-guide");
-    const viewerEl = document.getElementById("viewer");
     const taskViewEl = document.getElementById("research-task-view");
     const hasTask = !!window.currentResearchTask;
     if (guideEl) guideEl.classList.toggle("hidden", !isResearch || hasTask);
     if (taskViewEl) taskViewEl.classList.toggle("hidden", !isResearch || !hasTask);
-    if (viewerEl) viewerEl.style.display = isResearch ? "none" : "";
+    // Main-pane exclusivity is centralized in syncMainPanes(): #viewer is the Files document
+    // area unless a cloud note is open (then the note editor fills it), and both are hidden on
+    // the Chats/Research tabs. #viewer keeps its DOM state, so returning to Files restores it.
+    syncMainPanes();
+    // Chats tab: the chat column stretches across the whole main pane, ignoring whatever
+    // bottom/right dock preference applies on the other tabs.
+    appEl.classList.toggle("chat-fills", isSessions);
+    syncDock(); // re-apply composer rows — Chats keeps a fixed 4 lines regardless of dock side
+    if (isSessions && chatEl.classList.contains("minimized")) {
+      // A chat hidden to the mini DeepDive icon would leave the Chats pane blank.
+      chatEl.classList.remove("minimized");
+      if (chatMini) chatMini.classList.add("hidden");
+    }
   }
+
+  // Central rule for which document surface fills the main pane. Exposed on window so
+  // clouddrive.js can flip the open-note flag (openNote/closeNote) and re-sync immediately,
+  // without needing a tab switch. A note opened on Files stays "open" across a tab
+  // round-trip — other tabs simply hide it.
+  function syncMainPanes() {
+    const filesActive = !!tabFiles && tabFiles.classList.contains("active");
+    const noteOpen = !!window.__cloudNoteOpen;
+    const vEl = document.getElementById("viewer");
+    if (vEl) vEl.style.display = filesActive && !noteOpen ? "" : "none";
+    const nEl = document.getElementById("note-editor");
+    if (nEl) nEl.classList.toggle("hidden", !filesActive || !noteOpen);
+  }
+  window.__syncMainPanes = syncMainPanes;
   tabFiles.addEventListener("click", () => switchTab("files"));
   tabSessions.addEventListener("click", () => switchTab("sessions"));
   if (tabResearch) tabResearch.addEventListener("click", () => switchTab("research"));
@@ -4788,6 +4938,7 @@
     for (const s of sorted) {
       const item = document.createElement("div");
       item.className = "session-item";
+      if (String(s.id) === String(state.sessionId)) item.classList.add("active");
       const importing = importingSessions.has(String(s.id));
       const genLabel = generatingSessions.get(String(s.id));
       if (importing) item.classList.add("session-importing");

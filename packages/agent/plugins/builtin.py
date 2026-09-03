@@ -1,4 +1,4 @@
-"""Built-in plugins: destructive-tool interception (deny + monotonic guard) + audit observer.
+"""Built-in plugins: destructive-tool interception (deny + monotonic guard).
 
 Two ways to stop a tool are demonstrated side by side:
 
@@ -6,17 +6,11 @@ Two ways to stop a tool are demonstrated side by side:
   ``PreToolDecision.deny`` (it can be overridden by a later listener calling ``next()`` first).
 - ``guard_destructive`` is a monotonic guard: once it returns a reason, the run is denied and
   no later listener can flip it back to allow.
-
-``audit_result`` observes ``tools/result`` for logging.
 """
-import logging
-
 from agent.engine.decisions import PreToolDecision, ToolExecution
 from agent.plugins.base import Plugin
-from agent.plugins.hooks import PRE_TOOL_USE, TOOL_RESULT, observe, waterfall
+from agent.plugins.hooks import PRE_TOOL_USE, waterfall
 from agent.plugins.manager import PluginManager
-
-logger = logging.getLogger(__name__)
 
 
 def register_builtin_plugins(manager: PluginManager) -> None:
@@ -34,19 +28,11 @@ def register_builtin_plugins(manager: PluginManager) -> None:
             return f"destructive tool blocked by guard: {exec.name}"
         return None
 
-    async def audit_result(payload: dict) -> None:
-        exec = payload["exec"]
-        result = payload["result"]
-        logger.info("tool %s -> %s", exec.name, "error" if result.is_error else "ok")
-
     manager.register(
         Plugin(
             name="tool_audit",
-            description="Block destructive tools (deny + guard) and audit results.",
-            listeners=[
-                waterfall(PRE_TOOL_USE, deny_destructive),
-                observe(TOOL_RESULT, audit_result),
-            ],
+            description="Block destructive tools (deny + guard).",
             guards=[guard_destructive],
+            listeners=[waterfall(PRE_TOOL_USE, deny_destructive)],
         )
     )

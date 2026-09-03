@@ -52,6 +52,9 @@ dependencies = [
     # Misc
     "httpx>=0.27",
     "jsonschema>=4.21",
+    # Cross-process file lock for the research driver's atomic project.json CAS
+    # (portalocker, not fcntl — the dev machine is Windows).
+    "portalocker>=2.8",
 ]
 
 [project.optional-dependencies]

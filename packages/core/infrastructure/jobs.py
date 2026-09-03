@@ -29,6 +29,7 @@ ASSET_INGEST = "asset_ingest"
 LEARNING_IMPORT = "learning_import"        # Learning-Platform sentences/articles → query repo
 CHAT_SESSION_IMPORT = "chat_session_import"  # a whole chat session → query repo Q&A chunks
 TOOLKIT_GENERATE = "toolkit_generate"        # workspace files → slides / mindmap / summary
+RESEARCH_DRIVE = "research_drive"            # one auto-continue turn of a Research OS run chain
 
 # Job status values.
 QUEUED = "queued"

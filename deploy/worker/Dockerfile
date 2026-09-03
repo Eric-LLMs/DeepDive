@@ -10,6 +10,9 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY packages ./packages
 COPY apps ./apps
+# Research OS plugin code: worker's research_drive task imports plugins.research.{driver,plugin}
+# at runtime, and they are file-backed modules (not pip-packaged) — copy the tree verbatim.
+COPY plugins ./plugins
 
 RUN pip install --no-cache-dir "."
 

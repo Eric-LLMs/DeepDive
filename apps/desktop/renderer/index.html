@@ -24,7 +24,7 @@
         </div>
         <div id="sidebar-tabs">
           <button id="tab-files" class="active" type="button">Files</button>
-          <button id="tab-sessions" type="button">Sessions</button>
+          <button id="tab-sessions" type="button">Chats</button>
           <button id="tab-research" type="button" title="Research OS tasks">🔬 Research</button>
         </div>
         <div class="search-wrap">
@@ -106,16 +106,41 @@
              state. -->
         <section id="research-task-view" class="research-task-view hidden"></section>
 
+        <!-- Cloud note editor (.md / text): an in-flow document panel that takes the Files
+             document area (above a bottom-docked chat, or beside a right-docked one) — unlike
+             an overlay it never covers the chat. Shown/hidden by clouddrive.js openNote/
+             closeNote; visibility is coordinated via window.__cloudNoteOpen + __syncMainPanes. -->
+        <section id="note-editor" class="note-editor hidden">
+          <div class="note-editor-toolbar">
+            <span id="note-title" class="note-editor-title">note.md</span>
+            <span class="spacer"></span>
+            <span id="note-mode" class="note-mode">Edit</span>
+            <button id="note-preview" class="note-icon-btn" type="button" title="Toggle edit / preview">
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+              <span class="note-btn-label">Preview</span>
+            </button>
+            <button id="note-save" class="note-icon-btn" type="button" title="Save to cloud (Ctrl+S)">
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zM12 19a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm1-10H6V5h7v4z"/></svg>
+              <span class="note-btn-label">Save</span>
+            </button>
+            <button id="note-close" class="note-icon-btn note-icon-only" type="button" title="Close">
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+            </button>
+          </div>
+          <textarea id="note-textarea" class="note-editor-textarea" spellcheck="false" placeholder="Start writing…"></textarea>
+          <div id="note-preview-pane" class="md-preview hidden"></div>
+        </section>
+
         <section id="chat">
           <div id="chat-resize"></div>
           <div id="chat-header">
-            <!-- Top bar: global controls only (session title, New chat / ＋ Research, window
-                 controls). The session title is hidden in Research mode — the sub bar below
-                 carries the full task context instead of a truncated title. -->
+            <!-- Top bar: global controls only (session title, ＋ Research, window controls).
+                 New chats are started from the Chats list in the sidebar — the single entry
+                 point for a fresh conversation. The session title is hidden in Research mode;
+                 the sub bar below carries the full task context instead. -->
             <div id="chat-topbar" class="chat-topbar">
               <span id="chat-title">Chat</span>
               <div class="chat-header-actions">
-                <button id="chat-new-chat" type="button" title="New chat — start a fresh session">＋ New chat</button>
                 <button id="chat-new-research" type="button" title="New Research — create a research task the agent drives in this chat">＋ Research</button>
                 <button id="chat-hide" type="button" title="Hide chat (restore from the DeepDive logo)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
                 <button id="chat-float" type="button" title="Float the chat window"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
@@ -155,27 +180,6 @@
               </div>
             </div>
           </form>
-        </section>
-
-        <section id="note-editor" class="note-editor hidden">
-          <div class="note-editor-toolbar">
-            <span id="note-title" class="note-editor-title">note.md</span>
-            <span class="spacer"></span>
-            <span id="note-mode" class="note-mode">Edit</span>
-            <button id="note-preview" class="note-icon-btn" type="button" title="Toggle edit / preview">
-              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
-              <span class="note-btn-label">Preview</span>
-            </button>
-            <button id="note-save" class="note-icon-btn" type="button" title="Save to cloud (Ctrl+S)">
-              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zM12 19a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm1-10H6V5h7v4z"/></svg>
-              <span class="note-btn-label">Save</span>
-            </button>
-            <button id="note-close" class="note-icon-btn note-icon-only" type="button" title="Close">
-              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
-            </button>
-          </div>
-          <textarea id="note-textarea" class="note-editor-textarea" spellcheck="false" placeholder="Start writing…"></textarea>
-          <div id="note-preview-pane" class="md-preview hidden"></div>
         </section>
       </main>
 
