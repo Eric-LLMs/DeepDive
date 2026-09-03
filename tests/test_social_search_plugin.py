@@ -193,17 +193,42 @@ class TestX:
             }
         ]
 
-    async def test_requires_token(self):
+    async def test_without_token_degrades_to_site_scoped_web(self):
+        # No X_BEARER_TOKEN → the x adapter must never fail: it degrades to a
+        # keyless site-scoped aggregate web search (site:x.com + site:twitter.com).
+        hits = [
+            {
+                "title": "q in a post",
+                "snippet": "snippet text about q",
+                "url": "https://x.com/alice/status/1",
+            }
+        ]
         with mock.patch.dict(os.environ, {"X_BEARER_TOKEN": ""}, clear=False):
-            with pytest.raises(RuntimeError, match="not configured"):
-                await mod._execute({"query": "q", "platform": "x"}, exec=None)
+            with mock.patch.object(
+                mod, "site_limited_web_search", return_value=hits
+            ) as fake_search:
+                result = await mod._execute({"query": "q", "platform": "x"}, exec=None)
+        assert [c.args[0] for c in fake_search.call_args_list] == ["x.com", "twitter.com"]
+        assert result and all(i["platform"] == "x" for i in result)
+        assert result[0]["url"] == "https://x.com/alice/status/1"
 
 
 # ── unsupported / bad input ──────────────────────────────────────────────────
 class TestUnsupported:
-    async def test_zhihu_unsupported(self):
-        with pytest.raises(RuntimeError, match="not supported"):
-            await mod._execute({"query": "q", "platform": "zhihu"}, exec=None)
+    async def test_zhihu_degrades_to_site_scoped_web(self):
+        # zhihu has no public API but IS supported — the adapter degrades to a
+        # keyless site-scoped aggregate web search of zhihu.com.
+        hits = [
+            {
+                "title": "知乎上关于 q 的回答",
+                "snippet": "回答内容…",
+                "url": "https://www.zhihu.com/question/12345",
+            }
+        ]
+        with mock.patch.object(mod, "site_limited_web_search", return_value=hits) as fake_search:
+            result = await mod._execute({"query": "q", "platform": "zhihu"}, exec=None)
+        assert fake_search.call_args_list[0].args[0] == "zhihu.com"
+        assert result and result[0]["platform"] == "zhihu"
 
     async def test_unknown_platform(self):
         with pytest.raises(RuntimeError, match="unknown platform"):
