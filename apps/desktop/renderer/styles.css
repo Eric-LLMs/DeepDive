@@ -744,6 +744,23 @@ pre.text-viewer {
 .msg.assistant { align-self: flex-start; align-items: flex-start; }
 .msg.error { align-self: flex-start; max-width: 80%; background: #5a2a2a; color: #ffb3b3; border-radius: 10px; padding: 8px 12px; white-space: pre-wrap; word-break: break-word; }
 .msg.notice { align-self: center; max-width: 90%; background: #3a3320; color: #ffd966; font-size: 12px; text-align: center; border-radius: 10px; padding: 8px 12px; }
+/* Deterministic system notes (e.g. research gate review explanations) — display-only,
+   rendered via textContent as plain text so runtime bookkeeping never looks like model
+   output. Left border in the accent color marks them as guidance, not a chat bubble. */
+.msg.system {
+  align-self: flex-start;
+  max-width: 90%;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 12px;
+  white-space: pre-line;
+  word-break: break-word;
+}
 .msg-bubble { padding: 8px 12px 30px; border-radius: 10px; white-space: normal; word-break: break-word; max-width: 100%; }
 .msg.user .msg-bubble { background: var(--accent); color: #fff; }
 .msg.assistant .msg-bubble { background: var(--bg-soft-2); }

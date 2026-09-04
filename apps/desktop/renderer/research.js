@@ -442,12 +442,12 @@
       statusBody.appendChild(el("div", "research-status-empty", `Status unavailable: ${e.message}`));
       return;
     }
-    renderStatusDetail(detail);
+    await renderStatusDetail(detail);
   }
 
   // Render the left status panel from an already-fetched authoritative detail. Used by both the
   // initial load and the live revision monitor's coalesced refetch, so the two never double-fetch.
-  function renderStatusDetail(detail, opts = {}) {
+  async function renderStatusDetail(detail, opts = {}) {
     syncRunFromDetail(detail);
     recordResearchSession(detail);
     // Open this task's dedicated session in the chat — silent, no message sent. This is what
@@ -456,7 +456,11 @@
     // openSession:false — the user may be mid-conversation elsewhere, and a background refresh
     // must not yank them into the task's session.
     if (opts.openSession !== false && window.openResearchSession) {
-      window.openResearchSession(detail.task_id, detail.name || detail.task_id, detail.session_id || null);
+      // Await the session open: it rebuilds the chat from the session DB (and settles
+      // ``state.sessionId``) before the gate card / note logic below decides whether this task's
+      // session is the one on screen. Without the await, a first open of an already-parked task
+      // sees the *previous* session id and skips both the note reload and the Approve/Reject card.
+      await window.openResearchSession(detail.task_id, detail.name || detail.task_id, detail.session_id || null);
     }
     if (!statusBody) return;
     statusBody.innerHTML = "";
@@ -475,6 +479,16 @@
     syncRunCtl(); // reflect any run state on the freshly rendered Run control
     // Surface any human-gate decision (pending override) as an inline Approve / Reject card
     // in the task's chat; app.js decides whether that session is the one on screen.
+    if (window.researchReloadGateNotes) {
+      // When the run just parked at a gate, the backend has already committed its deterministic
+      // ``system`` note to the session DB — pull it into the live chat before the card renders.
+      await window.researchReloadGateNotes({
+        task_id: detail.task_id,
+        name: detail.name || detail.task_id,
+        session_id: detail.session_id || null,
+        pending_overrides: detail.pending_overrides || [],
+      });
+    }
     if (window.showResearchGateCard) {
       window.showResearchGateCard({
         task_id: detail.task_id,
@@ -552,6 +566,10 @@
   // and main task view show it until the next run starts, so a finished/blocked/stalled/
   // cancelled run is never silently unexplained on re-open.
   function renderLastBlock(detail) {
+    // A run in progress supersedes the previous terminal outcome: while ``is_running`` the old
+    // banner must not keep claiming the task is Paused/stopped (``last_block`` is only cleared
+    // when the *next* run reaches its own terminal state, so the previous one lingers).
+    if (detail.is_running) return null;
     const lb = detail.last_block;
     if (!lb || !lb.kind) return null;
     const kind = lb.kind === "finished" ? "finished"
@@ -991,7 +1009,7 @@
     if (taskId !== monitorTaskId) return;
     // Refresh both research surfaces without re-opening the chat session (openSession:false) —
     // the user may be in another chat; a background refresh must not yank them away.
-    renderStatusDetail(detail, { openSession: false });
+    await renderStatusDetail(detail, { openSession: false });
     const pane = document.getElementById("research-task-view");
     if (pane && !pane.classList.contains("hidden")) renderMainDetail(detail);
   }

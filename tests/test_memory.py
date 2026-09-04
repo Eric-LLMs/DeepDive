@@ -7,8 +7,14 @@ duck-typed dict shape the loop consumes.
 import uuid
 from types import SimpleNamespace
 
+from core.config import settings
 from core.infrastructure.db import MessageModel, SessionEventModel
-from core.infrastructure.memory import SessionMemoryStore, load_session_detail
+from core.infrastructure.memory import (
+    SessionMemoryStore,
+    finalize_session,
+    insert_plain_message,
+    load_session_detail,
+)
 
 
 class _Result:
@@ -157,4 +163,112 @@ async def test_load_session_detail_carries_imported_rag_flag():
     assert detail["messages"][0]["imported_rag"] is True
     assert detail["messages"][1]["imported_rag"] is False
     assert detail["messages"][0]["id"] == str(mid1)
+
     assert detail["messages"][0]["attach"] is None  # no attachment on these messages
+
+
+# ── gate ``system`` note path ─────────────────────────────────────────────────
+async def test_insert_plain_message_writes_system_role():
+    """The research gate note lands as a display-only ``system`` message row."""
+    store = _Store()
+    user_id, session_id = uuid.uuid4(), uuid.uuid4()
+
+    await insert_plain_message(store.session, user_id, session_id, "system", "a note")
+
+    assert len(store.added) == 1
+    msg = store.added[0]
+    assert isinstance(msg, MessageModel)
+    assert msg.role == "system"
+    assert msg.user_id == user_id
+    assert msg.session_id == session_id
+    assert msg.text == "a note"
+
+
+# ── archival (finalize) keeps ``system``/``tool`` out of embedding + summary ──
+class _BoxScalars:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _FinResult:
+    def __init__(self, msgs, sess):
+        self._msgs = msgs
+        self._sess = sess
+
+    def scalars(self):
+        return _BoxScalars(self._msgs)
+
+    def scalar_one_or_none(self):
+        return self._sess
+
+
+class _FinSession:
+    def __init__(self, msgs, sess):
+        self._msgs = msgs
+        self._sess = sess
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def commit(self):
+        pass
+
+    async def execute(self, stmt):
+        return _FinResult(self._msgs, self._sess)
+
+
+class _RecordingEmbedder:
+    def __init__(self):
+        self.texts = None
+
+    async def embed(self, texts):
+        self.texts = texts
+        return [[float(i)] for i in range(len(texts))]
+
+
+class _RecordingLLM:
+    def __init__(self):
+        self.prompts = []
+
+    async def complete(self, prompt, system, **kw):
+        self.prompts.append(prompt)
+        return "S"
+
+
+def _msg(role, text):
+    return SimpleNamespace(role=role, text=text, embedding=None)
+
+
+async def test_finalize_excludes_system_and_tool_from_embed_and_summary(monkeypatch):
+    """Only user/assistant rows enter the embedding corpus and the summary transcript."""
+    monkeypatch.setattr(settings, "session_summary_enabled", True)
+    sess = SimpleNamespace(title="Existing", summary=None, closed_at=None)
+    # Order matches created_at: a real conversation with a gate ``system`` note + a tool row.
+    msgs = [
+        _msg("user", "user Q"),
+        _msg("system", "SYSTEM GATE NOTE - must never reach a model"),
+        _msg("tool", "tool row - bookkeeping"),
+        _msg("assistant", "assistant A"),
+    ]
+    embedder = _RecordingEmbedder()
+    llm = _RecordingLLM()
+
+    result = await finalize_session(
+        lambda: _FinSession(msgs, sess), embedder, llm, uuid.uuid4()
+    )
+
+    assert result["embedded"] == 2
+    assert embedder.texts == ["user Q", "assistant A"]
+    assert sess.summary == "S"
+    assert sess.closed_at is not None
+    assert len(llm.prompts) == 1
+    assert "SYSTEM GATE NOTE" not in llm.prompts[0]
+    assert "tool row" not in llm.prompts[0]
+    assert "user: user Q" in llm.prompts[0]
+    assert "assistant: assistant A" in llm.prompts[0]

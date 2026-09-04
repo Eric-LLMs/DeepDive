@@ -26,6 +26,7 @@ Design notes (spike decisions, all auditable):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -97,6 +98,106 @@ _INVALIDATES = {"invalidates"}
 
 _VERIFIED = "verified"
 _ALLOWED_CLAIM_STRENGTH = {"asserted", "supported", "confident", "contested"}
+
+# ── gate review notes (auto-authored chat explanation, docs/research/10 §6) ──
+# When a gate override parks a run for a human decision, the gate service writes one
+# deterministic ``system`` note into the task's session chat so the operator sees WHY the
+# objective bar was not cleared. Notes are display-only: the ``system`` message row is
+# filtered out of model prompt context / session archival / RAG import everywhere.
+_GATE_NOTE_KEY = "gate_note_approvals"
+_REASON_LIMIT = 1024  # cap on the agent's free-form reason embedded in a note (chars)
+_DB_INSERT_ATTEMPTS = 3  # bounded retries before a note is abandoned (marker left unconsumed)
+_DB_INSERT_RETRY_DELAY = 0.2  # seconds, linear backoff between attempts
+
+_GATE_LABELS = {
+    "DESIGN_GATE": "Design Gate",
+    "EVIDENCE_GATE": "Evidence Gate",
+    "CLAIM_GATE": "Claim Gate",
+    "QUALITY_GATE": "Quality Gate",
+}
+
+# Plain-language "what this guards" per gate/check. Only these deterministic checks are
+# authoritative; the agent's free-form ``reason`` is secondary context and never overrides them.
+_GATE_CHECK_RISKS: dict[str, dict[str, str]] = {
+    "EVIDENCE_GATE": {
+        "sources_verified": "every source used as fact must exist and be marked verified — an unverified source is not evidence",
+        "evidence_linked": "each Evidence item must link to a verified Source, so a claim's support can be traced to an actual source",
+        "no_invalid_upstream": "no upstream node may be INVALID — a broken predecessor cannot feed trustworthy evidence",
+        "claim_draft_links": "each draft claim destined for the manuscript needs a support link from an Evidence node",
+    },
+    "DESIGN_GATE": {
+        "design_fields": "the Design node must carry register, estimand, identification and risk before the design is locked",
+    },
+    "CLAIM_GATE": {
+        "claims_anchored": "every Claim must carry citations and an allowed strength — restraint is the manuscript bar",
+    },
+    "QUALITY_GATE": {
+        "scorecard": "the quality scorecard needs >=7 dimensions with no fatal finding before a release decision",
+    },
+}
+
+_GATE_WHY: dict[str, str] = {
+    "DESIGN_GATE": "a research design that is not fully specified cannot be executed defensibly",
+    "EVIDENCE_GATE": "building the explanation on evidence that does not meet the objective bar would make the conclusions unverifiable",
+    "CLAIM_GATE": "claims that are not anchored to registered citations or that overstate the support cannot be published",
+    "QUALITY_GATE": "a release decision without a clean scorecard has no objective quality basis",
+}
+
+
+def _trim_reason(reason: str, limit: int = _REASON_LIMIT) -> str:
+    """Trim the agent's free-form override reason to ``limit`` chars for safe display."""
+    reason = (reason or "").strip()
+    if not reason:
+        return ""
+    if len(reason) <= limit:
+        return reason
+    return reason[:limit].rstrip() + "…"
+
+
+def compose_gate_review_note(
+    gate_name: str, failed_checks: list[dict], reason: str = ""
+) -> str:
+    """One deterministic, human-facing note for a gate that failed and awaits an override.
+
+    Pure (no I/O, no state). The note's authority is the mechanical ``failed_checks``; the
+    optional agent ``reason`` is appended as plain context, trimmed to ``_REASON_LIMIT``.
+    Output is never empty for a recognized gate: when every check is green it says so
+    explicitly rather than inventing a failure, so a pending approval always gets a card.
+    """
+    lines = [f"Review needed — {_GATE_LABELS.get(gate_name, gate_name)} did not pass."]
+    lines.append("")
+    lines.append(
+        "The deterministic gate checks below failed, so this task cannot advance on its own. "
+        "This is not a model opinion; it is the mechanical evidence bar the run must clear:"
+    )
+    risks = _GATE_CHECK_RISKS.get(gate_name, {})
+    failed = [c for c in failed_checks if not c.get("ok")]
+    if failed:
+        lines.append("")
+        for check in failed:
+            name = check.get("name") or "?"
+            lines.append(f"• {name}: {risks.get(name) or 'this gate check did not pass'}")
+            if check.get("detail"):
+                lines.append(f"  Gate detail: {check['detail']}")
+    else:
+        lines.append("")
+        lines.append("• (the gate's checks are green here — a human decision is still required)")
+    lines.append("")
+    why = _GATE_WHY.get(gate_name, "a failed gate has not met the objective research bar")
+    lines.append(
+        f"Why it matters: {why}. Proceeding past a failed check would build the research on "
+        "work the gate's objective bar did not accept, so the decision is yours."
+    )
+    lines.append("")
+    lines.append(
+        "Approve to continue despite the failed check(s), or Reject and let the agent rework "
+        "the underlying research."
+    )
+    trimmed = _trim_reason(reason)
+    if trimmed:
+        lines.append("")
+        lines.append(f"Agent's request: {trimmed}")
+    return "\n".join(lines)
 
 
 class RevisionConflictError(ValueError):
@@ -1229,7 +1330,9 @@ class ResearchService:
                 {
                     "approval_id": a["id"],
                     "gate_name": a.get("gate_name"),
-                    "reason": a.get("reason", ""),
+                    # Agent's free-form reason is secondary context only: trimmed for display so
+                    # the card never renders an unbounded LLM blob (docs/research/10 §6).
+                    "reason": _trim_reason(a.get("reason", "")),
                 }
                 for a in self.pending_overrides(owner_id, task_id)
             ],
@@ -1368,6 +1471,16 @@ class ResearchService:
         the caller whether it created the node or found it.
         """
         graph = self._load_graph(owner_id, project_id)
+        # The node's ``id``/``type`` are the graph's identity keys — index them only after a
+        # precise guard. A bare ``KeyError: 'id'`` (a probe node like ``{type, title}``) tells
+        # the model nothing about what is missing, so it cannot correct the call.
+        if not isinstance(node, dict):
+            raise TypeError("record_node 'node' must be an object, not a string")
+        if "id" not in node or "type" not in node:
+            raise ValueError(
+                "record_node 'node' must include 'id' and 'type' "
+                f"(got keys: {sorted(node)})"
+            )
         node_id = node["id"]
         node_type = node["type"]
         existing = next((n for n in graph["nodes"] if n["id"] == node_id), None)
@@ -1555,6 +1668,15 @@ class ResearchService:
             for n in graph["nodes"]
             if n["type"] in {"Source", "Evidence", "Claim", "Result"}
         )
+        linked_evidence_ok = bool(evidences) and all(
+            linked_to_verified(e["id"]) for e in evidences
+        )
+        linked_claims_ok = bool(claims) and all(
+            linked_to_evidence(c["id"]) for c in claims
+        )
+        verified_count = sum(
+            1 for s in sources if s.get("verification_status") == _VERIFIED
+        )
         return [
             {
                 "name": "sources_verified",
@@ -1562,13 +1684,24 @@ class ResearchService:
                 "detail": (
                     "at least one Source exists and every Source is verified"
                     if sources_ok
-                    else "need >=1 Source with verification_status='verified'"
+                    else (
+                        "need at least one Source node with verification_status='verified'"
+                        if not sources
+                        else (
+                            "every Source must be verification_status='verified': "
+                            f"{verified_count}/{len(sources)} verified"
+                        )
+                    )
                 ),
             },
             {
                 "name": "evidence_linked",
-                "ok": bool(evidences) and all(linked_to_verified(e["id"]) for e in evidences),
-                "detail": "every Evidence node links to a verified Source",
+                "ok": linked_evidence_ok,
+                "detail": (
+                    "every Evidence node links to a verified Source"
+                    if linked_evidence_ok
+                    else "every Evidence node must link to a verified Source"
+                ),
             },
             {
                 "name": "no_invalid_upstream",
@@ -1577,8 +1710,19 @@ class ResearchService:
             },
             {
                 "name": "claim_draft_links",
-                "ok": bool(claims) and all(linked_to_evidence(c["id"]) for c in claims),
-                "detail": ">=1 draft Claim linked to an Evidence node",
+                "ok": linked_claims_ok,
+                "detail": (
+                    "every Claim links to an Evidence node"
+                    if linked_claims_ok
+                    else (
+                        "need at least one Claim linked to an Evidence node"
+                        if not claims
+                        else (
+                            f"{len(claims) - sum(1 for c in claims if linked_to_evidence(c['id']))}/"
+                            f"{len(claims)} Claims lack an Evidence link; every Claim must link to an Evidence node"
+                        )
+                    )
+                ),
             },
         ]
 
@@ -1740,6 +1884,138 @@ class ResearchService:
             "approver_user_id": str(owner_id),
             "resolved_at": approval["resolved_at"],
         }
+
+    # ── gate review notes (auto chat explanation) ─────────────────────────
+    def _gate_checks_readonly(
+        self, owner_id: uuid.UUID, project_id: str, gate_name: str
+    ) -> list[dict]:
+        """Run a gate's mechanical checks WITHOUT recording a verdict.
+
+        ``check_gate`` writes ``gates[gate] = PASS/FAIL`` into ``project.json`` (a side
+        effect that must never happen while merely explaining a gate). This path reuses the
+        same pure check functions but is strictly read-only.
+        """
+        if gate_name == "EVIDENCE_GATE":
+            return self._evidence_checks(
+                project_id, self._load_graph(owner_id, project_id)
+            )
+        if gate_name == "DESIGN_GATE":
+            return self._design_checks(self._load_graph(owner_id, project_id))
+        if gate_name == "CLAIM_GATE":
+            return self._claim_checks(self._load_graph(owner_id, project_id))
+        if gate_name == "QUALITY_GATE":
+            return self._quality_checks(self._load_project(owner_id, project_id))
+        raise ValueError(f"unknown gate: {gate_name}")
+
+    def gate_note_drafts(self, owner_id: uuid.UUID, project_id: str) -> list[dict]:
+        """Draft one ``system`` note per unnoted PENDING gate approval.
+
+        Read-only: never mutates gate state, ``approvals.json``, or the ``_GATE_NOTE_KEY``
+        marker. The caller must persist each ``{approval_id, text}`` to the session DB first
+        and only then call :meth:`mark_gate_notes` (DB write always precedes the marker).
+        """
+        project = self._load_project(owner_id, project_id)  # existence check (ValueError)
+        noted = set(project.get(_GATE_NOTE_KEY) or [])
+        drafts: list[dict] = []
+        for approval in self.pending_overrides(owner_id, project_id):
+            approval_id = approval.get("id")
+            if approval_id in noted:
+                continue
+            gate_name = approval.get("gate_name", "")
+            if gate_name not in _GATES:
+                continue
+            checks = self._gate_checks_readonly(owner_id, project_id, gate_name)
+            failed = [c for c in checks if not c.get("ok")]
+            text = compose_gate_review_note(gate_name, failed, approval.get("reason") or "")
+            if text:
+                drafts.append({"approval_id": approval_id, "text": text})
+        return drafts
+
+    def mark_gate_notes(
+        self, owner_id: uuid.UUID, project_id: str, approval_ids: list[str]
+    ) -> None:
+        """Record that ``system`` notes were durably written for ``approval_ids`` (CAS).
+
+        Callers invoke this ONLY after the corresponding notes committed to the session DB —
+        the marker must never be consumed ahead of a durable write (a DB failure leaves the
+        marker untouched so a later attempt can retry). Only approvals still PENDING and not
+        already noted are added, so one approval id yields at most one note; a fresh approval
+        (e.g. after a human Reject) gets its own id and its own note.
+        """
+        if not approval_ids:
+            return
+        approvals = self._load_json(
+            self._project_dir(owner_id, project_id) / "approvals.json", {"approvals": []}
+        )
+        pending_ids = {
+            a["id"] for a in approvals["approvals"] if a.get("status") == "PENDING"
+        }
+        to_add = set(approval_ids) & pending_ids
+        if not to_add:
+            return
+
+        def mutate(project: dict) -> None:
+            noted = set(project.get(_GATE_NOTE_KEY) or [])
+            project[_GATE_NOTE_KEY] = sorted(noted | to_add)
+
+        self.atomic_update_project(owner_id, project_id, mutate)
+
+    async def emit_gate_notes(
+        self,
+        session_factory,
+        owner_id: uuid.UUID,
+        project_id: str,
+        session_id: str | None,
+    ) -> int:
+        """Durably write the gate review notes for a parked run, then mark them.
+
+        Ordering contract: each ``system`` note is committed to the session DB *before* its
+        ``approval_id`` is added to the marker (never marker-first). On a DB failure the id
+        is left unmarked so a later call can retry. Callers must invoke this BEFORE the run's
+        ``blocked`` wake-up is published, so a monitor refetch observes the note.
+        """
+        if not session_id:
+            return 0
+        drafts = self.gate_note_drafts(owner_id, project_id)
+        if not drafts:
+            return 0
+        from core.infrastructure.memory import insert_plain_message  # local: API/worker bridge
+
+        written = 0
+        for draft in drafts:
+            last_exc: Exception | None = None
+            for attempt in range(_DB_INSERT_ATTEMPTS):
+                try:
+                    await insert_plain_message(
+                        session_factory,
+                        owner_id,
+                        uuid.UUID(session_id),
+                        "system",
+                        draft["text"],
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001 - retried, then surfaced as a warning
+                    last_exc = exc
+                    if attempt + 1 < _DB_INSERT_ATTEMPTS:
+                        await asyncio.sleep(_DB_INSERT_RETRY_DELAY * (attempt + 1))
+            else:
+                # All attempts failed: leave the marker unconsumed so a later retry can write it.
+                logger.warning(
+                    "research gate note insert failed for approval %s (not marked): %s",
+                    draft["approval_id"],
+                    last_exc,
+                )
+                continue
+            # DB committed -> only now consume the marker for this approval id.
+            self.mark_gate_notes(owner_id, project_id, [draft["approval_id"]])
+            written += 1
+            try:
+                await self.append_session_turn(
+                    owner_id, session_id, "system", draft["text"]
+                )
+            except Exception as exc:  # noqa: BLE001 - mirror is advisory, never fatal
+                logger.debug("research gate note mirror failed for %s: %s", project_id, exc)
+        return written
 
     # ── research_run ──────────────────────────────────────────────────────
     def begin_run(
@@ -1922,13 +2198,6 @@ def _make_tool(
     )
 
 
-_ACTIONS = {
-    "action": {
-        "type": "string",
-        "description": "Which action to run on this tool.",
-    }
-}
-
 _COMMON_OBJ = {
     "project_id": {"type": "string", "description": "Research project id."},
     "artifact_id": {"type": "string", "description": "Research artifact id."},
@@ -1947,8 +2216,25 @@ _COMMON_OBJ = {
 }
 
 
-def _params(extra: dict, required: list[str]) -> dict:
-    props = {**_ACTIONS, **_COMMON_OBJ, **extra}
+def _params(actions: list[str], extra: dict, required: list[str]) -> dict:
+    """Build a research tool's argument schema with ``action`` pinned to its valid set.
+
+    ``action`` is the discriminator that selects the handler branch, so it must be an
+    **enum** of the tool's real action names — a free-form string lets a weaker tool-calling
+    model invent verbs like ``list`` / ``query`` / ``read`` that no handler implements, which
+    froze every research_evidence / research_artifact call on the worker. The enum mirrors the
+    handler's own ``if action == ...`` branches exactly, so it never excludes a working path.
+    """
+    props = {
+        "action": {
+            "type": "string",
+            "enum": actions,
+            "description": "Which action to run on this tool. One of: "
+            + ", ".join(actions),
+        },
+        **_COMMON_OBJ,
+        **extra,
+    }
     return {"type": "object", "properties": props, "required": ["action", *required]}
 
 
@@ -1988,6 +2274,31 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
         if handoff.get("kind") != "research":
             return None
         return handoff.get("project_id")
+
+    def _project_id(args: dict, tool: str, action: str) -> str:
+        """The acting project id: the explicit ``project_id`` arg, else the bound handoff.
+
+        The worker threads ``current_turn().context["handoff"].project_id`` (the task id) on
+        every auto turn and the desktop resume sinks the same handoff, so a call that omits
+        ``project_id`` still targets the bound project instead of dying with a ``KeyError``.
+        """
+        project_id = args.get("project_id") or _handoff_project_id()
+        if not project_id:
+            raise ValueError(
+                f"{tool} {action} needs a project_id: pass it in the tool call or run inside "
+                "a bound research handoff"
+            )
+        return project_id
+
+    def _require(args: dict, key: str, tool: str, action: str) -> Any:
+        """A required argument with a precise, actionable error (never a bare ``KeyError``).
+
+        The model sees the tool, action, and the missing key so it can correct the call
+        instead of guessing at a ``KeyError`` repr (``'node_id'`` etc.) and burning turns.
+        """
+        if key not in args or args[key] is None:
+            raise ValueError(f"{tool} {action} is missing required argument '{key}'")
+        return args[key]
 
     def _monitor_wrap(tool_name: str, handler):
         """Post-success publish hook for a research tool router.
@@ -2037,32 +2348,36 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
         action = args["action"]
         if action == "write_scratch":
             return await svc.write_scratch(
-                user(),
-                args["project_id"],
-                artifact_id=args["artifact_id"],
-                content=args["content"],
+                user(), _project_id(args, "research_artifact", action),
+                artifact_id=_require(args, "artifact_id", "research_artifact", action),
+                content=_require(args, "content", "research_artifact", action),
                 idempotency_key=args.get("idempotency_key"),
                 generated_by_execution=args.get("generated_by_execution"),
             )
         if action == "promote_to_drive":
-            return await svc.promote_to_drive(user(), args["project_id"], artifact_id=args["artifact_id"])
+            return await svc.promote_to_drive(
+                user(), _project_id(args, "research_artifact", action),
+                artifact_id=_require(args, "artifact_id", "research_artifact", action),
+            )
         if action == "read":
             return svc.read_artifact(
-                user(), args["project_id"], artifact_id=args["artifact_id"],
+                user(), _project_id(args, "research_artifact", action),
+                artifact_id=_require(args, "artifact_id", "research_artifact", action),
                 version=args.get("version"),
             )
         if action == "create_version":
             return await svc.create_version(
-                user(),
-                args["project_id"],
-                artifact_id=args["artifact_id"],
-                content=args["content"],
+                user(), _project_id(args, "research_artifact", action),
+                artifact_id=_require(args, "artifact_id", "research_artifact", action),
+                content=_require(args, "content", "research_artifact", action),
                 idempotency_key=args.get("idempotency_key"),
             )
         if action == "diff":
             return svc.diff_artifact(
-                user(), args["project_id"], artifact_id=args["artifact_id"],
-                from_version=args["from_version"], to_version=args["to_version"],
+                user(), _project_id(args, "research_artifact", action),
+                artifact_id=_require(args, "artifact_id", "research_artifact", action),
+                from_version=_require(args, "from_version", "research_artifact", action),
+                to_version=_require(args, "to_version", "research_artifact", action),
             )
         raise ValueError(f"unknown research_artifact action: {action}")
 
@@ -2070,50 +2385,95 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
         svc = service()
         action = args["action"]
         if action == "get_state":
-            return svc.get_state(user(), args["project_id"])
+            return svc.get_state(user(), _project_id(args, "research_state", action))
         if action == "transition_stage":
-            return svc.transition_stage(user(), args["project_id"], target=args["target"])
+            return svc.transition_stage(
+                user(), _project_id(args, "research_state", action),
+                target=_require(args, "target", "research_state", action),
+            )
         if action == "get_handoff":
-            return svc.get_handoff(user(), args["project_id"])
+            return svc.get_handoff(user(), _project_id(args, "research_state", action))
         raise ValueError(f"unknown research_state action: {action}")
 
     async def _evidence(args: dict, exec: ToolExecution) -> dict:
         svc = service()
         action = args["action"]
         if action == "record_node":
-            return svc.record_node(user(), args["project_id"], node=args["node"])
+            return svc.record_node(
+                user(), _project_id(args, "research_evidence", action),
+                node=_require(args, "node", "research_evidence", action),
+            )
         if action == "link_edge":
-            return svc.link_edge(user(), args["project_id"], src=args["src"], dst=args["dst"], kind=args["kind"])
+            return svc.link_edge(
+                user(), _project_id(args, "research_evidence", action),
+                src=_require(args, "src", "research_evidence", action),
+                dst=_require(args, "dst", "research_evidence", action),
+                kind=_require(args, "kind", "research_evidence", action),
+            )
         if action == "query_lineage":
-            return svc.query_lineage(user(), args["project_id"], node_id=args["node_id"])
+            return svc.query_lineage(
+                user(), _project_id(args, "research_evidence", action),
+                node_id=_require(args, "node_id", "research_evidence", action),
+            )
         if action == "mutate_node":
-            return svc.mutate_node(user(), args["project_id"], node_id=args["node_id"], patch=args["patch"])
+            return svc.mutate_node(
+                user(), _project_id(args, "research_evidence", action),
+                node_id=_require(args, "node_id", "research_evidence", action),
+                patch=_require(args, "patch", "research_evidence", action),
+            )
         if action == "invalidate_downstream":
-            return svc.invalidate_downstream(user(), args["project_id"], node_id=args["node_id"])
+            return svc.invalidate_downstream(
+                user(), _project_id(args, "research_evidence", action),
+                node_id=_require(args, "node_id", "research_evidence", action),
+            )
         raise ValueError(f"unknown research_evidence action: {action}")
 
     async def _gate(args: dict, exec: ToolExecution) -> dict:
         svc = service()
         action = args["action"]
         if action == "check":
-            return svc.check_gate(user(), args["project_id"], gate_name=args["gate_name"])
+            return svc.check_gate(
+                user(), _project_id(args, "research_gate", action),
+                gate_name=_require(args, "gate_name", "research_gate", action),
+            )
         if action == "explain_failure":
-            return svc.explain_failure(user(), args["project_id"], gate_name=args["gate_name"])
+            return svc.explain_failure(
+                user(), _project_id(args, "research_gate", action),
+                gate_name=_require(args, "gate_name", "research_gate", action),
+            )
         if action == "request_override":
-            return svc.request_override(user(), args["project_id"], gate_name=args["gate_name"], reason=args["reason"])
+            return svc.request_override(
+                user(), _project_id(args, "research_gate", action),
+                gate_name=_require(args, "gate_name", "research_gate", action),
+                reason=args.get("reason") or "",
+            )
         if action == "resolve_override":
-            return svc.resolve_override(user(), args["approval_id"], approve=args.get("approve", True))
+            return svc.resolve_override(
+                user(), _require(args, "approval_id", "research_gate", action),
+                approve=args.get("approve", True),
+            )
         raise ValueError(f"unknown research_gate action: {action}")
 
     async def _run(args: dict, exec: ToolExecution) -> dict:
         svc = service()
         action = args["action"]
         if action == "record_execution":
-            return svc.record_execution(user(), args["project_id"], tool=args["tool"], args=args.get("args", {}))
+            return svc.record_execution(
+                user(), _project_id(args, "research_run", action),
+                tool=_require(args, "tool", "research_run", action),
+                args=args.get("args", {}),
+            )
         if action == "finish_execution":
-            return svc.finish_execution(user(), args["project_id"], execution_id=args["execution_id"], result=args.get("result"))
+            return svc.finish_execution(
+                user(), _project_id(args, "research_run", action),
+                execution_id=_require(args, "execution_id", "research_run", action),
+                result=args.get("result"),
+            )
         if action == "execute_sandbox_script":
-            return svc.execute_sandbox_script(user(), args["project_id"], script=args["script"])
+            return svc.execute_sandbox_script(
+                user(), _project_id(args, "research_run", action),
+                script=_require(args, "script", "research_run", action),
+            )
         raise ValueError(f"unknown research_run action: {action}")
 
     research_project_tool = _make_tool(
@@ -2124,6 +2484,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "docs/research/07)."
         ),
         parameters=_params(
+            ["create", "resume", "snapshot", "archive"],
             {
                 "name": {"type": "string", "description": "Project display name."},
                 "profile": {
@@ -2145,6 +2506,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "RAG_PENDING, triggering the RAG projection worker."
         ),
         parameters=_params(
+            ["write_scratch", "promote_to_drive", "read", "create_version", "diff"],
             {
                 "generated_by_execution": {
                     "type": "string",
@@ -2167,6 +2529,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "illegal jumps and un-passed gate guards."
         ),
         parameters=_params(
+            ["get_state", "transition_stage", "get_handoff"],
             {"target": {"type": "string", "description": "Requested next stage."}},
             required=[],
         ),
@@ -2181,6 +2544,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "Mutating an upstream node STALE-cascades to its epistemic dependents."
         ),
         parameters=_params(
+            ["record_node", "link_edge", "query_lineage", "mutate_node", "invalidate_downstream"],
             {
                 "node": {
                     "type": "object",
@@ -2212,6 +2576,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "human can resolve (never self-approve)."
         ),
         parameters=_params(
+            ["check", "explain_failure", "request_override", "resolve_override"],
             {
                 "reason": {"type": "string", "description": "Override justification (human review)."},
                 "approval_id": {"type": "string", "description": "Approval id to resolve."},
@@ -2233,6 +2598,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "sandbox script. Sandbox execution is profile-gated; the literature profile blocks it."
         ),
         parameters=_params(
+            ["record_execution", "finish_execution", "execute_sandbox_script"],
             {
                 "tool": {"type": "string", "description": "Tool name being audited."},
                 "args": {"type": "object", "description": "Execution arguments."},

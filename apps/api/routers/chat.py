@@ -191,6 +191,14 @@ async def _maybe_continue_research(
         await _publish_async("run.finished")
         return False
     if service.pending_overrides(user_id, task_id):
+        # A run parked on a gate must explain itself in the task chat first: write the
+        # deterministic review note to the session DB *before* the blocked wake-up is
+        # published, so a monitor refetch observes the note next to the Approve/Reject card.
+        if session_id:
+            try:
+                await service.emit_gate_notes(SessionLocal, user_id, task_id, session_id)
+            except Exception as exc:  # noqa: BLE001 - never fail the parking decision
+                logger.warning("research gate note emission failed: %s", exc)
         await _publish_async("run.blocked")
         return False
 

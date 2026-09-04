@@ -112,6 +112,31 @@ request_override(gate_name, reason) → creates PENDING ResearchApproval; NEVER 
 
 Only the approval resolution path (human) may turn an approved request into `OVERRIDE`.
 
+### 6.1 Review note in the session chat
+
+When a run parks because a gate override is `PENDING` (a human decision is required), the gate
+service writes a **deterministic `system` note** into the run's session chat before the
+`blocked` wake-up is published. The note is assembled from the *mechanical* check results only
+(`§3`): it lists each failed check, its plain-language risk, why the gate cannot advance, and
+the agent's trimmed request reason (≤ 1 KiB, plain text). It is **not** an LLM opinion and it
+never records a gate verdict — assembling it calls the read-only check functions directly and
+never touches `gates`/artifacts/stage/revision (`check_gate`, which writes `PASS`/`FAIL`, is
+never invoked to explain a gate).
+
+The note is display-only. Because its row uses `role = "system"`, it is filtered out of the
+model's next-turn context, session archival/embedding, and RAG import — everywhere a message
+could reach the LLM or the knowledge base only `user`/`assistant` rows are read. One approval
+id yields at most one note (the id is the idempotency key); a human `Reject` followed by a
+fresh agent request creates a new approval id and may produce a new note.
+
+The note is normally written when the run parks (before the `blocked` wake-up). A task that
+parked *before* a note could be written — a pre-feature run, or a park-time DB failure that
+left the marker unconsumed — is caught up lazily: fetching the parked task's detail
+(GET `/tasks/{task_id}`) re-runs the same idempotent emit if any pending override is still
+unnoted, so the note exists in the session DB before the detail (with `pending_overrides`)
+reaches the client. That read-path emit is DB-before-marker and a no-op once every pending
+approval is marked.
+
 ## 7. Failure → stage mapping
 
 | Gate FAIL | Stage returns to |

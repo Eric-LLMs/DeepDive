@@ -10,16 +10,24 @@ Proves the six frozen mechanisms against ``plugins/research/plugin.py``:
 """
 from __future__ import annotations
 
+import json
 import uuid
 from types import SimpleNamespace
 
 import pytest
-
 from agent import Context, PluginManager, SkillRegistry, ToolRuntime
+from agent.engine.context import AgentTurn, bind_turn
 from agent.engine.decisions import ToolExecution
 from core.application.drive_service import DriveError
 from core.infrastructure.request_context import set_request_user
-from plugins.research.plugin import ResearchService, build_research_plugin, register_research_plugins
+
+from plugins.research.plugin import (
+    _GATE_NOTE_KEY,
+    _REASON_LIMIT,
+    ResearchService,
+    compose_gate_review_note,
+    register_research_plugins,
+)
 from tests._drive_fakes import make_drive
 
 USER = uuid.uuid4()
@@ -380,6 +388,154 @@ class TestGateOverride:
         )
         assert result.is_error is True
         assert "already resolved" in result.error.message
+
+
+# ── 6.5 Gate review notes (deterministic chat explanation) ───────────────────
+class TestGateReviewNotes:
+    # The auto ``system`` note a parked gate writes into the task chat: composed purely from
+    # the mechanical check results + a trimmed agent reason, persisted to the session DB
+    # BEFORE its approval id is CAS-marked (never marker-first), and never via check_gate
+    # (which would record a verdict). These tests prove the compose/draft/mark/emit contract.
+    async def _failing_evidence(self, env):
+        """A fresh project with an unverified Source + a PENDING EVIDENCE_GATE override."""
+        pid = (await _create_project(env.runtime, profile="literature"))["project_id"]
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node={"id": "S", "type": "Source", "label": "s",
+                         "verification_status": "unverified"})
+        pending = await _run(env.runtime, "research_gate", action="request_override",
+                             project_id=pid, gate_name="EVIDENCE_GATE",
+                             reason="literature profile has no empirical run")
+        return ResearchService(env.drive, env.scratch), pid, pending["approval_id"]
+
+    def test_compose_includes_gate_label_failed_checks_and_risk(self):
+        note = compose_gate_review_note("EVIDENCE_GATE", [
+            {"name": "sources_verified", "ok": False,
+             "detail": "need >=1 Source with verification_status='verified'"},
+            {"name": "claim_draft_links", "ok": False,
+             "detail": ">=1 draft Claim linked to an Evidence node"},
+        ], reason="no verified corpus yet")
+        assert "Evidence Gate did not pass." in note
+        assert "• sources_verified: every source used as fact must exist" in note
+        assert "Gate detail: need >=1 Source" in note
+        assert "• claim_draft_links:" in note
+        assert "Why it matters:" in note
+        assert "Agent's request: no verified corpus yet" in note
+
+    def test_compose_skips_ok_checks_and_empty_reason(self):
+        # A green check must never appear as a failure bullet.
+        note = compose_gate_review_note("EVIDENCE_GATE", [
+            {"name": "sources_verified", "ok": True, "detail": "fine"},
+            {"name": "no_invalid_upstream", "ok": False, "detail": "broken"},
+        ], reason="   ")
+        assert "sources_verified" not in note  # the ok check is not listed
+        assert "no_invalid_upstream" in note
+        assert "Agent's request" not in note
+
+    def test_compose_reason_trimmed_to_limit(self):
+        note = compose_gate_review_note(
+            "DESIGN_GATE",
+            [{"name": "design_fields", "ok": False, "detail": "missing fields"}],
+            reason="r" * (_REASON_LIMIT + 500),
+        )
+        agent_line = next(ln for ln in note.splitlines() if ln.startswith("Agent's request:"))
+        assert agent_line.endswith("…")
+        assert len(agent_line) <= len("Agent's request: ") + _REASON_LIMIT + 1
+
+    def test_compose_green_checks_still_emits_decision_note(self):
+        note = compose_gate_review_note("QUALITY_GATE", [])
+        assert "(the gate's checks are green here" in note
+        assert "Approve to continue" in note
+
+    async def test_drafts_are_readonly_and_list_failed_checks(self, env):
+        svc, pid, approval_id = await self._failing_evidence(env)
+        task_dir = env.scratch / str(USER) / pid
+        proj_before = (task_dir / "project.json").read_text()
+        appr_before = (task_dir / "approvals.json").read_text()
+
+        drafts = svc.gate_note_drafts(USER, pid)
+
+        assert len(drafts) == 1
+        assert drafts[0]["approval_id"] == approval_id
+        assert "sources_verified" in drafts[0]["text"]  # the unverified source's red check
+        assert "Agent's request: literature profile has no empirical run" in drafts[0]["text"]
+        # Read-only: no gate verdict, no approvals change, no marker write.
+        assert (task_dir / "project.json").read_text() == proj_before
+        assert (task_dir / "approvals.json").read_text() == appr_before
+
+    async def test_mark_is_idempotent_and_notes_are_consumed(self, env):
+        svc, pid, approval_id = await self._failing_evidence(env)
+        task_dir = env.scratch / str(USER) / pid
+
+        svc.mark_gate_notes(USER, pid, [approval_id])
+        project = ResearchService._load_json(task_dir / "project.json", None)
+        assert project[_GATE_NOTE_KEY] == [approval_id]
+
+        # Re-marking the same id is a no-op (still one entry), and drafts go quiet.
+        svc.mark_gate_notes(USER, pid, [approval_id])
+        assert ResearchService._load_json(task_dir / "project.json", None)[_GATE_NOTE_KEY] == [approval_id]
+        assert svc.gate_note_drafts(USER, pid) == []
+
+    async def test_mark_skips_resolved_and_unknown_ids(self, env):
+        svc, pid, approval_id = await self._failing_evidence(env)
+        task_dir = env.scratch / str(USER) / pid
+        svc.resolve_override(USER, approval_id, approve=False)  # REJECTED -> no longer PENDING
+        svc.mark_gate_notes(USER, pid, [approval_id, "does-not-exist"])
+        project = ResearchService._load_json(task_dir / "project.json", None)
+        assert project.get(_GATE_NOTE_KEY, []) == []
+
+    async def test_emit_db_failure_never_consumes_marker(self, env, monkeypatch):
+        svc, pid, _approval_id = await self._failing_evidence(env)
+        marked = []
+
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr("core.infrastructure.memory.insert_plain_message", boom)
+        monkeypatch.setattr(svc, "mark_gate_notes",
+                            lambda *a, **k: marked.append((a, k)))
+
+        written = await svc.emit_gate_notes(None, USER, pid, str(uuid.uuid4()))
+
+        assert written == 0
+        assert marked == []  # DB never committed -> marker untouched -> a retry can succeed later
+        project = ResearchService._load_json(env.scratch / str(USER) / pid / "project.json", None)
+        assert project.get(_GATE_NOTE_KEY, []) == []
+
+    async def test_emit_writes_db_then_marks(self, env, monkeypatch):
+        """DB insert (role system) commits before the id is CAS-marked; written == 1."""
+        svc, pid, approval_id = await self._failing_evidence(env)
+        added = []
+        marked = []
+
+        class _Session:
+            def __init__(self, log):
+                self._log = log
+
+            def add(self, obj):
+                self._log.append(obj)
+
+            async def commit(self):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        def factory():
+            return _Session(added)
+
+        monkeypatch.setattr(svc, "mark_gate_notes",
+                            lambda *a, **k: marked.append((a, k)))
+
+        written = await svc.emit_gate_notes(factory, USER, pid, str(uuid.uuid4()))
+
+        assert written == 1
+        assert len(added) == 1
+        assert added[0].role == "system"
+        assert "sources_verified" in added[0].text
+        assert marked == [( (USER, pid, [approval_id]), {} )]
 
 
 # ── 6. Idempotency + immutable executions ─────────────────────────────────────
@@ -750,3 +906,109 @@ class TestRunMutex:
         )["executions"]
         assert all(e["status"] == "ABORTED" for e in executions)
         svc.end_run(USER, task_id)
+
+
+# ── 7. Worker-turn arg resolution (handoff-bound, no raw KeyError) ───────────
+class TestWorkerArgResolution:
+    # The worker auto-run drives research tools WITHOUT repeating project_id in every call: the
+    # task id is threaded via current_turn().context["handoff"], so an omitted project_id must
+    # resolve to the bound project (not a KeyError), and a missing action argument must surface
+    # a precise, actionable message the model can correct instead of a bare KeyError repr.
+
+    async def _bound(self, pid: str):
+        """Bind a worker-style turn context carrying the research handoff for ``pid``."""
+        bind_turn(
+            AgentTurn(
+                user_msg="probe",
+                context={"handoff": {"kind": "research", "project_id": pid, "mode": "research_resume"}},
+            )
+        )
+
+    async def test_omitted_project_id_resolves_from_bound_handoff(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        await self._bound(pid)
+        try:
+            # Every research tool that targets a project must recover the id from the handoff.
+            await _run(env.runtime, "research_state", action="get_state")
+            await _run(env.runtime, "research_evidence", action="record_node",
+                       node={"id": "S", "type": "Source", "label": "s",
+                             "verification_status": "verified"})
+            await _run(env.runtime, "research_evidence", action="link_edge",
+                       src="S", dst="S", kind="supports")
+            await _run(env.runtime, "research_artifact", action="write_scratch",
+                       artifact_id="m.md", content="# m")
+            # The writes actually landed on the bound project.
+            state = await _run(env.runtime, "research_state", action="get_state")
+            assert state["stage"] == "DISCOVER"
+            node = await _run(env.runtime, "research_evidence", action="query_lineage",
+                              node_id="S")
+            assert node["node"]["label"] == "s"
+        finally:
+            bind_turn(None)
+
+    async def test_missing_action_arg_reports_precise_error(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        await self._bound(pid)
+        try:
+            for action_args, fragment in (
+                ({"action": "link_edge", "src": "S", "dst": "T"},
+                 "research_evidence link_edge is missing required argument 'kind'"),
+                ({"action": "query_lineage"},
+                 "research_evidence query_lineage is missing required argument 'node_id'"),
+                ({"action": "mutate_node", "node_id": "S"},
+                 "research_evidence mutate_node is missing required argument 'patch'"),
+            ):
+                result = await env.runtime.execute(
+                    ToolExecution(call_id=str(uuid.uuid4()), name="research_evidence",
+                                  arguments=action_args)
+                )
+                assert result.is_error is True
+                assert fragment in result.error.message
+                assert not result.error.message.startswith("'")  # never a bare KeyError repr
+        finally:
+            bind_turn(None)
+
+    async def test_missing_project_id_outside_handoff_is_actionable(self, env):
+        # No turn context bound: the id cannot be recovered, so the tool says so plainly.
+        pid = (await _create_project(env.runtime))["project_id"]
+        result = await env.runtime.execute(
+            ToolExecution(call_id=str(uuid.uuid4()), name="research_state",
+                          arguments={"action": "get_state"})
+        )
+        assert result.is_error is True
+        assert "research_state get_state needs a project_id" in result.error.message
+        assert str(pid) not in result.error.message  # never leaks a stale/wrong id
+
+    async def test_record_node_accepts_stringified_node(self, env):
+        # Some providers double-encode an object param into a JSON *string*; the tool must
+        # decode it before the handler runs (the historical record_node freeze root cause).
+        pid = (await _create_project(env.runtime))["project_id"]
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node=json.dumps({"id": "S", "type": "Source", "label": "s"}))
+        node = await _run(env.runtime, "research_evidence", action="query_lineage",
+                          project_id=pid, node_id="S")
+        assert node["node"]["type"] == "Source"
+
+    async def test_record_node_without_id_reports_precise_error(self, env):
+        # A probe node like {type, title} (no id) must not surface a bare ``KeyError: 'id'`` —
+        # the model cannot correct from that repr. The guard names the missing keys.
+        pid = (await _create_project(env.runtime))["project_id"]
+        result = await env.runtime.execute(
+            ToolExecution(
+                call_id=str(uuid.uuid4()), name="research_evidence",
+                arguments={"action": "record_node", "project_id": pid,
+                           "node": {"type": "Source", "title": "probe"}},
+            )
+        )
+        assert result.is_error is True
+        assert "'id' and 'type'" in result.error.message
+        assert not result.error.message.startswith("'")  # never a bare KeyError repr
+        result_str = await env.runtime.execute(
+            ToolExecution(
+                call_id=str(uuid.uuid4()), name="research_evidence",
+                arguments={"action": "record_node", "project_id": pid,
+                           "node": '{"type": "Source", "title": "probe"}'},
+            )
+        )
+        assert result_str.is_error is True
+        assert "'id' and 'type'" in result_str.error.message

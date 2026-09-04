@@ -82,6 +82,10 @@ Mapping onto DeepDive today:
 - On `APPROVED`, the gate row becomes `OVERRIDE` with `override_approval_id`; the failing
   checks remain visible.
 - Overrides are recorded in `decision_log.md` and surfaced in `FINAL_REPORT.md`.
+- While a run is parked on a `PENDING` override, the gate service writes a deterministic
+  `system` review note (failed checks + risks + trimmed agent reason) into the run's session
+  chat before the `blocked` wake-up — see `10` §6.1. The note is display-only: it never feeds
+  the model's context, session archival, or RAG.
 
 ## 6. Approval invariants
 

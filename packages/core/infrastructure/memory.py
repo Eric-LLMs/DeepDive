@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -126,6 +126,25 @@ class SessionMemoryStore:
         return await load_session_messages(self.session_factory, self.session_id)
 
 
+async def insert_plain_message(
+    session_factory, user_id: UUID, session_id: UUID, role: str, text: str
+) -> None:
+    """Insert one chat message row (any role) directly, committing immediately.
+
+    A lightweight twin of :meth:`SessionMemoryStore.append_message` for callers that already
+    hold ``user_id`` / ``session_id`` and have no embedder/llm handy. Used to persist the
+    deterministic ``system`` gate notes; those rows are display-only and are filtered out of
+    model context, session archival, and RAG import everywhere else.
+    """
+    async with session_factory() as session:
+        session.add(
+            MessageModel(
+                user_id=user_id, session_id=session_id, role=role, text=text
+            )
+        )
+        await session.commit()
+
+
 async def finalize_session(session_factory, embedder, llm, session_id: UUID) -> dict:
     """Batch-embed messages + generate a summary for a closed session.
 
@@ -142,8 +161,13 @@ async def finalize_session(session_factory, embedder, llm, session_id: UUID) -> 
             )
         ).scalars().all()
 
+        # Archival covers real conversation only: deterministic ``system`` notes (e.g. gate
+        # review explanations) and ``tool`` rows never enter the embedding corpus or the
+        # summary transcript, so recall/summary cannot leak runtime bookkeeping to the model.
+        convo = [m for m in messages if m.role in ("user", "assistant")]
+
         embedded = 0
-        to_embed = [m for m in messages if m.embedding is None]
+        to_embed = [m for m in convo if m.embedding is None]
         if to_embed:
             embeddings = await embedder.embed([m.text for m in to_embed])
             for message, embedding in zip(to_embed, embeddings):
@@ -151,8 +175,8 @@ async def finalize_session(session_factory, embedder, llm, session_id: UUID) -> 
             embedded = len(to_embed)
 
         summary = None
-        if settings.session_summary_enabled and messages:
-            transcript = "\n".join(f"{m.role}: {m.text}" for m in messages)
+        if settings.session_summary_enabled and convo:
+            transcript = "\n".join(f"{m.role}: {m.text}" for m in convo)
             try:
                 summary = await _summarize_transcript(llm, transcript)
             except Exception:  # noqa: BLE001 - summary is cosmetic; finalize must still finish
@@ -163,7 +187,7 @@ async def finalize_session(session_factory, embedder, llm, session_id: UUID) -> 
             await session.execute(select(SessionModel).where(SessionModel.id == session_id))
         ).scalar_one_or_none()
         if sess is not None:
-            sess.closed_at = datetime.now(timezone.utc)
+            sess.closed_at = datetime.now(UTC)
             sess.summary = summary
             # Auto-title once: a short LLM title from the first user message. Idempotent —
             # later finalizes skip because ``sess.title`` is already set. Cosmetic, so a
@@ -322,12 +346,21 @@ async def compact_history(
 
 
 async def load_session_messages(session_factory, session_id: UUID) -> list[dict]:
-    """Return a session's messages as ``[{"role", "content"}]`` for resume."""
+    """Return a session's *model-facing* messages as ``[{"role", "content"}]``.
+
+    Only ``user``/``assistant`` rows are returned. Deterministic ``system`` notes (gate
+    review explanations) and ``tool`` rows are display bookkeeping — they never enter the
+    prompt context the agent kernel builds from this history. (The client-facing resume view
+    is :func:`load_session_detail`, which keeps every row so ``system`` notes still render.)
+    """
     async with session_factory() as session:
         rows = (
             await session.execute(
                 select(MessageModel)
-                .where(MessageModel.session_id == session_id)
+                .where(
+                    MessageModel.session_id == session_id,
+                    MessageModel.role.in_(("user", "assistant")),
+                )
                 .order_by(MessageModel.created_at)
             )
         ).scalars().all()

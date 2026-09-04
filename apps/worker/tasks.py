@@ -900,10 +900,15 @@ async def chat_session_import(ctx, job_id: str, payload: dict) -> dict:
 
         cfg = await load_config(ctx["session_factory"])
         async with ctx["session_factory"]() as session:
+            # Conversation only: deterministic ``system`` notes (gate review explanations)
+            # never enter RAG — the segmenter pairs real user/assistant turns exclusively.
             messages = (
                 await session.execute(
                     select(MessageModel)
-                    .where(MessageModel.session_id == session_id)
+                    .where(
+                        MessageModel.session_id == session_id,
+                        MessageModel.role.in_(("user", "assistant")),
+                    )
                     .order_by(MessageModel.created_at)
                 )
             ).scalars().all()
@@ -1194,6 +1199,13 @@ async def _settle_research_outcome(
             await service.append_session_turn(
                 owner_id, session_id, "assistant", outcome.final_answer
             )
+
+    # A run parked on a gate (pending human override) must show the deterministic review note
+    # in the task chat BEFORE any blocked wake-up is published, so the desktop refetch that
+    # renders the Approve/Reject card also sees the note (DB write precedes the marker).
+    if session_id and service.pending_overrides(owner_id, task_id):
+        with contextlib.suppress(Exception):
+            await service.emit_gate_notes(ctx["session_factory"], owner_id, task_id, session_id)
 
     model, base_url, api_key = channel
     if outcome.action == "continue":

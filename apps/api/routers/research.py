@@ -6,7 +6,10 @@ folder (``materials/`` / ``outputs/`` / ``task_spec.json`` / ``session_history.j
 copies the selected cloud-drive materials atomically in that single request. The console is
 read-only for everything else: stage transitions, gate overrides, scratch writes, and new
 artifact versions are driven *only* by the agent through the six research tools under the
-``deep_research`` skill.
+``deep_research`` skill. (One narrow exception: GET ``/tasks/{task_id}`` lazily materializes the
+deterministic gate ``system`` note for a parked task the moment it is viewed, so a task that
+parked before its note was written catches up — idempotent, DB-before-marker; see
+``_ensure_gate_note``.)
 
 Tenancy: every path derives from ``user.user_id`` (a client-supplied owner is never
 trusted). Task/asset ids are resolved by :class:`ResearchService` against the owner's
@@ -60,6 +63,39 @@ def _http_error(exc: Exception) -> HTTPException:
 
 def _not_found(exc: ValueError) -> HTTPException:
     return HTTPException(status_code=404, detail=str(exc))
+
+
+# Serializes concurrent detail reads that each try to materialize the same gate note. The API
+# gateway runs a single process, so a module-level lock per task is enough; the worker emits at
+# park time under its own flow. The lock only guards the write window (draft→insert→mark), so a
+# second concurrent read sees the marker already consumed and drafts nothing.
+_gate_note_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _ensure_gate_note(
+    service: ResearchService, user_id: uuid.UUID, task_id: str, detail: dict
+) -> None:
+    """Best-effort: materialize the gate review note for a parked task when it is *viewed*.
+
+    A run parks once (its ``blocked`` wake-up emits the note at park time), but a task that
+    parked before this capability shipped — or one whose park-time DB insert transiently failed —
+    has no note in its session yet. Reading its detail is the reliable moment to close that gap:
+    by the time the detail (with ``pending_overrides``) reaches the client, every pending
+    approval's ``system`` note is already committed to the session DB. Emit is idempotent
+    (approval-id marker), DB-before-marker, and a no-op once all notes exist, so repeated reads
+    never rewrite anything. A failure here never breaks the read — the next read retries.
+    """
+    if not detail.get("pending_overrides"):
+        return
+    session_id = detail.get("session_id")
+    if not session_id:
+        return
+    lock = _gate_note_locks.setdefault(task_id, asyncio.Lock())
+    async with lock:
+        try:
+            await service.emit_gate_notes(SessionLocal, user_id, task_id, session_id)
+        except Exception:
+            logger.exception("research: gate note ensure-on-read failed for %s", task_id)
 
 
 async def _make_task_session(user_id: uuid.UUID, title: str) -> str | None:
@@ -117,7 +153,12 @@ async def get_task(
     drive: DriveService = Depends(get_drive_service),
 ):
     try:
-        return await _service(drive).get_task_status(user.user_id, task_id)
+        service = _service(drive)
+        detail = await service.get_task_status(user.user_id, task_id)
+        # A parked task whose note was never written (parked pre-feature, or a park-time DB
+        # failure) is caught up the moment it is viewed — see ``_ensure_gate_note``.
+        await _ensure_gate_note(service, user.user_id, task_id, detail)
+        return detail
     except ValueError as exc:
         raise _not_found(exc)
 

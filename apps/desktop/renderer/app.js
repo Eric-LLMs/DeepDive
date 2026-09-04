@@ -2094,6 +2094,30 @@
     return true;
   }
 
+  // Reload the on-screen research session from the DB so the deterministic gate ``system`` notes
+  // that the backend committed (before this detail was served) actually render in the live chat.
+  // Rebuild only when the on-screen chat is *missing* a note for a still-pending override — i.e.
+  // the chat was built before a run parked, or before a note commit caught up. Gate notes are
+  // recognized by their deterministic head ("Review needed — …"); once every pending override has
+  // its note on screen, further status refreshes are no-ops, so the live monitor never reload-loops,
+  // and a Reject → new approval (new id, new note) reloads again because the count comes up short.
+  window.researchReloadGateNotes = async (ctx) => {
+    if (!chatLog) return false;
+    const active = state.activeResearch;
+    const onScreen = !!(
+      active && active.task_id === ctx.task_id && ctx.session_id && state.sessionId === ctx.session_id
+    );
+    if (!onScreen) return false;
+    const pending = (ctx.pending_overrides || []).filter((o) => o.approval_id);
+    if (!pending.length) return false;
+    const visible = [...chatLog.querySelectorAll(".msg.system")].filter(
+      (n) => (n.textContent || "").trimStart().startsWith("Review needed")
+    ).length;
+    if (visible >= pending.length) return false; // every pending override's note is on screen
+    await resumeSession(ctx.session_id); // rebuild from DB: notes + last messages appear
+    return true;
+  };
+
   window.showResearchGateCard = (ctx) => {
     if (!chatLog) return;
     const active = state.activeResearch;
@@ -5017,6 +5041,12 @@
       chatLog.innerHTML = "";
       for (const m of data.messages) {
         if (m.role === "tool") continue;
+        if (m.role === "system") {
+          // Deterministic gate review notes: display-only, rendered as plain text (never
+          // markdown/HTML-parsed), so runtime bookkeeping never looks like model output.
+          appendMsg("system", m.content);
+          continue;
+        }
         appendMessage(m.id, m.role === "assistant" ? "assistant" : "user", m.content, m.attach);
       }
       chatTitle.textContent = data.title || (data.messages[0] ? data.messages[0].content.slice(0, 30) : "Chat");
