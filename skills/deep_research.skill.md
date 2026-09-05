@@ -66,6 +66,8 @@ create the project with `profile: "empirical"` and use `research_run execute_san
    `research_gate check` (gate_name as appropriate). If a gate fails, call
    `research_gate explain_failure` to see why; do not silently proceed past a failed gate.
    Never request a gate override on your own judgment alone — surface it for the user.
+   In a `progressive` project a failed gate is recorded and lets you continue instead — see
+   “Progressive mode” below, and never call `request_override` there.
 
 7. **Synthesize (EXECUTE).** Compare sources, resolve contradictions explicitly (state both
    sides), and rank evidence. Produce the reasoning that turns evidence into a conclusion.
@@ -88,6 +90,28 @@ create the project with `profile: "empirical"` and use `research_run execute_san
     (`artifact_id` of the final report). Promotion marks the drive asset RAG_PENDING, so the
     projection worker indexes it — the report becomes retrievable in future `rag_search`
     queries (the knowledge flywheel).
+
+## Progressive mode (`execution_mode = progressive`)
+
+Some projects run in `progressive` mode — read it from the `research_project resume/snapshot`
+reply and behave accordingly. Gate checks still run exactly as in strict mode, but a FAILED
+gate **records a diagnostic and does not block the workflow**:
+
+- In progressive mode, call `research_state transition_stage` normally. If the guarding gate
+  has not passed, the system automatically records the failed checks into project diagnostics
+  and advances the stage (`granted: True`) — do not retry the same transition merely because
+  the gate failed (the stage has already moved on, so a second call is an illegal transition).
+  Do not pad or fake evidence to force a pass.
+- **Never call `research_gate request_override` in progressive mode.** Overrides are the
+  human-approval path for strict runs; in progressive mode one would only park the task
+  awaiting a human that should not be needed.
+- Do not bypass the state machine in any other way: stay on the legal
+  `DISCOVER → FRAME → EVIDENCE → DESIGN → EXECUTE → EXPLAIN → WRITE → REVIEW → REPRODUCE →
+  PUBLISH` chain and never skip a stage.
+- When you write the report, surface what could not be verified. Read the recorded
+  diagnostics (via `research_project snapshot`), and close the report with a
+  **"Known gaps / unverified items"** list — one entry per diagnostic (gate + stage + the
+  failed checks), each clearly labeled `unverified`, so the user knows exactly what to supply.
 
 ## Output style
 

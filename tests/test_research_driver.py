@@ -49,22 +49,28 @@ def service(tmp_path) -> ResearchService:
     return ResearchService(drive=None, scratch_root=tmp_path / "scratch")
 
 
-def _create_project(service: ResearchService, task_id: str, *, stage: str = "FRAME") -> None:
+def _create_project(
+    service: ResearchService,
+    task_id: str,
+    *,
+    stage: str = "FRAME",
+    mode: str | None = None,
+) -> None:
     pdir = service._project_dir(OWNER, task_id)
     pdir.mkdir(parents=True, exist_ok=True)
-    service._save_json(
-        pdir / "project.json",
-        {
-            "id": task_id,
-            "owner_id": str(OWNER),
-            "name": "driver-test",
-            "profile": "research",
-            "stage": stage,
-            "gates": {},
-            "project_revision": 0,
-            "updated_at": _iso(0),
-        },
-    )
+    project = {
+        "id": task_id,
+        "owner_id": str(OWNER),
+        "name": "driver-test",
+        "profile": "research",
+        "stage": stage,
+        "gates": {},
+        "project_revision": 0,
+        "updated_at": _iso(0),
+    }
+    if mode is not None:
+        project["execution_mode"] = mode
+    service._save_json(pdir / "project.json", project)
     service._save_json(pdir / "approvals.json", {"approvals": []})
     service._save_json(pdir / "executions.json", {"executions": []})
     service._save_json(pdir / "graph.json", {"nodes": [], "edges": []})
@@ -503,6 +509,69 @@ async def test_auto_turn_transient_exhausted_becomes_error(service, monkeypatch)
     assert len(calls) == 2
     assert "exhausted" in outcome.reason
     assert "active_run" not in service.read_project(OWNER, "xerr")   # slot released
+
+
+async def test_auto_turn_progressive_advances_past_unpassed_gate(service):
+    # Progressive run hits the DESIGN_GATE-guarded DESIGN -> EXECUTE step with the gate
+    # un-passed. run_turn advances (granted, diagnosed) instead of parking on a human
+    # approval, and the driver keeps the chain alive to a clean FINISHED.
+    _create_project(service, "progchain", stage="DESIGN", mode="progressive")
+    calls = []
+    step: dict = {}
+
+    async def run_turn(prompt: str) -> RunTurnResult:
+        calls.append(prompt)
+        step["transition"] = service.transition_stage(OWNER, "progchain", target="EXECUTE")
+        _set_stage(service, "progchain", "PUBLISH")   # reach the finish line in the same turn
+        return RunTurnResult(final_answer="advanced past gate", cost_usd=0.2)
+
+    outcome, _ = await _drive(service, "progchain", run_turn)
+    tr = step["transition"]
+    assert tr["granted"] is True
+    assert tr["stage"] == "EXECUTE"
+    assert tr["gate"] == "DESIGN_GATE"
+    assert tr["diagnosed"]                             # the un-passed check is surfaced
+    assert outcome.action == "finished"
+    assert outcome.state == RunState.FINISHED
+    project = service.read_project(OWNER, "progchain")
+    assert "active_run" not in project                 # slot released — nothing parked on a human
+    diags = project["diagnostics"]
+    assert len(diags) == 1
+    assert diags[0]["gate"] == "DESIGN_GATE"
+    assert diags[0]["stage"] == "DESIGN"
+    assert diags[0]["target"] == "EXECUTE"
+    assert diags[0]["failed_checks"] == tr["diagnosed"]
+    # The progressive advance never forges the gate's own state to PASS/OVERRIDE.
+    assert project["gates"].get("DESIGN_GATE") not in ("PASS", "OVERRIDE")
+    assert len(calls) == 1
+
+
+async def test_auto_turn_strict_blocks_and_parks_on_human(service):
+    # Strict (the default): the same guarded step hard-blocks, and the run_turn requesting a
+    # human override parks the run on the approval — the driver stops, not the model.
+    _create_project(service, "strictgate", stage="DESIGN")  # no execution_mode key → strict
+    calls = []
+    step: dict = {}
+
+    async def run_turn(prompt: str) -> RunTurnResult:
+        calls.append(prompt)
+        step["transition"] = service.transition_stage(OWNER, "strictgate", target="EXECUTE")
+        service.request_override(
+            OWNER, "strictgate", gate_name="DESIGN_GATE", reason="human-in-the-loop call"
+        )
+        return RunTurnResult(final_answer="need human", cost_usd=0.1)
+
+    outcome, _ = await _drive(service, "strictgate", run_turn)
+    assert step["transition"]["granted"] is False       # strict hard-block, stage unchanged
+    assert step["transition"]["stage"] == "DESIGN"
+    assert outcome.state == RunState.BLOCKED
+    assert "awaiting a human" in outcome.reason
+    project = service.read_project(OWNER, "strictgate")
+    assert "active_run" not in project
+    assert project["last_block"]["kind"] == "blocked"
+    assert project["stage"] == "DESIGN"
+    assert not project.get("diagnostics")              # strict records no diagnostic
+    assert len(calls) == 1
 
 
 def test_settings_driver_defaults_present():

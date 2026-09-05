@@ -559,8 +559,13 @@ class ResearchService:
         *,
         name: str,
         profile: str,
+        execution_mode: str = "strict",
         idempotency_key: str | None = None,
     ) -> dict:
+        if execution_mode not in ("strict", "progressive"):
+            raise ValueError(
+                f"unknown execution_mode {execution_mode!r} (expected 'strict' | 'progressive')"
+            )
         if idempotency_key:
             existing = self._find_by_idempotency(owner_id, "project", idempotency_key)
             if existing is not None:
@@ -571,6 +576,7 @@ class ResearchService:
                     "stage": existing["stage"],
                     "status": existing["status"],
                     "profile": existing["profile"],
+                    "execution_mode": existing.get("execution_mode", "strict"),
                     "idempotent": True,
                 }
         project = {
@@ -578,6 +584,7 @@ class ResearchService:
             "owner_id": str(owner_id),
             "name": name,
             "profile": profile,
+            "execution_mode": execution_mode,
             "status": "ACTIVE",
             "stage": "DISCOVER",
             "gates": {gate: "NOT_RUN" for gate in _GATES},
@@ -597,6 +604,7 @@ class ResearchService:
             "stage": "DISCOVER",
             "status": "ACTIVE",
             "profile": profile,
+            "execution_mode": execution_mode,
             "idempotent": False,
         }
 
@@ -631,6 +639,7 @@ class ResearchService:
             "status": project["status"],
             "stage": project["stage"],
             "profile": project["profile"],
+            "execution_mode": project.get("execution_mode", "strict"),
             "gates": project["gates"],
             "updated_at": project["updated_at"],
         }
@@ -643,6 +652,7 @@ class ResearchService:
             "snapshot_at": _now_iso(),
             "stage": project["stage"],
             "gates": project["gates"],
+            "execution_mode": project.get("execution_mode", "strict"),
             "node_count": len(graph["nodes"]),
             "edge_count": len(graph["edges"]),
         }
@@ -1436,12 +1446,46 @@ class ResearchService:
             }
         gate = _GATE_BEFORE.get(target)
         if gate and project["gates"].get(gate) not in ("PASS", "OVERRIDE"):
+            # Strict (the default): an un-passed guard blocks the transition — unchanged.
+            if project.get("execution_mode", "strict") != "progressive":
+                return {
+                    "requested": target,
+                    "granted": False,
+                    "stage": current,
+                    "reason": f"transition {current} -> {target} guarded by {gate}: "
+                    f"not passed (current {project['gates'].get(gate)})",
+                }
+
+            # Progressive: the SAME deterministic checks still run (read-only, never writes a
+            # verdict) and the gate's own state is never forged to PASS — only the blocking
+            # consequence of a FAIL is lifted, by recording the failure into
+            # ``project["diagnostics"]`` and advancing the stage in the SAME atomic commit.
+            # No de-dup machinery is needed: ``_LEGAL_NEXT`` is a strictly forward chain with
+            # no backtracking, so each guarded target (EXECUTE/EXPLAIN/REVIEW/REPRODUCE) can
+            # be transitioned into at most once per run — a (gate, stage) diagnostic is
+            # structurally unique.
+            checks = self._gate_checks_readonly(owner_id, project_id, gate)
+            failed = [c for c in checks if not c.get("ok")]
+
+            def mutate(project: dict) -> None:
+                project["stage"] = target
+                project.setdefault("diagnostics", []).append(
+                    {
+                        "gate": gate,
+                        "stage": current,
+                        "target": target,
+                        "failed_checks": failed,
+                        "timestamp": _now_iso(),
+                    }
+                )
+
+            project = self.atomic_update_project(owner_id, project_id, mutate)
             return {
                 "requested": target,
-                "granted": False,
-                "stage": current,
-                "reason": f"transition {current} -> {target} guarded by {gate}: "
-                f"not passed (current {project['gates'].get(gate)})",
+                "granted": True,
+                "stage": project["stage"],
+                "gate": gate,
+                "diagnosed": failed,
             }
 
         def mutate(project: dict) -> None:
@@ -2330,6 +2374,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 user(),
                 name=args["name"],
                 profile=args.get("profile", "literature"),
+                execution_mode=args.get("execution_mode", "strict"),
                 idempotency_key=args.get("idempotency_key"),
             )
         if action in ("resume", "snapshot", "archive"):
@@ -2490,6 +2535,13 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 "profile": {
                     "type": "string",
                     "description": "Research profile (Method x Output), e.g. literature.",
+                },
+                "execution_mode": {
+                    "type": "string",
+                    "description": "Execution control-flow mode: 'strict' (default) or "
+                    "'progressive'. Orthogonal to profile. progressive records gate-FAIL "
+                    "diagnostics into project['diagnostics'] and lets the stage advance; "
+                    "strict blocks on a failed gate as today.",
                 },
             },
             required=[],

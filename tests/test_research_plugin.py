@@ -1012,3 +1012,147 @@ class TestWorkerArgResolution:
         )
         assert result_str.is_error is True
         assert "'id' and 'type'" in result_str.error.message
+
+
+# ── execution_mode: strict (regression) / progressive (record + advance) ─────
+# Guarded transition edges (target -> (guarding gate, legal predecessor stage)). Every guarded
+# target is entered at most once per run because ``_LEGAL_NEXT`` is a strictly forward chain —
+# so a (gate, stage) diagnostic is structurally unique and needs no de-dup logic.
+_GUARDED = {
+    "EXECUTE": ("DESIGN_GATE", "DESIGN"),
+    "EXPLAIN": ("EVIDENCE_GATE", "EXECUTE"),
+    "REVIEW": ("CLAIM_GATE", "WRITE"),
+    "REPRODUCE": ("QUALITY_GATE", "REVIEW"),
+}
+
+
+class TestExecutionMode:
+    @staticmethod
+    def _svc(env) -> ResearchService:
+        return ResearchService(drive=env.drive, scratch_root=env.scratch)
+
+    @staticmethod
+    def _project(env, pid: str) -> dict:
+        return ResearchService._load_json(env.scratch / str(USER) / pid / "project.json", None)
+
+    @staticmethod
+    def _fast_stage(env, pid: str, stage: str) -> None:
+        """Directly set the on-disk stage (skips the guards under test)."""
+        TestExecutionMode._svc(env).atomic_update_project(
+            USER, pid, lambda p: p.update(stage=stage)
+        )
+
+    async def test_create_defaults_strict_and_persists_mode(self, env):
+        strict_pid = (await _create_project(env.runtime))["project_id"]
+        prog_pid = (await _create_project(env.runtime, execution_mode="progressive"))["project_id"]
+        assert self._project(env, strict_pid)["execution_mode"] == "strict"
+        assert self._project(env, prog_pid)["execution_mode"] == "progressive"
+        assert self._svc(env).resume_project(USER, prog_pid)["execution_mode"] == "progressive"
+
+        # A legacy project persisted before this feature (no key) must behave as strict.
+        legacy = self._project(env, strict_pid)
+        del legacy["execution_mode"]
+        svc = self._svc(env)
+        svc._save_json(svc._project_dir(USER, strict_pid) / "project.json", legacy)
+        assert svc.resume_project(USER, strict_pid)["execution_mode"] == "strict"
+
+    async def test_create_rejects_unknown_execution_mode(self, env):
+        result = await env.runtime.execute(
+            ToolExecution(
+                call_id=str(uuid.uuid4()), name="research_project",
+                arguments={"action": "create", "name": "x", "execution_mode": "turbo"},
+            )
+        )
+        assert result.is_error is True
+        assert "execution_mode" in result.error.message
+
+    async def test_strict_blocks_every_unpassed_guard_without_diagnostics(self, env):
+        # Regression: the default (and any project without a mode) still hard-blocks all four
+        # guarded transitions when the guard is not PASS/OVERRIDE, and records nothing.
+        for target, (_gate, before) in _GUARDED.items():
+            pid = (await _create_project(env.runtime))["project_id"]  # strict default
+            self._fast_stage(env, pid, before)
+            res = await _run(env.runtime, "research_state", action="transition_stage",
+                             project_id=pid, target=target)
+            assert res["granted"] is False, target
+            project = self._project(env, pid)
+            assert project["stage"] == before
+            assert "diagnostics" not in project
+
+    async def test_progressive_records_and_advances_every_guard(self, env):
+        # Progressive does NOT weaken the checks: each guard still runs its real deterministic
+        # checks (all genuinely FAIL on an empty/immature project), records the failed checks,
+        # and — only then — lets the stage advance. The gate's own state is never forged to
+        # PASS (it stays exactly what it was before the transition).
+        for target, (gate, before) in _GUARDED.items():
+            pid = (await _create_project(env.runtime, execution_mode="progressive"))["project_id"]
+            self._fast_stage(env, pid, before)
+            gates_before = self._project(env, pid)["gates"].get(gate)
+            res = await _run(env.runtime, "research_state", action="transition_stage",
+                             project_id=pid, target=target)
+            assert res["granted"] is True, f"{target}: {res}"
+            assert res["gate"] == gate
+            project = self._project(env, pid)
+            assert project["stage"] == target
+            diags = project["diagnostics"]
+            assert len(diags) == 1, (target, diags)
+            d = diags[0]
+            assert d["gate"] == gate and d["stage"] == before and d["target"] == target
+            assert isinstance(d["timestamp"], str) and d["failed_checks"]
+            # Real gate check functions ran: rows keep the gate's own {name, ok, detail} shape.
+            assert all({"name", "ok", "detail"} <= set(c) for c in d["failed_checks"])
+            assert all(c["ok"] is False for c in d["failed_checks"])
+            # Gate verdict is unchanged — diagnostics never forge a PASS.
+            assert project["gates"].get(gate) == gates_before
+
+    async def test_progressive_passed_gate_not_recorded_failed_one_is(self, env):
+        # A gate that genuinely PASSES must not be recorded; a later FAILING one is.
+        pid = (await _create_project(env.runtime, execution_mode="progressive"))["project_id"]
+        await _walk_to(env.runtime, pid, "EXECUTE")  # DESIGN_GATE genuinely passes here
+        # An unverified Source makes EVIDENCE_GATE FAIL deterministically.
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node={"id": "S", "type": "Source", "label": "s",
+                         "verification_status": "unverified"})
+        failed = await _run(env.runtime, "research_gate", action="check",
+                            project_id=pid, gate_name="EVIDENCE_GATE")
+        assert failed["status"] == "FAIL"
+        gates_before = self._project(env, pid)["gates"]["EVIDENCE_GATE"]
+        res = await _run(env.runtime, "research_state", action="transition_stage",
+                         project_id=pid, target="EXPLAIN")
+        assert res["granted"] is True
+        project = self._project(env, pid)
+        recorded = [d["gate"] for d in project["diagnostics"]]
+        assert "EVIDENCE_GATE" in recorded and "DESIGN_GATE" not in recorded
+        assert project["gates"]["EVIDENCE_GATE"] == gates_before
+
+    async def test_progressive_still_enforces_state_machine_hard_constraints(self, env):
+        pid = (await _create_project(env.runtime, execution_mode="progressive"))["project_id"]
+        unknown = await _run(env.runtime, "research_state", action="transition_stage",
+                             project_id=pid, target="NOPE")
+        assert unknown["granted"] is False and "unknown" in unknown["reason"]
+        skip = await _run(env.runtime, "research_state", action="transition_stage",
+                          project_id=pid, target="WRITE")  # DISCOVER -> WRITE is illegal
+        assert skip["granted"] is False and "illegal" in skip["reason"]
+        assert "diagnostics" not in self._project(env, pid)
+
+    async def test_progressive_guarded_target_recorded_at_most_once(self, env):
+        # A guarded target cannot be entered twice: after the diagnostic the stage has moved
+        # on, so re-targeting it is an illegal transition — one entry, structurally unique.
+        # (No revision arithmetic here: the tool's monitor wrapper adds an advisory
+        # publish_change bump after any mutating action, so deltas are not a clean proxy.)
+        pid = (await _create_project(env.runtime, execution_mode="progressive"))["project_id"]
+        self._fast_stage(env, pid, "DESIGN")
+        first = await _run(env.runtime, "research_state", action="transition_stage",
+                           project_id=pid, target="EXECUTE")
+        assert first["granted"] is True
+        second = await _run(env.runtime, "research_state", action="transition_stage",
+                            project_id=pid, target="EXECUTE")
+        assert second["granted"] is False
+        project = self._project(env, pid)
+        assert project["stage"] == "EXECUTE"
+        diags = project["diagnostics"]
+        # Re-targeting a now-entered target appends nothing — the entry is unique.
+        assert len(diags) == 1
+        assert diags[0]["gate"] == "DESIGN_GATE"
+        assert diags[0]["stage"] == "DESIGN"
+        assert diags[0]["target"] == "EXECUTE"
