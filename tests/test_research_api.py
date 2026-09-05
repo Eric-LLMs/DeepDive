@@ -24,9 +24,11 @@ import pytest
 from api.auth import AuthUser, require_user
 from api.deps import get_drive_service
 from api.routers import research as research_module
+from api.routers.research import research_validation_handler
 from api.routers.research import router as research_router
 from core.infrastructure.db import UserRoleModel
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 
 from plugins.research.plugin import ResearchService
@@ -58,6 +60,8 @@ def _make_client(drive, scratch, *, authed: bool = True):
     """A minimal app with only the research router; deps overridden by fakes."""
     app = FastAPI()
     app.include_router(research_router)
+    # Mirrors the real app: an unknown execution_mode reads as 400, all else stays stock 422.
+    app.add_exception_handler(RequestValidationError, research_validation_handler)
     app.dependency_overrides[get_drive_service] = lambda: drive
     if authed:
         app.dependency_overrides[require_user] = lambda: _auth(USER)
@@ -71,6 +75,7 @@ def _make_client(drive, scratch, *, authed: bool = True):
 def _make_bob_client(drive_b, scratch):
     app = FastAPI()
     app.include_router(research_router)
+    app.add_exception_handler(RequestValidationError, research_validation_handler)
     app.dependency_overrides[get_drive_service] = lambda: drive_b
     app.dependency_overrides[require_user] = lambda: _auth(USER_B)
     research_module.settings = SimpleNamespace(research_scratch_dir=scratch)
@@ -250,11 +255,23 @@ class TestCreateTaskExecutionMode:
         svc = ResearchService(env.drive, env.scratch)
         assert svc.resume_project(USER, task_id)["execution_mode"] == "progressive"
 
-    def test_create_rejects_unknown_execution_mode(self, env):
+    def test_create_rejects_unknown_execution_mode_with_400(self, env):
+        # A bad mode is a malformed request (400), not Pydantic's default 422, and must never
+        # reach the service: no task folder / project.json is created behind it.
         client = _make_client(env.drive, env.scratch)
         res = client.post("/research/tasks", json={"title": "x", "execution_mode": "turbo"})
-        assert res.status_code == 422  # schema-level Literal, before any service write
+        assert res.status_code == 400
+        assert res.json()["detail"] == "execution_mode must be 'strict' or 'progressive'"
         assert client.get("/research/tasks").json()["tasks"] == []
+        # Nothing on disk either — the owner scratch root itself was never created.
+        assert not (env.scratch / str(USER)).exists()
+
+    def test_other_body_validation_errors_stay_422(self, env):
+        # The scoped 400 handler must not change any other request error: missing/empty title
+        # still reads as Pydantic's stock 422 (regression guard for the shared handler).
+        client = _make_client(env.drive, env.scratch)
+        assert client.post("/research/tasks", json={"title": ""}).status_code == 422
+        assert client.post("/research/tasks", json={}).status_code == 422
 
 
 # ── 3. Path traversal (404/400, never an escape) ────────────────────────────

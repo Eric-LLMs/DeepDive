@@ -34,6 +34,9 @@ from core.config import settings
 from core.infrastructure.db import SessionLocal
 from core.infrastructure.memory import create_session
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -43,6 +46,27 @@ from plugins.research.plugin import ResearchService
 router = APIRouter(prefix="/research", tags=["research"])
 
 logger = logging.getLogger(__name__)
+
+
+async def research_validation_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Scoped validation handler: an unknown ``execution_mode`` is HTTP 400, all else 422.
+
+    ``TaskCreateRequest.execution_mode`` is a ``Literal["strict", "progressive"]`` so Pydantic
+    already rejects ``"turbo"`` before the route runs — but its default status is 422, while the
+    client contract treats a bad mode as a malformed request (400). Every *other* body error
+    (missing/empty title, etc.) is delegated to FastAPI's stock ``request_validation_exception_handler``
+    so existing 422 behavior is unchanged app-wide.
+    """
+    for err in exc.errors():
+        loc = err.get("loc") or ()
+        if len(loc) >= 2 and loc[0] == "body" and loc[-1] == "execution_mode":
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "execution_mode must be 'strict' or 'progressive'"},
+            )
+    return await request_validation_exception_handler(request, exc)
 
 
 def _service(drive: DriveService) -> ResearchService:

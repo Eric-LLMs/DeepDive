@@ -21,6 +21,7 @@ from api.routers.drive import users as drive_users_router
 from api.routers.drive import workspaces as drive_workspaces_router
 from api.routers.jobs import router as jobs_router
 from api.routers.rag_admin import router as rag_admin_router
+from api.routers.research import research_validation_handler
 from api.routers.research import router as research_router
 from api.routers.sessions import router as sessions_router
 from api.routers.vocab import router as vocab_router
@@ -33,6 +34,7 @@ from core.infrastructure.db import SessionLocal, init_db
 from core.infrastructure.security import ensure_admin_user, ensure_default_admin
 from core.logger import configure_logging, reset_log_context, set_log_context
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -106,6 +108,12 @@ async def _vocab_error_handler(request: Request, exc: VocabError):
 async def _drive_error_handler(request: Request, exc: DriveError):
     """Map cloud-drive domain errors (403/404/409/etc.) to JSON responses."""
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
+# Research ``execution_mode`` is a Literal that must read as a malformed request (400) rather
+# than Pydantic's default 422; the handler delegates every non-execution_mode body error to the
+# stock 422 response, so nothing else changes.
+app.add_exception_handler(RequestValidationError, research_validation_handler)
 
 
 app.add_middleware(
