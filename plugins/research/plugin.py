@@ -1358,23 +1358,23 @@ class ResearchService:
     async def delete_task(self, owner_id: uuid.UUID, task_id: str) -> dict:
         """Delete a research task: 409-guarded, cloud folder soft-deleted, scratch removed.
 
-        Two P0 guards block deletion: a task with a RUNNING execution (mutex with the agent)
-        and a report the knowledge base already indexed (remove it from RAG first). The
-        request is recorded in ``project.json`` *before* teardown so a crash mid-delete is
-        auditable. The cloud folder goes to Trash (soft delete); restoring it does NOT
-        resurrect the task — scratch is hard-deleted, so the task state is gone.
+        Two P0 guards block deletion: a live agent run (the ``active_run`` slot — the mutex
+        over the agent) and a report the knowledge base already indexed (remove it from RAG
+        first). The request is recorded in ``project.json`` *before* teardown so a crash
+        mid-delete is auditable. The cloud folder goes to Trash (soft delete); restoring it
+        does NOT resurrect the task — scratch is hard-deleted, so the task state is gone.
         """
         project = self._load_project(owner_id, task_id)  # 404 if missing / traversal
 
-        # P0: never delete while the agent is mid-execution. Both the higher-level server-owned
-        # run slot (``active_run``) and any per-tool RUNNING execution block deletion; the slot
-        # is the authority for a live server-side run even when no execution record is mid-flight.
+        # P0: never delete while the agent is mid-execution. The server-owned run slot
+        # (``active_run``) is the live mutex; a run holds it from ``begin_run`` until the
+        # turn fully ends (``end_run``), so it alone distinguishes a live run from a dead
+        # one. Per-tool RUNNING execution rows are NOT an independent signal: they can be
+        # left behind when a run stops mid-step (the slot is released but the interrupted
+        # tool call was never finalized), and blocking on them makes such a task impossible
+        # to delete even though nothing is running. Those orphans are wiped by the teardown
+        # below, so only a live slot blocks.
         if project.get("active_run") and project["active_run"].get("status") == "RUNNING":
-            raise ValueError("Research task is currently running")
-        executions = self._load_json(
-            self._project_dir(owner_id, task_id) / "executions.json", {"executions": []}
-        )
-        if any(e.get("status") == "RUNNING" for e in executions["executions"]):
             raise ValueError("Research task is currently running")
 
         # P0: never delete a report the knowledge base already indexed. Check both the scratch

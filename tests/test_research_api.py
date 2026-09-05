@@ -374,16 +374,26 @@ class TestDeleteTask:
         assert client.delete(f"/research/tasks/{task_id}").status_code == 200
         assert svc.task_id_for_session(USER, session) is None
 
-    async def test_delete_running_task_is_409(self, env):
+    async def test_delete_released_run_with_orphan_execution_is_200(self, env):
+        # Regression: a run that stopped mid-step releases its slot (end_run) but can leave the
+        # interrupted tool call marked RUNNING in executions.json. With no live slot that row is
+        # an orphan, not a live run — the delete must succeed. Before the fix, delete guarded on
+        # ANY RUNNING execution row, so such a task 409'd forever ("currently running") even
+        # though nothing was running.
         client = _make_client(env.drive, env.scratch)
-        task_id = client.post("/research/tasks", json={"title": "busy"}).json()["task_id"]
+        task_id = client.post("/research/tasks", json={"title": "orphan"}).json()["task_id"]
         svc = ResearchService(env.drive, env.scratch)
-        svc.record_execution(USER, task_id, tool="research_run.execute_sandbox_script", args={})
+        svc.begin_run(USER, task_id, session_id="sess-1")
+        execution = svc.record_execution(
+            USER, task_id, tool="research_run.execute_sandbox_script", args={}
+        )
+        assert execution["status"] == "RUNNING"
+        svc.end_run(USER, task_id)
 
         res = client.delete(f"/research/tasks/{task_id}")
-        assert res.status_code == 409
-        assert "currently running" in res.json()["detail"]
-        assert client.get("/research/tasks").json()["tasks"]  # task survives the 409
+        assert res.status_code == 200
+        assert res.json() == {"deleted": True}
+        assert client.get("/research/tasks").json()["tasks"] == []
 
     async def test_delete_active_run_is_409(self, env):
         client = _make_client(env.drive, env.scratch)

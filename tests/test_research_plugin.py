@@ -771,14 +771,25 @@ class TestChatTasks:
 
 # ── 8. Cascade delete: 409 guards + soft cloud delete + hard scratch delete ──
 class TestDeleteTask:
-    async def test_delete_running_task_is_blocked(self, env):
+    async def test_delete_orphan_running_execution_succeeds(self, env):
+        # A run that stopped mid-step releases its slot (end_run) but can leave the interrupted
+        # tool call marked RUNNING in executions.json. With no live slot that row is an orphan —
+        # record_execution ran but finish_execution never did — and must not block deletion
+        # forever. Regression: delete used to guard on ANY RUNNING execution row, which made a
+        # cancelled/crashed task permanently undeletable even though nothing was running.
         svc = ResearchService(env.drive, env.scratch)
-        task_id = (await svc.create_task(USER, title="busy"))["task_id"]
-        svc.record_execution(USER, task_id, tool="research_run.execute_sandbox_script", args={})
-        with pytest.raises(ValueError) as exc:
-            await svc.delete_task(USER, task_id)
-        assert "currently running" in str(exc.value)
-        assert svc.list_tasks(USER)  # the 409 guard leaves the task in place
+        task_id = (await svc.create_task(USER, title="orphan"))["task_id"]
+        svc.begin_run(USER, task_id, session_id="sess-1")
+        execution = svc.record_execution(
+            USER, task_id, tool="research_run.execute_sandbox_script", args={}
+        )
+        assert execution["status"] == "RUNNING"
+        svc.end_run(USER, task_id)  # the driver stopped; the interrupted execution was never finished
+        assert svc.list_tasks(USER)[0]["is_running"] is False
+
+        await svc.delete_task(USER, task_id)
+        assert not (env.scratch / str(USER) / task_id).exists()
+        assert svc.list_tasks(USER) == []
 
     async def test_delete_indexed_report_is_blocked(self, env):
         svc = ResearchService(env.drive, env.scratch)
