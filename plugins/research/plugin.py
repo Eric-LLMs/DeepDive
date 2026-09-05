@@ -928,6 +928,7 @@ class ResearchService:
             "task_id": project["id"],
             "name": project["name"],
             "owner_id": project["owner_id"],
+            "execution_mode": project.get("execution_mode", "strict"),
             "stage": project["stage"],
             "status": project["status"],
             "gates": project["gates"],
@@ -971,6 +972,7 @@ class ResearchService:
         description: str = "",
         parent_folder_path: str = "",
         material_asset_ids: list[str] | None = None,
+        execution_mode: str = "strict",
         idempotency_key: str | None = None,
     ) -> dict:
         """Atomically create a research task folder + its cloud-drive projection, in one call.
@@ -983,6 +985,10 @@ class ResearchService:
         A failing material copy rolls the whole thing back — cloud folder soft-deleted into
         Trash, scratch removed — so a rejected create leaves no half-built task.
         """
+        if execution_mode not in ("strict", "progressive"):
+            raise ValueError(
+                f"unknown execution_mode {execution_mode!r} (expected 'strict' | 'progressive')"
+            )
         if idempotency_key:
             existing = self._find_by_idempotency(owner_id, "project", idempotency_key)
             if existing is not None:
@@ -1007,6 +1013,7 @@ class ResearchService:
             "owner_id": str(owner_id),
             "name": title.strip(),
             "profile": "research_task",
+            "execution_mode": execution_mode,
             "status": "ACTIVE",
             "stage": "DISCOVER",
             "gates": {gate: "NOT_RUN" for gate in _GATES},

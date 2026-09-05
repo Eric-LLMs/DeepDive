@@ -21,14 +21,14 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-
 from api.auth import AuthUser, require_user
 from api.deps import get_drive_service
 from api.routers import research as research_module
 from api.routers.research import router as research_router
 from core.infrastructure.db import UserRoleModel
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
 from plugins.research.plugin import ResearchService
 from tests._drive_fakes import make_drive
 
@@ -219,6 +219,42 @@ class TestCreateTask:
         client = _make_client(env.drive, env.scratch)
         assert client.post("/research/tasks", json={"title": ""}).status_code == 422
         assert client.post("/research/tasks", json={}).status_code == 422
+
+
+class TestCreateTaskExecutionMode:
+    def test_default_create_is_strict_everywhere(self, env):
+        client = _make_client(env.drive, env.scratch)
+        created = client.post("/research/tasks", json={"title": "strict-by-default"}).json()
+        task_id = created["task_id"]
+        assert created["execution_mode"] == "strict"
+        assert client.get("/research/tasks").json()["tasks"][0]["execution_mode"] == "strict"
+        assert client.get(f"/research/tasks/{task_id}").json()["execution_mode"] == "strict"
+        # Persisted: a later agent resume on this task reads strict too.
+        svc = ResearchService(env.drive, env.scratch)
+        assert svc.resume_project(USER, task_id)["execution_mode"] == "strict"
+
+    def test_create_progressive_persists_and_echoes(self, env):
+        client = _make_client(env.drive, env.scratch)
+        created = client.post(
+            "/research/tasks", json={"title": "prog-run", "execution_mode": "progressive"}
+        ).json()
+        task_id = created["task_id"]
+        assert created["execution_mode"] == "progressive"
+        assert client.get("/research/tasks").json()["tasks"][0]["execution_mode"] == "progressive"
+        assert client.get(f"/research/tasks/{task_id}").json()["execution_mode"] == "progressive"
+        # The authoritative project.json carries it, so every auto-run resume drives progressive.
+        project = ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "project.json", None
+        )
+        assert project["execution_mode"] == "progressive"
+        svc = ResearchService(env.drive, env.scratch)
+        assert svc.resume_project(USER, task_id)["execution_mode"] == "progressive"
+
+    def test_create_rejects_unknown_execution_mode(self, env):
+        client = _make_client(env.drive, env.scratch)
+        res = client.post("/research/tasks", json={"title": "x", "execution_mode": "turbo"})
+        assert res.status_code == 422  # schema-level Literal, before any service write
+        assert client.get("/research/tasks").json()["tasks"] == []
 
 
 # ── 3. Path traversal (404/400, never an escape) ────────────────────────────

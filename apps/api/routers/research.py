@@ -132,6 +132,7 @@ async def create_task(
             description=body.description,
             parent_folder_path=body.parent_folder_path,
             material_asset_ids=body.material_asset_ids,
+            execution_mode=body.execution_mode,
         )
         # Bind the task's dedicated chat session at creation (1:1). The session is a different
         # kind than a normal chat: it is hidden from the Sessions sidebar (the bound_session_ids
