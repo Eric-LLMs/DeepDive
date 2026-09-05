@@ -228,11 +228,17 @@ def test_auto_turn_prompt_embeds_state_and_never_asks_user():
     assert "turn 3" in prompt and "EVIDENCE" in prompt and "`T`" in prompt
     assert "ask the user anything" in prompt
     assert "NOT create a new project" in prompt
+    # The auto turn must discover the single legal next stage (get_handoff) and never guess a
+    # transition target — guessing (e.g. DISCOVER -> EVIDENCE) is an illegal transition that
+    # froze real auto-runs in DISCOVER.
+    assert "get_handoff" in prompt and "exact next_stage" in prompt
+    assert "never guess the stage name" in prompt
     push = auto_turn_prompt(
         task_name="T", project_id="p1", stage="EVIDENCE", turn_index=4,
         consecutive_no_progress=1,
     )
     assert "made no visible progress" in push
+    assert "get_handoff" in push
 
 
 # ── real-service: atomic CAS ─────────────────────────────────────────────────
@@ -425,6 +431,39 @@ async def test_auto_turn_stalls_after_max_no_progress(service):
     project = service.read_project(OWNER, "stall")
     assert "active_run" not in project
     assert project["last_block"]["kind"] == "stalled"
+
+
+async def test_auto_turn_evidence_churn_without_gate_advance_stalls(service):
+    # Regression: growing the graph (evidence nodes) while staying in the SAME stage must NOT
+    # count as progress. The pre-fix driver compared whole-file fingerprints, so a DISCOVER
+    # loop that kept recording evidence nodes reset the no-progress counter every turn and
+    # never stalled. Only a stage move or a new gate pass is a structural milestone.
+    _create_project(service, "churn", stage="DISCOVER")
+    calls = []
+
+    async def churn_turn(prompt: str) -> RunTurnResult:
+        calls.append(prompt)
+        service.record_node(
+            OWNER, "churn",
+            node={"id": f"ev-{len(calls)}", "type": "evidence", "label": "more"},
+        )
+        return RunTurnResult(final_answer="collected", cost_usd=0.1)
+
+    first, _ = await _drive(service, "churn", churn_turn, max_no_progress=2)
+    assert first.action == "continue"
+    assert first.consecutive_no_progress == 1      # the added node did NOT reset the counter
+    assert first.progress is False
+    run = service.read_project(OWNER, "churn")["active_run"]
+    second = await ResearchRunDriver(max_no_progress=2).auto_turn(
+        service, owner_id=OWNER, task_id="churn", run_id=run["run_id"],
+        turn_index=2, run_turn=churn_turn,
+    )
+    assert second.state == RunState.STALLED
+    assert second.action == "stalled"
+    # The churn is still on disk (nothing was rolled back) — the run just stopped trusting it
+    # as progress.
+    graph = service._load_graph(OWNER, "churn")
+    assert len(graph["nodes"]) == 2
 
 
 async def test_auto_turn_blocks_at_turn_cap(service):

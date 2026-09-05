@@ -177,7 +177,8 @@ def grade_turn(facts: TurnFacts) -> Grade:
     if facts.max_no_progress and new_consecutive >= facts.max_no_progress:
         return Grade(
             RunState.STALLED,
-            f"no visible progress across {new_consecutive} consecutive auto turns",
+            f"no stage or gate advance across {new_consecutive} consecutive auto turns "
+            f"(stuck at {facts.stage})",
             new_consecutive,
         )
     if facts.max_turns and facts.turn_index >= facts.max_turns:
@@ -273,10 +274,14 @@ def auto_turn_prompt(
     decision is genuinely required).
     """
     push = (
-        "\nNOTE: The previous auto turn made no visible progress on the task files. Do not "
-        "just talk — act: inspect the current state with research_project (action snapshot) "
-        "and advance at least one concrete step (record/update nodes or evidence, write "
-        "scratch, produce artifact versions, or transition the stage)."
+        "\nNOTE: The previous auto turn made no visible progress on the task files — the stage "
+        f"did not advance (still {stage}) and no gate newly passed. Do not just talk — act: "
+        "inspect the current state (research_project action snapshot) and cross a real "
+        "milestone this turn. If repeated retrieval attempts keep yielding no usable material "
+        "for the current stage, STOP gathering and call research_state get_handoff, then "
+        "transition_stage with the exact next_stage it returns: progressive mode records any "
+        "un-passed gate checks into the project diagnostics and grants the move. Never loop "
+        "inside a single stage."
         if consecutive_no_progress > 0
         else ""
     )
@@ -284,13 +289,36 @@ def auto_turn_prompt(
         f"[Research auto-run, turn {turn_index} of the same run]\n"
         f"Continue driving the existing Research OS task `{task_name}` (project_id "
         f"{project_id}), currently at stage {stage}, forward toward PUBLISH — fully "
-        "autonomously. Do NOT create a new project and do NOT ask the user anything. Use the "
-        "deep_research skill and the research tools exactly as a researcher would: consult "
-        "the task state (research_project action snapshot), then keep producing the evidence, "
-        "graph nodes/edges, artifacts, and stage transitions the current gate demands. "
+        "autonomously. Do NOT create a new project and do NOT ask the user anything. The "
+        "authoritative stage-by-stage procedure is the deep_research skill — load it now via "
+        "the `skill` tool if it is not already in your context, and follow it.\n"
+        "The task advances along ONE legal chain (DISCOVER then FRAME then EVIDENCE then DESIGN "
+        "then EXECUTE then EXPLAIN then WRITE then REVIEW then REPRODUCE then PUBLISH) and each "
+        "stage has exactly one legal next stage. To move on, call research_state action "
+        "get_handoff to read that exact next_stage (and gate_required) for THIS project, then "
+        "call research_state transition_stage passing ONLY that next_stage as target. "
+        "Transitioning to any other target is refused as an illegal transition and wastes the "
+        "turn — never guess the stage name, never skip a stage.\n"
+        "Drive the stage work with the research tools (research_project snapshot, "
+        "research_state incl. get_state/get_handoff/transition_stage, research_evidence "
+        "record_node/link_edge, research_gate check, research_artifact, research_run, "
+        "rag_search, web_search, search_social), reading the task state each turn. Follow each "
+        "tool's own schema — evidence record_node takes a node with id and type, link_edge "
+        "links src to dst with a kind; using the wrong field names errors and wastes steps.\n"
+        "Anti-stall rule: when ~2-3 retrieval attempts for the current stage come back empty "
+        "or keep failing, do NOT keep retrying in place — call research_state get_handoff and "
+        "then transition_stage with that exact next_stage. In progressive mode an un-passed "
+        "guarding gate records its failed checks into the project diagnostics and the "
+        "transition is granted, so advance and keep going. Never loop inside a single stage and "
+        "never fabricate evidence to force a pass.\n"
         "Check gates when a transition needs one (research_gate action check); if a gate "
         "fails, first use explain_failure and actually fix the underlying work; request a "
         f"human override only if a real human decision is required.{push}\n"
+        "Keep going to PUBLISH: write the report artifact and promote the final report to the "
+        "drive. When you write it, read the project diagnostics (research_project snapshot) and "
+        "close the report with a 'Known gaps / unverified items' list — one entry per recorded "
+        "diagnostic (gate + stage + the failed checks), each labeled unverified, so the user "
+        "sees exactly which stage could not be sourced and why.\n"
         "When the task reaches PUBLISH, or there is genuinely nothing more you can do "
         "unassisted, stop and report a concise summary of what you did this turn and the "
         "current state / next step. Keep the summary under ~200 words."
@@ -696,11 +724,21 @@ class ResearchRunDriver:
         # override, or Stop may have been pressed while we ran.
         project = service.read_project(owner_id, task_id)
         ledger = service.get_driver_checkpoint(owner_id, task_id)
+        after = await service.project_fingerprint(owner_id, task_id)
+        # "Progress" for the no-progress brake means a *structural* milestone — the stage
+        # moved or a gate newly passed/overrode — NOT arbitrary file churn. Early stages let
+        # the model hoard evidence nodes / sources forever without ever crossing the gate; an
+        # unchanged stage+gate diff is exactly the spin that must count toward the stall
+        # counter (the observed DISCOVER loop kept resetting it by growing the graph).
+        milestone_progress = (
+            before.get("stage") != after.get("stage")
+            or before.get("gates") != after.get("gates")
+        )
         facts = TurnFacts(
             stage=project.get("stage", "DISCOVER"),
             pending_overrides=len(service.pending_overrides(owner_id, task_id)),
             cancel_requested=bool(ledger.get("cancel_requested")) or interrupted_by_cancel,
-            progress=before != await service.project_fingerprint(owner_id, task_id),
+            progress=milestone_progress,
             consecutive_no_progress=consecutive,
             turn_index=turn_index,
             cumulative_cost_usd=cumulative,

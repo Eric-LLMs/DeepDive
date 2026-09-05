@@ -152,6 +152,9 @@ services:
       # Share the audio/image caches with the host-run FastAPI gateway, which serves /audio
       # and /images from the same directories.
       - ./data:/app/data
+      # Version-controlled skills: research auto-run turns load deep_research.skill.md via the
+      # agent's `skill` tool, so the worker must see ./skills (mirror of ./plugins below).
+      - ./skills:/app/skills
     depends_on:
       postgres:
         condition: service_healthy

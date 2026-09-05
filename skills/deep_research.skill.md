@@ -102,6 +102,15 @@ gate **records a diagnostic and does not block the workflow**:
   and advances the stage (`granted: True`) — do not retry the same transition merely because
   the gate failed (the stage has already moved on, so a second call is an illegal transition).
   Do not pad or fake evidence to force a pass.
+- **Never stall inside a stage.** Each stage must hand off to the next. If ~2-3 retrieval
+  attempts (rag_search / web_search / search_social) for the *current* stage keep coming back
+  empty or redundant, stop gathering and call `research_state transition_stage` to advance —
+  the un-passed guarding gate's failed checks land in the project diagnostics and the
+  transition is granted. Do not keep re-searching the same stage turn after turn hoping for a
+  lucky hit; the diagnostics progressive writes are the honest record of what could not be
+  sourced, and the report's "Known gaps / unverified items" section surfaces them. In
+  strict mode, use `research_gate explain_failure` and only request an override when a real
+  human decision is genuinely required.
 - **Never call `research_gate request_override` in progressive mode.** Overrides are the
   human-approval path for strict runs; in progressive mode one would only park the task
   awaiting a human that should not be needed.
