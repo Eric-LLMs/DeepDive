@@ -95,6 +95,24 @@ async def startup(ctx) -> None:
     set_bus(ctx["redis"])
     base_url, api_key, model = await _active_llm_channel()
     ctx["llm"] = OpenAILLM(api_key=api_key, base_url=base_url, model=model)
+    # Give the shared agent-kernel LLM (api.agent_factory's module singleton — the channel
+    # rag_search's query-rewrite / CRAG and context-free tool calls ride) the SAME default the
+    # API host gives it at startup. The host applies the stored admin provider via
+    # routers/config._bootstrap_config; this worker never runs that router, so without the
+    # mirror its singleton would stay on the env-seeded llm-gateway vars whose upstream is
+    # still a placeholder -> gateway 401. Reuse the identical bootstrap so host and worker
+    # defaults agree and the gateway placeholder is never a live default. (Per-owner turns
+    # override this at job time via the request LLM channel — see research_drive.)
+    try:
+        from apps.api.routers.config import _bootstrap_config
+
+        async with SessionLocal() as session:
+            await _bootstrap_config(session)
+    except Exception:
+        # The mirror is a best-effort default; a failure here must never take the worker down
+        # (per-owner turns do not depend on it — they resolve the owner's channel from the DB
+        # at job time via resolve_channel_for_owner).
+        logger.warning("worker default LLM channel mirror failed; per-owner resolution still applies", exc_info=True)
     ctx["tts"] = TTSClient()
     ctx["images"] = ImageScraper()
     # Batch embed (session finalize / sentence indexing / RAG ingest) can exceed the

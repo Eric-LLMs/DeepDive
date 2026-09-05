@@ -52,6 +52,10 @@ from core.infrastructure.repositories import (
     SqlArticleRepository,
     SqlSentenceRepository,
 )
+from core.infrastructure.request_context import (
+    set_request_llm_channel,
+    set_request_user,
+)
 from core.infrastructure.storage import get_storage, object_key
 from core.logger import reset_log_context, set_log_context
 from rag.query_cache import bump_corpus_version
@@ -1024,6 +1028,10 @@ async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
         log_tokens = set_log_context(
             user_id=str(user_id), session_id=str(session_id), request_id=f"job:{job_id}"
         )
+        # Scope RAG / memory recall + context-free LLM sub-calls (rag_search rewrite) to this
+        # turn's owner and its enqueued channel, mirroring the interactive chat path.
+        set_request_user(user_id)
+        set_request_llm_channel((payload.get("model"), payload.get("base_url"), payload.get("api_key")))
         try:
             session_memory = SessionMemoryStore(
                 ctx["session_factory"], ctx["embedder"], ctx["llm"], session_id, user_id
@@ -1076,20 +1084,40 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
             get_approval_bridge,
             set_request_approval,
         )
-        from core.infrastructure.request_context import set_request_user
 
+        # Reuse the web main-chat channel resolver (``_resolve_chat_route`` via the shared
+        # ``resolve_channel_for_owner`` helper) — never write one-off key SQL here. The task
+        # ownership is enforced by the driver claim below (projects are owner-scoped), and the
+        # resolver checks account/role active + only picks an active role channel the user is
+        # not banned from. This is what kills the worker's llm-gateway 401: rag_search's LLM
+        # sub-calls ride this owner channel, not the unconfigured global default.
+        from apps.api.routers._shared import resolve_channel_for_owner
         from plugins.research.driver import ResearchRunDriver, RunTurnResult
         from plugins.research.plugin import ResearchService
 
         user_id = UUID(payload["user_id"])
-        set_request_user(user_id)
         task_id = payload["task_id"]
         run_id = payload["run_id"]
         turn_index = int(payload["turn_index"])
         session_id = payload.get("session_id")
-        model = payload.get("model")
-        base_url = payload.get("base_url")
-        api_key = payload.get("api_key")
+
+        # Runtime dynamic injection: resolve the owner's effective LLM channel from the DB on
+        # every spawn (the "拉起任务时" point). Prefer the fresh DB route; fall back to the
+        # channel pinned on the originating login (the enqueued payload) only when no active
+        # DB channel resolves, so a run outlives an admin clearing the role binding mid-run.
+        db_base_url, db_api_key, db_model, _business, _credential_id = (
+            await resolve_channel_for_owner(ctx["session_factory"], user_id)
+        )
+        if db_base_url and db_api_key:
+            model, base_url, api_key = db_model or None, db_base_url, db_api_key
+        else:
+            model, base_url, api_key = payload.get("model"), payload.get("base_url"), payload.get("api_key")
+
+        # Scope RAG / memory recall to this run's owner, and pin this job's LLM channel so
+        # every context-free sub-call (rag_search query rewrite / CRAG judge) uses the same
+        # key/model as the conversation — the "执行 rag_search 时" injection point.
+        set_request_user(user_id)
+        set_request_llm_channel((model, base_url, api_key))
         # The _run wrapper already tagged the job id; add the research run's owner/task/run so
         # driver and settle log lines carry ``task_id:run_id`` like the interactive turn does.
         log_tokens = set_log_context(

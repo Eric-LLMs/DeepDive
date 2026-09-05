@@ -34,6 +34,7 @@ from core.config import export_secret_env, settings
 from core.infrastructure.db import SessionLocal
 from core.infrastructure.llm import OpenAILLM
 from core.infrastructure.memory_retrieval import PgKeywordRecaller, PgVectorRecaller
+from core.infrastructure.request_context import get_request_llm_channel
 from core.infrastructure.retrieval_grpc import GrpcRetriever
 from core.infrastructure.storage import get_storage
 from core.infrastructure.vector import PgVectorStore, TEIEmbedder
@@ -45,6 +46,34 @@ from plugins.research.plugin import register_research_plugins
 
 # Lightweight singletons
 llm = OpenAILLM()
+
+
+class _ChannelAwareLLM:
+    """LLMPort shim for the in-process retrieval pipeline.
+
+    rag_search's LLM sub-calls (query rewrite / CRAG judge) call ``complete`` with no per-call
+    channel, so they would ride the process-global default client. In the worker that default
+    is the unconfigured llm-gateway -> upstream 401, and on the host it can differ from the
+    conversation's per-request channel. When the current request carries an owner LLM channel
+    (host ``/chat`` and the worker's research_drive/run_agent_turn set it), forward it so
+    rag_search uses the SAME key/model as the conversation; otherwise delegate to the
+    configured default (unchanged for eval / admin console / no-channel requests).
+    """
+
+    def __init__(self, inner: OpenAILLM) -> None:
+        self._inner = inner
+
+    async def complete(self, prompt: str, system_prompt: str = "You are a helpful assistant.", **kwargs) -> str:
+        channel = get_request_llm_channel()
+        if channel is not None:
+            model, base_url, api_key = channel
+            return await self._inner.complete(
+                prompt, system_prompt, model=model or None, base_url=base_url, api_key=api_key, **kwargs
+            )
+        return await self._inner.complete(prompt, system_prompt, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
 
 
 @lru_cache
@@ -70,7 +99,10 @@ def _retriever() -> RAGPipeline:
         embedder=TEIEmbedder(),
         vector_store=PgVectorStore(SessionLocal),
         session_factory=SessionLocal,
-        llm=llm,
+        # The retrieval LLM (query rewrite / CRAG) is a process-wide singleton; wrap it so
+        # each rag_search call follows the request's owner LLM channel (see _ChannelAwareLLM)
+        # instead of whichever channel the global client happens to hold.
+        llm=_ChannelAwareLLM(llm),
         settings=settings,
     )
 

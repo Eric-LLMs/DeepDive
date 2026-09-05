@@ -52,7 +52,10 @@ from core.infrastructure.memory import (
     compact_history,
     create_session,
 )
-from core.infrastructure.request_context import set_request_user
+from core.infrastructure.request_context import (
+    set_request_llm_channel,
+    set_request_user,
+)
 from core.infrastructure.security import authorize_usage, get_role
 from core.logger import reset_log_context, set_log_context
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -455,6 +458,10 @@ async def chat(
                 status_code=503,
                 detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
             )
+    # Pin this request's LLM channel so context-free sub-calls (rag_search query rewrite /
+    # CRAG judge) use the same key/model as the conversation instead of the process-global
+    # default client — one turn, one channel, host and worker alike.
+    set_request_llm_channel((model, base_url or None, api_key or None))
 
     user_text = body.message
     # Only attaches the client flagged ``owned`` (a 📷 screenshot created for this message)
@@ -657,6 +664,11 @@ async def chat_stream(
             status_code=503,
             detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
         )
+    # Pin this request's LLM channel so context-free sub-calls (rag_search query rewrite /
+    # CRAG judge) use the same key/model as the conversation instead of the process-global
+    # default client. The SSE generator runs later in the request's captured context, so
+    # setting it here (before ``gen()`` is created) covers every tool call the stream makes.
+    set_request_llm_channel((model, base_url or None, api_key or None))
 
     user_text = body.message
     # Only attaches the client flagged ``owned`` (a 📷 screenshot created for this message)

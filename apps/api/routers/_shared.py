@@ -195,6 +195,35 @@ async def _resolve_chat_route(
     return "", "", "", "", None
 
 
+async def resolve_channel_for_owner(
+    session_factory, user_id: UUID
+) -> tuple[str, str, str, str, UUID | None]:
+    """Resolve a background turn's LLM channel with the SAME ladder as the web main chat.
+
+    Headless twin of :func:`_resolve_chat_route` for the worker (research_drive / scheduled
+    turns), where there is no request login token to carry a pinned channel. It loads the
+    owner account and applies the identical checks a ``/chat`` request for that user would:
+
+    - the account must exist and be active (``users.is_active``);
+    - the user's effective role must be active;
+    - the channel comes from :func:`_resolve_chat_route` itself, so role-binding /
+      credential ``is_active`` / user-level Tokens-ban validation is byte-identical to the
+      web path — no key logic is reimplemented here.
+
+    Returns ``(base_url, api_key, provider_model, business_name, credential_id)``, empty
+    strings when no active channel resolves (the caller then uses the configured global
+    client, exactly like the web chat's empty-channel fallback).
+    """
+    async with session_factory() as session:
+        user = await session.get(UserModel, user_id)
+        if user is None or not user.is_active:
+            return "", "", "", "", None
+        role = await get_role(session, user.role_id)
+        if role is None or not role.is_active:
+            return "", "", "", "", None
+        return await _resolve_chat_route(session, None, user.role_id)
+
+
 async def _provider_model_name(session, display_name: str) -> str:
     """Map a catalog display name (or raw id) to the provider's real model id.
 
@@ -343,7 +372,7 @@ async def _guest_quota(redis, guest_id: UUID, detail: str | None = None) -> None
             now = datetime.now(UTC)
             midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             await redis.expire(key, int((midnight - now).total_seconds()) + 1)
-    except Exception:  # noqa: BLE001 - quota counting is best-effort; availability wins
+    except Exception:
         logger.warning("guest quota counter unavailable for %s — allowing request", guest_id, exc_info=True)
         return
     if count > settings.guest_daily_limit:
