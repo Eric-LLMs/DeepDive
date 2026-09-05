@@ -26,7 +26,10 @@ Three ideas hold it together:
   state and applies the fixed priority chain (:func:`grade_turn`): PUBLISH → finished, human
   gate override pending → blocked, consecutive no-progress → stalled, turn cap → blocked,
   cost cap → blocked, else → continue one more turn. Every stop is honest and visible — the
-  run never silently skips a gate or loops forever.
+  run never silently skips a gate or loops forever. In **progressive** mode a stop short of
+  PUBLISH for a non-human reason (stall / cap) is not left mid-way: the driver auto-settles
+  it (see :meth:`ResearchRunDriver._try_settle`) — walking the legal chain to PUBLISH and
+  writing a model-free report that records every un-passed gate as a known gap.
 
 The driver is deliberately I/O-lean: it owns *state transitions* (claim, ledger, last_block,
 slot release). The worker job (`apps/worker/tasks.py: research_drive`) supplies the actual
@@ -255,6 +258,100 @@ class DriverOutcome:
     @property
     def publish_kind(self) -> str:
         return f"run.{self.action}"
+
+
+# ── deterministic auto-settle (progressive runs only) ────────────────────────
+# A progressive run that is about to stop short of PUBLISH for a NON-human reason (a
+# no-progress stall or a turn/cost cap) is finished deterministically instead of being left
+# mid-way: the driver walks the legal stage chain to PUBLISH — each un-passed guarding gate
+# records its failed checks as a diagnostic and the move is granted, exactly the progressive
+# semantics the agent itself uses — and writes an auto-settled report that aggregates the
+# produced artifacts, the graph, and every recorded diagnostic as the report's "Known gaps /
+# unverified items". This is what makes "ran out of usable material" tasks still end at
+# PUBLISH with an honest per-stage failure record. Strict runs never auto-settle: an un-passed
+# gate there is a real stop that needs the human override path.
+_SETTLE_ARTIFACT_ID = "settle_report.md"
+_MAX_SETTLE_HOPS = 12  # the chain is 9 hops; generous headroom guards against a corrupt project
+
+
+def build_settle_report(
+    *,
+    task_name: str,
+    mode: str,
+    created_at: str,
+    reached_stage: str,
+    reason: str,
+    node_counts: list[tuple[str, int]],
+    edge_count: int,
+    artifacts: list[dict],
+    diagnostics: list[dict],
+) -> str:
+    """Deterministic, model-free report for a run the driver auto-settled to PUBLISH.
+
+    Pure text templating — no LLM, no fabricated findings. It records what the run actually
+    established (the produced artifacts and the graph) and closes with the recorded gate
+    diagnostics as the "Known gaps / unverified items" list the report contract requires.
+    """
+    lines = [
+        f"# {task_name or '(untitled research task)'} — research report",
+        "",
+        f"> Auto-settled by the Research OS driver · mode: {mode} · created: {created_at}",
+        f"> Reason: {reason}",
+        "",
+        "This run could not advance to PUBLISH on its own, so the driver finished it "
+        "deterministically: it walked the remaining stages, recording each un-passed gate's "
+        "failed checks into the project diagnostics, and wrote this report from what the run "
+        "actually produced. Nothing below is filled in or fabricated.",
+        "",
+        "## What this run established",
+        "",
+    ]
+    if reached_stage and reached_stage != "PUBLISH":
+        lines.append(
+            f"- Reached **{reached_stage}** under its own power before the auto-settle."
+        )
+    total_nodes = sum(n for _, n in node_counts)
+    if node_counts:
+        breakdown = " · ".join(f"{t}: {n}" for t, n in node_counts)
+        lines.append(
+            f"- Graph: **{total_nodes}** node(s), {edge_count} edge(s) — {breakdown}."
+        )
+    else:
+        lines.append(f"- Graph: no nodes recorded ({edge_count} edge(s)).")
+    lines.append("- Artifacts:")
+    if artifacts:
+        lines.extend(
+            f"  - `{a['artifact_id']}` v{a.get('version', 1)} ({a.get('status', '?')})"
+            for a in artifacts
+        )
+    else:
+        lines.append("  - none")
+    lines += ["", "## Known gaps / unverified items", ""]
+    if not diagnostics:
+        lines.append(
+            "No gate diagnostics were recorded — the run simply ran out of runway before "
+            "PUBLISH."
+        )
+    for d in diagnostics:
+        gate = d.get("gate", "?")
+        lines.append(
+            f"- **{gate}** — did not pass when leaving {d.get('stage', '?')} → "
+            f"{d.get('target', '?')}:"
+        )
+        failed = [c for c in d.get("failed_checks") or [] if not c.get("ok")]
+        if failed:
+            for check in failed:
+                detail = check.get("detail")
+                if detail:
+                    lines.append(f"  - {check.get('name') or 'check'}: {detail}")
+                else:
+                    lines.append(f"  - {check.get('name') or 'check'}")
+        else:
+            lines.append("  - (gate checks failed — no per-check detail recorded)")
+        lines.append("    *unverified*")
+    lines.append("")
+    lines.append("_End of auto-settled report._")
+    return "\n".join(lines)
 
 
 # ── the auto-turn prompt ─────────────────────────────────────────────────────
@@ -600,6 +697,136 @@ class ResearchRunDriver:
         service.atomic_update_project(owner_id, task_id, mutate)
         service.end_run(owner_id, task_id)
 
+    # -- deterministic auto-settle to PUBLISH -----------------------------------
+    async def _try_settle(
+        self,
+        service,
+        owner_id: UUID,
+        task_id: str,
+        *,
+        run_id: str,
+        turn_index: int,
+        turn_attempt: int,
+        execution_id: str,
+        grade: Grade,
+        cumulative: float,
+        consecutive: int,
+    ) -> DriverOutcome | None:
+        """Finish a stuck progressive run deterministically, or return ``None`` to stop as graded.
+
+        Only called for progressive runs whose graded stop is NOT a human decision. Walks the
+        legal ``transition_stage`` chain from the current stage to PUBLISH (each guarded hop
+        whose gate has not passed records its failed checks as a diagnostic and is granted),
+        then writes a model-free :func:`build_settle_report` into the task's artifacts (it is
+        mirrored to cloud ``outputs/`` but never RAG-promoted, so a gaps-only record can't
+        surface as evidence later) and terminalizes the run as FINISHED. Returns ``None``
+        (caller falls back to the graded stop) when the mode is strict, the run is parked on a
+        real human decision, the chain refuses a hop, or the report write fails — the run is
+        never half-finished silently.
+        """
+        project = service.read_project(owner_id, task_id)
+        if project.get("execution_mode", "strict") != "progressive":
+            return None
+        if project.get("stage") == "PUBLISH":
+            return None
+        pre_walk_stage = project.get("stage", "DISCOVER")
+        diagnostics_before = len(project.get("diagnostics") or [])
+
+        # Walk to PUBLISH. Each hop re-reads the handoff so it always asks the state machine
+        # for the legal next stage — never guesses, never skips (mirror of auto_turn_prompt).
+        hops = 0
+        while project.get("stage") != "PUBLISH":
+            hops += 1
+            if hops > _MAX_SETTLE_HOPS:
+                logger.warning(
+                    "settle walk exceeded %d hops for task %s; stopping as graded", _MAX_SETTLE_HOPS, task_id
+                )
+                return None
+            handoff = service.get_handoff(owner_id, task_id)
+            nxt = handoff.get("next_stage")
+            if not nxt:
+                logger.warning(
+                    "settle hit a dead-end stage %r for task %s; stopping as graded",
+                    project.get("stage"), task_id,
+                )
+                return None
+            granted = service.transition_stage(owner_id, task_id, target=nxt)
+            if not granted.get("granted"):
+                logger.warning(
+                    "settle transition %s -> %s refused (%s) for task %s; stopping as graded",
+                    project.get("stage"), nxt, granted.get("reason"), task_id,
+                )
+                return None
+            project = service.read_project(owner_id, task_id)
+        diagnostics = project.get("diagnostics") or []
+        new_diagnostics = len(diagnostics) - diagnostics_before
+
+        # Synthesize + persist the auto-settled report from what the run ACTUALLY produced.
+        graph = service._load_graph(owner_id, task_id)
+        node_counts: dict[str, int] = {}
+        for node in graph["nodes"]:
+            node_type = node.get("type") or "node"
+            node_counts[node_type] = node_counts.get(node_type, 0) + 1
+        artifacts = service.list_artifacts(owner_id, task_id)
+        content = build_settle_report(
+            task_name=project.get("name", task_id),
+            mode=project.get("execution_mode", "strict"),
+            created_at=project.get("created_at", ""),
+            reached_stage=pre_walk_stage,
+            reason=grade.reason or "run could not advance to PUBLISH on its own",
+            node_counts=sorted(node_counts.items(), key=lambda kv: (-kv[1], kv[0])),
+            edge_count=len(graph["edges"]),
+            artifacts=artifacts,
+            diagnostics=diagnostics,
+        )
+        try:
+            # The report is deliberately NOT promoted to the drive/RAG queue: a "gaps only"
+            # record of what could not be established must never surface as evidence in a later
+            # rag_search. write_scratch still mirrors it into the task's cloud outputs/ (best
+            # effort) so the desktop shows it next to the other artifacts.
+            if any(a["artifact_id"] == _SETTLE_ARTIFACT_ID for a in artifacts):
+                made = await service.create_version(
+                    owner_id, task_id, artifact_id=_SETTLE_ARTIFACT_ID, content=content,
+                    idempotency_key=f"settle:{execution_id}",
+                )
+            else:
+                made = await service.write_scratch(
+                    owner_id, task_id, artifact_id=_SETTLE_ARTIFACT_ID, content=content,
+                    generated_by_execution=execution_id,
+                )
+            version = int(made.get("version") or 1)
+        except Exception as exc:
+            logger.warning(
+                "settle report write failed for task %s; stopping as graded: %s", task_id, exc
+            )
+            return None
+
+        reason = (
+            f"reached PUBLISH via auto-settle — the run could not advance on its own "
+            f"({grade.reason or 'no stage or gate advance'}); {new_diagnostics} gate "
+            f"diagnostic(s) recorded into the report"
+        )
+        final_answer = (
+            f"[auto-settled] {project.get('name', task_id)} reached PUBLISH deterministically — "
+            f"the run could not advance on its own ({grade.reason or 'no progress'}). Wrote "
+            f"`{_SETTLE_ARTIFACT_ID}` (v{version}) recording {new_diagnostics} new gap "
+            f"diagnostic(s) from the un-passed gate(s); the report closes with the 'Known gaps "
+            f"/ unverified items' list."
+        )
+        outcome = DriverOutcome(
+            state=RunState.FINISHED, action="finished",
+            run_id=run_id, turn_index=turn_index, turn_attempt=turn_attempt,
+            execution_id=execution_id, progress=False,
+            cumulative_cost_usd=cumulative, final_answer=final_answer,
+            reason=reason, consecutive_no_progress=consecutive,
+        )
+        self._finish_run(
+            service, owner_id, task_id,
+            outcome=outcome, reason=reason,
+            cumulative_cost_usd=cumulative, consecutive_no_progress=consecutive,
+        )
+        return outcome
+
     # -- the one-job orchestration ---------------------------------------------
     async def auto_turn(
         self,
@@ -772,6 +999,26 @@ class ResearchRunDriver:
                 next_turn_index=turn_index + 1,
                 consecutive_no_progress=grade.consecutive_no_progress,
             )
+
+        # ── deterministic auto-settle (progressive runs only) ──
+        # A progressive run that would otherwise stop short of PUBLISH for a NON-human reason
+        # (no-progress stall or a turn/cost cap) is finished deterministically instead: walk
+        # the legal chain to PUBLISH recording gate diagnostics, then write an auto-settled
+        # report. Strict runs — and runs parked on a real pending human decision — keep the
+        # graded stop below. On any failure _try_settle returns None and we fall through to it.
+        if (
+            grade.state in (RunState.STALLED, RunState.BLOCKED)
+            and not interrupted_by_cancel
+            and facts.pending_overrides == 0
+        ):
+            settled = await self._try_settle(
+                service, owner_id, task_id,
+                run_id=run_id, turn_index=turn_index, turn_attempt=attempt,
+                execution_id=execution_id, grade=grade,
+                cumulative=cumulative, consecutive=consecutive,
+            )
+            if settled is not None:
+                return settled
 
         # Terminal stop.
         if not final_answer:

@@ -26,6 +26,7 @@ from plugins.research.driver import (
     TurnFacts,
     _backoff_s,
     auto_turn_prompt,
+    build_settle_report,
     check_transition,
     grade_turn,
     is_transient_error,
@@ -464,6 +465,121 @@ async def test_auto_turn_evidence_churn_without_gate_advance_stalls(service):
     # as progress.
     graph = service._load_graph(OWNER, "churn")
     assert len(graph["nodes"]) == 2
+
+
+async def test_auto_turn_progressive_no_material_settles_to_publish(service):
+    # Regression for the observed grind: a progressive run that cannot gather usable material
+    # must NOT stall mid-way. After the no-progress threshold the driver auto-settles — walks
+    # EXECUTE→…→PUBLISH recording each un-passed guarding gate as a diagnostic, writes a
+    # model-free settle_report.md, and finishes instead of leaving the task RUNNING/stalled.
+    _create_project(service, "settle", stage="EXECUTE", mode="progressive")
+    service.atomic_update_project(
+        OWNER, "settle",
+        lambda p: p.update(
+            gates={
+                "DESIGN_GATE": "FAIL", "EVIDENCE_GATE": "FAIL",
+                "CLAIM_GATE": "FAIL", "QUALITY_GATE": "FAIL",
+            },
+            diagnostics=[],
+        ),
+    )
+
+    async def idle_turn(prompt: str) -> RunTurnResult:
+        return RunTurnResult(final_answer="no material yet")
+
+    first, _ = await _drive(service, "settle", idle_turn, max_no_progress=2)
+    assert first.action == "continue"               # counter = 1
+    run = service.read_project(OWNER, "settle")["active_run"]
+    second = await ResearchRunDriver(max_no_progress=2).auto_turn(
+        service, owner_id=OWNER, task_id="settle", run_id=run["run_id"],
+        turn_index=2, run_turn=idle_turn,
+    )
+    assert second.state == RunState.FINISHED
+    assert second.action == "finished"
+    project = service.read_project(OWNER, "settle")
+    assert project["stage"] == "PUBLISH"
+    assert "active_run" not in project
+    assert project["last_block"]["kind"] == "finished"
+    assert "auto-settle" in project["last_block"]["reason"]
+    # Crossing EXECUTE→EXPLAIN (EVIDENCE_GATE), WRITE→REVIEW (CLAIM_GATE) and
+    # REVIEW→REPRODUCE (QUALITY_GATE) with every gate FAIL records exactly three diagnostics.
+    assert [d["gate"] for d in (project["diagnostics"] or [])] == [
+        "EVIDENCE_GATE", "CLAIM_GATE", "QUALITY_GATE",
+    ]
+    # A model-free report exists and carries the gaps.
+    report = next(
+        (a for a in service.list_artifacts(OWNER, "settle")
+         if a["artifact_id"] == driver_module._SETTLE_ARTIFACT_ID),
+        None,
+    )
+    assert report is not None and report["status"] == "DRAFT"   # never promoted to the KB
+    content = service.read_artifact(
+        OWNER, "settle", artifact_id=driver_module._SETTLE_ARTIFACT_ID
+    )["content"]
+    assert "Known gaps / unverified items" in content
+    assert "EVIDENCE_GATE" in content
+    assert second.final_answer and "auto-settled" in second.final_answer
+
+
+async def test_auto_turn_progressive_turn_cap_settles(service):
+    # The settle also applies to a cap stop (not only a stall): a progressive run that hits
+    # the turn cap short of PUBLISH is finished deterministically with a report.
+    _create_project(service, "capset", stage="WRITE", mode="progressive")
+    service.atomic_update_project(
+        OWNER, "capset",
+        lambda p: p.update(
+            gates={
+                "DESIGN_GATE": "PASS", "EVIDENCE_GATE": "PASS",
+                "CLAIM_GATE": "FAIL", "QUALITY_GATE": "FAIL",
+            }
+        ),
+    )
+
+    async def idle(prompt: str) -> RunTurnResult:
+        return RunTurnResult(final_answer="done")
+
+    run = service.begin_run(OWNER, "capset")
+    outcome = await ResearchRunDriver(max_turns=1).auto_turn(
+        service, owner_id=OWNER, task_id="capset", run_id=run["run_id"],
+        turn_index=1, run_turn=idle,
+    )
+    assert outcome.state == RunState.FINISHED
+    assert outcome.action == "finished"
+    project = service.read_project(OWNER, "capset")
+    assert project["stage"] == "PUBLISH"
+    assert [d["gate"] for d in (project["diagnostics"] or [])] == [
+        "CLAIM_GATE", "QUALITY_GATE",
+    ]
+    assert "active_run" not in project
+    assert project["last_block"]["kind"] == "finished"
+
+
+def test_build_settle_report_records_gaps_and_artifacts():
+    text = build_settle_report(
+        task_name="Tomato study",
+        mode="progressive",
+        created_at="2026-09-05T00:00:00Z",
+        reached_stage="EXECUTE",
+        reason="no stage or gate advance across 2 consecutive auto turns",
+        node_counts=[("claim", 1)],
+        edge_count=1,
+        artifacts=[{"artifact_id": "sources.md", "version": 1, "status": "DRAFT"}],
+        diagnostics=[
+            {
+                "gate": "EVIDENCE_GATE",
+                "stage": "EXECUTE",
+                "target": "EXPLAIN",
+                "failed_checks": [
+                    {"name": "sources_verified", "ok": False, "detail": "need a verified Source"}
+                ],
+            }
+        ],
+    )
+    assert "Tomato study" in text and "Known gaps / unverified items" in text
+    assert "EVIDENCE_GATE" in text and "EXECUTE → EXPLAIN" in text
+    assert "sources_verified: need a verified Source" in text
+    assert "*unverified*" in text
+    assert "`sources.md` v1 (DRAFT)" in text and "Reached **EXECUTE**" in text
 
 
 async def test_auto_turn_blocks_at_turn_cap(service):

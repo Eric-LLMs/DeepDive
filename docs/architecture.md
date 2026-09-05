@@ -2142,7 +2142,14 @@ interactive 5, under caps: `research_driver_max_turns` (8), `research_driver_max
 stalled | cancelled | error` from the persisted run slot; after each successful turn a fixed
 grading chain fixes the state — cancel requested → CANCELLED, stage PUBLISH → FINISHED,
 `pending_overrides` > 0 → BLOCKED, consecutive no-progress over the cap → STALLED, turn/cost cap →
-BLOCKED, else the run continues. Terminal states are recorded in `last_block` (`{kind, reason, at,
+BLOCKED, else the run continues. In **progressive** mode a stop short of PUBLISH for a non-human
+reason (a no-progress stall or a turn/cost cap) is not left mid-way: the driver **auto-settles**
+it — it walks the remaining legal chain to PUBLISH (each un-passed guarding gate records its
+failed checks as a diagnostic) and writes a model-free `settle_report.md` that aggregates the
+produced artifacts/graph and closes with a "Known gaps / unverified items" list, so a run that
+ran out of usable material still ends at PUBLISH with an honest per-stage failure record (never
+RAG-promoted). Strict runs keep the stall/cap stop — an un-passed gate there is a real
+human-decision point. Terminal states are recorded in `last_block` (`{kind, reason, at,
 run_id, execution_id}`), the slot is released via `end_run`, and the terminal message is mirrored
 to the session. `begin_run`/`end_run` keep the `active_run` record in `project.json`; a task
 allows one live run at a time, **`is_running` stays true across the whole background chain**
@@ -2186,8 +2193,9 @@ publishing is best-effort and a no-op when no bus is installed).
 **Cascade delete.** `DELETE /research/tasks/{id}` (the desktop confirms first) records
 `deletion_requested` in `project.json`, soft-deletes the whole cloud task folder into the Trash,
 clears the session routing index, and hard-removes scratch — restoring the Trash folder never
-resurrects the task. Two **409** guards refuse deletion: a task with a live run (`active_run` or a
-RUNNING execution) and a report the Knowledge Base has already indexed ("Please remove from
+resurrects the task. Two **409** guards refuse deletion: a task with a live run (the `active_run`
+slot — an orphaned per-tool RUNNING execution left by a run that stopped mid-step does not block,
+it is wiped by teardown) and a report the Knowledge Base has already indexed ("Please remove from
 Knowledge Base first").
 
 **User-facing entry point:** two ways in — the chat-created **task** (＋ Research → pick a My
