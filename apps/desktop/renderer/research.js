@@ -23,6 +23,22 @@
   // load so the 🔬 chat badge (app.js updateResearchChip) stays live.
   window.researchSessions = window.researchSessions || new Map();
 
+  // A task's execution mode (strict | progressive) is fixed at creation; the UI only echoes it
+  // (locked badge next to Run, and the 🔬 chat sub-bar badge). Shared wording for every surface.
+  const RESEARCH_MODE_INFO = {
+    strict: {
+      label: "Strict",
+      tip: "Strict mode — a failed gate pauses the run for a human override. Locked at creation.",
+    },
+    progressive: {
+      label: "Progressive",
+      tip: "Progressive mode — a failed gate is recorded as a diagnostic and the run continues. Locked at creation.",
+    },
+  };
+  function modeInfo(mode) {
+    return RESEARCH_MODE_INFO[mode === "progressive" ? "progressive" : "strict"];
+  }
+
   function recordResearchSession(detail) {
     if (detail && detail.session_id) {
       window.researchSessions.set(detail.session_id, {
@@ -30,6 +46,7 @@
         name: detail.name || detail.task_id,
         stage: detail.stage || null,
         status: detail.status || null,
+        execution_mode: detail.execution_mode || "strict",
       });
       if (window.updateResearchChip) window.updateResearchChip();
     }
@@ -644,6 +661,15 @@
     titleRow.appendChild(el("span", "rtv-chip stage", `Stage ${detail.stage}`));
     head.appendChild(titleRow);
     const actions = el("div", "rtv-actions");
+    // Read-only echo of the task's locked execution mode, sat next to Run so it is never
+    // mistaken for an editable choice: the mode was set once at creation and cannot be changed.
+    const mode = modeInfo(detail.execution_mode);
+    const modeChip = el(
+      "span", `rtv-chip mode${detail.execution_mode === "progressive" ? " progressive" : ""}`,
+      mode.label
+    );
+    modeChip.title = mode.tip;
+    actions.appendChild(modeChip);
     // Run starts (or resumes) the task's run in one click; Stop requests the cooperative cancel
     // of the in-flight run; Delete cascades the cloud folder + state. Run and Delete disable
     // while a run is in flight (researchRunning), Run switches to its running style, and Stop is

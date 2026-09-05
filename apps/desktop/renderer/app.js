@@ -44,6 +44,23 @@
   // targets the task and drives it through the remaining stages to completion.
   const RESEARCH_RUN_PROMPT =
     "Run this research task now — resume from its current stage and drive it through every remaining stage to completion.";
+
+  // A task's execution mode (strict | progressive) is chosen at creation and locked for its
+  // whole life; the UI only ever *echoes* it (task-card badge + chat sub-bar badge). These
+  // strings keep every surface worded identically.
+  const RESEARCH_MODE_INFO = {
+    strict: {
+      label: "Strict",
+      tip: "Strict mode — a failed gate pauses the run for a human override. Locked at creation.",
+    },
+    progressive: {
+      label: "Progressive",
+      tip: "Progressive mode — a failed gate is recorded as a diagnostic and the run continues. Locked at creation.",
+    },
+  };
+  function researchModeInfo(mode) {
+    return RESEARCH_MODE_INFO[mode === "progressive" ? "progressive" : "strict"];
+  }
   try { state.token = localStorage.getItem("deepdive_token"); } catch { /* ignore */ }
   try { state.guestId = localStorage.getItem("deepdive_guest_id"); } catch { /* ignore */ }
   // Restore cached identity so the bottom bar shows the username immediately,
@@ -1576,7 +1593,9 @@
           // remember it on the active research context for the next open. research.js also
           // records ids from task statuses, so this just covers the first-turn seed.
           if (research && state.sessionId) {
-            (window.researchSessions = window.researchSessions || new Map()).set(state.sessionId, {
+            const prevSeed = (window.researchSessions = window.researchSessions || new Map()).get(state.sessionId) || {};
+            window.researchSessions.set(state.sessionId, {
+              ...prevSeed, // keep execution_mode already recorded for this bound session
               task_id: research.task_id,
               name: research.name,
               stage: null,
@@ -2008,10 +2027,25 @@
     const stage = (meta && meta.stage) || "";
     const title = bar.querySelector(".crc-title");
     const st = bar.querySelector(".crc-stage");
+    const m = bar.querySelector(".crc-mode");
     if (title) title.textContent = `🔬 Research · ${info.name || info.task_id}`;
     if (st) {
       if (stage) { st.textContent = stage; st.classList.remove("hidden"); }
       else st.classList.add("hidden");
+    }
+    // The task's locked execution mode as a read-only badge — the chat's persistent record of
+    // how this task behaves at a gate. Hidden only when the backend gave no mode yet (rare).
+    if (m) {
+      const mode = meta && meta.execution_mode;
+      if (mode) {
+        const mi = researchModeInfo(mode);
+        m.textContent = mi.label;
+        m.classList.toggle("progressive", mode === "progressive");
+        m.title = mi.tip;
+        m.classList.remove("hidden");
+      } else {
+        m.classList.add("hidden");
+      }
     }
     bar.classList.remove("hidden");
     header.classList.add("research-mode"); // hides the truncated #chat-title in the top bar
@@ -2045,6 +2079,7 @@
         if (t && t.session_id) {
           window.researchSessions.set(t.session_id, {
             task_id: t.task_id, name: t.name || t.task_id, stage: t.stage, status: t.status,
+            execution_mode: t.execution_mode || "strict",
           });
           updateResearchChip();
           // Server truth wins: a task still RUNNING (the worker kept chaining) keeps Run / Delete
@@ -2208,7 +2243,9 @@
     // even while a run streams in it (re-selecting the task during a run is harmless).
     if (sessionId && state.sessionId === sessionId) {
       state.activeResearch = { task_id: taskId, name: name || taskId, session_id: sessionId };
+      const prevKnown = window.researchSessions.get(sessionId) || {};
       window.researchSessions.set(sessionId, {
+        ...prevKnown, // keep execution_mode (and anything else) already recorded for this session
         task_id: taskId, name: name || taskId, stage: null, status: null,
       });
       updateResearchChip();
@@ -2224,7 +2261,9 @@
     state.activeResearch = { task_id: taskId, name: name || taskId, session_id: sessionId || null };
     startResearchChipPoll();
     if (sessionId) {
+      const prevKnown = window.researchSessions.get(sessionId) || {};
       window.researchSessions.set(sessionId, {
+        ...prevKnown, // keep execution_mode (and anything else) already recorded for this session
         task_id: taskId, name: name || taskId, stage: null, status: null,
       });
       updateResearchChip();
@@ -2276,6 +2315,23 @@
         <label>Description
           <textarea class="cd-prompt-input" id="rq-desc" rows="4" placeholder="Optional context for the agent…"></textarea>
         </label>
+        <div class="rq-mode">
+          <span class="rq-mode-label">Execution mode</span>
+          <label class="rq-mode-row">
+            <input type="radio" name="rq-mode" value="strict" checked />
+            <span class="rq-mode-opt">
+              <strong>Strict</strong>
+              <small>Default — a failed gate pauses the run for your approval.</small>
+            </span>
+          </label>
+          <label class="rq-mode-row">
+            <input type="radio" name="rq-mode" value="progressive" />
+            <span class="rq-mode-opt">
+              <strong>Progressive</strong>
+              <small>A failed gate is recorded as a diagnostic and the run continues.</small>
+            </span>
+          </label>
+        </div>
         <div class="rq-files">
           <button type="button" class="ghost" id="rq-add-files">＋ Add files</button>
           <div id="rq-files-list" class="rq-files-list"></div>
@@ -2323,6 +2379,10 @@
       const title = overlay.querySelector("#rq-title").value.trim();
       if (!title) { Viewer.toast("Task title is required."); return; }
       const description = overlay.querySelector("#rq-desc").value.trim();
+      // The mode is chosen exactly once, here at creation: the server persists it and every
+      // later resume reads it from the project, so it is locked from the first run onward.
+      const modeEl = overlay.querySelector('input[name="rq-mode"]:checked');
+      const execution_mode = modeEl ? modeEl.value : "strict";
       createBtn.disabled = true;
       createBtn.textContent = "Creating…";
       try {
@@ -2334,6 +2394,7 @@
             description,
             parent_folder_path: parentFolderPath,
             material_asset_ids: chosen.map((c) => c.id),
+            execution_mode,
           }),
         });
         if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }

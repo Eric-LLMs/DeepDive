@@ -1217,6 +1217,26 @@ pre.text-viewer {
   padding: 0 6px;
   background: var(--bg-soft);
 }
+/* The task's locked execution mode, echoed read-only in the chat sub-bar. Strict is the
+   accent-tinted default; progressive shifts to a calm green so a "continues past a failed
+   gate" task reads differently at a glance. */
+#chat-research-bar .crc-mode {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--accent);
+  border: 1px solid rgba(124, 130, 255, 0.35);
+  border-radius: 999px;
+  padding: 0 6px;
+  background: rgba(124, 130, 255, 0.10);
+  letter-spacing: 0.2px;
+  text-transform: none;
+}
+#chat-research-bar .crc-mode.progressive {
+  color: #8fe3b3;
+  border-color: rgba(126, 231, 160, 0.45);
+  background: rgba(126, 231, 160, 0.10);
+}
+#chat-research-bar .crc-mode.hidden { display: none; }
 #chat-research-bar:hover { background: rgba(124, 130, 255, 0.16); }
 #chat-research-bar.hidden { display: none; }
 .chat-title-input {
@@ -2729,6 +2749,10 @@ body.resizing-ew { cursor: ew-resize; }
 .rtv-chip { flex: none; font-size: 10px; color: var(--fg-dim); border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; text-transform: uppercase; letter-spacing: 0.3px; }
 .rtv-chip.active { color: var(--accent); border-color: var(--accent); }
 .rtv-chip.stage { color: var(--fg); }
+/* Read-only echo of the task's locked execution mode, shown next to the Run control. Strict is
+   the accent default; progressive tints green so a "continues past failed gates" task stands out. */
+.rtv-chip.mode { color: var(--accent); border-color: rgba(124, 130, 255, 0.35); text-transform: none; letter-spacing: 0.2px; }
+.rtv-chip.mode.progressive { color: #8fe3b3; border-color: rgba(126, 231, 160, 0.45); }
 .rtv-desc { font-size: 12px; color: var(--fg-dim); line-height: 1.5; margin-top: 2px; }
 .rtv-actions { flex: none; display: flex; gap: 8px; align-items: center; }
 .rtv-actions .primary { font-size: 12px; padding: 6px 12px; }
@@ -2799,6 +2823,20 @@ body.resizing-ew { cursor: ew-resize; }
 }
 .rq-files { margin-top: 10px; }
 .rq-files-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+/* Execution-mode choice in the "＋ Research" dialog: chosen once at creation, then the task is
+   locked to it (Strict default). Overrides the generic .modal label/input styles above. */
+.rq-mode { display: block; margin-top: 12px; }
+.rq-mode-label { display: block; font-size: 12px; color: var(--fg-dim); margin-bottom: 6px; }
+.rq-mode-row {
+  display: flex; flex-direction: row; align-items: flex-start; gap: 8px;
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px;
+  cursor: pointer; margin-bottom: 6px;
+}
+.rq-mode-row input[type="radio"] { margin: 2px 0 0 0; padding: 0; background: transparent; border: none; accent-color: var(--accent); }
+.rq-mode-row:has(input:checked) { border-color: var(--accent); background: rgba(124, 130, 255, 0.06); }
+.rq-mode-opt { display: flex; flex-direction: column; gap: 2px; }
+.rq-mode-opt strong { font-size: 12px; color: var(--fg); }
+.rq-mode-opt small { font-size: 11px; color: var(--fg-dim); line-height: 1.4; }
 .rq-file {
   font-size: 12px;
   color: var(--fg);
