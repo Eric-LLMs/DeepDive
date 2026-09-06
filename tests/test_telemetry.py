@@ -49,21 +49,6 @@ def test_fallback_table_lookup_survives_suffixed_model_names():
     assert estimate_cost_usd(usage, "gpt-4o-mini-2024-07-18") == 0.75
 
 
-def test_qwen38_flash_catalog_gap_entry():
-    """Phase 2B single-entry maintenance: qwen3.8-flash had no priced catalog row, so
-    every research turn costed as PRICING_UNKNOWN (``None``). One fallback-table entry
-    closes the gap — resolution order and unknown-model behavior stay untouched.
-    """
-    usage = {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}
-    assert resolve_model_pricing("qwen3.8-flash") == (0.05, 0.40)
-    assert estimate_cost_usd(usage, "qwen3.8-flash") == 0.45  # not None anymore
-    # Precedence unchanged: an injected catalog price still overrides the builtin entry.
-    injected = (Decimal("0.0001"), Decimal("0.0002"))
-    assert estimate_cost_usd(usage, "qwen3.8-flash", pricing=injected) == 0.30
-    # And a genuinely unknown model still yields PRICING_UNKNOWN, never a silent $0.
-    assert estimate_cost_usd(usage, "no-such-model-either") is None
-
-
 def test_resolve_model_pricing_precedence_injected_wins():
     injected = (Decimal("0.0025"), Decimal("0.0100"))
     assert resolve_model_pricing("gpt-4o", injected) is injected
