@@ -303,8 +303,14 @@ and the append-only session log is an optional collaborator. `AgentKernel.run(..
 final answer or `max_steps`, closing with `agent/session-end`. Each step is one LLM call
 (`AgentLLMPort.chat`) plus execution of any returned tool calls. Concurrency-safe tools are
 batched in parallel (`asyncio.gather`, capped by `max_parallel_tool_calls`); the rest run as
-serial barriers. A tool whose execution `concludes_turn` stops the loop early. Returns
-`AgentResult {messages, final_answer}`.
+serial barriers. Two generic termination paths stop the loop early besides the final answer: a
+tool whose execution `concludes_turn` (a static, tool-declared flag), and a **cooperative
+runtime stop** — a tool may call `AgentTurn.request_stop(reason)` mid-step, and the loop honours
+`stop_requested` only at the step boundary, after this step's tool results are committed and
+recorded, so in-flight work is never dropped; the `reason` is opaque audit metadata and the loop
+interprets no domain concept. In both cases the `finally` block still runs (session-end hooks,
+span finish, audit line). Returns
+`AgentResult {messages, final_answer, usage, error, cost_usd}`.
 
 `run_stream(...)` is the streaming twin: the same pipeline (prompt assembly, tool dispatch,
 session-start/session-end hooks, persistent session memory) with the LLM call streamed. It yields
@@ -476,10 +482,22 @@ kernel, wrapping any ``AgentLLMPort``):
 - **cross-talk-safe streams** — the stream generator is returned through the retry wrapper and bound only to the coroutine's local frame (never a ``self._gen`` slot), so two overlapping turns each own their generator and concurrent SSE streams cannot overwrite each other's deltas. Regression test: ``test_reliable_llm_concurrent_streams_do_not_cross_talk`` (``tests/test_loop_stream.py``).
 
 The loop also enforces a **hard per-turn budget** (:class:`AgentTurn.max_budget_usd`, default
-``settings.max_budget_per_turn_usd``). Each step accumulates ``usage`` on the turn; after the step
-``estimate_cost_usd(turn.usage, model)`` prices it and `_budget_exceeded` aborts the loop once the
-accumulated cost crosses the cap (an ``error`` event is streamed on the SSE path). Cost, usage, and
-budget all live on the per-turn object — concurrent turns never share accounting.
+``settings.max_budget_per_turn_usd``). The **pricing source of truth is the ``llm_models`` catalog**
+(§12.3): whoever resolves the turn's LLM channel (the request path or the worker job) looks the
+model's per-1k ``prompt/completion`` price pair up there and injects it as a plain numeric pair on
+the turn (:func:`agent.engine.telemetry.set_current_pricing` → ``AgentTurn.pricing``), and
+``estimate_cost_usd`` computes the turn cost with ``Decimal`` arithmetic in the same per-1k units as
+wallet billing — the generic runtime carries no DB or billing dependency, only the injected pair. A
+small built-in per-1M table remains as a **last-resort fallback** for a few bare OpenAI-style names;
+it is deliberately *not* a second source of truth. When a model has neither an injected price nor a
+fallback row, the turn cost is **PRICING_UNKNOWN (``cost_usd = None``)** and stays distinct from
+``0.0`` (nothing to bill): the turn span records a ``pricing_unknown`` error, the driver ledger
+counts ``pricing_unknown_turns``, and ``_budget_exceeded`` **fails open** on a ``None`` cost — so a
+price gap never fakes a $0 run, and the step cap plus the driver's stall detection remain the
+deterministic fallback brakes. Each step accumulates ``usage`` on the turn; ``_budget_exceeded``
+aborts the loop once the priced cost crosses the cap (an ``error`` event is streamed on the SSE
+path). Cost, usage, and budget all live on the per-turn object — concurrent turns never share
+accounting.
 
 ### 5.6 Human-in-the-loop: approvals, subagents, plan mode, checkpoints
 
@@ -2141,7 +2159,12 @@ tenancy check.
 moves from *discovery* to *loading the evidence base*, and the whole chain is batched so the agent
 doesn't round-trip a short prompt per URL. For every claimed source the driver decides is load-bearing,
 it first `record_node`s a `Claim` (a `claim_id` minted from the driver's own edge bookkeeping — model
-claims enter the graph *only* as driver-authored claim nodes). It then issues a single
+claims enter the graph *only* as driver-authored claim nodes). A Claim's `strength` uses the
+canonical vocabulary `asserted | supported | confident | contested`; report-style
+`high / medium / low` are accepted and **normalized at the single ingestion point** (`record_node` /
+`mutate_node`), an unrecognized value is refused with a repair hint instead of being stored and
+silently dooming `CLAIM_GATE`, `verify` never promotes or rewrites a claim's strength, and the gate's
+read side applies the same mapping so graphs recorded before the vocabulary fix still score valid. It then issues a single
 `research_scrape fetch` per URL-cluster that re-runs the real page fetch **server-side**: ≤3 URLs per
 call, **parallel inside the call only** — the ≤3 URLs are fetched and HTML-cleaned concurrently (one
 `asyncio.gather`, capped at 6) and their usable drafts are then **saved concurrently** in a second
@@ -2234,6 +2257,36 @@ FAIL and the agent proposes a different approach (resumed by another chat messag
 expose the terminal `last_block` banner and `pending_overrides` (`{approval_id, gate_name,
 reason}`), so a blocked run tells the user exactly what it's waiting on.
 
+**`transition_stage` reports seven outcomes.** A guarded move answers with `result["transition"]` as
+the authoritative verb — `ADVANCED` (the stage move committed), `ALREADY_AT_TARGET` (benign
+idempotent re-request of the stage already occupied: nothing written, no error — answering it as
+"illegal" previously baited the model into retrying with other guesses and burning turns),
+`NOT_READY` (strict, guarding gate never checked), `GATE_BLOCKED` (strict, checked and FAIL — fix
+the work or ask a human, never bypass here), `CONFLICT` (the optional `expected_current_stage`
+argument mismatched, **or** the fresh in-lock read found the stage moved — the CAS closes *inside*
+the `atomic_update_project` critical section, aborting the write), `ILLEGAL` (unknown stage, or not
+the single legal next stage), `ERROR` (persistence failure). `granted` remains the backward-compat
+summary (true only for the two benign outcomes). **Only a committed `ADVANCED` converges the turn**:
+announced strictly after the atomic write succeeded, it then asks the runtime to stop through the
+generic contract — `AgentTurn.request_stop("stage_advanced")` (§5.2) — so the rest of the turn
+cannot re-do the finished stage's collection/verification work and the next turn opens at the new
+stage. The domain layer touches the runtime only through that generic stop; the loop never learns
+the word "stage".
+
+```text
+ auto-turn N                                auto-turn N+1
+┌─────────────────────────────────────┐   ┌──────────────────────────────┐
+│ step k: research_state transition   │   │ opens at the NEW stage       │
+│   └─ atomic commit OK → ADVANCED    │   │ (handoff carries the stage)  │
+│        └─ turn.request_stop(...)    │   │ …                            │
+│ step boundary: loop sees            │   └──────────────────────────────┘
+│   stop_requested → break            │
+│   (tool result already committed)   │
+│ finally: session-end · span · audit │──┘
+└─────────────────────────────────────┘
+  loop knows only `stop_requested` — the string "stage" never enters it
+```
+
 **Execution mode — two gate-control pipelines (strict | progressive), locked at creation.** A task's
 `execution_mode` is chosen when it is created (the desktop ＋Research dialog offers both, defaulting
 to `progressive`; the plugin/API default is `strict`) and locked for the task's whole life. It never
@@ -2257,6 +2310,12 @@ transition's gate has not passed, i.e. the run's failure control flow is one of 
   entry per diagnostic, each labeled unverified; a progressive run that would stop short of PUBLISH
   for a non-human reason is deterministically **auto-settled** instead (the Run-lifecycle paragraph
   below).
+
+**Gate checks carry a severity.** A `QUALITY_GATE` whose project has *no scorecard recorded at all*
+emits its failed check as `severity: diagnostic_only` — a provisioning gap of the current toolset,
+not agent misconduct — so progressive diagnostics and review notes can tell it apart from a real
+scorecard FAIL (`severity: blocking`, e.g. fewer than 7 rows or a fatal finding); strict-mode
+blocking semantics are identical for both.
 
 **Live monitor & per-process logs.** `GET /research/tasks/{id}/monitor` is an SSE stream that
 subscribes to the Redis channel `research:monitor:{task_id}` *before* emitting a `snapshot`, then
