@@ -1180,6 +1180,27 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
                 turn_index=turn_index,
                 run_turn=run_turn,
             )
+            # Progress events that the turn appended to scratch run_events.json are drained into
+            # the bound session chat here, in the worker's async main loop (the only place DB /
+            # session writes belong — safety rule / red line 5). A graded terminal outcome first
+            # appends its own terminal event so it surfaces in the same drain. Best-effort: a DB
+            # failure only logs and never changes the driver outcome.
+            if session_id and not outcome.dropped:
+                if outcome.action != "continue":
+                    with contextlib.suppress(Exception):
+                        service.append_run_event(
+                            user_id,
+                            task_id,
+                            event_type="terminal",
+                            key="run",
+                            detail=(
+                                f"{outcome.action}: {outcome.reason or 'run complete'}"
+                            ),
+                        )
+                with contextlib.suppress(Exception):
+                    await service.drain_run_events(
+                        ctx["session_factory"], user_id, task_id, session_id
+                    )
             return await _settle_research_outcome(
                 ctx, service, driver,
                 owner_id=user_id,

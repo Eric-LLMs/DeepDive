@@ -5,17 +5,24 @@ Config is stored as a JSON blob in app_settings; the flat legacy keys and the ge
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 from api.account_email import _smtp_config
 from api.auth import AuthAdmin, require_admin
 from api.deps import llm
 from api.routers._shared import _fallback_model
-from api.schemas import ProbeModelsRequest, ProvidersUpdateRequest, TestEmailRequest
+from api.schemas import (
+    ProbeModelsRequest,
+    ProvidersUpdateRequest,
+    TestEmailRequest,
+    TestWebSearchRequest,
+)
 from core.config import settings
 from core.infrastructure.db import SessionLocal
 from core.infrastructure.mailer import MailNotConfigured, send_email
 from core.infrastructure.security import get_setting, list_roles, role_to_dict, set_setting
+from core.infrastructure.web_search import build_web_search_provider
 from fastapi import APIRouter, Depends, HTTPException
 
 router = APIRouter(tags=["config"])
@@ -307,6 +314,59 @@ async def test_email(body: TestEmailRequest, _: AuthAdmin = Depends(require_admi
         raise HTTPException(status_code=400, detail="SMTP 未配置:请先在 Settings 里填写 SMTP 信息。")
     except Exception as err:  # noqa: BLE001 — surface the smtplib error to the admin
         raise HTTPException(status_code=400, detail=f"发送失败:{err}")
+
+
+def _effective_web_search(cfg: dict, override: TestWebSearchRequest) -> dict:
+    """Resolve the web-search connection the probe should use.
+
+    Precedence: request override (blank = skip) → stored tools.web_search namespace →
+    stored legacy flat keys → live flat settings. ``config`` (stored JSON) is the DB-first
+    source of truth; the flat settings / env are only the fallback.
+    """
+    tools_ws = (cfg.get("tools") or {}).get("web_search") or {}
+
+    def pick(requested, *candidates) -> str:
+        for c in (requested, *candidates):
+            if c is not None and c != "":
+                return c
+        return ""
+
+    return {
+        "provider": pick(override.provider, tools_ws.get("provider"), cfg.get("web_search_provider"), settings.web_search_provider),
+        "api_key": pick(override.api_key, tools_ws.get("api_key"), cfg.get("web_search_api_key"), settings.web_search_api_key),
+        "engine_id": pick(override.engine_id, tools_ws.get("engine_id"), cfg.get("web_search_engine_id"), settings.web_search_engine_id),
+    }
+
+
+@router.post("/config/test-web-search")
+async def test_web_search(body: TestWebSearchRequest, _: AuthAdmin = Depends(require_admin)) -> dict:
+    """Run one real basic-depth search to verify the web-search connection (admin Tools card).
+
+    Tests the stored config, optionally overridden by the values currently typed in the
+    form (blank api_key keeps the stored one), so an admin can validate a provider + key
+    *before* saving. The key is never echoed: only status / provider / result count and a
+    sample title+url come back.
+    """
+    cfg = await _load_config()
+    eff = _effective_web_search(cfg, body)
+    if not eff["provider"]:
+        return {"status": "degraded", "provider": "", "error_type": "config",
+                "error": "no web search provider configured (set provider in Tools config)", "count": 0}
+    query = body.query.strip() or "web search connectivity test"
+    try:
+        provider = build_web_search_provider(eff["provider"], api_key=eff["api_key"], engine_id=eff["engine_id"])
+    except RuntimeError as exc:
+        return {"status": "degraded", "provider": eff["provider"], "error_type": "config",
+                "error": str(exc), "count": 0}
+    outcome = await asyncio.to_thread(provider.search, query, 3)
+    if outcome.get("status") == "ok":
+        results = outcome.get("results") or []
+        first = results[0] if results else {}
+        return {"status": "ok", "provider": outcome.get("provider"), "count": len(results),
+                "title": first.get("title", ""), "url": first.get("url", "")}
+    err = outcome.get("error") or {}
+    return {"status": "degraded", "provider": outcome.get("provider"),
+            "error_type": err.get("type", "error"), "error": err.get("message", "no details"), "count": 0}
 
 
 @router.post("/config/probe-models")

@@ -242,6 +242,35 @@ function readDir(dir) {
   return result;
 }
 
+// Stream a cloud asset's bytes to a local file path (bearer-authenticated). Shared by
+// single-file export (Save dialog) and whole-folder export (batch). The asset id is
+// stripped to word/dash characters so a hostile id can't influence the request target.
+async function downloadCloudTo(assetId, token, target) {
+  const safeId = String(assetId).replace(/[^\w-]/g, "");
+  const res = await net.fetch(`${BACKEND}/files/${safeId}/download`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try { const b = await res.json(); if (b && b.detail) detail = b.detail; } catch { /* not JSON */ }
+    throw new Error(detail);
+  }
+  const out = fs.createWriteStream(target);
+  await new Promise((resolve, reject) => {
+    Readable.fromWeb(res.body)
+      .on("error", reject)
+      .pipe(out)
+      .on("error", reject)
+      .on("finish", resolve);
+  });
+}
+
+// Sanitize a user-supplied filename for use as a local file name.
+function safeDownloadName(name) {
+  const clean = String(name || "").replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
+  return clean && clean !== "." && clean !== ".." ? clean : "download.bin";
+}
+
 function registerIpcHandlers() {
   ipcMain.handle("pick-folder", async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ["openDirectory"] });
@@ -353,6 +382,64 @@ function registerIpcHandlers() {
     } catch (err) {
       return { ok: false, error: err.message };
     }
+  });
+
+  // Export a single cloud file: a Save dialog proposes the file name in Downloads, and the
+  // asset bytes stream to the chosen path. Resolves { ok, path } | { ok, canceled } | { ok, error }.
+  ipcMain.handle("cloud-download-save", async (_event, { assetId, name, token }) => {
+    if (!assetId || !token) return { ok: false, error: "No asset or token." };
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      title: "Export file",
+      defaultPath: path.join(app.getPath("downloads"), safeDownloadName(name)),
+      buttonLabel: "Export",
+    });
+    if (canceled || !filePath) return { ok: false, canceled: true };
+    try {
+      await downloadCloudTo(assetId, token, filePath);
+      return { ok: true, path: filePath };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // Export a folder subtree: download each listed file to destDir/<relPath>, recreating the
+  // cloud folder structure locally. files: [{ assetId, name, relPath }]; relPath uses "/"
+  // separators and is verified to stay inside destDir (no "..", no absolute segments).
+  // Resolves { ok, count, errors: [{ name, error }] }.
+  ipcMain.handle("cloud-download-batch", async (_event, { files, destDir, token }) => {
+    if (!Array.isArray(files) || files.length === 0) {
+      return { ok: false, error: "No files selected." };
+    }
+    if (!destDir || !token) return { ok: false, error: "No destination or token." };
+    if (!fs.existsSync(destDir) || !fs.statSync(destDir).isDirectory()) {
+      return { ok: false, error: "The destination folder no longer exists." };
+    }
+    const root = path.resolve(destDir);
+    const errors = [];
+    let count = 0;
+    for (const f of files) {
+      const assetId = f && f.assetId;
+      const segs = String(f && f.relPath).split("/").filter((s) => s && s !== ".");
+      const name = segs.join("/") || safeDownloadName(f && f.name);
+      if (!assetId || segs.some((s) => s === "..")) {
+        errors.push({ name: name || "unknown", error: "invalid file path" });
+        continue;
+      }
+      let target = root;
+      for (const seg of segs) target = path.join(target, seg.replace(/[\\/:*?"<>|]/g, "_"));
+      if (target !== root && !target.startsWith(root + path.sep)) {
+        errors.push({ name, error: "path escapes the destination folder" });
+        continue;
+      }
+      try {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        await downloadCloudTo(assetId, token, target);
+        count += 1;
+      } catch (err) {
+        errors.push({ name, error: err.message });
+      }
+    }
+    return { ok: errors.length === 0, count, errors };
   });
 
   // Create a folder inside the workspace (or a subfolder of it). Like delete-file,

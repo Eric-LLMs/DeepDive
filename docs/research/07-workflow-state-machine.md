@@ -42,6 +42,12 @@ DISCOVER → FRAME → EVIDENCE → DESIGN ─[DESIGN GATE]→ EXECUTE ─[EVIDE
 | **REPRODUCE** | everything | `replication/README.md`, `run_all.sh`, `environment.*`, `data_availability.md` | — |
 | **PUBLISH** | final report | `FINAL_REPORT.md` → drive | — |
 
+EVIDENCE runs in batch mode: per claim, fetch ≤3 source URLs in one `research_scrape fetch` call
+(full drafts land under temp/vN/scrape, server-side provenance recorded), judge the pages, then
+verify the whole claim in one idempotent `research_evidence verify` (Sources/Evidence upserted,
+`neutral` records nothing). WRITE reads a fetched page's full draft back via `research_scrape read`
+before citing it.
+
 Gates are evaluated by `research_gate` **at the boundary**: DESIGN GATE after DESIGN,
 EVIDENCE GATE after EXECUTE, CLAIM GATE after WRITE, QUALITY GATE after REVIEW.
 

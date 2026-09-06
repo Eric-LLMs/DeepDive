@@ -14,15 +14,18 @@ import json
 import uuid
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from agent import Context, PluginManager, SkillRegistry, ToolRuntime
 from agent.engine.context import AgentTurn, bind_turn
 from agent.engine.decisions import ToolExecution
 from core.application.drive_service import DriveError
 from core.infrastructure.request_context import set_request_user
+from core.infrastructure.web_fetch import MIN_FETCH_TEXT_CHARS
 
 from plugins.research.plugin import (
     _GATE_NOTE_KEY,
+    _GATES,
     _REASON_LIMIT,
     ResearchService,
     compose_gate_review_note,
@@ -40,6 +43,7 @@ RESEARCH_TOOLS = {
     "research_evidence",
     "research_gate",
     "research_run",
+    "research_scrape",
 }
 
 
@@ -147,7 +151,7 @@ class TestCordisMounting:
         assert count == 0
         assert runtime.all() == []
 
-    async def test_all_six_tools_registered(self, env):
+    async def test_all_research_tools_registered(self, env):
         assert {t.name for t in env.runtime.all()} == RESEARCH_TOOLS
         plugin = env.manager.get("research")
         assert plugin is not None
@@ -1167,3 +1171,805 @@ class TestExecutionMode:
         assert diags[0]["gate"] == "DESIGN_GATE"
         assert diags[0]["stage"] == "DESIGN"
         assert diags[0]["target"] == "EXECUTE"
+
+
+# ── 10. Versioned chat-task run output layout ────────────────────────────────
+# Red lines of the output-layout plan: atomic per-run ``run_seq`` stamped into the driver
+# (temp/vN mirror + outputs/<stem>_vN promote), a fresh ``cloud_assets`` ledger per run,
+# Create-New versioned finals that never reuse another run's assets, silent save_scrape
+# capture under temp/v{N}/scrape/, and the append-only run_events.json drained by the worker.
+class TestRunOutputLayout:
+    @staticmethod
+    def _svc(env) -> ResearchService:
+        return ResearchService(drive=env.drive, scratch_root=env.scratch)
+
+    @staticmethod
+    def _project(env, task_id: str) -> dict:
+        return ResearchService._load_json(env.scratch / str(USER) / task_id / "project.json", None)
+
+    @staticmethod
+    async def _new_task(env, title: str = "task") -> tuple[ResearchService, str, str]:
+        svc = TestRunOutputLayout._svc(env)
+        created = await svc.create_task(USER, title=title)
+        return svc, created["task_id"], created["cloud_folder_path"]
+
+    @staticmethod
+    async def _files_in(env, folder_path: str) -> list[dict]:
+        files = await env.drive.list_files(USER)
+        return [f for f in files if (f["folder_path"] or "") == folder_path]
+
+    async def test_begin_run_mints_run_seq_and_resets_driver_per_run(self, env):
+        svc, task_id, _ = await self._new_task(env)
+        project = self._project(env, task_id)
+        assert project["run_seq"] == 0
+        assert project["driver"] is None
+
+        run1 = svc.begin_run(USER, task_id)
+        p1 = self._project(env, task_id)
+        assert p1["run_seq"] == 1
+        assert p1["driver"]["run_id"] == run1["run_id"]
+        assert p1["driver"]["run_version"] == 1
+        assert p1["driver"]["cloud_assets"] == {}
+        assert p1["driver"]["progress_cursor"] == 0
+
+        svc.end_run(USER, task_id)
+        run2 = svc.begin_run(USER, task_id)
+        p2 = self._project(env, task_id)
+        assert p2["run_seq"] == 2
+        assert p2["driver"]["run_id"] == run2["run_id"]
+        assert p2["driver"]["run_version"] == 2
+        # The transient per-run ledger is reset by every begin_run (never shared across runs).
+        assert p2["driver"]["cloud_assets"] == {}
+        assert p2["driver"]["progress_cursor"] == 0
+        svc.end_run(USER, task_id)
+
+    async def test_begin_run_default_keeps_a_finished_task_untouched(self, env):
+        # A plain begin_run (a typed resume message, no Run control) on a PUBLISHed task must
+        # NOT restart it — stage/gates/diagnostics/graph stay, so casual chat can't burn a
+        # full re-run. It only bumps the version counter (the no-op resume behaviour).
+        svc, task_id, _ = await self._new_task(env)
+        project = self._project(env, task_id)
+        project["run_seq"] = 1
+        project["stage"] = "PUBLISH"
+        project["gates"] = {g: "FAIL" for g in _GATES}
+        project["diagnostics"] = [{"gate": "EVIDENCE_GATE", "stage": "EXECUTE", "target": "EXPLAIN"}]
+        project["last_block"] = {"kind": "finished", "reason": "research task reached PUBLISH"}
+        svc._save_json(svc._project_dir(USER, task_id) / "project.json", project)
+        svc._save_graph(USER, task_id, {"nodes": [{"id": "src:old"}], "edges": []})
+
+        svc.begin_run(USER, task_id)
+        p = self._project(env, task_id)
+        assert p["run_seq"] == 2
+        assert p["stage"] == "PUBLISH"
+        assert p["gates"] == {g: "FAIL" for g in _GATES}
+        assert p["diagnostics"] != []
+        graph = svc._load_graph(USER, task_id)
+        assert len(graph["nodes"]) == 1  # evidence kept
+
+    async def test_begin_run_new_edition_resets_a_finished_task(self, env):
+        # The desktop Run control on a task that already reached PUBLISH starts a NEW edition:
+        # stage -> DISCOVER, gates -> NOT_RUN, diagnostics + last_block cleared, evidence graph
+        # emptied — so the driver actually drives DISCOVER→…→PUBLISH again into run_seq+1
+        # (temp/v2 + outputs/_v2). Versioned history of the prior edition is untouched.
+        svc, task_id, _ = await self._new_task(env)
+        project = self._project(env, task_id)
+        project["run_seq"] = 1
+        project["stage"] = "PUBLISH"
+        project["gates"] = {g: "FAIL" for g in _GATES}
+        project["diagnostics"] = [{"gate": "EVIDENCE_GATE", "stage": "EXECUTE",
+                                   "target": "EXPLAIN", "failed_checks": []}]
+        project["last_block"] = {"kind": "finished", "reason": "research task reached PUBLISH",
+                                 "at": "t", "run_id": "r", "execution_id": "e"}
+        svc._save_json(svc._project_dir(USER, task_id) / "project.json", project)
+        svc._save_graph(USER, task_id, {"nodes": [{"id": "src:old"}], "edges": [{"src": "s", "dst": "d"}]})
+
+        run = svc.begin_run(USER, task_id, new_edition=True)
+        p = self._project(env, task_id)
+        assert p["run_seq"] == 2
+        assert p["driver"]["run_version"] == 2
+        assert p["driver"]["run_id"] == run["run_id"]
+        assert p["stage"] == "DISCOVER"
+        assert p["gates"] == {g: "NOT_RUN" for g in _GATES}
+        assert p["diagnostics"] == []
+        assert p["last_block"] is None
+        graph = svc._load_graph(USER, task_id)
+        assert graph["nodes"] == [] and graph["edges"] == []
+
+    async def test_begin_run_new_edition_is_a_noop_mid_chain(self, env):
+        # new_edition only restarts a FINISHED task. A mid-chain (blocked/resume) task keeps
+        # its stage + evidence so the Run control resumes exactly where it stopped.
+        svc, task_id, _ = await self._new_task(env)
+        project = self._project(env, task_id)
+        project["run_seq"] = 1
+        project["stage"] = "EVIDENCE"
+        project["gates"] = {g: "NOT_RUN" for g in _GATES}
+        project["last_block"] = {"kind": "blocked", "reason": "human override pending"}
+        svc._save_json(svc._project_dir(USER, task_id) / "project.json", project)
+        svc._save_graph(USER, task_id, {"nodes": [{"id": "src:live"}], "edges": []})
+
+        svc.begin_run(USER, task_id, new_edition=True)
+        p = self._project(env, task_id)
+        assert p["run_seq"] == 2
+        assert p["stage"] == "EVIDENCE"  # resumes, never restarted
+        graph = svc._load_graph(USER, task_id)
+        assert len(graph["nodes"]) == 1  # mid-run evidence kept
+
+    async def test_begin_run_falls_back_for_legacy_task_without_run_seq(self, env):
+        svc, task_id, _ = await self._new_task(env)
+        project = self._project(env, task_id)
+        del project["run_seq"]  # a task persisted before this feature
+        project["driver"] = None
+        svc._save_json(svc._project_dir(USER, task_id) / "project.json", project)
+        svc.begin_run(USER, task_id)
+        p = self._project(env, task_id)
+        assert p["run_seq"] == 1
+        assert p["driver"]["run_version"] == 1
+
+    async def test_write_scratch_mirrors_into_temp_vN_and_updates_in_place_same_run(self, env):
+        svc, task_id, cloud_root = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        written = await svc.write_scratch(USER, task_id, artifact_id="plan", content="# Plan v1")
+        assert written["version"] == 1
+
+        # The working copy mirrors into temp/v1 — never into outputs/ (that is promote's job).
+        v1_files = await self._files_in(env, f"{cloud_root}/temp/v1")
+        assert len(v1_files) == 1
+        plan = v1_files[0]
+        assert plan["name"] == "plan.md"
+        assert await env.drive.read_text(USER, uuid.UUID(plan["id"])) == "# Plan v1"
+        assert await self._files_in(env, f"{cloud_root}/outputs") == []
+
+        # The record never carries the run's temp id: the per-run ledger owns it, so one run's
+        # asset id can never leak into a later run's bookkeeping.
+        record = ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "artifacts" / "plan" / "v1", None
+        )
+        assert record["cloud_output_asset_id"] is None
+        ledger = self._project(env, task_id)["driver"]["cloud_assets"]
+        assert {"temp", "temp/v1"} <= set(ledger["_dirs"])
+        assert ledger["_a:plan"]["temp_asset"] == plan["id"]
+
+        # A new scratch version inside the SAME run refreshes that one temp file in place.
+        await svc.create_version(USER, task_id, artifact_id="plan", content="# Plan v1b")
+        v1_files = await self._files_in(env, f"{cloud_root}/temp/v1")
+        assert len(v1_files) == 1
+        assert v1_files[0]["id"] == plan["id"]
+        assert await env.drive.read_text(USER, uuid.UUID(plan["id"])) == "# Plan v1b"
+        svc.end_run(USER, task_id)
+
+    async def test_next_run_mirrors_to_fresh_temp_v2_and_keeps_v1(self, env):
+        svc, task_id, cloud_root = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        await svc.write_scratch(USER, task_id, artifact_id="plan", content="# v1 body")
+        v1_asset = (await self._files_in(env, f"{cloud_root}/temp/v1"))[0]["id"]
+        svc.end_run(USER, task_id)
+
+        # Run 2 starts a brand-new ledger and stamps temp/v2 (never touches v1's files).
+        svc.begin_run(USER, task_id)
+        await svc.write_scratch(USER, task_id, artifact_id="plan", content="# v2 body")
+        v2_files = await self._files_in(env, f"{cloud_root}/temp/v2")
+        assert len(v2_files) == 1
+        assert v2_files[0]["name"] == "plan.md"
+        assert v2_files[0]["id"] != v1_asset  # physical isolation: no cross-run asset reuse
+        assert await env.drive.read_text(USER, uuid.UUID(v2_files[0]["id"])) == "# v2 body"
+        assert await env.drive.read_text(USER, uuid.UUID(v1_asset)) == "# v1 body"
+
+        ledger = self._project(env, task_id)["driver"]["cloud_assets"]
+        assert set(ledger["_dirs"]) == {"temp", "temp/v2"}  # v1's dir is not in run 2's ledger
+        assert ledger["_a:plan"]["temp_asset"] == v2_files[0]["id"]
+        svc.end_run(USER, task_id)
+
+    async def test_temp_folder_created_once_per_run(self, env):
+        # get-or-create (red line 7): several artifacts in one run reuse the single temp/vN
+        # folder row; a duplicate same-name folder is never minted per write.
+        svc, task_id, cloud_root = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        await svc.write_scratch(USER, task_id, artifact_id="plan", content="# p")
+        await svc.write_scratch(USER, task_id, artifact_id="notes", content="# n")
+        folders = await env.drive.list_folders(USER)
+        assert len([f for f in folders if f["path"] == f"{cloud_root}/temp/v1"]) == 1
+        svc.end_run(USER, task_id)
+
+    async def test_promote_mints_outputs_vN_and_single_run_is_strongly_idempotent(self, env):
+        svc, task_id, cloud_root = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        # ``draft.md`` -> ``draft_v1.md`` (the raw stem, not ``draft.md_v1.md``).
+        await svc.write_scratch(USER, task_id, artifact_id="draft.md", content="# final v1")
+
+        promoted = await svc.promote_to_drive(USER, task_id, artifact_id="draft.md")
+        assert promoted["status"] == "PROMOTED"
+        assert promoted["rag_status"] == "PENDING"
+        assert promoted["drive_path"] == f"{cloud_root}/outputs/draft_v1.md"
+        outs = await self._files_in(env, f"{cloud_root}/outputs")
+        assert [a["name"] for a in outs] == ["draft_v1.md"]
+        out_id = outs[0]["id"]
+        assert out_id == promoted["drive_asset_id"]
+        assert await env.drive.read_text(USER, uuid.UUID(out_id)) == "# final v1"
+        # The temp working copy is intact — promotion never moves/renames it (red line 2).
+        # (The mirror keeps the raw artifact id + ``.md``, so ``draft.md`` -> ``draft.md.md``.)
+        assert {a["name"] for a in await self._files_in(env, f"{cloud_root}/temp/v1")} == {
+            "draft.md.md"
+        }
+
+        # Re-promote without changes is a record-level no-op (no second _v1 file).
+        again = await svc.promote_to_drive(USER, task_id, artifact_id="draft.md")
+        assert again["idempotent"] is True
+        assert again["drive_asset_id"] == promoted["drive_asset_id"]
+        assert len(await self._files_in(env, f"{cloud_root}/outputs")) == 1
+
+        # A genuinely-new version in the SAME run refreshes the one _v1 final in place: the
+        # physical asset and filename never bump to _v2 (only a new begin_run can).
+        await svc.create_version(USER, task_id, artifact_id="draft.md", content="# final v2")
+        repromote = await svc.promote_to_drive(USER, task_id, artifact_id="draft.md")
+        outs = await self._files_in(env, f"{cloud_root}/outputs")
+        assert [a["name"] for a in outs] == ["draft_v1.md"]
+        assert outs[0]["id"] == out_id
+        assert repromote["drive_path"] == f"{cloud_root}/outputs/draft_v1.md"
+        assert await env.drive.read_text(USER, uuid.UUID(out_id)) == "# final v2"
+        svc.end_run(USER, task_id)
+
+    async def test_second_run_promotes_to_outputs_v2_keeping_v1(self, env):
+        svc, task_id, cloud_root = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        await svc.write_scratch(USER, task_id, artifact_id="report", content="# final v1")
+        run1 = await svc.promote_to_drive(USER, task_id, artifact_id="report")
+        svc.end_run(USER, task_id)
+
+        svc.begin_run(USER, task_id)  # run_seq 2
+        await svc.write_scratch(USER, task_id, artifact_id="report", content="# final v2")
+        run2 = await svc.promote_to_drive(USER, task_id, artifact_id="report")
+        assert run2["drive_path"] == f"{cloud_root}/outputs/report_v2.md"
+        assert run2["drive_asset_id"] != run1["drive_asset_id"]
+
+        outs = {a["name"]: a for a in await self._files_in(env, f"{cloud_root}/outputs")}
+        assert set(outs) == {"report_v1.md", "report_v2.md"}
+        # v1 is never overwritten or reused — both versioned finals coexist with their bytes.
+        assert await env.drive.read_text(USER, uuid.UUID(outs["report_v1.md"]["id"])) == "# final v1"
+        assert await env.drive.read_text(USER, uuid.UUID(outs["report_v2.md"]["id"])) == "# final v2"
+        svc.end_run(USER, task_id)
+
+    async def test_save_scrape_writes_metadata_file_and_increments_per_run(self, env):
+        svc, task_id, cloud_root = await self._new_task(env)
+        # Outside a versioned run save_scrape is a silent no-op, not an error.
+        assert await svc.save_scrape(
+            USER, task_id, source="web", url="https://x", query="q", content="body"
+        ) == {"saved": False, "path": None, "reason": "no versioned cloud task run"}
+
+        svc.begin_run(USER, task_id)
+        res = await svc.save_scrape(
+            USER, task_id,
+            source="web", url="https://example.com/a",
+            query='how to "cook"/ *tomato*', content="page body",
+        )
+        assert res["saved"] is True
+        assert res["path"] == f"{cloud_root}/temp/v1/scrape/web_how_to_cook_tomato_1.md"
+        text = await env.drive.read_text(USER, uuid.UUID(res["asset_id"]))
+        assert "Source: web" in text
+        assert "URL: https://example.com/a" in text
+        assert 'Query: how to "cook"/ *tomato*' in text
+        assert "Run_version: 1" in text
+        assert "Retrieved_at:" in text
+        assert text.endswith("page body")
+
+        # A second save for the same source+query increments its seq — never overwrites.
+        res2 = await svc.save_scrape(
+            USER, task_id,
+            source="web", url="https://example.com/b",
+            query='how to "cook"/ *tomato*', content="second page",
+        )
+        assert res2["path"] == f"{cloud_root}/temp/v1/scrape/web_how_to_cook_tomato_2.md"
+        scrapes = await self._files_in(env, f"{cloud_root}/temp/v1/scrape")
+        assert {a["name"] for a in scrapes} == {
+            "web_how_to_cook_tomato_1.md", "web_how_to_cook_tomato_2.md"
+        }
+        # Capture is silent: no run event, no chat line (totals fold into stage summaries).
+        events = ResearchService._load_json(
+            svc._run_events_path(USER, task_id), {"events": []}
+        )["events"]
+        assert events == []
+        svc.end_run(USER, task_id)
+
+    async def test_run_events_append_only_dedupe_and_drain(self, env, monkeypatch):
+        svc, task_id, _ = await self._new_task(env)
+        session = uuid.uuid4()
+        svc.bind_session(USER, task_id, session)
+
+        # Outside a run nothing is logged (skills / plain projects have no run_seq).
+        assert svc.append_run_event(
+            USER, task_id, event_type="stage", key="stage:FRAME", detail="x"
+        ) is None
+
+        svc.begin_run(USER, task_id)
+        seq1 = svc.append_run_event(
+            USER, task_id, event_type="stage", key="stage:FRAME",
+            detail="granted DISCOVER -> FRAME", stage="DISCOVER",
+        )
+        seq2 = svc.append_run_event(
+            USER, task_id, event_type="gate_diagnostic", key="gate:EVIDENCE_GATE",
+            detail="2 checks failed", stage="EXECUTE",
+        )
+        # (run_seq, type, key) is appended at most once — replay returns the original seq.
+        assert svc.append_run_event(
+            USER, task_id, event_type="stage", key="stage:FRAME",
+            detail="granted DISCOVER -> FRAME", stage="DISCOVER",
+        ) == seq1
+
+        path = svc._run_events_path(USER, task_id)
+        data = ResearchService._load_json(path, {"events": []})
+        events = data["events"]
+        assert [e["seq"] for e in events] == [seq1, seq2]
+        assert len({e["event_id"] for e in events}) == 2  # unique ids, append-only
+        assert all(e["run_seq"] == 1 for e in events)
+        assert events[0]["type"] == "stage" and events[1]["type"] == "gate_diagnostic"
+
+        # Worker drain: each un-consumed event becomes ONE system row (role=system rows are
+        # filtered from model context everywhere), then the cursor advances past it.
+        inserted = []
+
+        async def fake_insert(session_factory, user_id, sid, role, text):
+            inserted.append((str(user_id), str(sid), role, text))
+
+        monkeypatch.setattr("core.infrastructure.memory.insert_plain_message", fake_insert)
+        written = await svc.drain_run_events(object(), USER, task_id, str(session))
+        assert written == 2
+        assert [(r[2], r[3]) for r in inserted] == [
+            ("system", "[auto-run v1] stage → DISCOVER: granted DISCOVER -> FRAME"),
+            ("system", "[auto-run v1] gate recorded: 2 checks failed"),
+        ]
+        assert all(r[0] == str(USER) and r[1] == str(session) for r in inserted)
+        # Each system row is also mirrored into the bound task's session transcript.
+        mirror = ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "session_history.json", None
+        )
+        assert [t["role"] for t in mirror["turns"]] == ["system", "system"]
+
+        # Cursor advanced: a second drain emits nothing new.
+        assert await svc.drain_run_events(object(), USER, task_id, str(session)) == 0
+        assert self._project(env, task_id)["driver"]["progress_cursor"] == seq2
+        svc.end_run(USER, task_id)
+
+    async def test_drain_db_failure_keeps_cursor_before_failed_row(self, env, monkeypatch):
+        svc, task_id, _ = await self._new_task(env)
+        session = uuid.uuid4()
+        svc.bind_session(USER, task_id, session)
+        svc.begin_run(USER, task_id)
+        s1 = svc.append_run_event(USER, task_id, event_type="stage", key="stage:FRAME", detail="a")
+        s2 = svc.append_run_event(
+            USER, task_id, event_type="artifact", key="artifact:report", detail="b"
+        )
+
+        calls = {"n": 0}
+
+        async def flaky(session_factory, user_id, sid, role, text):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("db down")
+
+        monkeypatch.setattr("core.infrastructure.memory.insert_plain_message", flaky)
+        # s1 is committed (written=1) but the DB dies on s2, so the cursor stops BEFORE it.
+        assert await svc.drain_run_events(object(), USER, task_id, str(session)) == 1
+        assert self._project(env, task_id)["driver"]["progress_cursor"] == s1
+
+        # DB recovers: the retry emits only the failed row, never duplicating s1.
+        drained = []
+
+        async def healthy(session_factory, user_id, sid, role, text):
+            drained.append(text)
+
+        monkeypatch.setattr("core.infrastructure.memory.insert_plain_message", healthy)
+        assert await svc.drain_run_events(object(), USER, task_id, str(session)) == 1
+        assert drained == ["[auto-run v1] b"]
+        assert self._project(env, task_id)["driver"]["progress_cursor"] == s2
+        svc.end_run(USER, task_id)
+
+    async def test_drain_skips_leftover_events_from_an_older_run(self, env, monkeypatch):
+        svc, task_id, _ = await self._new_task(env)
+        session = uuid.uuid4()
+        svc.bind_session(USER, task_id, session)
+        svc.begin_run(USER, task_id)
+        svc.append_run_event(USER, task_id, event_type="stage", key="stage:FRAME", detail="old-run")
+        svc.end_run(USER, task_id)
+        svc.begin_run(USER, task_id)  # run_seq 2; its own events have not been written yet
+
+        inserted = []
+
+        async def fake_insert(session_factory, user_id, sid, role, text):
+            inserted.append(text)
+
+        monkeypatch.setattr("core.infrastructure.memory.insert_plain_message", fake_insert)
+        # Old-run leftovers are never shown again, but the cursor still consumes them.
+        assert await svc.drain_run_events(object(), USER, task_id, str(session)) == 0
+        assert inserted == []
+        assert self._project(env, task_id)["driver"]["progress_cursor"] == 1
+        svc.end_run(USER, task_id)
+
+
+# ── 11. Batch EVIDENCE: fetch / verify / read (E1-E3, E7-E10) ─────────────────
+class TestBatchEvidence:
+    """Wholesale EVIDENCE through the real fetch + provenance + verify path.
+
+    The E-series trust boundaries folded into the batch flow: E3 code-level batch cap,
+    E7 provenance-gated verify (server ledger is authoritative), E8 Claim immutability,
+    E9 read-back authz, E10 concurrent-save isolation — plus E1 (one (Claim, canonical
+    URL) is exactly one Evidence) and E2 (``neutral`` is not a ticket).
+    """
+
+    _PUBLIC = "93.184.216.34"
+
+    @staticmethod
+    def _svc(env) -> ResearchService:
+        return ResearchService(drive=env.drive, scratch_root=env.scratch)
+
+    @staticmethod
+    def _project(env, task_id: str) -> dict:
+        return ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "project.json", None
+        )
+
+    @staticmethod
+    def _graph(env, task_id: str) -> dict:
+        return ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "graph.json", {"nodes": [], "edges": []}
+        )
+
+    @staticmethod
+    def _provenance(env, task_id: str) -> dict:
+        p = TestBatchEvidence._project(env, task_id)
+        return p["driver"]["cloud_assets"].get("_fetch_provenance", {})
+
+    @staticmethod
+    async def _new_task(env) -> tuple[ResearchService, str]:
+        svc = TestBatchEvidence._svc(env)
+        created = await svc.create_task(USER, title="batch evidence")
+        return svc, created["task_id"]
+
+    @staticmethod
+    def _article(fact: str, n: int = 12) -> str:
+        paras = "".join(
+            f"<p>{fact} sentence {i}: the cleaned article text must comfortably clear "
+            "the usable floor so the page counts as a verifiable source.</p>"
+            for i in range(n)
+        )
+        return f"<html><head><title>{fact}</title></head><body><nav>sidebar-menu</nav>{paras}</body></html>"
+
+    @staticmethod
+    def _page_handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        if host == "good.example":
+            return httpx.Response(200, text=TestBatchEvidence._article("unique-fact-0001"))
+        if host == "boom.example":
+            return httpx.Response(200, text=TestBatchEvidence._article("unique-fact-0002"))
+        if host == "empty.example":
+            return httpx.Response(200, text="<html><body><p>nothing much here</p></body></html>")
+        if host == "wall.example":
+            return httpx.Response(
+                200,
+                text="<html><head><title>Sign in to continue</title></head><body>"
+                "<p>please log in to read the full article</p></body></html>",
+            )
+        return httpx.Response(404, text="nope")
+
+    def _install_fetch(self, monkeypatch, handler=_page_handler.__func__):
+        import plugins.research.plugin as rplugin
+
+        monkeypatch.setattr(rplugin, "_FETCH_TRANSPORT_OVERRIDE", httpx.MockTransport(handler))
+        monkeypatch.setattr(rplugin, "_FETCH_RESOLVER_OVERRIDE", lambda host: [self._PUBLIC])
+
+    # ── research_scrape fetch (E3/E7/E10) ───────────────────────────────────
+    async def test_fetch_hard_caps_batch_at_three(self, env):
+        svc, task_id = await self._new_task(env)
+        urls = [f"https://h{i}.example/x" for i in range(4)]
+        with pytest.raises(ValueError, match="at most 3 URLs"):
+            await svc.fetch_save_batch(USER, task_id, urls=urls)
+
+        result = await env.runtime.execute(
+            ToolExecution(
+                call_id=str(uuid.uuid4()),
+                name="research_scrape",
+                arguments={"action": "fetch", "project_id": task_id, "urls": urls},
+            )
+        )
+        assert result.is_error is True
+        assert "at most 3 URLs" in result.error.message
+
+    async def test_fetch_saves_usable_only_records_ledger_and_is_silent(self, env, monkeypatch):
+        svc, task_id = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        self._install_fetch(monkeypatch)
+
+        views = await svc.fetch_save_batch(
+            USER, task_id,
+            urls=[
+                "https://good.example/recipe",
+                "https://empty.example/x",
+                "https://wall.example/y",
+            ],
+        )
+        by_cu = {v["canonical_url"]: v for v in views}
+        assert set(by_cu) == {
+            "https://good.example/recipe", "https://empty.example/x", "https://wall.example/y"
+        }
+
+        good = by_cu["https://good.example/recipe"]
+        assert good["status"] == "ok"
+        assert good["content_status"] == "usable"
+        assert good["saved"] is True
+        assert good["full_char_len"] >= MIN_FETCH_TEXT_CHARS
+        assert good["asset_id"] and good["path"] and good["name"]
+
+        empty = by_cu["https://empty.example/x"]
+        assert empty["status"] == "ok"
+        assert empty["content_status"] == "empty"
+        assert empty["saved"] is False
+        wall = by_cu["https://wall.example/y"]
+        assert wall["status"] == "ok"
+        assert wall["content_status"] == "interstitial"
+        assert wall["saved"] is False
+
+        # E4: the model-facing batch (body already stripped) serializes inside the cap.
+        assert len(json.dumps(views, ensure_ascii=False)) <= 7200
+
+        # E7: the run's provenance ledger records every fetched page with its real verdicts.
+        prov = self._provenance(env, task_id)
+        assert set(prov) == set(by_cu)
+        g = prov["https://good.example/recipe"]
+        assert g["fetch_status"] == "ok" and g["content_status"] == "usable"
+        assert g["full_char_len"] >= MIN_FETCH_TEXT_CHARS and g["saved"] is True
+        assert g["asset_id"] == good["asset_id"]
+        e = prov["https://empty.example/x"]
+        assert e["fetch_status"] == "ok" and e["content_status"] == "empty" and e["saved"] is False
+
+        # E10/E6: the saved draft really holds the cleaned page (nav stripped), on the drive.
+        stored = await env.drive.read_text(USER, uuid.UUID(good["asset_id"]))
+        assert "unique-fact-0001" in stored
+        assert "sidebar-menu" not in stored
+
+        # Silent by contract: capture folds into stage summaries, never a run event / node.
+        events = ResearchService._load_json(
+            svc._run_events_path(USER, task_id), {"events": []}
+        )["events"]
+        assert events == []
+        assert self._graph(env, task_id) == {"nodes": [], "edges": []}
+        svc.end_run(USER, task_id)
+
+    async def test_fetch_one_failed_drive_write_never_polls_ledger(self, env, monkeypatch):
+        svc, task_id = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        self._install_fetch(monkeypatch)
+
+        from core.application import drive_service as drive_mod
+
+        orig = drive_mod.DriveService.save_artifact
+
+        async def flaky(self, user_id, name, mime_type, content, *, folder_path=None,
+                        workspace_id=None, source_asset_id=None):
+            if name.startswith("fetch_boom"):
+                raise RuntimeError("drive down mid-batch")
+            return await orig(self, user_id, name, mime_type, content,
+                              folder_path=folder_path, workspace_id=workspace_id,
+                              source_asset_id=source_asset_id)
+
+        monkeypatch.setattr(drive_mod.DriveService, "save_artifact", flaky)
+        views = await svc.fetch_save_batch(
+            USER, task_id,
+            urls=["https://good.example/recipe", "https://boom.example/big"],
+        )
+        by_cu = {v["canonical_url"]: v for v in views}
+        assert by_cu["https://good.example/recipe"]["saved"] is True
+        boom = by_cu["https://boom.example/big"]
+        assert boom["saved"] is False
+        assert boom["reason"] == "drive write failed"
+
+        # E10: the failed save is absent from the ledger; only successes are recorded.
+        prov = self._provenance(env, task_id)
+        assert set(prov) == {"https://good.example/recipe"}
+        assert "https://boom.example/big" not in prov
+
+        cloud_root = self._project(env, task_id)["cloud_folder_path"]
+        stored = [f for f in await env.drive.list_files(USER)
+                  if f["folder_path"] == f"{cloud_root}/temp/v1/scrape"]
+        assert {a["name"].split("_", 1)[1].split(".", 1)[0] for a in stored} == {"good"}
+        svc.end_run(USER, task_id)
+
+    # ── research_scrape read (E9) ──────────────────────────────────────────────
+    async def test_read_returns_full_draft_only_for_this_runs_fetch(self, env, monkeypatch):
+        svc, task_id = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        self._install_fetch(monkeypatch)
+        (view,) = await svc.fetch_save_batch(
+            USER, task_id, urls=["https://good.example/recipe"]
+        )
+        cu, asset_id, name = view["canonical_url"], view["asset_id"], view["name"]
+        stored = await env.drive.read_text(USER, uuid.UUID(asset_id))
+        expected = ResearchService._scrape_body(stored)
+        assert "unique-fact-0001" in expected
+
+        by_cu = await svc.read_fetch(USER, task_id, canonical_url=cu)
+        by_id = await svc.read_fetch(USER, task_id, asset_id=asset_id)
+        by_name = await svc.read_fetch(USER, task_id, name=name)
+        for r in (by_cu, by_id, by_name):
+            assert r["asset_id"] == asset_id
+            assert r["content"] == expected
+        assert by_cu["canonical_url"] == "https://good.example/recipe"
+
+        # An asset this run never fetched is refused — never a blind drive read.
+        result = await env.runtime.execute(
+            ToolExecution(
+                call_id=str(uuid.uuid4()),
+                name="research_scrape",
+                arguments={"action": "read", "project_id": task_id,
+                           "canonical_url": "https://other.example/nope"},
+            )
+        )
+        assert result.is_error is True
+        assert "no usable fetch recorded this run" in result.error.message
+
+        with pytest.raises(ValueError, match="was not fetched this run"):
+            await svc.read_fetch(USER, task_id, asset_id=str(uuid.uuid4()))
+        # Traversal / path tricks are refused before any drive access.
+        for bad in ("../escape", "a/../b", "sub/../x", "..", ".", "a\\b", "/abs"):
+            with pytest.raises(ValueError):
+                await svc.read_fetch(USER, task_id, name=bad)
+        svc.end_run(USER, task_id)
+
+    async def test_read_refuses_asset_from_an_earlier_run(self, env, monkeypatch):
+        svc, task_id = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        self._install_fetch(monkeypatch)
+        (view,) = await svc.fetch_save_batch(
+            USER, task_id, urls=["https://good.example/recipe"]
+        )
+        cu, asset_id = view["canonical_url"], view["asset_id"]
+        svc.end_run(USER, task_id)
+
+        # A fresh run resets the provenance ledger; the old asset is out of scope.
+        svc.begin_run(USER, task_id)
+        with pytest.raises(ValueError, match="was not fetched this run"):
+            await svc.read_fetch(USER, task_id, asset_id=asset_id)
+        with pytest.raises(ValueError, match="no usable fetch recorded this run"):
+            await svc.read_fetch(USER, task_id, canonical_url=cu)
+        svc.end_run(USER, task_id)
+
+    # ── research_evidence verify (E1/E2/E7/E8) ────────────────────────────────
+    async def _claim_and_fetch_good(self, env, monkeypatch, task_id, claim_id="claim:trust"):
+        self._install_fetch(monkeypatch)
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=task_id,
+                   node={"id": claim_id, "type": "Claim", "label": "tomato fact",
+                         "statement": "botanically, tomatoes are fruits"})
+        views = await self._svc(env).fetch_save_batch(
+            USER, task_id, urls=["https://good.example/recipe"]
+        )
+        return claim_id, views[0]["canonical_url"]
+
+    async def test_verify_requires_an_existing_claim_and_never_edits_it(self, env, monkeypatch):
+        svc, task_id = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        self._install_fetch(monkeypatch)
+
+        # E8: verify never creates a Claim — a missing id is refused precisely.
+        result = await env.runtime.execute(
+            ToolExecution(
+                call_id=str(uuid.uuid4()),
+                name="research_evidence",
+                arguments={"action": "verify", "project_id": task_id,
+                           "claim": {"id": "claim:ghost"},
+                           "findings": [{"url": "https://good.example/recipe",
+                                         "verdict": "supports"}]},
+            )
+        )
+        assert result.is_error is True
+        assert "claim node not found" in result.error.message
+
+        claim_id, cu = await self._claim_and_fetch_good(env, monkeypatch, task_id)
+        out = svc.ingest_evidence(
+            USER, task_id,
+            claim={"id": claim_id, "label": "hijacked", "statement": "rewritten"},
+            findings=[{"url": "https://good.example/recipe", "verdict": "supports",
+                       "facts": ["tomatoes are fruit"], "excerpt": "the draft says so"}],
+        )
+        assert out["claim_id"] == claim_id
+        assert out["verified_sources"] == [cu]
+        assert out["rejected"] == [] and out["neutral_skipped"] == []
+
+        graph = self._graph(env, task_id)
+        claim_node = next(n for n in graph["nodes"] if n["id"] == claim_id)
+        assert claim_node["statement"] == "botanically, tomatoes are fruits"
+        assert claim_node["label"] == "tomato fact"  # verify never rewrote the Claim
+        assert next(n for n in graph["nodes"] if n["type"] == "Source")["verification_status"] == "verified"
+        assert next(n for n in graph["nodes"] if n["type"] == "Evidence")["verdict"] == "supports"
+        assert sorted(e["kind"] for e in graph["edges"]) == ["depends_on", "supports"]
+        svc.end_run(USER, task_id)
+
+    async def test_verify_ignores_payload_content_claims_and_rejects_unproven(self, env, monkeypatch):
+        svc, task_id = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        self._install_fetch(monkeypatch)
+        claim_id = "claim:empty-lie"
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=task_id,
+                   node={"id": claim_id, "type": "Claim", "label": "wall claim"})
+        await svc.fetch_save_batch(USER, task_id, urls=["https://empty.example/x"])
+
+        # The payload can claim usable/char_len all it wants — the server ledger is authoritative.
+        out = svc.ingest_evidence(
+            USER, task_id,
+            claim={"id": claim_id},
+            findings=[{"url": "https://empty.example/x", "verdict": "supports",
+                       "usable": True, "content_status": "usable", "char_len": 5000}],
+        )
+        assert out["verified_sources"] == []
+        assert len(out["rejected"]) == 1
+        assert "not usable" in out["rejected"][0]["reason"]
+        assert self._graph(env, task_id)["nodes"] != []  # only the Claim node exists
+
+        # A URL this run never fetched has no provenance at all → rejected.
+        out2 = svc.ingest_evidence(
+            USER, task_id, claim={"id": claim_id},
+            findings=[{"url": "https://never.example/z", "verdict": "contradicts"}],
+        )
+        assert out2["rejected"][0]["reason"].startswith("no fetch provenance this run")
+
+        # And the honest path verifies: fetch the usable page, then supports is a ticket.
+        claim_id2, cu = await self._claim_and_fetch_good(
+            env, monkeypatch, task_id, claim_id="claim:real"
+        )
+        out3 = svc.ingest_evidence(
+            USER, task_id, claim={"id": claim_id2},
+            findings=[{"url": cu, "verdict": "supports"}],
+        )
+        assert out3["verified_sources"] == [cu]
+        svc.end_run(USER, task_id)
+
+    async def test_neutral_is_not_a_ticket_and_records_nothing_new(self, env, monkeypatch):
+        svc, task_id = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        self._install_fetch(monkeypatch)
+        claim_id, cu = await self._claim_and_fetch_good(env, monkeypatch, task_id)
+
+        # Fresh neutral: no verified Evidence yet, so it is skipped — never a node or edge.
+        out = svc.ingest_evidence(
+            USER, task_id, claim={"id": claim_id},
+            findings=[{"url": cu, "verdict": "neutral"}],
+        )
+        assert out["verified_sources"] == []
+        assert out["nodes_added"] == 0 and out["nodes_updated"] == 0 and out["edges_added"] == 0
+        assert len(out["neutral_skipped"]) == 1
+        graph = self._graph(env, task_id)
+        assert all(n["type"] == "Claim" for n in graph["nodes"])
+        assert graph["edges"] == []
+        svc.end_run(USER, task_id)
+
+    async def test_verify_is_idempotent_per_claim_url(self, env, monkeypatch):
+        svc, task_id = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        self._install_fetch(monkeypatch)
+        claim_id, cu = await self._claim_and_fetch_good(env, monkeypatch, task_id)
+        findings = [{"url": cu, "verdict": "supports",
+                     "facts": ["tomatoes are fruit"], "excerpt": "the draft says so"}]
+
+        first = svc.ingest_evidence(USER, task_id, claim={"id": claim_id}, findings=findings)
+        assert first["nodes_added"] == 2 and first["edges_added"] == 2  # Source + Evidence
+
+        # E1: replaying the same (Claim, canonical URL) is an upsert, never a duplicate.
+        second = svc.ingest_evidence(USER, task_id, claim={"id": claim_id}, findings=findings)
+        assert second["nodes_added"] == 0 and second["nodes_updated"] == 0
+        assert second["edges_added"] == 0
+        graph = self._graph(env, task_id)
+        assert len(graph["nodes"]) == 3  # Claim + Source + Evidence
+        assert len(graph["edges"]) == 2
+        svc.end_run(USER, task_id)
+
+    async def test_batch_flow_satisfies_evidence_gate(self, env, monkeypatch):
+        svc, task_id = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        self._install_fetch(monkeypatch)
+        claim_id, cu = await self._claim_and_fetch_good(env, monkeypatch, task_id)
+        svc.ingest_evidence(
+            USER, task_id, claim={"id": claim_id},
+            findings=[{"url": cu, "verdict": "supports"}],
+        )
+
+        result = await _run(env.runtime, "research_gate", action="check",
+                            project_id=task_id, gate_name="EVIDENCE_GATE")
+        assert result["status"] == "PASS"
+        assert all(c["ok"] for c in result["checks"])
+        svc.end_run(USER, task_id)

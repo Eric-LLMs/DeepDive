@@ -2551,6 +2551,18 @@ body.resizing-ew { cursor: ew-resize; }
 }
 .research-section-title { font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 4px; }
 .research-section { margin-bottom: 12px; }
+.research-tasks-toolbar { padding: 0 0 6px; }
+.research-tasks-toolbar button {
+  width: 100%;
+  padding: 5px 8px;
+  background: var(--bg-soft-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.research-tasks-toolbar button:hover { border-color: var(--accent); color: var(--accent); }
 .research-row {
   display: flex;
   align-items: center;
@@ -2623,19 +2635,24 @@ body.resizing-ew { cursor: ew-resize; }
 .research-status-sub { font-size: 11px; color: var(--fg-dim); line-height: 1.4; }
 .research-status-empty { font-size: 12px; color: var(--fg-dim); padding: 8px 0; }
 
-/* Discrete stage ladder: DISCOVER ✓ ➔ FRAME ● ➔ … ○ */
-.research-stage-bar { display: flex; gap: 3px; flex-wrap: wrap; align-items: center; }
-.research-stage-arrow { font-size: 11px; color: var(--fg-dim); }
+/* Canonical 10-stage ladder: DISCOVER ✓ ➔ FRAME ● ➔ … ➔ PUBLISH ○. Each pill travels with its
+   trailing arrow as one ``step`` flex unit, so a narrow sidebar wraps the chain at stage boundaries
+   (two or three tidy rows) and a wrapped row always starts with a stage — never an orphan ➔.
+   Row-gap keeps wrapped lines from colliding; no stage is ever dropped for space. */
+.research-stage-bar { display: flex; flex-wrap: wrap; align-items: center; column-gap: 1px; row-gap: 6px; }
+.research-stage-step { display: inline-flex; align-items: center; }
+.research-stage-arrow { font-size: 10px; color: var(--fg-dim); margin: 0 2px; }
 .research-stage-pill {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 3px 8px;
+  padding: 2px 7px;
   font-size: 11px;
-  border-radius: 12px;
+  border-radius: 11px;
   border: 1px solid var(--border);
   background: var(--bg-soft-2);
   color: var(--fg-dim);
+  white-space: nowrap;
 }
 .research-stage-mark { font-size: 10px; line-height: 1; }
 .research-stage-pill.done { color: var(--fg); border-color: var(--accent); }
@@ -2644,14 +2661,78 @@ body.resizing-ew { cursor: ew-resize; }
 .research-gates { display: flex; gap: 6px; flex-wrap: wrap; }
 .research-gate-chip { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); color: var(--fg-dim); }
 .research-gate-chip.pass { color: #34d399; border-color: #34d399; }
+.research-gate-chip.fail { color: #f87171; border-color: #f87171; }
 
-.research-graph { display: flex; flex-direction: column; gap: 8px; }
-.research-graph-group { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-.research-graph-group-title { font-size: 11px; color: var(--fg-dim); width: 70px; }
-.research-node { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg-soft-2); color: var(--fg); }
-.research-node-source { border-color: #60a5fa; }
-.research-node-evidence { border-color: #fbbf24; }
-.research-node-claim { border-color: #34d399; }
+/* ── Evidence-graph summary (status column) + right-hand detail drawer ── */
+/* The narrow status column only gets a compact metric card (counts + a "View graph" affordance)
+   — long Claim/Source text lives in the drawer, never flat-rendered here. The drawer is a
+   right-anchored overlay; closed = visibility:hidden with the panel translated off-screen, and
+   .open slides it in (pointer events stay inert until visible). */
+.evg { display: flex; flex-direction: column; gap: 5px; }
+.evg-row { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; font-size: 11px; }
+.evg-key { width: 62px; flex-shrink: 0; color: var(--fg-dim); text-transform: uppercase; font-size: 9px; letter-spacing: .4px; }
+.evg-val { font-variant-numeric: tabular-nums; color: var(--fg); }
+.evg-extra { display: inline-flex; gap: 4px; margin-left: auto; }
+.evg-chip { font-size: 9px; padding: 0 5px; border-radius: 999px; border: 1px solid var(--border); color: var(--fg-dim); white-space: nowrap; }
+.evg-chip.ok { color: #34d399; border-color: #34d399; }
+.evg-chip.bad { color: #f87171; border-color: #f87171; }
+.evg-btn { width: 100%; margin-top: 6px; padding: 3px 0; font-size: 11px; cursor: pointer; }
+.evg-btn:hover { border-color: var(--accent); color: var(--fg); }
+
+.graph-drawer-root { position: fixed; inset: 0; z-index: 200; visibility: hidden; pointer-events: none; transition: visibility 0s linear .2s; }
+.graph-drawer-root.open { visibility: visible; pointer-events: auto; transition-delay: 0s; }
+.graph-drawer-scrim { position: absolute; inset: 0; background: rgba(0, 0, 0, .45); opacity: 0; transition: opacity .18s ease; }
+.graph-drawer-root.open .graph-drawer-scrim { opacity: 1; }
+.graph-drawer-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(560px, 94vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-soft);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, .4);
+  transform: translateX(100%);
+  transition: transform .18s ease;
+}
+.graph-drawer-root.open .graph-drawer-panel { transform: none; }
+.graph-drawer-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.graph-drawer-title { font-weight: 600; font-size: 13px; color: var(--fg); overflow-wrap: anywhere; }
+.graph-drawer-close { padding: 2px 8px; font-size: 14px; line-height: 1; cursor: pointer; flex-shrink: 0; }
+.graph-drawer-body { flex: 1; min-height: 0; overflow: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 14px; }
+
+/* Drawer inner content */
+.evg-strip { display: flex; flex-wrap: wrap; gap: 4px; }
+.evg-strip-chip { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--fg-dim); }
+.evg-strip-chip.ok { color: #34d399; border-color: #34d399; }
+.evg-strip-chip.bad { color: #f87171; border-color: #f87171; }
+.evg-sec { display: flex; flex-direction: column; gap: 8px; }
+.evg-sec-title { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: var(--fg-dim); border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.evg-muted { font-size: 11px; color: var(--fg-dim); font-style: italic; }
+.evg-claim { display: flex; flex-direction: column; gap: 6px; }
+.evg-claim-head { display: flex; align-items: baseline; gap: 8px; }
+.evg-claim-label { font-size: 12px; font-weight: 600; color: var(--fg); overflow-wrap: anywhere; }
+.evg-id { font-size: 9px; color: var(--fg-dim); font-family: var(--mono); flex-shrink: 0; margin-left: auto; }
+.evg-card { border: 1px solid var(--border); border-left-width: 3px; border-radius: 8px; background: var(--bg-soft-2); padding: 7px 9px; display: flex; flex-direction: column; gap: 5px; }
+.evg-card.ok { border-left-color: #34d399; }
+.evg-card.bad { border-left-color: #f87171; }
+.evg-card.dim { border-left-color: var(--fg-dim); }
+.evg-card-top { display: flex; align-items: flex-start; gap: 7px; }
+.evg-badge { font-size: 9px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--fg-dim); text-transform: uppercase; letter-spacing: .4px; flex-shrink: 0; margin-top: 1px; white-space: nowrap; }
+.evg-badge.ok { color: #34d399; border-color: #34d399; }
+.evg-badge.bad { color: #f87171; border-color: #f87171; }
+.evg-card-title { font-size: 12px; color: var(--fg); overflow-wrap: anywhere; }
+.evg-src { display: flex; gap: 5px; align-items: baseline; font-size: 11px; }
+.evg-src-arrow { color: var(--fg-dim); font-size: 9px; text-transform: uppercase; }
+.evg-url { color: var(--accent); overflow-wrap: anywhere; font-family: var(--mono); font-size: 10px; }
+.evg-excerpt { font-size: 11px; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
+.evg-facts { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 2px; }
+.evg-facts li { font-size: 11px; color: var(--fg-dim); overflow-wrap: anywhere; }
+.evg-src-row { display: flex; align-items: baseline; gap: 7px; font-size: 11px; flex-wrap: wrap; }
+.evg-src-row .evg-url { flex: 1 1 auto; min-width: 0; }
+.evg-src-meta { color: var(--fg-dim); font-size: 10px; white-space: nowrap; margin-left: auto; }
 
 /* ── Bound research session transcript (the chat driving the task) ── */
 /* ── Main pane: selected task's two-zone workbench ──
@@ -2703,6 +2784,8 @@ body.resizing-ew { cursor: ew-resize; }
 .rtv-col-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--fg); }
 .rtv-col-count { flex: none; font-size: 11px; color: var(--fg-dim); }
 .rtv-col-hint { flex: none; margin-left: auto; font-size: 11px; color: var(--fg-dim); text-transform: none; letter-spacing: 0; }
+.rtv-preview-close { flex: none; margin-left: 4px; padding: 1px 7px; font-size: 13px; line-height: 1.2; cursor: pointer; color: var(--fg-dim); }
+.rtv-preview-close:hover { color: var(--fg); border-color: var(--accent); }
 .rtv-tree-col { flex: 3 1 0; min-width: 220px; }
 .rtv-preview-col { flex: 5 1 0; min-width: 0; }
 /* Tree scroll region: only the tree scrolls vertically; wide long names scroll horizontally. */

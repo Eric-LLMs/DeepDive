@@ -34,6 +34,7 @@ MUTATING_ACTIONS: dict[str, set[str]] = {
         "link_edge",
         "mutate_node",
         "invalidate_downstream",
+        "verify",
     },
     "research_gate": {"check", "explain_failure", "request_override", "resolve_override"},
     "research_run": set(),

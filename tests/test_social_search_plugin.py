@@ -193,9 +193,9 @@ class TestX:
             }
         ]
 
-    async def test_without_token_degrades_to_site_scoped_web(self):
+    async def test_without_token_degrades_to_domain_search(self):
         # No X_BEARER_TOKEN → the x adapter must never fail: it degrades to a
-        # keyless site-scoped aggregate web search (site:x.com + site:twitter.com).
+        # domain-scoped indexed web search of x.com / twitter.com (provider seam).
         hits = [
             {
                 "title": "q in a post",
@@ -203,21 +203,21 @@ class TestX:
                 "url": "https://x.com/alice/status/1",
             }
         ]
-        with mock.patch.dict(os.environ, {"X_BEARER_TOKEN": ""}, clear=False):
-            with mock.patch.object(
-                mod, "site_limited_web_search", return_value=hits
-            ) as fake_search:
-                result = await mod._execute({"query": "q", "platform": "x"}, exec=None)
-        assert [c.args[0] for c in fake_search.call_args_list] == ["x.com", "twitter.com"]
+        envelope = {"status": "ok", "provider": "tavily", "results": hits}
+        with mock.patch.dict(os.environ, {"X_BEARER_TOKEN": ""}, clear=False), mock.patch.object(
+            mod, "_domain_search", return_value=envelope
+        ) as fake:
+            result = await mod._execute({"query": "q", "platform": "x"}, exec=None)
+        assert fake.call_args.kwargs["domains"] == ["x.com", "twitter.com"]
         assert result and all(i["platform"] == "x" for i in result)
         assert result[0]["url"] == "https://x.com/alice/status/1"
 
 
 # ── unsupported / bad input ──────────────────────────────────────────────────
 class TestUnsupported:
-    async def test_zhihu_degrades_to_site_scoped_web(self):
+    async def test_zhihu_degrades_to_domain_search(self):
         # zhihu has no public API but IS supported — the adapter degrades to a
-        # keyless site-scoped aggregate web search of zhihu.com.
+        # domain-scoped indexed web search of zhihu.com.
         hits = [
             {
                 "title": "知乎上关于 q 的回答",
@@ -225,10 +225,39 @@ class TestUnsupported:
                 "url": "https://www.zhihu.com/question/12345",
             }
         ]
-        with mock.patch.object(mod, "site_limited_web_search", return_value=hits) as fake_search:
+        envelope = {"status": "ok", "provider": "tavily", "results": hits}
+        with mock.patch.object(mod, "_domain_search", return_value=envelope) as fake:
             result = await mod._execute({"query": "q", "platform": "zhihu"}, exec=None)
-        assert fake_search.call_args_list[0].args[0] == "zhihu.com"
+        assert fake.call_args.kwargs["domains"] == ["zhihu.com"]
         assert result and result[0]["platform"] == "zhihu"
+
+    async def test_degrade_drops_off_host_hits(self):
+        # The platform guarantee: an engine hit off zhihu.com never masquerades as social
+        # content, even when the underlying search leaks one.
+        envelope = {
+            "status": "ok",
+            "provider": "tavily",
+            "results": [
+                {"title": "off-site", "snippet": "s", "url": "https://evil.example/p"},
+            ],
+        }
+        with mock.patch.object(mod, "_domain_search", return_value=envelope):
+            result = await mod._execute({"query": "q", "platform": "zhihu"}, exec=None)
+        assert result == []
+
+    async def test_degrade_outage_raises_not_empty(self):
+        # A search-backend outage must surface as an error — never as a fake empty result
+        # ("0 evidence"), so gate diagnostics can distinguish infra-down from no-evidence.
+        envelope = {
+            "status": "degraded",
+            "provider": "tavily",
+            "results": [],
+            "error": {"type": "timeout", "message": "request timed out"},
+        }
+        with mock.patch.object(mod, "_domain_search", return_value=envelope), pytest.raises(
+            RuntimeError, match="degrade search unavailable"
+        ):
+            await mod._execute({"query": "q", "platform": "zhihu"}, exec=None)
 
     async def test_unknown_platform(self):
         with pytest.raises(RuntimeError, match="unknown platform"):

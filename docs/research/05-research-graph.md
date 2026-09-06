@@ -43,6 +43,12 @@ so "which execution produced this result" is always answerable.
 `motivates, uses, transformed_by, produces, supports, appears_in, invalidates, overrides,
 derived_from, generated_by, depends_on, cites, tests`.
 
+Evidence wiring (`research_evidence action="verify"`): an Evidence node links to its Source via
+`depends_on`, and its Claim via `supports` / `contradicts` — the **only** claim edge kinds. There
+is no `neutral` edge kind: a `neutral` verdict merely annotates an existing verified Evidence
+node's `verdict`, and never creates a node or edge (verify is an idempotent batch upsert keyed by
+`(Claim id, canonical_url)`).
+
 | Edge | Typical tail → head |
 |---|---|
 | `motivates` | Question → Design / Hypothesis |

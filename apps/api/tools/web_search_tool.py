@@ -14,7 +14,16 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
             raise RuntimeError("web search is not configured")
         query = args["query"]
         top_k = args.get("top_k", 5)
-        return await asyncio.to_thread(provider.search, query, top_k)
+        outcome = await asyncio.to_thread(provider.search, query, top_k)
+        if outcome.get("status") == "degraded":
+            # A real engine outage must surface as a tool failure — never masquerade as a
+            # normal "0 results" search, so gate diagnostics can tell the two apart.
+            err = outcome.get("error") or {}
+            raise RuntimeError(
+                f"web search degraded (provider={outcome.get('provider')}, "
+                f"{err.get('type', 'error')}): {err.get('message', 'no details')}"
+            )
+        return outcome.get("results") or []
 
     runtime.register(
         define_tool(

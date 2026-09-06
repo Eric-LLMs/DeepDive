@@ -13,16 +13,18 @@ Platform reality (honest):
   ``oauth.reddit.com`` API, which is the reliable live path.
 - ``x`` — the free public API is gone. With an ``X_BEARER_TOKEN`` env var set (X API v2
   recent search) the official API is used; without a token, the adapter *degrades* to a
-  site-scoped aggregate web search (``site:x.com`` + ``site:twitter.com``) instead of
-  failing — search engines still index much of what is posted there.
+  domain-scoped indexed web search of ``x.com`` / ``twitter.com`` instead of failing —
+  search engines still index much of what is posted there.
 - ``zhihu`` — no public API and aggressive anti-bot. The adapter degrades to a
-  site-scoped aggregate web search (``site:zhihu.com``) so answers and articles remain
+  domain-scoped indexed web search of ``zhihu.com`` so answers and articles remain
   reachable through the engines that index them.
 
-The x / zhihu degrade path runs through the same keyless multi-engine aggregate as the
-``web_search`` tool (``core.infrastructure.web_search_aggregate``): concurrent engines,
-tolerance degradation, real-URL decode, dedup/fusion/quality filter — a single code path
-for "no key, no login, still get results".
+The x / zhihu degrade path runs through the web-search provider seam's domain search
+(``core.infrastructure.web_search.domain_search``): Tavily scopes the query server-side
+with ``include_domains`` when it is the configured provider, otherwise the keyless
+site-scoped aggregate is used. Every result is guaranteed to live on the platform host. A
+search-backend outage / timeout / auth failure is surfaced as a tool error (``degraded``)
+— it is never disguised as a normal empty result, so gate diagnostics stay honest.
 
 ``platform="auto"`` runs every adapter that is actually configured (reddit always, x only
 when a token exists) concurrently and merges the results.
@@ -42,7 +44,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import time
 from urllib.parse import quote, urlparse
@@ -52,7 +53,7 @@ from agent.engine.decisions import text_block
 from agent.plugins.base import Plugin
 from agent.tools.definition import ToolOutput, define_tool
 from agent.tools.tool_permissions import ToolPermission
-from core.infrastructure.web_search_aggregate import site_limited_web_search
+from core.infrastructure.web_search import domain_search as _domain_search
 
 _USER_AGENT = "deepdive-social-search/0.1 (learning-workbench assistant)"
 _TIMEOUT = httpx.Timeout(15.0)
@@ -84,32 +85,44 @@ def _item(platform, *, title, content, url, author="", metrics=None, published_u
 
 
 def _web_degrade_to_items(platform: str, hosts: list[str], query: str, limit: int) -> list[dict]:
-    """Degrade path for platforms with no key/login: site-scoped aggregate web search.
+    """Degrade path for platforms with no key/login: domain-scoped indexed web search.
 
-    Runs ``site:<host> <query>`` through the keyless multi-engine aggregate for each
-    host, then dedupes and caps to ``limit``. The aggregate already dedupes/filters by
-    quality; here we additionally guarantee every returned URL lives on the platform's
-    own host, so an off-site hit can never masquerade as social content.
+    Asks the active provider seam for pages on ``hosts`` (Tavily ``include_domains`` when
+    configured; otherwise the keyless site-scoped aggregate) — *indexed web/domain search*,
+    never misrepresented as an official platform API. Every returned URL is guaranteed to
+    live on the platform's own host, so an off-site hit can never masquerade as social
+    content. When the search backend itself is down / timing out / auth-failing, this
+    raises instead of returning an empty list, so an infrastructure outage is never
+    mistaken for "0 relevant results".
     """
     out: list[dict] = []
+    if not hosts or not query.strip():
+        return out
+    envelope = _domain_search(query, limit, domains=hosts)
+    if envelope.get("status") != "ok":
+        err = envelope.get("error") or {}
+        raise RuntimeError(
+            f"{platform} degrade search unavailable ({err.get('type', 'error')}): "
+            f"{err.get('message', 'no details')} — the search backend is down, not 'no results'"
+        )
+    allowed = [h.lower() for h in hosts]
     seen: set[tuple[str, str]] = set()
-    per_host = max(1, math.ceil(limit / len(hosts)))
-    for host in hosts:
-        for hit in site_limited_web_search(host, query, top_k=per_host):
-            key = (urlparse(hit["url"]).hostname or "", hit["title"].strip().lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(
-                _item(
-                    platform,
-                    title=hit["title"],
-                    content=hit["snippet"][:_SNIPPET_CHARS],
-                    url=hit["url"],
-                )
+    for hit in envelope.get("results", []):
+        host = (urlparse(hit["url"]).hostname or "").lower()
+        if not any(host == d or host.endswith("." + d) for d in allowed):
+            continue
+        key = (host, hit["title"].strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            _item(
+                platform,
+                title=hit["title"],
+                content=(hit["snippet"] or "")[:_SNIPPET_CHARS],
+                url=hit["url"],
             )
-            if len(out) >= limit:
-                return out
+        )
     return out
 
 
@@ -289,8 +302,8 @@ _ADAPTERS = {"reddit": _reddit, "x": _x, "zhihu": _zhihu}
 def _available() -> list[str]:
     """Platforms merged by ``auto``: reddit always, plus official-API platforms whose
     keys are configured. x / zhihu degrade paths are *always* available, but running two
-    extra site-scoped aggregate searches on every ``auto`` call is slow, so they are
-    opt-in via an explicit ``platform`` argument rather than part of ``auto``."""
+    extra domain-scoped web searches on every ``auto`` call is slow, so they are opt-in
+    via an explicit ``platform`` argument rather than part of ``auto``."""
     available = ["reddit"]
     if os.environ.get("X_BEARER_TOKEN"):
         available.append("x")
@@ -342,8 +355,8 @@ PLUGIN = Plugin(
                 "(title, content, author, metrics, url). Platforms: reddit (anonymous "
                 "JSON first; REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD enables the live "
                 "OAuth API), x (X_BEARER_TOKEN enables the official API; otherwise it "
-                "degrades to a keyless site-scoped web search of x.com/twitter.com), "
-                "zhihu (no public API; degrades to a keyless site-scoped web search of "
+                "degrades to a domain-scoped indexed web search of x.com/twitter.com), "
+                "zhihu (no public API; degrades to a domain-scoped indexed web search of "
                 "zhihu.com). Use it to find community opinions, first-hand experiences, "
                 "or current discussion on a topic."
             ),

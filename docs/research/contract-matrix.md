@@ -52,6 +52,7 @@
 | `research_artifact` | Artifact, (Graph nodes via support) | promote validates PROMOTED status |
 | `research_state` | Stage | requires gate PASS before transition |
 | `research_evidence` | Graph, Source, Projections | feeds all gates' evidence_links |
+| `research_scrape` | Scrape store (temp/vN/scrape) | `save_scrape` records raw sources; `fetch`/`read` are the batch-EVIDENCE fetch + full-draft read-back path (fetch provenance gates every `verify`) |
 | `research_gate` | Gate, Approval | DESIGN / EVIDENCE / CLAIM / QUALITY |
 | `research_run` | Execution, Artifact | sandbox blocked unless profile allows |
 

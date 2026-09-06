@@ -713,6 +713,21 @@
       ctxMenuEl.appendChild(sep);
       ctxMenuEl.appendChild(mk("🗑 Delete folder", () => deleteFolder(folder)));
     }
+    // Export the clicked entity to local disk (right-click a file or a folder). Trash is
+    // skipped: trashed files are not part of the browseable folder tree.
+    if (file) {
+      const sep = document.createElement("div");
+      sep.className = "drive-ctxmenu-sep";
+      ctxMenuEl.appendChild(sep);
+      ctxMenuEl.appendChild(mk("📤 Export file…", () => exportCloudFile(file)));
+    } else if (folder && !ctx.trash) {
+      const sep = document.createElement("div");
+      sep.className = "drive-ctxmenu-sep";
+      ctxMenuEl.appendChild(sep);
+      const topName = folder.name || (ws ? wsName(ws) : "My Drive");
+      ctxMenuEl.appendChild(mk("📤 Export folder…", () =>
+        exportCloudFolder(driveFolderExportList(ws, path, topName), topName)));
+    }
     ctxMenuEl.style.left = `${Math.min(x, window.innerWidth - 200)}px`;
     ctxMenuEl.style.top = `${Math.min(y, window.innerHeight - 120)}px`;
     document.body.appendChild(ctxMenuEl);
@@ -721,6 +736,88 @@
   function closeCtxMenu() {
     if (ctxMenuEl) { ctxMenuEl.remove(); ctxMenuEl = null; }
   }
+
+  // ── Cloud export to local disk (shared with the Research tree) ──────────
+  // Both file trees right-click their rows and export through the main process, which owns
+  // the OS dialogs and streams the asset bytes with the bearer token.
+
+  // Generic ephemeral menu, reused by research.js so every right-click export shares the same
+  // .drive-ctxmenu look and is closed by the global outside-click/Escape listeners below.
+  window.cloudCtxMenu = (x, y, items) => {
+    closeCtxMenu();
+    if (!items || !items.length) return;
+    ctxMenuEl = document.createElement("div");
+    ctxMenuEl.className = "drive-ctxmenu";
+    for (const it of items) {
+      if (it.sep) {
+        const s = document.createElement("div");
+        s.className = "drive-ctxmenu-sep";
+        ctxMenuEl.appendChild(s);
+      } else {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = it.label;
+        b.addEventListener("click", () => { closeCtxMenu(); it.fn(); });
+        ctxMenuEl.appendChild(b);
+      }
+    }
+    ctxMenuEl.style.left = `${Math.min(x, window.innerWidth - 200)}px`;
+    ctxMenuEl.style.top = `${Math.min(y, window.innerHeight - 120)}px`;
+    document.body.appendChild(ctxMenuEl);
+  };
+
+  // Export a single cloud file → Save dialog (default: the file name in Downloads).
+  async function exportCloudFile(f) {
+    try {
+      const token = getToken();
+      if (!token) { Viewer.toast("Sign in to export cloud files."); return; }
+      const res = await window.desktopAPI.saveCloudFile({ assetId: f.id, name: f.name, token });
+      if (!res || res.canceled) return;
+      if (!res.ok) { Viewer.toast(`Export failed: ${res.error}`); return; }
+      Viewer.toast(`Exported "${f.name}" → ${res.path}`);
+    } catch (e) {
+      Viewer.toast(`Export failed: ${e.message}`);
+    }
+  }
+
+  // Export a set of files (relative paths preserved under the destination) into a picked folder.
+  // files: [{ assetId, name, relPath }].
+  async function exportCloudFolder(files, label) {
+    try {
+      const token = getToken();
+      if (!token) { Viewer.toast("Sign in to export cloud files."); return; }
+      if (!files || !files.length) { Viewer.toast(`"${label || "Folder"}" has no files to export.`); return; }
+      const destDir = await window.desktopAPI.pickFolder();
+      if (!destDir) return; // cancelled
+      Viewer.toast(`Exporting ${files.length} file${files.length === 1 ? "" : "s"}…`);
+      const res = await window.desktopAPI.downloadCloudFiles({ files, destDir, token });
+      if (!res) return;
+      const errs = (res.errors) || [];
+      if (!res.ok && errs.length === 0) { Viewer.toast(`Export failed: ${res.error || "unknown error"}`); return; }
+      const nOk = res.count || 0;
+      if (errs.length) Viewer.toast(`Exported ${nOk} file${nOk === 1 ? "" : "s"} to ${destDir}; ${errs.length} failed (${errs[0].error})`);
+      else Viewer.toast(`Exported ${nOk} file${nOk === 1 ? "" : "s"} to ${destDir}`);
+    } catch (e) {
+      Viewer.toast(`Export failed: ${e.message}`);
+    }
+  }
+
+  // Files under a drive folder (recursively), mapped for batch export. Each relPath starts
+  // with the clicked folder's own name so the local result mirrors what the user clicked.
+  function driveFolderExportList(ws, path, topName) {
+    const out = [];
+    for (const f of drive.files) {
+      if ((f.workspace_id || null) !== (ws || null)) continue;
+      const fp = f.folder_path || "";
+      if (path && fp !== path && !fp.startsWith(path + "/")) continue;
+      const under = path ? (fp === path ? "" : fp.slice(path.length + 1)) : fp;
+      out.push({ assetId: f.id, name: f.name, relPath: [topName, under, f.name].filter(Boolean).join("/") });
+    }
+    return out.sort((a, b) => a.relPath.localeCompare(b.relPath));
+  }
+
+  window.exportCloudFile = exportCloudFile;
+  window.exportCloudFolder = exportCloudFolder;
 
   // Delete a cloud file → moves to Trash (recoverable from the web console).
   async function deleteFile(f) {
@@ -2150,8 +2247,9 @@
     const folderRow = e.target.closest(".cd-folder");
     const fileRow = e.target.closest(".cd-file");
     const scopeWs = drive.loc.kind === "trash" ? null : drive.loc.ws;
-    const ctx = { ws: scopeWs, path: "", file: null, folder: null };
+    const ctx = { ws: scopeWs, path: "", file: null, folder: null, trash: false };
     if (folderRow) {
+      ctx.trash = folderRow.classList.contains("cd-trash");
       const p = folderRow.dataset.path;
       const ws = folderRow.dataset.ws === "__trash__" ? null : (folderRow.dataset.ws || null);
       ctx.ws = ws;

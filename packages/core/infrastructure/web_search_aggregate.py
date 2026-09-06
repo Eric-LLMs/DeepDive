@@ -278,9 +278,17 @@ async def _run_engines(query: str, limit: int, engines: tuple[str, ...], timeout
             tasks.append(_guard("google", _scrape_google(client, query, limit)))
         if "baidu" in engines:
             tasks.append(_guard("baidu", _scrape_baidu(client, query, limit)))
-        # ddgs runs on its own transport; give it the same overall deadline.
+        # ddgs runs on its own transport; give it the same overall deadline. The wait_for
+        # must stay INSIDE the guard: a slow/hung ddgs (common on networks that block DDG)
+        # must time out into an empty result, never raise and take down the whole search.
         if "ddg" in engines:
-            tasks.append(asyncio.wait_for(_guard("ddg", _scrape_ddg(query, limit)), timeout))
+            async def _scrape_ddg_bounded() -> list[dict]:
+                try:
+                    return await asyncio.wait_for(_scrape_ddg(query, limit), timeout)
+                except (asyncio.TimeoutError, TimeoutError):
+                    return []
+
+            tasks.append(_guard("ddg", _scrape_ddg_bounded()))
         await asyncio.gather(*tasks)
     return _fuse(results, limit)
 

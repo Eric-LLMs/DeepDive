@@ -34,16 +34,23 @@
     // ``neutralSessionId`` is the normal chat session restored when the user leaves Research.
     activeResearch: null,      // { task_id, name, session_id } | null
     neutralSessionId: null,    // normal session id to restore on leaving the Research tab
+    // Message ids currently rendered in the chat. The live auto-run refresh re-fetches the open
+    // session and appends only rows whose id is NOT here, so worker-inserted progress never
+    // duplicates a bubble that's already on screen (and a reopen never re-emits).
+    renderedMsgIds: new Set(),
   };
   // session_id → { task_id, name, stage, status } for every chat session bound to one of this
   // user's research tasks (hidden from the Sessions sidebar). Populated by research.js from
   // task statuses and by app.js when a research turn's session is created.
   window.researchSessions = window.researchSessions || new Map();
   // Auto-start instruction sent when a research task's Run button is pressed. It rides the
-  // research handoff (sendChat attaches it for an active research session), so the agent
-  // targets the task and drives it through the remaining stages to completion.
+  // research handoff (sendChat attaches it for an active research session) with mode
+  // "research_run", so the server decides how to start: an unfinished task (stage != PUBLISH)
+  // resumes from its current stage, while a task that already reached PUBLISH is reset to a
+  // NEW edition (stage -> DISCOVER, gates -> NOT_RUN, graph emptied) that lands in the next
+  // temp/vN + outputs/_vN. This bubble text mirrors that rule — never an unconditional resume.
   const RESEARCH_RUN_PROMPT =
-    "Run this research task now — resume from its current stage and drive it through every remaining stage to completion.";
+    "Run this research task now. If it already finished (PUBLISH), restart it as a fresh edition from DISCOVER; otherwise continue from the current stage — drive it through every remaining stage to completion.";
 
   // A task's execution mode (strict | progressive) is chosen at creation and locked for its
   // whole life; the UI only ever *echoes* it (task-card badge + chat sub-bar badge). These
@@ -756,7 +763,8 @@
   }
 
   // Plain message for error/notice rows (no per-message actions).
-  function appendMsg(role, text) {
+  function appendMsg(role, text, id) {
+    if (id) state.renderedMsgIds.add(id); // tracked so live refresh never re-renders it
     const div = document.createElement("div");
     div.className = `msg ${role}`;
     div.textContent = text;
@@ -1082,7 +1090,10 @@
     if (role !== "user" && role !== "assistant") return appendMsg(role, text);
     const div = document.createElement("div");
     div.className = `msg ${role}`;
-    if (id) div.dataset.id = id;
+    if (id) {
+      div.dataset.id = id;
+      state.renderedMsgIds.add(id); // tracked so live refresh never re-renders it
+    }
     div.dataset.raw = text; // markdown source, kept for edit + copy of raw text
     const bubble = document.createElement("div");
     bubble.className = "msg-bubble";
@@ -1100,6 +1111,15 @@
     div.appendChild(buildMsgActions(div, role, () => text));
     chatLog.scrollTop = chatLog.scrollHeight;
     return div;
+  }
+
+  // Render one DB message row the way a session open does: tool rows are hidden, deterministic
+  // ``system`` notes are plain text (never markdown/HTML-parsed), everything else is a normal
+  // user/assistant bubble. Shared by resumeSession and the live auto-run chat refresh.
+  function appendMsgRow(m) {
+    if (m.role === "tool") return;
+    if (m.role === "system") { appendMsg("system", m.content, m.id); return; }
+    appendMessage(m.id, m.role === "assistant" ? "assistant" : "user", m.content, m.attach);
   }
 
   // Build the inline media element for a message attachment. Images are fetched from the
@@ -1534,7 +1554,20 @@
     // is side-effect free; only a typed message here actually runs the task.
     const research = state.activeResearch;
     if (research) {
-      extra = { ...extra, handoff: { kind: "research", project_id: research.task_id, mode: "research_resume" } };
+      // A Run-control start (the ▶ Run button) may re-run a task that already reached PUBLISH
+      // as a NEW edition → handoff mode "research_run" (begin_run resets it to a fresh
+      // DISCOVER and the output lands in the next temp/vN + outputs/_vN). Any other message
+      // in a research session is a plain resume. The marker is consumed here — never sent up.
+      const runControl = extra.researchRun === true;
+      if (extra.researchRun !== undefined) delete extra.researchRun;
+      extra = {
+        ...extra,
+        handoff: {
+          kind: "research",
+          project_id: research.task_id,
+          mode: runControl ? "research_run" : "research_resume",
+        },
+      };
       // A message in a research session IS the run trigger (whether typed by the user or
       // auto-sent by the Run control): announce the run so Run / Delete Task disable and the
       // Run button switches to its running style on every research surface.
@@ -1612,8 +1645,14 @@
             appendMsg("notice", evt.data.notice);
             state.degradedNoticeShown = true;
           }
-          if (evt.data.user_message_id) userMsgEl.dataset.id = evt.data.user_message_id;
-          if (evt.data.assistant_message_id && streamMsg) streamMsg.el.dataset.id = evt.data.assistant_message_id;
+          if (evt.data.user_message_id) {
+            userMsgEl.dataset.id = evt.data.user_message_id;
+            state.renderedMsgIds.add(evt.data.user_message_id); // streamed rows are already on screen
+          }
+          if (evt.data.assistant_message_id && streamMsg) {
+            streamMsg.el.dataset.id = evt.data.assistant_message_id;
+            state.renderedMsgIds.add(evt.data.assistant_message_id); // never re-render from a refresh
+          }
           // Fallback when no content streamed (e.g. tool round produced only reasoning).
           if (!streamMsg && evt.data.answer) {
             streamMsg = appendStreamingAssistant();
@@ -1704,6 +1743,7 @@
   function newChat() {
     state.sessionId = null;
     state.importedByMsgId = new Map();
+    state.renderedMsgIds = new Set();
     state.sessionImported = false;
     state.sessionImportedLegacy = false;
     chatLog.innerHTML = "";
@@ -2066,6 +2106,7 @@
   // status from the lightweight task list so the badge stays current during a run (the heavy
   // per-task status with cloud_files is only fetched on selection).
   let researchChipTimer = null;
+  const researchRunSeen = new Map(); // session_id → last is_running polled (edge-triggers chat refresh)
   function startResearchChipPoll() {
     stopResearchChipPoll();
     researchChipTimer = setInterval(async () => {
@@ -2093,12 +2134,79 @@
             window.researchReleaseIfIdle(t.task_id);
           }
           if (window.researchActivityMeta) window.researchActivityMeta(t.status, t.stage);
+          // Live chat refresh while THIS task auto-runs: the worker appends run progress/terminal
+          // rows to the bound session only when a background turn ends, and an already-open chat
+          // never re-fetches — so the rows stay invisible until the session is reopened. While the
+          // task's session is the one on screen and the server says it is running, keep a short
+          // timer that re-fetches the session and appends rows not yet rendered (deduped by message
+          // id). The timer is edge-triggered: started on run start, stopped the moment the run ends
+          // (with one final flush for the terminal event + report rows) or the chat leaves the task.
+          const onScreen = state.sessionId === t.session_id;
+          const prevRunning = researchRunSeen.get(t.session_id) === true;
+          researchRunSeen.set(t.session_id, !!t.is_running);
+          if (onScreen) {
+            if (t.is_running && !chatSend.disabled) {
+              startResearchChatRefresh();
+              refreshOpenResearchChat(); // show what already landed — don't wait for the first tick
+            } else if (prevRunning && !t.is_running) {
+              stopResearchChatRefresh();
+              refreshOpenResearchChat(); // final flush: terminal event + report rows
+            }
+          } else {
+            stopResearchChatRefresh(); // the on-screen chat is not this task — no refresh needed
+          }
         }
       } catch { /* transient — keep polling */ }
     }, 10000);
   }
   function stopResearchChipPoll() {
     if (researchChipTimer) { clearInterval(researchChipTimer); researchChipTimer = null; }
+    stopResearchChatRefresh(); // leaving/switching a research context never leaves a chat timer behind
+  }
+
+  // ── live chat refresh during an auto-run ─────────────────────────────────
+  // The short timer below exists ONLY while the on-screen chat's bound task is auto-running; it is
+  // idempotent (one timer per active run) and is torn down by stopResearchChatRefresh at run end or
+  // session switch, so it never polls a normal chat or an idle task.
+  let researchChatTimer = null;
+  function startResearchChatRefresh() {
+    if (researchChatTimer) return;
+    researchChatTimer = setInterval(async () => {
+      // Re-check context on every tick: the chat may have switched to a normal (or another task's)
+      // session, or the run may have ended; stopResearchChatRefresh is called at those transitions
+      // and kills this timer. Keyed off window.researchSessions so a task whose session binds later
+      // (active.session_id null) still refreshes once the on-screen chat is recognized as its own.
+      const active = state.activeResearch;
+      if (!active || !state.sessionId) return;
+      const meta = window.researchSessions.get(state.sessionId);
+      if (!meta || meta.task_id !== active.task_id) return;
+      if (chatSend.disabled) return; // a user stream owns the log — never race it
+      await refreshOpenResearchChat();
+    }, 4000);
+  }
+  function stopResearchChatRefresh() {
+    if (researchChatTimer) { clearInterval(researchChatTimer); researchChatTimer = null; }
+  }
+  async function refreshOpenResearchChat() {
+    const sid = state.sessionId;
+    if (!sid) return;
+    let data;
+    try {
+      const res = await fetch(`/api/sessions/${sid}`, { headers: authHeaders() });
+      if (!res.ok) return;
+      data = await res.json();
+    } catch { /* transient — the next tick retries */ return; }
+    if (state.sessionId !== sid) return; // the user switched away mid-fetch
+    const nearBottom = chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight < 160;
+    const prevTop = chatLog.scrollTop;
+    let added = 0;
+    for (const m of data.messages || []) {
+      if (!m.id || state.renderedMsgIds.has(m.id)) continue; // append only unseen rows
+      appendMsgRow(m);
+      added++;
+    }
+    // New rows scroll the log; if the user was reading history, restore the viewport instead.
+    if (added && !nearBottom) chatLog.scrollTop = prevTop;
   }
 
   // ── research gate override: inline Approve / Reject card in the task's chat ──
@@ -2205,7 +2313,7 @@
         card.remove();
         // Drive the state machine forward past the now-OVERRIDE gate.
         if (window.startResearchRun) await window.startResearchRun(ctx.task_id, ctx.name, ctx.session_id);
-        else sendChat(RESEARCH_RUN_PROMPT);
+        else sendChat(RESEARCH_RUN_PROMPT, { researchRun: true });
       });
       rejectBtn.addEventListener("click", async () => {
         setBusy(true);
@@ -2286,7 +2394,7 @@
     if (chatSend.disabled) { Viewer.toast("A research run is already in progress."); return; }
     await openResearchSession(taskId, name, sessionId);
     const active = state.activeResearch;
-    if (active && active.task_id === taskId) sendChat(RESEARCH_RUN_PROMPT);
+    if (active && active.task_id === taskId) sendChat(RESEARCH_RUN_PROMPT, { researchRun: true });
     else Viewer.toast("Could not bind the task's session — select the task first.");
   };
 
@@ -2318,17 +2426,17 @@
         <div class="rq-mode">
           <span class="rq-mode-label">Execution mode</span>
           <label class="rq-mode-row">
-            <input type="radio" name="rq-mode" value="strict" checked />
+            <input type="radio" name="rq-mode" value="progressive" checked />
             <span class="rq-mode-opt">
-              <strong>Strict</strong>
-              <small>Default — a failed gate pauses the run for your approval.</small>
+              <strong>Progressive</strong>
+              <small>Default — a failed gate is recorded as a diagnostic and the run continues.</small>
             </span>
           </label>
           <label class="rq-mode-row">
-            <input type="radio" name="rq-mode" value="progressive" />
+            <input type="radio" name="rq-mode" value="strict" />
             <span class="rq-mode-opt">
-              <strong>Progressive</strong>
-              <small>A failed gate is recorded as a diagnostic and the run continues.</small>
+              <strong>Strict</strong>
+              <small>A failed gate pauses the run for your approval.</small>
             </span>
           </label>
         </div>
@@ -2382,7 +2490,7 @@
       // The mode is chosen exactly once, here at creation: the server persists it and every
       // later resume reads it from the project, so it is locked from the first run onward.
       const modeEl = overlay.querySelector('input[name="rq-mode"]:checked');
-      const execution_mode = modeEl ? modeEl.value : "strict";
+      const execution_mode = modeEl ? modeEl.value : "progressive";
       createBtn.disabled = true;
       createBtn.textContent = "Creating…";
       try {
@@ -4766,6 +4874,9 @@
   // opens a fresh chat that drives it via the deep_research skill.
   const researchNewBtn = document.getElementById("chat-new-research");
   if (researchNewBtn) researchNewBtn.addEventListener("click", openResearchTaskDialog);
+  // "New Research" above the Research task list opens the same create-task dialog.
+  const researchNewSidebarBtn = document.getElementById("research-new");
+  if (researchNewSidebarBtn) researchNewSidebarBtn.addEventListener("click", openResearchTaskDialog);
   if (fileSearch) fileSearch.addEventListener("input", (e) => {
     applyFileSearch(e.target.value);
     renderLocalSuggest(e.target.value.trim());
@@ -5100,16 +5211,8 @@
       // import buttons are born with their persistent state (disabled + "✓ Imported").
       await refreshImportedState();
       chatLog.innerHTML = "";
-      for (const m of data.messages) {
-        if (m.role === "tool") continue;
-        if (m.role === "system") {
-          // Deterministic gate review notes: display-only, rendered as plain text (never
-          // markdown/HTML-parsed), so runtime bookkeeping never looks like model output.
-          appendMsg("system", m.content);
-          continue;
-        }
-        appendMessage(m.id, m.role === "assistant" ? "assistant" : "user", m.content, m.attach);
-      }
+      state.renderedMsgIds = new Set(); // every row below is now on screen; live refresh dedupes against it
+      for (const m of data.messages) appendMsgRow(m);
       chatTitle.textContent = data.title || (data.messages[0] ? data.messages[0].content.slice(0, 30) : "Chat");
       // Reconciliation: the buttons were rendered from state above, but re-apply so a
       // pair already in the repo can never show as importable even if a message was

@@ -27,6 +27,7 @@ Design notes (spike decisions, all auditable):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -48,6 +49,23 @@ from agent.tools.definition import ToolOutput, define_tool
 from agent.tools.tool_permissions import ToolPermission
 from core.application.drive_service import DriveError
 from core.infrastructure.request_context import get_request_user_id
+from core.infrastructure.web_fetch import (
+    MIN_FETCH_TEXT_CHARS,
+    fetch_clean_urls,
+)
+from core.infrastructure.web_fetch import (
+    canonical_url as canonicalize,
+)
+
+# Fetch transport/resolver overrides — production runs with the real network (None); unit
+# tests patch these globals to a MockTransport + stub resolver so nothing is hit offline.
+_FETCH_TRANSPORT_OVERRIDE = None
+_FETCH_RESOLVER_OVERRIDE = None
+
+# Source/Evidence node id prefixes (deterministic, url-anchored — E1/E5 identity keys).
+_SOURCE_ID_PREFIX = "src:"
+_EVIDENCE_ID_PREFIX = "ev:"
+_FETCH_PROVENANCE_KEY = "_fetch_provenance"
 
 # ── stage / gate vocabulary (frozen in docs/research/07 + 10) ─────────────────
 # INBOX is deliberately gone: a project/task is born in DISCOVER (no ghost intake
@@ -142,6 +160,46 @@ _GATE_WHY: dict[str, str] = {
     "CLAIM_GATE": "claims that are not anchored to registered citations or that overstate the support cannot be published",
     "QUALITY_GATE": "a release decision without a clean scorecard has no objective quality basis",
 }
+
+
+# ── run progress events (scratch log the worker drains into the bound session chat) ──
+# ``run_events.json`` is append-only per task. A run's driver checkpoint keeps a
+# ``progress_cursor`` (last event seq already surfaced); the worker drains only events newer
+# than the cursor, one ``system`` row each (role=system rows are filtered from model context
+# everywhere). Exactly four event kinds keep the chat flood-free and semantically
+# idempotent (a (run_seq, type, key) triple is appended at most once):
+#   stage           - a stage transition was granted
+#   gate_diagnostic - progressive mode recorded a failing gate AND advanced (distinct event
+#                     from the stage change, so the two are never collapsed)
+#   artifact        - a genuinely new artifact / new artifact version was produced
+#   terminal        - the run reached a graded terminal outcome (worker-appended)
+# Ordinary overwrite updates, micro-retries and individual tool steps are NEVER events.
+_RUN_EVENTS_FILE = "run_events.json"
+_RUN_EVENT_TYPES = ("stage", "gate_diagnostic", "artifact", "terminal")
+_SCRAPE_SUBDIR = "scrape"
+
+
+def _slug_token(token: str, limit: int = 40) -> str:
+    """A filesystem-safe slug for a user-supplied query/fragment (anti-explosion).
+
+    ``_safe_filename`` strips path/control characters; this additionally collapses spaces and
+    underscores and truncates so a long natural-language query stays one short filename part.
+    """
+    cleaned = _safe_filename(token or "").replace(" ", "_")
+    cleaned = re.sub(r"_{2,}", "_", cleaned).strip("_")
+    return (cleaned or "query")[:limit].strip("_")
+
+
+def _report_stem(artifact_id: str) -> str:
+    """The report's base filename without a trailing ``.md``, for versioned output names.
+
+    ``draft.md`` -> ``draft`` so the versioned final lands at ``outputs/draft_v1.md`` (a raw
+    ``draft.md_v1.md`` would be ugly and is why the suffix is stripped first).
+    """
+    stem = _safe_filename(artifact_id)
+    if stem.lower().endswith(".md"):
+        stem = stem[:-3]
+    return stem.rstrip(".")
 
 
 def _trim_reason(reason: str, limit: int = _REASON_LIMIT) -> str:
@@ -395,6 +453,7 @@ class ResearchService:
     def _empty_driver() -> dict:
         return {
             "run_id": None,             # run_id currently driving (mirrors active_run)
+            "run_version": None,        # run_seq of the current run (drives temp/vN + outputs/_vN)
             "turn_index": 0,            # business turn index (0 = interactive first turn)
             "turn_attempt": 1,          # retry count for the current execution (starts at 1)
             "turn_state": "done",       # pending | running | done (see plugins/research/driver.py)
@@ -405,7 +464,122 @@ class ResearchService:
             "started_at": None,
             "updated_at": None,
             "next_scheduled": None,
+            # Per-run transient ledger of cloud folder/asset ids created for THIS run's
+            # temp/vN + scrape/ projection (red line 3): reset every begin_run, never a
+            # multi-run index. ``progress_cursor`` is the last run_events seq the worker has
+            # already drained into the bound session chat.
+            "cloud_assets": {},
+            "progress_cursor": 0,
         }
+
+    @staticmethod
+    def _run_version_of(project: dict) -> int | None:
+        """The current run's ``run_seq`` (``driver.run_version``), or ``None`` outside a run.
+
+        A value of ``None`` means the versioned temp/vN + outputs/_vN layout does not apply and
+        callers must fall back to the legacy in-place ``outputs/`` behaviour.
+        """
+        driver = project.get("driver")
+        rv = driver.get("run_version") if isinstance(driver, dict) else None
+        return rv if isinstance(rv, int) else None
+
+    @staticmethod
+    def _assets_ledger(project: dict) -> dict:
+        """The current run's ``cloud_assets`` transient ledger (never ``None``)."""
+        driver = project.get("driver")
+        if not isinstance(driver, dict):
+            driver = project["driver"] = {}
+        ledger = driver.setdefault("cloud_assets", {})
+        if not isinstance(ledger, dict):
+            ledger = driver["cloud_assets"] = {}
+        return ledger
+
+    @staticmethod
+    def _cloud_asset_key(artifact_id: str) -> str:
+        """A ``cloud_assets`` key for one artifact that can never collide with the ``_dirs`` sub-dict."""
+        return f"_a:{artifact_id}"
+
+    @staticmethod
+    def _scrape_tally(project: dict) -> int:
+        """How many scrape files this run has captured so far (0 when none / not a run).
+
+        Scrape saves never announce themselves; totals are folded into stage-summary events so
+        the user still sees capture volume without per-save chat spam (safety rule 3).
+        """
+        ledger = project.get("driver", {}).get("cloud_assets") if isinstance(project.get("driver"), dict) else None
+        counts = ledger.get("_scrape_counts") if isinstance(ledger, dict) else None
+        if not isinstance(counts, dict):
+            return 0
+        return sum(int(v) for v in counts.values())
+
+    async def _ensure_cloud_dir(
+        self, owner_id: uuid.UUID, project: dict, cloud_rel_dir: str
+    ) -> str | None:
+        """Get-or-create the cloud folder row at ``<task folder>/{cloud_rel_dir}`` (idempotent).
+
+        Only meaningful for a versioned run (temp/vN + scrape need real folder rows so the
+        working-directory tree shows them). Walks each path segment under the task's cloud
+        folder, reusing an existing row when one is already there and creating only the missing
+        levels — never creating a duplicate same-name folder (red line 7). Returns the folder id
+        of the deepest requested directory, or ``None`` when the task has no cloud projection or
+        no versioned run (the caller then falls back to legacy behaviour).
+        """
+        cloud_root = project.get("cloud_folder_path")
+        rv = self._run_version_of(project)
+        if not cloud_root or not rv:
+            return None
+        ledger = self._assets_ledger(project)
+        dirs = ledger.setdefault("_dirs", {})
+        if not isinstance(dirs, dict):
+            dirs = ledger["_dirs"] = {}
+        rel = ""
+        folder_id: str | None = None
+        for part in cloud_rel_dir.split("/"):
+            rel = f"{rel}/{part}" if rel else part
+            folder_id = dirs.get(rel)
+            if folder_id:
+                continue
+            parent_path = f"{cloud_root}/{rel.rsplit('/', 1)[0]}" if "/" in rel else cloud_root
+            full = f"{cloud_root}/{rel}"
+            existing = [
+                f for f in await self.drive.list_folders(owner_id) if f.get("path") == full
+            ]
+            if existing:
+                folder_id = str(existing[0]["id"])
+            else:
+                created = await self.drive.create_folder(owner_id, None, parent_path, part)
+                folder_id = str(created["id"])
+            dirs[rel] = folder_id
+        return folder_id
+
+    def _merge_cloud_assets(
+        self, owner_id: uuid.UUID, project_id: str, additions: dict
+    ) -> None:
+        """Merge ``additions`` (top-level cloud_assets keys) into the driver ledger atomically.
+
+        The merge re-reads the project under the lock so a concurrently-updated checkpoint is
+        preserved, and nested dicts are merged (never clobbered). Best-effort persistence: the
+        mirror's authoritative path stays the artifact record, so a failure only means the
+        ledger is rebuilt next time (the folder/asset already exists and is re-found).
+        """
+        def mutate(project: dict) -> None:
+            ledger = project.setdefault("driver", {}).setdefault("cloud_assets", {})
+            if not isinstance(ledger, dict):
+                ledger = project["driver"]["cloud_assets"] = {}
+            for key, value in additions.items():
+                current = ledger.get(key)
+                if isinstance(current, dict) and isinstance(value, dict):
+                    current.update(value)
+                else:
+                    ledger[key] = value
+
+        try:
+            self.atomic_update_project(owner_id, project_id, mutate)
+        except Exception as exc:  # noqa: BLE001 - best-effort ledger, never break the caller
+            logger.debug(
+                "research cloud-assets ledger merge failed for %s (rebuilt lazily): %s",
+                project_id, exc,
+            )
 
     def get_driver_checkpoint(self, owner_id: uuid.UUID, project_id: str) -> dict:
         """The task's driver checkpoint (or the empty default when none is recorded yet)."""
@@ -693,6 +867,7 @@ class ResearchService:
         # the file nor mirrors a duplicate cloud output asset.
         v1_path = self._artifact_dir(owner_id, project_id, artifact_id) / "v1"
         v1 = self._load_json(v1_path, None)
+        new_artifact = v1 is None  # only a genuinely-new artifact is a progress event (not an overwrite)
         if v1 is not None and v1.get("content") == content:
             return {
                 "artifact_id": v1["artifact_id"],
@@ -721,13 +896,23 @@ class ResearchService:
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
-        # Project the draft into the task's cloud outputs/ (best-effort; scratch is the
-        # authority). The created cloud asset id is persisted with the record so a later
-        # version/promote updates it in place instead of exploding assets.
+        # Project the draft into the task's cloud projection (best-effort; scratch is the
+        # authority). In a versioned run the working copy lands in temp/vN and the id is kept on
+        # the run ledger, not this record; legacy tasks keep the in-place outputs/ id on record.
         await self._mirror_output(owner_id, project, record, content)
         self._save_json(
             self._artifact_dir(owner_id, project_id, artifact_id) / "v1", record
         )
+        if new_artifact:
+            self._log_run_event(
+                owner_id,
+                project_id,
+                event_type="artifact",
+                key=f"artifact:{artifact_id}",
+                detail=f"new artifact '{artifact_id}' v1 written",
+                stage=project.get("stage"),
+                project=project,
+            )
         return {
             "artifact_id": artifact_id,
             "project_id": project_id,
@@ -772,7 +957,22 @@ class ResearchService:
         if record.get("status") == "PROMOTED" and record.get("drive_asset_id"):
             return self._promoted_view(record, idempotent=True)
         if project.get("cloud_folder_id"):
-            # Task path: the report lives in the cloud outputs/ projection already.
+            rv = self._run_version_of(project)
+            if rv:
+                # Versioned task path: promotion CREATES a NEW versioned final asset
+                # ``outputs/<stem>_v{rv}.md`` (Create-New — never Move/Rename or reuse the
+                # temp/vN working copy, which stays intact; red line 2). The run ledger holds
+                # the promoted asset so single-run retries are strongly idempotent: a re-promote
+                # in the SAME run (even after a new scratch version) updates that one asset in
+                # place instead of minting ``_v{rv+1}`` (safety rule 5); only a NEW begin_run
+                # moves the version forward.
+                return await self._promote_run_asset(
+                    owner_id, project, project_id, record, version_paths[-1],
+                    artifact_id=artifact_id,
+                    run_version=rv,
+                    promote_idempotency_key=promote_idempotency_key,
+                )
+            # Legacy task path: the report lives in the cloud outputs/ projection already.
             if not record.get("cloud_output_asset_id"):
                 await self._mirror_output(owner_id, project, record, record["content"])
             cloud_asset_id = record["cloud_output_asset_id"]
@@ -810,6 +1010,65 @@ class ResearchService:
         (outputs_dir / f"{_safe_filename(artifact_id)}.md").write_text(
             record["content"], encoding="utf-8"
         )
+        return self._promoted_view(record, idempotent=False)
+
+    async def _promote_run_asset(
+        self,
+        owner_id: uuid.UUID,
+        project: dict,
+        project_id: str,
+        record: dict,
+        record_path: Path,
+        *,
+        artifact_id: str,
+        run_version: int,
+        promote_idempotency_key: str | None,
+    ) -> dict:
+        """Create/refresh the ONE versioned final asset for this artifact+run in ``outputs/``.
+
+        First promote of a run mints ``outputs/<stem>_v{run_version}.md`` (Create-New). Any
+        later promote inside the SAME run — including after the agent mints a new scratch
+        version — reuses that same asset (``update_content`` in place), so a run never produces
+        a second ``_v{N}`` file. The promoted id + path live on the run's ``cloud_assets``
+        ledger (persisted only when newly created).
+        """
+        cloud_root = project["cloud_folder_path"]
+        ledger = self._assets_ledger(project)
+        key = self._cloud_asset_key(artifact_id)
+        entry = ledger.setdefault(key, {})
+        if not isinstance(entry, dict):
+            entry = ledger[key] = {}
+        out_asset = entry.get("out_asset")
+        out_name = entry.get("out_name")
+        newly_created = False
+        if out_asset and out_name:
+            # Same-run re-promote after a new scratch version: refresh in place, never a v+1.
+            await self.drive.update_content(owner_id, uuid.UUID(out_asset), record["content"])
+        else:
+            out_name = f"{_report_stem(artifact_id)}_v{run_version}.md"
+            asset = await self.drive.save_artifact(
+                owner_id,
+                name=out_name,
+                mime_type="text/markdown",
+                content=record["content"].encode("utf-8"),
+                folder_path=f"{cloud_root}/outputs",
+                workspace_id=None,
+            )
+            out_asset = str(asset.id)
+            entry["out_asset"] = out_asset
+            entry["out_name"] = out_name
+            entry["out_path"] = f"{cloud_root}/outputs/{out_name}"
+            newly_created = True
+        await self.drive.mark_rag_pending(uuid.UUID(out_asset))
+        record["status"] = "PROMOTED"
+        record["drive_asset_id"] = out_asset
+        record["drive_path"] = f"{cloud_root}/outputs/{out_name}"
+        record["rag_status"] = "PENDING"
+        record["promote_idempotency_key"] = promote_idempotency_key
+        record["updated_at"] = _now_iso()
+        self._save_json(record_path, record)
+        if newly_created:
+            self._merge_cloud_assets(owner_id, project_id, {key: entry})
         return self._promoted_view(record, idempotent=False)
 
     @staticmethod
@@ -877,8 +1136,9 @@ class ResearchService:
                 }
         previous = self._artifact(owner_id, project_id, artifact_id, next_version - 1)
         record = dict(previous)
-        # ``cloud_output_asset_id`` is intentionally carried over from the previous version so
-        # the cloud outputs/<id>.md projection is updated in place, never re-created.
+        # ``cloud_output_asset_id`` is carried over for the LEGACY no-run projection so it is
+        # updated in place. Under a versioned run the mirror id lives on the run ledger (never
+        # shared across runs), so this field is simply untouched (None) there.
         record.update(
             {
                 "artifact_id": artifact_id,
@@ -895,6 +1155,15 @@ class ResearchService:
         )
         await self._mirror_output(owner_id, project, record, content)
         self._save_json(artifact_dir / f"v{next_version}", record)
+        self._log_run_event(
+            owner_id,
+            project_id,
+            event_type="artifact",
+            key=f"artifact:{artifact_id}:v{next_version}",
+            detail=f"artifact '{artifact_id}' v{next_version} written",
+            stage=project.get("stage"),
+            project=project,
+        )
         return {
             "artifact_id": artifact_id,
             "project_id": project_id,
@@ -1022,6 +1291,7 @@ class ResearchService:
             "cloud_folder_path": cloud_folder["path"],
             "materials": [],
             "cloud_mirrors": {},
+            "run_seq": 0,               # monotonic per-run version (bumped atomically in begin_run)
             "project_revision": 0,      # monotonic version; bumped by every atomic commit
             "driver": None,             # driver checkpoint (materialized on first run)
             "last_block": None,         # terminal-stop record {kind, reason, at, execution_id}
@@ -1029,12 +1299,14 @@ class ResearchService:
             "updated_at": _now_iso(),
         }
         try:
-            # The user-visible task folder always carries the two work folders, even before
-            # any material is copied or artifact promoted, so the working-directory layout is
-            # stable from the moment the task exists (a task with no materials/outputs yet
-            # still shows both folders in the drive).
+            # The user-visible task folder always carries the three work folders, even before
+            # any material is copied / run begun / artifact promoted, so the working-directory
+            # layout is stable from the moment the task exists (a task with no materials,
+            # outputs or temp run yet still shows all three in the drive). ``temp/`` holds one
+            # per-run ``v{N}`` subfolder (created lazily by the first run).
             await self.drive.create_folder(owner_id, None, cloud_folder["path"], "materials")
             await self.drive.create_folder(owner_id, None, cloud_folder["path"], "outputs")
+            await self.drive.create_folder(owner_id, None, cloud_folder["path"], "temp")
             self._save_project(project)
             self._save_graph(owner_id, task_id, {"nodes": [], "edges": []})
             task_spec = {
@@ -1138,15 +1410,61 @@ class ResearchService:
             return False
 
     async def _mirror_output(self, owner_id: uuid.UUID, project: dict, record: dict, content: str) -> bool:
-        """Project one artifact into the task's cloud ``outputs/<artifact_id>.md``.
+        """Project one artifact's scratch content into the task's cloud drive.
 
-        Best-effort like :meth:`_mirror_cloud`: scratch ``artifacts/`` is the authority. The
-        created asset id is stored on ``record["cloud_output_asset_id"]`` so a later version
-        or promote updates it in place. Returns ``True`` when a new cloud asset was created.
+        Two shapes (chat-task path only; a task without a ``cloud_folder_path`` is a no-op):
+
+        - **Versioned run** (``driver.run_version`` set): the working copy mirrors into
+          ``temp/v{N}/<artifact_id>.md`` — never into ``outputs/``. The run's ``cloud_assets``
+          ledger holds the temp asset id so a same-run rewrite updates it in place and a
+          *later* run creates a fresh ``temp/v{N+1}`` file instead of clobbering vN (the id is
+          deliberately NOT stored on the shared version record — that would leak one run's
+          asset id into the next run). ``record["cloud_output_asset_id"]`` stays untouched.
+        - **Legacy / no run**: the previous in-place ``outputs/<artifact_id>.md`` projection
+          with the asset id carried on the record (unchanged behaviour).
+
+        Best-effort like :meth:`_mirror_cloud`: scratch ``artifacts/`` is always authoritative,
+        so a drive failure only logs. Returns ``True`` when a new cloud asset was created.
         """
         cloud_folder_path = project.get("cloud_folder_path")
         if not cloud_folder_path:
             return False
+        rv = self._run_version_of(project)
+        if rv:
+            rel_dir = f"temp/v{rv}"
+            ledger = self._assets_ledger(project)
+            dirs = ledger.setdefault("_dirs", {})
+            if not isinstance(dirs, dict):
+                dirs = ledger["_dirs"] = {}
+            key = self._cloud_asset_key(record["artifact_id"])
+            entry = ledger.setdefault(key, {})
+            if not isinstance(entry, dict):
+                entry = ledger[key] = {}
+            try:
+                if dirs.get(rel_dir) is None:
+                    folder_id = await self._ensure_cloud_dir(owner_id, project, rel_dir)
+                    if folder_id is None:
+                        return False
+                asset_id = entry.get("temp_asset")
+                if asset_id:
+                    await self.drive.update_content(owner_id, uuid.UUID(asset_id), content)
+                    return False
+                asset = await self.drive.save_artifact(
+                    owner_id,
+                    name=f"{_safe_filename(record['artifact_id'])}.md",
+                    mime_type="text/markdown",
+                    content=content.encode("utf-8"),
+                    folder_path=f"{cloud_folder_path}/{rel_dir}",
+                    workspace_id=None,
+                )
+                entry["temp_asset"] = str(asset.id)
+                self._merge_cloud_assets(
+                    owner_id, record["project_id"], {"_dirs": dirs, key: entry}
+                )
+                return True
+            except Exception:
+                logger.exception("research run-temp mirror failed for %s", record["artifact_id"])
+                return False
         asset_id = record.get("cloud_output_asset_id")
         try:
             if asset_id:
@@ -1487,6 +1805,20 @@ class ResearchService:
                 )
 
             project = self.atomic_update_project(owner_id, project_id, mutate)
+            self._log_stage_event(
+                owner_id, project_id, current=current, target=target, project=project
+            )
+            if failed:
+                names = ", ".join(c["name"] for c in failed)
+                self._log_run_event(
+                    owner_id,
+                    project_id,
+                    event_type="gate_diagnostic",
+                    key=f"gate:{gate}→{target}",
+                    stage=target,
+                    detail=f"{gate} failed ({len(failed)}): {names}",
+                    project=project,
+                )
             return {
                 "requested": target,
                 "granted": True,
@@ -1499,7 +1831,34 @@ class ResearchService:
             project["stage"] = target
 
         project = self.atomic_update_project(owner_id, project_id, mutate)
+        self._log_stage_event(owner_id, project_id, current=current, target=target, project=project)
         return {"requested": target, "granted": True, "stage": project["stage"], "gate": gate}
+
+    def _log_stage_event(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        current: str,
+        target: str,
+        project: dict,
+    ) -> None:
+        """Record one ``stage`` progress event for a granted transition (run-scoped, idempotent).
+
+        The detail carries this run's scrape tally when any capture happened, so per-save scrape
+        writes stay silent but the stage boundary still reports volume (safety rule 3).
+        """
+        tally = self._scrape_tally(project)
+        suffix = f" · {tally} scrape{'s' if tally != 1 else ''} saved" if tally else ""
+        self._log_run_event(
+            owner_id,
+            project_id,
+            event_type="stage",
+            key=f"stage:{target}",
+            stage=target,
+            detail=f"{current} → {target}{suffix}",
+            project=project,
+        )
 
     def get_handoff(self, owner_id: uuid.UUID, project_id: str) -> dict:
         project = self._load_project(owner_id, project_id)
@@ -2076,6 +2435,7 @@ class ResearchService:
         *,
         session_id: str | None = None,
         stale_after_seconds: int = 7200,
+        new_edition: bool = False,
     ) -> dict:
         """Acquire the single active-run slot for a task (mutex over concurrent turns).
 
@@ -2084,6 +2444,16 @@ class ResearchService:
         A RUNNING slot older than ``stale_after_seconds`` is presumed dead — the owning
         process crashed before ``end_run`` — and is adopted: any RUNNING executions it
         left behind are flipped to ABORTED so the delete guard never blocks forever.
+
+        ``new_edition`` (the desktop "Run" control on a task that already reached the
+        terminal PUBLISH stage): PUBLISH has no legal next stage, so a plain resume would
+        stop at turn 0 and produce nothing. This run instead starts a NEW edition — the
+        run-scoped shared state is reset (stage -> DISCOVER, gates -> NOT_RUN, diagnostics
+        and last_block cleared, evidence graph emptied) so the driver actually drives
+        DISCOVER -> ... -> PUBLISH again. ``run_seq`` still advances (red line 1), so this
+        edition's working copy lands in temp/v{N} + outputs/_v{N}; earlier editions' files
+        are versioned and are never touched. For a task short of PUBLISH (mid-chain /
+        blocked resume) the flag is a no-op and the run resumes from the current stage.
 
         Raises ``ValueError`` for a live conflict; the router maps it to a 409.
         """
@@ -2120,11 +2490,33 @@ class ResearchService:
                 "started_at": _now_iso(),
                 "status": "RUNNING",
             }
+            # Atomically mint the next per-run version (red line 1). Legacy tasks without the
+            # field fall back to ``get("run_seq", 0) + 1`` — no wholesale migration. The
+            # version stamps every temp/vN + outputs/_vN folder/asset for THIS run.
+            run_seq = project.get("run_seq", 0) + 1
+            project["run_seq"] = run_seq
+            if new_edition and project.get("stage") == "PUBLISH":
+                # Re-run of a task that already finished → start a NEW edition. PUBLISH is a
+                # terminal stage with no legal next, so a resume can never leave it; resetting
+                # the run-scoped shared state is what lets this run drive DISCOVER→…→PUBLISH
+                # again. Only run-scoped state is touched — the finished edition's artifacts
+                # (artifacts/<id>/vN), temp/vN + outputs/_vN and event logs stay intact, and
+                # run_seq above has already moved the version forward for this new edition.
+                project["stage"] = "DISCOVER"
+                project["gates"] = {g: "NOT_RUN" for g in _GATES}
+                project["diagnostics"] = []
+                project["last_block"] = None
+                project["status"] = "ACTIVE"
+                # The evidence graph is per-task shared state (graph.json, not versioned):
+                # empty it so the new edition re-gathers sources instead of inheriting the
+                # finished edition's STALE/CANDIDATE nodes as if they were current evidence.
+                self._save_graph(owner_id, project_id, {"nodes": [], "edges": []})
             # Reset the driver ledger for this run: a new run = a new run_id, and the old
             # run's turn/cost/no-progress state must never leak into it.
             project["driver"] = {
                 **self._empty_driver(),
                 "run_id": run_id,
+                "run_version": run_seq,
                 "turn_state": "done",
                 "started_at": _now_iso(),
                 "updated_at": _now_iso(),
@@ -2143,6 +2535,712 @@ class ResearchService:
 
         self.atomic_update_project(owner_id, project_id, mutate)
         return {"run_id": holder.get("run_id"), "status": "IDLE"}
+
+    # ── run progress events (append-only scratch log, drained by the worker) ──
+    # Events are produced AT the point a milestone commits (never by a poller) and persist to
+    # ``<task>/run_events.json``, which is semantically append-only: rows are never deleted,
+    # every row carries a monotonic ``seq`` + unique ``event_id``, and the driver checkpoint's
+    # ``progress_cursor`` is the only "consumed up to" marker (red line 4 + safety rule 1).
+    # The worker drains new rows into the bound session chat as ``system`` messages.
+
+    def _run_events_path(self, owner_id: uuid.UUID, project_id: str) -> Path:
+        return self._project_dir(owner_id, project_id) / _RUN_EVENTS_FILE
+
+    def _log_run_event(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        event_type: str,
+        key: str,
+        detail: str = "",
+        stage: str | None = None,
+        project: dict | None = None,
+    ) -> int | None:
+        """Append one progress event, deduplicated by ``(run_seq, event_type, key)``.
+
+        No-op outside a versioned run (skills / plain projects have no run_seq). Returns the
+        event's ``seq`` when recorded (or found already recorded), else ``None``.
+        """
+        if event_type not in _RUN_EVENT_TYPES:
+            raise ValueError(f"unknown run event type: {event_type}")
+        if project is None:
+            project = self._load_project(owner_id, project_id)
+        run_seq = self._run_version_of(project)
+        if not run_seq:
+            return None
+        path = self._run_events_path(owner_id, project_id)
+        data = self._load_json(path, {"events": []})
+        events = data["events"]
+        for event in events:
+            if (
+                event.get("run_seq") == run_seq
+                and event.get("type") == event_type
+                and event.get("key") == key
+            ):
+                return event["seq"]
+        seq = max((e["seq"] for e in events), default=0) + 1
+        events.append(
+            {
+                "seq": seq,
+                "event_id": str(uuid.uuid4()),
+                "run_seq": run_seq,
+                "type": event_type,
+                "key": key,
+                "stage": stage,
+                "detail": detail,
+                "ts": _now_iso(),
+            }
+        )
+        self._save_json(path, {"events": events})
+        return seq
+
+    def append_run_event(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        event_type: str,
+        key: str,
+        detail: str = "",
+        stage: str | None = None,
+    ) -> int | None:
+        """Public append (worker terminal events + tests); delegates to :meth:`_log_run_event`."""
+        return self._log_run_event(
+            owner_id, project_id, event_type=event_type, key=key, detail=detail, stage=stage
+        )
+
+    @staticmethod
+    def _render_run_event(event: dict) -> str:
+        """One compact human line for a run event (what the worker surfaces as a system row)."""
+        run_seq = event.get("run_seq")
+        tag = f"[auto-run v{run_seq}]"
+        etype = event["type"]
+        detail = event.get("detail") or ""
+        if etype == "stage":
+            return f"{tag} stage → {event.get('stage') or detail}: {detail}"
+        if etype == "gate_diagnostic":
+            return f"{tag} gate recorded: {detail}"
+        if etype == "artifact":
+            return f"{tag} {detail}"
+        if etype == "terminal":
+            return f"{tag} {detail}"
+        return f"{tag} {etype}: {detail}"
+
+    async def drain_run_events(
+        self,
+        session_factory,
+        owner_id: uuid.UUID,
+        project_id: str,
+        session_id: str | None,
+    ) -> int:
+        """Surface un-consumed run events of the CURRENT run into the bound session chat.
+
+        **Worker-only bridge** (this is where DB/session writes belong, never inside the state
+        machine or a tool monitor wrapper). Reads rows newer than ``driver.progress_cursor``,
+        writes each as one ``system`` message via ``insert_plain_message`` + a best-effort
+        task mirror, then advances the cursor past everything it *committed*. A DB failure on a
+        row leaves the cursor BEFORE that row so the next drain retries it — events already
+        committed are never re-emitted (no duplicates). Rows left over from an older run are
+        skipped (they were never this run's to show) but still consume the cursor.
+        """
+        if not session_id:
+            return 0
+        project = self._load_project(owner_id, project_id)
+        driver = project.get("driver") or {}
+        run_seq = driver.get("run_version")
+        if not isinstance(run_seq, int):
+            return 0
+        cursor = int(driver.get("progress_cursor", 0) or 0)
+        events = self._load_json(self._run_events_path(owner_id, project_id), {"events": []})
+        newer = [e for e in events["events"] if int(e["seq"]) > cursor]
+        if not newer:
+            return 0
+        from core.infrastructure.memory import insert_plain_message  # local: worker-only bridge
+
+        written = 0
+        committed = cursor
+        for event in sorted(newer, key=lambda e: e["seq"]):
+            if event.get("run_seq") != run_seq:
+                committed = max(committed, int(event["seq"]))
+                continue
+            text = self._render_run_event(event)
+            try:
+                await insert_plain_message(
+                    session_factory, owner_id, uuid.UUID(session_id), "system", text
+                )
+            except Exception as exc:  # noqa: BLE001 - DB write is best-effort, never blocks
+                logger.warning(
+                    "research drain insert failed for event %s (cursor kept): %s",
+                    event["seq"], exc,
+                )
+                break
+            written += 1
+            committed = max(committed, int(event["seq"]))
+            try:
+                await self.append_session_turn(owner_id, session_id, "system", text)
+            except Exception as exc:  # noqa: BLE001 - advisory mirror
+                logger.debug("research drain mirror failed for %s: %s", event["seq"], exc)
+        if committed != cursor:
+            try:
+                self.set_driver_checkpoint(
+                    owner_id, project_id, patch={"progress_cursor": committed}
+                )
+            except Exception as exc:  # noqa: BLE001 - a stale cursor only re-drains (deduped)
+                logger.warning("research drain cursor write failed for %s: %s", project_id, exc)
+        return written
+
+    # ── research_scrape (agent-invocable raw-source capture, silent by contract) ──
+    async def save_scrape(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        source: str,
+        url: str,
+        query: str,
+        content: str,
+    ) -> dict:
+        """Store one retrieved page's *content* into ``temp/v{N}/scrape/<source>_<query>_<n>.md``.
+
+        Agent-invocable capture of what a web/social search actually returned. Writes a small
+        structured metadata header then the extracted body text — never the underlying response
+        JSON. **Silent**: no run event, no chat line, no monitor wake-up per save (safety rule 3);
+        totals surface only in the stage-summary event a transition emits. No-op (returns
+        ``saved: False``) outside a versioned cloud task.
+        """
+        project = self._load_project(owner_id, project_id)
+        cloud_root = project.get("cloud_folder_path")
+        rv = self._run_version_of(project)
+        if not cloud_root or not rv:
+            return {"saved": False, "path": None, "reason": "no versioned cloud task run"}
+        rel_dir = f"temp/v{rv}/{_SCRAPE_SUBDIR}"
+        try:
+            await self._ensure_cloud_dir(owner_id, project, rel_dir)
+        except Exception as exc:  # noqa: BLE001 - best-effort, never fail the agent's turn
+            logger.warning("research scrape dir ensure failed for %s: %s", project_id, exc)
+            return {"saved": False, "path": None, "reason": "scrape folder unavailable"}
+        ledger = self._assets_ledger(project)
+        counts = ledger.setdefault("_scrape_counts", {})
+        if not isinstance(counts, dict):
+            counts = ledger["_scrape_counts"] = {}
+        seq_key = f"{source}|{query}"
+        seq = int(counts.get(seq_key, 0)) + 1
+        header = (
+            f"<!-- DeepDive research scrape\n"
+            f"Source: {source}\n"
+            f"URL: {url}\n"
+            f"Query: {query}\n"
+            f"Retrieved_at: {_now_iso()}\n"
+            f"Run_version: {rv}\n"
+            f"-->\n\n"
+        )
+        name = f"{_safe_filename(source or 'source')}_{_slug_token(query)}_{seq}.md"
+        try:
+            asset = await self.drive.save_artifact(
+                owner_id,
+                name=name,
+                mime_type="text/markdown",
+                content=(header + (content or "")).encode("utf-8"),
+                folder_path=f"{cloud_root}/{rel_dir}",
+                workspace_id=None,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort, never fail the agent's turn
+            logger.warning("research scrape save failed for %s: %s", project_id, exc)
+            return {"saved": False, "path": None, "reason": "drive write failed"}
+        counts[seq_key] = seq
+        self._merge_cloud_assets(owner_id, project_id, {"_scrape_counts": counts})
+        return {
+            "saved": True,
+            "path": f"{cloud_root}/{rel_dir}/{name}",
+            "name": name,
+            "asset_id": str(asset.id),
+            "folder_path": f"{cloud_root}/{rel_dir}",
+        }
+
+    # ── research_scrape fetch (batch EVIDENCE: real fetch + provenance ledger E7/E10) ──
+    @staticmethod
+    def _fetch_provenance(project: dict) -> dict:
+        """This run's ``_fetch_provenance`` ledger (canonical_url -> fetch record)."""
+        ledger = ResearchService._assets_ledger(project)
+        prov = ledger.setdefault(_FETCH_PROVENANCE_KEY, {})
+        if not isinstance(prov, dict):
+            prov = ledger[_FETCH_PROVENANCE_KEY] = {}
+        return prov
+
+    @staticmethod
+    def _source_id(cu: str) -> str:
+        """Deterministic Source node id for a canonical URL (E1 identity key)."""
+        digest = hashlib.sha256(cu.encode("utf-8")).hexdigest()[:16]
+        return f"{_SOURCE_ID_PREFIX}{digest}"
+
+    @staticmethod
+    def _evidence_id(claim_id: str, cu: str) -> str:
+        """Deterministic Evidence node id for one (Claim, canonical URL) pair (E1)."""
+        digest = hashlib.sha256(f"{claim_id}\x00{cu}".encode()).hexdigest()[:16]
+        return f"{_EVIDENCE_ID_PREFIX}{digest}"
+
+    @staticmethod
+    def _scrape_body(full: str) -> str:
+        """The file's article body (everything after the leading ``-->`` marker)."""
+        marker = "\n-->\n"
+        idx = full.find(marker)
+        return full[idx + len(marker):] if idx != -1 else full
+
+    @staticmethod
+    def _fetch_view(o: dict, *, saved: bool, reason: str | None = None, **extra: Any) -> dict:
+        """The model-facing shape of one fetch result (never carries the full ``body``)."""
+        view = {
+            "url": o.get("url", ""),
+            "canonical_url": o.get("canonical_url", ""),
+            "status": o.get("status", "error"),
+            "content_status": o.get("content_status", "n/a"),
+            "saved": bool(saved),
+            "title": o.get("title", ""),
+            "http_status": o.get("http_status"),
+            "final_url": o.get("final_url", ""),
+            "full_char_len": o.get("full_char_len", 0),
+            "char_len": o.get("char_len", 0),
+            "text": o.get("text", ""),
+            "truncated": bool(o.get("truncated", False)),
+        }
+        if o.get("status") == "error":
+            view["error"] = o.get("error")
+        for key, value in extra.items():
+            if value:
+                view[key] = value
+        if reason:
+            view["reason"] = reason
+        return view
+
+    async def fetch_save_batch(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        urls: list[str],
+        transport=None,
+        resolver=None,
+    ) -> list[dict]:
+        """Fetch ≤3 URLs concurrently, persist usable drafts under temp/vN/scrape, and record
+        server-side fetch provenance (E7) for this run.
+
+        Contract (the E-series trust boundaries):
+        - **E3** a code-level batch cap: more than 3 URLs is a ``ValueError``.
+        - **E7** every successful fetch records ``_fetch_provenance[canonical_url]`` in the
+          run's ``cloud_assets`` ledger — ``verify`` later trusts only this record, never a
+          model-supplied ``content_status``/length.
+        - **E10** saves run concurrently under ``asyncio.gather``; a failed drive write marks
+          that URL unsaved and is **not** entered into the ledger (no account skew). It never
+          fails the batch.
+        - Silent by contract (like ``save_scrape``): no run event / monitor wake-up per batch.
+
+        Returns one model-facing view per input URL (order preserved; ``body`` stripped).
+        """
+        raw = [u for u in (urls or []) if isinstance(u, str) and u.strip()]
+        if len(raw) > 3:
+            raise ValueError(
+                f"fetch_save_batch accepts at most 3 URLs per call (got {len(raw)}); "
+                "fetch in batches of ≤3"
+            )
+        if not raw:
+            return []
+        project = self._load_project(owner_id, project_id)
+        cloud_root = project.get("cloud_folder_path")
+        rv = self._run_version_of(project)
+        if not cloud_root or not rv:
+            return [
+                self._fetch_view(
+                    {"url": u, "canonical_url": canonicalize(u), "status": "error",
+                     "content_status": "n/a", "title": "", "http_status": None,
+                     "final_url": canonicalize(u), "full_char_len": 0, "char_len": 0,
+                     "text": "", "truncated": False},
+                    saved=False, reason="no versioned cloud task run",
+                )
+                for u in raw
+            ]
+        rel_dir = f"temp/v{rv}/{_SCRAPE_SUBDIR}"
+        folder_path = f"{cloud_root}/{rel_dir}"
+        try:
+            await self._ensure_cloud_dir(owner_id, project, rel_dir)
+        except Exception as exc:  # noqa: BLE001 - best-effort, never fail the turn
+            logger.warning("research fetch dir ensure failed for %s: %s", project_id, exc)
+            return [
+                self._fetch_view(
+                    {"url": u, "canonical_url": canonicalize(u), "status": "error",
+                     "content_status": "n/a", "title": "", "http_status": None,
+                     "final_url": canonicalize(u), "full_char_len": 0, "char_len": 0,
+                     "text": "", "truncated": False},
+                    saved=False, reason="scrape folder unavailable",
+                )
+                for u in raw
+            ]
+        envelopes = await fetch_clean_urls(
+            raw,
+            transport=transport or _FETCH_TRANSPORT_OVERRIDE,
+            resolver=resolver or _FETCH_RESOLVER_OVERRIDE,
+        )
+        # Pre-persist plan for the usable pages (names/content computed offline; no IO yet).
+        persist_plan: list[tuple[int, str, bytes]] = []  # (envelope index, name, content bytes)
+        plan_of: dict[int, int] = {}  # envelope index -> position in persist_plan
+        for i, o in enumerate(envelopes):
+            if o.get("status") == "ok" and o.get("content_status") == "usable":
+                plan_of[i] = len(persist_plan)
+                cu = o.get("canonical_url", "")
+                host = cu.split("://", 1)[1].split("/", 1)[0].lower() if "://" in cu else "page"
+                host = _safe_filename(host)
+                name = f"fetch_{host}_{uuid.uuid4().hex[:10]}.md"
+                header = (
+                    f"<!-- DeepDive research scrape\n"
+                    f"Source: fetch\n"
+                    f"URL: {cu}\n"
+                    f"Run_version: {rv}\n"
+                    f"Retrieved_at: {_now_iso()}\n"
+                    f"-->\n\n"
+                )
+                persist_plan.append((i, name, (header + (o.get("body") or "")).encode("utf-8")))
+
+        async def _persist(name: str, content: bytes) -> dict:
+            try:
+                asset = await self.drive.save_artifact(
+                    owner_id,
+                    name=name,
+                    mime_type="text/markdown",
+                    content=content,
+                    folder_path=folder_path,
+                    workspace_id=None,
+                )
+                return {"ok": True, "asset_id": str(asset.id)}
+            except Exception as exc:  # noqa: BLE001 - one failed save never kills the batch
+                logger.warning("research fetch save failed for %s: %s", name, exc)
+                return {"ok": False, "asset_id": None}
+
+        save_results = await asyncio.gather(
+            *(_persist(name, content) for _, name, content in persist_plan),
+            return_exceptions=True,
+        )
+        persist_outcomes: dict[int, dict] = {}
+        for (idx, _, _), outcome in zip(persist_plan, save_results):
+            persist_outcomes[idx] = (
+                outcome if isinstance(outcome, dict) else {"ok": False, "asset_id": None}
+            )
+
+        # Build the model-facing views + this run's provenance additions.
+        additions: dict[str, dict] = {}
+        views: list[dict] = []
+        for i, o in enumerate(envelopes):
+            cu = o.get("canonical_url", "")
+            if o.get("status") != "ok":
+                views.append(self._fetch_view(o, saved=False))
+                continue
+            entry: dict[str, Any] = {
+                "url": o.get("url", ""),
+                "canonical_url": cu,
+                "fetch_status": "ok",
+                "http_status": o.get("http_status"),
+                "content_status": o.get("content_status", "n/a"),
+                "full_char_len": o.get("full_char_len", 0),
+                "saved": False,
+                "asset_id": None,
+            }
+            if o.get("content_status") != "usable":
+                additions[cu] = entry  # fetched but unusable → recorded, never verifiable
+                views.append(self._fetch_view(o, saved=False))
+                continue
+            outcome = persist_outcomes.get(i) or {"ok": False, "asset_id": None}
+            if not outcome.get("ok"):
+                # E10: a failed drive write is left OUT of the ledger (no account skew).
+                views.append(self._fetch_view(o, saved=False, reason="drive write failed"))
+                continue
+            asset_id = outcome["asset_id"]
+            name = persist_plan[plan_of[i]][1]
+            entry.update(
+                {
+                    "saved": True,
+                    "asset_id": asset_id,
+                    "name": name,
+                    "path": f"{folder_path}/{name}",
+                }
+            )
+            additions[cu] = entry
+            views.append(
+                self._fetch_view(
+                    o, saved=True, asset_id=asset_id, path=entry["path"], name=name
+                )
+            )
+        if additions:
+            self._merge_cloud_assets(
+                owner_id, project_id, {_FETCH_PROVENANCE_KEY: additions}
+            )
+        return views
+
+    async def read_fetch(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        canonical_url: str | None = None,
+        asset_id: str | None = None,
+        name: str | None = None,
+    ) -> dict:
+        """Read back a page full draft this run actually fetched (E6/E9 write-time citation).
+
+        Resolution is locked to this run's ``_fetch_provenance`` ledger: only assets the run
+        fetched and saved can be read, addressed by exactly one of ``canonical_url`` /
+        ``asset_id`` / ``name``. Anything else — a foreign run's asset, a path with ``..``, a
+        made-up id — is refused with a precise error (never a blind drive read).
+        """
+        project = self._load_project(owner_id, project_id)
+        cloud_root = project.get("cloud_folder_path")
+        rv = self._run_version_of(project)
+        if not cloud_root or not rv:
+            raise ValueError(
+                "read_fetch needs a versioned cloud task run (no fetch provenance this run)"
+            )
+        provided = sum(1 for x in (canonical_url, asset_id, name) if x)
+        if provided != 1:
+            raise ValueError("read_fetch needs exactly one of canonical_url | asset_id | name")
+        prov = self._fetch_provenance(project)
+        entries = [e for e in prov.values() if isinstance(e, dict) and e.get("saved")]
+        if canonical_url:
+            cu = canonicalize(canonical_url)
+            entry = prov.get(cu) if isinstance(prov, dict) else None
+            if not isinstance(entry, dict) or not entry.get("saved"):
+                raise ValueError(
+                    f"no usable fetch recorded this run for {cu!r} — read only what research_scrape fetch saved"
+                )
+            asset_id, name = entry["asset_id"], entry.get("name")
+        elif asset_id:
+            match = next((e for e in entries if e.get("asset_id") == asset_id), None)
+            if match is None:
+                raise ValueError(
+                    f"asset {asset_id!r} was not fetched this run — read only what research_scrape fetch saved"
+                )
+            asset_id, name = match["asset_id"], match.get("name")
+            cu = match["canonical_url"]
+        else:  # by name — never a path; a plain filename inside this run's scrape folder.
+            if (
+                not name
+                or name in (".", "..")
+                or "/" in name
+                or "\\" in name
+                or name != _safe_filename(name)
+            ):
+                raise ValueError(f"invalid scrape file name: {name!r}")
+            match = next((e for e in entries if e.get("name") == name), None)
+            if match is None:
+                raise ValueError(f"no fetch asset named {name!r} this run")
+            asset_id, cu = match["asset_id"], match["canonical_url"]
+        try:
+            full = await self.drive.read_text(owner_id, uuid.UUID(asset_id))
+        except Exception as exc:
+            logger.warning("research fetch read failed for %s: %s", asset_id, exc)
+            raise ValueError(f"could not read fetched asset {asset_id}: drive read failed") from exc
+        return {
+            "canonical_url": cu,
+            "asset_id": asset_id,
+            "name": name,
+            "path": f"{cloud_root}/temp/v{rv}/{_SCRAPE_SUBDIR}/{name}",
+            "content": self._scrape_body(full),
+        }
+
+    def ingest_evidence(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        claim: dict,
+        findings: list[dict],
+    ) -> dict:
+        """Bulk-verify one Claim's findings into the graph (idempotent, provenance-gated).
+
+        The single write path behind ``research_evidence action="verify"``. Trust boundaries:
+
+        - **E8** the Claim must already exist (recorded first with ``record_node``) — verify
+          never creates a Claim and never edits an existing Claim's statement/label.
+        - **E1** every verified finding maps to Source ``src:<sha(cu)>`` (reused when a Source
+          with ``url==cu`` exists) and Evidence ``ev:<sha(claim_id \x00 cu)>`` — replaying the
+          same (Claim, URL) is an upsert, never a duplicate node/edge.
+        - **E7** a finding is verifiable **only** when this run's ``_fetch_provenance`` ledger
+          (written by ``fetch_save_batch``) records the URL as fetched-ok with usable content;
+          the model-supplied ``content_status``/length/``usable`` carry no authority.
+        - **E2** a Source becomes ``verified`` only when the ledger says
+          fetch ok + content usable + ``full_char_len ≥ MIN`` + verdict is
+          supports/contradicts. ``neutral`` is not a ticket: it never creates nodes and adds no
+          Claim edge — it only annotates an existing verified Evidence for the same (Claim, URL).
+        """
+        claim_id = (claim or {}).get("id") if isinstance(claim, dict) else None
+        if not isinstance(claim_id, str) or not claim_id.strip():
+            raise ValueError("verify 'claim' must include the recorded claim's 'id'")
+        claim_id = claim_id.strip()
+        project = self._load_project(owner_id, project_id)
+        graph = self._load_graph(owner_id, project_id)
+        claim_node = next((n for n in graph["nodes"] if n["id"] == claim_id), None)
+        if claim_node is None:
+            raise ValueError(
+                f"claim node not found: {claim_id!r} — verify does not create claims; "
+                "record it first with research_evidence record_node (type 'Claim')"
+            )
+        claim_label = claim_node.get("label") or claim_id
+        prov = self._fetch_provenance(project)
+        nodes_by_id = {n["id"]: n for n in graph["nodes"]}
+        edges = graph["edges"]
+
+        counts = {"nodes_added": 0, "nodes_updated": 0, "edges_added": 0}
+        verified_sources: list[str] = []
+        rejected: list[dict] = []
+        neutral_skipped: list[dict] = []
+        changed = False
+
+        def _add_edge(src: str, dst: str, kind: str) -> bool:
+            """Append ``(src, dst, kind)`` if absent; returns True when newly added."""
+            if any(e["src"] == src and e["dst"] == dst and e["kind"] == kind for e in edges):
+                return False
+            edges.append({"src": src, "dst": dst, "kind": kind})
+            return True
+
+        for f in findings or []:
+            if not isinstance(f, dict):
+                rejected.append({"cu": "", "reason": "finding is not an object"})
+                continue
+            url = (f.get("url") or "").strip()
+            verdict = (f.get("verdict") or "").strip().lower()
+            if not url:
+                rejected.append({"cu": "", "reason": "finding is missing 'url'"})
+                continue
+            if verdict not in ("supports", "contradicts", "neutral"):
+                rejected.append({"cu": url, "reason": f"unknown verdict {verdict!r} (supports|contradicts|neutral)"})
+                continue
+            cu = canonicalize(url)
+            entry = prov.get(cu) if isinstance(prov, dict) else None
+            if not isinstance(entry, dict):
+                rejected.append(
+                    {"cu": cu, "reason": "no fetch provenance this run (fetch the URL with research_scrape fetch first)"}
+                )
+                continue
+            fetch_ok = entry.get("fetch_status") == "ok"
+            content_ok = (
+                fetch_ok
+                and entry.get("content_status") == "usable"
+                and int(entry.get("full_char_len", 0)) >= MIN_FETCH_TEXT_CHARS
+            )
+
+            if verdict in ("supports", "contradicts"):
+                if not content_ok:
+                    if entry.get("fetch_status") != "ok":
+                        reason = "fetch failed this run (not verifiable)"
+                    elif entry.get("content_status") != "usable":
+                        reason = (
+                            f"fetched content {entry.get('content_status')} (not usable "
+                            "for verification — login wall / empty page)"
+                        )
+                    else:
+                        reason = "fetched content too short to verify"
+                    rejected.append({"cu": cu, "reason": reason})
+                    continue
+                # Reuse an existing Source whose url == cu (any id), else the deterministic one.
+                source = next(
+                    (n for n in graph["nodes"] if n["type"] == "Source" and n.get("url") == cu),
+                    None,
+                )
+                if source is None:
+                    source_id = self._source_id(cu)
+                    source = nodes_by_id.get(source_id)
+                    if source is None:
+                        source = {
+                            "id": source_id,
+                            "type": "Source",
+                            "label": (f.get("source_label") or "").strip() or cu,
+                            "url": cu,
+                            "verification_status": "verified",
+                            "canonical_url": cu,
+                            "full_char_len": entry.get("full_char_len"),
+                            "content_status": entry.get("content_status"),
+                            "asset_id": entry.get("asset_id"),
+                            "status": "VALID",
+                        }
+                        graph["nodes"].append(source)
+                        nodes_by_id[source_id] = source
+                        counts["nodes_added"] += 1
+                        changed = True
+                    else:
+                        source["verification_status"] = "verified"
+                else:
+                    if source.get("verification_status") != "verified":
+                        source["verification_status"] = "verified"
+                        counts["nodes_updated"] += 1
+                        changed = True
+                    source_id = source["id"]
+
+                ev_id = self._evidence_id(claim_id, cu)
+                evidence = nodes_by_id.get(ev_id)
+                facts = [s for s in (f.get("facts") or []) if isinstance(s, str) and s.strip()]
+                excerpt = (f.get("excerpt") or "").strip()
+                if evidence is None:
+                    evidence = {
+                        "id": ev_id,
+                        "type": "Evidence",
+                        "label": f"{claim_label} → {source.get('label', cu)}",
+                        "verdict": verdict,
+                        "source_url": cu,
+                        "facts": facts,
+                        "excerpt": excerpt,
+                        "status": "VALID",
+                    }
+                    graph["nodes"].append(evidence)
+                    nodes_by_id[ev_id] = evidence
+                    counts["nodes_added"] += 1
+                    changed = True
+                else:
+                    touched = False
+                    if evidence.get("verdict") != verdict:
+                        evidence["verdict"] = verdict
+                        touched = True
+                    if (evidence.get("facts") or []) != facts:
+                        evidence["facts"] = facts
+                        touched = True
+                    if (evidence.get("excerpt") or "") != excerpt:
+                        evidence["excerpt"] = excerpt
+                        touched = True
+                    if touched:
+                        counts["nodes_updated"] += 1
+                        changed = True
+                if _add_edge(ev_id, source_id, "depends_on"):
+                    counts["edges_added"] += 1
+                    changed = True
+                if _add_edge(claim_id, ev_id, verdict):
+                    counts["edges_added"] += 1
+                    changed = True
+                verified_sources.append(cu)
+            else:  # verdict == neutral — a note on an existing verified Evidence, nothing new.
+                source = next(
+                    (n for n in graph["nodes"] if n["type"] == "Source" and n.get("url") == cu),
+                    None,
+                )
+                evidence = nodes_by_id.get(self._evidence_id(claim_id, cu))
+                linked_ok = source is not None and source.get("verification_status") == "verified"
+                if not linked_ok or evidence is None:
+                    neutral_skipped.append(
+                        {
+                            "cu": cu,
+                            "reason": "neutral is not a ticket: no verified Evidence for this (claim, url) yet",
+                        }
+                    )
+                    continue
+                if evidence.get("verdict") != "neutral":
+                    evidence["verdict"] = "neutral"
+                    counts["nodes_updated"] += 1
+                    changed = True
+
+        if changed:
+            self._save_graph(owner_id, project_id, graph)
+        return {
+            "claim_id": claim_id,
+            **counts,
+            "verified_sources": verified_sources,
+            "rejected": rejected,
+            "neutral_skipped": neutral_skipped,
+        }
 
     def record_execution(
         self,
@@ -2478,6 +3576,12 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 user(), _project_id(args, "research_evidence", action),
                 node_id=_require(args, "node_id", "research_evidence", action),
             )
+        if action == "verify":
+            return svc.ingest_evidence(
+                user(), _project_id(args, "research_evidence", action),
+                claim=_require(args, "claim", "research_evidence", action),
+                findings=_require(args, "findings", "research_evidence", action),
+            )
         raise ValueError(f"unknown research_evidence action: {action}")
 
     async def _gate(args: dict, exec: ToolExecution) -> dict:
@@ -2527,6 +3631,43 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 script=_require(args, "script", "research_run", action),
             )
         raise ValueError(f"unknown research_run action: {action}")
+
+    async def _scrape(args: dict, exec: ToolExecution) -> dict:
+        svc = service()
+        action = args["action"]
+        if action == "save_scrape":
+            # Deliberately NOT wrapped in _monitor_wrap: scrape saves are silent (no per-save
+            # monitor wake-up or chat line — safety rule 3); the folder shows up on the next
+            # natural stage change.
+            return await svc.save_scrape(
+                user(), _project_id(args, "research_scrape", action),
+                source=_require(args, "source", "research_scrape", action) or "source",
+                url=args.get("url") or "",
+                query=_require(args, "query", "research_scrape", action),
+                content=_require(args, "content", "research_scrape", action),
+            )
+        if action == "fetch":
+            # E3 hard code-level cap: >3 URLs is a parameter error, never fetched.
+            urls = args.get("urls")
+            if not isinstance(urls, list) or not urls or any(not isinstance(u, str) or not u.strip() for u in urls):
+                raise ValueError("research_scrape fetch needs 'urls' as a non-empty list of URL strings")
+            if len(urls) > 3:
+                raise ValueError(
+                    f"research_scrape fetch accepts at most 3 URLs per call (got {len(urls)}); "
+                    "fetch a claim's sources in batches of ≤3"
+                )
+            # Silent by contract (like save_scrape): no per-fetch monitor wake-up.
+            return await svc.fetch_save_batch(
+                user(), _project_id(args, "research_scrape", action), urls=urls
+            )
+        if action == "read":
+            return await svc.read_fetch(
+                user(), _project_id(args, "research_scrape", action),
+                canonical_url=args.get("canonical_url"),
+                asset_id=args.get("asset_id"),
+                name=args.get("name"),
+            )
+        raise ValueError(f"unknown research_scrape action: {action}")
 
     research_project_tool = _make_tool(
         name="research_project",
@@ -2599,11 +3740,15 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
     research_evidence_tool = _make_tool(
         name="research_evidence",
         description=(
-            "Record graph nodes and edges, query lineage, and invalidate downstream nodes. "
-            "Mutating an upstream node STALE-cascades to its epistemic dependents."
+            "Record graph nodes and edges, query lineage, bulk-verify one Claim's fetched "
+            "findings, and invalidate downstream nodes. Mutating an upstream node "
+            "STALE-cascades to its epistemic dependents. 'verify' is the batch-EVIDENCE "
+            "ingest: pass the recorded claim + your findings after research_scrape fetch; "
+            "the service writes Sources/Evidence/edges idempotently and only for URLs whose "
+            "content it itself fetched this run."
         ),
         parameters=_params(
-            ["record_node", "link_edge", "query_lineage", "mutate_node", "invalidate_downstream"],
+            ["record_node", "link_edge", "query_lineage", "mutate_node", "invalidate_downstream", "verify"],
             {
                 "node": {
                     "type": "object",
@@ -2619,6 +3764,18 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                     "type": "string",
                     "description": "Edge kind: derived_from / generated_by / depends_on / "
                     "supports / cites / tests / invalidates / ...",
+                },
+                "claim": {
+                    "type": "object",
+                    "description": "verify: the already-recorded claim node's id, e.g. {id: '...'} "
+                    "(verify never creates or edits a claim).",
+                },
+                "findings": {
+                    "type": "array",
+                    "description": "verify: [{url, verdict: supports|contradicts|neutral, "
+                    "source_label?, facts?: [str], excerpt?: str}]. The service checks each "
+                    "URL against this run's server-side fetch ledger — your content_status/"
+                    "length assertions carry no authority.",
                 },
             },
             required=[],
@@ -2671,9 +3828,63 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
         permission={ToolPermission.READ, ToolPermission.WRITE},
     )
 
+    research_scrape_tool = _make_tool(
+        name="research_scrape",
+        description=(
+            "Research source capture. 'save_scrape' files a retrieved page's raw content "
+            "under `temp/vN/scrape/`. 'fetch' real-fetches ≤3 URLs concurrently, cleans each "
+            "page to core text, persists usable drafts, and returns snippets (batch "
+            "EVIDENCE — call it per claim, THEN verify). 'read' reads back a full draft this "
+            "run fetched (address it by canonical_url / asset_id / name) when you need the "
+            "whole page to cite in WRITE. All silent: nothing is printed or announced."
+        ),
+        parameters=_params(
+            ["save_scrape", "fetch", "read"],
+            {
+                "source": {
+                    "type": "string",
+                    "description": "save_scrape: where the content came from (site/domain or social handle).",
+                },
+                "url": {
+                    "type": "string",
+                    "description": "save_scrape: the original URL of the retrieved page.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "save_scrape: the search query this page answered (part of the file name).",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "save_scrape: the extracted page content as text/markdown (never raw JSON).",
+                },
+                "urls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "fetch: ≤3 URLs to real-fetch this run (SSRF-guarded, "
+                    "concurrent, cleaned to core text).",
+                },
+                "canonical_url": {
+                    "type": "string",
+                    "description": "read: the canonical URL of a page this run fetched.",
+                },
+                "asset_id": {
+                    "type": "string",
+                    "description": "read: the asset id of a page this run fetched.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "read: the scrape file name of a page this run fetched.",
+                },
+            },
+            required=[],
+        ),
+        handler=_scrape,
+        permission={ToolPermission.READ, ToolPermission.WRITE},
+    )
+
     return Plugin(
         name="research",
-        description="Research OS: 6 tools over the ResearchProject/Artifact/Graph/State/Gate/Execution contracts.",
+        description="Research OS: research tools over the Project/Artifact/Graph/State/Gate/Scrape/Execution contracts.",
         tools=[
             research_project_tool,
             research_artifact_tool,
@@ -2681,6 +3892,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             research_evidence_tool,
             research_gate_tool,
             research_run_tool,
+            research_scrape_tool,
         ],
         inject=["drive", "research_scratch"],
     )

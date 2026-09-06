@@ -32,6 +32,14 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   cloudCache: (assetId, name, token) =>
     ipcRenderer.invoke("cloud-cache", { assetId, name, token }),
 
+  // Export a single cloud file through a Save dialog: { assetId, name, token } →
+  // { ok, path } | { ok, canceled } | { ok, error }.
+  saveCloudFile: (o) => ipcRenderer.invoke("cloud-download-save", o),
+
+  // Export a folder subtree to a pre-picked destination: { files, destDir, token } →
+  // { ok, count, errors } (files: [{ assetId, name, relPath }]).
+  downloadCloudFiles: (o) => ipcRenderer.invoke("cloud-download-batch", o),
+
   // Create a folder inside the workspace (or a subfolder): { workspaceDir, parentDir, name }.
   createFolder: (o) => ipcRenderer.invoke("create-folder", o),
 

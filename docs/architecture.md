@@ -1179,9 +1179,10 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Rewrite args / augment result | `tools/post-execute` returns `PostToolDecision.accept(value=..., content=...)` |
 | Observe results without blocking | `EventBus.observe("tools/result", ...)` (serial) / `emit` (fire-and-forget) |
 | Swap retrieval provider | `Context.provide("retrieval", …)` + `settings.retrieval_mode` |
-| Swap web-search provider | `Context.provide("web_search", get_web_search_provider())` + `settings.web_search_provider`; default `aggregate` — keyless concurrent Bing + Google + Baidu (`web_search_aggregate.py`), with DDG added as a second chance when the primary engines return empty |
+| Swap web-search provider | `Context.provide("web_search", get_web_search_provider())` + `settings.web_search_provider`; default `aggregate` (keyless concurrent Bing + Google + Baidu, `web_search_aggregate.py`); set `WEB_SEARCH_PROVIDER=tavily` + `WEB_SEARCH_API_KEY` for Tavily (the production provider) — always called at `search_depth="basic"` with raw-content/answer/auto-parameters off, DuckDuckGo tried only as a last-resort fallback behind a Tavily failure |
+| Surface a search outage honestly | every provider returns an outcome envelope `{status: ok\|degraded, provider, results, error}`; a timeout / auth failure / 5xx is `degraded`, never an empty `ok` result — so gate diagnostics can tell "no evidence" from "search infra down", and error text never contains the API key |
 | Refuse to silently hide a tool / skill | full catalog render + `check_index_capacity` hard ceiling (16 KB), raised at startup from `AgentKernel.ensure_capacity` after every plugin/skill is discovered |
-| Social degrade when a platform has no API / login | x / zhihu adapters → `site_limited_web_search` (site-scoped keyless aggregate, host-filtered, deduped/fused) instead of failing |
+| Social degrade when a platform has no API / login | x / zhihu adapters → `domain_search` on the provider seam (Tavily `include_domains` when configured; keyless site-scoped aggregate otherwise) — *indexed web/domain search*, host-filtered; a backend outage surfaces as a tool error, never a fake empty result |
 | Session extension points | `agent/session-start` / `agent/session-end` observers in the loop |
 | Stable prompt head for prefix cache | `CacheBoundaryAssembler` zones (internal `CACHE_BOUNDARY` separator, never rendered) + `snapshot_key()` |
 | Load a tool schema on demand | `tool_search` meta-tool → `ToolGateway.mount(name)` (defer_loading stub) + `schema_of(name)` in the result |
@@ -2110,17 +2111,29 @@ admin console are the remaining Phase 1 work — see [Implementation Status
 authoritative state lives in server scratch (`<research_scratch>/<owner>/<task_id>/`):
 `project.json` (stage/gates, `cloud_folder_id` — the unique task↔folder binding, `cloud_folder_path`
 — a display-only cache, the `materials` provenance table `{asset_id, name, cloud_asset_id, mime}`,
-`active_run`, `deletion_requested`), `graph.json`, `executions.json`, `approvals.json`,
+`active_run`, `deletion_requested`, and `run_seq` — the monotonic per-run version minted atomically
+inside `begin_run`'s single-writer mutate and copied to the driver checkpoint as `run_version`, never
+read-modify-written outside that lock), `graph.json`, `executions.json`, `approvals.json`,
 `artifacts/<id>/v<N>` (versioned), `task_spec.json` / `session_history.json` (also mirrored to the
-cloud), and `_session_index.json` (the session→task routing map). The user-visible **cloud task
-folder** lives in My Drive under the parent the user picked: `materials/` (copies of selected
-cloud assets, named `<asset_id>__<safe_name>`), `outputs/<id>.md` (each agent artifact's latest
-version projected and updated in place — no asset explosion), plus the two JSON mirrors. Promoting
-a report to RAG just flips the cloud `outputs/<id>.md` asset to RAG-pending (the skill-driven
-`research_project` path still uploads to `research/<project_id>/`). A failing create rolls the
-whole thing back (cloud folder → Trash, scratch removed), so no half-built task is ever left
-behind; the cloud folder is created with the Drive's collision-safe naming and the `drive.download`
-permission gate doubles as the material tenancy check.
+cloud), the append-only `run_events.json` progress log (see the run-lifecycle paragraph below), and
+`_session_index.json` (the session→task routing map). The user-visible **cloud task folder** lives in
+My Drive under the parent the user picked: `materials/` (copies of selected cloud assets, named
+`<asset_id>__<safe_name>`); `temp/v1/ v2/ …` — one **permanent per-run subfolder** per `run_seq`,
+holding that run's working copies (`write_scratch` / `create_version` intermediates land in
+`temp/v{run_version}/<id>.md`, updated in place within a run, never clobbering an earlier run's
+folder) and its raw-source captures under `temp/v{run_version}/scrape/<source>_<query>_<n>.md`
+(agent-saved via `research_scrape save_scrape`, a metadata header plus page text — never the raw
+search response JSON); and `outputs/<stem>_v<N>.md` — a run's promote **Create-New** final, versioned
+per run: the first promote of a run mints `outputs/<stem>_vN.md` and RAG-pends that asset, a
+re-promote inside the same run refreshes it in place (never a `_vN+1`), and a later run writes a fresh
+`_v{N+1}` that never overwrites or reuses an earlier final. The transient `driver.cloud_assets` ledger
+(folder/asset ids for the current run's `temp/vN` + `scrape/` projection) is reset by every
+`begin_run` and is never a multi-run index. The legacy no-run projection (a task promoted outside any
+run) still writes `outputs/<id>.md` in place, and the skill-driven `research_project` path still
+uploads to `research/<project_id>/`. A failing create rolls the whole thing back (cloud folder →
+Trash, scratch removed), so no half-built task is ever left behind; the cloud folder is created with
+the Drive's collision-safe naming and the `drive.download` permission gate doubles as the material
+tenancy check.
 
 **Session isolation.** Every task binds a single dedicated chat session (1:1, `bind_session`).
 Research sessions are a different kind than a normal chat: `GET /sessions` filters them out via
@@ -2151,7 +2164,20 @@ ran out of usable material still ends at PUBLISH with an honest per-stage failur
 RAG-promoted). Strict runs keep the stall/cap stop — an un-passed gate there is a real
 human-decision point. Terminal states are recorded in `last_block` (`{kind, reason, at,
 run_id, execution_id}`), the slot is released via `end_run`, and the terminal message is mirrored
-to the session. `begin_run`/`end_run` keep the `active_run` record in `project.json`; a task
+to the session.
+
+**Run progress — appended, never replaced.** A run's milestones — a granted stage transition, a
+progressive gate diagnostic recording failed checks, a genuinely new artifact/version, or the graded
+terminal state — append one lightweight row to the task's scratch `run_events.json` at the point each
+commits (never micro-retries or ordinary tool steps); every row carries a monotonic `seq` + unique
+`event_id`, and the log is only ever appended to. The worker's `research_drive` job — not the state
+machine or any tool wrapper, which never touch the DB — drains rows newer than
+`driver.progress_cursor` into the bound session as one `system` message each (appended, never
+replacing prior chat lines) and advances the cursor only past the rows it committed: a DB failure
+leaves the cursor before the failing row so the retry re-emits exactly that row, and rows left over
+from an older run are skipped (never re-shown) while still consuming the cursor.
+
+`begin_run`/`end_run` keep the `active_run` record in `project.json`; a task
 allows one live run at a time, **`is_running` stays true across the whole background chain**
 (surfaced in every task view), a fresh chat-triggered run while one is active is a **409
 conflict**, and the chat `done` frame carries `research_continuing: true` when the worker keeps

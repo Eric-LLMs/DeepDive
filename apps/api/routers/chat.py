@@ -110,6 +110,20 @@ def _handoff_note(body: ChatRequest) -> str | None:
     if not project_id:
         return None
     mode = handoff.get("mode") or "research_resume"
+    if mode == "research_run":
+        # The desktop Run control. Mid-chain this means "drive the remaining stages"; on a
+        # task that already reached PUBLISH begin_run reset it to a NEW edition (stage ->
+        # DISCOVER, evidence graph emptied), so the agent must re-gather rather than treat
+        # the prior edition's report as current evidence.
+        return (
+            f"[Research handoff: run {project_id} via research_project (action resume), "
+            "Run-control start. Do NOT create a new project — the project already exists. "
+            "Continue the current stage and drive every remaining stage through the "
+            "deep_research skill to PUBLISH. If this task had already reached PUBLISH, it was "
+            "reset to a fresh edition: the stage is DISCOVER, gates are NOT_RUN and the "
+            "evidence graph was emptied, so re-gather sources from scratch instead of "
+            "reusing the prior edition's report as current evidence.]"
+        )
     return (
         f"[Research handoff: resume project {project_id} via research_project (action resume), "
         f"mode {mode}. Do NOT create a new project — the project already exists. Continue "
@@ -492,7 +506,15 @@ async def chat(
     research_turn = research_service is not None and bound_task_id is not None
     if research_turn:
         try:
-            research_service.begin_run(user_id, bound_task_id, session_id=str(session_id))
+            # The desktop Run control on a task that already reached PUBLISH is a NEW-edition
+            # run (handoff mode "research_run"): begin_run resets the finished task so it
+            # drives DISCOVER→…→PUBLISH again into temp/vN + outputs/_vN instead of stopping
+            # at turn 0. A plain resume ("research_resume", e.g. a typed session message)
+            # never restarts a finished task — casual chat must not burn a full re-run.
+            new_edition = (effective_handoff or {}).get("mode") == "research_run"
+            research_service.begin_run(
+                user_id, bound_task_id, session_id=str(session_id), new_edition=new_edition
+            )
         except ValueError as exc:
             msg = str(exc)
             if "already running" in msg:
@@ -707,7 +729,15 @@ async def chat_stream(
     research_turn = research_service is not None and bound_task_id is not None
     if research_turn:
         try:
-            research_service.begin_run(user_id, bound_task_id, session_id=str(session_id))
+            # The desktop Run control on a task that already reached PUBLISH is a NEW-edition
+            # run (handoff mode "research_run"): begin_run resets the finished task so it
+            # drives DISCOVER→…→PUBLISH again into temp/vN + outputs/_vN instead of stopping
+            # at turn 0. A plain resume ("research_resume", e.g. a typed session message)
+            # never restarts a finished task — casual chat must not burn a full re-run.
+            new_edition = (effective_handoff or {}).get("mode") == "research_run"
+            research_service.begin_run(
+                user_id, bound_task_id, session_id=str(session_id), new_edition=new_edition
+            )
         except ValueError as exc:
             msg = str(exc)
             if "already running" in msg:

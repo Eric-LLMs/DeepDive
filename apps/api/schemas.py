@@ -191,6 +191,20 @@ class TestEmailRequest(BaseModel):
     to_email: str
 
 
+class TestWebSearchRequest(BaseModel):
+    """Web-search connectivity probe payload for /config/test-web-search.
+
+    Every field is an optional override over the stored tools config: a blank ``api_key``
+    (or None) means "keep the stored one". The result is sanitized — the key is never
+    echoed back.
+    """
+
+    provider: str | None = None
+    api_key: str | None = None
+    engine_id: str | None = None
+    query: str = ""
+
+
 class ProvidersUpdateRequest(BaseModel):
     """Full provider-card list + active selection, written wholesale by the settings UI."""
 

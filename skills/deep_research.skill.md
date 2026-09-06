@@ -2,7 +2,7 @@
 name: deep_research
 description: Run a full multi-source research workflow — plan, search, gather evidence, cross-verify claims, synthesize, and publish a cited report to the drive. Use for substantive questions that need several sources and verification, not a quick answer.
 keywords: research, deep research, investigate, sources, evidence, claims, citations, report, literature, study, synthesis
-allowed_tools: research_project, research_artifact, research_state, research_evidence, research_gate, research_run, rag_search, web_search, search_social
+allowed_tools: research_project, research_artifact, research_state, research_evidence, research_gate, research_run, research_scrape, rag_search, web_search, search_social
 ---
 
 # Deep Research Procedure
@@ -46,18 +46,44 @@ create the project with `profile: "empirical"` and use `research_run execute_san
    - `web_search` — official docs and recent, authoritative pages.
    - `search_social` — lived experience and current community discussion (useful for
      fast-moving topics, but treat anecdotes as opinions, not facts).
-   Write the candidate list to an artifact `corpus.md` via `research_artifact write_scratch`
-   with `project_id` + `artifact_id: "corpus.md"`.
+   **Capture the raw source text first.** Whenever a `web_search` / `search_social` hit returns
+   usable material, call `research_scrape` with `action: "save_scrape"` (pass `source`, `url`,
+   `query`, `content` = the page text/markdown) BEFORE condensing it into notes — the file
+   lands in the run's `temp/vN/scrape/` folder. It is silent: no message comes back, and it is
+   not a substitute for note-taking. Then write the condensed candidate list to an artifact
+   `corpus.md` via `research_artifact write_scratch` with `project_id` +
+   `artifact_id: "corpus.md"`.
 
 4. **FRAME — pin the question and scope.** Write `research_question.md` (the falsifiable
    question you will answer) and `scope.md` (what is in and out of bounds). Changing the
    question later needs an approval — so get it right here.
 
-5. **EVIDENCE — verify and record.** For each material claim:
-   - Record the claim as a graph node: `research_evidence record_node` with
-     `node: {id, type: "claim", label, status: "CANDIDATE"}`.
-   - Link it to its source: `research_evidence link_edge` with `src: <source_id>`,
-     `dst: <claim_id>`, `kind: "supports"` (or `"contradicts"` when a source disagrees).
+5. **EVIDENCE — verify and record (batch mode).** Work claim by claim, but *wholesale* per
+   claim instead of one source at a time:
+   - First record the claim as a graph node: `research_evidence record_node` with
+     `node: {id: <claim id>, type: "Claim", label}`. `verify` anchors to that claim id and
+     never creates a claim itself.
+   - Pick 1–3 of the strongest candidate source URLs for the claim (from `web_search` /
+     `search_social` hits you have not captured yet) and fetch them in ONE call:
+     `research_scrape` with `action: "fetch"` and `urls: [≤3 URLs]`. The service fetches the
+     batch concurrently (SSRF-guarded), cleans each page to its core text, files a full draft
+     under `temp/vN/scrape/`, and returns a snippet per URL carrying its `canonical_url`,
+     `content_status` (`usable` / `empty` / `interstitial`), `full_char_len` and the text.
+   - Judge each returned page from its snippet. A page whose content supports the claim gets
+     verdict `supports`; one that contradicts it `contradicts`; a login/empty/JS-only shell is
+     unusable (do not verify it as a source); a page that genuinely neither supports nor
+     contradicts gets `neutral`.
+   - Then verify the whole claim in ONE call: `research_evidence` with `action: "verify"`,
+     `claim: {id: <the claim id you recorded>}` and
+     `findings: [{url: <canonical_url returned by fetch>, verdict: "supports"|"contradicts"|"neutral",
+     source_label?, facts?: [...], excerpt?}]`. The service only turns a finding into a
+     verified Source/Evidence when **its own server-side fetch ledger** for this run confirms
+     the page was fetched-ok and usable — `neutral` and unusable pages never become claim
+     edges. Run another `fetch` batch (≤3 URLs) only if the claim still needs more sources.
+   - Do NOT hand-record Source/Evidence nodes or hand-link claim edges in EVIDENCE —
+     `verify` writes them idempotently (re-verifying the same claim+URL is an upsert, never a
+     duplicate). `record_node` is only for the Claim (and any non-source concept you want in
+     the graph).
    - Keep a source ledger in `sources.md`; mark each source's authority and independence.
    - Deliberately search for disagreement — a missing contradiction is weaker evidence
      than an active search that found none.
@@ -78,6 +104,10 @@ create the project with `profile: "empirical"` and use `research_run execute_san
    - Lead with the direct answer, then the reasoning and the evidence trail.
    - Cite each substantive claim to a source inline; separate your synthesis from what
      sources actually say.
+   - Ground each citation in the full page, not the search snippet: before you quote or cite a
+     fetched source, read its full draft back with `research_scrape` `action: "read"` passing
+     the `canonical_url` (or `asset_id`) that `fetch` returned for it. The draft holds detail
+     the returned snippet was too short to carry.
    - Rate confidence per claim: **high** (multiple independent, specific sources agree),
      **medium** (one strong source, or several with gaps), **low** (thin or conflicting).
    - Name the remaining uncertainty explicitly — a good report states its gaps.

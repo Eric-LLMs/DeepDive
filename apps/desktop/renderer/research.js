@@ -52,9 +52,21 @@
     }
   }
 
-  // Discrete stage ladder (the literature profile skips DESIGN/EXPLAIN/REPRODUCE).
-  const STAGES = ["DISCOVER", "FRAME", "EVIDENCE", "EXECUTE", "WRITE", "PUBLISH"];
-  const GATE_NAMES = { EVIDENCE_GATE: "Evidence Gate", CLAIM_GATE: "Claim Gate" };
+  // Canonical 10-stage chain (mirrors plugins/research/plugin.py ``_STAGES``): every research task
+  // advances DISCOVER -> … -> PUBLISH, so the ladder must list all ten — a truncated array would
+  // leave later stages (DESIGN / EXPLAIN / REVIEW / REPRODUCE) with no node to highlight.
+  const STAGES = [
+    "DISCOVER", "FRAME", "EVIDENCE", "DESIGN", "EXECUTE",
+    "EXPLAIN", "WRITE", "REVIEW", "REPRODUCE", "PUBLISH",
+  ];
+  // Human labels for the deterministic gates the state machine can record (plugins/research/plugin.py
+  // ``_GATES``). Only gates present in a task's status dict are rendered.
+  const GATE_NAMES = {
+    DESIGN_GATE: "Design Gate",
+    EVIDENCE_GATE: "Evidence Gate",
+    CLAIM_GATE: "Claim Gate",
+    QUALITY_GATE: "Quality Gate",
+  };
 
   // Activity feed shows normalized action summaries only — never the agent's raw reasoning
   // (thinking fragments like "_handoff" / "Let me try…"). Tool-call names map to a short,
@@ -101,6 +113,8 @@
   let monitorTaskId = null;
   let monitorAbort = null;       // AbortController for the open monitor stream
   let monitorRevision = 0;       // last applied project_revision (stale events ignored)
+  let monitorLive = false;       // an SSE connection is open right now (false → reconnect on Run)
+  let monitorRetryTimer = null;  // pending reconnect backoff timeout (cleared by stopMonitor)
   let refreshQueued = false;     // throttle: coalesce change bursts into ≤2s refetches
   let refreshTimer = null;
   // Working-directory tree expansion, keyed per task, survives live re-renders.
@@ -115,6 +129,14 @@
   let previewBodyEl = null;       // its scrollable content area
   let previewState = { taskId: null, file: null, size: null };
   let previewRefreshedAt = 0;     // throttle: don't refetch an open file more than ~1/s
+  // Evidence-graph detail drawer: the status panel only shows compact counts + a "View graph"
+  // button; the full Source–Evidence–Claim mapping renders in a right-hand drawer. The body is
+  // always rebuilt from the freshest task detail (never cached across renders), so an edition
+  // reset (graph emptied server-side) or a task switch closes it and the next open is clean.
+  let graphDrawerOpen = false;    // drawer is visible (slide-in shown)
+  let graphDrawerTaskId = null;   // task whose graph the drawer is showing (switch/reset → close)
+  let graphDrawerSig = null;      // signature of the graph the open drawer was rendered from
+  let graphDrawerBound = false;   // scrim / close-button / Esc listeners attached once
 
   function bearerToken() {
     try { return localStorage.getItem("deepdive_token"); } catch { return null; }
@@ -245,6 +267,14 @@
   window.researchRunActive = (taskId, on) => {
     researchRunning = !!(taskId && on);
     if (on && taskId) runningTaskId = taskId;
+    // A Run click restarts the task server-side (begin_run bumps the project revision). The
+    // monitor may have silently died while the task sat finished — reconnect it now (no backoff
+    // wait) so it catches that bump, and refetch the authoritative status right away. Without
+    // this the status card keeps showing the stale Finished view until a manual reload.
+    if (on && taskId && monitorTaskId === taskId) {
+      scheduleRefresh(taskId);
+      if (!monitorLive) startMonitor(taskId);
+    }
     syncRunCtl();
     if (activityEl) {
       activityEl.classList.toggle("running", researchRunning);
@@ -377,7 +407,7 @@
     if (seq !== loadTasksSeq) return; // a newer load is in flight — drop this stale render
     if (!tasks.length) {
       tasksList.appendChild(
-        el("div", "research-empty", "No tasks yet — create one with ＋ Research in the chat.")
+        el("div", "research-empty", "No tasks yet — create one with ＋ New Research above.")
       );
       return;
     }
@@ -491,8 +521,9 @@
     statusBody.appendChild(renderStageNodes(detail.stage));
     const gates = renderGates(detail.gates || {});
     if (gates) statusBody.appendChild(gates);
-    const nodes = renderNodes(detail.nodes || {});
-    if (nodes) statusBody.appendChild(nodes);
+    const graphCard = renderEvidenceSummary(detail);
+    if (graphCard) statusBody.appendChild(graphCard);
+    syncGraphDrawer(detail); // keep an open drawer live / zeroed against this fresh detail
     syncRunCtl(); // reflect any run state on the freshly rendered Run control
     // Surface any human-gate decision (pending override) as an inline Approve / Reject card
     // in the task's chat; app.js decides whether that session is the one on screen.
@@ -516,17 +547,24 @@
     }
   }
 
-  // Discrete stage nodes: done ✓ / current ● / pending ○, chained with arrows.
+  // Discrete stage nodes: done ✓ / current ● / pending ○, chained with arrows. State is derived
+  // purely from the canonical array order (index < current → done, index == current → current,
+  // else pending) — never a per-stage special case. Each pill rides with its trailing arrow in one
+  // flex "step" unit, so a narrow sidebar wraps the chain at pill boundaries and a wrapped row
+  // always starts with a stage, never an orphan ➔.
   function renderStageNodes(stage) {
     const box = section("Stage");
     const bar = el("div", "research-stage-bar");
+    const curIdx = STAGES.indexOf(stage);
     STAGES.forEach((s, i) => {
-      if (i > 0) bar.appendChild(el("span", "research-stage-arrow", "➔"));
-      const state = s === stage ? "current" : (STAGES.indexOf(stage) > i ? "done" : "pending");
+      const state = i === curIdx ? "current" : (curIdx > i ? "done" : "pending");
+      const step = el("span", "research-stage-step");
       const pill = el("span", `research-stage-pill ${state}`);
       pill.appendChild(el("span", "research-stage-mark", state === "done" ? "✓" : (state === "current" ? "●" : "○")));
       pill.appendChild(el("span", "research-stage-label", s));
-      bar.appendChild(pill);
+      step.appendChild(pill);
+      if (i < STAGES.length - 1) step.appendChild(el("span", "research-stage-arrow", "➔"));
+      bar.appendChild(step);
     });
     box.appendChild(bar);
     return box;
@@ -538,38 +576,307 @@
     const box = section("Gates");
     const wrap = el("div", "research-gates");
     for (const [name, status] of entries) {
-      const chip = el("span", `research-gate-chip ${status === "PASS" || status === "OVERRIDE" ? "pass" : "pending"}`, `${GATE_NAMES[name]}: ${status}`);
+      // PASS / OVERRIDE clear the gate (green); FAIL shows red so a recorded diagnostic reads at
+      // a glance; anything else (NOT_RUN / …) stays a neutral pending chip.
+      const tone = status === "PASS" || status === "OVERRIDE" ? "pass" : status === "FAIL" ? "fail" : "pending";
+      const chip = el("span", `research-gate-chip ${tone}`, `${GATE_NAMES[name]}: ${status}`);
       wrap.appendChild(chip);
     }
     box.appendChild(wrap);
     return box;
   }
 
-  function renderNodes(nodes) {
-    const groups = { Source: [], Claim: [], Evidence: [] };
-    let count = 0;
-    for (const type of Object.keys(groups)) {
-      for (const n of nodes[type] || []) {
-        groups[type].push(n);
-        count++;
+  // ── evidence-graph summary (status column) + detail drawer (right) ────────
+
+  // Aggregate counts over the three evidence kinds. Returns null when the graph has none of
+  // them, so the status column shows no evidence section before the first record.
+  function graphCounts(nodes) {
+    const c = { sources: 0, verified: 0, claims: 0, evidence: 0, supports: 0, contradicts: 0, neutral: 0 };
+    const list = (t) => (nodes && nodes[t]) || [];
+    for (const n of list("Source")) {
+      c.sources++;
+      if (n.verification_status === "verified") c.verified++;
+    }
+    c.claims = list("Claim").length;
+    for (const n of list("Evidence")) {
+      c.evidence++;
+      if (n.verdict === "supports") c.supports++;
+      else if (n.verdict === "contradicts") c.contradicts++;
+      else if (n.verdict === "neutral") c.neutral++;
+    }
+    return c.sources + c.claims + c.evidence === 0 ? null : c;
+  }
+
+  // Cheap content signature of the evidence graph (type × id × verdict/verification), used to
+  // refresh an open drawer in place as a run records more nodes, and to notice a wipe (empty
+  // string) so an edition reset never leaves the previous edition's graph on screen.
+  function graphSig(detail) {
+    const parts = [];
+    const nodes = detail && detail.nodes;
+    if (nodes) {
+      for (const type of ["Source", "Claim", "Evidence"]) {
+        for (const n of nodes[type] || []) {
+          parts.push(`${type}:${n.id}:${n.verification_status || n.verdict || ""}`);
+        }
       }
     }
-    if (!count) return null;
+    parts.sort();
+    return parts.join("|");
+  }
+
+  // Compact summary for the narrow status column (replaces the old flat node-chip dump, which
+  // wrapped long Claim/Source labels across the whole sidebar). Long text lives in the drawer.
+  function renderEvidenceSummary(detail) {
+    const c = graphCounts(detail && detail.nodes);
+    if (!c) return null;
     const box = section("Evidence graph");
-    const wrap = el("div", "research-graph");
-    for (const [type, list] of Object.entries(groups)) {
-      if (!list.length) continue;
-      const group = el("div", "research-graph-group");
-      group.appendChild(el("div", "research-graph-group-title", type));
-      for (const n of list) {
-        const chip = el("span", `research-node research-node-${type.toLowerCase()}`, n.label || n.id);
-        chip.title = `${n.id} · ${n.status || "VALID"}`;
-        group.appendChild(chip);
-      }
-      wrap.appendChild(group);
-    }
-    box.appendChild(wrap);
+    const rows = el("div", "evg");
+    rows.appendChild(evgRow("Sources", c.sources, c.verified ? [[`${c.verified} verified`, "ok"]] : []));
+    rows.appendChild(evgRow("Claims", c.claims, []));
+    const evParts = [];
+    if (c.supports) evParts.push([`${c.supports} supports`, "ok"]);
+    if (c.contradicts) evParts.push([`${c.contradicts} contradicts`, "bad"]);
+    if (c.neutral) evParts.push([`${c.neutral} neutral`, "dim"]);
+    rows.appendChild(evgRow("Evidence", c.evidence, evParts));
+    const btn = el("button", "ghost evg-btn", "View graph →");
+    btn.title = "Open the full Source · Evidence · Claim detail";
+    btn.addEventListener("click", () => openGraphDrawer(detail));
+    rows.appendChild(btn);
+    box.appendChild(rows);
     return box;
+  }
+
+  // One key/value line of the summary card. extra holds [label, tone] chips shown beside the
+  // count; tones are "ok" (verified/supports), "bad" (contradicts) or "dim" (neutral).
+  function evgRow(key, value, extra) {
+    const row = el("div", "evg-row");
+    row.appendChild(el("span", "evg-key", key));
+    row.appendChild(el("span", "evg-val", String(value)));
+    if (extra && extra.length) {
+      const chips = el("span", "evg-extra");
+      for (const [label, tone] of extra) chips.appendChild(el("span", `evg-chip ${tone}`, label));
+      row.appendChild(chips);
+    }
+    return row;
+  }
+
+  // Drawer open/close. Show/hide is pure CSS (visibility + transform transition on .open), so no
+  // element is ever display:none while animating; pointer events are inert while hidden.
+  function bindGraphDrawer() {
+    const root = document.getElementById("graph-drawer");
+    if (!root || graphDrawerBound) return;
+    graphDrawerBound = true;
+    const scrim = root.querySelector(".graph-drawer-scrim");
+    const closeBtn = root.querySelector(".graph-drawer-close");
+    if (scrim) scrim.addEventListener("click", closeGraphDrawer);
+    if (closeBtn) closeBtn.addEventListener("click", closeGraphDrawer);
+    // Esc closes the drawer only while it is actually open; other overlays own their own keys.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && graphDrawerOpen) closeGraphDrawer();
+    });
+  }
+
+  function openGraphDrawer(detail) {
+    const root = document.getElementById("graph-drawer");
+    if (!root) return;
+    bindGraphDrawer();
+    graphDrawerTaskId = detail && detail.task_id;
+    graphDrawerSig = graphSig(detail);
+    graphDrawerOpen = true;
+    const title = root.querySelector(".graph-drawer-title");
+    if (title) title.textContent = `${detail && detail.name ? `${detail.name} — ` : ""}Evidence graph`;
+    renderGraphDrawerBody(detail);
+    root.setAttribute("aria-hidden", "false");
+    // Add .open a frame later so the browser registers the (re)shown layout before transitioning.
+    requestAnimationFrame(() => { if (graphDrawerOpen) root.classList.add("open"); });
+  }
+
+  function closeGraphDrawer() {
+    graphDrawerOpen = false;
+    graphDrawerTaskId = null;
+    graphDrawerSig = null;
+    const root = document.getElementById("graph-drawer");
+    if (!root) return;
+    root.classList.remove("open");
+    root.setAttribute("aria-hidden", "true");
+  }
+
+  // Keep an open drawer honest against a freshly re-rendered detail: same task + growing graph →
+  // refresh the body in place; task switch or an emptied graph (edition reset) → close. This is
+  // the "status to zero" guarantee — no stale prior-edition graph survives a render boundary.
+  function syncGraphDrawer(detail) {
+    if (!graphDrawerOpen) return;
+    if (graphDrawerTaskId !== detail.task_id) return closeGraphDrawer();
+    const sig = graphSig(detail);
+    if (!sig) return closeGraphDrawer();
+    if (sig !== graphDrawerSig) {
+      graphDrawerSig = sig;
+      renderGraphDrawerBody(detail);
+    }
+  }
+
+  // Flat list of Source/Claim/Evidence nodes + id→node map, sourced from either the grouped
+  // detail.nodes or the raw detail.graph.nodes (whichever the payload carried).
+  function evidenceGraphNodes(detail) {
+    const byId = new Map();
+    const list = [];
+    const add = (n) => { if (n && n.id && !byId.has(n.id)) { byId.set(n.id, n); list.push(n); } };
+    const grouped = detail && detail.nodes;
+    for (const type of ["Source", "Claim", "Evidence"]) {
+      for (const n of (grouped && grouped[type]) || []) add(n);
+    }
+    const flat = detail && detail.graph && detail.graph.nodes;
+    if (Array.isArray(flat)) for (const n of flat) add(n);
+    return { byId, list };
+  }
+
+  // Full Source–Evidence–Claim mapping for the right-hand drawer: grouped Claims with their
+  // verdict-carrying Evidence inline (excerpt, facts, source URL), a Sources index, and any
+  // unlinked Evidence (e.g. neutral) at the end so nothing is dropped.
+  function renderGraphDrawerBody(detail) {
+    const root = document.getElementById("graph-drawer");
+    if (!root) return;
+    const body = root.querySelector(".graph-drawer-body");
+    if (!body) return;
+    body.innerHTML = "";
+
+    const { byId, list } = evidenceGraphNodes(detail);
+    const kinds = { Source: [], Claim: [], Evidence: [] };
+    for (const n of list) if (kinds[n.type]) kinds[n.type].push(n);
+
+    // Index the graph edges: claim→evidence (kind carries the verdict) and evidence→source
+    // (depends_on). Fallbacks cover payloads whose edges were omitted.
+    const evOfClaim = new Map(); // claim id -> evidence ids
+    const srcOfEv = new Map();   // evidence id -> source node
+    const edges = (detail && detail.graph && detail.graph.edges) || [];
+    for (const e of edges) {
+      if (!e || !e.src || !e.dst) continue;
+      const from = byId.get(e.src);
+      const to = byId.get(e.dst);
+      if (!from || !to) continue;
+      if (from.type === "Claim" && to.type === "Evidence") {
+        if (!evOfClaim.has(from.id)) evOfClaim.set(from.id, []);
+        evOfClaim.get(from.id).push(to.id);
+      } else if (from.type === "Evidence" && to.type === "Source") {
+        srcOfEv.set(from.id, to);
+      }
+    }
+    const sourceFor = (ev) => {
+      if (srcOfEv.has(ev.id)) return srcOfEv.get(ev.id);
+      if (ev.source_url) return kinds.Source.find(
+        (s) => s.url === ev.source_url || s.canonical_url === ev.source_url,
+      ) || null;
+      return null;
+    };
+
+    // One evidence card: verdict badge + label, the source it came from, excerpt + facts.
+    const evidenceNode = (ev) => {
+      const verdict = ev.verdict || "unknown";
+      const tone = verdict === "supports" ? "ok" : verdict === "contradicts" ? "bad" : "dim";
+      const card = el("div", `evg-card ${tone}`);
+      const top = el("div", "evg-card-top");
+      top.appendChild(el("span", `evg-badge ${tone}`, verdict));
+      const label = ev.label || ev.id || "Evidence";
+      const lab = el("div", "evg-card-title", clipText(label, 180));
+      if (String(label).length > 180) lab.title = label;
+      top.appendChild(lab);
+      card.appendChild(top);
+      const src = sourceFor(ev);
+      if (src) {
+        const row = el("div", "evg-src");
+        row.appendChild(el("span", "evg-src-arrow", "from"));
+        row.appendChild(el("span", "evg-url", clipText(src.url || src.canonical_url || src.label || src.id, 160)));
+        card.appendChild(row);
+      }
+      if (ev.excerpt) {
+        const t = String(ev.excerpt);
+        const ex = el("div", "evg-excerpt", clipText(t, 600));
+        if (t.length > 600) ex.title = t;
+        card.appendChild(ex);
+      }
+      if (Array.isArray(ev.facts) && ev.facts.length) {
+        const ul = el("ul", "evg-facts");
+        for (const f of ev.facts) ul.appendChild(el("li", "", clipText(String(f), 240)));
+        card.appendChild(ul);
+      }
+      return card;
+    };
+
+    // Header strip of the current counts (mirrors the status-column card).
+    const c = graphCounts(detail && detail.nodes) || {};
+    const strip = el("div", "evg-strip");
+    const stripChip = (label, tone) => el("span", `evg-strip-chip${tone ? ` ${tone}` : ""}`, label);
+    strip.appendChild(stripChip(`Sources ${c.sources || 0}`));
+    if (c.verified) strip.appendChild(stripChip(`${c.verified} verified`, "ok"));
+    strip.appendChild(stripChip(`Claims ${c.claims || 0}`));
+    strip.appendChild(stripChip(`Evidence ${c.evidence || 0}`));
+    if (c.supports) strip.appendChild(stripChip(`${c.supports} supports`, "ok"));
+    if (c.contradicts) strip.appendChild(stripChip(`${c.contradicts} contradicts`, "bad"));
+    if (c.neutral) strip.appendChild(stripChip(`${c.neutral} neutral`, "dim"));
+    body.appendChild(strip);
+
+    // Claims → evidence mapping tree (the primary view).
+    const claimsSec = el("div", "evg-sec");
+    claimsSec.appendChild(el("div", "evg-sec-title", `Claims · ${kinds.Claim.length}`));
+    if (!kinds.Claim.length) {
+      claimsSec.appendChild(el("div", "evg-muted", "No claims recorded yet."));
+    } else {
+      for (const cl of kinds.Claim) {
+        const blk = el("div", "evg-claim");
+        const head = el("div", "evg-claim-head");
+        head.appendChild(el("div", "evg-claim-label", cl.label || cl.id || "Claim"));
+        if (cl.id) head.appendChild(el("span", "evg-id", clipText(cl.id, 48)));
+        blk.appendChild(head);
+        const evIds = evOfClaim.get(cl.id) || [];
+        const evs = evIds.map((id) => byId.get(id)).filter(Boolean);
+        if (evs.length) {
+          for (const ev of evs) blk.appendChild(evidenceNode(ev));
+        } else {
+          blk.appendChild(el("div", "evg-muted", "No supporting or contradicting evidence yet."));
+        }
+        claimsSec.appendChild(blk);
+      }
+    }
+    body.appendChild(claimsSec);
+
+    // Sources index (all fetched sources, verified or not).
+    const srcSec = el("div", "evg-sec");
+    srcSec.appendChild(el(
+      "div", "evg-sec-title",
+      `Sources · ${kinds.Source.length}${c.verified ? ` · ${c.verified} verified` : ""}`,
+    ));
+    if (!kinds.Source.length) {
+      srcSec.appendChild(el("div", "evg-muted", "No sources fetched yet."));
+    } else {
+      for (const s of kinds.Source) {
+        const row = el("div", "evg-src-row");
+        row.appendChild(
+          s.verification_status === "verified"
+            ? el("span", "evg-badge ok", "verified")
+            : el("span", "evg-badge dim", "unverified"),
+        );
+        const url = s.url || s.canonical_url || s.label || s.id || "?";
+        row.appendChild(el("span", "evg-url", String(url)));
+        const metaBits = [];
+        if (s.content_status) metaBits.push(s.content_status);
+        if (s.full_char_len != null) metaBits.push(`${s.full_char_len} ch`);
+        if (s.asset_id) metaBits.push(clipText(s.asset_id, 24));
+        if (metaBits.length) row.appendChild(el("span", "evg-src-meta", metaBits.join(" · ")));
+        srcSec.appendChild(row);
+      }
+    }
+    body.appendChild(srcSec);
+
+    // Evidence with no claim link (e.g. a neutral re-annotation) — shown so nothing is hidden.
+    const placed = new Set();
+    for (const ids of evOfClaim.values()) for (const id of ids) placed.add(id);
+    const orphans = kinds.Evidence.filter((ev) => !placed.has(ev.id));
+    if (orphans.length) {
+      const oSec = el("div", "evg-sec");
+      oSec.appendChild(el("div", "evg-sec-title", `Unlinked evidence · ${orphans.length}`));
+      for (const ev of orphans) oSec.appendChild(evidenceNode(ev));
+      body.appendChild(oSec);
+    }
   }
 
   function formatBytes(n) {
@@ -723,11 +1030,13 @@
 
   // The task folder as a standard VS Code / Explorer-style vertical tree — the left column of
   // the workbench's top area. Rows reuse the Cloud Drive .cd-* classes; children nest in
-  // .rtv-kids containers whose dotted border-left is the per-level indent guide. The task
-  // folder row opens into its subfolders (materials/, outputs/, any extra) and the root mirrors
-  // (task_spec.json / session_history.json). Folder rows start collapsed but the task row is
-  // expanded one level; ▸/▾ toggles expand in place and each file row opens in the preview
-  // column to the right. The expansion set is kept per task across live re-renders.
+  // .rtv-kids containers whose dotted border-left is the per-level indent guide. The three
+  // canonical subfolders (materials/, outputs/, temp/) always render — even empty — so a fresh
+  // task shows its stable layout; per-run folders (temp/v1 …) and scrape/ nest beneath temp/.
+  // Root mirrors (task_spec.json / session_history.json) read as the task folder's own files.
+  // Folder rows start collapsed but the task row is expanded one level; ▸/▾ toggles expand in
+  // place and each file row opens in the preview column to the right. The expansion set is kept
+  // per task across live re-renders.
   function renderTreeCol(detail) {
     const col = el("div", "rtv-col rtv-tree-col");
     const head = el("div", "rtv-col-head");
@@ -738,26 +1047,99 @@
     const wrap = el("div", "rtv-tree-scroll");
     col.appendChild(wrap);
     const cloudPath = detail.cloud_folder_path || "";
-    const groups = new Map();
+    const filesByDir = new Map();
     for (const f of detail.cloud_files || []) {
       let sub = f.folder_path || "";
       if (sub.startsWith(cloudPath + "/")) sub = sub.slice(cloudPath.length + 1);
-      else sub = sub === cloudPath ? "" : sub;
-      if (!groups.has(sub)) groups.set(sub, []);
-      groups.get(sub).push(f);
+      else if (sub !== cloudPath) sub = sub.replace(/^\/+/, "");
+      else sub = "";
+      if (!filesByDir.has(sub)) filesByDir.set(sub, []);
+      filesByDir.get(sub).push(f);
     }
-    const roots = groups.get("") || [];
-    const extra = Array.from(groups.keys()).filter((k) => k && k !== "materials" && k !== "outputs");
-    const segs = ["materials", "outputs", ...extra];
+    // Root-level mirrors (task_spec.json / session_history.json) are rendered as the task
+    // folder's own files below, so no separate ``roots`` list is needed.
+
+    // Ordered hierarchical folder set. The three canonical task folders (materials/, outputs/,
+    // temp/) always exist — even when empty — so a brand-new task shows the full stable layout
+    // instead of hiding temp/ until the first run writes into it. File-bearing folders then add
+    // their deeper segments (temp/v1, temp/v1/scrape) beneath the matching parent.
+    const dirSet = new Set(["materials", "outputs", "temp"]);
+    for (const dir of filesByDir.keys()) {
+      if (!dir) continue;
+      const parts = dir.split("/");
+      for (let i = 1; i <= parts.length; i++) dirSet.add(parts.slice(0, i).join("/"));
+    }
+    // Immediate subfolders of ``dir`` (dirs exactly one path segment deeper).
+    const childDirs = (dir) => {
+      const prefix = dir ? `${dir}/` : "";
+      return [...dirSet]
+        .filter((d) => d !== dir && d.startsWith(prefix) && !d.slice(prefix.length).includes("/"))
+        .sort((a, b) => a.localeCompare(b));
+    };
     const open = treeOpenState.get(detail.task_id) || new Set([""]);
     treeOpenState.set(detail.task_id, open);
 
-    function toggle(seg) {
-      if (open.has(seg)) open.delete(seg);
-      else open.add(seg);
+    function toggle(dir) {
+      if (open.has(dir)) open.delete(dir);
+      else open.add(dir);
       const treeEl = wrap.querySelector(".rtv-tree");
       if (treeEl) treeEl.replaceWith(buildTree());
     }
+
+    // Subtree file totals: how many files a folder holds including everything under it. Direct
+    // counts alone mislead for folders that only nest other folders — temp/ stores runs as
+    // temp/v1/, temp/v2/, … temp/vN/scrape/, so its own file count is always 0 and a parent
+    // row must sum its descendants or it reads "(0)" the moment a run writes files beneath it.
+    const fileCountBelow = new Map();
+    for (const [dir, list] of filesByDir) {
+      if (!dir) continue; // the task root row is tallied below
+      fileCountBelow.set(dir, (fileCountBelow.get(dir) || 0) + list.length);
+      const parts = dir.split("/");
+      let acc = "";
+      for (const seg of parts) {
+        acc = acc ? `${acc}/${seg}` : seg;
+        fileCountBelow.set(acc, (fileCountBelow.get(acc) || 0) + list.length);
+      }
+    }
+    let totalFiles = 0;
+    for (const list of filesByDir.values()) totalFiles += list.length;
+    fileCountBelow.set("", totalFiles);
+
+    // Right-click export → shared cloud export (clouddrive.js). A file row exports that single
+    // file (Save dialog); a folder row downloads its whole subtree into a picked folder with the
+    // on-screen structure preserved (each relPath is prefixed with the clicked folder's name).
+    function folderExportEntries(dir) {
+      const topName = dir === ""
+        ? (cloudPath.split("/").filter(Boolean).pop() || "task folder")
+        : dir.slice(dir.lastIndexOf("/") + 1);
+      const prefix = dir ? dir + "/" : "";
+      const out = [];
+      for (const [d, list] of filesByDir) {
+        if (!d) continue;
+        if (dir && d !== dir && !d.startsWith(prefix)) continue;
+        const under = dir ? (d === dir ? "" : d.slice(prefix.length)) : d;
+        for (const f of list) out.push({ assetId: f.id, name: f.name, relPath: [topName, under, f.name].filter(Boolean).join("/") });
+      }
+      if (!dir) {
+        for (const f of (filesByDir.get("") || [])) out.push({ assetId: f.id, name: f.name, relPath: `${topName}/${f.name}` });
+      }
+      return out.sort((a, b) => a.relPath.localeCompare(b.relPath));
+    }
+
+    function showTreeRowMenu(e, f, dir) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!window.cloudCtxMenu) return;
+      const folderName = dir === ""
+        ? (cloudPath.split("/").filter(Boolean).pop() || "task folder")
+        : dir.slice(dir.lastIndexOf("/") + 1);
+      const items = [];
+      if (f) {
+        items.push({ label: "📤 Export file…", fn: () => { if (window.exportCloudFile) window.exportCloudFile(f); } });
+      } else {
+        items.push({ label: "📤 Export folder…", fn: () => { if (window.exportCloudFolder) window.exportCloudFolder(folderExportEntries(dir), folderName); } });
+      }
+      window.cloudCtxMenu(e.clientX, e.clientY, items);    }
 
     // One clickable file row: type icon + name on the left, size (and Knowledge Base tag) on
     // the right — .cd-name flex:1 pushes the meta to the far edge, like the Cloud Drive rows.
@@ -775,50 +1157,57 @@
       else if (f.rag_status === "PENDING") row.appendChild(el("span", "rtv-rag-tag pending", "…"));
       row.title = `${f.folder_path ? f.folder_path + "/" : ""}${f.name}`;
       row.addEventListener("click", () => previewFile(detail.task_id, f));
+      row.addEventListener("contextmenu", (e) => showTreeRowMenu(e, f, null));
       return row;
     }
 
     // A folder row: ▸/▾ toggles its children. The count (n) hangs right after the name and,
     // for empty folders, a grey "(empty)" tag — all on the same line (no separate empty row).
-    function folderRow(seg) {
-      const files = groups.get(seg) || [];
-      const isOpen = open.has(seg);
+    // The folder's children are its direct subfolders (nested tree) plus the files in it.
+    function folderRow(dir) {
+      const files = filesByDir.get(dir) || [];
+      const kids = childDirs(dir);
+      const hasKids = files.length > 0 || kids.length > 0;
+      const isOpen = open.has(dir);
+      const label = dir === "" ? (cloudPath || "Task folder") : dir.slice(dir.lastIndexOf("/") + 1);
       const row = el("div", "cd-row cd-folder rtv-folder-row");
-      const tw = el("span", "cd-tw", files.length ? (isOpen ? "▾" : "▸") : "");
+      const tw = el("span", "cd-tw", hasKids ? (isOpen ? "▾" : "▸") : "");
       row.appendChild(tw);
-      row.appendChild(el("span", "cd-icon", seg === "" ? "🗂" : "📁"));
-      row.appendChild(el("span", "cd-name", seg === "" ? (cloudPath || "Task folder") : seg));
-      row.appendChild(el("span", "rtv-count", `(${files.length})`));
-      if (!files.length) row.appendChild(el("span", "rtv-empty-tag", "(empty)"));
-      row.title = seg === "" ? cloudPath : seg;
-      if (files.length) {
-        tw.addEventListener("click", (e) => { e.stopPropagation(); toggle(seg); });
-        row.addEventListener("click", () => toggle(seg));
+      row.appendChild(el("span", "cd-icon", dir === "" ? "🗂" : "📁"));
+      row.appendChild(el("span", "cd-name", label));
+      row.appendChild(el("span", "rtv-count", `(${fileCountBelow.get(dir) || 0})`));
+      if (!files.length && !kids.length) row.appendChild(el("span", "rtv-empty-tag", "(empty)"));
+      row.title = dir === "" ? cloudPath : dir;
+      if (hasKids) {
+        tw.addEventListener("click", (e) => { e.stopPropagation(); toggle(dir); });
+        row.addEventListener("click", () => toggle(dir));
       }
+      row.addEventListener("contextmenu", (e) => showTreeRowMenu(e, null, dir));
       return row;
     }
 
-    // One nesting level: its own dotted guide line (border-left) + children.
-    function kidsOf() {
+    // Recursive children of one folder: each immediate subfolder (recursing into it when it is
+    // open), then the files sitting directly in it. The root mirrors (task_spec.json /
+    // session_history.json) are simply the task root folder's own files.
+    function childrenOf(dir) {
       const kids = el("div", "rtv-kids");
-      for (const seg of segs) {
-        kids.appendChild(folderRow(seg));
-        const files = groups.get(seg) || [];
-        if (open.has(seg) && files.length) {
-          const sub = el("div", "rtv-kids");
-          for (const f of files.slice(0, 50)) sub.appendChild(fileRow(f));
-          kids.appendChild(sub);
-        }
+      for (const child of childDirs(dir)) {
+        kids.appendChild(folderRow(child));
+        if (open.has(child)) kids.appendChild(childrenOf(child));
       }
-      // Root mirrors (task_spec.json / session_history.json) sit at the folder root.
-      for (const f of roots.slice(0, 50)) kids.appendChild(fileRow(f));
+      const files = filesByDir.get(dir) || [];
+      if (files.length) {
+        const sub = el("div", "rtv-kids");
+        for (const f of files.slice(0, 50)) sub.appendChild(fileRow(f));
+        kids.appendChild(sub);
+      }
       return kids;
     }
 
     function buildTree() {
       const treeEl = el("div", "rtv-tree");
       treeEl.appendChild(folderRow(""));
-      if (open.has("")) treeEl.appendChild(kidsOf());
+      if (open.has("")) treeEl.appendChild(childrenOf(""));
       return treeEl;
     }
 
@@ -853,7 +1242,14 @@
     const col = el("div", "rtv-col rtv-preview-col");
     const head = el("div", "rtv-col-head");
     head.appendChild(el("span", "rtv-col-title", "File preview"));
-    head.appendChild(el("span", "rtv-col-hint", "click a file to preview"));
+    const hint = el("span", "rtv-col-hint", "click a file to preview");
+    head.appendChild(hint);
+    const closeBtn = el("button", "ghost rtv-preview-close", "×");
+    closeBtn.type = "button";
+    closeBtn.title = "Close the open file preview";
+    closeBtn.classList.add("hidden");
+    closeBtn.addEventListener("click", closePreview);
+    head.appendChild(closeBtn);
     col.appendChild(head);
     const body = el("div", "rtv-preview-body");
     body.appendChild(
@@ -862,8 +1258,23 @@
     );
     col.appendChild(body);
     col._title = head.querySelector(".rtv-col-title");
+    col._hint = hint;
+    col._closeBtn = closeBtn;
     col._body = body;
     return col;
+  }
+
+  // Close the currently open file: clear the selection back to the empty placeholder state. The
+  // preview column itself stays (it is the workbench's right-hand panel); only the open file is
+  // dismissed.
+  function closePreview() {
+    if (!previewColEl) return;
+    previewState = { taskId: previewColEl._taskId, file: null, size: null };
+    previewRefreshedAt = 0;
+    if (previewTitleEl) previewTitleEl.textContent = "File preview";
+    if (previewColEl._hint) previewColEl._hint.textContent = "click a file to preview";
+    if (previewColEl._closeBtn) previewColEl._closeBtn.classList.add("hidden");
+    previewPlaceholder("Select a file in the Working directory to preview its contents here.");
   }
 
   function ensurePreviewCol(detail) {
@@ -893,6 +1304,9 @@
     if (previewTitleEl) {
       previewTitleEl.textContent = `${f.folder_path ? f.folder_path + "/" : ""}${f.name}`;
     }
+    // A file is now open: drop the hint and surface the close (×) control in the header.
+    if (previewColEl._hint) previewColEl._hint.textContent = "";
+    if (previewColEl._closeBtn) previewColEl._closeBtn.classList.remove("hidden");
     previewPlaceholder("Loading…");
     let res;
     try {
@@ -916,9 +1330,9 @@
     if (!previewBodyEl) return;
     const cur = (detail.cloud_files || []).find((f) => f.id === previewState.file.id);
     if (!cur) {
-      previewState = { taskId: detail.task_id, file: null, size: null };
-      if (previewTitleEl) previewTitleEl.textContent = "File preview";
-      previewPlaceholder("This file is no longer in the task folder.");
+      // The open file vanished from the task folder (agent cleanup / edition reset) — close the
+      // preview and reset the header chrome (title, hint, × button).
+      closePreview();
       return;
     }
     const sz = cur.size != null ? cur.size : null;
@@ -942,46 +1356,71 @@
     "run.finished", "run.blocked", "run.stalled", "run.cancelled", "run.error",
   ]);
 
+  // The live monitor reconnects itself: an SSE stream left open across an idle stretch (e.g. a
+  // task that reached PUBLISH and sat finished) can be dropped by the server or the network, and
+  // without a retry the panel would freeze on the stale terminal view until a manual reload. Each
+  // attempt opens a fresh stream; on any drop/error it backs off and reconnects while the task
+  // stays selected, so a later "Run" click's revision bump is always caught.
   function startMonitor(taskId) {
     stopMonitor();
     monitorTaskId = taskId;
+    if (!bearerToken()) return; // guests have no tasks — nothing to watch
+    connectMonitor(taskId, 0);
+  }
+
+  async function connectMonitor(taskId, attempt) {
+    const token = bearerToken();
+    if (!token) return;
+    if (attempt > 0) {
+      // Back off between attempts (0.5s, 1s, 2s, … capped at 10s). The pending timeout is stored
+      // so stopMonitor can clear it — a task switch cancels the retry immediately.
+      await new Promise((resolve) => {
+        monitorRetryTimer = setTimeout(resolve, Math.min(500 * 2 ** (attempt - 1), 10_000));
+      });
+      if (monitorTaskId !== taskId) return; // the user switched tasks during the backoff
+    }
     const abort = new AbortController();
     monitorAbort = abort;
-    const token = bearerToken();
-    if (!token) return; // guests have no tasks — nothing to watch
-    (async () => {
-      try {
-        const res = await fetch(`/api/research/tasks/${encodeURIComponent(taskId)}/monitor`, {
-          headers: { Authorization: `Bearer ${token}` },
-          signal: abort.signal,
-        });
-        if (!res.ok) return;
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-          let idx;
-          while ((idx = buf.indexOf("\n\n")) !== -1) {
-            handleMonitorBlock(buf.slice(0, idx));
-            buf = buf.slice(idx + 2);
-          }
+    monitorLive = false;
+    try {
+      const res = await fetch(`/api/research/tasks/${encodeURIComponent(taskId)}/monitor`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: abort.signal,
+      });
+      if (res.status === 401 || res.status === 404) { abort.abort(); return; } // auth/task gone
+      if (!res.ok) throw new Error(`monitor http ${res.status}`);
+      monitorLive = true;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          handleMonitorBlock(buf.slice(0, idx));
+          buf = buf.slice(idx + 2);
         }
-        if (buf.trim()) handleMonitorBlock(buf);
-      } catch { /* aborted on task switch / network drop — the next selection restarts it */ }
-      finally {
-        if (monitorAbort === abort) monitorAbort = null;
       }
-    })();
+      if (buf.trim()) handleMonitorBlock(buf);
+    } catch { /* network drop / server restart → reconnect below */ }
+    finally {
+      if (monitorAbort === abort) {
+        monitorAbort = null;
+        monitorLive = false;
+      }
+    }
+    if (monitorTaskId === taskId && !abort.signal.aborted) connectMonitor(taskId, attempt + 1);
   }
 
   function stopMonitor() {
     monitorTaskId = null;
     refreshQueued = false;
     if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+    if (monitorRetryTimer) { clearTimeout(monitorRetryTimer); monitorRetryTimer = null; }
     if (monitorAbort) { monitorAbort.abort(); monitorAbort = null; }
+    monitorLive = false;
   }
 
   function handleMonitorBlock(block) {

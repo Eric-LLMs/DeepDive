@@ -62,6 +62,9 @@
         <div id="research" class="research hidden">
           <div id="research-tasks" class="research-section research-tasks">
             <div class="research-section-title">Tasks</div>
+            <div class="research-tasks-toolbar">
+              <button id="research-new" type="button" title="Start a new research task">＋ New Research</button>
+            </div>
             <div id="research-tasks-list"></div>
           </div>
           <div id="research-status" class="research-section research-status">
@@ -567,6 +570,20 @@
     <!-- markdown-it (vendored; sets window.markdownit) -->
     <script src="vendor/markdown-it.min.js"></script>
     <!-- JSZip (vendored; sets window.JSZip) — used by the .pptx viewer -->
+    <!-- Evidence-graph detail drawer (research status panel → "View graph"). Pure-CSS show/hide:
+         closed state is visibility:hidden + panel translated off the right edge; .open slides it
+         in. Body content is rendered by research.js from the freshest task detail. -->
+    <div id="graph-drawer" class="graph-drawer-root" aria-hidden="true">
+      <div class="graph-drawer-scrim"></div>
+      <aside class="graph-drawer-panel" role="dialog" aria-label="Evidence graph detail">
+        <div class="graph-drawer-head">
+          <span class="graph-drawer-title"></span>
+          <button type="button" class="ghost graph-drawer-close" title="Close (Esc)">×</button>
+        </div>
+        <div class="graph-drawer-body"></div>
+      </aside>
+    </div>
+
     <script src="vendor/jszip.min.js"></script>
     <!-- mammoth (vendored; sets window.mammoth) — .docx → HTML -->
     <script src="vendor/mammoth.min.js"></script>

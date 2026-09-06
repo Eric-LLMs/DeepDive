@@ -203,6 +203,11 @@
       .kv-row { display: flex; gap: 8px; margin-bottom: 6px; align-items: center; }
       .kv-row input { flex: 1; }
       .kv-row .btn { flex: 0 0 auto; padding: 4px 10px; }
+      /* secret field with reveal / copy actions (Tools config) */
+      .secret-row { display: flex; gap: 6px; align-items: center; }
+      .secret-row input { flex: 1; min-width: 0; }
+      .secret-row .btn { flex: 0 0 auto; padding: 6px 10px; font-size: 12px; }
+      .secret-row .btn:disabled { opacity: 0.45; cursor: default; }
 
       /* ── chat-test user autocomplete ── */
       .user-ac { position: relative; }
@@ -1536,7 +1541,26 @@
                 input = textInput(cur[f.key] != null ? String(cur[f.key]) : (f.def || ""));
                 input.type = "number";
               } else if (f.type === "password") {
-                input = textInput("", { type: "password", placeholder: cur[f.key] ? "Configured — leave empty to keep" : (f.ph || "") });
+                // Pre-fill the stored value (masked) so a configured secret is visibly set,
+                // with a reveal eye and a copy button. Saving an unchanged value keeps it.
+                const secret = cur[f.key] != null ? String(cur[f.key]) : "";
+                input = textInput(secret, { type: "password", placeholder: f.ph || "" });
+                const eye = el("button", "btn secret-btn", "👁");
+                eye.type = "button";
+                eye.title = "Show / hide";
+                eye.onclick = () => { input.type = input.type === "password" ? "text" : "password"; };
+                const copyBtn = el("button", "btn secret-btn", "Copy");
+                copyBtn.type = "button";
+                copyBtn.disabled = !secret;
+                copyBtn.onclick = async () => {
+                  if (!input.value) return;
+                  try { await navigator.clipboard.writeText(input.value); } catch { /* clipboard unavailable */ }
+                };
+                const wrap = el("div", "secret-row");
+                wrap.append(input, eye, copyBtn);
+                card.appendChild(field(f.label, wrap));
+                inputs[f.key] = input;
+                continue;
               } else {
                 input = textInput(cur[f.key] != null ? String(cur[f.key]) : (f.def || ""), { placeholder: f.ph || "" });
               }
@@ -1622,6 +1646,42 @@
               const trow = el("div", "cfg-row");
               trow.append(field("Send a test email to", testTo), testBtn, testRes);
               card.appendChild(trow);
+            }
+
+            if (tool.id === "web_search") {
+              // Connectivity test: runs the values currently in the form (blank secret → the
+              // stored one) through one real basic-depth search. Never echoes the key.
+              const tq = textInput("", { placeholder: "Test query (default: web search connectivity test)" });
+              const tbtn = el("button", "btn ghost", "Test search");
+              const tres = el("div", "test-res");
+              tbtn.onclick = async () => {
+                if (tbtn.disabled) return;
+                tbtn.disabled = true;
+                tres.textContent = "";
+                const payload = { query: tq.value.trim() };
+                for (const k of ["provider", "api_key", "engine_id"]) {
+                  const v = inputs[k] ? inputs[k].value.trim() : "";
+                  if (v) payload[k] = v;
+                }
+                try {
+                  const r = await apiFetch("/config/test-web-search", { method: "POST", body: JSON.stringify(payload) });
+                  if (r.status === "ok") {
+                    const head = "✓ " + (r.provider || "provider") + " · " + r.count + " results";
+                    tres.textContent = r.title ? head + " · " + r.title : head;
+                    tres.className = "test-res ok";
+                  } else {
+                    tres.textContent = "✗ " + (r.error_type || "error") + ": " + (r.error || "search failed");
+                    tres.className = "test-res err";
+                  }
+                } catch (e) {
+                  tres.textContent = "✗ " + e.message;
+                  tres.className = "test-res err";
+                }
+                tbtn.disabled = false;
+              };
+              const wrow = el("div", "cfg-row");
+              wrow.append(field("Web search connectivity test", tq), tbtn, tres);
+              card.appendChild(wrow);
             }
 
             content.appendChild(card);

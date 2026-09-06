@@ -51,6 +51,13 @@ dependencies = [
     "docker>=7.0",
     # Misc
     "httpx>=0.27",
+    # Tavily Search API — production web-search provider (WEB_SEARCH_PROVIDER=tavily +
+    # WEB_SEARCH_API_KEY). Adapter + outcome envelope in core/infrastructure/web_search.py.
+    "tavily-python>=0.5",
+    # Keyless DuckDuckGo search engine — used only as a last-resort best-effort fallback
+    # after a configured keyed provider (Tavily) fails; never a primary engine.
+    # (lazy-imported in core/infrastructure/web_search.py / web_search_aggregate.py).
+    "ddgs>=9",
     "jsonschema>=4.21",
     # Cross-process file lock for the research driver's atomic project.json CAS
     # (portalocker, not fcntl — the dev machine is Windows).

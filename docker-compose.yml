@@ -148,6 +148,11 @@ services:
       LLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-gateway}
       LLM_MODEL: deepdive-chat
       TTS_BASE_URL: http://tts:8880/v1
+      # Web search provider: add WEB_SEARCH_PROVIDER=tavily and WEB_SEARCH_API_KEY to the
+      # compose .env (gitignored) to make the worker use Tavily. Defaults keep the keyless
+      # aggregate active when neither is set.
+      WEB_SEARCH_PROVIDER: ${WEB_SEARCH_PROVIDER:-aggregate}
+      WEB_SEARCH_API_KEY: ${WEB_SEARCH_API_KEY:-}
     volumes:
       # Share the audio/image caches with the host-run FastAPI gateway, which serves /audio
       # and /images from the same directories.

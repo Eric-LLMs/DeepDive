@@ -66,6 +66,44 @@
 `storage_path` in the artifact record is the logical path relative to the storage scope;
 physical asset names are managed by `save_artifact` (auto-uniqued).
 
+### 3.1 Chat-task cloud layout (live surface; coexists with the skill path above)
+
+A chat-created **research task** (`create_task`, desktop **＋ Research**) is a different shape
+from the skill-project `research/{project_id}/` scope above: the task folder is user-visible in
+My Drive and the drive holds per-run projections over authoritative server scratch state.
+
+```text
+<task folder>/                  # cloud task folder (named after the title)
+  materials/                    #   copies of selected source assets: <asset_id>__<safe_name>
+  temp/
+    v1/  v2/ …                  # one PERMANENT per-run subfolder per run_seq (never overwritten)
+      <artifact>.md             #   that run's working copies (write_scratch / create_version)
+      scrape/                   #   raw-source captures (save_scrape): <source>_<query>_<n>.md
+  outputs/
+    <stem>_v1.md  <stem>_v2.md  # a run's promote Create-New final, flipped to RAG-pending
+```
+
+- `run_seq` (scratch `project.json`) is minted **atomically inside `begin_run`'s single-writer
+  mutate** and mirrored to the driver checkpoint as `run_version`; it stamps that run's `temp/v{N}`
+  and `outputs/<stem>_v{N}.md`. The driver's `cloud_assets` ledger (folder/asset ids for the
+  current run's `temp/vN` + `scrape/`) is transient — reset every `begin_run`, never a multi-run
+  index.
+- Intermediate writes mirror into `temp/v{run_version}/<id>.md`: updated in place within a run, while
+  a later run writes a fresh `v{N+1}` and never reuses another run's assets (v{N} stays intact).
+- **Promote is Create-New and single-run idempotent**: it mints `outputs/<stem>_vN.md` and RAG-pends
+  that asset; re-promotes inside the same run (even after a new scratch version) refresh that one
+  asset in place; only a new `begin_run` enables `_v{N+1}`. Earlier versioned finals are never
+  overwritten, renamed, or removed.
+- Raw search returns are captured by the agent (`research_scrape save_scrape`) into
+  `temp/v{run_version}/scrape/` with a structured metadata header (URL / Source / Query / Retrieved /
+  Run_version) — silent per save, never the underlying response JSON.
+- Run progress appends to scratch `run_events.json` (monotonic `seq` + unique `event_id`); the worker
+  drains rows newer than `driver.progress_cursor` into the bound session as `system` messages —
+  appended, never replacing earlier chat.
+- A task promoted outside any versioned run (legacy no-run path) still writes `outputs/<id>.md`
+  in place; the skill-driven `research_project` path keeps the `research/{project_id}/` layout
+  described in §1-3.
+
 ## 4. Delete semantics
 
 - Scratch delete: fine, ephemeral.

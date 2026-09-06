@@ -298,10 +298,12 @@ def build_settle_report(
         f"> Auto-settled by the Research OS driver · mode: {mode} · created: {created_at}",
         f"> Reason: {reason}",
         "",
-        "This run could not advance to PUBLISH on its own, so the driver finished it "
-        "deterministically: it walked the remaining stages, recording each un-passed gate's "
-        "failed checks into the project diagnostics, and wrote this report from what the run "
-        "actually produced. Nothing below is filled in or fabricated.",
+        (
+            "This run could not advance to PUBLISH on its own, so the driver finished it "
+            "deterministically: it walked the remaining stages, recording each un-passed gate's "
+            "failed checks into the project diagnostics, and wrote this report from what the run "
+            "actually produced. Nothing below is filled in or fabricated."
+        ),
         "",
         "## What this run established",
         "",
@@ -398,10 +400,22 @@ def auto_turn_prompt(
         "turn — never guess the stage name, never skip a stage.\n"
         "Drive the stage work with the research tools (research_project snapshot, "
         "research_state incl. get_state/get_handoff/transition_stage, research_evidence "
-        "record_node/link_edge, research_gate check, research_artifact, research_run, "
-        "rag_search, web_search, search_social), reading the task state each turn. Follow each "
-        "tool's own schema — evidence record_node takes a node with id and type, link_edge "
-        "links src to dst with a kind; using the wrong field names errors and wastes steps.\n"
+        "record_node/verify, research_gate check, research_artifact, research_run, "
+        "research_scrape, rag_search, web_search, search_social), reading the task state each "
+        "turn. In EVIDENCE work **wholesale per claim**, not one source at a time: (1) record "
+        "the claim first with research_evidence record_node (node with id and type \"Claim\"); "
+        "(2) gather 1-3 candidate source URLs and fetch them in ONE research_scrape action "
+        "\"fetch\" call with urls (≤3) — the service fetches them concurrently, cleans each "
+        "page, stores a full draft under temp/vN/scrape, and returns a snippet per URL with "
+        "canonical_url and content_status; (3) judge the snippets and verify the whole claim in "
+        "ONE research_evidence action \"verify\" call ({claim:{id}, findings:[{url, "
+        "verdict:\"supports\"|\"contradicts\"|\"neutral\", ...}]}) — the service only verifies "
+        "URLs it itself fetched-ok as usable, and never fabricates a source. Do NOT hand-record "
+        "Source/Evidence nodes or hand-link claim edges; verify writes them idempotently. In "
+        "WRITE, before you quote or cite a fetched source, read its full draft back with "
+        "research_scrape action \"read\" (canonical_url from fetch) so the citation is grounded "
+        "in the whole page, not just the snippet. Follow each tool's own schema — using the "
+        "wrong field names errors and wastes steps.\n"
         "Anti-stall rule: when ~2-3 retrieval attempts for the current stage come back empty "
         "or keep failing, do NOT keep retrying in place — call research_state get_handoff and "
         "then transition_stage with that exact next_stage. In progressive mode an un-passed "
@@ -795,7 +809,7 @@ class ResearchRunDriver:
                     generated_by_execution=execution_id,
                 )
             version = int(made.get("version") or 1)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - best-effort settle report; the run still stops
             logger.warning(
                 "settle report write failed for task %s; stopping as graded: %s", task_id, exc
             )
