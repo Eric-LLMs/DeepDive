@@ -2089,7 +2089,7 @@ research-domain rule; Research OS adds exactly that domain layer.
 
 | Research OS needs | Reused from |
 |---|---|
-| 6 research tools mounted via a Cordis plugin (`Context`/`Fiber`, lazy capability resolution) | [§5.1 DI](#51-di-state-machine--context--fiber), [§6.3 Plugins](#63-plugins) |
+| 7 research tools mounted via a Cordis plugin (`Context`/`Fiber`, lazy capability resolution) | [§5.1 DI](#51-di-state-machine--context--fiber), [§6.3 Plugins](#63-plugins) |
 | Tool lifecycle + permission/sandbox gating | [§6 Tool Runtime](#6-tool-runtime) |
 | Three-layer storage: scratch → Cloud Drive → RAG projection | [§14 Cloud Drive](#14-cloud-drive-module), [§10 RAG](#10-rag-module-config-node-pipeline) |
 | Tenant isolation (`request_user` ContextVar) | [§13 Multi-Tenancy](#13-multi-tenancy-and-deployment-strategy) |
@@ -2121,19 +2121,50 @@ My Drive under the parent the user picked: `materials/` (copies of selected clou
 `<asset_id>__<safe_name>`); `temp/v1/ v2/ …` — one **permanent per-run subfolder** per `run_seq`,
 holding that run's working copies (`write_scratch` / `create_version` intermediates land in
 `temp/v{run_version}/<id>.md`, updated in place within a run, never clobbering an earlier run's
-folder) and its raw-source captures under `temp/v{run_version}/scrape/<source>_<query>_<n>.md`
-(agent-saved via `research_scrape save_scrape`, a metadata header plus page text — never the raw
-search response JSON); and `outputs/<stem>_v<N>.md` — a run's promote **Create-New** final, versioned
+folder) and the batch-fetched **evidence drafts** under `temp/v{run_version}/scrape/` (full page
+text captured **server-side** by `research_scrape fetch` — ≤3 URLs per call, cleaned — each usable
+draft persisted alongside a per-run provenance row, see the EVIDENCE paragraph below); and `outputs/<stem>_v<N>.md` — a run's promote **Create-New** final, versioned
 per run: the first promote of a run mints `outputs/<stem>_vN.md` and RAG-pends that asset, a
 re-promote inside the same run refreshes it in place (never a `_vN+1`), and a later run writes a fresh
 `_v{N+1}` that never overwrites or reuses an earlier final. The transient `driver.cloud_assets` ledger
 (folder/asset ids for the current run's `temp/vN` + `scrape/` projection) is reset by every
-`begin_run` and is never a multi-run index. The legacy no-run projection (a task promoted outside any
+`begin_run` and is never a multi-run index; inside it, the driver's `_fetch_provenance` table records
+one row per evidence `source_url` fetched this run — the whitelist `research_scrape read` and the
+`verified` boundary consult (see the EVIDENCE paragraph below). The legacy no-run projection (a task promoted outside any
 run) still writes `outputs/<id>.md` in place, and the skill-driven `research_project` path still
 uploads to `research/<project_id>/`. A failing create rolls the whole thing back (cloud folder →
 Trash, scratch removed), so no half-built task is ever left behind; the cloud folder is created with
 the Drive's collision-safe naming and the `drive.download` permission gate doubles as the material
 tenancy check.
+
+**EVIDENCE — wholesale batch, one idempotent verify.** The EVIDENCE stage is where the driver
+moves from *discovery* to *loading the evidence base*, and the whole chain is batched so the agent
+doesn't round-trip a short prompt per URL. For every claimed source the driver decides is load-bearing,
+it first `record_node`s a `Claim` (a `claim_id` minted from the driver's own edge bookkeeping — model
+claims enter the graph *only* as driver-authored claim nodes). It then issues a single
+`research_scrape fetch` per URL-cluster that re-runs the real page fetch **server-side**: ≤3 URLs per
+call, **parallel inside the call only** — the ≤3 URLs are fetched and HTML-cleaned concurrently (one
+`asyncio.gather`, capped at 6) and their usable drafts are then **saved concurrently** in a second
+gather (E10; a single page or a failed drive write never fails the batch — that URL is just left
+without a provenance row), while the results keep the input order so the claim↔source pairing stays
+stable; the run's agent turns themselves remain strictly serial (one `research_drive` job at a time,
+never a per-claim fan-out). Each call's returned view JSON is capped at 7200 bytes; fetch concurrency
+is SSRF-guarded by the same `web_fetch` domain allow-list the tools use, HTML stripped to clean text,
+and each usable draft
+persisted under `temp/v{run}/scrape/` as a `fetch_<host>_<hex>.md` draft (the legacy agent-saved
+`save_scrape` captures keep their `<source>_<query>_<n>.md` naming) alongside a per-canonical-URL
+provenance row in the run's `_fetch_provenance` ledger (see the storage-mapping paragraph above).
+Verification then happens **once per evidence row**: one `research_evidence verify` per cluster maps
+each canonical URL to an evidence row whose id is a **stable hash of `(claim_id, canonical_url)`**, so
+the whole call is idempotent — a re-run in a fresh edition re-hashes to the same ids and upserts in
+place instead of duplicating. The `verified` label therefore means *server-side provenance only*: the
+run ledger has a row (fetch returned ok, draft was usable, `full_char_len ≥ MIN`, and the model judged
+the claim with a `supports`/`contradicts` verdict) — the model's self-report about having "read" or
+"checked" a page is never enough. A `neutral` verdict is a note on an already-verified evidence row and
+creates no claim edge; a failed fetch simply leaves no row, so a claim silently has "no evidence yet".
+Two hard rules keep the graph honest: verify never creates or rewrites claims (a claim's only writer is
+the driver), and the WRITE stage may cite a page only through `research_scrape read`, which is scoped
+to the current run's own provenance rows — the agent can't cite a URL it never actually loaded this run.
 
 **Session isolation.** Every task binds a single dedicated chat session (1:1, `bind_session`).
 Research sessions are a different kind than a normal chat: `GET /sessions` filters them out via
@@ -2155,14 +2186,12 @@ interactive 5, under caps: `research_driver_max_turns` (8), `research_driver_max
 stalled | cancelled | error` from the persisted run slot; after each successful turn a fixed
 grading chain fixes the state — cancel requested → CANCELLED, stage PUBLISH → FINISHED,
 `pending_overrides` > 0 → BLOCKED, consecutive no-progress over the cap → STALLED, turn/cost cap →
-BLOCKED, else the run continues. In **progressive** mode a stop short of PUBLISH for a non-human
-reason (a no-progress stall or a turn/cost cap) is not left mid-way: the driver **auto-settles**
-it — it walks the remaining legal chain to PUBLISH (each un-passed guarding gate records its
-failed checks as a diagnostic) and writes a model-free `settle_report.md` that aggregates the
-produced artifacts/graph and closes with a "Known gaps / unverified items" list, so a run that
-ran out of usable material still ends at PUBLISH with an honest per-stage failure record (never
-RAG-promoted). Strict runs keep the stall/cap stop — an un-passed gate there is a real
-human-decision point. Terminal states are recorded in `last_block` (`{kind, reason, at,
+BLOCKED, else the run continues. A progressive run that stops short of PUBLISH for a non-human
+reason (a no-progress stall or a turn/cost cap) is never left mid-way: the driver **auto-settles**
+it (the Execution-mode paragraph above) — it walks the remaining legal chain to PUBLISH, records
+each un-passed guarding gate as a diagnostic, and writes a model-free `settle_report.md` closing
+with a "Known gaps / unverified items" list (never RAG-promoted); a strict run keeps the stall/cap
+stop. Terminal states are recorded in `last_block` (`{kind, reason, at,
 run_id, execution_id}`), the slot is released via `end_run`, and the terminal message is mirrored
 to the session.
 
@@ -2205,6 +2234,30 @@ FAIL and the agent proposes a different approach (resumed by another chat messag
 expose the terminal `last_block` banner and `pending_overrides` (`{approval_id, gate_name,
 reason}`), so a blocked run tells the user exactly what it's waiting on.
 
+**Execution mode — two gate-control pipelines (strict | progressive), locked at creation.** A task's
+`execution_mode` is chosen when it is created (the desktop ＋Research dialog offers both, defaulting
+to `progressive`; the plugin/API default is `strict`) and locked for the task's whole life. It never
+changes *how* a stage is worked — both modes run identical stage work and the identical deterministic
+gate checks (read-only; a gate's state is never forged) — it changes only what happens when a guarded
+transition's gate has not passed, i.e. the run's failure control flow is one of two pipelines:
+
+- **strict** — an un-passed guard gate **blocks** the transition: `research_state transition_stage`
+  refuses, and the run stalls at the stage until the agent actually fixes the underlying work and the
+  gate passes, or the agent calls `research_gate request_override` and a human Approve flips the gate
+  to OVERRIDE (the Cooperative-Stop paragraph above). A strict run that stalls or hits a cap stops
+  graded (STALLED / BLOCKED) and never advances on gaps — a failed gate there is a genuine
+  human-decision point.
+- **progressive** — a FAIL loses its blocking consequence but not its record: the deterministic
+  checks run read-only, the failed checks are appended to `project["diagnostics"]` as a
+  `{gate, stage, target, failed_checks}` entry (plus a `gate_diagnostic` run event), and the stage
+  advances **in the same atomic commit**. No de-dup machinery is needed: the legal stage chain is
+  strictly forward with no backtracking, so each guarded target is entered at most once per run and a
+  `(gate, stage)` diagnostic is structurally unique. A progressive run can therefore reach PUBLISH
+  with honest gaps, and its report must close with a **"Known gaps / unverified items"** list — one
+  entry per diagnostic, each labeled unverified; a progressive run that would stop short of PUBLISH
+  for a non-human reason is deterministically **auto-settled** instead (the Run-lifecycle paragraph
+  below).
+
 **Live monitor & per-process logs.** `GET /research/tasks/{id}/monitor` is an SSE stream that
 subscribes to the Redis channel `research:monitor:{task_id}` *before* emitting a `snapshot`, then
 pushes `change` frames carrying only `project_revision` (20 s keep-alives) — an **invalidation
@@ -2230,7 +2283,7 @@ auto-opens and resumes the `deep_research` skill) and the skill-driven **project
 (`research_project` under the `deep_research` skill,
 [skills/deep_research.skill.md](../skills/deep_research.skill.md) — clarify → plan → discover →
 frame → evidence → cross-verify → synthesize → write → review → publish). The skill's
-`allowed_tools` is scoped to the six research tools plus search and enforced by
+`allowed_tools` is scoped to the seven research tools plus search and enforced by
 `SkillScopeEnforcer` (§5.4), so a research run stays inside the governed workflow; the lighter
 `fact_check` skill covers single-claim verification.
 
