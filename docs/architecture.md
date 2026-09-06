@@ -308,8 +308,10 @@ tool whose execution `concludes_turn` (a static, tool-declared flag), and a **co
 runtime stop** — a tool may call `AgentTurn.request_stop(reason)` mid-step, and the loop honours
 `stop_requested` only at the step boundary, after this step's tool results are committed and
 recorded, so in-flight work is never dropped; the `reason` is opaque audit metadata and the loop
-interprets no domain concept. In both cases the `finally` block still runs (session-end hooks,
-span finish, audit line). Returns
+interprets no domain concept. The request is **first-wins idempotent** (a repeated call keeps the
+original reason; the default is `generic_stop`), the same stop is honoured on the streaming path,
+and the loop records a `turn-stop-requested` event carrying the reason before breaking. In both
+cases the `finally` block still runs (session-end hooks, span finish, audit line). Returns
 `AgentResult {messages, final_answer, usage, error, cost_usd}`.
 
 `run_stream(...)` is the streaming twin: the same pipeline (prompt assembly, tool dispatch,
