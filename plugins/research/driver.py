@@ -229,7 +229,9 @@ class RunTurnResult:
     """What one successful ``run_turn`` returned."""
 
     final_answer: str
-    cost_usd: float = 0.0
+    # ``float | None``: ``None`` = PRICING_UNKNOWN (tokens spent, no price resolved).
+    # Strictly kept distinct from ``0.0`` (genuinely nothing to bill).
+    cost_usd: float | None = 0.0
 
 
 @dataclass
@@ -397,7 +399,10 @@ def auto_turn_prompt(
         "get_handoff to read that exact next_stage (and gate_required) for THIS project, then "
         "call research_state transition_stage passing ONLY that next_stage as target. "
         "Transitioning to any other target is refused as an illegal transition and wastes the "
-        "turn — never guess the stage name, never skip a stage.\n"
+        "turn — never guess the stage name, never skip a stage. When transition_stage reports "
+        "transition=\"ADVANCED\", the stage change is committed and this turn ends "
+        "automatically: the next turn opens at the new stage, so do NOT re-do or pad the old "
+        "stage's work after a successful transition.\n"
         "Drive the stage work with the research tools (research_project snapshot, "
         "research_state incl. get_state/get_handoff/transition_stage, research_evidence "
         "record_node/verify, research_gate check, research_artifact, research_run, "
@@ -871,6 +876,9 @@ class ResearchRunDriver:
         ledger = service.get_driver_checkpoint(owner_id, task_id)
         consecutive = int(ledger.get("consecutive_no_progress") or 0)
         cumulative = float(ledger.get("cumulative_cost_usd") or 0.0)
+        # Turns whose cost could not be computed (PRICING_UNKNOWN) are counted explicitly
+        # instead of being laundered into the $0 cumulative total.
+        pricing_unknown = int(ledger.get("pricing_unknown_turns") or 0)
 
         final_answer: str | None = None
         cost_usd = 0.0
@@ -948,7 +956,8 @@ class ResearchRunDriver:
                     raise
                 else:
                     final_answer = result.final_answer
-                    cost_usd = float(result.cost_usd or 0.0)
+                    # Pass through None (PRICING_UNKNOWN) untouched — never coerce to 0.0.
+                    cost_usd = result.cost_usd
                     break
             else:
                 # cancel_event fired → the watcher saw cancel_requested mid-turn.
@@ -959,7 +968,10 @@ class ResearchRunDriver:
                 break
 
         # ── post-turn grading ──
-        cumulative += cost_usd
+        if cost_usd is None:
+            pricing_unknown += 1
+        else:
+            cumulative += cost_usd
 
         # Re-read authoritative state: stage may have advanced, a human may have resolved an
         # override, or Stop may have been pressed while we ran.
@@ -999,6 +1011,7 @@ class ResearchRunDriver:
                 patch={
                     "turn_state": "done",
                     "cumulative_cost_usd": cumulative,
+                    "pricing_unknown_turns": pricing_unknown,
                     "consecutive_no_progress": grade.consecutive_no_progress,
                     "execution_id": execution_id,
                     "next_scheduled": _now_iso(),

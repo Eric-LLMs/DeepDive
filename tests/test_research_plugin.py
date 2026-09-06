@@ -1151,18 +1151,19 @@ class TestExecutionMode:
         assert "diagnostics" not in self._project(env, pid)
 
     async def test_progressive_guarded_target_recorded_at_most_once(self, env):
-        # A guarded target cannot be entered twice: after the diagnostic the stage has moved
-        # on, so re-targeting it is an illegal transition — one entry, structurally unique.
+        # After the diagnostic the stage has moved on; re-targeting the now-occupied stage is
+        # the benign ALREADY_AT_TARGET no-op (granted, but nothing written), so the entry and
+        # its diagnostic stay structurally unique.
         # (No revision arithmetic here: the tool's monitor wrapper adds an advisory
         # publish_change bump after any mutating action, so deltas are not a clean proxy.)
         pid = (await _create_project(env.runtime, execution_mode="progressive"))["project_id"]
         self._fast_stage(env, pid, "DESIGN")
         first = await _run(env.runtime, "research_state", action="transition_stage",
                            project_id=pid, target="EXECUTE")
-        assert first["granted"] is True
+        assert first["granted"] is True and first["transition"] == "ADVANCED"
         second = await _run(env.runtime, "research_state", action="transition_stage",
                             project_id=pid, target="EXECUTE")
-        assert second["granted"] is False
+        assert second["granted"] is True and second["transition"] == "ALREADY_AT_TARGET"
         project = self._project(env, pid)
         assert project["stage"] == "EXECUTE"
         diags = project["diagnostics"]
@@ -1171,6 +1172,162 @@ class TestExecutionMode:
         assert diags[0]["gate"] == "DESIGN_GATE"
         assert diags[0]["stage"] == "DESIGN"
         assert diags[0]["target"] == "EXECUTE"
+
+
+# ── 9b. transition_stage outcome verbs + claim-strength vocabulary ───────────
+# Phase-1 A-class fixes: the seven outcome verbs (ADVANCED / ALREADY_AT_TARGET /
+# NOT_READY / GATE_BLOCKED / CONFLICT / ILLEGAL / ERROR), the turn-convergence contract
+# (only a committed ADVANCED asks the runtime to stop), the canonical Claim strength set
+# with report-style aliases, and the QUALITY_GATE scorecard severity split.
+class TestTransitionOutcomes:
+    @staticmethod
+    def _svc(env) -> ResearchService:
+        return ResearchService(drive=env.drive, scratch_root=env.scratch)
+
+    @staticmethod
+    def _project(env, pid: str) -> dict:
+        return ResearchService._load_json(env.scratch / str(USER) / pid / "project.json", None)
+
+    @staticmethod
+    def _fast_stage(env, pid: str, stage: str) -> None:
+        TestTransitionOutcomes._svc(env).atomic_update_project(
+            USER, pid, lambda p: p.update(stage=stage)
+        )
+
+    async def test_advanced_stops_the_bound_turn(self, env):
+        # The only outcome that ends the turn: a committed ADVANCED calls the generic
+        # AgentTurn.request_stop contract (loop honours it at the step boundary).
+        pid = (await _create_project(env.runtime, execution_mode="progressive"))["project_id"]
+        self._fast_stage(env, pid, "DESIGN")
+        turn = AgentTurn(user_msg="t")
+        bind_turn(turn)
+        try:
+            res = await _run(env.runtime, "research_state", action="transition_stage",
+                             project_id=pid, target="EXECUTE")
+        finally:
+            bind_turn(None)
+        assert res["transition"] == "ADVANCED" and res["granted"] is True
+        assert turn.stop_requested is True
+        assert turn.stop_reason == "stage_advanced"
+
+    async def test_non_advanced_outcomes_never_stop_the_turn(self, env):
+        # ILLEGAL / CONFLICT / ALREADY_AT_TARGET leave the turn running.
+        pid = (await _create_project(env.runtime))["project_id"]
+        turn = AgentTurn(user_msg="t")
+        bind_turn(turn)
+        try:
+            illegal = await _run(env.runtime, "research_state", action="transition_stage",
+                                 project_id=pid, target="WRITE")
+            conflict = await _run(env.runtime, "research_state", action="transition_stage",
+                                  project_id=pid, target="FRAME",
+                                  expected_current_stage="EVIDENCE")
+            at_target = await _run(env.runtime, "research_state", action="transition_stage",
+                                   project_id=pid, target="DISCOVER")
+        finally:
+            bind_turn(None)
+        assert illegal["transition"] == "ILLEGAL" and illegal["granted"] is False
+        assert conflict["transition"] == "CONFLICT" and conflict["granted"] is False
+        assert conflict["stage"] == "DISCOVER"
+        assert at_target["transition"] == "ALREADY_AT_TARGET" and at_target["granted"] is True
+        assert turn.stop_requested is False
+        assert self._project(env, pid)["stage"] == "DISCOVER"  # nothing written
+
+    async def test_strict_splits_not_ready_from_gate_blocked(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]  # strict default
+        self._fast_stage(env, pid, "DESIGN")
+        never = await _run(env.runtime, "research_state", action="transition_stage",
+                           project_id=pid, target="EXECUTE")
+        assert never["transition"] == "NOT_READY" and never["granted"] is False
+        assert never["gate"] == "DESIGN_GATE"
+        checked = await _run(env.runtime, "research_gate", action="check",
+                             project_id=pid, gate_name="DESIGN_GATE")
+        assert checked["status"] == "FAIL"
+        blocked = await _run(env.runtime, "research_state", action="transition_stage",
+                             project_id=pid, target="EXECUTE")
+        assert blocked["transition"] == "GATE_BLOCKED" and blocked["granted"] is False
+        assert self._project(env, pid)["stage"] == "DESIGN"
+
+    async def test_unknown_stage_is_illegal(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        res = await _run(env.runtime, "research_state", action="transition_stage",
+                         project_id=pid, target="NOPE")
+        assert res["transition"] == "ILLEGAL" and "unknown" in res["reason"]
+
+
+class TestClaimStrengthVocabulary:
+    @staticmethod
+    def _svc(env) -> ResearchService:
+        return ResearchService(drive=env.drive, scratch_root=env.scratch)
+
+    async def test_record_node_normalizes_report_style_aliases(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        for raw, canonical in (("high", "confident"), ("Medium", "supported"), ("low", "asserted")):
+            res = await _run(env.runtime, "research_evidence", action="record_node",
+                             project_id=pid,
+                             node={"id": f"C{raw}", "type": "Claim", "label": "c", "strength": raw})
+            assert res["node"]["strength"] == canonical, raw
+
+    async def test_record_node_rejects_illegal_strength_with_repair_hint(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        result = await env.runtime.execute(ToolExecution(
+            call_id=str(uuid.uuid4()), name="research_evidence",
+            arguments={"action": "record_node", "project_id": pid,
+                       "node": {"id": "C", "type": "Claim", "label": "c", "strength": "banana"}},
+        ))
+        assert result.is_error is True
+        msg = result.error.message
+        assert "banana" in msg and "confident" in msg and "normalized" in msg
+
+    async def test_mutate_node_patch_is_normalized_and_guarded(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node={"id": "C", "type": "Claim", "label": "c", "strength": "asserted"})
+        patched = await _run(env.runtime, "research_evidence", action="mutate_node",
+                             project_id=pid, node_id="C", patch={"strength": "high"})
+        assert patched["node"]["strength"] == "confident"
+        bad = await env.runtime.execute(ToolExecution(
+            call_id=str(uuid.uuid4()), name="research_evidence",
+            arguments={"action": "mutate_node", "project_id": pid, "node_id": "C",
+                       "patch": {"strength": "very-strong"}},
+        ))
+        assert bad.is_error is True and "very-strong" in bad.error.message
+
+    async def test_claim_gate_accepts_legacy_raw_strength(self, env):
+        # Read-side compat: strengths stored before the alias table (raw "high") still
+        # score valid in CLAIM_GATE.
+        pid = (await _create_project(env.runtime))["project_id"]
+        TestTransitionOutcomes._fast_stage(env, pid, "WRITE")
+        res = await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                         node={"id": "C", "type": "Claim", "label": "c", "strength": "high",
+                               "citations": ["u1"]})
+        assert res["node"]["strength"] == "confident"
+        # Rewind the stored node to the pre-fix raw value, as a legacy graph would have it.
+        svc = self._svc(env)
+        graph = svc._load_graph(USER, pid)
+        next(n for n in graph["nodes"] if n["id"] == "C")["strength"] = "high"
+        svc._save_graph(USER, pid, graph)
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=pid, gate_name="CLAIM_GATE")
+        assert gate["status"] == "PASS"
+
+    async def test_quality_gate_scorecard_missing_is_diagnostic_only(self, env):
+        pid = (await _create_project(env.runtime, execution_mode="progressive"))["project_id"]
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=pid, gate_name="QUALITY_GATE")
+        assert gate["status"] == "FAIL"
+        sc = next(c for c in gate["checks"] if c["name"] == "scorecard")
+        assert sc["ok"] is False and sc["severity"] == "diagnostic_only"
+        assert "scorecard_missing" in sc["detail"]
+
+    async def test_quality_gate_present_scorecard_is_blocking(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        rows = [{"metric": f"m{i}", "ok": True} for i in range(7)]
+        self._svc(env).atomic_update_project(USER, pid, lambda p: p.update(scorecard=rows))
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=pid, gate_name="QUALITY_GATE")
+        assert gate["status"] == "PASS"
+        sc = next(c for c in gate["checks"] if c["name"] == "scorecard")
+        assert sc["severity"] == "blocking"
 
 
 # ── 10. Versioned chat-task run output layout ────────────────────────────────

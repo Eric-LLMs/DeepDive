@@ -26,9 +26,15 @@ Clarify → Plan → DISCOVER → FRAME → EVIDENCE → Synthesize → WRITE �
 ```
 
 Each stage maps to a `research_state` stage; advance with `research_state transition_stage`
-only after its outputs exist. The default `literature` profile skips DESIGN/EXPLAIN/REPRODUCE
-and runs EXECUTE as *synthesis* — no sandbox script. If the user needs empirical work,
-create the project with `profile: "empirical"` and use `research_run execute_sandbox_script`.
+only after its outputs exist. The DAG is always the full ten-stage chain — no profile removes
+stages. Under the default `literature` profile, DESIGN / EXPLAIN / REPRODUCE are light
+pass-throughs: do the stage's minimal honest work (or nothing material for that stage) and
+call `transition_stage` to advance; in progressive mode a failed guarding gate is recorded as
+a diagnostic and the move is granted. Only an `empirical` project (create it with
+`profile: "empirical"`) does substantive EXECUTE work via `research_run execute_sandbox_script`.
+A transition that reports `transition: "ADVANCED"` has committed and **ends the current turn**
+automatically — the next turn opens at the new stage, so after a successful transition, do not
+re-do the previous stage's collection or verification work.
 
 ## Steps
 
@@ -62,7 +68,10 @@ create the project with `profile: "empirical"` and use `research_run execute_san
    claim instead of one source at a time:
    - First record the claim as a graph node: `research_evidence record_node` with
      `node: {id: <claim id>, type: "Claim", label}`. `verify` anchors to that claim id and
-     never creates a claim itself.
+     never creates a claim itself. CLAIM_GATE later requires every Claim to carry a
+     `strength`; when you pass one on `record_node`, use the canonical vocabulary
+     `asserted | supported | confident | contested` (report-style `high`/`medium`/`low` are
+     accepted and stored normalized; anything else is rejected with a repair hint).
    - Pick 1–3 of the strongest candidate source URLs for the claim (from `web_search` /
      `search_social` hits you have not captured yet) and fetch them in ONE call:
      `research_scrape` with `action: "fetch"` and `urls: [≤3 URLs]`. The service fetches the
@@ -90,10 +99,11 @@ create the project with `profile: "empirical"` and use `research_run execute_san
 
 6. **Cross-verify claims.** For contested or load-bearing claims, check a gate with
    `research_gate check` (gate_name as appropriate). If a gate fails, call
-   `research_gate explain_failure` to see why; do not silently proceed past a failed gate.
-   Never request a gate override on your own judgment alone — surface it for the user.
-   In a `progressive` project a failed gate is recorded and lets you continue instead — see
-   “Progressive mode” below, and never call `request_override` there.
+   `research_gate explain_failure` to see why. In **strict** mode, do not silently proceed
+   past a failed gate and never request a gate override on your own judgment alone —
+   surface it for the user. In **progressive** mode a failed gate is recorded and lets you
+   continue instead — see “Progressive mode” below (that path is not "silently proceeding";
+   the diagnostics are the honest record), and never call `request_override` there.
 
 7. **Synthesize (EXECUTE).** Compare sources, resolve contradictions explicitly (state both
    sides), and rank evidence. Produce the reasoning that turns evidence into a conclusion.
@@ -110,6 +120,8 @@ create the project with `profile: "empirical"` and use `research_run execute_san
      the returned snippet was too short to carry.
    - Rate confidence per claim: **high** (multiple independent, specific sources agree),
      **medium** (one strong source, or several with gaps), **low** (thin or conflicting).
+     These are report prose; the graph node's `strength` field uses the canonical set
+     `asserted | supported | confident | contested` (see EVIDENCE above).
    - Name the remaining uncertainty explicitly — a good report states its gaps.
 
 9. **REVIEW — self-check before publish.** Re-read the draft for unsupported assertions.

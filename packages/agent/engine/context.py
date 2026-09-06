@@ -82,6 +82,22 @@ class AgentTurn:
     max_budget_usd: float | None = None
     loop_tracker: Any | None = None           # ToolLoopTracker (see agent.engine.loop_guard)
 
+    # ── generic turn-convergence control ──
+    # ``request_stop`` is a cooperative, step-boundary stop with a business-neutral reason
+    # string: a tool (or any in-turn code) asks the loop to end the turn *after* the current
+    # step finishes completely. The loop never interprets ``stop_reason`` — it is opaque
+    # runtime metadata for the audit trail only. Distinct from ``cancel_token``, which is a
+    # user-initiated abort; lifecycle is strictly one turn (fresh AgentTurn per turn).
+    stop_requested: bool = False
+    stop_reason: str | None = None
+
+    # Per-turn LLM price pair as plain numbers ``(prompt_price_per_1k,
+    # completion_price_per_1k)``. A neutral numeric tuple (Decimal or float) injected by the
+    # caller that resolved the model's channel — never a DB/billing dependency. ``None``
+    # means "no authoritative price was provided"; cost estimation then falls back and may
+    # report PRICING_UNKNOWN (it must never silently assume $0).
+    pricing: tuple[Any, Any] | None = None
+
     # ── observability / streaming ──
     span: TurnSpan | None = None
     audit: Any | None = None                # AuditSink (agent.engine.telemetry); JSONL turn trail
@@ -93,6 +109,19 @@ class AgentTurn:
 
     # ── skill scope (allowed_tools enforcement) ──
     active_skills: list[str] = field(default_factory=list)  # skills loaded this turn (call order)
+
+    def request_stop(self, reason: str = "generic_stop") -> None:
+        """Cooperatively end this turn after the current step completes (idempotent).
+
+        First call wins (``reason`` kept); later calls are no-ops. The loop checks
+        ``stop_requested`` only at the step boundary — after the current step's tool calls
+        finished, results were appended, and step audit/telemetry were recorded — so this
+        never cancels in-flight work. ``reason`` is opaque metadata the loop does not
+        interpret; the caller (e.g. a plugin tool) supplies it.
+        """
+        if not self.stop_requested:
+            self.stop_requested = True
+            self.stop_reason = reason
 
     def activate_skill(self, name: str) -> None:
         """Record a skill as active for the rest of the turn (idempotent).

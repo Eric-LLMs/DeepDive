@@ -38,7 +38,14 @@ from agent.engine.decisions import (
 from agent.engine.loop_guard import ToolLoopTracker
 from agent.engine.runtime import ToolRuntime
 from agent.engine.sessions import SessionLog
-from agent.engine.telemetry import TraceContext, TurnSpan, estimate_cost_usd, log_error, log_event
+from agent.engine.telemetry import (
+    TraceContext,
+    TurnSpan,
+    estimate_cost_usd,
+    get_current_pricing,
+    log_error,
+    log_event,
+)
 from agent.llm.llm_errors import LLMFatalError, LLMTemporaryError
 from agent.prompt.system_prompt import (
     CacheBoundaryAssembler,
@@ -85,7 +92,9 @@ class AgentResult:
     final_answer: str
     usage: dict[str, int] = field(default_factory=dict)
     error: str | None = None
-    cost_usd: float = 0.0
+    # ``None`` = PRICING_UNKNOWN (cost not computable) — deliberately distinct from ``0.0``
+    # (free / nothing billed). Downstream accounting must not coerce None to 0.
+    cost_usd: float | None = 0.0
 
 
 class ReactLoopAgent:
@@ -147,6 +156,10 @@ class ReactLoopAgent:
             turn.loop_tracker = ToolLoopTracker()  # tool-oscillation breaker, on by default
         if turn.span is None:
             turn.span = TurnSpan(turn.turn_id)
+        if turn.pricing is None:
+            # Pick up a per-channel price the caller pinned around this run (generic
+            # request-scoped metadata; see telemetry.set_current_pricing).
+            turn.pricing = get_current_pricing()
         TraceContext.bind(turn_id=turn.turn_id)
         return turn
 
@@ -198,9 +211,11 @@ class ReactLoopAgent:
         system = render_prompt(assembly)
 
         await self.events.serial("agent/session-start", {"user_msg": turn.user_msg})
-        self._log(turn, "session-start", user_msg=turn.user_msg, snapshot_key=self._snapshot_key())
-
         messages = (turn.history or []) + [{"role": "user", "content": turn.user_msg}]
+        self._log(
+            turn, "session-start", user_msg=turn.user_msg, snapshot_key=self._snapshot_key(),
+            context_profile=self._context_profile(system, messages),
+        )
         await self._persist_message(turn.session_memory, "user", turn.user_msg)
 
         error: str | None = None
@@ -218,7 +233,7 @@ class ReactLoopAgent:
                 visible_tools = self._step_tools(context, assembly, tools)
                 t0 = time.monotonic()
                 try:
-                    finished, step_usage = await self._step(
+                    finished, step_usage, llm_duration_ms = await self._step(
                         turn, system, visible_tools, messages, step, model, base_url, api_key
                     )
                 except (LLMFatalError, LLMTemporaryError) as exc:
@@ -233,6 +248,9 @@ class ReactLoopAgent:
                     tokens=turn.usage.get("total_tokens", 0),
                     duration_ms=(time.monotonic() - t0) * 1000,
                 )
+                # record_llm tags the most recent step entry, so it must come after
+                # record_step to land on this step (mirrors run_stream's per-call record).
+                turn.span.record_llm(duration_ms=llm_duration_ms)
                 self._enforce_window(messages)
                 await self.events.serial("agent/step-end", {})
                 self._log(turn, "step-end")
@@ -243,6 +261,14 @@ class ReactLoopAgent:
                     self._reset_oscillation(turn)
                 if finished:
                     break
+                # Cooperative turn convergence (generic contract): a tool may call
+                # ``turn.request_stop(reason)`` mid-step; the loop honours it only here —
+                # after this step's tool results are committed and step-end recorded — so
+                # in-flight work is never cancelled or dropped. The reason is opaque
+                # metadata for the audit trail; the loop does not interpret it.
+                if turn.stop_requested:
+                    self._log(turn, "turn-stop-requested", reason=turn.stop_reason)
+                    break
         except asyncio.CancelledError:
             log_error(kind="turn_cancelled")
             turn.span.record_error(kind="cancelled", message="turn cancelled")
@@ -252,10 +278,15 @@ class ReactLoopAgent:
             self._log(turn, "session-end")
             if turn.session_memory is not None:
                 await turn.session_memory.close()
-            turn.span.finish(cost_usd=estimate_cost_usd(turn.usage, model))
+            turn.span.finish(cost_usd=self._turn_cost(turn, model))
             if turn.audit is not None:
                 turn.audit.write(
-                    {**TraceContext.snapshot(), "type": "turn-end", **turn.span.to_dict()}
+                    {
+                        **TraceContext.snapshot(),
+                        "type": "turn-end",
+                        **turn.span.to_dict(),
+                        "context_profile": self._context_profile(system, messages),
+                    }
                 )
 
         final_answer = self._final(messages) if error is None else (
@@ -310,9 +341,11 @@ class ReactLoopAgent:
         system = render_prompt(assembly)
 
         await self.events.serial("agent/session-start", {"user_msg": turn.user_msg})
-        self._log(turn, "session-start", user_msg=turn.user_msg, snapshot_key=self._snapshot_key())
-
         messages = (turn.history or []) + [{"role": "user", "content": turn.user_msg}]
+        self._log(
+            turn, "session-start", user_msg=turn.user_msg, snapshot_key=self._snapshot_key(),
+            context_profile=self._context_profile(system, messages),
+        )
         await self._persist_message(turn.session_memory, "user", turn.user_msg)
 
         error: str | None = None
@@ -384,6 +417,11 @@ class ReactLoopAgent:
                     self._reset_oscillation(turn)
                 if concludes:
                     break
+                # Cooperative turn convergence — same step-boundary contract as run():
+                # honored only after this step's tool results are committed.
+                if turn.stop_requested:
+                    self._log(turn, "turn-stop-requested", reason=turn.stop_reason)
+                    break
         except asyncio.CancelledError:
             log_error(kind="turn_cancelled")
             turn.span.record_error(kind="cancelled", message="turn cancelled")
@@ -393,10 +431,15 @@ class ReactLoopAgent:
             self._log(turn, "session-end")
             if turn.session_memory is not None:
                 await turn.session_memory.close()
-            turn.span.finish(cost_usd=estimate_cost_usd(turn.usage, model))
+            turn.span.finish(cost_usd=self._turn_cost(turn, model))
             if turn.audit is not None:
                 turn.audit.write(
-                    {**TraceContext.snapshot(), "type": "turn-end", **turn.span.to_dict()}
+                    {
+                        **TraceContext.snapshot(),
+                        "type": "turn-end",
+                        **turn.span.to_dict(),
+                        "context_profile": self._context_profile(system, messages),
+                    }
                 )
 
         answer = self._final(messages) if error is None else (
@@ -416,12 +459,34 @@ class ReactLoopAgent:
 
     # ── guards ──
     @staticmethod
+    def _turn_cost(turn: AgentTurn, model: str | None) -> float | None:
+        """This turn's accumulated USD cost, or ``None`` = PRICING_UNKNOWN (never fake $0).
+
+        Records a one-shot ``pricing_unknown`` span error so the billing gap is visible in
+        the audit trail; the per-model warning itself lives in telemetry.
+        """
+        cost = estimate_cost_usd(turn.usage, model, turn.pricing)
+        if cost is None and turn.span is not None and not any(
+            e.get("kind") == "pricing_unknown" for e in turn.span.errors
+        ):
+            turn.span.record_error(
+                kind="pricing_unknown",
+                message=f"no price resolved for model {model!r}; cost unknown (not $0)",
+            )
+        return cost
+
+    @staticmethod
     def _budget_exceeded(turn: AgentTurn, model: str | None) -> bool:
-        """Hard per-turn budget: abort the loop once accumulated cost passes the cap."""
+        """Hard per-turn budget: abort the loop once accumulated cost passes the cap.
+
+        Type-safe against PRICING_UNKNOWN: an unknown cost never yields a budget verdict
+        in either direction (fail-open by design — the step cap / stall brakes still bound
+        the turn); it is surfaced via the ``pricing_unknown`` span error instead.
+        """
         if not turn.max_budget_usd:
             return False
-        cost = estimate_cost_usd(turn.usage, model)
-        return cost >= turn.max_budget_usd
+        cost = ReactLoopAgent._turn_cost(turn, model)
+        return cost is not None and cost >= turn.max_budget_usd
 
     def _oscillation(self, turn: AgentTurn) -> bool:
         return bool(turn.loop_tracker is not None and turn.loop_tracker.should_break())
@@ -465,6 +530,47 @@ class ReactLoopAgent:
         messages[:] = others + list(reversed(kept))
 
     # ── helpers ──
+    @staticmethod
+    def _context_profile(system: str, messages: list[dict]) -> dict:
+        """Coarse context-composition baseline in characters (measurement-only, estimated).
+
+        The provider reports usage per step, never per prompt segment, so this profile is an
+        explicit ``estimated`` approximation (~4 chars/token) recorded on session-start and
+        turn-end audit lines: a baseline for where prompt mass comes from (system prompt vs
+        skill loads vs tool results vs conversation). It is deliberately char-based and
+        heuristic — precision here would require a context-builder refactor, out of scope.
+        """
+
+        def chars(m: dict) -> int:
+            content = m.get("content")
+            if isinstance(content, str):
+                return len(content)
+            return len(str(content)) if content else 0
+
+        skill = tool = convo = 0
+        for m in messages:
+            role = m.get("role")
+            if role == "tool":
+                # Skill bodies render with a "# skill:<name>" header (registry.skill_tool);
+                # that prefix is the marker for lazily-loaded skill instructions.
+                if isinstance(m.get("content"), str) and m["content"].startswith("# skill:"):
+                    skill += chars(m)
+                else:
+                    tool += chars(m)
+            elif role in ("user", "assistant"):
+                convo += chars(m)
+        system_chars = len(system or "")
+        total = system_chars + skill + tool + convo
+        return {
+            "estimated": True,
+            "system_chars": system_chars,
+            "skill_chars": skill,
+            "tool_result_chars": tool,
+            "history_chars": convo,
+            "total_chars": total,
+            "estimated_tokens": total // 4,
+        }
+
     def _runtime_schemas(self) -> list[dict]:
         return [{"type": "function", "function": s} for s in self.runtime.schemas()]
 
@@ -497,10 +603,16 @@ class ReactLoopAgent:
         model: str | None,
         base_url: str | None,
         api_key: str | None,
-    ) -> tuple[bool, dict | None]:
-        """Run one LLM call + execute any tool calls. Returns ``(finished, usage)``."""
+    ) -> tuple[bool, dict | None, float]:
+        """Run one LLM call + execute any tool calls.
+
+        Returns ``(finished, usage, llm_duration_ms)`` — the wall-clock time of the model
+        call (monotonic), so the non-streaming loop can report LLM latency per turn.
+        """
         request = [{"role": "system", "content": system}] + self._snip_messages(messages)
+        t_llm = time.monotonic()
         resp = await self.llm.chat(request, tools=tools, model=model, base_url=base_url, api_key=api_key)
+        llm_duration_ms = (time.monotonic() - t_llm) * 1000
         tool_calls = resp.get("tool_calls") or []
         usage = resp.get("usage")
         self._log(turn, "llm-call", tool_calls=len(tool_calls))
@@ -513,10 +625,10 @@ class ReactLoopAgent:
             await self._persist_message(turn.session_memory, "assistant", resp["content"])
 
         if not tool_calls:
-            return True, usage
+            return True, usage, llm_duration_ms
 
         concludes = await self._execute_tool_calls(turn, tool_calls, messages, model)
-        return concludes, usage
+        return concludes, usage, llm_duration_ms
 
     async def _execute_tool_calls(
         self, turn: AgentTurn, tool_calls: list[dict], messages: list[dict], model: str | None

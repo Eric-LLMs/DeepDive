@@ -1118,6 +1118,20 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
         # key/model as the conversation — the "执行 rag_search 时" injection point.
         set_request_user(user_id)
         set_request_llm_channel((model, base_url, api_key))
+        # A4: inject the catalog price pair (the single pricing source of truth — the
+        # Admin-Console-managed model catalog) for turns created in this job. Only a plain
+        # numeric pair flows downstream (telemetry/AgentTurn never see a session); a model
+        # with no priced catalog row yields None = PRICING_UNKNOWN, never a silent $0.
+        if model:
+            from core.infrastructure.billing import get_model_prices
+            from agent.engine.telemetry import set_current_pricing
+
+            try:
+                async with ctx["session_factory"]() as _price_session:
+                    _pp, _pc = await get_model_prices(_price_session, model)
+                set_current_pricing((_pp, _pc) if (_pp or _pc) else None)
+            except Exception:  # noqa: BLE001 - pricing is observational; unknown stays None
+                set_current_pricing(None)
         # The _run wrapper already tagged the job id; add the research run's owner/task/run so
         # driver and settle log lines carry ``task_id:run_id`` like the interactive turn does.
         log_tokens = set_log_context(
@@ -1168,7 +1182,8 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
             )
             return RunTurnResult(
                 final_answer=result.final_answer or "",
-                cost_usd=float(result.cost_usd or 0.0),
+                # float | None: None = PRICING_UNKNOWN (kept distinct from a real 0.0).
+                cost_usd=result.cost_usd,
             )
 
         try:

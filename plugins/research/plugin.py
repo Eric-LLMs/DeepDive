@@ -117,6 +117,34 @@ _INVALIDATES = {"invalidates"}
 _VERIFIED = "verified"
 _ALLOWED_CLAIM_STRENGTH = {"asserted", "supported", "confident", "contested"}
 
+# Report-style confidence words the deep_research skill asks for in prose
+# ("high/medium/low") normalized onto the canonical Claim strengths. The gate vocabulary
+# and the writing vocabulary disagreed, which made CLAIM_GATE mechanically unsatisfiable.
+_CLAIM_STRENGTH_ALIASES = {"high": "confident", "medium": "supported", "low": "asserted"}
+
+
+def _claim_strength_error(value: Any) -> ValueError:
+    return ValueError(
+        f"claim strength {value!r} is not valid; use one of "
+        f"{sorted(_ALLOWED_CLAIM_STRENGTH)} (report-style 'high'/'medium'/'low' are "
+        "accepted and normalized)"
+    )
+
+
+def normalize_claim_strength(value: Any) -> str | None:
+    """Canonicalize one Claim ``strength``; ``None`` = not a recognizable strength.
+
+    Write-side (record_node / mutate_node) rejects ``None`` at the boundary with a repair
+    hint; read-side (``_claim_checks``) applies the same mapping so graphs recorded before
+    this normalization (raw ``high/medium``) still score valid.
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lower()
+    if v in _ALLOWED_CLAIM_STRENGTH:
+        return v
+    return _CLAIM_STRENGTH_ALIASES.get(v)
+
 # ── gate review notes (auto-authored chat explanation, docs/research/10 §6) ──
 # When a gate override parks a run for a human decision, the gate service writes one
 # deterministic ``system`` note into the task's session chat so the operator sees WHY the
@@ -273,6 +301,18 @@ class ProjectLockError(RuntimeError):
     Distinct from a CAS conflict so the driver can grade it Transient (retry with
     backoff) rather than Terminal.
     """
+
+
+class _StageMoved(Exception):
+    """In-lock CAS signal for transition_stage: the stage changed after our pre-read.
+
+    Raised inside the :meth:`ResearchService.atomic_update_project` critical section so
+    the (aborted) commit writes nothing; translated to the ``CONFLICT`` outcome.
+    """
+
+    def __init__(self, stage: str) -> None:
+        super().__init__(f"stage moved to {stage!r}")
+        self.stage = stage
 
 
 # Seconds to wait for the exclusive project.json lock before raising ProjectLockError.
@@ -1751,88 +1791,141 @@ class ResearchService:
         }
 
     def transition_stage(
-        self, owner_id: uuid.UUID, project_id: str, *, target: str
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        target: str,
+        expected_current_stage: str | None = None,
     ) -> dict:
+        """Move the task one legal stage forward, reporting the outcome as one of seven states.
+
+        ``result["transition"]`` is the authoritative verb; ``granted`` stays as the
+        backward-compatible summary (True only for the two benign outcomes):
+
+        - ``ADVANCED``          — the stage move COMMITTED (atomic write finished). This is
+          the only outcome that ends the current agent turn: the runtime is asked to stop
+          via the generic ``AgentTurn.request_stop`` contract, so the next turn opens at the
+          new stage instead of re-doing the old one. Never reported unless the commit
+          succeeded.
+        - ``ALREADY_AT_TARGET`` — benign no-op re-request (idempotent); nothing written, the
+          turn continues.
+        - ``NOT_READY``         — strict mode, guarding gate has never been checked.
+        - ``GATE_BLOCKED``      — strict mode, guarding gate is FAIL (needs a pass or a
+          human override; never bypass it here).
+        - ``CONFLICT``          — the stage moved concurrently (the in-lock CAS failed).
+        - ``ILLEGAL``           — unknown stage, or not the single legal next stage.
+        - ``ERROR``             — persistence failed (raises as before for missing projects).
+        """
         project = self._load_project(owner_id, project_id)
         current = project["stage"]
         if target not in _STAGES:
             return {
-                "requested": target,
-                "granted": False,
-                "stage": current,
+                "requested": target, "transition": "ILLEGAL", "granted": False, "stage": current,
                 "reason": f"unknown stage {target!r}",
+            }
+        if current == target:
+            # Re-requesting the stage we already occupy is a benign outcome, not an error:
+            # answering it as "illegal" made the model retry with other guesses and burn
+            # turns. Nothing is written and the turn is NOT stopped.
+            return {
+                "requested": target, "transition": "ALREADY_AT_TARGET", "granted": True,
+                "stage": current,
+                "note": "stage unchanged; continue this stage's work",
+            }
+        if expected_current_stage is not None and current != expected_current_stage:
+            return {
+                "requested": target, "transition": "CONFLICT", "granted": False, "stage": current,
+                "reason": f"stage moved: expected {expected_current_stage!r}, found {current!r}",
             }
         if _LEGAL_NEXT.get(current) != target:
             return {
-                "requested": target,
-                "granted": False,
-                "stage": current,
+                "requested": target, "transition": "ILLEGAL", "granted": False, "stage": current,
                 "reason": f"illegal transition {current} -> {target}",
             }
         gate = _GATE_BEFORE.get(target)
-        if gate and project["gates"].get(gate) not in ("PASS", "OVERRIDE"):
-            # Strict (the default): an un-passed guard blocks the transition — unchanged.
-            if project.get("execution_mode", "strict") != "progressive":
-                return {
-                    "requested": target,
-                    "granted": False,
-                    "stage": current,
-                    "reason": f"transition {current} -> {target} guarded by {gate}: "
-                    f"not passed (current {project['gates'].get(gate)})",
-                }
+        gate_state = project["gates"].get(gate) if gate else None
+        progressive = project.get("execution_mode", "strict") == "progressive"
+        if gate and gate_state not in ("PASS", "OVERRIDE") and not progressive:
+            # Strict (the default): an un-passed guard blocks the transition — semantics
+            # unchanged; only the reason is now split into its own verbs (never checked
+            # vs checked-and-failed).
+            return {
+                "requested": target,
+                "transition": "NOT_READY" if gate_state in (None, "NOT_RUN") else "GATE_BLOCKED",
+                "granted": False, "stage": current, "gate": gate,
+                "reason": f"transition {current} -> {target} guarded by {gate}: "
+                f"not passed (current {gate_state or 'NOT_RUN'})",
+            }
 
-            # Progressive: the SAME deterministic checks still run (read-only, never writes a
-            # verdict) and the gate's own state is never forged to PASS — only the blocking
-            # consequence of a FAIL is lifted, by recording the failure into
-            # ``project["diagnostics"]`` and advancing the stage in the SAME atomic commit.
-            # No de-dup machinery is needed: ``_LEGAL_NEXT`` is a strictly forward chain with
-            # no backtracking, so each guarded target (EXECUTE/EXPLAIN/REVIEW/REPRODUCE) can
-            # be transitioned into at most once per run — a (gate, stage) diagnostic is
-            # structurally unique.
+        # Progressive: the SAME deterministic checks still run (read-only, never writes a
+        # verdict) and the gate's own state is never forged to PASS — only the blocking
+        # consequence of a FAIL is lifted, by recording the failure into
+        # ``project["diagnostics"]`` and advancing the stage in the SAME atomic commit.
+        # No de-dup machinery is needed: ``_LEGAL_NEXT`` is a strictly forward chain with
+        # no backtracking, so each guarded target (EXECUTE/EXPLAIN/REVIEW/REPRODUCE) can
+        # be transitioned into at most once per run — a (gate, stage) diagnostic is
+        # structurally unique.
+        diagnosed: list[dict] | None = None
+        if gate and gate_state not in ("PASS", "OVERRIDE") and progressive:
             checks = self._gate_checks_readonly(owner_id, project_id, gate)
-            failed = [c for c in checks if not c.get("ok")]
+            diagnosed = [c for c in checks if not c.get("ok")]
 
-            def mutate(project: dict) -> None:
-                project["stage"] = target
-                project.setdefault("diagnostics", []).append(
+        def mutate(p: dict) -> None:
+            # CAS closed inside the lock critical section (atomic_update_project): if the
+            # stage moved between the pre-read above and our commit, abort without writing.
+            if p["stage"] != current:
+                raise _StageMoved(p["stage"])
+            p["stage"] = target
+            if diagnosed:
+                p.setdefault("diagnostics", []).append(
                     {
                         "gate": gate,
                         "stage": current,
                         "target": target,
-                        "failed_checks": failed,
+                        "failed_checks": diagnosed,
                         "timestamp": _now_iso(),
                     }
                 )
 
+        try:
             project = self.atomic_update_project(owner_id, project_id, mutate)
-            self._log_stage_event(
-                owner_id, project_id, current=current, target=target, project=project
-            )
-            if failed:
-                names = ", ".join(c["name"] for c in failed)
-                self._log_run_event(
-                    owner_id,
-                    project_id,
-                    event_type="gate_diagnostic",
-                    key=f"gate:{gate}→{target}",
-                    stage=target,
-                    detail=f"{gate} failed ({len(failed)}): {names}",
-                    project=project,
-                )
+        except _StageMoved as moved:
             return {
-                "requested": target,
-                "granted": True,
-                "stage": project["stage"],
-                "gate": gate,
-                "diagnosed": failed,
+                "requested": target, "transition": "CONFLICT", "granted": False,
+                "stage": moved.stage,
+                "reason": f"stage moved concurrently (now {moved.stage!r})",
             }
 
-        def mutate(project: dict) -> None:
-            project["stage"] = target
-
-        project = self.atomic_update_project(owner_id, project_id, mutate)
-        self._log_stage_event(owner_id, project_id, current=current, target=target, project=project)
-        return {"requested": target, "granted": True, "stage": project["stage"], "gate": gate}
+        # ── ADVANCED: the commit succeeded; only now may we announce it ──
+        self._log_stage_event(
+            owner_id, project_id, current=current, target=target, project=project
+        )
+        if diagnosed:
+            names = ", ".join(c["name"] for c in diagnosed)
+            self._log_run_event(
+                owner_id,
+                project_id,
+                event_type="gate_diagnostic",
+                key=f"gate:{gate}→{target}",
+                stage=target,
+                detail=f"{gate} failed ({len(diagnosed)}): {names}",
+                project=project,
+            )
+        # Turn convergence through the GENERIC runtime contract: the loop never learns the
+        # word "stage" — it only honors turn.stop_requested at the step boundary, so the
+        # rest of this turn cannot keep re-doing the finished stage's work.
+        turn = current_turn()
+        if turn is not None:
+            turn.request_stop("stage_advanced")
+        return {
+            "requested": target,
+            "transition": "ADVANCED",
+            "granted": True,
+            "stage": project["stage"],
+            "gate": gate,
+            "diagnosed": diagnosed or [],
+        }
 
     def _log_stage_event(
         self,
@@ -1903,6 +1996,15 @@ class ResearchService:
             "status": node.get("status", "VALID"),
             **{k: v for k, v in node.items() if k not in ("id", "type", "label", "status")},
         }
+        if record["type"] == "Claim" and record.get("strength") is not None:
+            # Boundary validation (single ingestion point): a strength outside the canonical
+            # set is refused with a repair hint instead of being stored and silently
+            # dooming CLAIM_GATE later. Report-style high/medium/low are accepted, stored
+            # normalized.
+            norm = normalize_claim_strength(record["strength"])
+            if norm is None:
+                raise _claim_strength_error(record["strength"])
+            record["strength"] = norm
         graph["nodes"].append(record)
         self._save_graph(owner_id, project_id, graph)
         return {"node": record, "idempotent": False}
@@ -1965,6 +2067,11 @@ class ResearchService:
             raise ValueError(f"node not found: {node_id}")
         to_invalid = "status" in patch and patch["status"] == "INVALID"
         protected = {"id", "type"}
+        if target["type"] == "Claim" and "strength" in patch:
+            norm = normalize_claim_strength(patch["strength"])
+            if norm is None:
+                raise _claim_strength_error(patch["strength"])
+            patch = {**patch, "strength": norm}
         for key, value in patch.items():
             if key not in protected:
                 target[key] = value
@@ -2179,8 +2286,12 @@ class ResearchService:
     @staticmethod
     def _claim_checks(graph: dict) -> list[dict]:
         claims = [n for n in graph["nodes"] if n["type"] == "Claim"]
+        # Read-side normalization: strengths stored before the alias table existed (raw
+        # "high"/"medium") count as valid here, so legacy graphs are not held hostage by
+        # the vocabulary fix.
         ok = bool(claims) and all(
-            c.get("citations") and c.get("strength") in _ALLOWED_CLAIM_STRENGTH for c in claims
+            c.get("citations") and normalize_claim_strength(c.get("strength")) is not None
+            for c in claims
         )
         return [
             {
@@ -2193,11 +2304,26 @@ class ResearchService:
     @staticmethod
     def _quality_checks(project: dict) -> list[dict]:
         scorecard = project.get("scorecard") or []
+        if not scorecard:
+            # Nothing in the current toolset writes a scorecard, so "missing" is a
+            # provisioning gap, not agent misconduct: tagged ``diagnostic_only`` so
+            # progressive diagnostics and review notes can tell it apart from a real
+            # scorecard FAIL. Strict blocking semantics are unchanged (ok stays False).
+            return [
+                {
+                    "name": "scorecard",
+                    "ok": False,
+                    "severity": "diagnostic_only",
+                    "detail": "scorecard_missing: no scorecard has been recorded for this "
+                    "project (the >=7-rows / no-fatal bar cannot be evaluated)",
+                }
+            ]
         ok = len(scorecard) >= 7 and not any(row.get("fatal") for row in scorecard)
         return [
             {
                 "name": "scorecard",
                 "ok": ok,
+                "severity": "blocking",
                 "detail": "scorecard has >=7 rows and no fatal finding",
             }
         ]
@@ -3540,6 +3666,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             return svc.transition_stage(
                 user(), _project_id(args, "research_state", action),
                 target=_require(args, "target", "research_state", action),
+                expected_current_stage=args.get("expected_current_stage"),
             )
         if action == "get_handoff":
             return svc.get_handoff(user(), _project_id(args, "research_state", action))
@@ -3730,7 +3857,15 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
         ),
         parameters=_params(
             ["get_state", "transition_stage", "get_handoff"],
-            {"target": {"type": "string", "description": "Requested next stage."}},
+            {
+                "target": {"type": "string", "description": "Requested next stage."},
+                "expected_current_stage": {
+                    "type": "string",
+                    "description": "Optional CAS guard: the stage you believe the project is "
+                    "on. If it already moved, the transition returns CONFLICT instead of "
+                    "acting on stale state.",
+                },
+            },
             required=[],
         ),
         handler=_monitor_wrap("research_state", _state),
