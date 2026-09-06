@@ -61,6 +61,7 @@ from core.logger import reset_log_context, set_log_context
 from rag.query_cache import bump_corpus_version
 
 from apps.worker.rag_images import save_images, scan_embedded_images
+from apps.worker.tool_audit import install as install_tool_call_audit
 
 # Image-attribution sentinels inserted by ``extract_document_text(page_markers=True)`` (PDF
 # → ``[[PAGE:n]]``, DOCX → ``[[PARA:n]]``). The annotator below strips them from stored
@@ -1205,6 +1206,10 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
             # _research_visible_tools). kernel.run exposes neither tools= nor turn=, so the
             # composition lives here; loop._ensure_turn keeps the provided turn as-is.
             kernel = get_agent_kernel()
+            # P0 observability (Phase 2B): one "tool-call-detail" audit line per tool
+            # call via the runtime's pre-execute/result lifecycle hooks. Idempotent,
+            # execution-semantics-neutral — see apps/worker/tool_audit.py.
+            install_tool_call_audit(kernel)
             visible_tools = _research_visible_tools(kernel)
             context = {
                 "handoff": {

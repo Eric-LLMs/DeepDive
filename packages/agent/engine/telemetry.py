@@ -88,6 +88,10 @@ _PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
     "deepdive-chat": (0.15, 0.60),
+    # One-off catalog-gap entry (Phase 2B): qwen3.8-flash runs without a priced
+    # llm_models row, so every research turn costed as PRICING_UNKNOWN. Fallback-only —
+    # the Admin-Console catalog (injected as turn.pricing) stays authoritative.
+    "qwen3.8-flash": (0.05, 0.40),
 }
 
 # Model names already reported as PRICING_UNKNOWN (warn once per process per model, so a
