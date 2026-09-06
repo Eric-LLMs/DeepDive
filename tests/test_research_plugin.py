@@ -24,10 +24,18 @@ from core.infrastructure.request_context import set_request_user
 from core.infrastructure.web_fetch import MIN_FETCH_TEXT_CHARS
 
 from plugins.research.plugin import (
+    _ARTIFACT_ACTIONS,
+    _EVIDENCE_ACTIONS,
+    _GATE_ACTIONS,
     _GATE_NOTE_KEY,
     _GATES,
+    _PROJECT_ACTIONS,
     _REASON_LIMIT,
+    _RUN_ACTIONS,
+    _SCRAPE_ACTIONS,
+    _STATE_ACTIONS,
     ResearchService,
+    _unknown_action,
     compose_gate_review_note,
     register_research_plugins,
 )
@@ -251,24 +259,31 @@ class TestThreeLayerStorage:
 # ── 4. Graph lineage + STALE/INVALID cascade ──────────────────────────────────
 class TestGraphLineage:
     @staticmethod
-    async def _build_chain(runtime, pid):
+    def _service(env):
+        # link_edge / query_lineage are internal plumbing: they are no longer LLM-visible
+        # actions on research_evidence, so lineage fixtures drive the service directly —
+        # which is exactly how the batch-verify ingest and the gates use them internally.
+        return ResearchService(drive=env.drive, scratch_root=env.scratch)
+
+    @staticmethod
+    async def _build_chain(env, pid):
         # Canonical epistemic chain: Dataset -> Execution -> Result -> Evidence -> Claim.
         for nid, ntype in [("D", "Dataset"), ("EX", "Execution"), ("R", "Result"),
                            ("E", "Evidence"), ("C", "Claim")]:
-            await _run(runtime, "research_evidence", action="record_node", project_id=pid,
+            await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
                        node={"id": nid, "type": ntype, "label": nid})
+        svc = TestGraphLineage._service(env)
         for src, dst, kind in [
             ("EX", "D", "derived_from"),   # Execution is derived from the Dataset
             ("R", "EX", "derived_from"),   # Result is derived from the Execution
             ("R", "E", "supports"),        # Result supports the Evidence
             ("E", "C", "supports"),        # Evidence supports the Claim
         ]:
-            await _run(runtime, "research_evidence", action="link_edge", project_id=pid,
-                       src=src, dst=dst, kind=kind)
+            svc.link_edge(USER, pid, src=src, dst=dst, kind=kind)
 
     async def test_mutating_upstream_stale_cascades_downstream(self, env):
         pid = (await _create_project(env.runtime))["project_id"]
-        await self._build_chain(env.runtime, pid)
+        await self._build_chain(env, pid)
 
         mutated = await _run(env.runtime, "research_evidence", action="mutate_node",
                              project_id=pid, node_id="D",
@@ -277,41 +292,39 @@ class TestGraphLineage:
         for node in mutated["cascade"]:
             assert node != "D"
 
+        svc = self._service(env)
         statuses = {}
         for nid in ("D", "EX", "R", "E", "C"):
-            lineage = await _run(env.runtime, "research_evidence", action="query_lineage",
-                                 project_id=pid, node_id=nid)
+            lineage = svc.query_lineage(USER, pid, node_id=nid)
             statuses[nid] = lineage["node"]["status"]
         assert statuses == {"D": "VALID", "EX": "STALE", "R": "STALE", "E": "STALE", "C": "STALE"}
 
     async def test_invalidate_downstream_marks_invalid(self, env):
         pid = (await _create_project(env.runtime))["project_id"]
-        await self._build_chain(env.runtime, pid)
+        await self._build_chain(env, pid)
 
         invalidated = await _run(env.runtime, "research_evidence", action="invalidate_downstream",
                                  project_id=pid, node_id="D")
         assert sorted(invalidated["cascade"]) == ["C", "E", "EX", "R"]
 
-        d = await _run(env.runtime, "research_evidence", action="query_lineage",
-                       project_id=pid, node_id="D")
+        svc = self._service(env)
+        d = svc.query_lineage(USER, pid, node_id="D")
         assert d["node"]["status"] == "INVALID"
         # Method refuted / evidence overturned: downstream is INVALID, not just STALE.
         for nid in ("EX", "R", "E", "C"):
-            node = await _run(env.runtime, "research_evidence", action="query_lineage",
-                              project_id=pid, node_id=nid)
+            node = svc.query_lineage(USER, pid, node_id=nid)
             assert node["node"]["status"] == "INVALID"
 
     async def test_lineage_ancestors_and_descendants(self, env):
         pid = (await _create_project(env.runtime))["project_id"]
-        await self._build_chain(env.runtime, pid)
+        await self._build_chain(env, pid)
 
-        lineage = await _run(env.runtime, "research_evidence", action="query_lineage",
-                             project_id=pid, node_id="C")
+        svc = self._service(env)
+        lineage = svc.query_lineage(USER, pid, node_id="C")
         assert lineage["ancestors"] == ["D", "E", "EX", "R"]
         assert lineage["descendants"] == []
 
-        lineage = await _run(env.runtime, "research_evidence", action="query_lineage",
-                             project_id=pid, node_id="D")
+        lineage = svc.query_lineage(USER, pid, node_id="D")
         assert lineage["ancestors"] == []
         assert lineage["descendants"] == ["C", "E", "EX", "R"]
 
@@ -327,10 +340,11 @@ class TestGateOverride:
                    node={"id": "EV", "type": "Evidence", "label": "ev"})
         await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
                    node={"id": "CL", "type": "Claim", "label": "cl"})
-        await _run(env.runtime, "research_evidence", action="link_edge", project_id=pid,
-                   src="EV", dst="S", kind="depends_on")
-        await _run(env.runtime, "research_evidence", action="link_edge", project_id=pid,
-                   src="CL", dst="EV", kind="supports")
+        # Edges are internal plumbing (link_edge is hidden from the tool enum): the gate's
+        # graph checks read what the service writes, exactly as batch-verify writes it.
+        svc = ResearchService(drive=env.drive, scratch_root=env.scratch)
+        svc.link_edge(USER, pid, src="EV", dst="S", kind="depends_on")
+        svc.link_edge(USER, pid, src="CL", dst="EV", kind="supports")
 
         result = await _run(env.runtime, "research_gate", action="check",
                             project_id=pid, gate_name="EVIDENCE_GATE")
@@ -948,15 +962,14 @@ class TestWorkerArgResolution:
             await _run(env.runtime, "research_evidence", action="record_node",
                        node={"id": "S", "type": "Source", "label": "s",
                              "verification_status": "verified"})
-            await _run(env.runtime, "research_evidence", action="link_edge",
-                       src="S", dst="S", kind="supports")
             await _run(env.runtime, "research_artifact", action="write_scratch",
                        artifact_id="m.md", content="# m")
             # The writes actually landed on the bound project.
             state = await _run(env.runtime, "research_state", action="get_state")
             assert state["stage"] == "DISCOVER"
-            node = await _run(env.runtime, "research_evidence", action="query_lineage",
-                              node_id="S")
+            # Read-back via the service (query_lineage is internal-only, not a tool action).
+            node = ResearchService(drive=env.drive, scratch_root=env.scratch).query_lineage(
+                USER, pid, node_id="S")
             assert node["node"]["label"] == "s"
         finally:
             bind_turn(None)
@@ -966,12 +979,12 @@ class TestWorkerArgResolution:
         await self._bound(pid)
         try:
             for action_args, fragment in (
-                ({"action": "link_edge", "src": "S", "dst": "T"},
-                 "research_evidence link_edge is missing required argument 'kind'"),
-                ({"action": "query_lineage"},
-                 "research_evidence query_lineage is missing required argument 'node_id'"),
                 ({"action": "mutate_node", "node_id": "S"},
                  "research_evidence mutate_node is missing required argument 'patch'"),
+                ({"action": "invalidate_downstream"},
+                 "research_evidence invalidate_downstream is missing required argument 'node_id'"),
+                ({"action": "verify", "claim": {"id": "C"}},
+                 "research_evidence verify is missing required argument 'findings'"),
             ):
                 result = await env.runtime.execute(
                     ToolExecution(call_id=str(uuid.uuid4()), name="research_evidence",
@@ -1000,8 +1013,8 @@ class TestWorkerArgResolution:
         pid = (await _create_project(env.runtime))["project_id"]
         await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
                    node=json.dumps({"id": "S", "type": "Source", "label": "s"}))
-        node = await _run(env.runtime, "research_evidence", action="query_lineage",
-                          project_id=pid, node_id="S")
+        node = ResearchService(drive=env.drive, scratch_root=env.scratch).query_lineage(
+            USER, pid, node_id="S")
         assert node["node"]["type"] == "Source"
 
     async def test_record_node_without_id_reports_precise_error(self, env):
@@ -2130,3 +2143,138 @@ class TestBatchEvidence:
         assert result["status"] == "PASS"
         assert all(c["ok"] for c in result["checks"])
         svc.end_run(USER, task_id)
+
+
+# ── 12. Phase 2A action-space contract: enum discipline ──────────────────────
+# The auto-run's error mass came from an unconstrained action space: the model invented
+# verbs (read/get/status/inspect/lineage...) and hand-drove edge actions that verify
+# already writes. The contract under test: the LLM-facing enum is the ONLY legal action
+# space, every enum literal is named in the description, hidden means hidden-not-deleted
+# (the service paths stay), and any escape route yields a structured, self-repairing error.
+_TOOL_ACTIONS = {
+    "research_project": _PROJECT_ACTIONS,
+    "research_artifact": _ARTIFACT_ACTIONS,
+    "research_state": _STATE_ACTIONS,
+    "research_evidence": _EVIDENCE_ACTIONS,
+    "research_gate": _GATE_ACTIONS,
+    "research_run": _RUN_ACTIONS,
+    "research_scrape": _SCRAPE_ACTIONS,
+}
+
+
+class TestActionSpaceContract:
+    @staticmethod
+    def _schema(env, tool: str) -> dict:
+        return next(s for s in env.runtime.schemas() if s["name"] == tool)
+
+    def test_enum_mirrors_the_single_source_constants(self, env):
+        for tool, actions in _TOOL_ACTIONS.items():
+            enum = self._schema(env, tool)["parameters"]["properties"]["action"]["enum"]
+            assert enum == actions, tool  # exact list, exact order, no extras
+
+    def test_evidence_enum_hides_internal_actions_and_edge_properties(self, env):
+        props = self._schema(env, "research_evidence")["parameters"]["properties"]
+        assert "link_edge" not in props["action"]["enum"]
+        assert "query_lineage" not in props["action"]["enum"]
+        # The edge-only argument surface is gone too — no dangling src/dst/kind props.
+        assert "src" not in props and "dst" not in props and "kind" not in props
+
+    def test_every_enum_literal_is_named_in_the_description(self, env):
+        # The model must be able to pick a legal verb from the description alone; an enum
+        # value with no prose anchor is a hallucination magnet.
+        for tool, actions in _TOOL_ACTIONS.items():
+            desc = self._schema(env, tool)["description"]
+            assert "Supported actions" in desc, tool
+            for action in actions:
+                assert action in desc, f"{tool}: enum action {action!r} missing from description"
+
+    async def test_hidden_action_rejected_by_schema_with_allowed_list(self, env):
+        # Schema validation rejects before the handler runs, and the message lists the
+        # legal space without offering the hidden verb as an option.
+        pid = (await _create_project(env.runtime))["project_id"]
+        for hidden in ("link_edge", "query_lineage"):
+            result = await env.runtime.execute(
+                ToolExecution(
+                    call_id=str(uuid.uuid4()), name="research_evidence",
+                    arguments={"action": hidden, "project_id": pid, "node_id": "S"},
+                )
+            )
+            assert result.is_error is True, hidden
+            msg = result.error.message
+            assert "is not one of" in msg, msg
+            allowed_part = msg.split("is not one of", 1)[1]
+            for action in _EVIDENCE_ACTIONS:
+                assert action in allowed_part
+            assert hidden not in allowed_part
+
+    async def test_hallucinated_verb_rejected_before_handler(self, env):
+        # The historical T1 cluster: read / get / status / inspect / show / list / query.
+        pid = (await _create_project(env.runtime))["project_id"]
+        for verb in ("read", "get", "status", "inspect", "show", "list", "query"):
+            result = await env.runtime.execute(
+                ToolExecution(
+                    call_id=str(uuid.uuid4()), name="research_evidence",
+                    arguments={"action": verb, "project_id": pid},
+                )
+            )
+            assert result.is_error is True, verb
+            assert "is not one of" in result.error.message, verb
+
+    def test_unknown_action_fallback_is_machine_readable_json(self):
+        # The handler-level defensive net (reached only by internal callers bypassing the
+        # schema): one JSON payload a model can repair from in a single step.
+        err = _unknown_action("research_evidence", "inspect", _EVIDENCE_ACTIONS)
+        assert isinstance(err, ValueError)
+        assert json.loads(str(err)) == {
+            "error": "invalid_action",
+            "tool": "research_evidence",
+            "received": "inspect",
+            "allowed_actions": _EVIDENCE_ACTIONS,
+        }
+
+    async def test_verify_still_writes_edges_so_manual_linking_stays_unnecessary(self, env, monkeypatch):
+        # The functional reason link_edge is hidden: the batch-verify path writes the
+        # Source/Evidence nodes and edges itself — the visible action set is sufficient
+        # for the whole EVIDENCE stage.
+        svc, task_id = await self._new_task_and_fetch(env, monkeypatch)
+        out = svc.ingest_evidence(
+            USER, task_id, claim={"id": "claim:x"},
+            findings=[{"url": "https://good.example/recipe", "verdict": "supports"}],
+        )
+        assert out["verified_sources"] == ["https://good.example/recipe"]
+        graph = ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "graph.json", {"nodes": [], "edges": []}
+        )
+        assert sorted(e["kind"] for e in graph["edges"]) == ["depends_on", "supports"]
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=task_id, gate_name="EVIDENCE_GATE")
+        assert gate["status"] == "PASS"
+        svc.end_run(USER, task_id)
+
+    @staticmethod
+    async def _new_task_and_fetch(env, monkeypatch):
+        import plugins.research.plugin as rplugin
+        import httpx
+
+        svc = ResearchService(drive=env.drive, scratch_root=env.scratch)
+        created = await svc.create_task(USER, title="contract verify")
+        task_id = created["task_id"]
+        svc.begin_run(USER, task_id)
+        article = "<html><body>" + "".join(
+            f"<p>unique-fact sentence {i}: enough cleaned article text to clear the "
+            "usable floor for verification.</p>" for i in range(12)
+        ) + "</body></html>"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "good.example":
+                return httpx.Response(200, text=article)
+            return httpx.Response(404, text="nope")
+
+        monkeypatch.setattr(rplugin, "_FETCH_TRANSPORT_OVERRIDE", httpx.MockTransport(handler))
+        monkeypatch.setattr(
+            rplugin, "_FETCH_RESOLVER_OVERRIDE", lambda host: ["93.184.216.34"]
+        )
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=task_id,
+                   node={"id": "claim:x", "type": "Claim", "label": "x"})
+        await svc.fetch_save_batch(USER, task_id, urls=["https://good.example/recipe"])
+        return svc, task_id

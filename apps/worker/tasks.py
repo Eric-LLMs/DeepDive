@@ -1062,6 +1062,38 @@ async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
     return await _run(ctx, job_id, work())
 
 
+def _research_visible_tools(kernel) -> list[dict]:
+    """The fixed, skill-scoped tool set for a research auto-run turn.
+
+    The interactive path lets the model mount tools via ``tool_search``; an unattended
+    auto-run must not browse its way to ``bash`` / ``read_file`` — every extra visible
+    schema is both a prompt-dilution tax and an action-space drift risk (the ReAct loop
+    spends one LLM call per attempt, and hallucinated tools burn whole turns). So the
+    worker passes an explicit ``tools=`` set built from ``deep_research``'s declared
+    ``allowed_tools`` — which ``loop._step_tools`` returns verbatim every step, giving
+    structural cross-step schema statics (prefix-cache friendly, drift-proof).
+
+    Order discipline (hard constraint): the list mirrors ``skill.allowed_tools`` in its
+    declared order with the ``skill`` loader appended LAST — never sorted or reshuffled,
+    so the tools array is byte-stable across runs. Schemas are single-sourced from
+    ``kernel.runtime.schemas()`` — nothing is hand-written or copied here. A missing
+    skill or unregistered tool fails the turn fast (RuntimeError → honest job failure)
+    rather than silently degrading the action space.
+    """
+    skill = kernel.skills.get("deep_research")
+    names = list(skill.allowed_tools) if skill else []
+    if not names:
+        raise RuntimeError(
+            "research auto-run needs the deep_research skill with declared allowed_tools"
+        )
+    names.append("skill")  # the loader itself, appended last — never reordered
+    found = {s["name"]: s for s in kernel.runtime.schemas()}
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise RuntimeError(f"research auto-run tools not registered: {missing}")
+    return [{"type": "function", "function": found[n]} for n in names]
+
+
 async def research_drive(ctx, job_id: str, payload: dict) -> dict:
     """Run one auto-continue worker turn of a Research OS task run (the T0 chain).
 
@@ -1164,20 +1196,37 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
         set_request_approval(ApprovalStore(get_approval_bridge().broker, user_id=str(user_id)))
 
         async def run_turn(prompt: str) -> RunTurnResult:
-            result = await get_agent_kernel().run(
+            # Compose the turn the way AgentKernel.run does — _build_turn (pricing pin,
+            # budget, audit sink, context bind) + workspace snapshot + loop.run — but with
+            # two research-auto-run additions: the deep_research skill is pre-activated
+            # (so its allowed_tools scope is live from step 0, closing the "callable before
+            # mount" hole), and the visible tool set is the fixed skill-scoped list (order
+            # locked to SKILL.md, schemas single-sourced from the runtime; see
+            # _research_visible_tools). kernel.run exposes neither tools= nor turn=, so the
+            # composition lives here; loop._ensure_turn keeps the provided turn as-is.
+            kernel = get_agent_kernel()
+            visible_tools = _research_visible_tools(kernel)
+            context = {
+                "handoff": {
+                    "kind": "research",
+                    "project_id": task_id,
+                    "mode": "research_resume",
+                }
+            }
+            turn = kernel._build_turn(
+                prompt, history, None, None, model, base_url, api_key, None, context,
+            )
+            turn.activate_skill("deep_research")
+            await kernel._snapshot_workspace(turn)
+            result = await kernel.loop.run(
                 prompt,
-                history,
+                history=history,
                 session_memory=None,
                 model=model,
                 base_url=base_url,
                 api_key=api_key,
-                context={
-                    "handoff": {
-                        "kind": "research",
-                        "project_id": task_id,
-                        "mode": "research_resume",
-                    }
-                },
+                turn=turn,
+                tools=visible_tools,
                 max_steps=settings.research_driver_turn_max_steps,
             )
             return RunTurnResult(

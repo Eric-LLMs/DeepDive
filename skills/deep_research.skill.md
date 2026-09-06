@@ -36,6 +36,39 @@ A transition that reports `transition: "ADVANCED"` has committed and **ends the 
 automatically — the next turn opens at the new stage, so after a successful transition, do not
 re-do the previous stage's collection or verification work.
 
+## Tool contract
+
+Every `research_*` tool takes an `action` argument pinned to a fixed enum — use ONLY the
+literal verbs listed below; anything else is rejected before it reaches the handler. The
+tool schema's `Supported actions` / `Constraints` text is the authority; this section is
+the at-a-glance map.
+
+| Tool | Actions (the complete legal set) |
+|---|---|
+| `research_project` | `create` · `resume` · `snapshot` · `archive` |
+| `research_artifact` | `write_scratch` · `promote_to_drive` · `read` · `create_version` · `diff` |
+| `research_state` | `get_state` · `get_handoff` · `transition_stage` |
+| `research_evidence` | `record_node` · `mutate_node` · `invalidate_downstream` · `verify` |
+| `research_gate` | `check` · `explain_failure` · `request_override` · `resolve_override` |
+| `research_run` | `record_execution` · `finish_execution` · `execute_sandbox_script` |
+| `research_scrape` | `save_scrape` · `fetch` · `read` |
+
+Hard boundaries:
+
+- **No manual graph edges.** There is no link / edge / lineage action — `verify` writes
+  Sources/Evidence nodes and claim edges itself. Do not invent verbs like `list`, `get`,
+  `status`, `show`, `inspect`, `query`, `add_node`, `lineage`, `transitions` — none exist.
+- **`bash` / `read_file` / `tool_search` do not exist in this workflow.** Never attempt
+  them; your tools are already mounted and listed above. There is nothing to search for,
+  nothing to shell out to, and scratch files are read only through `research_scrape read` /
+  `research_artifact read`.
+- **Batch per claim, not per source.** One `research_scrape fetch` (≤3 URLs) then one
+  `research_evidence verify` per claim; one `write_scratch` with the full text per artifact
+  (it auto-versions — do not stream incremental writes).
+- **One `get_handoff` before each `transition_stage`**, and `ADVANCED` ends the turn —
+  never re-issue a transition for a stage you already left, and never call
+  `query`-style discovery loops on `research_state` (`get_state` already returns the stage).
+
 ## Steps
 
 1. **Clarify and plan.** Restate the question precisely; if it embeds a false premise,

@@ -3491,6 +3491,19 @@ _COMMON_OBJ = {
 }
 
 
+# The LLM-facing action enum per tool. This is the *visible* action space: it mirrors the
+# handler branches the model may drive. ``research_evidence`` deliberately omits
+# ``link_edge`` / ``query_lineage`` — edges are written by ``verify`` itself and lineage is
+# internal plumbing; their handler branches and service methods stay for internal callers.
+_PROJECT_ACTIONS = ["create", "resume", "snapshot", "archive"]
+_ARTIFACT_ACTIONS = ["write_scratch", "promote_to_drive", "read", "create_version", "diff"]
+_STATE_ACTIONS = ["get_state", "transition_stage", "get_handoff"]
+_EVIDENCE_ACTIONS = ["record_node", "mutate_node", "invalidate_downstream", "verify"]
+_GATE_ACTIONS = ["check", "explain_failure", "request_override", "resolve_override"]
+_RUN_ACTIONS = ["record_execution", "finish_execution", "execute_sandbox_script"]
+_SCRAPE_ACTIONS = ["save_scrape", "fetch", "read"]
+
+
 def _params(actions: list[str], extra: dict, required: list[str]) -> dict:
     """Build a research tool's argument schema with ``action`` pinned to its valid set.
 
@@ -3511,6 +3524,25 @@ def _params(actions: list[str], extra: dict, required: list[str]) -> dict:
         **extra,
     }
     return {"type": "object", "properties": props, "required": ["action", *required]}
+
+
+def _unknown_action(tool: str, action: str, allowed_actions: list[str]) -> ValueError:
+    """Structured fallback error for an action that no handler branch implements.
+
+    Schema validation already rejects out-of-enum actions before the handler runs, so this
+    is a *defensive* net (e.g. an internal caller bypassing the schema). The payload is
+    machine-readable JSON so a model that lands here repairs in one shot instead of
+    guessing at free-form prose.
+    """
+    return ValueError(json.dumps(
+        {
+            "error": "invalid_action",
+            "tool": tool,
+            "received": action,
+            "allowed_actions": allowed_actions,
+        },
+        ensure_ascii=False,
+    ))
 
 
 def build_research_plugin(ctx: Any | None = None) -> Plugin:
@@ -3617,7 +3649,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             if action == "snapshot":
                 return svc.snapshot_project(user(), project_id)
             return svc.archive_project(user(), project_id)
-        raise ValueError(f"unknown research_project action: {action}")
+        raise _unknown_action("research_project", action, _PROJECT_ACTIONS)
 
     async def _artifact(args: dict, exec: ToolExecution) -> dict:
         svc = service()
@@ -3655,7 +3687,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 from_version=_require(args, "from_version", "research_artifact", action),
                 to_version=_require(args, "to_version", "research_artifact", action),
             )
-        raise ValueError(f"unknown research_artifact action: {action}")
+        raise _unknown_action("research_artifact", action, _ARTIFACT_ACTIONS)
 
     async def _state(args: dict, exec: ToolExecution) -> dict:
         svc = service()
@@ -3670,7 +3702,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             )
         if action == "get_handoff":
             return svc.get_handoff(user(), _project_id(args, "research_state", action))
-        raise ValueError(f"unknown research_state action: {action}")
+        raise _unknown_action("research_state", action, _STATE_ACTIONS)
 
     async def _evidence(args: dict, exec: ToolExecution) -> dict:
         svc = service()
@@ -3709,7 +3741,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 claim=_require(args, "claim", "research_evidence", action),
                 findings=_require(args, "findings", "research_evidence", action),
             )
-        raise ValueError(f"unknown research_evidence action: {action}")
+        raise _unknown_action("research_evidence", action, _EVIDENCE_ACTIONS)
 
     async def _gate(args: dict, exec: ToolExecution) -> dict:
         svc = service()
@@ -3735,7 +3767,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 user(), _require(args, "approval_id", "research_gate", action),
                 approve=args.get("approve", True),
             )
-        raise ValueError(f"unknown research_gate action: {action}")
+        raise _unknown_action("research_gate", action, _GATE_ACTIONS)
 
     async def _run(args: dict, exec: ToolExecution) -> dict:
         svc = service()
@@ -3757,7 +3789,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 user(), _project_id(args, "research_run", action),
                 script=_require(args, "script", "research_run", action),
             )
-        raise ValueError(f"unknown research_run action: {action}")
+        raise _unknown_action("research_run", action, _RUN_ACTIONS)
 
     async def _scrape(args: dict, exec: ToolExecution) -> dict:
         svc = service()
@@ -3794,17 +3826,23 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 asset_id=args.get("asset_id"),
                 name=args.get("name"),
             )
-        raise ValueError(f"unknown research_scrape action: {action}")
+        raise _unknown_action("research_scrape", action, _SCRAPE_ACTIONS)
 
     research_project_tool = _make_tool(
         name="research_project",
         description=(
-            "Create / resume / snapshot / archive a ResearchProject. Projects are the "
-            "tenant-scoped container for a research OS workflow (state machine in "
-            "docs/research/07)."
+            "ResearchProject container: the tenant-scoped workspace for one Research OS "
+            "workflow (state machine in docs/research/07). "
+            "Supported actions: create (new project), resume (reopen an existing project), "
+            "snapshot (point-in-time copy incl. recorded diagnostics), archive (retire a "
+            "project). "
+            "Constraints: 'create' requires 'name'; 'execution_mode' ('strict' default | "
+            "'progressive') is LOCKED at creation and cannot change afterwards; "
+            "resume/snapshot/archive need 'project_id' (auto-bound by the research handoff). "
+            "Never create a second project for an existing task — resume it."
         ),
         parameters=_params(
-            ["create", "resume", "snapshot", "archive"],
+            _PROJECT_ACTIONS,
             {
                 "name": {"type": "string", "description": "Project display name."},
                 "profile": {
@@ -3828,12 +3866,19 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
     research_artifact_tool = _make_tool(
         name="research_artifact",
         description=(
-            "Write scratch content, promote to the cloud drive (folder research/<project_id>), "
-            "version, read, and diff a ResearchArtifact. Promotion marks the drive asset "
-            "RAG_PENDING, triggering the RAG projection worker."
+            "ResearchArtifact IO: scratch-first authoring with explicit drive promotion. "
+            "Supported actions: write_scratch (author content in the scratch workspace), "
+            "promote_to_drive (publish an artifact to the cloud drive — marks the asset "
+            "RAG_PENDING so the projection worker indexes it; promotion is the ONLY path "
+            "into the knowledge base), read (fetch a version's content), create_version "
+            "(append a new version, e.g. to fix a draft), diff (compare two versions). "
+            "Constraints: write_scratch takes the FULL text in ONE call and auto-versions — "
+            "do not call it repeatedly for incremental edits; 'artifact_id' is required for "
+            "write/promote/read/create_version/diff; 'version' is optional on read (latest "
+            "when omitted)."
         ),
         parameters=_params(
-            ["write_scratch", "promote_to_drive", "read", "create_version", "diff"],
+            _ARTIFACT_ACTIONS,
             {
                 "generated_by_execution": {
                     "type": "string",
@@ -3851,12 +3896,21 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
     research_state_tool = _make_tool(
         name="research_state",
         description=(
-            "Read the project state machine, request a stage transition, and inspect the "
-            "handoff. Transitions are legal-transition-only: the state machine rejects "
-            "illegal jumps and un-passed gate guards."
+            "State-machine access: where the project is and where it may legally go next. "
+            "Supported actions: get_state (current stage + metadata), get_handoff (the "
+            "next-turn briefing: stage, pending gates, open work), transition_stage (advance "
+            "to the single legal next stage). "
+            "Constraints: call get_handoff BEFORE every transition_stage — it lists what the "
+            "next move requires; transition_stage requires 'target' and 'expected_current_stage' "
+            "is an optional CAS guard. transition_stage returns one of seven outcomes: "
+            "ADVANCED (committed — this ENDS your turn; never re-do the old stage's work), "
+            "ALREADY_AT_TARGET (benign no-op), NOT_READY (gate never checked), GATE_BLOCKED "
+            "(strict mode, check/repair the gate — never bypass here), CONFLICT (stage moved "
+            "concurrently), ILLEGAL (not the single legal next stage), ERROR. "
+            "Legal-transition-only: jumps and skips are rejected."
         ),
         parameters=_params(
-            ["get_state", "transition_stage", "get_handoff"],
+            _STATE_ACTIONS,
             {
                 "target": {"type": "string", "description": "Requested next stage."},
                 "expected_current_stage": {
@@ -3875,15 +3929,24 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
     research_evidence_tool = _make_tool(
         name="research_evidence",
         description=(
-            "Record graph nodes and edges, query lineage, bulk-verify one Claim's fetched "
-            "findings, and invalidate downstream nodes. Mutating an upstream node "
-            "STALE-cascades to its epistemic dependents. 'verify' is the batch-EVIDENCE "
-            "ingest: pass the recorded claim + your findings after research_scrape fetch; "
-            "the service writes Sources/Evidence/edges idempotently and only for URLs whose "
-            "content it itself fetched this run."
+            "Evidence-graph writes, batch verification, and staleness cascade. "
+            "Supported actions: record_node (insert/update a graph node), mutate_node (patch "
+            "a recorded node — mutating an upstream node STALE-cascades to its epistemic "
+            "dependents), invalidate_downstream (mark a node's dependents INVALID), verify "
+            "(batch-EVIDENCE ingest for ONE claim). "
+            "Constraints: there is NO manual edge action — 'verify' writes Source/Evidence "
+            "nodes and claim edges itself, idempotently; do not try to link or query lineage "
+            "by hand. 'record_node' is idempotent by node['id']; a Claim's 'strength' uses "
+            "the canonical vocabulary asserted|supported|confident|contested (report-style "
+            "high/medium/low are normalized). 'verify' requires claim{id} of an "
+            "already-recorded claim (it never creates or edits the claim) plus "
+            "findings[{url, verdict: supports|contradicts|neutral}]; only URLs this run's "
+            "server-side fetch ledger (research_scrape fetch) confirms were fetched-ok and "
+            "usable become edges — your own content_status/length assertions carry no "
+            "authority."
         ),
         parameters=_params(
-            ["record_node", "link_edge", "query_lineage", "mutate_node", "invalidate_downstream", "verify"],
+            _EVIDENCE_ACTIONS,
             {
                 "node": {
                     "type": "object",
@@ -3892,13 +3955,6 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 "patch": {
                     "type": "object",
                     "description": "Node mutation fields (e.g. {status: 'INVALID'}).",
-                },
-                "src": {"type": "string", "description": "Edge source node id."},
-                "dst": {"type": "string", "description": "Edge destination node id."},
-                "kind": {
-                    "type": "string",
-                    "description": "Edge kind: derived_from / generated_by / depends_on / "
-                    "supports / cites / tests / invalidates / ...",
                 },
                 "claim": {
                     "type": "object",
@@ -3922,12 +3978,18 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
     research_gate_tool = _make_tool(
         name="research_gate",
         description=(
-            "Check a gate, explain a failure, or request/resolve a human override. Checks are "
-            "deterministic; an override always spawns a PENDING ResearchApproval that only a "
-            "human can resolve (never self-approve)."
+            "Quality gates: deterministic checks and the human-override ladder. "
+            "Supported actions: check (evaluate a gate — deterministic, never a judgment "
+            "call), explain_failure (item-by-item reasons for a failed gate), "
+            "request_override (ask a human to waive a failed strict-mode gate), "
+            "resolve_override (the human verdict path). "
+            "Constraints: 'check', 'explain_failure' and 'request_override' require "
+            "'gate_name'; an override spawns a PENDING ResearchApproval that only a human "
+            "resolves — the agent must NEVER self-resolve its own override; always carry a "
+            "'reason' for review."
         ),
         parameters=_params(
-            ["check", "explain_failure", "request_override", "resolve_override"],
+            _GATE_ACTIONS,
             {
                 "reason": {"type": "string", "description": "Override justification (human review)."},
                 "approval_id": {"type": "string", "description": "Approval id to resolve."},
@@ -3945,11 +4007,16 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
     research_run_tool = _make_tool(
         name="research_run",
         description=(
-            "Record (and finish) an immutable ResearchExecution audit row, or execute a "
-            "sandbox script. Sandbox execution is profile-gated; the literature profile blocks it."
+            "Execution audit ledger and sandbox dispatch. "
+            "Supported actions: record_execution (open an immutable ResearchExecution audit "
+            "row for a tool call), finish_execution (close a row with its result), "
+            "execute_sandbox_script (run generated code in the sandbox). "
+            "Constraints: record/finish complete the provenance trail for substantive "
+            "synthesis work; 'execute_sandbox_script' is profile-gated — only 'empirical' / "
+            "'mixed' projects run code; a 'literature' project's call returns blocked."
         ),
         parameters=_params(
-            ["record_execution", "finish_execution", "execute_sandbox_script"],
+            _RUN_ACTIONS,
             {
                 "tool": {"type": "string", "description": "Tool name being audited."},
                 "args": {"type": "object", "description": "Execution arguments."},
@@ -3966,15 +4033,22 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
     research_scrape_tool = _make_tool(
         name="research_scrape",
         description=(
-            "Research source capture. 'save_scrape' files a retrieved page's raw content "
-            "under `temp/vN/scrape/`. 'fetch' real-fetches ≤3 URLs concurrently, cleans each "
-            "page to core text, persists usable drafts, and returns snippets (batch "
-            "EVIDENCE — call it per claim, THEN verify). 'read' reads back a full draft this "
-            "run fetched (address it by canonical_url / asset_id / name) when you need the "
-            "whole page to cite in WRITE. All silent: nothing is printed or announced."
+            "Research source capture. All actions are silent: nothing is announced or "
+            "printed per call. "
+            "Supported actions: save_scrape (file a retrieved page's raw content under "
+            "`temp/vN/scrape/`), fetch (server-side real-fetch of a claim's source URLs — "
+            "concurrent, SSRF-guarded, cleaned to core text, recorded in this run's "
+            "fetch ledger, snippets returned), read (read back a full draft this run "
+            "fetched). "
+            "Constraints: save_scrape requires 'source', 'query' and 'content' ('url' "
+            "optional); content must be extracted text/markdown, never raw JSON. 'fetch' "
+            "takes 'urls' with a HARD cap of 3 per call — more is rejected as a parameter "
+            "error, so batch a claim's sources in groups of ≤3; call it per claim THEN "
+            "research_evidence verify; a URL whose fetch failed can never be verified. "
+            "'read' addresses only pages this run fetched (canonical_url / asset_id / name)."
         ),
         parameters=_params(
-            ["save_scrape", "fetch", "read"],
+            _SCRAPE_ACTIONS,
             {
                 "source": {
                     "type": "string",
