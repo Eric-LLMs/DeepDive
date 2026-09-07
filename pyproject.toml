@@ -86,6 +86,7 @@ packages = [
     "packages/agent",
     "packages/rag",
     "packages/core",
+    "packages/workflow",
     "packages/shared/proto/retrieval",
     "apps/api",
 ]
