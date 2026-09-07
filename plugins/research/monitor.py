@@ -35,6 +35,7 @@ MUTATING_ACTIONS: dict[str, set[str]] = {
         "mutate_node",
         "invalidate_downstream",
         "verify",
+        "verify_batch",  # P3-1: same user-visible graph commit as verify -> same wake-up
     },
     "research_gate": {"check", "explain_failure", "request_override", "resolve_override"},
     "research_run": set(),

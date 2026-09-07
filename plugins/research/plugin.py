@@ -56,6 +56,11 @@ from core.infrastructure.web_fetch import (
 from core.infrastructure.web_fetch import (
     canonical_url as canonicalize,
 )
+from plugins.research.batch import (
+    compute_pending,
+    evidence_fingerprint,
+    gate_ok as _batch_gate_ok,
+)
 
 # Fetch transport/resolver overrides — production runs with the real network (None); unit
 # tests patch these globals to a MockTransport + stub resolver so nothing is hit offline.
@@ -385,6 +390,32 @@ class ResearchService:
         return json.loads(path.read_text(encoding="utf-8"))
 
     @staticmethod
+    def _dump_tmp(path: Path, data: Any) -> Path:
+        """Serialize ``data`` durably into ``<path>.tmp`` (fsync'd) and return the tmp path.
+
+        Split out of :meth:`_save_json` so :meth:`_txn_write` can stage *every* payload of a
+        multi-file commit before any ``os.replace`` makes one visible (all-or-nothing).
+        """
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+            fh.flush()
+            os.fsync(fh.fileno())
+        return tmp
+
+    @staticmethod
+    def _fsync_dir(directory: Path) -> None:
+        """Best-effort directory fsync (rename durability); a no-op on Windows."""
+        try:
+            dir_fd = os.open(directory, os.O_DIRECTORY)  # type: ignore[attr-defined]
+        except (AttributeError, OSError):
+            return  # Windows / non-posix: no directory fd to fsync
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    @staticmethod
     def _save_json(path: Path, data: Any) -> None:
         """Durably persist ``data``: write ``.tmp`` -> ``fsync`` -> ``os.replace``.
 
@@ -394,20 +425,28 @@ class ResearchService:
         (it needs ``O_DIRECTORY``, which Windows lacks).
         """
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8", newline="") as fh:
-            fh.write(json.dumps(data, indent=2, ensure_ascii=False, default=str))
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        try:
-            dir_fd = os.open(path.parent, os.O_DIRECTORY)  # type: ignore[attr-defined]
-        except (AttributeError, OSError):
-            return  # Windows / non-posix: no directory fd to fsync
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        os.replace(ResearchService._dump_tmp(path, data), path)
+        ResearchService._fsync_dir(path.parent)
+
+    def _txn_write(self, saves: list[tuple[Path, Any]]) -> None:
+        """Commit several JSON files as ONE all-or-nothing visible transaction (P3-1 c5).
+
+        Protocol: stage *every* payload into its ``.tmp`` (fsync) BEFORE performing *any*
+        ``os.replace``. If staging any tmp fails, no replace has run — the on-disk set is
+        untouched (the caller's lock guarantees no interleaved writer). Because
+        ``os.replace`` is atomic per file, the only crash window is *between* replaces, so
+        callers pass auxiliary files first and the revision-bearing file (``project.json``)
+        LAST: a half-applied commit can then never present a mutated graph under an
+        un-bumped revision.
+        """
+        staged: list[tuple[Path, Path]] = []
+        for path, data in saves:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            staged.append((path, self._dump_tmp(path, data)))
+        for path, tmp in staged:
+            os.replace(tmp, path)
+        for path, _tmp in staged:
+            self._fsync_dir(path.parent)
 
     def _load_project(self, owner_id: uuid.UUID, project_id: str) -> dict:
         path = self._project_dir(owner_id, project_id) / "project.json"
@@ -437,6 +476,7 @@ class ResearchService:
         mutate_fn,
         *,
         expected_revision: int | None = None,
+        extra_files: list[str] | None = None,
     ) -> dict:
         """Atomically mutate an existing task's ``project.json`` (single-writer primitive).
 
@@ -446,6 +486,17 @@ class ResearchService:
         re-read fresh, CAS-verified against ``expected_revision`` (when given), mutated by
         ``mutate_fn``, stamped with a new monotonic ``project_revision``, and durably
         persisted (``.tmp`` -> ``fsync`` -> ``os.replace``).
+
+        ``extra_files`` (P3-1): sibling files in the same project dir (e.g.
+        ``["graph.json"]``) that must commit *together* with ``project.json`` as one
+        transaction. Each is loaded fresh inside the lock and handed to
+        ``mutate_fn(project, extras)`` as a ``name -> value`` dict (``None`` when the file
+        does not exist yet — the mutation owns the default). The commit goes through
+        :meth:`_txn_write` with the extras replaced FIRST and ``project.json`` LAST, so a
+        crash can never expose a mutated graph under an un-bumped revision (constraint 5).
+        A ``mutate_fn`` that returns ``False`` signals "nothing changed": NOTHING is
+        written and the revision is NOT bumped (transaction-level idempotency,
+        constraint 6) — the caller still receives the current project dict.
 
         Raises:
             ValueError: the project does not exist.
@@ -478,10 +529,24 @@ class ResearchService:
                         f"project {project_id} revision changed: expected {expected_revision}, "
                         f"got {project.get('project_revision', 0)}"
                     )
-                mutate_fn(project)
-                project["updated_at"] = _now_iso()
-                project["project_revision"] = project.get("project_revision", 0) + 1
-                self._save_json(path, project)
+                if extra_files is not None:
+                    extras = {
+                        name: self._load_json(project_dir / name, None)
+                        for name in extra_files
+                    }
+                    if mutate_fn(project, extras) is False:
+                        return dict(project)  # no-op replay: zero writes, zero bump
+                    project["updated_at"] = _now_iso()
+                    project["project_revision"] = project.get("project_revision", 0) + 1
+                    self._txn_write(
+                        [(project_dir / name, extras[name]) for name in extra_files]
+                        + [(path, project)]  # revision-bearing file replaced LAST
+                    )
+                else:
+                    mutate_fn(project)
+                    project["updated_at"] = _now_iso()
+                    project["project_revision"] = project.get("project_revision", 0) + 1
+                    self._save_json(path, project)
         except portalocker.exceptions.AlreadyLocked as exc:
             raise ProjectLockError(
                 f"could not lock project {project_id} within {_PROJECT_LOCK_TIMEOUT:.0f}s"
@@ -1790,23 +1855,34 @@ class ResearchService:
             "gates": project["gates"],
         }
         # P1-C: a tiny Claim digest so a fresh (auto) turn can SEE the claims an
-        # earlier turn already recorded — cross-turn context is cleared, and no other
+        # earlier turn already recorded — cross-turn context is cleared and no other
         # action lists node ids, which is what let a shadow k*-set be minted in
         # EVIDENCE. ``id`` is the sole identity anchor; ``label`` (first 80 chars) is
         # display-only semantic context, and ``anchored`` mirrors the CLAIM_GATE
         # predicate (has citations) so the model can tell "reuse + verify/mutate" from
-        # "create the missing ones". Conditional emission: with no claims the payload is
-        # old contract. Never a full graph dump.
+        # "create the missing ones". P3-1: ``evidence_fingerprint`` + ``pending`` extend
+        # the same digest with the delta-pending verdict (batch.py constraint-2 rule read
+        # against this run's ``_verify_fps`` baseline) so a fresh turn can skip
+        # already-committed claims BEFORE issuing verify_batch work. Conditional
+        # emission: with no claims the payload is the old contract. Never a full graph
+        # dump.
         graph = self._load_graph(owner_id, project_id)
-        claims = [
-            {
+        stored_fps = ResearchService._assets_ledger(project).get("_verify_fps")
+        if not isinstance(stored_fps, dict):
+            stored_fps = {}
+        claims = []
+        for n in graph["nodes"]:
+            if n.get("type") != "Claim":
+                continue
+            fp = evidence_fingerprint(graph, n["id"])
+            claims.append({
                 "id": n["id"],
                 "label": (n.get("label") or "")[:80],
                 "anchored": bool(n.get("citations")),
-            }
-            for n in graph["nodes"]
-            if n.get("type") == "Claim"
-        ]
+                "evidence_fingerprint": fp,
+                "pending": compute_pending(stored_fps.get(n["id"]), fp,
+                                           _batch_gate_ok(n, normalize_claim_strength)),
+            })
         if claims:
             out["claims"] = claims
         return out
@@ -3230,6 +3306,35 @@ class ResearchService:
             )
         claim_label = claim_node.get("label") or claim_id
         prov = self._fetch_provenance(project)
+        out = self._apply_findings(graph, claim_id, claim_label, prov, findings)
+        if out["changed"]:
+            self._save_graph(owner_id, project_id, graph)
+        return {
+            "claim_id": claim_id,
+            "nodes_added": out["nodes_added"],
+            "nodes_updated": out["nodes_updated"],
+            "edges_added": out["edges_added"],
+            "verified_sources": out["verified_sources"],
+            "rejected": out["rejected"],
+            "neutral_skipped": out["neutral_skipped"],
+        }
+
+    def _apply_findings(
+        self,
+        graph: dict,
+        claim_id: str,
+        claim_label: str,
+        prov: dict,
+        findings: list[dict],
+    ) -> dict:
+        """The shared E1/E2/E7 ingest core — the SINGLE business path of ``verify`` and
+        ``verify_batch`` (P3-1 constraints 7+8: batch ≡ sequential, never a copy).
+
+        Mutates ``graph`` in place and returns
+        ``{nodes_added, nodes_updated, edges_added, verified_sources, rejected,
+        neutral_skipped, changed}``. Extracted verbatim from :meth:`ingest_evidence`;
+        ``changed`` tells the caller whether a graph write is needed at all.
+        """
         nodes_by_id = {n["id"]: n for n in graph["nodes"]}
         edges = graph["edges"]
 
@@ -3379,14 +3484,175 @@ class ResearchService:
                     counts["nodes_updated"] += 1
                     changed = True
 
-        if changed:
-            self._save_graph(owner_id, project_id, graph)
         return {
-            "claim_id": claim_id,
             **counts,
             "verified_sources": verified_sources,
             "rejected": rejected,
             "neutral_skipped": neutral_skipped,
+            "changed": changed,
+        }
+
+    # Upper bound on claims committed per ``verify_batch`` call. Sized to one EVIDENCE
+    # stage's claim set (Run 7: 8) — big enough to fold the whole stage into one commit,
+    # small enough to keep the critical section and the LLM payload bounded.
+    _VERIFY_BATCH_MAX = 8
+
+    def verify_batch(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        batch: list[dict],
+    ) -> dict:
+        """Commit a batch of per-claim verifications in ONE atomic transaction (P3-1).
+
+        The deterministic (no-LLM, no-network — constraint 1) vertical slice behind
+        ``research_evidence action="verify_batch"``. Business semantics are *inherited*,
+        not reimplemented: each pending item runs the exact ``_apply_findings`` core that
+        single-claim ``verify`` uses (E1/E2/E7 + error classification, constraint 7), so
+        batch ≡ sequential final graph (constraint 8).
+
+        Delta-pending rule (constraint 2, frozen in ``plugins/research/batch.py``):
+        an item is skipped iff this run's stored ``_verify_fps`` baseline exists, the
+        claim passes the CLAIM_GATE predicate, and its ``evidence_fingerprint`` is
+        unchanged. A legacy single-``verify`` anchor (no baseline yet) is therefore
+        pending exactly once — the skipping call *stamps* the baseline, a pure
+        bookkeeping write, never a re-derivation.
+
+        Citations/strength are accepted as optional per-item patches and written in the
+        SAME commit (this is the "补齐 citations" single-write that kills the
+        verify→mutate double-anchor chain), subject to the same canonical-vocabulary
+        normalization as ``record_node``/``mutate_node``.
+
+        Commit protocol: the whole batch runs inside :meth:`atomic_update_project` with
+        ``extra_files=["graph.json"]`` — graph + project.json + revision + ``_verify_fps``
+        ledger become visible together or not at all (constraint 5). When every item is
+        skipped and no stamp is needed the mutation returns ``False``: zero writes, zero
+        revision bump (transaction-level idempotency, constraint 6). Structural
+        validation errors reject only the offending item (partial isolation) — the rest
+        of the batch still commits.
+        """
+        if not isinstance(batch, list) or not batch:
+            raise ValueError("verify_batch needs 'batch' as a non-empty list of items")
+        if len(batch) > self._VERIFY_BATCH_MAX:
+            raise ValueError(
+                f"verify_batch accepts at most {self._VERIFY_BATCH_MAX} items per call "
+                f"(got {len(batch)}); split the claims into batches of ≤{self._VERIFY_BATCH_MAX}"
+            )
+
+        meta: dict = {}
+
+        def _mutate(project: dict, extras: dict) -> Any:
+            graph = extras.get("graph.json")
+            if not isinstance(graph, dict) or not isinstance(graph.get("nodes"), list):
+                graph = {"nodes": [], "edges": []}
+            extras["graph.json"] = graph  # own the default so the txn writes a valid file
+            prov = self._fetch_provenance(project)
+            ledger = self._assets_ledger(project)
+            stored_fps = ledger.get("_verify_fps")
+            if not isinstance(stored_fps, dict):
+                stored_fps = {}
+            new_fps = dict(stored_fps)  # copy: the ledger changes only on a real commit
+
+            results: list[dict] = []
+            seen: set[str] = set()
+            dirty = False
+
+            for item in batch:
+                if not isinstance(item, dict):
+                    results.append({"status": "rejected", "reason": "batch item is not an object"})
+                    continue
+                item_id = item.get("item_id")
+                if not isinstance(item_id, str) or not item_id.strip():
+                    results.append({"status": "rejected", "reason": "batch item needs a non-empty 'item_id' string"})
+                    continue
+                item_id = item_id.strip()
+                if item_id in seen:
+                    results.append({"item_id": item_id, "status": "rejected", "reason": "duplicate item_id in batch"})
+                    continue
+                seen.add(item_id)
+                claim_id = (item.get("claim") or {}).get("id") if isinstance(item.get("claim"), dict) else None
+                if not isinstance(claim_id, str) or not claim_id.strip():
+                    results.append({"item_id": item_id, "status": "rejected", "reason": "verify_batch 'claim' must include the recorded claim's 'id'"})
+                    continue
+                claim_id = claim_id.strip()
+                findings = item.get("findings", [])
+                if not isinstance(findings, list):
+                    results.append({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
+                                    "reason": "verify_batch 'findings' must be a list"})
+                    continue
+                citations = item.get("citations")
+                if citations is not None and not isinstance(citations, list):
+                    results.append({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
+                                    "reason": "verify_batch 'citations' must be a list of strings"})
+                    continue
+                strength_raw = item.get("strength")
+                strength_norm: str | None = None
+                if strength_raw is not None:
+                    strength_norm = normalize_claim_strength(strength_raw)
+                    if strength_norm is None:
+                        results.append({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
+                                        "reason": str(_claim_strength_error(strength_raw))})
+                        continue
+
+                node = next((n for n in graph["nodes"] if n.get("id") == claim_id), None)
+                if node is None:  # E8 — the exact single-verify classification
+                    results.append({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
+                                    "reason": f"claim node not found: {claim_id!r} — verify does not create claims; "
+                                              "record it first with research_evidence record_node (type 'Claim')"})
+                    continue
+
+                current_fp = evidence_fingerprint(graph, claim_id)
+                stored = new_fps.get(claim_id)
+                gate = _batch_gate_ok(node, normalize_claim_strength)
+                if not compute_pending(stored, current_fp, gate):
+                    results.append({"item_id": item_id, "claim_id": claim_id, "status": "skipped_unchanged",
+                                    "pending": False, "evidence_fingerprint": current_fp})
+                    continue
+
+                out = self._apply_findings(graph, claim_id, node.get("label") or claim_id, prov, findings)
+                item_changed = out["changed"]
+                if citations is not None:
+                    node["citations"] = citations
+                    item_changed = True
+                if strength_norm is not None:
+                    node["strength"] = strength_norm
+                    item_changed = True
+                if citations is not None or strength_norm is not None:
+                    # Same epistemic-delta semantics as mutate_node (constraint 7/8): a
+                    # Claim patch STALE-cascades to its dependents through the one
+                    # shared _cascade — no parallel reimplementation.
+                    if self._cascade(graph, claim_id, to_invalid=False):
+                        item_changed = True
+                fp_after = evidence_fingerprint(graph, claim_id)
+                if item_changed or stored != fp_after:
+                    new_fps[claim_id] = fp_after
+                    dirty = True
+                results.append({
+                    "item_id": item_id, "claim_id": claim_id, "status": "applied",
+                    "pending": True, "changed": item_changed,
+                    "nodes_added": out["nodes_added"], "nodes_updated": out["nodes_updated"],
+                    "edges_added": out["edges_added"],
+                    "verified_sources": out["verified_sources"], "rejected": out["rejected"],
+                    "neutral_skipped": out["neutral_skipped"],
+                    "evidence_fingerprint": fp_after,
+                })
+
+            meta["revision_before"] = project.get("project_revision", 0)
+            meta["items"] = results
+            if not dirty:
+                return False  # all skipped with a live baseline: no file is written at all
+            ledger["_verify_fps"] = new_fps
+            extras["graph.json"] = graph
+            return None
+
+        project = self.atomic_update_project(
+            owner_id, project_id, _mutate, extra_files=["graph.json"],
+        )
+        return {
+            "items": meta.get("items", []),
+            "revision_before": meta.get("revision_before"),
+            "revision_after": project.get("project_revision"),
         }
 
     def record_execution(
@@ -3482,14 +3748,21 @@ def _make_tool(
     parameters: dict,
     handler: Any,
     permission: set[ToolPermission],
+    concurrency_safe: bool = False,
 ) -> Any:
+    # P3-1 constraint-1 flag mapping. The frozen loop decides parallelism PER TOOL
+    # (``_is_concurrency_safe`` reads the tool attribute; per-ACTION flags are impossible
+    # without touching packages/agent/engine/*), so a tool that mixes reads with
+    # unlocked read-modify-write commits on graph.json must be mapped conservatively:
+    # default False serializes every state-mutating research tool, while the pure
+    # network-I/O research_scrape (no scratch graph commit) opts in via ``True``.
     return define_tool(
         name=name,
         description=description,
         parameters=parameters,
         output=ToolOutput(schema={"type": "object"}, render=_render_json),
         execute=handler,
-        is_concurrency_safe=True,
+        is_concurrency_safe=concurrency_safe,
         permission=permission,
     )
 
@@ -3519,7 +3792,7 @@ _COMMON_OBJ = {
 _PROJECT_ACTIONS = ["create", "resume", "snapshot", "archive"]
 _ARTIFACT_ACTIONS = ["write_scratch", "promote_to_drive", "read", "create_version", "diff"]
 _STATE_ACTIONS = ["get_state", "transition_stage", "get_handoff"]
-_EVIDENCE_ACTIONS = ["record_node", "mutate_node", "invalidate_downstream", "verify"]
+_EVIDENCE_ACTIONS = ["record_node", "mutate_node", "invalidate_downstream", "verify", "verify_batch"]
 _GATE_ACTIONS = ["check", "explain_failure", "request_override", "resolve_override"]
 _RUN_ACTIONS = ["record_execution", "finish_execution", "execute_sandbox_script"]
 _SCRAPE_ACTIONS = ["save_scrape", "fetch", "read"]
@@ -3762,6 +4035,11 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 claim=_require(args, "claim", "research_evidence", action),
                 findings=_require(args, "findings", "research_evidence", action),
             )
+        if action == "verify_batch":
+            return svc.verify_batch(
+                user(), _project_id(args, "research_evidence", action),
+                batch=_require(args, "batch", "research_evidence", action),
+            )
         raise _unknown_action("research_evidence", action, _EVIDENCE_ACTIONS)
 
     async def _gate(args: dict, exec: ToolExecution) -> dict:
@@ -3959,7 +4237,11 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "Supported actions: record_node (insert/update a graph node), mutate_node (patch "
             "a recorded node — mutating an upstream node STALE-cascades to its epistemic "
             "dependents), invalidate_downstream (mark a node's dependents INVALID), verify "
-            "(batch-EVIDENCE ingest for ONE claim). "
+            "(batch-EVIDENCE ingest for ONE claim), verify_batch (the same ingest rules for "
+            "UP TO 8 claims committed in ONE atomic transaction — prefer it over one verify "
+            "per claim; claims whose stored evidence fingerprint is unchanged and already "
+            "anchored return skipped_unchanged with zero re-writing, and each item may "
+            "carry optional citations/strength patches written in the SAME commit). "
             "Constraints: there is NO manual edge action — 'verify' writes Source/Evidence "
             "nodes and claim edges itself, idempotently; do not try to link or query lineage "
             "by hand. 'record_node' is idempotent by node['id']; a Claim's 'strength' uses "
@@ -3993,6 +4275,15 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                     "source_label?, facts?: [str], excerpt?: str}]. The service checks each "
                     "URL against this run's server-side fetch ledger — your content_status/"
                     "length assertions carry no authority.",
+                },
+                "batch": {
+                    "type": "array",
+                    "description": "verify_batch: up to 8 items "
+                    "[{item_id: str, claim: {id}, findings: [same shape as verify], "
+                    "citations?: [str], strength?: asserted|supported|confident|contested}]. "
+                    "One atomic commit (single revision bump) for the whole batch; a "
+                    "structural error rejects only that item.",
+                    "items": {"type": "object"},
                 },
             },
             required=[],
@@ -4115,6 +4406,7 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
         ),
         handler=_scrape,
         permission={ToolPermission.READ, ToolPermission.WRITE},
+        concurrency_safe=True,  # pure fetch/save I/O — no scratch graph RMW (P3-1 flag map)
     )
 
     return Plugin(

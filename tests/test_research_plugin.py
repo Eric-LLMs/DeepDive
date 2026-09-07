@@ -2344,7 +2344,10 @@ class TestGetStateClaimsDigest:
         state = await _run(env.runtime, "research_state", action="get_state", project_id=pid)
         claims = state["claims"]
         assert [c["id"] for c in claims] == ["C1", "C2"]  # only Claims, in graph order
-        assert all(set(c) == {"id", "label", "anchored"} for c in claims)
+        # P3-1 additive contract: evidence_fingerprint + pending join the digest.
+        assert all(set(c) == {"id", "label", "anchored", "evidence_fingerprint", "pending"}
+                   for c in claims)
+        assert all(c["pending"] is True for c in claims)  # no _verify_fps baseline yet
         assert claims[0]["label"] == long_label[:80]  # display cap, not the identity
         assert claims[1]["label"] == "short claim"    # <=80 kept whole
         assert claims[0]["anchored"] is False and claims[1]["anchored"] is False
@@ -2360,3 +2363,258 @@ class TestGetStateClaimsDigest:
         state = await _run(env.runtime, "research_state", action="get_state", project_id=pid)
         anchored = {c["id"]: c["anchored"] for c in state["claims"]}
         assert anchored == {"C1": True, "C2": False}  # partial set: reuse C1, complete C2
+
+
+# ── 13. P3-1 verify_batch — atomic batch commit + delta-pending fingerprints ─────
+class _EvidenceHarness(TestBatchEvidence):
+    """Reuse of the EVIDENCE fixture helpers (underscore class — pytest never collects it,
+    so no parent test is duplicated)."""
+
+
+class TestVerifyBatchAtomic:
+    """The P3-1 vertical slice: N claims → ONE commit, delta-skips, all-or-nothing."""
+
+    @staticmethod
+    async def _setup(env, monkeypatch):
+        h = _EvidenceHarness()
+        svc, task_id = await h._new_task(env)
+        svc.begin_run(USER, task_id)
+        claim_id, cu = await h._claim_and_fetch_good(env, monkeypatch, task_id, claim_id="C1")
+        return h, svc, task_id, claim_id, cu
+
+    @staticmethod
+    def _mask_assets(graph: dict) -> dict:
+        """Strip per-run drive noise (Source.asset_id) — two tasks legitimately own
+        different drive objects; constraint 8 is about ingest semantics, not ids."""
+        g = json.loads(json.dumps(graph))
+        for n in g["nodes"]:
+            if n.get("type") == "Source":
+                n["asset_id"] = "*"
+        return g
+
+    async def test_batch_equals_sequential_final_graph(self, env, monkeypatch):
+        """Constraint 8: a batch commit leaves the byte-identical graph the legacy
+        verify→mutate double-chain produced — same shared ingest core, same cascade."""
+        h, svc, t_seq, cid, cu = await self._setup(env, monkeypatch)
+        findings = [{"url": cu, "verdict": "supports", "facts": ["tomatoes are fruit"],
+                     "excerpt": "the draft says so"}]
+        svc.ingest_evidence(USER, t_seq, claim={"id": cid}, findings=findings)
+        await _run(env.runtime, "research_evidence", action="mutate_node", project_id=t_seq,
+                   node_id="C1", patch={"citations": [cu], "strength": "supported"})
+        graph_seq = h._graph(env, t_seq)
+
+        h2, svc2, t_bat, _, cu2 = await self._setup(env, monkeypatch)
+        out = svc2.verify_batch(USER, t_bat, batch=[{
+            "item_id": "i1", "claim": {"id": "C1"}, "findings": findings,
+            "citations": [cu2], "strength": "supported",
+        }])
+        assert out["items"][0]["status"] == "applied"
+        assert out["revision_after"] == out["revision_before"] + 1  # ONE revision per batch
+        assert self._mask_assets(graph_seq) == self._mask_assets(h._graph(env, t_bat))
+
+    async def test_replay_skips_with_zero_write_and_no_revision_bump(self, env, monkeypatch):
+        """Constraint 6: transaction-level idempotency — a replay of the committed batch
+        touches no file and does NOT bump project_revision."""
+        h, svc, tid, _, cu = await self._setup(env, monkeypatch)
+        batch = [{"item_id": "i1", "claim": {"id": "C1"},
+                  "findings": [{"url": cu, "verdict": "supports", "facts": ["f"]}],
+                  "citations": [cu], "strength": "supported"}]
+        first = svc.verify_batch(USER, tid, batch=batch)
+        assert first["items"][0]["status"] == "applied"
+        graph1, proj1 = h._graph(env, tid), h._project(env, tid)
+
+        second = svc.verify_batch(USER, tid, batch=batch)
+        assert [i["status"] for i in second["items"]] == ["skipped_unchanged"]
+        assert second["items"][0]["pending"] is False
+        assert second["revision_after"] == second["revision_before"] == first["revision_after"]
+        assert h._graph(env, tid) == graph1
+        assert h._project(env, tid)["project_revision"] == proj1["project_revision"]
+
+    async def test_legacy_verify_anchor_is_pending_until_the_batch_stamps_it(self, env, monkeypatch):
+        """Constraint-2 legacy clause: single-verify anchoring never wrote a baseline, so
+        get_state reports pending=True; the first verify_batch call stamps the fp (the
+        stamping commit itself re-runs the shared core idempotently), replays then skip."""
+        h, svc, tid, cid, cu = await self._setup(env, monkeypatch)
+        svc.ingest_evidence(USER, tid, claim={"id": cid},
+                            findings=[{"url": cu, "verdict": "supports"}])
+        await _run(env.runtime, "research_evidence", action="mutate_node", project_id=tid,
+                   node_id="C1", patch={"citations": [cu], "strength": "supported"})
+        state = await _run(env.runtime, "research_state", action="get_state", project_id=tid)
+        c1 = state["claims"][0]
+        assert c1["anchored"] is True and c1["pending"] is True  # no _verify_fps baseline
+
+        out = svc.verify_batch(USER, tid, batch=[
+            {"item_id": "s", "claim": {"id": "C1"}, "findings": [], "citations": [cu]}])
+        assert out["items"][0]["status"] == "applied"  # the baseline-stamp commit
+        state2 = await _run(env.runtime, "research_state", action="get_state", project_id=tid)
+        assert state2["claims"][0]["pending"] is False
+        assert state2["claims"][0]["evidence_fingerprint"] == out["items"][0]["evidence_fingerprint"]
+        out2 = svc.verify_batch(USER, tid, batch=[
+            {"item_id": "s", "claim": {"id": "C1"}, "findings": [], "citations": [cu]}])
+        assert out2["items"][0]["status"] == "skipped_unchanged"
+        assert out2["revision_after"] == out2["revision_before"]
+
+    async def test_partial_validation_isolates_bad_items(self, env, monkeypatch):
+        """Structural/E8 failures reject ONLY the offending item; the valid ones still
+        commit in the same single transaction (single revision bump)."""
+        h, svc, tid, _, cu = await self._setup(env, monkeypatch)
+        out = svc.verify_batch(USER, tid, batch=[
+            "not-an-object",
+            {"item_id": "dup", "claim": {"id": "C1"}, "findings": []},
+            {"item_id": "dup", "claim": {"id": "C1"}, "findings": []},
+            {"claim": {"id": "C1"}, "findings": []},
+            {"item_id": "e8", "claim": {"id": "ghost"}, "findings": []},
+            {"item_id": "badstrength", "claim": {"id": "C1"}, "findings": [], "strength": "very-high"},
+            {"item_id": "ok", "claim": {"id": "C1"},
+             "findings": [{"url": cu, "verdict": "supports", "facts": ["f"]}],
+             "citations": [cu]},
+        ])
+        items = out["items"]
+        assert len(items) == 7  # one result per input, in input order
+        assert items[0]["status"] == "rejected" and "item_id" not in items[0]
+        assert items[1]["status"] == "applied"                      # first dup wins
+        assert items[2]["status"] == "rejected" and "duplicate item_id" in items[2]["reason"]
+        assert items[3]["status"] == "rejected" and "item_id" in items[3]["reason"]
+        assert items[4]["status"] == "rejected" and "claim node not found" in items[4]["reason"]
+        assert items[5]["status"] == "rejected" and "not valid" in items[5]["reason"]
+        assert items[6]["status"] == "applied"
+        assert out["revision_after"] == out["revision_before"] + 1  # ONE commit for all
+        graph = h._graph(env, tid)
+        assert next(n for n in graph["nodes"] if n["id"] == "C1")["citations"] == [cu]
+        assert any(n["type"] == "Evidence" for n in graph["nodes"])
+
+    async def test_batch_rejects_empty_and_oversize(self, env, monkeypatch):
+        h = _EvidenceHarness()
+        svc, tid = await h._new_task(env)
+        with pytest.raises(ValueError, match="non-empty"):
+            svc.verify_batch(USER, tid, batch=[])
+        with pytest.raises(ValueError, match="at most 8"):
+            svc.verify_batch(USER, tid, batch=[{"item_id": str(i)} for i in range(9)])
+
+    async def test_commit_failure_is_all_or_nothing(self, env, monkeypatch):
+        """Constraint 5: if staging the LAST tmp fails, NO os.replace ran — graph, project
+        and revision on disk are exactly the pre-call bytes (zero pollution)."""
+        h, svc, tid, _, cu = await self._setup(env, monkeypatch)
+        before_project, before_graph = h._project(env, tid), h._graph(env, tid)
+        orig = ResearchService._dump_tmp
+        calls: list[str] = []
+
+        def flaky(path, data):
+            calls.append(path.name)
+            if len(calls) == 2:  # graph.json staged, project.json staging dies
+                raise OSError("simulated disk failure on project.json")
+            return orig(path, data)
+
+        monkeypatch.setattr(ResearchService, "_dump_tmp", staticmethod(flaky))
+        with pytest.raises(OSError, match="simulated"):
+            svc.verify_batch(USER, tid, batch=[{
+                "item_id": "i1", "claim": {"id": "C1"},
+                "findings": [{"url": cu, "verdict": "supports"}], "citations": [cu]}])
+        assert calls == ["graph.json", "project.json"]
+        assert h._project(env, tid) == before_project
+        assert h._graph(env, tid) == before_graph
+
+    async def test_verify_batch_runtime_roundtrip(self, env, monkeypatch):
+        """Tool plumbing: the action enum accepts verify_batch, _require hands the batch
+        over, and the shared object output schema serializes the transactional result."""
+        h, svc, tid, _, cu = await self._setup(env, monkeypatch)
+        result = await env.runtime.execute(ToolExecution(
+            call_id=str(uuid.uuid4()), name="research_evidence",
+            arguments={"action": "verify_batch", "project_id": tid, "batch": [{
+                "item_id": "i1", "claim": {"id": "C1"},
+                "findings": [{"url": cu, "verdict": "supports"}], "citations": [cu]}]},
+        ))
+        assert result.is_error is False, getattr(result.error, "message", None)
+        assert result.value["items"][0]["status"] == "applied"
+        graph = h._graph(env, tid)
+        assert next(n for n in graph["nodes"] if n["id"] == "C1")["citations"] == [cu]
+        assert any(n["type"] == "Evidence" for n in graph["nodes"])
+
+    def test_concurrency_flags_serialize_writers_keep_scrape_parallel(self, env):
+        """P3-1 flag mapping: graph-committing tools default to False (the loop only
+        parallelizes tools flagged safe); pure-I/O research_scrape keeps True."""
+        flags = {t.name: t.is_concurrency_safe for t in env.runtime.all()}
+        assert flags["research_scrape"] is True
+        assert all(flags[n] is False for n in RESEARCH_TOOLS - {"research_scrape"})
+
+
+class TestP3Fingerprints:
+    """Pure-function contract of plugins/research/batch.py (no I/O — constraint 1)."""
+
+    @staticmethod
+    def _graph():
+        return {
+            "nodes": [
+                {"id": "C1", "type": "Claim", "label": "c", "citations": ["a"],
+                 "strength": "supported"},
+                {"id": "ev:a", "type": "Evidence", "source_url": "https://a",
+                 "verdict": "supports", "facts": ["f1"], "excerpt": "e1"},
+                {"id": "ev:b", "type": "Evidence", "source_url": "https://b",
+                 "verdict": "contradicts", "facts": ["f2"], "excerpt": "e2"},
+                {"id": "src:a", "type": "Source", "url": "https://a",
+                 "full_char_len": 1234, "content_status": "usable"},
+            ],
+            "edges": [
+                {"src": "C1", "dst": "ev:a", "kind": "supports"},
+                {"src": "C1", "dst": "ev:b", "kind": "contradicts"},
+                {"src": "ev:a", "dst": "src:a", "kind": "depends_on"},
+            ],
+        }
+
+    def test_evidence_fingerprint_is_order_invariant(self):
+        from plugins.research.batch import evidence_fingerprint
+
+        base = self._graph()
+        fp = evidence_fingerprint(base, "C1")
+        shuffled = self._graph()
+        shuffled["nodes"] = list(reversed(shuffled["nodes"]))
+        shuffled["edges"] = [
+            {"src": "C1", "dst": "ev:b", "kind": "contradicts"},
+            {"src": "ev:a", "dst": "src:a", "kind": "depends_on"},
+            {"src": "C1", "dst": "ev:a", "kind": "supports"},
+        ]
+        assert evidence_fingerprint(shuffled, "C1") == fp
+
+    def test_evidence_fingerprint_tracks_add_remove_and_content(self):
+        from plugins.research.batch import evidence_fingerprint
+
+        g = self._graph()
+        fp = evidence_fingerprint(g, "C1")
+        g2 = self._graph()
+        g2["nodes"] = [n for n in g2["nodes"] if n["id"] != "ev:b"]
+        g2["edges"] = [e for e in g2["edges"] if e["dst"] != "ev:b"]
+        assert evidence_fingerprint(g2, "C1") != fp          # removal moves the value
+        g3 = self._graph()
+        next(n for n in g3["nodes"] if n["id"] == "ev:a")["facts"] = ["different"]
+        assert evidence_fingerprint(g3, "C1") != fp          # content moves the value
+        g4 = self._graph()  # source char-len/status is part of each identity
+        next(n for n in g4["nodes"] if n["type"] == "Source")["full_char_len"] = 99
+        assert evidence_fingerprint(g4, "C1") != fp
+
+    def test_claim_fingerprint_excludes_physical_id(self):
+        from plugins.research.batch import claim_fingerprint
+
+        a = {"id": "C1", "label": " Main  Flow ", "statement": "s"}
+        b = {"id": "zz-remapped-9", "label": "main flow", "statement": "s"}
+        assert claim_fingerprint(a, strength_norm="Supported") == \
+               claim_fingerprint(b, strength_norm="supported")   # id + case/space ignored
+        assert claim_fingerprint(a, strength_norm="supported") != \
+               claim_fingerprint(a, strength_norm="contested")   # strength participates
+
+    def test_compute_pending_matrix(self):
+        from plugins.research.batch import compute_pending
+
+        assert compute_pending(None, "fp", True) is True     # clause 1: no baseline
+        assert compute_pending("fp", "fp", False) is True    # clause 2: gate not met
+        assert compute_pending("fp", "fp", True) is False    # the ONLY skip case
+        assert compute_pending("fp", "moved", True) is True  # clause 3: evidence moved
+
+    def test_gate_ok_mirrors_claim_gate_predicate(self):
+        from plugins.research.batch import gate_ok
+        from plugins.research.plugin import normalize_claim_strength
+
+        good = {"citations": ["https://x"], "strength": "supported"}
+        assert gate_ok(good, normalize_claim_strength) is True
+        assert gate_ok({"citations": [], "strength": "supported"}, normalize_claim_strength) is False
+        assert gate_ok({"citations": ["u"], "strength": "very-high"}, normalize_claim_strength) is False
+        assert gate_ok({"citations": ["u"]}, normalize_claim_strength) is False

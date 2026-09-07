@@ -196,6 +196,7 @@ class TestCrossStepSchemaStatics:
         ev = next(t["function"] for t in step2 if t["function"]["name"] == "research_evidence")
         assert ev["parameters"]["properties"]["action"]["enum"] == [
             "record_node", "mutate_node", "invalidate_downstream", "verify",
+            "verify_batch",  # P3-1 additive contract
         ]
         assert "link_edge" not in str(step2)  # hidden actions absent from the whole array
 
