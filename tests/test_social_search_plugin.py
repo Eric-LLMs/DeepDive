@@ -266,13 +266,32 @@ class TestUnsupported:
 
 # ── HTTP error mapping ───────────────────────────────────────────────────────
 class TestHttpErrors:
-    async def test_403_maps_to_denied_error(self):
-        with pytest.raises(RuntimeError, match="denied"):
-            await _run(_REDDIT_PAYLOAD, status_code=403)
+    async def test_403_is_terminal_for_run_not_a_failure(self):
+        # P3-5b: a 403 is source-scoped — it returns a terminal_for_run marker
+        # instead of raising, so one denied platform never kills the task.
+        result, _ = await _run(_REDDIT_PAYLOAD, status_code=403)
+        assert len(result) == 1
+        marker = result[0]
+        assert marker["terminal_for_run"] is True
+        assert marker["platform"] == "reddit"
+        assert marker["http_status"] == 403
+        assert "do not retry" in marker["hint"]
 
-    async def test_429_maps_to_rate_limit_error(self):
-        with pytest.raises(RuntimeError, match="rate-limited"):
-            await _run(_REDDIT_PAYLOAD, status_code=429)
+    async def test_429_is_terminal_for_run_not_a_failure(self):
+        result, _ = await _run(_REDDIT_PAYLOAD, status_code=429)
+        assert len(result) == 1
+        marker = result[0]
+        assert marker["terminal_for_run"] is True
+        assert marker["platform"] == "reddit"
+        assert marker["http_status"] == 429
+
+    async def test_auto_surfaces_denied_platform_as_marker(self):
+        # In auto mode a 403 on one platform becomes the same marker in the merged
+        # list; other platforms still contribute their results.
+        result, _ = await _run(_REDDIT_PAYLOAD, platform="auto", status_code=403)
+        markers = [i for i in result if i.get("terminal_for_run")]
+        assert len(markers) == 1
+        assert markers[0]["platform"] == "reddit"
 
     async def test_5xx_maps_to_status_error(self):
         with pytest.raises(RuntimeError, match="HTTP 500"):

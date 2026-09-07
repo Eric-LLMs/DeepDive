@@ -119,9 +119,11 @@ Hard boundaries:
       existing claim. The `id` is the sole anchor; `label` is display-only.
    4. **One fetch call per chunk.** Gather the candidate source URLs for the whole
       chunk and fetch them in ONE `research_scrape` `action: "fetch"` call
-      (`urls: [≤3]`, fetched concurrently server-side, each cleaned to a
-      `temp/vN/scrape/` draft plus a returned snippet with `canonical_url` and
-      `content_status`). Never one fetch per claim.
+      (`urls: [≤5]`, unique per call, fetched concurrently server-side, each cleaned to
+      a `temp/vN/scrape/` draft plus a returned snippet with `canonical_url` and
+      `content_status`). A URL the run already fetched comes back as an
+      `already_fetched` reference WITHOUT text — reuse its ids instead of re-fetching.
+      Never one fetch per claim.
    5. **One adjudication round-trip per chunk.** Judge every returned snippet of the
       chunk in a single pass and produce the findings for ALL its claims together —
       one LLM round-trip per batch, never one question per claim.
@@ -145,7 +147,8 @@ Hard boundaries:
    10. **Source-scoped failures are terminal for that source.** A 403, `empty`, or
        `interstitial` source is dead for this run: do not retry it in-run and never
        let one page stall or kill the task — note the gap and proceed with the other
-       sources.
+       sources. `search_social` signals the same contract with a `terminal_for_run`
+       item in its results: when you see it, stop querying that platform this run.
    11. **Explicit ids, never positions.** Every batch item carries a unique
        `item_id`; match results by `item_id` and claim `id`, never by array order or
        label text.

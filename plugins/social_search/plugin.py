@@ -310,6 +310,21 @@ def _available() -> list[str]:
     return available
 
 
+def _terminal_for_run(platform: str, code: int) -> dict:
+    """P3-5b error contract: a 403/429 is terminal FOR THIS RUN on this platform — a
+    source-scoped marker in the result list, never a raised tool error. Run 9 retried
+    reddit 3x across turns (each retry cost an LLM round-trip); the prompt/skill rule
+    keys on the ``terminal_for_run`` string to stop that. Other HTTP codes still raise
+    (a genuine transient network error should surface as a tool failure)."""
+    return {
+        "terminal_for_run": True,
+        "platform": platform,
+        "http_status": code,
+        "hint": f"{platform} denied/rate-limited ({code}); do not retry this platform "
+        "this run — proceed with other sources",
+    }
+
+
 async def _execute(args: dict, exec) -> list[dict]:
     platform = args.get("platform", "reddit").lower()
     if platform not in _SUPPORTED:
@@ -319,14 +334,25 @@ async def _execute(args: dict, exec) -> list[dict]:
     subreddit = args.get("subreddit")
 
     if platform == "auto":
+        plats = list(_available())
         results = await asyncio.gather(
-            *[ADAPTER(query, limit, subreddit) for ADAPTER in (_ADAPTERS[p] for p in _available())],
+            *(_ADAPTERS[p](query, limit, subreddit) for p in plats),
             return_exceptions=True,
         )
         merged: list[dict] = []
-        for r in results:
+        for p, r in zip(plats, results):
             if isinstance(r, BaseException):
-                continue  # a failing platform never takes down the others
+                # a failing platform never takes down the others; a 403/429 still
+                # surfaces as the same terminal-for-run marker the explicit path returns
+                exc = r
+                while not isinstance(exc, httpx.HTTPStatusError) and exc.__cause__ is not None:
+                    exc = exc.__cause__
+                if (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code in (429, 403)
+                ):
+                    merged.append(_terminal_for_run(p, exc.response.status_code))
+                continue
             merged.extend(r)
         return merged
 
@@ -335,10 +361,7 @@ async def _execute(args: dict, exec) -> list[dict]:
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         if code in (429, 403):
-            raise RuntimeError(
-                f"{platform} rate-limited or denied ({code}); retry later or use a "
-                "platform with live configuration"
-            ) from exc
+            return [_terminal_for_run(platform, code)]
         raise RuntimeError(f"{platform} returned HTTP {code}") from exc
     except httpx.HTTPError as exc:
         raise RuntimeError(f"{platform} request failed: {exc}") from exc

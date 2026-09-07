@@ -46,5 +46,9 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
                 ],
             ),
             execute=web_search,
+            # P3-5: pure network I/O against the provider seam, no local state — the
+            # frozen loop serializes tools without this flag (Run 9: 13 calls, Σ 28.3 s);
+            # marking it safe lets same-step search calls fan out.
+            is_concurrency_safe=True,
         )
     )

@@ -261,6 +261,39 @@ _RUN_EVENTS_FILE = "run_events.json"
 _RUN_EVENT_TYPES = ("stage", "gate_diagnostic", "artifact", "terminal")
 _SCRAPE_SUBDIR = "scrape"
 
+# ── P3-5 fetch fan-out budget ────────────────────────────────────────────────
+# One fetch call may carry up to 5 URLs (was 3; the fan-out raised after P3-4 proved
+# pending-first orchestration stops over-fetching — Run 10 never filled a 3-slot batch
+# twice in the same call, so 5 caps demand-side fan-out, it does not invite more text).
+FETCH_MAX_URLS = 5
+# The batch body budget invariant (design P3 §11.3): n_urls × max_chars ≤ 5 × 30k = 150k.
+# Per-page persisted drafts are already capped far below FETCH_MAX_PAGE_CHARS by the
+# fetch layer (DEFAULT_MAX_CHARS), and the model-facing slice is DEFAULT_TEXT_TARGET//n;
+# these constants make the invariant explicit and guard-checked at assembly time.
+FETCH_MAX_PAGE_CHARS = 30_000
+FETCH_BATCH_CHAR_CAP = FETCH_MAX_URLS * FETCH_MAX_PAGE_CHARS  # 150_000
+
+# ── P3-7B read-fetch window (telemetry-derived, not a gut number) ────────────
+# Source: data/audit.jsonl context_profile on 140 turn-end rows (Runs incl. 9/10):
+# per-turn tool_result_chars med=2,160 p75=22,365 p90=46,386 max=84,668; the largest
+# tool results in EVIDENCE/WRITE turns are re-delivered page text. A single read result
+# is bounded to one median-band page (4k ≈ the persisted-draft ceiling), and the
+# fetch-ref path (P3-7A) returns a digest instead of the text at all. The default is
+# the ceiling for the whole stored draft: with drafts already ≤ DEFAULT_MAX_CHARS, one
+# window returns the complete page (no loss), while the explicit offset/max_chars
+# contract keeps the return bounded if the store ceiling ever grows.
+READ_DEFAULT_WINDOW_CHARS = 4_000
+
+# ── P3-6 per-turn asset-merge buffer (process-local, memory-only) ────────────
+# ``_merge_cloud_assets`` no longer commits per call: additions accumulate here keyed by
+# project_id and are FLUSHED by the next real ``atomic_update_project`` commit inside its
+# lock (design §12: "one commit per turn, or a pending_assets buffer flushed by the next
+# commit"). Ledger READ paths overlay the buffer in memory (never destructive), so
+# same-turn read-after-write (E7 provenance, scrape seq counters) behaves exactly as
+# before. Crash before the flush loses only the best-effort mirror (same loss profile the
+# old try/except swallowed merges had); the authoritative artifact records stay intact.
+_PENDING_ASSET_MERGES: dict[str, dict] = {}
+
 
 def _slug_token(token: str, limit: int = 40) -> str:
     """A filesystem-safe slug for a user-supplied query/fragment (anti-explosion).
@@ -590,6 +623,13 @@ class ResearchService:
                         f"project {project_id} revision changed: expected {expected_revision}, "
                         f"got {project.get('project_revision', 0)}"
                     )
+                # P3-6 flush point: buffered asset-merges ride this commit — merged into
+                # the FRESH in-lock project before the mutation, so the ledger mirror
+                # commits atomically with whatever this transaction changes (and a
+                # same-turn verify sees provenance written earlier in the same turn).
+                pending = _PENDING_ASSET_MERGES.get(project_id)
+                if pending:
+                    self._merge_ledger(self._buffer_ledger(project), pending)
                 if extra_files is not None:
                     extras = {
                         name: self._load_json(project_dir / name, None)
@@ -608,6 +648,9 @@ class ResearchService:
                     project["updated_at"] = _now_iso()
                     project["project_revision"] = project.get("project_revision", 0) + 1
                     self._save_json(path, project)
+                if pending:
+                    # consumed exactly by the commit that wrote it (never on conflict/no-op)
+                    _PENDING_ASSET_MERGES.pop(project_id, None)
         except portalocker.exceptions.AlreadyLocked as exc:
             raise ProjectLockError(
                 f"could not lock project {project_id} within {_PROJECT_LOCK_TIMEOUT:.0f}s"
@@ -694,7 +737,7 @@ class ResearchService:
         rv = self._run_version_of(project)
         if not cloud_root or not rv:
             return None
-        ledger = self._assets_ledger(project)
+        ledger = self._assets_ledger(self._overlay_pending(project))
         dirs = ledger.setdefault("_dirs", {})
         if not isinstance(dirs, dict):
             dirs = ledger["_dirs"] = {}
@@ -718,32 +761,73 @@ class ResearchService:
             dirs[rel] = folder_id
         return folder_id
 
+    @staticmethod
+    def _merge_ledger(ledger: dict, additions: dict) -> None:
+        """Nested-dict merge (never clobber) shared by buffer, overlay and commit paths."""
+        for key, value in additions.items():
+            current = ledger.get(key)
+            if isinstance(current, dict) and isinstance(value, dict):
+                current.update(value)
+            else:
+                ledger[key] = value
+
+    @staticmethod
+    def _buffer_ledger(project: dict) -> dict:
+        """The ``driver.cloud_assets`` ledger of a loaded project (creating the shell).
+
+        Robust against the create-time ``driver: None`` placeholder (a legacy project
+        can be overlaid before its first ``begin_run``)."""
+        driver = project.get("driver")
+        if not isinstance(driver, dict):
+            driver = project["driver"] = {}
+        ledger = driver.get("cloud_assets")
+        if not isinstance(ledger, dict):
+            ledger = driver["cloud_assets"] = {}
+        return ledger
+
+    @classmethod
+    def _overlay_pending(cls, project: dict) -> dict:
+        """P3-6: make buffered-but-uncommitted asset additions visible to an in-memory
+        project read (non-destructive — the buffer survives for the next commit)."""
+        pending = _PENDING_ASSET_MERGES.get(project.get("id") or "")
+        if pending:
+            cls._merge_ledger(cls._buffer_ledger(project), pending)
+        return project
+
     def _merge_cloud_assets(
         self, owner_id: uuid.UUID, project_id: str, additions: dict
     ) -> None:
-        """Merge ``additions`` (top-level cloud_assets keys) into the driver ledger atomically.
+        """Queue ``additions`` (top-level cloud_assets keys) for the next commit (P3-6).
 
-        The merge re-reads the project under the lock so a concurrently-updated checkpoint is
-        preserved, and nested dicts are merged (never clobbered). Best-effort persistence: the
-        mirror's authoritative path stays the artifact record, so a failure only means the
-        ledger is rebuilt next time (the folder/asset already exists and is re-found).
+        The ledger mirror is best-effort, so k merges inside one turn collapse into the
+        ONE flush performed by the next real ``atomic_update_project`` (inside its lock —
+        a concurrently-updated checkpoint is still preserved because the flush merges
+        into the freshly-read project). Read paths overlay the buffer, so same-turn
+        read-after-write keeps working; a process crash before the flush loses only the
+        mirror, exactly like a swallowed merge failure did before.
         """
-        def mutate(project: dict) -> None:
-            ledger = project.setdefault("driver", {}).setdefault("cloud_assets", {})
-            if not isinstance(ledger, dict):
-                ledger = project["driver"]["cloud_assets"] = {}
-            for key, value in additions.items():
-                current = ledger.get(key)
-                if isinstance(current, dict) and isinstance(value, dict):
-                    current.update(value)
-                else:
-                    ledger[key] = value
+        if not additions:
+            return
+        pending = _PENDING_ASSET_MERGES.setdefault(project_id, {})
+        self._merge_ledger(pending, additions)
 
+    def flush_asset_merges(self, owner_id: uuid.UUID, project_id: str) -> None:
+        """Commit any buffered asset-merges immediately (no-op when nothing is pending).
+
+        The production flush point is the *next real* ``atomic_update_project`` (P3-6
+        fold), and every turn ends on a driver checkpoint/monitor commit anyway. This
+        explicit seam exists for callers that must observe the ledger on disk at a
+        specific instant (tests; any future read-only snapshot path), and it shares the
+        best-effort semantics of the old per-call merge (a lost flush only means the
+        mirror is rebuilt lazily).
+        """
+        if project_id not in _PENDING_ASSET_MERGES:
+            return
         try:
-            self.atomic_update_project(owner_id, project_id, mutate)
+            self.atomic_update_project(owner_id, project_id, lambda p: None)
         except Exception as exc:  # noqa: BLE001 - best-effort ledger, never break the caller
             logger.debug(
-                "research cloud-assets ledger merge failed for %s (rebuilt lazily): %s",
+                "research cloud-assets merge flush failed for %s (rebuilt lazily): %s",
                 project_id, exc,
             )
 
@@ -1199,7 +1283,8 @@ class ResearchService:
         ledger (persisted only when newly created).
         """
         cloud_root = project["cloud_folder_path"]
-        ledger = self._assets_ledger(project)
+        # P3-6: overlay buffered merges so a same-turn re-promote still finds its entry.
+        ledger = self._assets_ledger(self._overlay_pending(project))
         key = self._cloud_asset_key(artifact_id)
         entry = ledger.setdefault(key, {})
         if not isinstance(entry, dict):
@@ -1603,7 +1688,8 @@ class ResearchService:
             return False
         rv = self._run_version_of(project)
         if rv:
-            ledger = self._assets_ledger(project)
+            # P3-6: overlay buffered merges (same-turn second version must update in place).
+            ledger = self._assets_ledger(self._overlay_pending(project))
             dirs = ledger.setdefault("_dirs", {})
             if not isinstance(dirs, dict):
                 dirs = ledger["_dirs"] = {}
@@ -2191,6 +2277,15 @@ class ResearchService:
         }
 
     # ── research_evidence ─────────────────────────────────────────────────
+    @staticmethod
+    def _graph_from_extras(extras: dict) -> dict:
+        """A valid graph object from the transaction's fresh read (owns the default)."""
+        graph = extras.get("graph.json")
+        if not isinstance(graph, dict) or not isinstance(graph.get("nodes"), list):
+            graph = {"nodes": [], "edges": []}
+        extras["graph.json"] = graph
+        return graph
+
     def record_node(
         self, owner_id: uuid.UUID, project_id: str, *, node: dict
     ) -> dict:
@@ -2200,8 +2295,12 @@ class ResearchService:
         of raising (the driver re-executes a turn after a hard kill and must not duplicate
         graph writes). First-write behavior is unchanged; the extra ``idempotent`` flag tells
         the caller whether it created the node or found it.
+
+        P3-6: the load→check→append→save runs INSIDE one :meth:`atomic_update_project`
+        transaction (graph as ``extra_files``), so a concurrent writer can never lose this
+        node to a stale in-memory copy; an idempotent replay returns ``False`` from the
+        mutation and costs zero writes / zero revision bumps.
         """
-        graph = self._load_graph(owner_id, project_id)
         # P3-3 boundary repair: a JSON-encoded object string is un-wrapped ONCE and then
         # flows through the unchanged checks below — a repaired record is identical to a
         # native one; the repair itself is audited via the ``coerced`` tag (never the raw
@@ -2219,28 +2318,38 @@ class ResearchService:
             )
         node_id = node["id"]
         node_type = node["type"]
-        existing = next((n for n in graph["nodes"] if n["id"] == node_id), None)
-        if existing is not None:
-            return _with_coerced({"node": existing, "idempotent": True}, _node_coerced, "node")
-        record = {
-            "id": node_id,
-            "type": node_type,
-            "label": node.get("label", node_id),
-            "status": node.get("status", "VALID"),
-            **{k: v for k, v in node.items() if k not in ("id", "type", "label", "status")},
-        }
-        if record["type"] == "Claim" and record.get("strength") is not None:
-            # Boundary validation (single ingestion point): a strength outside the canonical
-            # set is refused with a repair hint instead of being stored and silently
-            # dooming CLAIM_GATE later. Report-style high/medium/low are accepted, stored
-            # normalized.
-            norm = normalize_claim_strength(record["strength"])
-            if norm is None:
-                raise _claim_strength_error(record["strength"])
-            record["strength"] = norm
-        graph["nodes"].append(record)
-        self._save_graph(owner_id, project_id, graph)
-        return _with_coerced({"node": record, "idempotent": False}, _node_coerced, "node")
+        out: dict = {}
+
+        def _mutate(project: dict, extras: dict) -> Any:
+            graph = self._graph_from_extras(extras)
+            existing = next((n for n in graph["nodes"] if n.get("id") == node_id), None)
+            if existing is not None:
+                out.update({"node": existing, "idempotent": True})
+                return False
+            record = {
+                "id": node_id,
+                "type": node_type,
+                "label": node.get("label", node_id),
+                "status": node.get("status", "VALID"),
+                **{k: v for k, v in node.items() if k not in ("id", "type", "label", "status")},
+            }
+            if record["type"] == "Claim" and record.get("strength") is not None:
+                # Boundary validation (single ingestion point): a strength outside the canonical
+                # set is refused with a repair hint instead of being stored and silently
+                # dooming CLAIM_GATE later. Report-style high/medium/low are accepted, stored
+                # normalized.
+                norm = normalize_claim_strength(record["strength"])
+                if norm is None:
+                    raise _claim_strength_error(record["strength"])
+                record["strength"] = norm
+            graph["nodes"].append(record)
+            out.update({"node": record, "idempotent": False})
+            return None
+
+        self.atomic_update_project(
+            owner_id, project_id, _mutate, extra_files=["graph.json"]
+        )
+        return _with_coerced(out, _node_coerced, "node")
 
     def link_edge(
         self, owner_id: uuid.UUID, project_id: str, *, src: str, dst: str, kind: str
@@ -2248,22 +2357,85 @@ class ResearchService:
         """Link two recorded nodes, deduplicated by ``(src, dst, kind)``.
 
         Re-linking an existing ``(src, dst, kind)`` tuple is a no-op that returns the existing
-        edge (crash reruns must not fan out duplicate dependency edges).
+        edge (crash reruns must not fan out duplicate dependency edges). P3-6: the check and
+        the append commit inside one CAS transaction; the dedup no-op writes nothing.
         """
-        graph = self._load_graph(owner_id, project_id)
-        ids = {n["id"] for n in graph["nodes"]}
-        if src not in ids or dst not in ids:
-            raise ValueError(f"edge endpoints must be recorded nodes: {src} -> {dst}")
-        edge = {"src": src, "dst": dst, "kind": kind}
-        existing = next(
-            (e for e in graph["edges"] if e["src"] == src and e["dst"] == dst and e["kind"] == kind),
-            None,
+        out: dict = {}
+
+        def _mutate(project: dict, extras: dict) -> Any:
+            graph = self._graph_from_extras(extras)
+            ids = {n["id"] for n in graph["nodes"]}
+            if src not in ids or dst not in ids:
+                raise ValueError(f"edge endpoints must be recorded nodes: {src} -> {dst}")
+            edge = {"src": src, "dst": dst, "kind": kind}
+            existing = next(
+                (e for e in graph["edges"]
+                 if e["src"] == src and e["dst"] == dst and e["kind"] == kind),
+                None,
+            )
+            if existing is not None:
+                out.update({"edge": existing, "idempotent": True})
+                return False
+            graph["edges"].append(edge)
+            out.update({"edge": edge, "idempotent": False})
+            return None
+
+        self.atomic_update_project(
+            owner_id, project_id, _mutate, extra_files=["graph.json"]
         )
-        if existing is not None:
-            return {"edge": existing, "idempotent": True}
-        graph["edges"].append(edge)
-        self._save_graph(owner_id, project_id, graph)
-        return {"edge": edge, "idempotent": False}
+        return out
+
+    def mutate_node(
+        self, owner_id: uuid.UUID, project_id: str, *, node_id: str, patch: dict
+    ) -> dict:
+        """Patch a node + cascade staleness — P3-6: one CAS transaction over graph.json."""
+        out: dict = {}
+
+        def _mutate(project: dict, extras: dict) -> Any:
+            graph = self._graph_from_extras(extras)
+            target = next((n for n in graph["nodes"] if n["id"] == node_id), None)
+            if target is None:
+                raise ValueError(f"node not found: {node_id}")
+            to_invalid = "status" in patch and patch["status"] == "INVALID"
+            protected = {"id", "type"}
+            effective = patch
+            if target["type"] == "Claim" and "strength" in patch:
+                norm = normalize_claim_strength(patch["strength"])
+                if norm is None:
+                    raise _claim_strength_error(patch["strength"])
+                effective = {**patch, "strength": norm}
+            for key, value in effective.items():
+                if key not in protected:
+                    target[key] = value
+            cascade = self._cascade(graph, node_id, to_invalid=to_invalid)
+            out.update({"node": target, "cascade": cascade})
+            return None
+
+        self.atomic_update_project(
+            owner_id, project_id, _mutate, extra_files=["graph.json"]
+        )
+        return out
+
+    def invalidate_downstream(
+        self, owner_id: uuid.UUID, project_id: str, *, node_id: str
+    ) -> dict:
+        """Mark a node INVALID + cascade — P3-6: one CAS transaction over graph.json."""
+        out: dict = {}
+
+        def _mutate(project: dict, extras: dict) -> Any:
+            graph = self._graph_from_extras(extras)
+            target = next((n for n in graph["nodes"] if n["id"] == node_id), None)
+            if target is None:
+                raise ValueError(f"node not found: {node_id}")
+            target["status"] = "INVALID"
+            cascade = self._cascade(graph, node_id, to_invalid=True)
+            out.update({"node": target, "cascade": cascade})
+            return None
+
+        self.atomic_update_project(
+            owner_id, project_id, _mutate, extra_files=["graph.json"]
+        )
+        return out
 
     def _cascade(
         self, graph: dict, start_id: str, *, to_invalid: bool
@@ -2290,39 +2462,6 @@ class ResearchService:
                 affected.append(neighbor)
                 queue.append(neighbor)
         return affected
-
-    def mutate_node(
-        self, owner_id: uuid.UUID, project_id: str, *, node_id: str, patch: dict
-    ) -> dict:
-        graph = self._load_graph(owner_id, project_id)
-        target = next((n for n in graph["nodes"] if n["id"] == node_id), None)
-        if target is None:
-            raise ValueError(f"node not found: {node_id}")
-        to_invalid = "status" in patch and patch["status"] == "INVALID"
-        protected = {"id", "type"}
-        if target["type"] == "Claim" and "strength" in patch:
-            norm = normalize_claim_strength(patch["strength"])
-            if norm is None:
-                raise _claim_strength_error(patch["strength"])
-            patch = {**patch, "strength": norm}
-        for key, value in patch.items():
-            if key not in protected:
-                target[key] = value
-        cascade = self._cascade(graph, node_id, to_invalid=to_invalid)
-        self._save_graph(owner_id, project_id, graph)
-        return {"node": target, "cascade": cascade}
-
-    def invalidate_downstream(
-        self, owner_id: uuid.UUID, project_id: str, *, node_id: str
-    ) -> dict:
-        graph = self._load_graph(owner_id, project_id)
-        target = next((n for n in graph["nodes"] if n["id"] == node_id), None)
-        if target is None:
-            raise ValueError(f"node not found: {node_id}")
-        target["status"] = "INVALID"
-        cascade = self._cascade(graph, node_id, to_invalid=True)
-        self._save_graph(owner_id, project_id, graph)
-        return {"node": target, "cascade": cascade}
 
     def query_lineage(
         self, owner_id: uuid.UUID, project_id: str, *, node_id: str
@@ -3073,7 +3212,9 @@ class ResearchService:
         totals surface only in the stage-summary event a transition emits. No-op (returns
         ``saved: False``) outside a versioned cloud task.
         """
-        project = self._load_project(owner_id, project_id)
+        # P3-6 overlay: scrape seq counters from an earlier save this turn may still be
+        # buffered — overlay so consecutive saves never collide on the same seq name.
+        project = self._overlay_pending(self._load_project(owner_id, project_id))
         cloud_root = project.get("cloud_folder_path")
         rv = self._run_version_of(project)
         if not cloud_root or not rv:
@@ -3177,6 +3318,27 @@ class ResearchService:
             view["reason"] = reason
         return view
 
+    @staticmethod
+    def _already_fetched_view(url: str, entry: dict) -> dict:
+        """P3-7A ref-only view: identity + sizes, never the page text again."""
+        return {
+            "url": url,
+            "canonical_url": entry.get("canonical_url", ""),
+            "status": "ok",
+            "content_status": entry.get("content_status", "usable"),
+            "saved": True,
+            "asset_id": entry.get("asset_id"),
+            "name": entry.get("name"),
+            "path": entry.get("path"),
+            "full_char_len": entry.get("full_char_len", 0),
+            "char_len": 0,
+            "text": "",
+            "truncated": False,
+            "already_fetched": True,
+            "hint": "this run already fetched this page — its text is not re-delivered; "
+            "reuse the ids from the first fetch, or research_scrape read for the draft",
+        }
+
     async def fetch_save_batch(
         self,
         owner_id: uuid.UUID,
@@ -3186,11 +3348,18 @@ class ResearchService:
         transport=None,
         resolver=None,
     ) -> list[dict]:
-        """Fetch ≤3 URLs concurrently, persist usable drafts under temp/vN/scrape, and record
-        server-side fetch provenance (E7) for this run.
+        """Fetch up to ``FETCH_MAX_URLS`` (5, P3-5) URLs concurrently, persist usable
+        drafts under temp/vN/scrape, and record server-side fetch provenance (E7) for
+        this run.
 
         Contract (the E-series trust boundaries):
-        - **E3** a code-level batch cap: more than 3 URLs is a ``ValueError``.
+        - **E3** a code-level batch cap: more than 5 URLs (or a duplicate canonical URL
+          in one batch) is a ``ValueError``, never fetched. The batch body budget
+          invariant (P3-5) is ``n_urls × max_chars ≤ FETCH_BATCH_CHAR_CAP`` (150k).
+        - **P3-7A** a URL this run already fetched-and-saved is NEVER re-delivered: the
+          view comes back as an ``already_fetched`` reference (ids + lengths, no text),
+          sharing the run's single copy of the page — the same source text enters the
+          model context at most once per run.
         - **E7** every successful fetch records ``_fetch_provenance[canonical_url]`` in the
           run's ``cloud_assets`` ledger — ``verify`` later trusts only this record, never a
           model-supplied ``content_status``/length.
@@ -3212,13 +3381,21 @@ class ResearchService:
         Returns one model-facing view per input URL (order preserved; ``body`` stripped).
         """
         raw = [u for u in (urls or []) if isinstance(u, str) and u.strip()]
-        if len(raw) > 3:
+        if len(raw) > FETCH_MAX_URLS:
             raise ValueError(
-                f"fetch_save_batch accepts at most 3 URLs per call (got {len(raw)}); "
-                "fetch in batches of ≤3"
+                f"fetch_save_batch accepts at most {FETCH_MAX_URLS} URLs per call "
+                f"(got {len(raw)}); fetch in batches of ≤{FETCH_MAX_URLS}"
             )
         if not raw:
             return []
+        # P3-5: a duplicate canonical URL in ONE batch is a caller mistake worth naming —
+        # reject with the offending URL instead of silently under-filling the budget.
+        _cu_seen: set[str] = set()
+        for u in raw:
+            _cu = canonicalize(u)
+            if _cu in _cu_seen:
+                raise ValueError(f"duplicate URL in one fetch batch: {_cu}")
+            _cu_seen.add(_cu)
         project = self._load_project(owner_id, project_id)
         cloud_root = project.get("cloud_folder_path")
         rv = self._run_version_of(project)
@@ -3249,6 +3426,28 @@ class ResearchService:
                 )
                 for u in raw
             ]
+        # ── P3-7A Page-Pool dedup (memory-level, run-scoped) ────────────────
+        # A canonical URL already fetched AND saved by this run is never re-delivered:
+        # its ledger entry is the single reference, and the caller gets an
+        # ``already_fetched`` view without page text (no network, no re-persist, no
+        # second copy of the same source text in context). The ledger is read from the
+        # overlayed project so same-turn earlier fetches (buffered, not yet flushed —
+        # P3-6) still dedup.
+        raw_all = raw
+        run_prov = self._fetch_provenance(self._overlay_pending(project))
+        ref_entries: dict[int, dict] = {}
+        keep: list[str] = []
+        for i, u in enumerate(raw_all):
+            cu = canonicalize(u)
+            entry = run_prov.get(cu) if cu else None
+            if isinstance(entry, dict) and entry.get("saved") and entry.get("asset_id"):
+                ref_entries[i] = entry
+            else:
+                keep.append(u)
+        if not keep:
+            return [self._already_fetched_view(u, ref_entries[i])
+                    for i, u in enumerate(raw_all)]
+        raw = keep
         # ── P3-2A pre-fetch CAS lookup (public drafts only) ──
         # The cache is a strict accelerator: any store/lookup fault degrades to a miss and
         # costs one re-fetch, never data. A HIT never skips the run-scoped bookkeeping:
@@ -3256,7 +3455,17 @@ class ResearchService:
         # below (cache ≠ provenance), so read_fetch/E6/E7/E10 discipline is identical.
         store = FetchStore(self.scratch_root / "fetch_store")
         n_call = len({u.strip() for u in raw})  # E4: whole-batch text budget denominator
-        per_url_chars = max(1, DEFAULT_TEXT_TARGET // n_call)
+        # P3-5 batch body-budget invariant: n × max_chars ≤ FETCH_BATCH_CHAR_CAP (150k).
+        # The E4 model-facing slice (DEFAULT_TEXT_TARGET//n) dominates in practice; the
+        # guards bind only if the fetch layer's per-page ceilings are ever raised.
+        per_url_chars = max(
+            1,
+            min(
+                DEFAULT_TEXT_TARGET // n_call,
+                FETCH_MAX_PAGE_CHARS,
+                FETCH_BATCH_CHAR_CAP // n_call,
+            ),
+        )
         cu_of = [canonicalize(u) for u in raw]
         hits: dict[int, dict] = {}
         miss_idx: list[int] = []
@@ -3450,6 +3659,15 @@ class ResearchService:
             self._merge_cloud_assets(
                 owner_id, project_id, {_FETCH_PROVENANCE_KEY: additions}
             )
+        if ref_entries:
+            # Re-interleave: one view per ORIGINAL input URL, order preserved — the
+            # already-fetched slots carry ref-only views, the rest the fresh fetch views.
+            fresh = iter(views)
+            views = [
+                self._already_fetched_view(u, ref_entries[i]) if i in ref_entries
+                else next(fresh)
+                for i, u in enumerate(raw_all)
+            ]
         return views
 
     async def read_fetch(
@@ -3460,6 +3678,8 @@ class ResearchService:
         canonical_url: str | None = None,
         asset_id: str | None = None,
         name: str | None = None,
+        offset: int = 0,
+        max_chars: int = READ_DEFAULT_WINDOW_CHARS,
     ) -> dict:
         """Read back a page full draft this run actually fetched (E6/E9 write-time citation).
 
@@ -3467,8 +3687,16 @@ class ResearchService:
         fetched and saved can be read, addressed by exactly one of ``canonical_url`` /
         ``asset_id`` / ``name``. Anything else — a foreign run's asset, a path with ``..``, a
         made-up id — is refused with a precise error (never a blind drive read).
+
+        P3-7B: the return is a BOUNDED window (``offset``/``max_chars``, default
+        ``READ_DEFAULT_WINDOW_CHARS`` — derived from the audit context_profile
+        distribution, see constant) with ``total_chars``/``truncated`` metadata, so one
+        read result can never re-inject an unbounded page into the model context; the
+        next window is an explicit caller choice, not a silent full re-delivery.
         """
-        project = self._load_project(owner_id, project_id)
+        # Overlay first: a fetch saved THIS turn whose ledger merge is still buffered
+        # (P3-6) must be readable immediately (E6 read-after-write).
+        project = self._overlay_pending(self._load_project(owner_id, project_id))
         cloud_root = project.get("cloud_folder_path")
         rv = self._run_version_of(project)
         if not cloud_root or not rv:
@@ -3514,12 +3742,23 @@ class ResearchService:
         except Exception as exc:
             logger.warning("research fetch read failed for %s: %s", asset_id, exc)
             raise ValueError(f"could not read fetched asset {asset_id}: drive read failed") from exc
+        body = self._scrape_body(full)
+        total = len(body)
+        try:
+            start = max(0, int(offset))
+            window_chars = max(1, int(max_chars))
+        except (TypeError, ValueError):
+            start, window_chars = max(0, int(offset or 0)), READ_DEFAULT_WINDOW_CHARS
+        window = body[start: start + window_chars]
         return {
             "canonical_url": cu,
             "asset_id": asset_id,
             "name": name,
             "path": f"{cloud_root}/temp/v{rv}/{_SCRAPE_SUBDIR}/{name}",
-            "content": self._scrape_body(full),
+            "content": window,
+            "total_chars": total,
+            "offset": start,
+            "truncated": start + len(window) < total,
         }
 
     def ingest_evidence(
@@ -3558,19 +3797,30 @@ class ResearchService:
         findings, _findings_coerced = _coerce_json_container(findings, expect="list")
         if findings is not None and not isinstance(findings, list):
             raise ValueError("verify 'findings' must be a list")
-        project = self._load_project(owner_id, project_id)
-        graph = self._load_graph(owner_id, project_id)
-        claim_node = next((n for n in graph["nodes"] if n["id"] == claim_id), None)
-        if claim_node is None:
-            raise ValueError(
-                f"claim node not found: {claim_id!r} — verify does not create claims; "
-                "record it first with research_evidence record_node (type 'Claim')"
+        out: dict = {}
+
+        def _mutate(project: dict, extras: dict) -> Any:
+            # P3-6: the claim lookup, the E7 provenance read and the graph mutation all
+            # run on the FRESH in-lock state — single verify is now a CAS transaction
+            # like verify_batch, never a naked graph overwrite that can lose a
+            # concurrent commit. An unchanged replay returns False (zero writes/bumps).
+            graph = self._graph_from_extras(extras)
+            claim_node = next((n for n in graph["nodes"] if n["id"] == claim_id), None)
+            if claim_node is None:
+                raise ValueError(
+                    f"claim node not found: {claim_id!r} — verify does not create claims; "
+                    "record it first with research_evidence record_node (type 'Claim')"
+                )
+            prov = self._fetch_provenance(project)
+            res = self._apply_findings(
+                graph, claim_id, claim_node.get("label") or claim_id, prov, findings
             )
-        claim_label = claim_node.get("label") or claim_id
-        prov = self._fetch_provenance(project)
-        out = self._apply_findings(graph, claim_id, claim_label, prov, findings)
-        if out["changed"]:
-            self._save_graph(owner_id, project_id, graph)
+            out.update(res)
+            return None if res["changed"] else False
+
+        self.atomic_update_project(
+            owner_id, project_id, _mutate, extra_files=["graph.json"]
+        )
         return _with_coerced({
             "claim_id": claim_id,
             "nodes_added": out["nodes_added"],
@@ -4374,14 +4624,16 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 content=_require(args, "content", "research_scrape", action),
             )
         if action == "fetch":
-            # E3 hard code-level cap: >3 URLs is a parameter error, never fetched.
+            # E3 hard code-level cap (P3-5: 3→5): >FETCH_MAX_URLS is a parameter error,
+            # never fetched; the service re-checks cap + duplicate-URL + the batch body
+            # budget invariant.
             urls = args.get("urls")
             if not isinstance(urls, list) or not urls or any(not isinstance(u, str) or not u.strip() for u in urls):
                 raise ValueError("research_scrape fetch needs 'urls' as a non-empty list of URL strings")
-            if len(urls) > 3:
+            if len(urls) > FETCH_MAX_URLS:
                 raise ValueError(
-                    f"research_scrape fetch accepts at most 3 URLs per call (got {len(urls)}); "
-                    "fetch a claim's sources in batches of ≤3"
+                    f"research_scrape fetch accepts at most {FETCH_MAX_URLS} URLs per call "
+                    f"(got {len(urls)}); fetch a chunk's sources in batches of ≤{FETCH_MAX_URLS}"
                 )
             # Silent by contract (like save_scrape): no per-fetch monitor wake-up.
             # F1 output-contract fix: the tool's shared schema is ``{"type": "object"}``
@@ -4398,6 +4650,8 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 canonical_url=args.get("canonical_url"),
                 asset_id=args.get("asset_id"),
                 name=args.get("name"),
+                offset=args.get("offset", 0),
+                max_chars=args.get("max_chars", READ_DEFAULT_WINDOW_CHARS),
             )
         raise _unknown_action("research_scrape", action, _SCRAPE_ACTIONS)
 
@@ -4633,10 +4887,13 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "fetched). "
             "Constraints: save_scrape requires 'source', 'query' and 'content' ('url' "
             "optional); content must be extracted text/markdown, never raw JSON. 'fetch' "
-            "takes 'urls' with a HARD cap of 3 per call — more is rejected as a parameter "
-            "error, so batch a claim's sources in groups of ≤3; call it per claim THEN "
-            "research_evidence verify; a URL whose fetch failed can never be verified. "
-            "'read' addresses only pages this run fetched (canonical_url / asset_id / name)."
+            "takes 'urls' with a HARD cap of 5 per call (P3-5) — more is rejected as a "
+            "parameter error, duplicate URLs in one batch are rejected too; a URL this "
+            "run already fetched comes back as an 'already_fetched' reference WITHOUT "
+            "text (never re-delivered). Batch a chunk's sources in ONE fetch call, then "
+            "research_evidence verify_batch; a URL whose fetch failed can never be "
+            "verified. 'read' addresses only pages this run fetched (canonical_url / "
+            "asset_id / name) and returns a bounded window (offset/max_chars)."
         ),
         parameters=_params(
             _SCRAPE_ACTIONS,
@@ -4660,8 +4917,18 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 "urls": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "fetch: ≤3 URLs to real-fetch this run (SSRF-guarded, "
-                    "concurrent, cleaned to core text).",
+                    "description": "fetch: ≤5 unique URLs to real-fetch this run (P3-5; "
+                    "SSRF-guarded, concurrent, cleaned to core text; already-fetched "
+                    "URLs return a text-free reference).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "read: start character of the window (default 0).",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": f"read: window size in chars (default "
+                    f"{READ_DEFAULT_WINDOW_CHARS}; response carries total_chars/truncated).",
                 },
                 "canonical_url": {
                     "type": "string",

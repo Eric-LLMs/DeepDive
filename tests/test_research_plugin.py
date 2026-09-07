@@ -1362,7 +1362,11 @@ class TestRunOutputLayout:
 
     @staticmethod
     def _project(env, task_id: str) -> dict:
-        return ResearchService._load_json(env.scratch / str(USER) / task_id / "project.json", None)
+        # P3-6: asset-merge ledger writes are buffered until the next commit, so a raw
+        # disk read would miss same-turn merges — overlay the pending buffer.
+        return ResearchService._overlay_pending(
+            ResearchService._load_json(env.scratch / str(USER) / task_id / "project.json", None)
+        )
 
     @staticmethod
     async def _new_task(env, title: str = "task") -> tuple[ResearchService, str, str]:
@@ -1801,6 +1805,9 @@ class TestBatchEvidence:
     @staticmethod
     def _provenance(env, task_id: str) -> dict:
         p = TestBatchEvidence._project(env, task_id)
+        # P3-6: asset merges are buffered until the next commit; the ledger read path
+        # overlays the buffer, so the test reads exactly what a service read would see.
+        ResearchService._overlay_pending(p)
         return p["driver"]["cloud_assets"].get("_fetch_provenance", {})
 
     @staticmethod
@@ -1842,10 +1849,12 @@ class TestBatchEvidence:
         monkeypatch.setattr(rplugin, "_FETCH_RESOLVER_OVERRIDE", lambda host: [self._PUBLIC])
 
     # ── research_scrape fetch (E3/E7/E10) ───────────────────────────────────
-    async def test_fetch_hard_caps_batch_at_three(self, env):
+    async def test_fetch_hard_caps_batch_at_five(self, env):
+        # P3-5: the fan-out cap moved 3 -> 5; over-cap and duplicate-in-batch are both
+        # parameter errors, never fetched.
         svc, task_id = await self._new_task(env)
-        urls = [f"https://h{i}.example/x" for i in range(4)]
-        with pytest.raises(ValueError, match="at most 3 URLs"):
+        urls = [f"https://h{i}.example/x" for i in range(6)]
+        with pytest.raises(ValueError, match="at most 5 URLs"):
             await svc.fetch_save_batch(USER, task_id, urls=urls)
 
         result = await env.runtime.execute(
@@ -1856,7 +1865,11 @@ class TestBatchEvidence:
             )
         )
         assert result.is_error is True
-        assert "at most 3 URLs" in result.error.message
+        assert "at most 5 URLs" in result.error.message
+
+        dupe = ["https://good.example/a", "https://good.example/a"]
+        with pytest.raises(ValueError, match="duplicate URL"):
+            await svc.fetch_save_batch(USER, task_id, urls=dupe)
 
     async def test_fetch_runtime_roundtrip_passes_output_validation(self, env, monkeypatch):
         """F1 regression: fetch must clear the full tool chain — runtime.execute →
@@ -2894,6 +2907,24 @@ class TestFetchCacheP32A:
         path = store._index_path(cache_index_id(cu))
         return json.loads(path.read_text(encoding="utf-8")), path
 
+    @staticmethod
+    def _reset_run_ledger(env, task_id: str) -> None:
+        """Clear this run's ``_fetch_provenance`` so a same-run re-fetch reaches the
+        CAS layer. P3-7A makes a saved URL return an ``already_fetched`` reference
+        before any network/cache work — these tests deliberately exercise the
+        *cache* component under the refetch, so they simulate a fresh ledger."""
+        path = env.scratch / str(USER) / task_id / "project.json"
+        p = ResearchService._load_json(path, None)
+        (p.get("driver") or {}).get("cloud_assets", {}).pop("_fetch_provenance", None)
+        ResearchService._save_json(path, p)
+        import plugins.research.plugin as rplugin
+
+        pending = rplugin._PENDING_ASSET_MERGES.get(task_id)
+        if pending:
+            pending.get("cloud_assets", {}).pop("_fetch_provenance", None)
+            if not pending.get("cloud_assets"):
+                rplugin._PENDING_ASSET_MERGES.pop(task_id, None)
+
     # ── T1: miss → store → hit, freshness anchored to fetched_at ─────────────
     async def test_t1_hit_skips_network_keeps_asset_and_fetched_at(self, env, monkeypatch):
         svc, task_id = await self.H._new_task(env)
@@ -2910,6 +2941,7 @@ class TestFetchCacheP32A:
         entry, _ = self._index_of(env, cu)
         assert prov1["content_hash"] == entry["sha256"]  # eligible miss published to CAS
 
+        self._reset_run_ledger(env, task_id)  # P3-7A: fresh ledger so the refetch hits CAS
         (v2,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
         assert len(calls) == 1  # HIT: the network was not touched again
         assert v2["saved"] is True and v2["cache_hit"] is True
@@ -2929,6 +2961,7 @@ class TestFetchCacheP32A:
         # Freshness is fetched_at-only: age the entry past max_age → honest refetch.
         aged["fetched_at"] -= 90000  # > 24h
         ipath.write_text(json.dumps(aged), encoding="utf-8")
+        self._reset_run_ledger(env, task_id)  # P3-7A: see the comment above
         (v3,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
         assert len(calls) == 2  # stale ⇒ network again, and the slot is re-published
         assert "cache_hit" not in v3
@@ -2948,6 +2981,7 @@ class TestFetchCacheP32A:
         original = bpath.read_bytes()
 
         bpath.write_bytes(b"X" + original[1:])  # one-byte tamper
+        self._reset_run_ledger(env, task_id)  # P3-7A: exercise the cache layer, not dedup
         (v,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
         assert len(calls) == 2  # served as a miss → refetched
         assert "cache_hit" not in v
@@ -3029,7 +3063,9 @@ class TestFetchCacheP32A:
         assert len(calls) == 2
         prov = self.H._provenance(env, task_id)
         assert all(e["cache_hit"] is False and "content_hash" not in e for e in prov.values())
-        # Same batch again: still no cache anywhere (fetch_store never even created).
+        # Same batch again with a fresh ledger (P3-7A dedup would otherwise short-circuit):
+        # still no cache anywhere (fetch_store never even created).
+        self._reset_run_ledger(env, task_id)
         views2 = await svc.fetch_save_batch(USER, task_id, urls=urls)
         assert len(calls) == 4
         assert all("cache_hit" not in v for v in views2)
