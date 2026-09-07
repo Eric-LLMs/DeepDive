@@ -2567,27 +2567,70 @@ logical id at a different implementation never invalidates live executions (§19
 The full end-to-end chain, and where each system's responsibility stops:
 
 ```
-Worker (apps/worker: research_drive)   ← job delivery ONLY: one arq job == one iteration;
-  │                                      never touches stages or flow decisions
-  ▼
-Workflow Core (drive_iteration)        ← flow control: lease → execute → probe → grade → settle
-  │ activity "auto_turn" → logical id "research-agent-kernel"
-  ▼
-Executor registry (adapter-built)      ← MappingRegistry binds logical id → implementation
-  ▼
-Agent (ReactLoop kernel turn, §5)      ← the opaque executor: one turn, step budget is runtime config
-  │
-  ▼
-Skill + LLM steps → Tools (§5.4/§6)    ← methodology + sandbox-guarded actions
-  ▼
-ResearchService / RAG / web / Drive    ← domain invariants, reached ONLY through tools
+Application / Worker
+   (research_drive)
+        │
+        │ 1 job = 1 iteration
+        ▼
+Research Workflow Adapter
+   ├─ LeaseStore
+   ├─ ProgressProbe
+   ├─ business_facts
+   ├─ ExecutorRegistry (MappingRegistry)
+   └─ Research-specific translation / settle
+        │
+        │ build_deps + drive_iteration
+        ▼
+Generic Workflow Runtime / Runner
+        │
+        ├──── reads/validates ────► Workflow Definition
+        │                           ├─ transitions
+        │                           ├─ activities
+        │                           └─ caps
+        │
+        ├─ claim
+        ├─ execute
+        ├─ heartbeat / cancel
+        ├─ retry
+        ├─ probe
+        └─ grade
+                  │
+          continue / terminal
+                  │
+                  └──── next job ───► Worker
+
+Activity: auto_turn
+        │
+        │ executor = research-agent-kernel
+        ▼
+Executor Resolution
+        │
+        ▼
+Research Agent
+        │
+        │ Skill = methodology / prompt guidance
+        ▼
+      LLM steps
+        │
+        ▼
+      Tool
+        │
+        ▼
+ResearchService / RAG / Web / Drive
 ```
 
-**The workflow ends at the `Executor` call boundary** — everything below it is the agent
-system, which the core sees as one black-box function. Conversely the worker/driver never
-moves a research stage: stage and gate transitions happen *only* when the agent invokes a
-research tool; the workflow just observes via the `ProgressProbe` and grades what the
-`business_facts` callable reports.
+Four confusions this view is built to prevent: the **Definition is a declaration, not a
+node** (read/validated each acquire — it never sits in the call chain); the **Adapter is the
+seam** between the core and research (that is where every port binds); **Skill is a
+constraint/methodology, not an execution node** (it guides the prompt and scopes the tools —
+only Tools act on services); and the **workflow's loop closes via grade → continue → next
+job back to the Worker** (flow control lives in the runner, delivery lives in the worker).
+
+The corollary of the loop's endpoints: **the workflow ends at the `Executor` call boundary**
+— everything below it is the agent system, which the core sees as one black-box function.
+Neither the worker nor the workflow ever moves a research stage: stage and gate transitions
+happen *only* when the agent invokes a research tool; the workflow just observes via the
+`ProgressProbe` and grades what the `business_facts` callable reports.
 
 A one-line roster of each layer's job: **Workflow Core** = generic flow machinery ·
 **Research workflow** = the domain definition + adapter (§19.10) · **Agent** = an executor
