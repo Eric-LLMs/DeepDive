@@ -1599,7 +1599,10 @@ class TestRunOutputLayout:
         assert run2["drive_asset_id"] != run1["drive_asset_id"]
 
         outs = {a["name"]: a for a in await self._files_in(env, f"{cloud_root}/outputs")}
-        assert set(outs) == {"report_v1.md", "report_v2.md"}
+        # Beyond the promoted per-version finals, the ``report`` artifact also auto-mirrors
+        # into ``outputs/<task name>.md``: run 1 creates it, run 2's fresh report is a new
+        # file (same-run rewrites would update in place instead).
+        assert set(outs) == {"report_v1.md", "report_v2.md", "task.md", "task(1).md"}
         # v1 is never overwritten or reused — both versioned finals coexist with their bytes.
         assert await env.drive.read_text(USER, uuid.UUID(outs["report_v1.md"]["id"])) == "# final v1"
         assert await env.drive.read_text(USER, uuid.UUID(outs["report_v2.md"]["id"])) == "# final v2"

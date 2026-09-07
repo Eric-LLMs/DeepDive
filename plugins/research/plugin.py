@@ -283,6 +283,17 @@ def _report_stem(artifact_id: str) -> str:
     return stem.rstrip(".")
 
 
+def _is_report_artifact(artifact_id: str) -> bool:
+    """Whether an artifact is the report (→ auto-mirrors into the task's cloud ``outputs/``).
+
+    Only explicitly report-named artifacts (``report.md``, ``settle_report.md``) qualify; every
+    other artifact (corpus, sources, drafts, scorecards, notes, logs) is an intermediate
+    working product and stays in ``temp/v{N}`` (promote remains the opt-in path for those).
+    """
+    stem = (artifact_id or "").rsplit("/", 1)[-1].lower()
+    return "report" in stem
+
+
 def _trim_reason(reason: str, limit: int = _REASON_LIMIT) -> str:
     """Trim the agent's free-form override reason to ``limit`` chars for safe display."""
     reason = (reason or "").strip()
@@ -1456,10 +1467,15 @@ class ResearchService:
             # any material is copied / run begun / artifact promoted, so the working-directory
             # layout is stable from the moment the task exists (a task with no materials,
             # outputs or temp run yet still shows all three in the drive). ``temp/`` holds one
-            # per-run ``v{N}`` subfolder (created lazily by the first run).
-            await self.drive.create_folder(owner_id, None, cloud_folder["path"], "materials")
-            await self.drive.create_folder(owner_id, None, cloud_folder["path"], "outputs")
-            await self.drive.create_folder(owner_id, None, cloud_folder["path"], "temp")
+            # per-run ``v{N}`` subfolder (created lazily by the first run). Get-or-create by
+            # exact path so a stale/trashed same-name row can never leave the task folder
+            # missing ``outputs/`` (the folder the user's reports must land in).
+            existing_paths = {
+                f.get("path") for f in await self.drive.list_folders(owner_id)
+            }
+            for sub in ("materials", "outputs", "temp"):
+                if f"{cloud_folder['path']}/{sub}" not in existing_paths:
+                    await self.drive.create_folder(owner_id, None, cloud_folder["path"], sub)
             self._save_project(project)
             self._save_graph(owner_id, task_id, {"nodes": [], "edges": []})
             task_spec = {
@@ -1568,9 +1584,10 @@ class ResearchService:
         Two shapes (chat-task path only; a task without a ``cloud_folder_path`` is a no-op):
 
         - **Versioned run** (``driver.run_version`` set): the working copy mirrors into
-          ``temp/v{N}/<artifact_id>.md`` — never into ``outputs/``. The run's ``cloud_assets``
-          ledger holds the temp asset id so a same-run rewrite updates it in place and a
-          *later* run creates a fresh ``temp/v{N+1}`` file instead of clobbering vN (the id is
+          ``temp/v{N}/<artifact_id>.md``. Report artifacts additionally mirror into
+          ``outputs/<task name>.md`` (same folder/ledger mechanism, no version suffix). The
+          run's ``cloud_assets`` ledger holds the temp/out asset ids so a same-run rewrite
+          updates in place and a *later* run writes a new file (the ids are
           deliberately NOT stored on the shared version record — that would leak one run's
           asset id into the next run). ``record["cloud_output_asset_id"]`` stays untouched.
         - **Legacy / no run**: the previous in-place ``outputs/<artifact_id>.md`` projection
@@ -1584,7 +1601,6 @@ class ResearchService:
             return False
         rv = self._run_version_of(project)
         if rv:
-            rel_dir = f"temp/v{rv}"
             ledger = self._assets_ledger(project)
             dirs = ledger.setdefault("_dirs", {})
             if not isinstance(dirs, dict):
@@ -1593,31 +1609,55 @@ class ResearchService:
             entry = ledger.setdefault(key, {})
             if not isinstance(entry, dict):
                 entry = ledger[key] = {}
-            try:
-                if dirs.get(rel_dir) is None:
-                    folder_id = await self._ensure_cloud_dir(owner_id, project, rel_dir)
-                    if folder_id is None:
-                        return False
-                asset_id = entry.get("temp_asset")
+
+            async def _mirror(rel_dir: str, out_name: str, asset_field: str) -> bool:
+                """Create-or-update one cloud asset under ``<task folder>/<rel_dir>``.
+
+                Returns ``True`` when a new asset was created. Raises on drive failure so the
+                caller can log per-target and keep the other mirror independent.
+                """
+                if dirs.get(rel_dir) is None and await self._ensure_cloud_dir(owner_id, project, rel_dir) is None:
+                    raise RuntimeError(f"cloud folder {rel_dir} unavailable")
+                asset_id = entry.get(asset_field)
                 if asset_id:
                     await self.drive.update_content(owner_id, uuid.UUID(asset_id), content)
                     return False
                 asset = await self.drive.save_artifact(
                     owner_id,
-                    name=f"{_safe_filename(record['artifact_id'])}.md",
+                    name=out_name,
                     mime_type="text/markdown",
                     content=content.encode("utf-8"),
                     folder_path=f"{cloud_folder_path}/{rel_dir}",
                     workspace_id=None,
                 )
-                entry["temp_asset"] = str(asset.id)
-                self._merge_cloud_assets(
-                    owner_id, record["project_id"], {"_dirs": dirs, key: entry}
-                )
+                entry[asset_field] = str(asset.id)
                 return True
+
+            created_new = False
+            try:
+                created_new |= await _mirror(
+                    f"temp/v{rv}", f"{_safe_filename(record['artifact_id'])}.md", "temp_asset"
+                )
             except Exception:
                 logger.exception("research run-temp mirror failed for %s", record["artifact_id"])
                 return False
+            if _is_report_artifact(record["artifact_id"]):
+                try:
+                    # Filename = the task name (no version suffix): the first report write of
+                    # a run creates ``outputs/<task name>.md``; later writes of the SAME run
+                    # update it in place (``out_asset``); a NEW run's report lands as a new
+                    # file (fresh ledger → ``save_artifact`` auto-suffixes the busy name).
+                    created_new |= await _mirror(
+                        "outputs",
+                        f"{_safe_filename(project.get('name') or 'report')}.md",
+                        "out_asset",
+                    )
+                except Exception:
+                    logger.exception("research report-output mirror failed for %s", record["artifact_id"])
+            self._merge_cloud_assets(
+                owner_id, record["project_id"], {"_dirs": dirs, key: entry}
+            )
+            return created_new
         asset_id = record.get("cloud_output_asset_id")
         try:
             if asset_id:
