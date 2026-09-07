@@ -1783,12 +1783,33 @@ class ResearchService:
     # ── research_state ────────────────────────────────────────────────────
     def get_state(self, owner_id: uuid.UUID, project_id: str) -> dict:
         project = self._load_project(owner_id, project_id)
-        return {
+        out = {
             "project_id": project["id"],
             "stage": project["stage"],
             "status": project["status"],
             "gates": project["gates"],
         }
+        # P1-C: a tiny Claim digest so a fresh (auto) turn can SEE the claims an
+        # earlier turn already recorded — cross-turn context is cleared, and no other
+        # action lists node ids, which is what let a shadow k*-set be minted in
+        # EVIDENCE. ``id`` is the sole identity anchor; ``label`` (first 80 chars) is
+        # display-only semantic context, and ``anchored`` mirrors the CLAIM_GATE
+        # predicate (has citations) so the model can tell "reuse + verify/mutate" from
+        # "create the missing ones". Conditional emission: with no claims the payload is
+        # old contract. Never a full graph dump.
+        graph = self._load_graph(owner_id, project_id)
+        claims = [
+            {
+                "id": n["id"],
+                "label": (n.get("label") or "")[:80],
+                "anchored": bool(n.get("citations")),
+            }
+            for n in graph["nodes"]
+            if n.get("type") == "Claim"
+        ]
+        if claims:
+            out["claims"] = claims
+        return out
 
     def transition_stage(
         self,

@@ -99,7 +99,13 @@ Hard boundaries:
 
 5. **EVIDENCE — verify and record (batch mode).** Work claim by claim, but *wholesale* per
    claim instead of one source at a time:
-   - First record the claim as a graph node: `research_evidence record_node` with
+   - **Reuse before you create.** `research_state get_state` returns a `claims` digest
+     (`id`, display-only `label`, `anchored` flag) for every Claim already on the graph.
+     If the claim you are about to record is already listed, use that exact `id` for
+     `verify` / `mutate_node` — never mint a new id for an existing claim. Call
+     `record_node` ONLY for claims not yet listed. The `id` is the sole identity anchor;
+     match semantically, never by label text.
+   - Record each *new* claim as a graph node: `research_evidence record_node` with
      `node: {id: <claim id>, type: "Claim", label}`. `verify` anchors to that claim id and
      never creates a claim itself. CLAIM_GATE later requires every Claim to carry a
      `strength`; when you pass one on `record_node`, use the canonical vocabulary

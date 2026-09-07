@@ -2310,3 +2310,53 @@ class TestActionSpaceContract:
                    node={"id": "claim:x", "type": "Claim", "label": "x"})
         await svc.fetch_save_batch(USER, task_id, urls=["https://good.example/recipe"])
         return svc, task_id
+
+
+# ── 12. get_state claims digest (P1-C cross-turn visibility — shadow-k* prevention) ─
+class TestGetStateClaimsDigest:
+    """``get_state`` must surface the Claim identity an earlier turn created.
+
+    Run-5 root cause: cross-turn context is cleared and NO action listed claim ids,
+    so the EVIDENCE turn re-minted a shadow k*-set for claims already recorded as
+    C*. The digest is conditional (absent = legacy contract byte-identical), id is
+    the sole anchor, label is display-only and capped at 80 chars, and ``anchored``
+    mirrors the CLAIM_GATE predicate (non-empty citations).
+    """
+
+    async def test_get_state_omits_claims_when_none_recorded(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        state = await _run(env.runtime, "research_state", action="get_state", project_id=pid)
+        assert "claims" not in state  # conditional emission
+        assert state["stage"] == "DISCOVER" and state["project_id"] == pid
+
+    async def test_get_state_lists_claims_with_id_label_anchor_semantics(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        long_label = "x" * 100
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node={"id": "C1", "type": "Claim", "label": long_label,
+                         "strength": "supported"})
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node={"id": "C2", "type": "Claim", "label": "short claim"})
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node={"id": "S1", "type": "Source", "label": "s1",
+                         "verification_status": "verified"})
+
+        state = await _run(env.runtime, "research_state", action="get_state", project_id=pid)
+        claims = state["claims"]
+        assert [c["id"] for c in claims] == ["C1", "C2"]  # only Claims, in graph order
+        assert all(set(c) == {"id", "label", "anchored"} for c in claims)
+        assert claims[0]["label"] == long_label[:80]  # display cap, not the identity
+        assert claims[1]["label"] == "short claim"    # <=80 kept whole
+        assert claims[0]["anchored"] is False and claims[1]["anchored"] is False
+
+    async def test_get_state_anchored_flag_tracks_citations_patch(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node={"id": "C1", "type": "Claim", "label": "a", "strength": "supported"})
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node={"id": "C2", "type": "Claim", "label": "b", "strength": "supported"})
+        await _run(env.runtime, "research_evidence", action="mutate_node", project_id=pid,
+                   node_id="C1", patch={"citations": ["https://example.com/a"]})
+        state = await _run(env.runtime, "research_state", action="get_state", project_id=pid)
+        anchored = {c["id"]: c["anchored"] for c in state["claims"]}
+        assert anchored == {"C1": True, "C2": False}  # partial set: reuse C1, complete C2
