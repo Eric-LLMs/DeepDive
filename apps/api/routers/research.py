@@ -162,8 +162,8 @@ async def create_task(
             execution_mode=body.execution_mode,
         )
         # Bind the task's dedicated chat session at creation (1:1). The session is a different
-        # kind than a normal chat: it is hidden from the Sessions sidebar (the bound_session_ids
-        # filter), opened silently when the user selects the task, and a typed run instruction
+        # kind than a normal chat: created marked type=1 (hidden from the Sessions sidebar),
+        # opened silently when the user selects the task, and a typed run instruction
         # in it drives the task. Reusing the same session on every open never forks a new one.
         session_id = await _make_task_session(user.user_id, created["name"])
         if session_id:

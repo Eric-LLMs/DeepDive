@@ -1721,8 +1721,9 @@ class ResearchService:
     def bound_session_ids(self, owner_id: uuid.UUID) -> set[str]:
         """Every chat session id bound to one of this owner's research tasks.
 
-        Research sessions are a different kind from normal chats (one per task, driven from
-        the Research monitor), so the chat sidebar hides them; this is the filter set.
+        A view of the session→task routing index. The sidebar's hide-filter is the DB
+        ``sessions.type`` column; these rows are created marked type=1 and deleted with
+        the task, this index only routes session→task.
         """
         return set(self._load_session_index(owner_id).keys())
 

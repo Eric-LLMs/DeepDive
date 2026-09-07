@@ -745,7 +745,7 @@ class TestChatTasks:
             svc.bind_session(USER, b, session)
         assert "already bound" in str(exc.value)
         assert svc.task_id_for_session(USER, session) == a
-        assert svc.bound_session_ids(USER) == {str(session)}  # chat sidebar filter set
+        assert svc.bound_session_ids(USER) == {str(session)}  # routing-index view
         mirror = ResearchService._load_json(
             env.scratch / str(USER) / a / "session_history.json", None
         )

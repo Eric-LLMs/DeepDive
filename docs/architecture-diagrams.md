@@ -101,7 +101,7 @@ flowchart TB
 
     subgraph trackB["Track B · session memory — PostgreSQL, system-written · agent read-only"]
         MSGS[(messages<br/>text · pgvector · tsvector · created_at)]
-        SESS[(sessions<br/>title · summary · closed_at)]
+        SESS[(sessions<br/>title · summary · closed_at · type<br/>0=chat 1=research, hidden from sidebar)]
         EVTS[(session_events<br/>audit log · JSONB payload<br/>compaction summaries persist here)]
         KW[tsvector keyword recall<br/>to_tsvector english<br/>fts_config swappable for CJK]
         VEC[pgvector semantic recall]

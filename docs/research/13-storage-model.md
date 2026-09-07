@@ -81,15 +81,25 @@ My Drive and the drive holds per-run projections over authoritative server scrat
       scrape/                   #   raw-source captures (save_scrape): <source>_<query>_<n>.md
   outputs/
     <stem>_v1.md  <stem>_v2.md  # a run's promote Create-New final, flipped to RAG-pending
+    <task name>.md              #   the run's report auto-mirror (no version suffix)
 ```
 
+- All three work folders (`materials/`, `outputs/`, `temp/`) are **get-or-created by exact path
+  at `create_task`** — the layout is complete the moment the task exists; each mirror path
+  additionally back-fills a missing folder row (`temp/` itself stays empty until the first run).
 - `run_seq` (scratch `project.json`) is minted **atomically inside `begin_run`'s single-writer
   mutate** and mirrored to the driver checkpoint as `run_version`; it stamps that run's `temp/v{N}`
   and `outputs/<stem>_v{N}.md`. The driver's `cloud_assets` ledger (folder/asset ids for the
-  current run's `temp/vN` + `scrape/`) is transient — reset every `begin_run`, never a multi-run
+  current run's `temp/vN` + `scrape/` + report `outputs/` mirror) is transient — reset every `begin_run`, never a multi-run
   index.
 - Intermediate writes mirror into `temp/v{run_version}/<id>.md`: updated in place within a run, while
   a later run writes a fresh `v{N+1}` and never reuses another run's assets (v{N} stays intact).
+- **Report artifacts auto-mirror** (independent of promote): any artifact whose id contains
+  `report` additionally projects into `outputs/<task name>.md` on every write during a versioned
+  run — no version suffix; the run's first report write creates the file, later writes in the same
+  run update it in place (ledger `out_asset`), a new run lands a fresh file (collision-suffixed).
+  A report-mirror failure is logged, never fails the run's temp mirror. Non-report artifacts stay
+  in `temp/vN` unless explicitly promoted.
 - **Promote is Create-New and single-run idempotent**: it mints `outputs/<stem>_vN.md` and RAG-pends
   that asset; re-promotes inside the same run (even after a new scratch version) refresh that one
   asset in place; only a new `begin_run` enables `_v{N+1}`. Earlier versioned finals are never
