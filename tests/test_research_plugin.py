@@ -2545,6 +2545,146 @@ class TestVerifyBatchAtomic:
         assert all(flags[n] is False for n in RESEARCH_TOOLS - {"research_scrape"})
 
 
+class TestArgCoercionP33:
+    """P3-3 protocol repair — a JSON-stringified ``findings``/``citations``/``node`` is
+    un-wrapped ONCE at the existing validation boundary and audited via ``coerced`` tags.
+
+    The closed loop pinned here (work-order sections 1.2–1.5): repaired calls are 100%
+    equivalent to native ones (same result, graph bytes, revision delta); unparseable /
+    scalar / wrong-container inputs keep the pre-existing reject wording with zero writes;
+    native calls carry no audit key at all; the TOP-LEVEL ``batch`` array is deliberately
+    NOT in the repair list — the engine schema still refuses a stringified batch outright.
+    """
+
+    async def test_stringified_batch_findings_equivalent_to_native(self, env, monkeypatch):
+        hA, svcA, tA, _, cu = await TestVerifyBatchAtomic._setup(env, monkeypatch)
+        findings = [{"url": cu, "verdict": "supports", "facts": ["tomatoes are fruit"]}]
+        out_native = svcA.verify_batch(USER, tA, batch=[{
+            "item_id": "i1", "claim": {"id": "C1"}, "findings": findings,
+            "citations": [cu], "strength": "supported"}])
+        hB, svcB, tB, _, _ = await TestVerifyBatchAtomic._setup(env, monkeypatch)
+        out_coerced = svcB.verify_batch(USER, tB, batch=[{
+            "item_id": "i1", "claim": {"id": "C1"}, "findings": json.dumps(findings),
+            "citations": [cu], "strength": "supported"}])
+
+        assert out_native["items"][0]["status"] == "applied"
+        assert "coerced" not in out_native["items"][0]           # native: zero noise
+        assert out_coerced["items"][0]["coerced"] == ["findings_from_json_string"]
+        repaired = json.loads(json.dumps(out_coerced))           # deep copy before stripping
+        repaired["items"][0].pop("coerced")
+        assert repaired["items"] == out_native["items"]          # same result minus the audit
+        assert repaired["revision_after"] - repaired["revision_before"] == \
+            out_native["revision_after"] - out_native["revision_before"] == 1
+        assert TestVerifyBatchAtomic._mask_assets(hA._graph(env, tA)) == \
+            TestVerifyBatchAtomic._mask_assets(hB._graph(env, tB))  # byte-identical graph
+
+    async def test_stringified_citations_written_as_real_list(self, env, monkeypatch):
+        h, svc, tid, _, cu = await TestVerifyBatchAtomic._setup(env, monkeypatch)
+        out = svc.verify_batch(USER, tid, batch=[{
+            "item_id": "i1", "claim": {"id": "C1"}, "findings": [],
+            "citations": json.dumps([cu]), "strength": "supported"}])
+        item = out["items"][0]
+        assert item["status"] == "applied"
+        assert item["coerced"] == ["citations_from_json_string"]
+        graph = h._graph(env, tid)
+        assert next(n for n in graph["nodes"] if n["id"] == "C1")["citations"] == [cu]
+
+    async def test_record_node_stringified_object_repaired_and_audited(self, env, monkeypatch):
+        _h, svc, tid, _, _ = await TestVerifyBatchAtomic._setup(env, monkeypatch)
+        node = {"id": "S1", "type": "Source", "label": "s"}
+        out = svc.record_node(USER, tid, node=json.dumps(node))
+        assert out["idempotent"] is False
+        assert out["coerced"] == ["node_from_json_string"]
+        assert out["node"]["id"] == "S1" and out["node"]["label"] == "s"
+        replay = svc.record_node(USER, tid, node=node)           # native replay, no tag
+        assert replay["idempotent"] is True and "coerced" not in replay
+
+    async def test_verify_findings_string_equivalent_to_native(self, env, monkeypatch):
+        hA, svcA, tA, cid, cu = await TestVerifyBatchAtomic._setup(env, monkeypatch)
+        findings = [{"url": cu, "verdict": "supports", "facts": ["f"]}]
+        out_native = svcA.ingest_evidence(USER, tA, claim={"id": cid}, findings=findings)
+        hB, svcB, tB, cid2, _ = await TestVerifyBatchAtomic._setup(env, monkeypatch)
+        out_coerced = svcB.ingest_evidence(USER, tB, claim={"id": cid2},
+                                           findings=json.dumps(findings))
+        assert out_native.get("coerced") is None
+        assert out_coerced["coerced"] == ["findings_from_json_string"]
+        stripped = dict(out_coerced)
+        stripped.pop("coerced")
+        assert stripped == out_native
+        assert TestVerifyBatchAtomic._mask_assets(hA._graph(env, tA)) == \
+            TestVerifyBatchAtomic._mask_assets(hB._graph(env, tB))
+
+    async def test_unrepairable_inputs_keep_existing_rejects(self, env, monkeypatch):
+        h, svc, tid, _, _ = await TestVerifyBatchAtomic._setup(env, monkeypatch)
+        graph0 = h._graph(env, tid)
+        rev0 = h._project(env, tid)["project_revision"]
+        out = svc.verify_batch(USER, tid, batch=[
+            {"item_id": "badjson", "claim": {"id": "C1"}, "findings": "[not json"},
+            {"item_id": "wrongc", "claim": {"id": "C1"}, "findings": '{"a": 1}'},
+            {"item_id": "citscalar", "claim": {"id": "C1"}, "findings": [], "citations": "5"},
+            {"item_id": "citdict", "claim": {"id": "C1"}, "findings": [], "citations": '{"a":1}'},
+        ])
+        assert [(i["item_id"], i["status"]) for i in out["items"]] == [
+            ("badjson", "rejected"), ("wrongc", "rejected"),
+            ("citscalar", "rejected"), ("citdict", "rejected")]
+        assert "must be a list" in out["items"][0]["reason"]
+        assert "must be a list" in out["items"][1]["reason"]
+        assert "must be a list of strings" in out["items"][2]["reason"]
+        assert "must be a list of strings" in out["items"][3]["reason"]
+        assert all("coerced" not in i for i in out["items"])     # repair never half-happens
+        assert out["revision_after"] == out["revision_before"] == rev0
+        assert h._graph(env, tid) == graph0                       # zero writes
+        # verify action: scalar / bad JSON / wrong container → the boundary reject message
+        for junk in ("5", "nope", '{"a":1}'):
+            with pytest.raises(ValueError, match="verify 'findings' must be a list"):
+                svc.ingest_evidence(USER, tid, claim={"id": "C1"}, findings=junk)
+        # record_node: stringified list / garbage → the existing TypeError, verbatim
+        for junk in ("[1, 2]", "{oops", '"hello"'):
+            with pytest.raises(TypeError, match="must be an object, not a string"):
+                svc.record_node(USER, tid, node=junk)
+
+    async def test_tool_roundtrip_layering_engine_repair_is_transparent(self, env, monkeypatch):
+        """Layered contract pinned honestly: the engine pre-validates tool args with its
+        own generic stringified-container decoder, so a TOP-LEVEL stringified param never
+        reaches the plugin (repair invisible, no ``coerced`` tag). The plugin-level repair
+        — the one that is audited — covers what the engine's schema walk cannot see:
+        untyped batch-item properties (the Run 7 retry source) and direct service calls.
+        """
+        _h, svc, tid, _, cu = await TestVerifyBatchAtomic._setup(env, monkeypatch)
+        res = await env.runtime.execute(ToolExecution(
+            call_id=str(uuid.uuid4()), name="research_evidence",
+            arguments={"action": "record_node", "project_id": tid,
+                       "node": json.dumps({"id": "S9", "type": "Source"})}))
+        assert res.is_error is False, getattr(res.error, "message", None)
+        assert "coerced" not in res.value          # engine-layer repair: no plugin tag
+        assert res.value["node"]["id"] == "S9"
+        res2 = await env.runtime.execute(ToolExecution(
+            call_id=str(uuid.uuid4()), name="research_evidence",
+            arguments={"action": "verify_batch", "project_id": tid, "batch": json.dumps([
+                {"item_id": "i1", "claim": {"id": "C1"},
+                 "findings": [{"url": cu, "verdict": "supports"}], "citations": [cu]}])}))
+        assert res2.is_error is False, getattr(res2.error, "message", None)  # top level: engine
+        assert "coerced" not in res2.value["items"][0]
+        res3 = await env.runtime.execute(ToolExecution(
+            call_id=str(uuid.uuid4()), name="research_evidence",
+            arguments={"action": "verify_batch", "project_id": tid, "batch": [{
+                "item_id": "i2", "claim": {"id": "C1"},
+                "findings": json.dumps([{"url": cu, "verdict": "supports",
+                                         "facts": ["repair-me"]}]),
+                "citations": json.dumps([cu])}]}))
+        assert res3.is_error is False, getattr(res3.error, "message", None)  # ITEM level: plugin
+        item = res3.value["items"][0]
+        assert item["status"] == "applied"
+        assert item["coerced"] == ["findings_from_json_string", "citations_from_json_string"]
+        # Unparseable top-level node still rides the engine's EXISTING invalid_args reject
+        # (strict schema — the plugin never sees it, error class unchanged).
+        res4 = await env.runtime.execute(ToolExecution(
+            call_id=str(uuid.uuid4()), name="research_evidence",
+            arguments={"action": "record_node", "project_id": tid, "node": "{oops"}))
+        assert res4.is_error is True
+        assert res4.error.info.get("name") == "invalid_args"
+
+
 class TestP3Fingerprints:
     """Pure-function contract of plugins/research/batch.py (no I/O — constraint 1)."""
 

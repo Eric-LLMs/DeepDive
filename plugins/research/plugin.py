@@ -162,6 +162,37 @@ def normalize_claim_strength(value: Any) -> str | None:
         return v
     return _CLAIM_STRENGTH_ALIASES.get(v)
 
+
+def _coerce_json_container(value: Any, *, expect: str) -> tuple[Any, bool]:
+    """P3-3 protocol repair: unwrap a container argument the model JSON-encoded as a string.
+
+    A known LLM failure mode is double-serialization — passing ``"[{...}]"`` where the
+    contract asks for the array itself. This helper performs the *one* deterministic repair
+    (``json.loads``) at the existing validation boundary and then hands the value straight
+    back into the unchanged checks, so a repaired call is 100% equivalent to a native one.
+
+    Zero guessing (P3-3 constraint 3): the parsed value must match ``expect``
+    (``"list"`` or ``"dict"``) EXACTLY; unparseable text, scalars, or the wrong container
+    are returned untouched so every existing reject path fires verbatim. Returns
+    ``(value, coerced)``; ``coerced`` is the audit flag — the raw payload is never logged.
+    """
+    if not isinstance(value, str):
+        return value, False
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return value, False
+    ok = parsed.__class__ is list if expect == "list" else parsed.__class__ is dict
+    return (parsed, True) if ok else (value, False)
+
+
+def _with_coerced(result: dict, coerced: bool, name: str) -> dict:
+    """Attach the P3-3 audit marker (``"coerced": ["<name>_from_json_string"]``) to a
+    result dict ONLY when a repair actually happened — native calls stay byte-identical."""
+    if coerced:
+        result["coerced"] = [f"{name}_from_json_string"]
+    return result
+
 # ── gate review notes (auto-authored chat explanation, docs/research/10 §6) ──
 # When a gate override parks a run for a human decision, the gate service writes one
 # deterministic ``system`` note into the task's session chat so the operator sees WHY the
@@ -2083,6 +2114,11 @@ class ResearchService:
         the caller whether it created the node or found it.
         """
         graph = self._load_graph(owner_id, project_id)
+        # P3-3 boundary repair: a JSON-encoded object string is un-wrapped ONCE and then
+        # flows through the unchanged checks below — a repaired record is identical to a
+        # native one; the repair itself is audited via the ``coerced`` tag (never the raw
+        # payload). Anything unparseable / non-dict falls through to the same TypeError.
+        node, _node_coerced = _coerce_json_container(node, expect="dict")
         # The node's ``id``/``type`` are the graph's identity keys — index them only after a
         # precise guard. A bare ``KeyError: 'id'`` (a probe node like ``{type, title}``) tells
         # the model nothing about what is missing, so it cannot correct the call.
@@ -2097,7 +2133,7 @@ class ResearchService:
         node_type = node["type"]
         existing = next((n for n in graph["nodes"] if n["id"] == node_id), None)
         if existing is not None:
-            return {"node": existing, "idempotent": True}
+            return _with_coerced({"node": existing, "idempotent": True}, _node_coerced, "node")
         record = {
             "id": node_id,
             "type": node_type,
@@ -2116,7 +2152,7 @@ class ResearchService:
             record["strength"] = norm
         graph["nodes"].append(record)
         self._save_graph(owner_id, project_id, graph)
-        return {"node": record, "idempotent": False}
+        return _with_coerced({"node": record, "idempotent": False}, _node_coerced, "node")
 
     def link_edge(
         self, owner_id: uuid.UUID, project_id: str, *, src: str, dst: str, kind: str
@@ -3422,6 +3458,13 @@ class ResearchService:
         if not isinstance(claim_id, str) or not claim_id.strip():
             raise ValueError("verify 'claim' must include the recorded claim's 'id'")
         claim_id = claim_id.strip()
+        # P3-3 boundary repair: a JSON-encoded findings list is un-wrapped ONCE before the
+        # E7/E1/E2 core runs, then re-enters the unchanged path. A container that is still
+        # not a list after the single attempt (bad JSON, scalar, dict) is rejected here with
+        # the same wording verify_batch uses for the same field — verify never guesses.
+        findings, _findings_coerced = _coerce_json_container(findings, expect="list")
+        if findings is not None and not isinstance(findings, list):
+            raise ValueError("verify 'findings' must be a list")
         project = self._load_project(owner_id, project_id)
         graph = self._load_graph(owner_id, project_id)
         claim_node = next((n for n in graph["nodes"] if n["id"] == claim_id), None)
@@ -3435,7 +3478,7 @@ class ResearchService:
         out = self._apply_findings(graph, claim_id, claim_label, prov, findings)
         if out["changed"]:
             self._save_graph(owner_id, project_id, graph)
-        return {
+        return _with_coerced({
             "claim_id": claim_id,
             "nodes_added": out["nodes_added"],
             "nodes_updated": out["nodes_updated"],
@@ -3443,7 +3486,7 @@ class ResearchService:
             "verified_sources": out["verified_sources"],
             "rejected": out["rejected"],
             "neutral_skipped": out["neutral_skipped"],
-        }
+        }, _findings_coerced, "findings")
 
     def _apply_findings(
         self,
@@ -3656,7 +3699,10 @@ class ResearchService:
         skipped and no stamp is needed the mutation returns ``False``: zero writes, zero
         revision bump (transaction-level idempotency, constraint 6). Structural
         validation errors reject only the offending item (partial isolation) — the rest
-        of the batch still commits.
+        of the batch still commits. P3-3 boundary repair: a stringified ``findings`` /
+        ``citations`` JSON array inside an item is un-wrapped ONCE before those checks
+        (audited via a per-item ``coerced`` tag); unparseable or wrong-container inputs
+        reject exactly as before.
         """
         if not isinstance(batch, list) or not batch:
             raise ValueError("verify_batch needs 'batch' as a non-empty list of items")
@@ -3702,38 +3748,54 @@ class ResearchService:
                     results.append({"item_id": item_id, "status": "rejected", "reason": "verify_batch 'claim' must include the recorded claim's 'id'"})
                     continue
                 claim_id = claim_id.strip()
+                # P3-3 boundary repair (per item, before the unchanged type checks): the
+                # ONLY repair attempted is one json.loads of a stringified container that
+                # matches the expected type; failures fall into the same rejects below.
+                item_coerced: list[str] = []
+
+                def _push(res: dict) -> None:
+                    if item_coerced:
+                        res["coerced"] = item_coerced
+                    results.append(res)
+
                 findings = item.get("findings", [])
+                findings, f_coerced = _coerce_json_container(findings, expect="list")
+                if f_coerced:
+                    item_coerced.append("findings_from_json_string")
                 if not isinstance(findings, list):
-                    results.append({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
-                                    "reason": "verify_batch 'findings' must be a list"})
+                    _push({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
+                           "reason": "verify_batch 'findings' must be a list"})
                     continue
                 citations = item.get("citations")
+                citations, c_coerced = _coerce_json_container(citations, expect="list")
+                if c_coerced:
+                    item_coerced.append("citations_from_json_string")
                 if citations is not None and not isinstance(citations, list):
-                    results.append({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
-                                    "reason": "verify_batch 'citations' must be a list of strings"})
+                    _push({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
+                           "reason": "verify_batch 'citations' must be a list of strings"})
                     continue
                 strength_raw = item.get("strength")
                 strength_norm: str | None = None
                 if strength_raw is not None:
                     strength_norm = normalize_claim_strength(strength_raw)
                     if strength_norm is None:
-                        results.append({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
-                                        "reason": str(_claim_strength_error(strength_raw))})
+                        _push({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
+                               "reason": str(_claim_strength_error(strength_raw))})
                         continue
 
                 node = next((n for n in graph["nodes"] if n.get("id") == claim_id), None)
                 if node is None:  # E8 — the exact single-verify classification
-                    results.append({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
-                                    "reason": f"claim node not found: {claim_id!r} — verify does not create claims; "
-                                              "record it first with research_evidence record_node (type 'Claim')"})
+                    _push({"item_id": item_id, "claim_id": claim_id, "status": "rejected",
+                           "reason": f"claim node not found: {claim_id!r} — verify does not create claims; "
+                                     "record it first with research_evidence record_node (type 'Claim')"})
                     continue
 
                 current_fp = evidence_fingerprint(graph, claim_id)
                 stored = new_fps.get(claim_id)
                 gate = _batch_gate_ok(node, normalize_claim_strength)
                 if not compute_pending(stored, current_fp, gate):
-                    results.append({"item_id": item_id, "claim_id": claim_id, "status": "skipped_unchanged",
-                                    "pending": False, "evidence_fingerprint": current_fp})
+                    _push({"item_id": item_id, "claim_id": claim_id, "status": "skipped_unchanged",
+                           "pending": False, "evidence_fingerprint": current_fp})
                     continue
 
                 out = self._apply_findings(graph, claim_id, node.get("label") or claim_id, prov, findings)
@@ -3754,7 +3816,7 @@ class ResearchService:
                 if item_changed or stored != fp_after:
                     new_fps[claim_id] = fp_after
                     dirty = True
-                results.append({
+                _push({
                     "item_id": item_id, "claim_id": claim_id, "status": "applied",
                     "pending": True, "changed": item_changed,
                     "nodes_added": out["nodes_added"], "nodes_updated": out["nodes_updated"],
@@ -4384,7 +4446,8 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             {
                 "node": {
                     "type": "object",
-                    "description": "Node record: {id, type, label?, status?, ...}",
+                    "description": "Node record: {id, type, label?, status?, ...}. Pass the "
+                    "OBJECT itself — never pre-encode it as a JSON string.",
                 },
                 "patch": {
                     "type": "object",
@@ -4398,8 +4461,9 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 "findings": {
                     "type": "array",
                     "description": "verify: [{url, verdict: supports|contradicts|neutral, "
-                    "source_label?, facts?: [str], excerpt?: str}]. The service checks each "
-                    "URL against this run's server-side fetch ledger — your content_status/"
+                    "source_label?, facts?: [str], excerpt?: str}]. Pass the ARRAY itself — "
+                    "never pre-encode it as a JSON string. The service checks each URL "
+                    "against this run's server-side fetch ledger — your content_status/"
                     "length assertions carry no authority.",
                 },
                 "batch": {
@@ -4407,8 +4471,11 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                     "description": "verify_batch: up to 8 items "
                     "[{item_id: str, claim: {id}, findings: [same shape as verify], "
                     "citations?: [str], strength?: asserted|supported|confident|contested}]. "
-                    "One atomic commit (single revision bump) for the whole batch; a "
-                    "structural error rejects only that item.",
+                    "Per item, 'findings'/'citations' must be native JSON arrays, never "
+                    "JSON-encoded strings (a stringified container is repaired once and "
+                    "audited via a 'coerced' tag on that item). One atomic commit (single "
+                    "revision bump) for the whole batch; a structural error rejects only "
+                    "that item.",
                     "items": {"type": "object"},
                 },
             },
