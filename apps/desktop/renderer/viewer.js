@@ -94,11 +94,6 @@ const Viewer = (() => {
     return i < 0 ? "" : clean.slice(i + 1).toLowerCase();
   }
 
-  function baseName(name) {
-    const i = name.lastIndexOf(".");
-    return i < 0 ? name : name.slice(0, i);
-  }
-
   // Parent directory of an absolute path (handles both "/" and "\" separators).
   function dirOf(pathStr) {
     const parts = pathStr.replace(/\\/g, "/").split("/");
@@ -675,18 +670,13 @@ const Viewer = (() => {
       bar._toolItem(label, onClick);
     }
 
+    // Unified screenshot: hand off to app.js's attach flow (capture window → drag-select
+    // region → stage as the next chat message's attachment). The former whole-frame
+    // "save PNG to folder" path (desktopAPI.saveScreenshot) is retired — one behavior
+    // across every 📷 entry.
     menuItem("📷 Screenshot", async () => {
-      if (!video.videoWidth) {
-        toast("Video not ready yet");
-        return;
-      }
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-      const dataURL = canvas.toDataURL("image/png");
-      const saved = await window.desktopAPI.saveScreenshot(dataURL, `${baseName(name)}.png`);
-      toast(saved ? `Saved: ${saved}` : "Cancelled");
+      if (!attachHandler) { toast("Chat is not ready yet"); return; }
+      await attachHandler("screenshot");
     });
     menuItem("Generate PPT", () => generateMedia("pptx"));
     menuItem("Generate Book", () => generateMedia("pdf"));
