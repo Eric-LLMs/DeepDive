@@ -63,9 +63,11 @@ from core.infrastructure.web_fetch import (
     canonical_url as canonicalize,
 )
 from plugins.research.batch import (
+    MAX_CHUNK_CLAIMS,
     compute_pending,
     evidence_fingerprint,
     gate_ok as _batch_gate_ok,
+    suggest_chunks,
 )
 from plugins.research.fetch_cache import (
     FetchStore,
@@ -1962,19 +1964,56 @@ class ResearchService:
         stored_fps = ResearchService._assets_ledger(project).get("_verify_fps")
         if not isinstance(stored_fps, dict):
             stored_fps = {}
+        # Verdict summary per claim (ticket edges → their Evidence verdicts): a
+        # read-optimization digest of what the last batch commit established.
+        evidence_nodes = {
+            n.get("id"): n
+            for n in graph["nodes"]
+            if isinstance(n, dict) and n.get("type") == "Evidence"
+        }
+        verdicts_by_claim: dict[str, set[str]] = {}
+        for e in graph["edges"]:
+            if (
+                isinstance(e, dict)
+                and e.get("kind") in ("supports", "contradicts")
+                and isinstance(e.get("dst"), str)
+            ):
+                ev = evidence_nodes.get(e["dst"])
+                verdict = (ev or {}).get("verdict")
+                if isinstance(verdict, str) and verdict.strip():
+                    verdicts_by_claim.setdefault(e["src"], set()).add(
+                        verdict.strip().lower()
+                    )
         claims = []
         for n in graph["nodes"]:
             if n.get("type") != "Claim":
                 continue
             fp = evidence_fingerprint(graph, n["id"])
+            pending = compute_pending(
+                stored_fps.get(n["id"]), fp,
+                _batch_gate_ok(n, normalize_claim_strength),
+            )
             claims.append({
                 "id": n["id"],
                 "label": (n.get("label") or "")[:80],
                 "anchored": bool(n.get("citations")),
                 "evidence_fingerprint": fp,
-                "pending": compute_pending(stored_fps.get(n["id"]), fp,
-                                           _batch_gate_ok(n, normalize_claim_strength)),
+                "pending": pending,
+                # P3-4 derived/read-optimization fields — hints ONLY. The absolute
+                # source of truth remains graph + revision + ``_verify_fps``:
+                # dropping either field can never change correctness, and the
+                # commit-time skip rule (compute_pending) is the real gate.
+                "last_verdict": sorted(verdicts_by_claim.get(n["id"], set())) or None,
             })
+        # Deterministic chunk packing over the pending set (pure suggest_chunks): the
+        # digest tells the agent which claims belong to one verify_batch call without
+        # it having to re-derive the grouping. Hint-only, same invariant as above.
+        chunks = suggest_chunks(
+            [c["id"] for c in claims if c["pending"]], graph
+        )
+        hint_by_claim = {cid: ch.chunk_id for ch in chunks for cid in ch.claim_ids}
+        for c in claims:
+            c["chunk_hint"] = hint_by_claim.get(c["id"])
         if claims:
             out["claims"] = claims
         return out
@@ -3717,8 +3756,9 @@ class ResearchService:
 
     # Upper bound on claims committed per ``verify_batch`` call. Sized to one EVIDENCE
     # stage's claim set (Run 7: 8) — big enough to fold the whole stage into one commit,
-    # small enough to keep the critical section and the LLM payload bounded.
-    _VERIFY_BATCH_MAX = 8
+    # small enough to keep the critical section and the LLM payload bounded. Shared with
+    # the digest chunker (``batch.MAX_CHUNK_CLAIMS``): one chunk is exactly one call.
+    _VERIFY_BATCH_MAX = MAX_CHUNK_CLAIMS
 
     def verify_batch(
         self,

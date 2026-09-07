@@ -31,13 +31,33 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
     "claim_fingerprint",
     "evidence_fingerprint",
     "compute_pending",
+    "EvidenceChunk",
+    "suggest_chunks",
+    "MAX_CHUNK_CLAIMS",
+    "DEFAULT_BUDGET_TOKENS",
 ]
+
+# The chunker's per-chunk claim ceiling mirrors verify_batch's commit cap — one chunk
+# is exactly one verify_batch call, so the two constants must never drift.
+MAX_CHUNK_CLAIMS = 8
+
+# Default adjudication-context budget (tokens) per chunk: the batched claim set plus
+# its findings is sized to stay far below the model's context window (P3 constraint:
+# deterministic Python chunking, never a full claims×pages Cartesian prompt).
+DEFAULT_BUDGET_TOKENS = 4000
+
+# Crude deterministic token estimate: 4 chars ≈ 1 token, plus a fixed per-claim
+# allowance covering its findings payload and the verdict/facts output it costs in
+# the batched prompt. Constants only — no tokenizer, no clock, no I/O.
+_CHARS_PER_TOKEN = 4
+_PER_CLAIM_ALLOWANCE = 150
 
 # Edge kinds that carry committed support/contradiction (E1/E2 semantics inherited
 # from verify: a "neutral" verdict annotates an existing Evidence node but adds no
@@ -143,3 +163,83 @@ def gate_ok(claim_node: dict, normalize_strength) -> bool:
     return bool(claim_node.get("citations")) and normalize_strength(
         claim_node.get("strength")
     ) is not None
+
+
+# ── deterministic batch chunker (P3-4) ───────────────────────────────────────
+@dataclass(frozen=True)
+class EvidenceChunk:
+    """One logical adjudication batch: a stable, content-derived group of claims.
+
+    ``chunk_id`` is a content-stable hash (never a UUID): the same normalized
+    (claim_ids, budget) always yields the same id, so a digest hint survives reloads
+    and is comparable across turns. ``claim_ids`` is a fixed ascending-order tuple —
+    iteration order of the input can never change it.
+    """
+
+    chunk_id: str
+    claim_ids: tuple[str, ...]
+    budget: int
+
+
+def _claim_token_estimate(node: dict) -> int:
+    """Deterministic per-claim budget cost: statement text + a fixed findings allowance."""
+    text = normalize_text(node.get("label")) + normalize_text(node.get("statement"))
+    return len(text) // _CHARS_PER_TOKEN + _PER_CLAIM_ALLOWANCE
+
+
+def _chunk_id(claim_ids: tuple[str, ...], budget: int) -> str:
+    return "chk-" + _sha(",".join(claim_ids), str(budget))[:12]
+
+
+def suggest_chunks(
+    pending_claims: Any,
+    graph: dict,
+    budget_tokens: int = DEFAULT_BUDGET_TOKENS,
+) -> list[EvidenceChunk]:
+    """Pack pending claims into verify_batch-sized, budget-bounded chunks — pure code,
+    never an LLM planner (P3 constraint 3: deterministic orchestration).
+
+    ``pending_claims`` accepts claim ids or digest rows (``{"id": ...}``); order does
+    not matter — ids are de-duplicated and sorted ascending before packing. Greedy
+    first-fit over that fixed order: a chunk closes when the next claim would break
+    the token budget or the per-chunk ceiling. A single claim that alone exceeds the
+    budget still gets its own chunk (liveness: nothing is silently dropped). Output is
+    deterministic for identical normalized input: no clock, no RNG, no external state.
+
+    The result is a *hint* for the agent (digest ``chunk_hint``); correctness never
+    depends on it — the authority stays in graph + ``_verify_fps`` + ``compute_pending``.
+    """
+    ids: list[str] = []
+    for item in pending_claims or ():
+        if isinstance(item, dict):
+            cid = item.get("id")
+        else:
+            cid = item
+        if isinstance(cid, str) and cid.strip():
+            ids.append(cid.strip())
+    ids = sorted(set(ids))
+    if not ids:
+        return []
+
+    nodes = {
+        n.get("id"): n
+        for n in graph.get("nodes", [])
+        if isinstance(n, dict) and n.get("type") == "Claim"
+    }
+    budget = max(1, int(budget_tokens))
+
+    chunks: list[EvidenceChunk] = []
+    current: list[str] = []
+    current_est = 0
+    for cid in ids:
+        est = _claim_token_estimate(nodes[cid]) if cid in nodes else _PER_CLAIM_ALLOWANCE
+        if current and (current_est + est > budget or len(current) >= MAX_CHUNK_CLAIMS):
+            chunk_ids = tuple(current)
+            chunks.append(EvidenceChunk(_chunk_id(chunk_ids, budget), chunk_ids, budget))
+            current, current_est = [], 0
+        current.append(cid)
+        current_est += est
+    if current:
+        chunk_ids = tuple(current)
+        chunks.append(EvidenceChunk(_chunk_id(chunk_ids, budget), chunk_ids, budget))
+    return chunks

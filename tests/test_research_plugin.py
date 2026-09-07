@@ -2360,10 +2360,16 @@ class TestGetStateClaimsDigest:
         state = await _run(env.runtime, "research_state", action="get_state", project_id=pid)
         claims = state["claims"]
         assert [c["id"] for c in claims] == ["C1", "C2"]  # only Claims, in graph order
-        # P3-1 additive contract: evidence_fingerprint + pending join the digest.
-        assert all(set(c) == {"id", "label", "anchored", "evidence_fingerprint", "pending"}
-                   for c in claims)
+        # P3-1 additive contract: evidence_fingerprint + pending join the digest;
+        # P3-4 adds the derived hint fields last_verdict + chunk_hint.
+        assert all(set(c) == {
+            "id", "label", "anchored", "evidence_fingerprint", "pending",
+            "last_verdict", "chunk_hint",
+        } for c in claims)
         assert all(c["pending"] is True for c in claims)  # no _verify_fps baseline yet
+        assert all(c["last_verdict"] is None for c in claims)  # nothing committed yet
+        # both pending claims share one hint chunk (they fit the default budget)
+        assert claims[0]["chunk_hint"] == claims[1]["chunk_hint"] is not None
         assert claims[0]["label"] == long_label[:80]  # display cap, not the identity
         assert claims[1]["label"] == "short claim"    # <=80 kept whole
         assert claims[0]["anchored"] is False and claims[1]["anchored"] is False
@@ -2774,6 +2780,80 @@ class TestP3Fingerprints:
         assert gate_ok({"citations": [], "strength": "supported"}, normalize_claim_strength) is False
         assert gate_ok({"citations": ["u"], "strength": "very-high"}, normalize_claim_strength) is False
         assert gate_ok({"citations": ["u"]}, normalize_claim_strength) is False
+
+
+class TestSuggestChunks:
+    """P3-4 deterministic chunker: pure, order-invariant, budget- and cap-bounded."""
+
+    @staticmethod
+    def _graph(ids):
+        return {
+            "nodes": [{"id": i, "type": "Claim", "label": f"claim {i}"} for i in ids],
+            "edges": [],
+        }
+
+    def test_empty_pending_yields_no_chunks(self):
+        from plugins.research.batch import suggest_chunks
+
+        assert suggest_chunks([], self._graph(["C1"])) == []
+        assert suggest_chunks(None, self._graph([])) == []
+
+    def test_output_is_deterministic_and_order_invariant(self):
+        from plugins.research.batch import suggest_chunks
+
+        g = self._graph(["C1", "C2", "C3"])
+        a = suggest_chunks(["C3", "C1", "C2"], g)
+        b = suggest_chunks(["C2", "C1", "C3", "C1"], g)  # dupes collapse too
+        assert [(c.chunk_id, c.claim_ids, c.budget) for c in a] == \
+               [(c.chunk_id, c.claim_ids, c.budget) for c in b]
+        assert all(list(c.claim_ids) == sorted(c.claim_ids) for c in a)
+
+    def test_chunk_id_is_content_stable_not_random(self):
+        from plugins.research.batch import suggest_chunks
+
+        g = self._graph(["C1", "C2"])
+        c1 = suggest_chunks(["C1", "C2"], g)[0]
+        c2 = suggest_chunks(["C1", "C2"], g)[0]
+        assert c1.chunk_id == c2.chunk_id
+        assert c1.chunk_id.startswith("chk-")
+        # different membership or budget ⇒ different id (content-derived)
+        assert suggest_chunks(["C1"], g)[0].chunk_id != c1.chunk_id
+        assert suggest_chunks(["C1", "C2"], g, budget_tokens=100)[0].chunk_id != c1.chunk_id
+
+    def test_respects_per_chunk_claim_ceiling(self):
+        from plugins.research.batch import MAX_CHUNK_CLAIMS, suggest_chunks
+
+        ids = [f"C{i:02d}" for i in range(1, MAX_CHUNK_CLAIMS * 2 + 3)]
+        chunks = suggest_chunks(ids, self._graph(ids))
+        assert chunks and all(len(c.claim_ids) <= MAX_CHUNK_CLAIMS for c in chunks)
+        assert sorted(cid for c in chunks for cid in c.claim_ids) == sorted(ids)
+
+    def test_budget_splits_even_below_the_ceiling(self):
+        from plugins.research.batch import suggest_chunks
+
+        # Long statements: each claim ≈ (2000 chars / 4) + 150 ≈ 650 tokens.
+        ids = [f"C{i}" for i in range(4)]
+        g = {"nodes": [{"id": i, "type": "Claim", "label": "x" * 2000} for i in ids],
+             "edges": []}
+        chunks = suggest_chunks(ids, g, budget_tokens=1500)
+        assert all(len(c.claim_ids) <= 2 for c in chunks)  # ≤2 claims fit 1500 tok
+        assert len(chunks) >= 2
+
+    def test_oversized_single_claim_still_gets_a_chunk(self):
+        from plugins.research.batch import suggest_chunks
+
+        g = {"nodes": [{"id": "BIG", "type": "Claim", "label": "x" * 40000}], "edges": []}
+        chunks = suggest_chunks(["BIG"], g, budget_tokens=100)  # alone exceeds budget
+        assert [c.claim_ids for c in chunks] == [("BIG",)]  # liveness: never dropped
+
+    def test_accepts_digest_rows_and_unknown_ids(self):
+        from plugins.research.batch import suggest_chunks
+
+        g = self._graph(["C1"])
+        chunks = suggest_chunks(
+            [{"id": "C1", "pending": True}, {"id": " C2 "}, {"id": ""}], g
+        )  # C2 not on graph: allowance-only cost, still scheduled
+        assert [c.claim_ids for c in chunks] == [("C1", "C2")]
 
 
 class TestFetchCacheP32A:
