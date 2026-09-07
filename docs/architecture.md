@@ -92,7 +92,7 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
-| Research OS (chat-driven) | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent (`materials/`, `outputs/`, live `task_spec.json` / `session_history.json` mirrors) over authoritative scratch state; session isolation (research sessions bound 1:1 to a task and hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module) |
+| Research OS (chat-driven) | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module) |
 | Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX embedded images → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
 | Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload). Auth endpoints are Redis **rate-limited per client IP** (login/register/recovery, fixed window, fail-open); `enforce_secure_secrets` fails fast at startup when the legacy `JWT_SECRET` default is untouched |
 | Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover. The Tokens page disables a user's access to a key per (user, channel); a user with no usable key degrades to the anonymous tier (guest quota) instead of losing login |
@@ -203,6 +203,7 @@ deepdive/
 │   ├── core/                     # package `core`: config + domain/application/ports/infrastructure
 │   │   ├── infrastructure/mailer.py            # stdlib smtplib emailer (verification / reset / test)
 │   │   └── infrastructure/memory_retrieval.py  # PG tsvector + pgvector session-recall channels
+│   ├── workflow/                 # package `workflow`: generic workflow core (definition / runner / runtime / ports / leases / ledger / policy / retry / states) — domain-free control plane driven by adapters
 │   └── shared/proto/retrieval/   # generated protobuf/gRPC stubs (import name `retrieval.v1`)
 ├── data/
 │   └── soul.md                   # agent identity persona (STATIC_PREFIX source)
@@ -230,8 +231,9 @@ deepdive/
 > `packages/core/{domain,ports,infrastructure}`, `migrations/*.sql` and `tests/` account for
 > most of the omitted files. `git ls-files` is the authoritative list.
 
-> `packages/agent`, `packages/rag`, `packages/core`, and `apps/api` are independent top-level
-> packages (import names `agent` / `rag` / `core` / `api`); no nested `deepdive` package layer.
+> `packages/agent`, `packages/rag`, `packages/core`, `packages/workflow`, and `apps/api` are
+> independent top-level packages (import names `agent` / `rag` / `core` / `workflow` / `api`);
+> no nested `deepdive` package layer.
 > Generated proto stubs live under `packages/shared/proto` and are imported as
 > `retrieval.v1.retrieval_pb2` (a real package on the editable-install path, no `sys.path` hack).
 
@@ -1232,10 +1234,12 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 > earlier design names (`conversations`, `job_logs` …). `migrations/0001_init.sql` is the single
 > consolidated base schema (the squash of the original 0001–0008 development migrations; every
 > statement is idempotent). On top of it, the incremental migrations `0002_auth_profiles.sql` …
-> `0013_asset_acl_public.sql` layer later changes (self-service accounts + `verification_tokens`,
+> `0017_sessions_type.sql` layer later changes (self-service accounts + `verification_tokens`,
 > usage-log channel, cloud-drive objects, vocabulary isolation, folders, workspace activity,
 > memory-retention index, session title, RAG pipeline columns, the multi-source query
-> repository, RAG retrieval feedback, and the public-link asset ACL). All are applied in
+> repository, RAG retrieval feedback, the public-link asset ACL, the per-message
+> `imported_rag` flag, the chat-screenshot `attach_asset_id` link, the derived-image
+> `source_asset_id` lineage, and the `sessions.type` chat/research discriminator). All are applied in
 > filename order by `init_db()`.
 
 The core learning + chat tables that run today (`migrations/0001_init.sql`):
@@ -1253,7 +1257,10 @@ The core learning + chat tables that run today (`migrations/0001_init.sql`):
   GIN-indexed). The `0011_query_repository.sql` migration makes non-file content first-class:
   `source_type` (`'file'` default | `'learning'` | `'chat'`, indexed) + `source_id`, and the new
   `articles` table (user / domain / title / content / created_at) for Learning-Platform study material.
-- **sessions** — `id`, `user_id` (FK → `users`), `title`, `created_at`, `closed_at`, `summary`.
+- **sessions** — `id`, `user_id` (FK → `users`), `title`, `created_at`, `closed_at`, `summary`,
+  `type`. `type` (`0017_sessions_type.sql`, default `0`) distinguishes the session kind:
+  `0` = ordinary chat, `1` = research task session — `GET /sessions` hides type 1 from the chat
+  sidebar and deleting a research task cascades to its type-1 sessions (§17).
   `title` (`0009_session_title.sql`) is auto-set at creation from the first user message —
   whitespace-normalized and capped at 40 chars — so the sidebar shows a readable name while the
   deferred finalize job is still running; `PATCH /sessions/{id}` can rename it and an empty title
@@ -2137,7 +2144,10 @@ read-modify-written outside that lock), `graph.json`, `executions.json`, `approv
 `artifacts/<id>/v<N>` (versioned), `task_spec.json` / `session_history.json` (also mirrored to the
 cloud), the append-only `run_events.json` progress log (see the run-lifecycle paragraph below), and
 `_session_index.json` (the session→task routing map). The user-visible **cloud task folder** lives in
-My Drive under the parent the user picked: `materials/` (copies of selected cloud assets, named
+My Drive under the parent the user picked — the three work folders (`materials/`, `outputs/`,
+`temp/`) are **get-or-created by exact path when the task is created**, so the layout is stable from
+the first moment (and every later mirror independently back-fills a missing folder row):
+`materials/` (copies of selected cloud assets, named
 `<asset_id>__<safe_name>`); `temp/v1/ v2/ …` — one **permanent per-run subfolder** per `run_seq`,
 holding that run's working copies (`write_scratch` / `create_version` intermediates land in
 `temp/v{run_version}/<id>.md`, updated in place within a run, never clobbering an earlier run's
@@ -2146,8 +2156,15 @@ text captured **server-side** by `research_scrape fetch` — ≤3 URLs per call,
 draft persisted alongside a per-run provenance row, see the EVIDENCE paragraph below); and `outputs/<stem>_v<N>.md` — a run's promote **Create-New** final, versioned
 per run: the first promote of a run mints `outputs/<stem>_vN.md` and RAG-pends that asset, a
 re-promote inside the same run refreshes it in place (never a `_vN+1`), and a later run writes a fresh
-`_v{N+1}` that never overwrites or reuses an earlier final. The transient `driver.cloud_assets` ledger
-(folder/asset ids for the current run's `temp/vN` + `scrape/` projection) is reset by every
+`_v{N+1}` that never overwrites or reuses an earlier final. Independent of promote, **report
+artifacts auto-mirror**: any artifact whose id contains `report` (e.g. `report`, `settle_report.md`)
+additionally projects into `outputs/<task name>.md` on every write during a versioned run — no
+version suffix: the run's first report write creates the file, later writes in the same run update
+it in place (the run ledger's `out_asset`), and a NEW run's report lands as a fresh file
+(collision-safe auto-suffix on the busy name); a report-mirror failure is logged and never fails
+the run's temp mirror. Non-report artifacts are intermediate working products and stay in
+`temp/vN` (promote remains their opt-in path to `outputs/`). The transient `driver.cloud_assets` ledger
+(folder/asset ids for the current run's `temp/vN` + `scrape/` + report `outputs/` projection) is reset by every
 `begin_run` and is never a multi-run index; inside it, the driver's `_fetch_provenance` table records
 one row per evidence `source_url` fetched this run — the whitelist `research_scrape read` and the
 `verified` boundary consult (see the EVIDENCE paragraph below). The legacy no-run projection (a task promoted outside any
@@ -2192,10 +2209,55 @@ the driver), and the WRITE stage may cite a page only through `research_scrape r
 to the current run's own provenance rows — the agent can't cite a URL it never actually loaded this run.
 
 **Session isolation.** Every task binds a single dedicated chat session (1:1, `bind_session`).
-Research sessions are a different kind than a normal chat: `GET /sessions` filters them out via
-`bound_session_ids`, so the chat sidebar never shows them, and opening a task's session is
+The kind lives in the DB — `sessions.type` (migration `0017_sessions_type.sql`; 0 = chat,
+1 = research): the task's session row is created **marked `type=1`**, and when an ordinary chat's
+first message binds it to a task the chat route marks it type 1 too (`set_session_type`,
+best-effort — a marking failure never breaks the turn). `GET /sessions` filters by `type != 1`, so
+the chat sidebar never shows research sessions; the `_session_index.json` routing map stays purely
+the session→task dispatch index, no longer the isolation mechanism. Opening a task's session is
 side-effect free — navigation never creates an execution, opening never starts a run; only a typed
 message drives the task (the first one auto-resumes the `deep_research` skill).
+
+**Generic Workflow Core (`packages/workflow`) — research is one workflow on it.** The
+control-plane abstractions shared by workflow adapters live in a domain-free package
+(import name `workflow`; adapters import from it, it imports none of them):
+
+- `definition.py` — a `WorkflowDefinition` is **pure structural data** (lifecycle transition
+  table, activities, declared cap dimensions, hooks) carrying a `wf1-` fingerprint that answers
+  exactly one question: *is this the same flow definition?* `validate_spec` whitelists the spec
+  keys, so runtime-swappable configuration — model / provider names, endpoints, budgets, cap
+  *values* — is structurally rejected rather than silently drifting the fingerprint: changing
+  them is configuration, not definition. The fingerprint is minted into the run slot at
+  acquisition and re-checked inside every lease CAS; a mid-flight deploy that rewrites the flow
+  terminalizes live executions as FAILED (`cause="definition_drift"`) — no silent resume, no
+  replay machinery, no version tables; a new definition takes effect by starting a new execution.
+- `runner.py` — `drive_iteration` is the generic one-iteration choreography: acquire the lease,
+  execute the opaque task under heartbeat + cooperative cancel, bisect failures through
+  `retry.py`, probe progress, grade against the `policy.py` loop caps, give the terminal hook
+  its last look, and settle the `ledger.py` row. It owns **no I/O, no scheduling, no business
+  vocabulary** — every collaborator arrives through `ports.py`, and the two facts only an
+  adapter can know (`finished` / `pending_signals`) are recomputed per grading through an
+  injected `business_facts` callable. Every exit leaves a settled ledger; converting a settle
+  into slot release and enqueueing the next iteration is the adapter's job.
+- `runtime.py` — the thin structural seam from definition to `RunnerDeps`: executor resolution
+  (a logical executor id resolved by an adapter-owned `ExecutorRegistry` — a lookup, never a
+  construction) and cap assembly (the definition declares *which* dimensions bind the loop, the
+  caller supplies the *values*). It must never grow domain parameters.
+- `leases.py` / `states.py` — the lease-ledger fold and the transition-legality rules, owned
+  exclusively by the core.
+
+The research side is the adapter layer: `plugins/research/workflow_spec.py` declares the flow
+as data — the stage-chain topology mirroring the plugin's `_LEGAL_NEXT` (parity asserted in
+tests so the mirror cannot drift), validated at import so a malformed definition fails at
+deploy, never mid-lease — and `plugins/research/workflow_adapter.py` answers every generic port
+question in research terms: `ResearchLeaseStore` folds the on-disk `active_run` slot +
+`project["driver"]` checkpoint into a core `LeaseLedger` behind the service CAS (stale /
+duplicate / out-of-order jobs are dropped, a stale `running` heartbeat is crash-recovered at
+attempt+1, a fresh one is a live twin), the executor wraps one agent-kernel turn, the probe
+diffs stage/gate milestones, and `grade_turn` re-expresses core verdicts in the on-disk
+`RunState` vocabulary the gate/UI speak — zero legality rules live in the adapter, only
+vocabulary translation and consequences. The `research_drive` worker delivers one job per
+iteration (the Run-lifecycle paragraph below).
 
 **Run lifecycle — server-owned, worker-driven to PUBLISH.** A research run belongs to the server,
 not the SSE pipe: closing the chat, navigating away, or dropping the network never cancels an
@@ -2332,8 +2394,13 @@ publishing is best-effort and a no-op when no bus is installed).
 
 **Cascade delete.** `DELETE /research/tasks/{id}` (the desktop confirms first) records
 `deletion_requested` in `project.json`, soft-deletes the whole cloud task folder into the Trash,
-clears the session routing index, and hard-removes scratch — restoring the Trash folder never
-resurrects the task. Two **409** guards refuse deletion: a task with a live run (the `active_run`
+clears the session routing index, hard-removes scratch, and **deletes the task's bound chat
+sessions** with it: `delete_task` returns the session ids from the routing index and the router
+removes every row that is owned by the caller and `type=1` (messages + `session_events` cascade
+via the FK; screenshots owned by those messages are soft-deleted best-effort, folder-agnostic as
+in §12.5; a type-0 session is never touched here, and a per-session failure is logged without
+failing the task delete). Restoring the Trash folder never resurrects the task. Two **409** guards
+refuse deletion: a task with a live run (the `active_run`
 slot — an orphaned per-tool RUNNING execution left by a run that stopped mid-step does not block,
 it is wiped by teardown) and a report the Knowledge Base has already indexed ("Please remove from
 Knowledge Base first").
