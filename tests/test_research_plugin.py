@@ -2753,16 +2753,6 @@ class TestP3Fingerprints:
         next(n for n in g4["nodes"] if n["type"] == "Source")["full_char_len"] = 99
         assert evidence_fingerprint(g4, "C1") != fp
 
-    def test_claim_fingerprint_excludes_physical_id(self):
-        from plugins.research.batch import claim_fingerprint
-
-        a = {"id": "C1", "label": " Main  Flow ", "statement": "s"}
-        b = {"id": "zz-remapped-9", "label": "main flow", "statement": "s"}
-        assert claim_fingerprint(a, strength_norm="Supported") == \
-               claim_fingerprint(b, strength_norm="supported")   # id + case/space ignored
-        assert claim_fingerprint(a, strength_norm="supported") != \
-               claim_fingerprint(a, strength_norm="contested")   # strength participates
-
     def test_compute_pending_matrix(self):
         from plugins.research.batch import compute_pending
 

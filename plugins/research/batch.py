@@ -4,17 +4,19 @@ No I/O, no LLM, no network (P3-1 hard constraint 1): ``plugin.py`` feeds these
 functions already-loaded ``graph``/``project`` dicts and decides what skips, what
 recomputes and what commits.
 
-Two orthogonal fingerprints (design P3 §6 / freeze constraints 3+4):
+Two fingerprints feed the delta-pending rule (design P3 §6 / freeze constraint 4):
 
-* ``claim_fingerprint``  — semantic identity of the claim STATEMENT (normalized
-  label/statement text + the canonical strength vocabulary). The physical node id is
-  deliberately excluded, so id re-mapping (shadow-set renames, merges, exports)
-  can never avalanche a content-addressed reuse key.
 * ``evidence_fingerprint`` — content identity of the claim's COMMITTED evidence set:
   a sorted, de-duplicated set of per-evidence identity strings built from
   ``{source_url, edge kinds, verdict, sha(facts+excerpt), source char-len/status}``.
   Order-independent by construction (constraint 4): permuting the backing node/edge
   lists never changes the value; only adds/removes or real content changes do.
+* the ``chunk_id`` of :class:`EvidenceChunk` — a content-stable id over the sorted
+  claim-id set + budget, so digest batch hints are reproducible across turns.
+
+(The earlier ``claim_fingerprint`` — semantic identity of the claim STATEMENT — was
+never wired into the production pending rule, which keys on the claim node id, and
+was removed in P3-4 to keep no orphan implementations.)
 
 Pending rule (constraint 2, frozen verbatim):
 
@@ -35,7 +37,6 @@ from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
-    "claim_fingerprint",
     "evidence_fingerprint",
     "compute_pending",
     "EvidenceChunk",
@@ -78,20 +79,6 @@ def normalize_text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return " ".join(value.split()).lower()
-
-
-def claim_fingerprint(node: dict, *, strength_norm: str | None = None) -> str:
-    """Semantic fingerprint of a Claim node — physical id NOT included (constraint 3).
-
-    ``strength_norm`` must be the output of the canonical vocabulary normalizer
-    (caller passes ``normalize_claim_strength(...) or ""``) so "high" and "supported"
-    cannot produce divergent fingerprints for the same statement.
-    """
-    return _sha(
-        normalize_text(node.get("label")),
-        normalize_text(node.get("statement")),
-        (strength_norm or "").strip().lower(),
-    )
 
 
 def evidence_fingerprint(graph: dict, claim_id: str) -> str:
