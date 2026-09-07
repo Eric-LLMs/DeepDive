@@ -2558,6 +2558,44 @@ The layering is enforced by construction, not convention:
 - **The runner performs no I/O, no scheduling, no prompt construction.** Everything external
   arrives through the injected ports (§19.7); the runner only sequences them.
 
+**Activity ≠ Executor.** In a spec, an activity declares *what* the iteration does (research:
+task name `auto_turn`); its `executor` field is a **logical identity** (`research-agent-kernel`)
+resolved through the adapter-built registry at drive time (§19.10). They are one
+declaration→binding pair, not two serial business nodes — which is also why re-pointing a
+logical id at a different implementation never invalidates live executions (§19.9).
+
+The full end-to-end chain, and where each system's responsibility stops:
+
+```
+Worker (apps/worker: research_drive)   ← job delivery ONLY: one arq job == one iteration;
+  │                                      never touches stages or flow decisions
+  ▼
+Workflow Core (drive_iteration)        ← flow control: lease → execute → probe → grade → settle
+  │ activity "auto_turn" → logical id "research-agent-kernel"
+  ▼
+Executor registry (adapter-built)      ← MappingRegistry binds logical id → implementation
+  ▼
+Agent (ReactLoop kernel turn, §5)      ← the opaque executor: one turn, step budget is runtime config
+  │
+  ▼
+Skill + LLM steps → Tools (§5.4/§6)    ← methodology + sandbox-guarded actions
+  ▼
+ResearchService / RAG / web / Drive    ← domain invariants, reached ONLY through tools
+```
+
+**The workflow ends at the `Executor` call boundary** — everything below it is the agent
+system, which the core sees as one black-box function. Conversely the worker/driver never
+moves a research stage: stage and gate transitions happen *only* when the agent invokes a
+research tool; the workflow just observes via the `ProgressProbe` and grades what the
+`business_facts` callable reports.
+
+A one-line roster of each layer's job: **Workflow Core** = generic flow machinery ·
+**Research workflow** = the domain definition + adapter (§19.10) · **Agent** = an executor
+implementation · **Skill** = methodology · **Tool** = action · **Plugin runtime** =
+capability registration (tools/skills/guards/listeners per [§6.3](#63-plugins); executors
+bind through the adapter's registry, not `PluginManager`) · **Worker** = job delivery ·
+**Service** = domain invariants.
+
 [↑ Back to top](#table-of-contents)
 
 ### 19.2 Run states and transition legality
@@ -2790,7 +2828,7 @@ re-exports, so older import sites keep working without duplicating logic.
 |---|---|
 | Definition / states | `workflow_spec` mirrors the DAG's `_LEGAL_NEXT` parity table — an import-time + parity-tested check keeps the spec and the domain state machine from diverging |
 | `LeaseStore` | `ResearchLeaseStore` — folds the lease into the existing `active_run` + driver checkpoint, committed by the portalocker `project_revision` CAS |
-| `Executor` | **one agent turn** through the kernel loop — the per-turn LLM step cap is runtime config (`research_driver_turn_max_steps = 25` for auto-drive vs the interactive default of 5), supplied by the caller, never part of the spec |
+| `Executor` binding | spec activity `auto_turn` → logical id `research-agent-kernel`; the adapter builds a `MappingRegistry` binding that id to `_RunTurnExecutor`, which wraps **one agent-kernel turn** — the prompt rides in `TaskRequest` (opaque to the core), and the per-turn LLM step cap is runtime config (`research_driver_turn_max_steps = 25` for auto-drive vs the interactive default of 5), never part of the spec |
 | `ProgressProbe` | `_ResearchProgressProbe` — stage / gate milestone diff: progress means the run moved a phase or cleared a gate, not token churn |
 | `business_facts` | `finished` = the task reached PUBLISH; `pending_signals` = open gate overrides awaiting review → `WAITING` park; human approval of an override starts a *new* execution from `IDLE` |
 | `TerminalHook` | the **progressive mode** mechanism: an about-to-`FAILED` gate iteration is rewritten to continue (a replacement grade with `state None` — gap recorded honestly, run auto-settles forward), plus `build_settle_report` finalization at terminal — this is why progressive runs reach PUBLISH with disclosed gaps instead of deadlocking |
