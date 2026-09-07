@@ -32,7 +32,7 @@ from api.schemas_research import TaskCreateRequest
 from core.application.drive_service import DriveError, DriveService
 from core.config import settings
 from core.infrastructure.db import MessageModel, SessionLocal, SessionModel
-from core.infrastructure.memory import create_session, set_session_type
+from core.infrastructure.memory import create_session
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
