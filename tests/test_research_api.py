@@ -150,8 +150,7 @@ class TestCreateTask:
         task_id = created["task_id"]
         assert created["stage"] == "DISCOVER"
         assert created["status"] == "ACTIVE"
-        # The title gains the 【任务】 display prefix at creation; the folder follows it.
-        assert created["cloud_folder_path"] == "【任务】VecDB"
+        assert created["cloud_folder_path"] == "VecDB"
 
         # Scratch state is authoritative and complete.
         task_dir = env.scratch / str(USER) / task_id
@@ -159,7 +158,7 @@ class TestCreateTask:
             assert (task_dir / f).is_file(), f
         project = ResearchService._load_json(task_dir / "project.json", None)
         assert project["cloud_folder_id"]
-        assert project["cloud_folder_path"] == "【任务】VecDB"
+        assert project["cloud_folder_path"] == "VecDB"
         # Materials provenance row: {asset_id, name, cloud_asset_id, mime}.
         assert project["materials"][0]["asset_id"] == str(asset.id)
         assert project["materials"][0]["name"] == "paper.pdf"
@@ -168,11 +167,11 @@ class TestCreateTask:
 
         # Cloud projection: the task folder + material asset + the two JSON mirrors.
         folders = [f["name"] for f in await env.drive.list_folders(USER)]
-        assert "【任务】VecDB" in folders
+        assert "VecDB" in folders
         # The two work folders always exist inside the task folder, even before any outputs.
         assert "materials" in folders and "outputs" in folders
         files = await env.drive.list_files(USER)
-        mats = [a for a in files if a["folder_path"] == "【任务】VecDB/materials"]
+        mats = [a for a in files if a["folder_path"] == "VecDB/materials"]
         assert len(mats) == 1
         assert mats[0]["name"] == f"{asset.id}__paper.pdf"
         assert mats[0]["id"] == project["materials"][0]["cloud_asset_id"]
@@ -188,7 +187,7 @@ class TestCreateTask:
             "task_spec.json", "session_history.json", f"{asset.id}__paper.pdf",
         }
         assert {f["folder_path"] for f in status["cloud_files"]} == {
-            "【任务】VecDB", "【任务】VecDB/materials",
+            "VecDB", "VecDB/materials",
         }
         # Each entry carries the asset id + mime so the frontend can fetch content on click.
         assert all(f["id"] and f["mime_type"] for f in status["cloud_files"])
@@ -201,11 +200,10 @@ class TestCreateTask:
         project = ResearchService._load_json(
             env.scratch / str(USER) / created["task_id"] / "project.json", None
         )
-        # The working directory is honored: the task folder lands under Projects/ (the title
-        # carries the 【任务】 display prefix).
-        assert project["cloud_folder_path"] == "Projects/【任务】nested"
+        # The working directory is honored: the task folder lands under Projects/
+        assert project["cloud_folder_path"] == "Projects/nested"
         folders = [f["path"] for f in await env.drive.list_folders(USER)]
-        assert "Projects/【任务】nested" in folders
+        assert "Projects/nested" in folders
 
     def test_create_binds_a_dedicated_session(self, env):
         # Each task owns exactly one chat session, bound at creation (1:1). The same id is
@@ -353,7 +351,7 @@ class TestDeleteTask:
             env.scratch / str(USER) / task_id / "project.json", None
         )
         cloud_id = project["cloud_folder_id"]
-        assert project["cloud_folder_path"] == "【任务】doomed"
+        assert project["cloud_folder_path"] == "doomed"
 
         res = client.delete(f"/research/tasks/{task_id}")
         assert res.status_code == 200

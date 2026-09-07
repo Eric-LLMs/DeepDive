@@ -121,11 +121,6 @@ _LEGAL_NEXT: dict[str, str] = {
 
 _GATES = ["DESIGN_GATE", "EVIDENCE_GATE", "CLAIM_GATE", "QUALITY_GATE"]
 
-# Display prefix applied to a research task's title at creation. The task folder name and
-# the bound chat-session title are both derived from the task title, so prefixing once here
-# keeps folder == session title == ``【任务】xxx`` everywhere (matches existing titled rows).
-TASK_TITLE_PREFIX = "【任务】"
-
 # A transition into ``target`` is guarded by this gate (None = unguarded).
 _GATE_BEFORE: dict[str, str | None] = {
     "EXECUTE": "DESIGN_GATE",   # DESIGN -> EXECUTE
@@ -909,9 +904,6 @@ class ResearchService:
             raise ValueError(
                 f"unknown execution_mode {execution_mode!r} (expected 'strict' | 'progressive')"
             )
-        name = (name or "").strip()
-        if name and not name.startswith(TASK_TITLE_PREFIX):
-            name = f"{TASK_TITLE_PREFIX}{name}"
         if idempotency_key:
             existing = self._find_by_idempotency(owner_id, "project", idempotency_key)
             if existing is not None:
@@ -1430,12 +1422,6 @@ class ResearchService:
             raise ValueError(
                 f"unknown execution_mode {execution_mode!r} (expected 'strict' | 'progressive')"
             )
-        # The task title carries the display prefix from the moment it exists; the cloud task
-        # folder name and the bound session title are both derived from it, so prefixing here
-        # once keeps folder == session title == ``【任务】xxx`` everywhere.
-        title = (title or "").strip()
-        if title and not title.startswith(TASK_TITLE_PREFIX):
-            title = f"{TASK_TITLE_PREFIX}{title}"
         if idempotency_key:
             existing = self._find_by_idempotency(owner_id, "project", idempotency_key)
             if existing is not None:
