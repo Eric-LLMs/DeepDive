@@ -2560,9 +2560,11 @@ The layering is enforced by construction, not convention:
 
 **Activity ≠ Executor.** In a spec, an activity declares *what* the iteration does (research:
 task name `auto_turn`); its `executor` field is a **logical identity** (`research-agent-kernel`)
-resolved through the adapter-built registry at drive time (§19.10). They are one
-declaration→binding pair, not two serial business nodes — which is also why re-pointing a
-logical id at a different implementation never invalidates live executions (§19.9).
+resolved through the adapter-built registry — once per drive job in `runtime.build_deps`
+(`resolve_executor`), so the runner's execute phase only ever calls the pre-bound executor,
+never a lookup (§19.10). They are one declaration→binding pair, not two serial business
+nodes — which is also why re-pointing a logical id at a different implementation never
+invalidates live executions (§19.9).
 
 The full end-to-end chain, and where each system's responsibility stops:
 
@@ -2579,7 +2581,8 @@ Research Workflow Adapter
    ├─ ExecutorRegistry (MappingRegistry)
    └─ Research-specific translation / settle
         │
-        │ build_deps + drive_iteration
+        │ build_deps — resolves the activity ONCE per drive job:
+        │              "auto_turn" → logical id "research-agent-kernel" → implementation
         ▼
 Generic Workflow Runtime / Runner
         │
@@ -2589,34 +2592,28 @@ Generic Workflow Runtime / Runner
         │                           └─ caps
         │
         ├─ claim
-        ├─ execute
+        ├─ execute ─────► Executor (_RunTurnExecutor)      ← the black-box edge:
+        │                     │                               opaque prompt in,
+        │                     ▼                               value + spend out
+        │              Research Agent (one kernel turn)
+        │                     │ Skill = methodology / prompt guidance + tool scoping
+        │                     ▼
+        │                  LLM steps
+        │                     ▼
+        │                   Tool
+        │                     ▼
+        │     ResearchService / RAG / Web / Drive
         ├─ heartbeat / cancel
         ├─ retry
         ├─ probe
         └─ grade
-                  │
-          continue / terminal
-                  │
-                  └──── next job ───► Worker
-
-Activity: auto_turn
-        │
-        │ executor = research-agent-kernel
-        ▼
-Executor Resolution
-        │
-        ▼
-Research Agent
-        │
-        │ Skill = methodology / prompt guidance
-        ▼
-      LLM steps
-        │
-        ▼
-      Tool
-        │
-        ▼
-ResearchService / RAG / Web / Drive
+              │
+        ┌─────┴──────┐
+     continue      terminal
+        │             │
+        ▼             ▼
+   next job ──►   settle + release slot; a WAITING park resumes
+    Worker        later as a NEW execution from IDLE
 ```
 
 Four confusions this view is built to prevent: the **Definition is a declaration, not a
