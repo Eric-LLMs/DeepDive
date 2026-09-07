@@ -40,6 +40,11 @@ from typing import Any
 
 import portalocker
 
+from workflow.ledger import finish_into as ledger_finish_into
+from workflow.ledger import record_into as ledger_record_into
+
+from plugins.research.workflow_spec import RESEARCH_WORKFLOW
+
 logger = logging.getLogger(__name__)
 
 from agent.engine.context import current_turn
@@ -2791,6 +2796,11 @@ class ResearchService:
                 "turn_state": "done",
                 "started_at": _now_iso(),
                 "updated_at": _now_iso(),
+                # L2 definition stamp: mint the workflow-definition fingerprint at
+                # acquisition; every later turn re-checks it (driver.auto_turn) and a
+                # mismatch terminalizes the run as definition drift — never a silent
+                # resume under a rewritten flow.
+                "definition_fp": RESEARCH_WORKFLOW.fingerprint(),
             }
 
         project = self.atomic_update_project(owner_id, project_id, mutate)
@@ -3857,49 +3867,36 @@ class ResearchService:
         A crash rerun can hand a deterministic ``execution_id`` (e.g. the driver's
         ``run_id:turn_index:turn_attempt``) so re-recording the same execution is a no-op
         instead of a second RUNNING row. Without it the behaviour is unchanged: a fresh uuid
-        and one appended row.
+        and one appended row. The record/finish algorithm itself lives in the domain-free
+        Workflow Core (``workflow.ledger``); this shell owns loading and persistence.
         """
         self._load_project(owner_id, project_id)
         path = self._project_dir(owner_id, project_id) / "executions.json"
         data = self._load_json(path, {"executions": []})
-        if execution_id is not None:
-            existing = next(
-                (e for e in data["executions"] if e["execution_id"] == execution_id), None
-            )
-            if existing is not None:
-                return {
-                    "execution_id": existing["execution_id"],
-                    "status": existing["status"],
-                    "idempotent": True,
-                }
-        execution = {
-            "execution_id": execution_id or str(uuid.uuid4()),
-            "project_id": project_id,
-            "tool": tool,
-            "args": args,
-            "status": "RUNNING",
-            "result": None,
-            "created_at": _now_iso(),
+        row, created = ledger_record_into(
+            data,
+            execution_id=execution_id,
+            tool=tool,
+            args=args,
+            now_iso=_now_iso(),
+            extra_fields={"project_id": project_id},
+        )
+        if created:
+            self._save_json(path, data)
+        return {
+            "execution_id": row["execution_id"],
+            "status": row["status"],
+            "idempotent": not created,
         }
-        data["executions"].append(execution)
-        self._save_json(path, data)
-        return {"execution_id": execution["execution_id"], "status": "RUNNING", "idempotent": False}
 
     def finish_execution(
         self, owner_id: uuid.UUID, project_id: str, *, execution_id: str, result: Any
     ) -> dict:
         path = self._project_dir(owner_id, project_id) / "executions.json"
         data = self._load_json(path, {"executions": []})
-        execution = next(
-            (e for e in data["executions"] if e["execution_id"] == execution_id), None
+        row = ledger_finish_into(
+            data, execution_id=execution_id, result=result, now_iso=_now_iso()
         )
-        if execution is None:
-            raise ValueError(f"execution not found: {execution_id}")
-        if execution["status"] == "SUCCESS":
-            raise ValueError("execution is immutable: already finished")
-        execution["status"] = "SUCCESS"
-        execution["result"] = result
-        execution["finished_at"] = _now_iso()
         self._save_json(path, data)
         return {"execution_id": execution_id, "status": "SUCCESS"}
 
