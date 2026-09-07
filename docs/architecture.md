@@ -73,6 +73,17 @@
   - [16.8 Configuration](#168-configuration)
 - [17. Research OS Module](#17-research-os-module)
 - [18. Image Handling (screenshots & document images)](#18-image-handling-screenshots--document-images)
+- [19. Workflow Core (packages/workflow)](#19-workflow-core-packagesworkflow)
+  - [19.1 Layering and hard rules](#191-layering-and-hard-rules)
+  - [19.2 Run states and transition legality](#192-run-states-and-transition-legality)
+  - [19.3 Leases — one live runner per run](#193-leases--one-live-runner-per-run)
+  - [19.4 Ledger — idempotent tool-execution record](#194-ledger--idempotent-tool-execution-record)
+  - [19.5 Retry — transient classification and backoff](#195-retry--transient-classification-and-backoff)
+  - [19.6 Policy — loop-cap grading](#196-policy--loop-cap-grading)
+  - [19.7 Ports — the adapter's surface](#197-ports--the-adapters-surface)
+  - [19.8 drive_iteration — per-job choreography](#198-drive_iteration--per-job-choreography)
+  - [19.9 Definition and fingerprint — drift detection](#199-definition-and-fingerprint--drift-detection)
+  - [19.10 The research adapter](#1910-the-research-adapter)
 
 [↑ Back to top](#table-of-contents)
 
@@ -2218,46 +2229,13 @@ the session→task dispatch index, no longer the isolation mechanism. Opening a 
 side-effect free — navigation never creates an execution, opening never starts a run; only a typed
 message drives the task (the first one auto-resumes the `deep_research` skill).
 
-**Generic Workflow Core (`packages/workflow`) — research is one workflow on it.** The
-control-plane abstractions shared by workflow adapters live in a domain-free package
-(import name `workflow`; adapters import from it, it imports none of them):
-
-- `definition.py` — a `WorkflowDefinition` is **pure structural data** (lifecycle transition
-  table, activities, declared cap dimensions, hooks) carrying a `wf1-` fingerprint that answers
-  exactly one question: *is this the same flow definition?* `validate_spec` whitelists the spec
-  keys, so runtime-swappable configuration — model / provider names, endpoints, budgets, cap
-  *values* — is structurally rejected rather than silently drifting the fingerprint: changing
-  them is configuration, not definition. The fingerprint is minted into the run slot at
-  acquisition and re-checked inside every lease CAS; a mid-flight deploy that rewrites the flow
-  terminalizes live executions as FAILED (`cause="definition_drift"`) — no silent resume, no
-  replay machinery, no version tables; a new definition takes effect by starting a new execution.
-- `runner.py` — `drive_iteration` is the generic one-iteration choreography: acquire the lease,
-  execute the opaque task under heartbeat + cooperative cancel, bisect failures through
-  `retry.py`, probe progress, grade against the `policy.py` loop caps, give the terminal hook
-  its last look, and settle the `ledger.py` row. It owns **no I/O, no scheduling, no business
-  vocabulary** — every collaborator arrives through `ports.py`, and the two facts only an
-  adapter can know (`finished` / `pending_signals`) are recomputed per grading through an
-  injected `business_facts` callable. Every exit leaves a settled ledger; converting a settle
-  into slot release and enqueueing the next iteration is the adapter's job.
-- `runtime.py` — the thin structural seam from definition to `RunnerDeps`: executor resolution
-  (a logical executor id resolved by an adapter-owned `ExecutorRegistry` — a lookup, never a
-  construction) and cap assembly (the definition declares *which* dimensions bind the loop, the
-  caller supplies the *values*). It must never grow domain parameters.
-- `leases.py` / `states.py` — the lease-ledger fold and the transition-legality rules, owned
-  exclusively by the core.
-
-The research side is the adapter layer: `plugins/research/workflow_spec.py` declares the flow
-as data — the stage-chain topology mirroring the plugin's `_LEGAL_NEXT` (parity asserted in
-tests so the mirror cannot drift), validated at import so a malformed definition fails at
-deploy, never mid-lease — and `plugins/research/workflow_adapter.py` answers every generic port
-question in research terms: `ResearchLeaseStore` folds the on-disk `active_run` slot +
-`project["driver"]` checkpoint into a core `LeaseLedger` behind the service CAS (stale /
-duplicate / out-of-order jobs are dropped, a stale `running` heartbeat is crash-recovered at
-attempt+1, a fresh one is a live twin), the executor wraps one agent-kernel turn, the probe
-diffs stage/gate milestones, and `grade_turn` re-expresses core verdicts in the on-disk
-`RunState` vocabulary the gate/UI speak — zero legality rules live in the adapter, only
-vocabulary translation and consequences. The `research_drive` worker delivers one job per
-iteration (the Run-lifecycle paragraph below).
+**Run mechanics live on the generic Workflow Core** — lease contest, crash recovery, retry
+bisect, loop-cap grading and the definition fingerprint are domain-free machinery in
+`packages/workflow`; research is that core's first adapter (`workflow_spec` declares the flow,
+`workflow_adapter` binds every port in research terms, and the `research_drive` worker delivers
+one job per iteration). The full design — states, leases, ledger, ports, choreography and the
+adapter mapping — is [§19](#19-workflow-core-packagesworkflow); the Run-lifecycle paragraph
+below keeps only the research-visible consequences.
 
 **Run lifecycle — server-owned, worker-driven to PUBLISH.** A research run belongs to the server,
 not the SSE pipe: closing the chat, navigating away, or dropping the network never cancels an
@@ -2540,5 +2518,289 @@ in the `user` message). The vision tool is **not** allowlisted in the gateway (t
 root in `agent_factory.py` allows `rag_search` + the toolkit generators), so the model reaches
 it through a `tool_search` discovery hop when an `[Attached: …]` note calls for it — see
 [§5.2](#52-agent-loop--reactloopagent).
+
+[↑ Back to top](#table-of-contents)
+
+## 19. Workflow Core (packages/workflow)
+
+The Research OS run engine (lease contest, crash recovery, retry, loop-cap grading, definition
+drift detection) is **domain-free machinery** extracted into `packages/workflow` (import name
+`workflow`). It knows nothing about research, stages, gates, or reports — it drives *any*
+iterative "run one step, grade whether to continue, settle honestly" workflow supplied by an
+adapter. Research is that core's first adapter (§19.10). Each section below maps to one module
+in the package.
+
+### 19.1 Layering and hard rules
+
+```
+Agent (domain logic)          ← what one "step" of work actually is
+  ▲
+Worker (apps/worker)          ← arq jobs; calls the adapter's drive entry once per job
+  ▲
+Adapter (plugins/research)    ← supplies ports, business facts, ledger/lease persistence
+  ▲
+Workflow Core (packages/workflow) ← states, transitions, grading, retry, orchestration
+  ▲
+Definition (workflow_spec)    ← declarative per-workflow shape (transitions, activities, cap dimensions, hooks)
+```
+
+The layering is enforced by construction, not convention:
+
+- **Transition legality lives only in the core** (`states.validate_transition`). An adapter
+  cannot legalize a state hop by writing storage directly — the core checks before every
+  terminal publish.
+- **Business facts live only in the adapter.** The core never reads a task folder, a gate, or a
+  scorecard; it asks the injected `business_facts` callable at grade time and folds the
+  returned mapping into `IterationFacts` — neutral keys, neutral values.
+- **The core never learns domain vocabulary.** No module in `packages/workflow` imports
+  research code or mentions stage/gate/report names; domain strings pass through as opaque
+  values.
+- **The runner performs no I/O, no scheduling, no prompt construction.** Everything external
+  arrives through the injected ports (§19.7); the runner only sequences them.
+
+[↑ Back to top](#table-of-contents)
+
+### 19.2 Run states and transition legality
+
+`states.py` defines a six-state machine per run:
+
+| State | Kind |
+|---|---|
+| `IDLE` | no live execution owns the slot; a new execution may begin |
+| `RUNNING` | an execution owns the slot and is advancing |
+| `WAITING` | **terminal** — the execution ended parked on an external condition (signal / human / timer) |
+| `SUCCEEDED` / `FAILED` / `CANCELLED` | terminal — **irreversible** |
+
+Transition rules (the only legal hops):
+
+- Only `IDLE → RUNNING` starts work; a terminal state has **no way out** — `WAITING` included.
+  Resuming a parked run is not a `WAITING → RUNNING` hop; it is a *new execution* beginning
+  from `IDLE` once the external condition clears.
+- From `RUNNING` the legal targets are `RUNNING` (the iteration continue-hop) or any of the four
+  terminal states; nothing else.
+- `validate_transition(current, next)` raises `IllegalTransition` on anything else — the runner
+  calls it *before* publishing a terminal state, so a buggy adapter cannot smuggle an illegal
+  hop through.
+- **The runner never transitions *to* `IDLE` explicitly** — releasing the slot *is* the
+  execution returning to `IDLE` on disk, so every in-code transition is `RUNNING → RUNNING` or
+  `RUNNING → terminal`. `observe_state` derives what an arriving job sees from the persisted
+  slot record: a terminal outcome has already released the slot and shows up as `IDLE`, so a
+  late duplicate job **drops** instead of resurrecting a finished execution.
+- `WAITING` means exactly one thing — waiting on an external condition. It is never used as a
+  euphemism for a policy-detected failure (which is `FAILED`).
+
+[↑ Back to top](#table-of-contents)
+
+### 19.3 Leases — one live runner per run
+
+`leases.py` implements the lease contest that guarantees a single live runner per run even with
+overlapping arq jobs or a crashed predecessor. The adapter supplies a `LeaseStore` port whose
+`atomic(mutator)` commits the verdict **inside the adapter's own atomic write section** (for
+research: the same portalocker CAS on `project_revision` that persists `active_run`), so the
+lease decision and the durable state can never diverge.
+
+`acquire` (a pure decision run inside the adapter's atomic section) returns one of four
+verdicts:
+
+| Verdict | Condition | Consequence |
+|---|---|---|
+| `granted` | slot `DONE` (or fresh) and the arriving job is the **expected next iteration** (`index = last + 1`) | this job owns the iteration, `attempt = 1` |
+| `reclaimed` | the same iteration is leased but the holder is `PENDING` or its heartbeat is stale (> `stale_s`) | adopts the dead slot with `attempt + 1` — the execution id changes so the ledger sees a new attempt |
+| `dropped` | anything else: another run owns the ledger, a wrong index (duplicate / delayed / gap), or a **fresh `RUNNING` lease = a live twin** | this job exits without touching state — no double run, and it never yanks the slot (or the cancel) from under a live owner |
+| `cancelled` | the job is legitimately expected but a cancel is on the ledger (so no live owner holds the slot) | terminalizes `CANCELLED` instead of executing |
+
+The monotonic index gate (`index == last_done + 1`) is what makes chained arq jobs
+duplicate-proof: a queued second job for a finished iteration is `dropped`, not re-run.
+Timing comes from `LeaseConfig` — defaults `refresh_s = 20.0` (holder renews during the
+iteration) and `stale_s = 150.0` (≈7 missed refreshes before a slot is adoptable).
+Reclaim-on-stale-heartbeat is what makes crash recovery idempotent: a wedged job's slot is
+adopted on the *same* iteration with `attempt+1`, so the run continues where it stopped
+without ever two writers running concurrently.
+
+[↑ Back to top](#table-of-contents)
+
+### 19.4 Ledger — idempotent tool-execution record
+
+`ledger.py` is a pure record/finish algorithm over a plain `{"executions": [...]}` document —
+the same discipline as Temporal's history or Step Functions' execution log. The adapter owns
+loading, persistence, and file locking; the core never touches storage.
+
+- **Deterministic identity:** `record_into` appends a `RUNNING` row keyed by `execution_id`
+  (`{run_id}:{index}:{attempt}` from the runner; an adapter may pass `None` for a fresh random
+  id, which opts out of replay protection). Re-recording an existing `execution_id` is a
+  no-op that returns the **original** row with `created=False` — so a crash-rerun never mints
+  a second row for the same execution, and callers can tell a rerun from a first run.
+- **Rows are tool invocations, not grades:** each carries `tool`, deep-copied `args`,
+  `status`, `result`, `created_at`. `finish_into` closes a row to `SUCCESS` — **SUCCESS is
+  final**: never re-opened, never overwritten, and closing an unknown id raises.
+- **`extra_fields`** lets the adapter stamp its own columns (e.g. a scoped id) on the row
+  without the core ever naming them.
+
+[↑ Back to top](#table-of-contents)
+
+### 19.5 Retry — transient classification and backoff
+
+`retry.py` bounds the per-iteration retry loop:
+
+- **Transient-ness is injected, never guessed.** The adapter supplies a classifier predicate
+  over the raised exception (research classifies upstream LLM / network hiccups); the core only
+  consumes the boolean. The default classifier says *nothing* is transient, and
+  `max_attempts` defaults to 1 — retry is pure opt-in config.
+- **Lease loss is never transient.** A lost contest means another worker already owns the
+  iteration — the loser drops, it does not retry.
+- **Backoff:** `default_backoff(attempt) = min(2^(attempt-1), 30)` seconds (1 s, 2 s, 4 s …
+  hard-capped), applied between attempts inside the drive job.
+- **Honest failure, two flavors.** After a terminal attempt failure the runner *first* releases
+  the lease (`mark_done` on the lease ledger, inside `LeaseStore.atomic`), then:
+  - transient error with retries **exhausted** → returns a `FAILED` outcome with
+    `cause = "transient_exhausted"` (the drive job ends cleanly, nothing re-raised);
+  - **non-transient** error → raises `ExecutionFailed(outcome, error)` wrapping the original,
+    so the caller sees the failure with the slot already freed — no orphan lease either way.
+
+[↑ Back to top](#table-of-contents)
+
+### 19.6 Policy — loop-cap grading
+
+`policy.py` decides after each iteration whether to continue, and with what outcome. The grade
+chain is a **fixed priority order** — first match wins:
+
+| Priority | Grade | Stable cause code | Meaning |
+|---|---|---|---|
+| 1 | cancel | `CAUSE_CANCEL` | cooperative stop requested |
+| 2 | finished | `CAUSE_FINISHED` | adapter facts say the run's goal state is reached |
+| 3 | pending signal | `CAUSE_PENDING_SIGNAL` | an external event (e.g. a gate override awaiting review) should park the run |
+| 4 | no-progress | `CAUSE_NO_PROGRESS` | `consecutive_no_progress` reached the declared limit |
+| 5 | turn cap | `CAUSE_TURN_CAP` | per-execution turn budget exhausted |
+| 6 | spend cap | `CAUSE_SPEND_CAP` | cost budget exhausted |
+
+- **Caps are runtime config, joined to the spec at build time.** The definition declares the
+  cap *dimensions* (names); concrete ceilings arrive as a `caps_values` mapping to
+  `runtime.build_loop_policy`, which validates **both directions**: every declared dimension
+  needs a value (a missing one would silently disable a cap the flow says exists), no undeclared
+  value may be passed (that would smuggle behavior the fingerprint never saw), and `None` is a
+  legal value meaning "dimension active, ceiling lifted this run".
+- **Cause vs reason:** grades carry stable machine codes (`CAUSE_*`); the human-readable
+  `CAP_REASON = "budget_or_turn_cap_exceeded"` string is attached to cap outcomes for display,
+  never used for branching.
+- **Unknown spend is metered separately.** An iteration reporting `spend = None` increments
+  `RunCounters.unknown_spend_count`; it is *never* laundered into the numeric `total_spend`, so
+  a budget can't be silently evaded by opaque steps — and a run of only-unknown spends still
+  trips the no-progress guard.
+- **Terminal outcomes of caps and signals are declared at construction, never invented per
+  event.** `cap_outcome` defaults to `FAILED` (hitting a budget is a stop, not a euphemism);
+  a deployment that wants "cap → park for a human" sets `cap_outcome = WAITING`.
+  `signal_outcome` defaults to `WAITING` (a pending external decision is exactly what WAITING
+  means). Both are LoopPolicy constructor arguments — configuration, not domain branching.
+
+[↑ Back to top](#table-of-contents)
+
+### 19.7 Ports — the adapter's surface
+
+`ports.py` declares the external dependencies as protocols (plus `ProgressProbe` in
+`policy.py` and the injected `business_facts` / `compose_prompt` callables on `RunnerDeps`);
+the core touches the world only through them:
+
+| Seam | Contract |
+|---|---|
+| `LeaseStore` | `atomic(mutate)` — run `mutate(LeaseLedger) → LeaseLedger` inside the adapter's own compare-and-set (file lock + revision, DB transaction, …) and persist the result; `read()` for a plain authoritative snapshot. External cancel flips (a UI stop button) are written into the **same** ledger |
+| `Executor` | `execute(TaskRequest{prompt, hints}) → TaskResult{value, spend}` — the one place non-determinism lives; the prompt is **opaque** to the core, and physical details (which model / endpoint / worker) ride in `hints` and belong to NO spec |
+| `Scheduler` | `schedule_next(request)` hands off the next iteration; **MUST raise on delivery failure** — the runner then terminalizes honestly instead of stranding the slot with no follow-up (no orphan leases) |
+| `EventPublisher` | `publish(kind, revision)` — advisory wake-up hints (research: Redis pub/sub feeding the SSE monitor); `NoopPublisher` is a legal binding — hints are an optimization, absence is correctness-preserving |
+| `TerminalHook` | `before_terminalize(grade, facts)` — last look before a terminal grade executes (the Step Functions *Catch* / Conductor failure-hook analogue): return a **replacement Grade** to rewrite the stop — a replacement whose `state is None` turns the stop back into a continuation — or `None` to keep the original outcome; a rewritten continuation still goes through `mark_done`, and the core re-validates any transition it does publish |
+| `ProgressProbe` | `snapshot()` (sync or async) / `changed(before, after)` — the adapter owns *what counts* as visible progress (its own fingerprint); the core owns *when to ask*: once before and once after every execution |
+| `business_facts` | zero-arg callable (sync or async) returning a `Mapping` — the adapter's fresh authoritative read of domain facts (`finished`, `pending_signals`, domain `cancel_requested`) at grade time |
+| `compose_prompt` | `(IterationRequest, attempt) → str` — the adapter builds the opaque prompt per execution |
+
+`RuntimeContext` (in `ports.py`) is the frozen `values` bundle for per-run runtime knobs
+injected at drive time — the standing rule for it and everything above: runtime facts are
+**never part of a definition spec** (§19.9); the spec declares *shape*, the ports and context
+supply *behavior and values*.
+
+[↑ Back to top](#table-of-contents)
+
+### 19.8 drive_iteration — per-job choreography
+
+`runner.py::drive_iteration` is the whole life of one drive job, in four phases:
+
+1. **Lease contest** — `acquire` inside one `LeaseStore.atomic` section; `dropped` returns a
+   dropped outcome without touching state, `cancelled` returns a CANCELLED outcome (after
+   `validate_transition`), `granted`/`reclaimed` continue (`reclaimed` bumps `attempt` and the
+   execution id).
+2. **Execute loop** — snapshot the probe, call the `Executor`; on a transient failure that
+   `should_retry`, bump `attempt`, **re-mint the `execution_id`**
+   (`{run_id}:{index}:{attempt}`), persist the renewed lease (attempt + new execution id +
+   heartbeat) in one atomic section, sleep `retry.wait_s`, and try again — so each attempt gets
+   its own ledger identity. A terminal attempt failure releases the lease and either returns
+   (transient exhausted) or raises `ExecutionFailed` (non-transient) per §19.5. A success
+   absorbs `result.spend` into the counters.
+3. **Grade** — snapshot the probe again (`progress = changed(before, after)`), read the lease
+   ledger, and assemble `IterationFacts` from the probe result, the counters, and the adapter's
+   fresh `business_facts()`; `cancel_requested` is the OR of the business facts, the
+   ledger's cancel flag, and mid-execution interruption. Run the policy chain; if the run was
+   interrupted by a cancel but the chain produced no terminal grade, force `CANCELLED` — a
+   cancelled run cannot accidentally continue.
+4. **Settle** — on *continue* (`grade.state is None`): `mark_done` the lease, publish a
+   `continue` event, and return `next_index = index + 1` for the next job. On *terminal*: give
+   the `TerminalHook` its last look (a replacement grade with `state None` flips this into the
+   continue path), `validate_transition` the final hop, publish the state event, and return the
+   outcome. Releasing the slot durably (marking the run's state back to `IDLE` in the
+   adapter's checkpoint) and enqueueing the next job are the adapter's job — the core only
+   decides *what* the state should be and *that* a follow-up must exist.
+
+`IterationOutcome` is the single return record of the choreography: `state / action / dropped /
+reason / cause / run_id / index / attempt / execution_id / progress / counters /
+consecutive_no_progress / value / next_index` — everything an adapter needs to persist,
+publish, and chain.
+
+[↑ Back to top](#table-of-contents)
+
+### 19.9 Definition and fingerprint — drift detection
+
+`definition.py` holds `WorkflowDefinition`: an immutable **pure structural description** of a
+workflow whose spec is exactly `{name, transitions, activities, caps, hooks}` — the lifecycle
+transition table, logical activities (each a `task_name` bound to a **logical executor
+identity**), the cap *dimensions* the loop declares, and the hooks it uses. No I/O, no domain
+logic.
+
+- **Structural rejection of runtime config:** `validate_spec` whitelists that exact key set and
+  the activity record shape; model / provider names, endpoints, temperature, token budgets,
+  concurrency, worker instances, environments, and cap *values* have nowhere to live inside a
+  spec — adding any of them fails validation (unknown key or wrong type) **at load time**,
+  not as a silent fingerprint-drift surprise at lease-acquire time. Because activities bind
+  *logical* executor identities, re-pointing an executor at a different provider must not
+  invalidate live executions.
+- **Fingerprint:** `wf1-` + sha256 over `canonical_json` — validated, sorted-keys, strict
+  ASCII JSON with no `default=str` fallback (anything non-plain-JSON raises, so a fingerprint
+  can never silently absorb a stringified object). The algorithm prefix allows future rotation.
+- **Drift → honest failure:** `begin` mints the fingerprint into the slot at acquisition; every
+  `acquire` re-checks it **inside the lease CAS**; a mismatch (the deployed spec no longer
+  matches the one the run started under) terminalizes `FAILED` with cause
+  `definition_drift` — no silent resume, no replay machinery, no version tables. A modified
+  definition takes effect only by starting a *new execution*.
+
+[↑ Back to top](#table-of-contents)
+
+### 19.10 The research adapter
+
+`plugins/research/workflow_adapter.py` + `workflow_spec.py` bind the core to Research OS;
+`plugins/research/driver.py` is a compatibility facade that only late-binds `_backoff_s` and
+re-exports, so older import sites keep working without duplicating logic.
+
+| Core concept | Research binding |
+|---|---|
+| Definition / states | `workflow_spec` mirrors the DAG's `_LEGAL_NEXT` parity table — an import-time + parity-tested check keeps the spec and the domain state machine from diverging |
+| `LeaseStore` | `ResearchLeaseStore` — folds the lease into the existing `active_run` + driver checkpoint, committed by the portalocker `project_revision` CAS |
+| `Executor` | **one agent turn** through the kernel loop — the per-turn LLM step cap is runtime config (`research_driver_turn_max_steps = 25` for auto-drive vs the interactive default of 5), supplied by the caller, never part of the spec |
+| `ProgressProbe` | `_ResearchProgressProbe` — stage / gate milestone diff: progress means the run moved a phase or cleared a gate, not token churn |
+| `business_facts` | `finished` = the task reached PUBLISH; `pending_signals` = open gate overrides awaiting review → `WAITING` park; human approval of an override starts a *new* execution from `IDLE` |
+| `TerminalHook` | the **progressive mode** mechanism: an about-to-`FAILED` gate iteration is rewritten to continue (a replacement grade with `state None` — gap recorded honestly, run auto-settles forward), plus `build_settle_report` finalization at terminal — this is why progressive runs reach PUBLISH with disclosed gaps instead of deadlocking |
+| Grade vocabulary | `grade_turn` re-expresses the domain gate/stage outcomes onto the core's `Grade` / `CAUSE_*` codes |
+| Choreography | `research_drive` runs exactly one `drive_iteration` per arq job and schedules the next on `continue` |
+| Events | `EventPublisher` → the Redis task channel that wakes the SSE monitor (advisory; `NoopPublisher` passes the same tests) |
+
+The net effect for the user-visible behavior described in [§17](#17-research-os-module):
+stall recovery, double-run prevention, cooperative cancellation, strict-vs-progressive gate
+handling, and honest cap failures all come from this core — §17's Run-lifecycle paragraph
+reports only their research-level consequences.
 
 [↑ Back to top](#table-of-contents)
