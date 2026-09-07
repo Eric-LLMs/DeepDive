@@ -245,7 +245,11 @@ class ReactLoopAgent:
                 turn.span.record_step(
                     index=step,
                     tool_calls=0,
-                    tokens=turn.usage.get("total_tokens", 0),
+                    # Per-step DELTA, not the running cumulative total: the same
+                    # ``int(... or 0)`` coercion as ``AgentTurn.add_usage`` applied to
+                    # this step's provider usage, so ``sum(step.tokens)`` conserves
+                    # ``turn.usage["total_tokens"]`` and no step double-counts history.
+                    tokens=int((step_usage or {}).get("total_tokens") or 0),
                     duration_ms=(time.monotonic() - t0) * 1000,
                 )
                 # record_llm tags the most recent step entry, so it must come after

@@ -121,6 +121,103 @@ async def test_non_streaming_run_records_llm_duration_in_span():
     assert d["duration_s"] >= 0
 
 
+# ── C0 telemetry fix: step.tokens is the per-step DELTA ──────────────────────
+# Before the fix, record_step stored ``turn.usage["total_tokens"]`` — the running
+# cumulative — so ``to_dict()["tokens"]`` summed a triangular series and inflated
+# every audit token figure ~n/2×. The invariant pinned here is exactly what the
+# audit consumer (driver ledger / dashboards) needs to stay true.
+
+def _usage(p: int, c: int) -> dict:
+    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _with_usage(resp: dict, usage: dict) -> dict:
+    out = dict(resp)
+    out["usage"] = usage
+    return out
+
+
+async def test_step_tokens_are_deltas_and_conserve_cumulative_usage():
+    from agent.engine.context import AgentTurn
+
+    runtime = ToolRuntime()
+    runtime.register(_echo_tool())
+    llm = FakeLLM([
+        _with_usage(tool_call("c1", "echo", {"x": 1}), _usage(100, 10)),   # tool step
+        _with_usage(tool_call("c2", "echo", {"x": 2}), _usage(120, 20)),   # tool step
+        _with_usage(assistant("done"), _usage(130, 5)),                    # final step
+    ])
+    agent = ReactLoopAgent(llm, runtime, SystemPrompt())
+    turn = AgentTurn(user_msg="go")
+
+    result = await agent.run("go", turn=turn)
+
+    steps = turn.span.steps
+    # Each step carries only its own call's usage — no double counting.
+    assert [s["tokens"] for s in steps] == [110, 140, 135]
+    assert all(s["tokens"] >= 0 for s in steps)
+    # Conservation: sum(per-step deltas) == final cumulative usage == audit total.
+    assert turn.usage["total_tokens"] == 385
+    assert sum(s["tokens"] for s in steps) == turn.usage["total_tokens"]
+    assert turn.span.to_dict()["tokens"] == 385
+    # Business semantics UNCHANGED: AgentResult.usage stays the cumulative dict,
+    # and cost is priced off it, never off the per-step list.
+    assert result.usage == {"prompt_tokens": 350, "completion_tokens": 35, "total_tokens": 385}
+
+
+async def test_step_tokens_handle_missing_and_zero_usage():
+    """Provider usage absent → 0 delta; a genuinely-zero usage → 0; never negative."""
+    from agent.engine.context import AgentTurn
+
+    runtime = ToolRuntime()
+    runtime.register(_echo_tool())
+    llm = FakeLLM([
+        tool_call("c1", "echo", {"x": 1}),                                  # no usage key
+        _with_usage(tool_call("c2", "echo", {"x": 2}), _usage(0, 0)),       # zero usage
+        _with_usage(assistant("done"), _usage(50, 4)),
+    ])
+    agent = ReactLoopAgent(llm, runtime, SystemPrompt())
+    turn = AgentTurn(user_msg="go")
+
+    await agent.run("go", turn=turn)
+
+    steps = turn.span.steps
+    assert [s["tokens"] for s in steps] == [0, 0, 54]
+    assert sum(s["tokens"] for s in steps) == turn.usage["total_tokens"] == 54
+
+
+async def test_step_tokens_conserve_under_fatal_error_exit():
+    """Abnormal exit (fatal LLM error): recorded steps still sum to cumulative usage."""
+    from agent.engine.context import AgentTurn
+    from agent.llm.llm_errors import LLMTemporaryError
+
+    class _BoomLLM:
+        def __init__(self, scripted):
+            self.scripted = list(scripted)
+
+        async def chat(self, messages, tools=None, model=None, base_url=None, api_key=None):
+            if not self.scripted:
+                raise LLMTemporaryError("provider down")
+            return self.scripted.pop(0)
+
+        async def chat_stream(self, *a, **kw):  # pragma: no cover - run() only
+            raise AssertionError("not used")
+
+    runtime = ToolRuntime()
+    runtime.register(_echo_tool())
+    llm = _BoomLLM([_with_usage(tool_call("c1", "echo", {"x": 1}), _usage(80, 6))])
+    agent = ReactLoopAgent(llm, runtime, SystemPrompt())
+    turn = AgentTurn(user_msg="go")
+
+    result = await agent.run("go", turn=turn)
+
+    assert result.error  # fatal path taken; loop broke BEFORE record_step on the raise
+    assert [s["tokens"] for s in turn.span.steps] == [86]
+    assert sum(s["tokens"] for s in turn.span.steps) == turn.usage["total_tokens"] == 86
+    # The failed call recorded no usage and no phantom step.
+    assert len(turn.span.steps) == 1
+
+
 # ── generic cooperative turn stop (request_stop) ─────────────────────────────
 # The stop contract lives on AgentTurn; the loop must honour it WITHOUT knowing
 # anything about Research (no stage/gate vocabulary in the loop). These tests use a
