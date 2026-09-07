@@ -1842,6 +1842,38 @@ class TestBatchEvidence:
         assert result.is_error is True
         assert "at most 3 URLs" in result.error.message
 
+    async def test_fetch_runtime_roundtrip_passes_output_validation(self, env, monkeypatch):
+        """F1 regression: fetch must clear the full tool chain — runtime.execute →
+        output-schema validation ({"type": "object"}) → _render_json serialization.
+
+        A service-direct call would bypass exactly the contract point that failed
+        23/23 as ``invalid_output`` in the live run: ``fetch_save_batch`` returns a
+        list, the shared schema demanded an object. The wrapped ``{"results": [...]}``
+        return keeps the batch array (order-preserved) inside a valid object.
+        """
+        svc, task_id = await self._new_task(env)
+        svc.begin_run(USER, task_id)
+        self._install_fetch(monkeypatch)
+        urls = [
+            "https://good.example/recipe",
+            "https://empty.example/x",
+            "https://wall.example/y",
+        ]
+        result = await env.runtime.execute(
+            ToolExecution(
+                call_id=str(uuid.uuid4()),
+                name="research_scrape",
+                arguments={"action": "fetch", "project_id": task_id, "urls": urls},
+            )
+        )
+        assert result.is_error is False, getattr(result.error, "message", None)
+        assert isinstance(result.value, dict) and isinstance(result.value["results"], list)
+        views = result.value["results"]
+        assert [v["canonical_url"] for v in views] == urls  # batch order preserved
+        assert views[0]["status"] == "ok" and views[0]["saved"] is True
+        # The renderer serialized the wrapped dict — model-visible content is non-empty.
+        assert result.content and '"results"' in result.content[0].text
+
     async def test_fetch_saves_usable_only_records_ledger_and_is_silent(self, env, monkeypatch):
         svc, task_id = await self._new_task(env)
         svc.begin_run(USER, task_id)

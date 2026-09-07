@@ -3816,9 +3816,14 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                     "fetch a claim's sources in batches of ≤3"
                 )
             # Silent by contract (like save_scrape): no per-fetch monitor wake-up.
-            return await svc.fetch_save_batch(
-                user(), _project_id(args, "research_scrape", action), urls=urls
-            )
+            # F1 output-contract fix: the tool's shared schema is ``{"type": "object"}``
+            # (see _make_tool), but fetch_save_batch natively returns one view per URL as
+            # a list — wrap it so the batch array passes output validation (order kept).
+            return {
+                "results": await svc.fetch_save_batch(
+                    user(), _project_id(args, "research_scrape", action), urls=urls
+                )
+            }
         if action == "read":
             return await svc.read_fetch(
                 user(), _project_id(args, "research_scrape", action),
