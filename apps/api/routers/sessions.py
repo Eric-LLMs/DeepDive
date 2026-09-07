@@ -12,11 +12,9 @@ from api.auth import AuthUser, require_user
 from api.deps import get_agent, get_drive_service
 from api.schemas import ApprovalResolveRequest, SessionRenameRequest
 from core.application.drive_service import DriveError, DriveService
-from core.config import settings
 from core.infrastructure.db import ChunkModel, MessageModel, SessionLocal, SessionModel
 from core.infrastructure.memory import list_sessions, load_session_detail
 from fastapi import APIRouter, Depends, HTTPException, Response
-from plugins.research.plugin import ResearchService
 from sqlalchemy import select, update
 
 router = APIRouter(tags=["sessions"])
@@ -86,7 +84,6 @@ async def _backfill_imported_rag(session_factory, user_id: UUID, session_id: UUI
 async def get_sessions(
     user: AuthUser = Depends(require_user),
     q: str | None = None,
-    drive: DriveService = Depends(get_drive_service),
 ) -> dict:
     """List the authenticated user's chat sessions (newest first).
 
@@ -96,10 +93,9 @@ async def get_sessions(
     """
     q = (q or "").strip()
     sessions = await list_sessions(SessionLocal, user.user_id, q or None)
-    if sessions:
-        bound = ResearchService(drive, settings.research_scratch_dir).bound_session_ids(user.user_id)
-        sessions = [s for s in sessions if s["id"] not in bound]
-    return {"sessions": sessions}
+    # Research task sessions (type 1) are a different kind than chats: they are opened from
+    # the Research monitor, never listed in the chat sidebar.
+    return {"sessions": [s for s in sessions if s.get("type") != 1]}
 
 
 @router.get("/sessions/{session_id}")

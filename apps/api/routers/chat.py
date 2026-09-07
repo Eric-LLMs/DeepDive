@@ -51,6 +51,7 @@ from core.infrastructure.memory import (
     SessionMemoryStore,
     compact_history,
     create_session,
+    set_session_type,
 )
 from core.infrastructure.request_context import (
     set_request_llm_channel,
@@ -503,6 +504,13 @@ async def chat(
     research_service, bound_task_id, effective_handoff, research_notice = _resolve_research_context(
         drive, user, session_id, body.handoff
     )
+    if bound_task_id:
+        # Isolation marker: a session bound to a research task is stored as type=1 — hidden
+        # from the chat sidebar, opened only from the Research tab, deleted with the task.
+        try:
+            await set_session_type(SessionLocal, UUID(str(session_id)), 1)
+        except Exception:
+            logger.warning("research: failed to mark the bound session as type=1", exc_info=True)
     research_turn = research_service is not None and bound_task_id is not None
     if research_turn:
         try:
@@ -721,6 +729,12 @@ async def chat_stream(
     research_service, bound_task_id, effective_handoff, research_notice = _resolve_research_context(
         drive, user, session_id, body.handoff
     )
+    if bound_task_id:
+        # Isolation marker (see /chat): a research-bound session is stored as type=1.
+        try:
+            await set_session_type(SessionLocal, UUID(str(session_id)), 1)
+        except Exception:
+            logger.warning("research: failed to mark the bound session as type=1", exc_info=True)
     # Single active-run mutex per task (T4 invariant #2): a second concurrent trigger for a
     # task that is already running is a 409 conflict. The slot is released by ``end_run`` in
     # ``gen()``'s finally, so a client disconnect cannot strand it; a crashed process's slot

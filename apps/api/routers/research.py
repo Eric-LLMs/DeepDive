@@ -31,13 +31,14 @@ from api.deps import get_drive_service
 from api.schemas_research import TaskCreateRequest
 from core.application.drive_service import DriveError, DriveService
 from core.config import settings
-from core.infrastructure.db import SessionLocal
-from core.infrastructure.memory import create_session
+from core.infrastructure.db import MessageModel, SessionLocal, SessionModel
+from core.infrastructure.memory import create_session, set_session_type
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
 from plugins.research.monitor import task_channel
@@ -125,11 +126,13 @@ async def _ensure_gate_note(
 async def _make_task_session(user_id: uuid.UUID, title: str) -> str | None:
     """Create the task's dedicated chat session row (one task, one session).
 
-    Best-effort: a DB hiccup leaves the task created without a session (``None``); the client
-    then opens a fresh chat whose first message binds it via the research handoff.
+    Marked ``type=1`` (research): the chat sidebar hides it, and the Research tab only ever
+    opens the task's own type-1 session. Best-effort: a DB hiccup leaves the task created
+    without a session (``None``); the client then opens a fresh chat whose first message
+    binds it via the research handoff (the bind path re-marks it as type 1 as well).
     """
     try:
-        return str(await create_session(SessionLocal, user_id, title=title))
+        return str(await create_session(SessionLocal, user_id, title=title, type=1))
     except Exception:
         logger.exception("research: failed to create the task's chat session")
         return None
@@ -194,14 +197,43 @@ async def delete_task(
     user: AuthUser = Depends(require_user),
     drive: DriveService = Depends(get_drive_service),
 ):
-    """Cascade-delete a research task: cloud task folder → Trash, scratch state removed.
+    """Cascade-delete a research task: cloud task folder → Trash, scratch state removed,
+    and its bound type-1 chat session(s) deleted (messages cascade via the FK).
 
     409 Conflict when the task is RUNNING or its report is already indexed by RAG; 404 for a
     missing task / owner traversal. ``delete_task`` raises ``ValueError`` for all three and the
     message discriminates 409 (guard) from 404 (not found).
     """
     try:
-        return await _service(drive).delete_task(user.user_id, task_id)
+        result = await _service(drive).delete_task(user.user_id, task_id)
+        # Data consistency: the task's session rows go with it. Best-effort — an already
+        # deleted session is a no-op, never a failed task delete.
+        for sid in result.get("session_ids") or []:
+            try:
+                async with SessionLocal() as db:
+                    sess = await db.get(SessionModel, uuid.UUID(sid))
+                    if sess is None or sess.user_id != user.user_id or sess.type != 1:
+                        continue
+                    attach = (
+                        await db.execute(
+                            select(MessageModel.attach_asset_id).where(
+                                MessageModel.session_id == sess.id,
+                                MessageModel.attach_asset_id.is_not(None),
+                            )
+                        )
+                    ).scalars().all()
+                    await db.delete(sess)
+                    await db.commit()
+                for aid in attach:
+                    if aid is None:
+                        continue
+                    try:
+                        await drive.delete_asset(user.user_id, aid)
+                    except DriveError:
+                        pass
+            except Exception:
+                logger.warning("research delete: session cascade failed for %s", sid, exc_info=True)
+        return result
     except ValueError as exc:
         if "currently running" in str(exc) or "Knowledge Base" in str(exc):
             raise HTTPException(status_code=409, detail=str(exc))

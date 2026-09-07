@@ -150,7 +150,8 @@ class TestCreateTask:
         task_id = created["task_id"]
         assert created["stage"] == "DISCOVER"
         assert created["status"] == "ACTIVE"
-        assert created["cloud_folder_path"] == "VecDB"
+        # The title gains the 【任务】 display prefix at creation; the folder follows it.
+        assert created["cloud_folder_path"] == "【任务】VecDB"
 
         # Scratch state is authoritative and complete.
         task_dir = env.scratch / str(USER) / task_id
@@ -158,7 +159,7 @@ class TestCreateTask:
             assert (task_dir / f).is_file(), f
         project = ResearchService._load_json(task_dir / "project.json", None)
         assert project["cloud_folder_id"]
-        assert project["cloud_folder_path"] == "VecDB"
+        assert project["cloud_folder_path"] == "【任务】VecDB"
         # Materials provenance row: {asset_id, name, cloud_asset_id, mime}.
         assert project["materials"][0]["asset_id"] == str(asset.id)
         assert project["materials"][0]["name"] == "paper.pdf"
@@ -167,11 +168,11 @@ class TestCreateTask:
 
         # Cloud projection: the task folder + material asset + the two JSON mirrors.
         folders = [f["name"] for f in await env.drive.list_folders(USER)]
-        assert "VecDB" in folders
+        assert "【任务】VecDB" in folders
         # The two work folders always exist inside the task folder, even before any outputs.
         assert "materials" in folders and "outputs" in folders
         files = await env.drive.list_files(USER)
-        mats = [a for a in files if a["folder_path"] == "VecDB/materials"]
+        mats = [a for a in files if a["folder_path"] == "【任务】VecDB/materials"]
         assert len(mats) == 1
         assert mats[0]["name"] == f"{asset.id}__paper.pdf"
         assert mats[0]["id"] == project["materials"][0]["cloud_asset_id"]
@@ -186,7 +187,9 @@ class TestCreateTask:
         assert {f["name"] for f in status["cloud_files"]} == {
             "task_spec.json", "session_history.json", f"{asset.id}__paper.pdf",
         }
-        assert {f["folder_path"] for f in status["cloud_files"]} == {"VecDB", "VecDB/materials"}
+        assert {f["folder_path"] for f in status["cloud_files"]} == {
+            "【任务】VecDB", "【任务】VecDB/materials",
+        }
         # Each entry carries the asset id + mime so the frontend can fetch content on click.
         assert all(f["id"] and f["mime_type"] for f in status["cloud_files"])
 
@@ -198,10 +201,11 @@ class TestCreateTask:
         project = ResearchService._load_json(
             env.scratch / str(USER) / created["task_id"] / "project.json", None
         )
-        # The working directory is honored: the task folder lands under Projects/.
-        assert project["cloud_folder_path"] == "Projects/nested"
+        # The working directory is honored: the task folder lands under Projects/ (the title
+        # carries the 【任务】 display prefix).
+        assert project["cloud_folder_path"] == "Projects/【任务】nested"
         folders = [f["path"] for f in await env.drive.list_folders(USER)]
-        assert "Projects/nested" in folders
+        assert "Projects/【任务】nested" in folders
 
     def test_create_binds_a_dedicated_session(self, env):
         # Each task owns exactly one chat session, bound at creation (1:1). The same id is
@@ -349,11 +353,11 @@ class TestDeleteTask:
             env.scratch / str(USER) / task_id / "project.json", None
         )
         cloud_id = project["cloud_folder_id"]
-        assert project["cloud_folder_path"] == "doomed"
+        assert project["cloud_folder_path"] == "【任务】doomed"
 
         res = client.delete(f"/research/tasks/{task_id}")
         assert res.status_code == 200
-        assert res.json() == {"deleted": True}
+        assert res.json().get("deleted") is True  # + session_ids for the cascaded session rows
 
         # Scratch state is gone; the task is out of the list.
         assert not (env.scratch / str(USER) / task_id).exists()
@@ -392,7 +396,7 @@ class TestDeleteTask:
 
         res = client.delete(f"/research/tasks/{task_id}")
         assert res.status_code == 200
-        assert res.json() == {"deleted": True}
+        assert res.json().get("deleted") is True  # + session_ids for the cascaded session rows
         assert client.get("/research/tasks").json()["tasks"] == []
 
     async def test_delete_active_run_is_409(self, env):
@@ -477,27 +481,20 @@ class TestRestartPersistence:
 
 # ── 7. Research-session isolation (hidden from the chat sidebar list) ───────
 class TestSessionIsolation:
-    async def test_get_sessions_filters_research_bound_sessions(self, env, monkeypatch):
+    async def test_get_sessions_filters_type1_research_sessions(self, monkeypatch):
         from api.routers import sessions as sessions_module
 
-        # A normal chat session plus a session bound to a research task.
+        # The sidebar hides every session the DB marked type=1 (a research task's session);
+        # create_task binds such a row, so this is the whole isolation contract.
         normal_id = str(uuid.uuid4())
         research_session_id = str(uuid.uuid4())
-        svc = ResearchService(env.drive, env.scratch)
-        task_id = (await svc.create_task(USER, title="t"))["task_id"]
-        svc.bind_session(USER, task_id, research_session_id)
-        assert svc.bound_session_ids(USER) == {research_session_id}
 
         async def _fake_list_sessions(*_args, **_kwargs):
             return [
-                {"id": normal_id, "created_at": None, "summary": None, "title": "normal"},
-                {"id": research_session_id, "created_at": None, "summary": None, "title": "research"},
+                {"id": normal_id, "created_at": None, "summary": None, "title": "normal", "type": 0},
+                {"id": research_session_id, "created_at": None, "summary": None, "title": "research", "type": 1},
             ]
 
-        # Point the router at the throwaway scratch root, then exercise the endpoint directly.
-        monkeypatch.setattr(sessions_module, "settings", SimpleNamespace(research_scratch_dir=env.scratch))
         monkeypatch.setattr(sessions_module, "list_sessions", _fake_list_sessions)
-        result = await sessions_module.get_sessions(user=_auth(USER), q=None, drive=env.drive)
-        # The research-bound session is a different kind (tracked in the Research monitor),
-        # so the chat sidebar only sees the normal conversation.
+        result = await sessions_module.get_sessions(user=_auth(USER), q=None)
         assert [s["id"] for s in result["sessions"]] == [normal_id]

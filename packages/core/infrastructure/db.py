@@ -720,6 +720,9 @@ class SessionModel(Base):
     summary: Mapped[str | None] = mapped_column(Text)
     # Short auto-generated title (LLM from the first user message); None until finalized.
     title: Mapped[str | None] = mapped_column(Text)
+    # 0 = ordinary chat, 1 = research task session: type 1 is hidden from the chat sidebar
+    # and cascade-deleted with its task (migration 0017). Old rows default to 0.
+    type: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
 
 class MessageModel(Base):

@@ -399,6 +399,8 @@ async def list_sessions(session_factory, user_id: UUID, q: str | None = None) ->
                 "created_at": s.created_at.isoformat() if s.created_at else None,
                 "summary": s.summary,
                 "title": s.title,
+                # 0 = chat, 1 = research task session — the sidebar filter drops type 1.
+                "type": s.type,
             }
             for s in rows
         ]
@@ -495,18 +497,32 @@ async def ensure_user(session_factory, user_id: UUID | None = None) -> UUID:
         return row.id
 
 
-async def create_session(session_factory, user_id: UUID, title: str | None = None) -> UUID:
+async def create_session(
+    session_factory, user_id: UUID, title: str | None = None, type: int = 0
+) -> UUID:
     """Create a session row and return its id.
+
+    ``type``: 0 = ordinary chat (default), 1 = research task session (hidden from the chat
+    sidebar, deleted together with its task).
 
     A fresh session is titled after the first user message (ChatGPT/Gemini style) so the
     sidebar shows a readable name immediately instead of the raw id while the deferred
     finalize job is still running.
     """
     async with session_factory() as session:
-        row = SessionModel(user_id=user_id)
+        row = SessionModel(user_id=user_id, type=type)
         if title:
             row.title = " ".join(title.split())[:40]
         session.add(row)
         await session.commit()
         await session.refresh(row)
         return row.id
+
+
+async def set_session_type(session_factory, session_id: UUID, type: int) -> None:
+    """Mark an existing session's type (used when a chat turn binds it to a research task)."""
+    async with session_factory() as session:
+        row = await session.get(SessionModel, session_id)
+        if row is not None and row.type != type:
+            row.type = type
+            await session.commit()

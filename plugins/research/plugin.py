@@ -121,6 +121,11 @@ _LEGAL_NEXT: dict[str, str] = {
 
 _GATES = ["DESIGN_GATE", "EVIDENCE_GATE", "CLAIM_GATE", "QUALITY_GATE"]
 
+# Display prefix applied to a research task's title at creation. The task folder name and
+# the bound chat-session title are both derived from the task title, so prefixing once here
+# keeps folder == session title == ``【任务】xxx`` everywhere (matches existing titled rows).
+TASK_TITLE_PREFIX = "【任务】"
+
 # A transition into ``target`` is guarded by this gate (None = unguarded).
 _GATE_BEFORE: dict[str, str | None] = {
     "EXECUTE": "DESIGN_GATE",   # DESIGN -> EXECUTE
@@ -904,6 +909,9 @@ class ResearchService:
             raise ValueError(
                 f"unknown execution_mode {execution_mode!r} (expected 'strict' | 'progressive')"
             )
+        name = (name or "").strip()
+        if name and not name.startswith(TASK_TITLE_PREFIX):
+            name = f"{TASK_TITLE_PREFIX}{name}"
         if idempotency_key:
             existing = self._find_by_idempotency(owner_id, "project", idempotency_key)
             if existing is not None:
@@ -1422,6 +1430,12 @@ class ResearchService:
             raise ValueError(
                 f"unknown execution_mode {execution_mode!r} (expected 'strict' | 'progressive')"
             )
+        # The task title carries the display prefix from the moment it exists; the cloud task
+        # folder name and the bound session title are both derived from it, so prefixing here
+        # once keeps folder == session title == ``【任务】xxx`` everywhere.
+        title = (title or "").strip()
+        if title and not title.startswith(TASK_TITLE_PREFIX):
+            title = f"{TASK_TITLE_PREFIX}{title}"
         if idempotency_key:
             existing = self._find_by_idempotency(owner_id, "project", idempotency_key)
             if existing is not None:
@@ -1925,13 +1939,16 @@ class ResearchService:
                 pass
 
         # Scratch is runtime state: clear the session routing index, then hard-delete the
-        # task directory. Restoring the Trash folder cannot resurrect the task.
+        # task directory. Restoring the Trash folder cannot resurrect the task. The bound
+        # session ids are returned so the router can delete the type-1 chat rows too
+        # (task deletion must not leave orphaned sessions behind).
         index = self._load_session_index(owner_id)
+        bound_sessions = [k for k, v in index.items() if v == task_id]
         cleaned = {k: v for k, v in index.items() if v != task_id}
         if len(cleaned) != len(index):
             self._save_session_index(owner_id, cleaned)
         shutil.rmtree(self._project_dir(owner_id, task_id), ignore_errors=True)
-        return {"deleted": True}
+        return {"deleted": True, "session_ids": bound_sessions}
 
     # ── research_state ────────────────────────────────────────────────────
     def get_state(self, owner_id: uuid.UUID, project_id: str) -> dict:
