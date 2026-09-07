@@ -10,6 +10,8 @@ Proves the six frozen mechanisms against ``plugins/research/plugin.py``:
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import uuid
 from types import SimpleNamespace
@@ -23,6 +25,11 @@ from core.application.drive_service import DriveError
 from core.infrastructure.request_context import set_request_user
 from core.infrastructure.web_fetch import MIN_FETCH_TEXT_CHARS
 
+from plugins.research.fetch_cache import (
+    FetchStore,
+    cache_index_id,
+    classify_eligibility,
+)
 from plugins.research.plugin import (
     _ARTIFACT_ACTIONS,
     _EVIDENCE_ACTIONS,
@@ -2618,3 +2625,240 @@ class TestP3Fingerprints:
         assert gate_ok({"citations": [], "strength": "supported"}, normalize_claim_strength) is False
         assert gate_ok({"citations": ["u"], "strength": "very-high"}, normalize_claim_strength) is False
         assert gate_ok({"citations": ["u"]}, normalize_claim_strength) is False
+
+
+class TestFetchCacheP32A:
+    """P3-2A CAS: content-addressed fetch cache + eligibility + receipt materialization.
+
+    Composition over ``_EvidenceHarness`` (inheriting a ``Test*`` base would re-collect
+    its 11 parent tests — the P3-1 pattern composes instead). All offline (MockTransport +
+    stub resolver); the store lives under each test's fresh
+    ``tmp_path/scratch/fetch_store`` so runs never bleed into each other. Pinned contracts:
+
+    * T1  MISS→store→HIT: zero second network call, a fresh current-run asset + ledger
+          entry (cache ≠ provenance), freshness anchored to ``fetched_at`` (a hit must
+          never refresh it — proven by aging the index past max_age and forcing a refetch).
+    * T6  tampered / truncated blob → self-heal purge + honest miss + refetch.
+    * T7  cross-run: Run B hit ADDS only its own ledger + asset; Run A's historical asset
+          bytes are untouched.
+    * T8  a server-generated cache receipt passes the UNCHANGED E7 gate; read_fetch body
+          is byte-identical to the miss path.
+    * T9  secret-bearing query (token/sig) → ``no_cache``: usable in-run, store directory
+          never even created.
+    """
+
+    H = _EvidenceHarness()  # shared EVIDENCE fixture helpers (no test re-collection)
+
+    def _install_counting_fetch(self, monkeypatch):
+        import plugins.research.plugin as rplugin
+
+        calls: list[str] = []
+        base = TestBatchEvidence._page_handler  # accessed via class ⇒ plain function
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return base(request)
+
+        monkeypatch.setattr(rplugin, "_FETCH_TRANSPORT_OVERRIDE", httpx.MockTransport(handler))
+        monkeypatch.setattr(
+            rplugin, "_FETCH_RESOLVER_OVERRIDE", lambda host: [TestBatchEvidence._PUBLIC]
+        )
+        return calls
+
+    @staticmethod
+    def _store(env) -> FetchStore:
+        return FetchStore(env.scratch / "fetch_store")
+
+    @staticmethod
+    def _index_of(env, cu: str) -> dict:
+        store = TestFetchCacheP32A._store(env)
+        path = store._index_path(cache_index_id(cu))
+        return json.loads(path.read_text(encoding="utf-8")), path
+
+    # ── T1: miss → store → hit, freshness anchored to fetched_at ─────────────
+    async def test_t1_hit_skips_network_keeps_asset_and_fetched_at(self, env, monkeypatch):
+        svc, task_id = await self.H._new_task(env)
+        svc.begin_run(USER, task_id)
+        calls = self._install_counting_fetch(monkeypatch)
+        cu = "https://good.example/recipe"
+
+        (v1,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
+        assert v1["saved"] is True and "cache_hit" not in v1  # miss view: no hit flag
+        assert len(calls) == 1
+        prov1 = self.H._provenance(env, task_id)[cu]
+        assert prov1["cache_hit"] is False
+        assert "retrieved_at" not in prov1
+        entry, _ = self._index_of(env, cu)
+        assert prov1["content_hash"] == entry["sha256"]  # eligible miss published to CAS
+
+        (v2,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
+        assert len(calls) == 1  # HIT: the network was not touched again
+        assert v2["saved"] is True and v2["cache_hit"] is True
+        assert v2["asset_id"] != v1["asset_id"]  # a NEW current-run asset, not a pointer
+        assert v2["text"] == v1["text"] and v2["full_char_len"] == v1["full_char_len"]
+        prov2 = self.H._provenance(env, task_id)[cu]
+        assert prov2["cache_hit"] is True
+        assert prov2["retrieved_at"]  # this run's read stamp…
+        aged, ipath = self._index_of(env, cu)
+        assert aged["fetched_at"] == entry["fetched_at"]  # …and the cache clock did NOT move
+
+        # read_fetch resolves the hit-materialized asset exactly like a fetched one.
+        # (same lstrip semantics as the miss path — body vs header-stripped asset)
+        r = await svc.read_fetch(USER, task_id, canonical_url=cu)
+        assert r["content"].lstrip("\n") == v2["text"].lstrip("\n")
+
+        # Freshness is fetched_at-only: age the entry past max_age → honest refetch.
+        aged["fetched_at"] -= 90000  # > 24h
+        ipath.write_text(json.dumps(aged), encoding="utf-8")
+        (v3,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
+        assert len(calls) == 2  # stale ⇒ network again, and the slot is re-published
+        assert "cache_hit" not in v3
+        fresh, _ = self._index_of(env, cu)
+        assert fresh["fetched_at"] > entry["fetched_at"]
+
+    # ── T6: corrupt pair self-heals to a miss, never serves, never lingers ───
+    async def test_t6_tampered_and_truncated_blobs_self_heal(self, env, monkeypatch):
+        svc, task_id = await self.H._new_task(env)
+        svc.begin_run(USER, task_id)
+        calls = self._install_counting_fetch(monkeypatch)
+        cu = "https://good.example/recipe"
+        await svc.fetch_save_batch(USER, task_id, urls=[cu])
+        store = self._store(env)
+        key_id = cache_index_id(cu)
+        bpath = store._blob_path(key_id)
+        original = bpath.read_bytes()
+
+        bpath.write_bytes(b"X" + original[1:])  # one-byte tamper
+        (v,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
+        assert len(calls) == 2  # served as a miss → refetched
+        assert "cache_hit" not in v
+        idx = json.loads(store._index_path(key_id).read_text(encoding="utf-8"))
+        assert store._blob_path(key_id).read_bytes() == original  # clean entry republished
+        assert idx["sha256"] == hashlib.sha256(original).hexdigest()
+
+        bpath.write_bytes(original[:10])  # truncation → same discipline, at store level
+        assert store.lookup(cu) is None
+        assert not store._index_path(key_id).exists()  # dirty index purged
+        assert not bpath.exists()  # dirty blob purged
+
+    # ── T7: cross-run hit adds ONLY its own run-scoped records ───────────────
+    async def test_t7_cross_run_hit_pollutes_no_historical_records(self, env, monkeypatch):
+        svc, task_id = await self.H._new_task(env)
+        svc.begin_run(USER, task_id)
+        calls = self._install_counting_fetch(monkeypatch)
+        cu = "https://good.example/recipe"
+        (vA,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
+        assert len(calls) == 1  # Run A is the cold MISS (baseline network use)
+        old_asset = uuid.UUID(vA["asset_id"])
+        old_full = await svc.drive.read_text(USER, old_asset)
+        svc.end_run(USER, task_id)
+
+        svc.begin_run(USER, task_id)
+        (vB,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
+        assert len(calls) == 1  # Run B: still just Run A's one fetch — cache served it
+        assert vB["cache_hit"] is True and vB["saved"] is True
+        assert vB["asset_id"] != str(old_asset)  # current-run asset, minted fresh
+        assert await svc.drive.read_text(USER, old_asset) == old_full  # history untouched
+        prov = self.H._provenance(env, task_id)
+        assert list(prov) == [cu] and prov[cu]["cache_hit"] is True
+        # begin_run wholesale-replaced the driver ⇒ Run A's ledger is gone by construction;
+        # only Run B's own receipt exists, and it is the hit receipt.
+        svc.end_run(USER, task_id)
+
+    # ── T8: the cache receipt satisfies E7 with ZERO gate change ─────────────
+    async def test_t8_cache_receipt_passes_e7_and_reads_byte_identical(self, env, monkeypatch):
+        svc, task_id = await self.H._new_task(env)
+        svc.begin_run(USER, task_id)
+        claim_id, cu = await self.H._claim_and_fetch_good(env, monkeypatch, task_id)
+        rA = await svc.read_fetch(USER, task_id, canonical_url=cu)
+        outA = svc.ingest_evidence(
+            USER, task_id, claim={"id": claim_id},
+            findings=[{"url": cu, "verdict": "supports"}],
+        )
+        assert outA["verified_sources"] == [cu]  # miss-path baseline
+        svc.end_run(USER, task_id)
+
+        calls = self._install_counting_fetch(monkeypatch)
+        svc.begin_run(USER, task_id)
+        (vB,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
+        assert len(calls) == 0 and vB["cache_hit"] is True  # the hit receipt
+        outB = svc.ingest_evidence(
+            USER, task_id, claim={"id": claim_id},
+            findings=[{"url": cu, "verdict": "supports"}],
+        )
+        assert outB["verified_sources"] == [cu]  # E7 trusted it, code untouched
+        rB = await svc.read_fetch(USER, task_id, canonical_url=cu)
+        assert rB["content"] == rA["content"]  # byte-identical draft, hit vs miss
+
+    # ── T9: secret-bearing URLs never enter the global store ─────────────────
+    async def test_t9_secret_query_urls_are_no_cache_but_still_usable(self, env, monkeypatch):
+        # Pure-function edge of the eligibility gate first (server-decided, exact names).
+        assert classify_eligibility("https://x.test/p?token=abc", None) == "no_cache"
+        assert classify_eligibility("https://x.test/p", "https://x.test/p?sig=1") == "no_cache"
+        assert classify_eligibility("https://x.test/p?q=recipe&page=2") == "public"
+        assert classify_eligibility("http://[::1") == "no_cache"  # unparseable → refuse
+
+        svc, task_id = await self.H._new_task(env)
+        svc.begin_run(USER, task_id)
+        calls = self._install_counting_fetch(monkeypatch)
+        urls = [
+            "https://good.example/recipe?token=abc",
+            "https://good.example/recipe?sig=deadbeef",
+        ]
+        views = await svc.fetch_save_batch(USER, task_id, urls=urls)
+        assert all(v["saved"] is True for v in views)  # in-run usable as normal
+        assert len(calls) == 2
+        prov = self.H._provenance(env, task_id)
+        assert all(e["cache_hit"] is False and "content_hash" not in e for e in prov.values())
+        # Same batch again: still no cache anywhere (fetch_store never even created).
+        views2 = await svc.fetch_save_batch(USER, task_id, urls=urls)
+        assert len(calls) == 4
+        assert all("cache_hit" not in v for v in views2)
+        assert not (env.scratch / "fetch_store").exists()
+
+    # ── P3-2B end-to-end: concurrent cold MISSes collapse to one network call ──
+    async def test_t1b_concurrent_runs_collapse_to_one_fetch(self, env, monkeypatch):
+        """Two LIVE runs race the same cold URL: single-flight makes exactly one real
+        network call, yet BOTH runs still materialize their own asset and ledger entry
+        (flight collapse covers the network only — cache ≠ provenance discipline holds).
+        """
+        import plugins.research.plugin as rplugin
+        from plugins.research.fetch_cache import FlightRegistry
+
+        reg = FlightRegistry(lease_s=10)
+        monkeypatch.setattr(rplugin, "_FETCH_FLIGHTS", reg)
+
+        svc, task_a = await self.H._new_task(env)
+        _, task_b = await self.H._new_task(env)
+        svc.begin_run(USER, task_a)
+        svc.begin_run(USER, task_b)
+
+        calls: list[str] = []
+        base = TestBatchEvidence._page_handler
+
+        async def slow_handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            await asyncio.sleep(0.05)  # hold the leader long enough for the joiner
+            return base(request)
+
+        monkeypatch.setattr(
+            rplugin, "_FETCH_TRANSPORT_OVERRIDE", httpx.MockTransport(slow_handler)
+        )
+        monkeypatch.setattr(
+            rplugin, "_FETCH_RESOLVER_OVERRIDE", lambda host: [TestBatchEvidence._PUBLIC]
+        )
+        cu = "https://good.example/recipe"
+        va, vb = await asyncio.gather(
+            svc.fetch_save_batch(USER, task_a, urls=[cu]),
+            svc.fetch_save_batch(USER, task_b, urls=[cu]),
+        )
+        assert len(calls) == 1                     # collapsed: ONE real fetch
+        assert va[0]["saved"] is True and vb[0]["saved"] is True
+        assert va[0]["asset_id"] != vb[0]["asset_id"]  # each run owns its asset
+        assert va[0]["text"] == vb[0]["text"]      # shared envelope, per-run re-slice
+        for t in (task_a, task_b):
+            prov = self.H._provenance(env, t)[cu]
+            assert prov["cache_hit"] is False      # flight ≠ cache hit — separate flags
+            assert prov["content_hash"]            # both wrote their own receipt
+        assert reg._flights == {}                  # registry self-cleaned after resolve
+        assert self._store(env).lookup(cu) is not None  # CAS published once, usable

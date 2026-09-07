@@ -50,6 +50,7 @@ from agent.tools.tool_permissions import ToolPermission
 from core.application.drive_service import DriveError
 from core.infrastructure.request_context import get_request_user_id
 from core.infrastructure.web_fetch import (
+    DEFAULT_TEXT_TARGET,
     MIN_FETCH_TEXT_CHARS,
     fetch_clean_urls,
 )
@@ -61,11 +62,22 @@ from plugins.research.batch import (
     evidence_fingerprint,
     gate_ok as _batch_gate_ok,
 )
+from plugins.research.fetch_cache import (
+    FetchStore,
+    FlightRegistry,
+    cache_index_id,
+    classify_eligibility,
+)
 
 # Fetch transport/resolver overrides — production runs with the real network (None); unit
 # tests patch these globals to a MockTransport + stub resolver so nothing is hit offline.
 _FETCH_TRANSPORT_OVERRIDE = None
 _FETCH_RESOLVER_OVERRIDE = None
+
+# P3-2B: process-local single-flight over the *network* fetch, keyed by the full P3-2A
+# cache identity (canonical_url × policy × parser). One asyncio event loop only — the
+# registry holds futures; there is deliberately no cross-process/thread dedup tier.
+_FETCH_FLIGHTS = FlightRegistry()
 
 # Source/Evidence node id prefixes (deterministic, url-anchored — E1/E5 identity keys).
 _SOURCE_ID_PREFIX = "src:"
@@ -3056,6 +3068,16 @@ class ResearchService:
         - **E10** saves run concurrently under ``asyncio.gather``; a failed drive write marks
           that URL unsaved and is **not** entered into the ledger (no account skew). It never
           fails the batch.
+        - **P3-2A CAS**: each URL is looked up in the global fetch cache first. A HIT skips
+          only the network — the draft is still persisted as a fresh *current-run* asset and
+          gets a full ledger entry (``cache_hit=True`` + original ``fetched_at`` +
+          ``retrieved_at``), so E6/E7/E10 behave exactly as on a MISS. Eligible MISSes
+          (usable, no secret-bearing query on request or final URL) are published to the
+          cache best-effort after a successful fetch.
+        - **P3-2B single-flight**: concurrent MISS fetches of the same cache identity in
+          this process/event loop collapse to one network call (exclusive lease +
+          generation-fenced takeover inside ``fetch_cache.FlightRegistry``); waiters get
+          the shared envelope but keep their full per-run persist/ledger discipline.
         - Silent by contract (like ``save_scrape``): no run event / monitor wake-up per batch.
 
         Returns one model-facing view per input URL (order preserved; ``body`` stripped).
@@ -3098,11 +3120,93 @@ class ResearchService:
                 )
                 for u in raw
             ]
-        envelopes = await fetch_clean_urls(
-            raw,
-            transport=transport or _FETCH_TRANSPORT_OVERRIDE,
-            resolver=resolver or _FETCH_RESOLVER_OVERRIDE,
-        )
+        # ── P3-2A pre-fetch CAS lookup (public drafts only) ──
+        # The cache is a strict accelerator: any store/lookup fault degrades to a miss and
+        # costs one re-fetch, never data. A HIT never skips the run-scoped bookkeeping:
+        # the draft is still materialized as a *current-run* drive asset and ledger entry
+        # below (cache ≠ provenance), so read_fetch/E6/E7/E10 discipline is identical.
+        store = FetchStore(self.scratch_root / "fetch_store")
+        n_call = len({u.strip() for u in raw})  # E4: whole-batch text budget denominator
+        per_url_chars = max(1, DEFAULT_TEXT_TARGET // n_call)
+        cu_of = [canonicalize(u) for u in raw]
+        hits: dict[int, dict] = {}
+        miss_idx: list[int] = []
+        for i, cu in enumerate(cu_of):
+            hit = store.lookup(cu) if cu else None
+            if hit is None:
+                miss_idx.append(i)
+            else:
+                hits[i] = hit
+        envelopes: list[dict] = []
+        by_index: dict[int, dict] = {}
+        for i, meta in hits.items():
+            body = meta["body_bytes"].decode("utf-8", errors="replace")
+            shown = body[:per_url_chars]
+            by_index[i] = {
+                "url": raw[i],
+                "canonical_url": cu_of[i],
+                "status": "ok",
+                "title": meta.get("title", ""),
+                "http_status": meta.get("http_status"),
+                "final_url": meta.get("final_url", cu_of[i]),
+                "content_status": meta.get("content_status", "usable"),
+                "full_char_len": len(body),
+                "char_len": len(shown),
+                "text": shown,
+                "truncated": len(body) > len(shown),
+                "body": body,
+            }
+        if miss_idx:
+            # ── P3-2B single-flight (in-process, event-loop-local) ──
+            # MISSes of the same cache identity (flight key == the P3-2A cache_index_id)
+            # collapse to ONE real network call: the first caller leads, concurrent ones
+            # wait behind the shared future; lease expiry hands leadership to exactly one
+            # generation-fenced successor. Only the NETWORK collapses — every consumer
+            # below still re-slices at its own batch n, materializes its own current-run
+            # asset and writes its own ledger entry (cache ≠ provenance).
+            transport_eff = transport or _FETCH_TRANSPORT_OVERRIDE
+            resolver_eff = resolver or _FETCH_RESOLVER_OVERRIDE
+
+            async def _net(i: int) -> dict:
+                envs = await fetch_clean_urls(
+                    [raw[i]], transport=transport_eff, resolver=resolver_eff
+                )
+                return envs[0] if envs else {
+                    "url": raw[i], "canonical_url": cu_of[i], "status": "error",
+                    "error": {"type": "transport", "message": "empty fetch result"},
+                    "title": "", "http_status": None, "final_url": cu_of[i],
+                    "content_status": "n/a", "full_char_len": 0, "char_len": 0,
+                    "text": "", "truncated": False,
+                }
+
+            results = await asyncio.gather(
+                *(
+                    _FETCH_FLIGHTS.run(cache_index_id(cu_of[i]), lambda i=i: _net(i))
+                    for i in miss_idx
+                )
+            )
+            for i, shared in zip(miss_idx, results):
+                o = dict(shared)  # the flight result is SHARED — copy before re-slicing
+                if o.get("status") == "ok":
+                    # Re-slice the view text at the WHOLE-call n (the flight fetched with
+                    # its own n=1 budget); the persisted body is untouched.
+                    body = o.get("body") or ""
+                    shown = body[:per_url_chars]
+                    o["text"] = shown
+                    o["char_len"] = len(shown)
+                    o["truncated"] = o.get("full_char_len", len(body)) > len(shown)
+                by_index[i] = o
+        for i in range(len(raw)):
+            envelopes.append(
+                by_index.get(i)
+                or {  # defensive: input dup collapsed by the fetcher's own dedup
+                    "url": raw[i], "canonical_url": cu_of[i], "status": "error",
+                    "error": {"type": "dedup", "message": "duplicate URL in batch"},
+                    "title": "", "http_status": None, "final_url": cu_of[i],
+                    "content_status": "n/a", "full_char_len": 0, "char_len": 0,
+                    "text": "", "truncated": False,
+                }
+            )
         # Pre-persist plan for the usable pages (names/content computed offline; no IO yet).
         persist_plan: list[tuple[int, str, bytes]] = []  # (envelope index, name, content bytes)
         plan_of: dict[int, int] = {}  # envelope index -> position in persist_plan
@@ -3165,11 +3269,32 @@ class ResearchService:
                 "full_char_len": o.get("full_char_len", 0),
                 "saved": False,
                 "asset_id": None,
+                "cache_hit": i in hits,  # P3-2A: server-set; a hit still re-materializes
             }
             if o.get("content_status") != "usable":
                 additions[cu] = entry  # fetched but unusable → recorded, never verifiable
                 views.append(self._fetch_view(o, saved=False))
                 continue
+            # ── P3-2A cache bookkeeping (fetch succeeded; drive outcome is orthogonal) ──
+            # HIT: carry the original fetch time forward — freshness stays anchored to
+            # fetched_at, retrieved_at is this run's read stamp only and can never extend
+            # the cache entry's life. MISS (eligible): publish to CAS, best-effort.
+            if i in hits:
+                meta = hits[i]
+                entry["content_hash"] = meta.get("sha256")
+                entry["fetched_at"] = meta.get("fetched_at_iso")
+                entry["retrieved_at"] = _now_iso()
+            elif classify_eligibility(cu, o.get("final_url") or cu) == "public":
+                body_bytes = (o.get("body") or "").encode("utf-8")
+                if store.store(cu, body_bytes, {
+                    "title": o.get("title", ""),
+                    "http_status": o.get("http_status"),
+                    "final_url": o.get("final_url", cu),
+                    "content_status": o.get("content_status"),
+                    "full_char_len": o.get("full_char_len", 0),
+                }):
+                    entry["content_hash"] = hashlib.sha256(body_bytes).hexdigest()
+                    entry["fetched_at"] = _now_iso()
             outcome = persist_outcomes.get(i) or {"ok": False, "asset_id": None}
             if not outcome.get("ok"):
                 # E10: a failed drive write is left OUT of the ledger (no account skew).
@@ -3188,7 +3313,8 @@ class ResearchService:
             additions[cu] = entry
             views.append(
                 self._fetch_view(
-                    o, saved=True, asset_id=asset_id, path=entry["path"], name=name
+                    o, saved=True, asset_id=asset_id, path=entry["path"], name=name,
+                    cache_hit=True if i in hits else None,
                 )
             )
         if additions:
