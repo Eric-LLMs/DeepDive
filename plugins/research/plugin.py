@@ -1524,6 +1524,17 @@ class ResearchService:
         )
         if not version_paths:
             raise ValueError(f"artifact has no scratch content: {artifact_id}")
+        # G3 base provenance (mirror of review_draft): prefer the CURRENT run's tagged
+        # versions over numeric max, so a stale higher-numbered file can never be the
+        # promotion source while this edition's own output exists.
+        _cur_seq = project.get("run_seq")
+        _tagged_paths = [
+            p for p in version_paths
+            if _cur_seq is not None
+            and (self._load_json(p, None) or {}).get("run_seq") == _cur_seq
+        ]
+        if _tagged_paths:
+            version_paths = _tagged_paths
         record = self._load_json(version_paths[-1], None)
         if record is None:
             raise ValueError(f"artifact not found: {artifact_id}")
@@ -3024,7 +3035,9 @@ class ResearchService:
                 graph, owner_id=owner_id, project_id=project_id, project=project
             )
         else:  # QUALITY_GATE
-            checks = self._quality_checks(project)
+            checks = self._quality_checks(
+                project, owner_id=owner_id, project_id=project_id
+            )
         ok = all(c["ok"] for c in checks)
         status = "PASS" if ok else "FAIL"
 
@@ -3095,29 +3108,113 @@ class ResearchService:
         ]
 
     @staticmethod
-    def _quality_checks(project: dict) -> list[dict]:
-        scorecard = project.get("scorecard") or []
-        if not scorecard:
-            # Nothing in the current toolset writes a scorecard, so "missing" is a
-            # provisioning gap, not agent misconduct: tagged ``diagnostic_only`` so
-            # progressive diagnostics and review notes can tell it apart from a real
-            # scorecard FAIL. Strict blocking semantics are unchanged (ok stays False).
+    def _parse_scorecard_rows(content: str) -> tuple[int, int]:
+        """(dimension_rows, fatal_flags) from a markdown scorecard table.
+
+        A dimension row = pipe-table line whose first cell is an integer index; the
+        4th column is the Fatal flag (Run-15 agent shape: ``| # | Criterion | Score |
+        Fatal | Note |``).
+        """
+        rows = fatal = 0
+        for line in (content or "").splitlines():
+            s = line.strip()
+            if not s.startswith("|"):
+                continue
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if len(cells) < 4 or not cells[0].isdigit():
+                continue
+            rows += 1
+            if cells[3].lower() in ("yes", "y", "true", "fatal", "x", "✕", "☓"):
+                fatal += 1
+        return rows, fatal
+
+    def _quality_checks(
+        self, project: dict, *, owner_id: uuid.UUID, project_id: str
+    ) -> list[dict]:
+        """QUALITY_GATE with strict per-edition scorecard scope (Run-15 closure).
+
+        Priority: (1) a ``scorecard.md`` artifact version tagged run_seq == current —
+        authoritative, blocking verdict; (2) a newest scorecard.md that is stale or
+        unprovenanced — REJECTED as borrowed (never silently accepted); (3) the legacy
+        in-project ``scorecard`` rows, honored only when their own ``scorecard_run_seq``
+        stamp is absent (pre-stamp data) or equal to the current run; a concrete
+        mismatch is a stale grade sheet; (4) nothing at all — the historical
+        ``scorecard_missing`` diagnostic_only verdict (provisioning gap, unchanged).
+        """
+        cur = project.get("run_seq")
+        adir = self._artifact_dir(owner_id, project_id, "scorecard.md")
+        versions = sorted(
+            (int(p.name[1:]) for p in adir.glob("v*") if p.name[1:].isdigit())
+        ) if adir.is_dir() else []
+        for v in reversed(versions):  # newest first — one file's verdict decides
+            rec = self._load_json(adir / f"v{v}", None) or {}
+            rs = rec.get("run_seq")
+            if rs is None:
+                return [
+                    {
+                        "name": "scorecard",
+                        "ok": False,
+                        "severity": "blocking",
+                        "detail": "scorecard_unprovenanced: newest scorecard.md v"
+                        f"{v} carries no run_seq stamp and cannot be trusted as THIS "
+                        "edition's grade sheet — re-record it via write_scratch in this run",
+                    }
+                ]
+            if rs != cur:
+                return [
+                    {
+                        "name": "scorecard",
+                        "ok": False,
+                        "severity": "blocking",
+                        "detail": f"scorecard_stale: newest scorecard.md v{v} was graded "
+                        f"by run_seq={rs}, not the current run_seq={cur}; a borrowed "
+                        "grade sheet from an older edition is never accepted",
+                    }
+                ]
+            rows, fatal = self._parse_scorecard_rows(rec.get("content") or "")
+            ok = rows >= 7 and fatal == 0
             return [
                 {
                     "name": "scorecard",
-                    "ok": False,
-                    "severity": "diagnostic_only",
-                    "detail": "scorecard_missing: no scorecard has been recorded for this "
-                    "project (the >=7-rows / no-fatal bar cannot be evaluated)",
+                    "ok": ok,
+                    "severity": "blocking",
+                    "detail": f"scorecard.md v{v} (run_seq={cur}): {rows} rows / {fatal} "
+                    "fatal — the bar is >=7 dimensions and no fatal finding",
                 }
             ]
-        ok = len(scorecard) >= 7 and not any(row.get("fatal") for row in scorecard)
+        scorecard = project.get("scorecard") or []
+        if scorecard:
+            src = project.get("scorecard_run_seq")
+            if src is not None and cur is not None and src != cur:
+                return [
+                    {
+                        "name": "scorecard",
+                        "ok": False,
+                        "severity": "blocking",
+                        "detail": f"scorecard_stale: project scorecard rows are stamped "
+                        f"run_seq={src}, not the current run_seq={cur}",
+                    }
+                ]
+            ok = len(scorecard) >= 7 and not any(row.get("fatal") for row in scorecard)
+            return [
+                {
+                    "name": "scorecard",
+                    "ok": ok,
+                    "severity": "blocking",
+                    "detail": "scorecard has >=7 rows and no fatal finding",
+                }
+            ]
+        # Nothing in the current toolset writes a scorecard, so "missing" is a
+        # provisioning gap, not agent misconduct: tagged ``diagnostic_only`` so
+        # progressive diagnostics and review notes can tell it apart from a real
+        # scorecard FAIL. Strict blocking semantics are unchanged (ok stays False).
         return [
             {
                 "name": "scorecard",
-                "ok": ok,
-                "severity": "blocking",
-                "detail": "scorecard has >=7 rows and no fatal finding",
+                "ok": False,
+                "severity": "diagnostic_only",
+                "detail": "scorecard_missing: no scorecard has been recorded for this "
+                "project (the >=7-rows / no-fatal bar cannot be evaluated)",
             }
         ]
 
@@ -3237,7 +3334,10 @@ class ResearchService:
                 project=self._load_project(owner_id, project_id),
             )
         if gate_name == "QUALITY_GATE":
-            return self._quality_checks(self._load_project(owner_id, project_id))
+            return self._quality_checks(
+                self._load_project(owner_id, project_id),
+                owner_id=owner_id, project_id=project_id,
+            )
         raise ValueError(f"unknown gate: {gate_name}")
 
     def gate_note_drafts(self, owner_id: uuid.UUID, project_id: str) -> list[dict]:
@@ -3374,9 +3474,12 @@ class ResearchService:
         run-scoped shared state is reset (stage -> DISCOVER, gates -> NOT_RUN, diagnostics
         and last_block cleared, evidence graph emptied) so the driver actually drives
         DISCOVER -> ... -> PUBLISH again. ``run_seq`` still advances (red line 1), so this
-        edition's working copy lands in temp/v{N} + outputs/_v{N}; earlier editions' files
-        are versioned and are never touched. For a task short of PUBLISH (mid-chain /
-        blocked resume) the flag is a no-op and the run resumes from the current stage.
+        edition's working copy lands in temp/v{N} + outputs/_v{N}. Earlier editions' files
+        stay on disk for history, with ONE G3 exception: the previous PRIMARY report's
+        version tree is ARCHIVED (moved, never deleted) under ``archive/run{N-1}/``, so the
+        new edition's draft slot (v1) can never be base-hijacked by a stale higher-numbered
+        version. For a task short of PUBLISH (mid-chain / blocked resume) the flag is a
+        no-op and the run resumes from the current stage.
 
         Raises ``ValueError`` for a live conflict; the router maps it to a 409.
         """
@@ -3434,7 +3537,24 @@ class ResearchService:
                 # report-named write must be free to re-bind it (the previous edition's
                 # artifact trees stay on disk for history, but they are no longer the
                 # REVIEW/PUBLISH target).
-                project.pop("primary_report_artifact_id", None)
+                # G3 (Run-15 lesson): "stays on disk" was NOT neutral — write_scratch
+                # writes the v1 DRAFT slot while review/promote read the NUMERIC max, so
+                # a previous edition's higher-numbered version (v2) hijacked the base and
+                # the current draft (v1) was orphaned. The old primary's tree is therefore
+                # ARCHIVED (moved, never deleted) to archive/run{N-1}/<id>/ before the pop:
+                # the new edition's primary starts empty, v1 -> v2 numbering is clean.
+                old_primary = project.pop("primary_report_artifact_id", None)
+                if old_primary:
+                    odir = self._artifact_dir(owner_id, project_id, old_primary)
+                    if odir.is_dir():
+                        dest = (
+                            self._project_dir(owner_id, project_id) / "archive"
+                            / f"run{run_seq - 1}" / old_primary
+                        )
+                        dest.mkdir(parents=True, exist_ok=True)
+                        for vp in list(odir.glob("v*")):
+                            if vp.name[1:].isdigit():
+                                vp.rename(dest / vp.name)
                 # The evidence graph is per-task shared state (graph.json, not versioned):
                 # empty it so the new edition re-gathers sources instead of inheriting the
                 # finished edition's STALE/CANDIDATE nodes as if they were current evidence.
@@ -5038,7 +5158,19 @@ class ResearchService:
             raise ValueError(
                 f"review_draft: artifact '{artifact_id}' has no version to review"
             )
-        base_version = versions[-1]
+        # G3 base provenance (Run-15 lesson): write_scratch lives in the v1 DRAFT slot
+        # while a previous edition's create_version output may still sit at a HIGHER
+        # number — numeric max then lets a stale tree hijack the base. Base selection
+        # therefore prefers, and force-matches, versions tagged run_seq == current;
+        # only when this run has tagged NOTHING does it fall back to numeric max
+        # (grandfathered pre-G3 trees), where the ghost check below still bites.
+        _cur_seq = _proj.get("run_seq")
+        _tagged = [
+            v for v in versions
+            if _cur_seq is not None
+            and (self._load_json(artifact_dir / f"v{v}", None) or {}).get("run_seq") == _cur_seq
+        ]
+        base_version = max(_tagged) if _tagged else versions[-1]
         record = self._artifact(owner_id, project_id, artifact_id, base_version)
         # G3 ghost-tree isolation: never review a version physically produced by a
         # different run edition. Combined with G1 (which forces the current run to write

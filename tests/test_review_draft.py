@@ -289,3 +289,75 @@ async def test_g3_identical_rewrite_reclaims_run_seq(env, monkeypatch):
     _seam(monkeypatch, [json.dumps({"changes": [_change(old="stable", new="STABLE")]})])
     out = await svc.review_draft(USER, task_id, artifact_id="report.md")
     assert out["status"] == "ok"
+
+
+# ── G3 hardening (Run-15 closure): tagged-base preference + new_edition archive ─
+
+def _plant_stale_v2(svc, env, task_id, content="STALE older-edition final\n"):
+    """Run-15 residual shape: a higher-numbered version WITHOUT this run's tag sitting
+    above the current run's v1 draft (grandfathered/untagged tree from an old edition)."""
+    adir = env.scratch / str(USER) / task_id / "artifacts" / "report.md"
+    rec = svc._load_json(adir / "v1", None)
+    stale = dict(rec)
+    stale.update(version=2, content=content)
+    stale.pop("run_seq", None)
+    svc._save_json(adir / "v2", stale)
+    return adir
+
+
+async def test_g3_review_base_prefers_current_tagged_over_stale_higher(env, monkeypatch):
+    draft = "current draft body\n"
+    svc, task_id = await _project_with_draft(env, draft, {"c1": "x"})
+    _plant_stale_v2(svc, env, task_id)
+    seen = _seam(monkeypatch, [json.dumps({"changes": [
+        _change(old="draft body", new="polished prose")]})])
+    out = await svc.review_draft(USER, task_id, artifact_id="report.md")
+    # The REVIEW input is THIS run's v1 — never the stale numeric-max v2.
+    assert out["base_version"] == 1
+    assert draft in seen[0][0] and "STALE" not in seen[0][0]
+    # create_version still numbers from the physical max (no overwrite of the stale file).
+    assert out["new_version"] == 3
+
+
+async def test_g3_promote_prefers_current_tagged_over_stale_higher(env):
+    draft = "current final content\n"
+    svc, task_id = await _project_with_draft(env, draft, {"c1": "x"})
+    adir = _plant_stale_v2(svc, env, task_id)
+    out = await svc.promote_to_drive(USER, task_id, artifact_id="report.md")
+    assert out["version"] == 1 and out["status"] == "PROMOTED" and out["drive_asset_id"]
+    v1 = svc._load_json(adir / "v1", None)
+    assert v1["status"] == "PROMOTED" and v1.get("drive_asset_id")
+    # The stale v2 was never touched — PUBLISH output came from this edition's v1.
+    v2 = svc._load_json(adir / "v2", None)
+    assert v2.get("status") != "PROMOTED" and not v2.get("drive_asset_id")
+
+
+async def test_g3_new_edition_archives_old_primary_tree(env, monkeypatch):
+    svc = _svc(env)
+    task_id = (await svc.create_task(USER, title="archive"))["task_id"]
+    svc.begin_run(USER, task_id)
+    seq1 = svc.read_project(USER, task_id)["run_seq"]
+    await svc.write_scratch(USER, task_id, artifact_id="report.md", content="edition one draft\n")
+    await svc.create_version(USER, task_id, artifact_id="report.md", content="edition one final\n")
+    # Edition one finishes and the task is re-ignited as a new edition.
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(stage="PUBLISH"))
+    svc.end_run(USER, task_id)
+    svc.begin_run(USER, task_id, new_edition=True)
+
+    proj = svc.read_project(USER, task_id)
+    assert proj["run_seq"] == seq1 + 1 and proj["stage"] == "DISCOVER"
+    assert "primary_report_artifact_id" not in proj
+    adir = env.scratch / str(USER) / task_id / "artifacts" / "report.md"
+    live = [p.name for p in adir.glob("v*") if p.name[1:].isdigit()] if adir.is_dir() else []
+    assert live == []  # draft slot starts EMPTY — the old v1/v2 can no longer hijack a base
+    archived = env.scratch / str(USER) / task_id / "archive" / f"run{seq1}" / "report.md"
+    assert (archived / "v1").is_file() and (archived / "v2").is_file()  # moved, never deleted
+
+    # Literal Run-16 acceptance chain: write -> v1, review -> v2.
+    await svc.write_scratch(USER, task_id, artifact_id="report.md", content="edition two draft\n")
+    assert svc.read_project(USER, task_id)["primary_report_artifact_id"] == "report.md"
+    rec = svc._load_json(adir / "v1", None)
+    assert rec["run_seq"] == seq1 + 1
+    _seam(monkeypatch, [json.dumps({"changes": [_change(old="edition two", new="polished two")]})])
+    out = await svc.review_draft(USER, task_id, artifact_id="report.md")
+    assert out["base_version"] == 1 and out["new_version"] == 2

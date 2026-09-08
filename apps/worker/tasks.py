@@ -1221,6 +1221,25 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
             turn = kernel._build_turn(
                 prompt, history, None, None, model, base_url, api_key, None, context,
             )
+            # PRE-CALL cost hard gate (run-level). The driver executor also gates at the
+            # turn seam; this wires the SAME cap into the step loop so that every
+            # would-be LLM request inside the turn is refused once the run's cumulative
+            # spend reaches it: ``loop._budget_exceeded`` checks cost >= max_budget_usd
+            # BEFORE issuing, i.e. turn budget = remaining run budget, not a stat.
+            from plugins.research.workflow_adapter import CostLimitExceeded
+
+            _cap = settings.research_driver_max_cost_usd
+            if _cap is not None:
+                _ck = service.get_driver_checkpoint(user_id, task_id) or {}
+                _spent = float(_ck.get("cumulative_cost_usd") or 0.0)
+                if _spent >= _cap:
+                    raise CostLimitExceeded(
+                        f"research run {run_id} turn {turn_index}: cumulative "
+                        f"${_spent:.4f} >= cap ${_cap:.4f} — no LLM call is made"
+                    )
+                turn.max_budget_usd = min(
+                    _cap - _spent, settings.max_budget_per_turn_usd or _cap - _spent
+                )
             turn.activate_skill("deep_research")
             await kernel._snapshot_workspace(turn)
             result = await kernel.loop.run(

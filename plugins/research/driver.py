@@ -25,6 +25,7 @@ from ``workflow_adapter`` / ``workflow_spec`` directly.
 from __future__ import annotations
 
 from plugins.research.workflow_adapter import (  # noqa: F401 — re-exported compat surface
+    CostLimitExceeded,
     DriverOutcome,
     IllegalRunTransition,
     ProjectLockError,

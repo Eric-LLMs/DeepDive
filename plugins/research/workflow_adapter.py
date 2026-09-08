@@ -296,6 +296,16 @@ def grade_turn(facts: TurnFacts) -> Grade:
 
 
 # ── transient classification ─────────────────────────────────────────────────
+class CostLimitExceeded(RuntimeError):
+    """PRE-CALL hard gate fired: the run's cumulative spend already reached
+    ``max_cost_usd``, so NO further LLM call may be made. Raised by the turn
+    executor before invoking ``run_turn`` (turn-start gate) and by the worker
+    before composing the kernel turn — never a passive billing stat. Explicitly
+    graded NON-transient in :func:`is_transient_error` (the "$5xx" text hint would
+    otherwise match digits inside the dollar amounts of this message).
+    """
+
+
 _TRANSIENT_HINTS = (
     "timed out", "timeout", "timedout", "connection", "refused", "reset", "broken pipe",
     "server error", "internal server error", "unavailable", "rate limit", "too many requests",
@@ -315,6 +325,8 @@ def is_transient_error(exc: BaseException) -> bool:
         return True
     if isinstance(exc, RevisionConflictError):
         return False
+    if isinstance(exc, CostLimitExceeded):
+        return False  # a spent budget never un-spends; retrying only wastes steps
     text = f"{type(exc).__name__}: {exc}".lower()
     return any(h in text for h in _TRANSIENT_HINTS)
 
@@ -711,10 +723,19 @@ class _RunTurnExecutor:
     ``None`` (PRICING_UNKNOWN) — the core meters it as UNKNOWN, never as $0.
     """
 
-    def __init__(self, run_turn: Callable[[str], Awaitable[RunTurnResult]]) -> None:
+    def __init__(
+        self,
+        run_turn: Callable[[str], Awaitable[RunTurnResult]],
+        pre_gate: Callable[[], None] | None = None,
+    ) -> None:
         self._run_turn = run_turn
+        # Pre-call hard gate: invoked at the exact seam between "about to spend" and
+        # "spending" — raises CostLimitExceeded when the run budget is already gone.
+        self._pre_gate = pre_gate
 
     async def execute(self, request) -> TaskResult:
+        if self._pre_gate is not None:
+            self._pre_gate()
         result = await self._run_turn(request.prompt)
         return TaskResult(value=result.final_answer, spend=result.cost_usd)
 
@@ -1191,7 +1212,19 @@ class ResearchRunDriver:
         # executor id through the registry and joins the definition's declared cap
         # dimensions with this run's config values. The core still never sees a
         # research word: the registry binding and every port are adapter closures.
-        registry = MappingRegistry({RESEARCH_EXECUTOR_ID: _RunTurnExecutor(run_turn)})
+        # PRE-CALL cost hard gate: checked on the executor's seam, i.e. right before
+        # each would-be LLM turn; counters.total_spend is the run's ledger cumulative.
+        def _cost_pre_gate() -> None:
+            if self.max_cost_usd is not None and counters.total_spend >= self.max_cost_usd:
+                raise CostLimitExceeded(
+                    f"research run {run_id} turn {turn_index}: cumulative "
+                    f"${counters.total_spend:.4f} >= cap ${self.max_cost_usd:.4f} — "
+                    "no LLM call is made"
+                )
+
+        registry = MappingRegistry({
+            RESEARCH_EXECUTOR_ID: _RunTurnExecutor(run_turn, pre_gate=_cost_pre_gate)
+        })
         deps = build_deps(
             definition=RESEARCH_WORKFLOW,
             registry=registry,

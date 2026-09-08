@@ -16,6 +16,7 @@ from core.config import settings
 
 import plugins.research.driver as driver_module
 from plugins.research.driver import (
+    CostLimitExceeded,
     DriverOutcome,
     IllegalRunTransition,
     ProjectLockError,
@@ -805,3 +806,48 @@ def test_settings_driver_defaults_present():
     assert settings.research_driver_max_turns >= 1
     assert settings.research_driver_max_no_progress_turns >= 1
     assert settings.research_driver_turn_max_steps >= 1
+
+
+# ── PRE-CALL cost hard gate (Run-15 closure: $ cap = electric brake, not a stat) ─
+
+
+def test_cost_limit_exceeded_is_never_transient():
+    # The transient text hints contain "5" (for 5xx) — dollar digits in this message
+    # must NOT launder a dead budget into a retry loop.
+    exc = CostLimitExceeded("cumulative $0.1534 >= cap $0.1000 — no LLM call is made")
+    assert is_transient_error(exc) is False
+
+
+async def test_cost_pre_gate_raises_and_refuses_the_llm_turn(service):
+    _create_project(service, "costx", stage="EXECUTE", mode="progressive")
+
+    async def cheap(prompt: str) -> RunTurnResult:
+        return RunTurnResult(final_answer="ok", cost_usd=0.01)
+
+    first, _ = await _drive(
+        service, "costx", cheap, max_cost_usd=0.40, max_no_progress=99, max_turns=99
+    )
+    assert first.action == "continue"
+    _ledger(service, "costx", cumulative_cost_usd=0.45)  # burn the budget on the ledger
+
+    calls: list[str] = []
+
+    async def expensive(prompt: str) -> RunTurnResult:
+        calls.append(prompt)
+        return RunTurnResult(final_answer="should never run", cost_usd=0.5)
+
+    run = service.read_project(OWNER, "costx")["active_run"]
+    with pytest.raises(CostLimitExceeded):
+        await ResearchRunDriver(
+            max_cost_usd=0.40, max_no_progress=99, max_turns=99
+        ).auto_turn(
+            service, owner_id=OWNER, task_id="costx", run_id=run["run_id"],
+            turn_index=2, run_turn=expensive,
+        )
+    assert calls == []  # the gate fires BEFORE the turn: zero LLM spend past the cap
+
+
+def test_settings_cost_cap_is_a_hard_default_now():
+    # 0.40 shipped as the default cap; None (passive billing) must never come back.
+    assert settings.research_driver_max_cost_usd == 0.40
+    assert settings.research_driver_max_turns == 14

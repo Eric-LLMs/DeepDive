@@ -1359,6 +1359,87 @@ class TestClaimStrengthVocabulary:
         sc = next(c for c in gate["checks"] if c["name"] == "scorecard")
         assert sc["severity"] == "blocking"
 
+    # ── Run-15 closure: QUALITY_GATE reads THIS edition's scorecard.md, strictly ──
+
+    @staticmethod
+    def _scorecard_table(fatal: str = "No") -> str:
+        rows = "\n".join(f"| {i} | criterion-{i} | 8 | {fatal} | ok |" for i in range(1, 8))
+        return (
+            "# Scorecard\n\n| # | Criterion | Score | Fatal | Note |\n"
+            f"|---|---|---|---|---|\n{rows}\n"
+        )
+
+    async def test_quality_gate_accepts_current_run_scorecard_md(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        svc = self._svc(env)
+        svc.atomic_update_project(USER, pid, lambda p: p.update(run_seq=7))
+        await svc.write_scratch(USER, pid, artifact_id="scorecard.md",
+                                content=self._scorecard_table())
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=pid, gate_name="QUALITY_GATE")
+        sc = next(c for c in gate["checks"] if c["name"] == "scorecard")
+        assert sc["ok"] is True and sc["severity"] == "blocking"
+        assert "scorecard.md v1 (run_seq=7)" in sc["detail"]
+
+    async def test_quality_gate_rejects_stale_tagged_scorecard_md(self, env):
+        # A newer scorecard.md version graded by an OLDER edition must never be borrowed
+        # for this edition's QUALITY_GATE (Run-15: gate read nothing the agent wrote).
+        pid = (await _create_project(env.runtime))["project_id"]
+        svc = self._svc(env)
+        svc.atomic_update_project(USER, pid, lambda p: p.update(run_seq=7))
+        await svc.write_scratch(USER, pid, artifact_id="scorecard.md",
+                                content=self._scorecard_table())
+        adir = env.scratch / str(USER) / pid / "artifacts" / "scorecard.md"
+        rec = svc._load_json(adir / "v1", None)
+        stale = dict(rec)
+        stale.update(version=2, run_seq=6, content=self._scorecard_table())
+        svc._save_json(adir / "v2", stale)
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=pid, gate_name="QUALITY_GATE")
+        sc = next(c for c in gate["checks"] if c["name"] == "scorecard")
+        assert sc["ok"] is False and sc["severity"] == "blocking"
+        assert "scorecard_stale" in sc["detail"] and "run_seq=6" in sc["detail"]
+
+    async def test_quality_gate_rejects_unprovenanced_scorecard_md(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        svc = self._svc(env)
+        svc.atomic_update_project(USER, pid, lambda p: p.update(run_seq=7))
+        await svc.write_scratch(USER, pid, artifact_id="scorecard.md",
+                                content=self._scorecard_table())
+        vpath = env.scratch / str(USER) / pid / "artifacts" / "scorecard.md" / "v1"
+        rec = svc._load_json(vpath, None)
+        rec.pop("run_seq", None)
+        svc._save_json(vpath, rec)
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=pid, gate_name="QUALITY_GATE")
+        sc = next(c for c in gate["checks"] if c["name"] == "scorecard")
+        assert sc["ok"] is False and "scorecard_unprovenanced" in sc["detail"]
+
+    async def test_quality_gate_scorecard_md_fatal_row_fails(self, env):
+        pid = (await _create_project(env.runtime))["project_id"]
+        svc = self._svc(env)
+        svc.atomic_update_project(USER, pid, lambda p: p.update(run_seq=7))
+        await svc.write_scratch(USER, pid, artifact_id="scorecard.md",
+                                content=self._scorecard_table(fatal="Yes"))
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=pid, gate_name="QUALITY_GATE")
+        sc = next(c for c in gate["checks"] if c["name"] == "scorecard")
+        assert sc["ok"] is False and "7 rows / 7 fatal" in sc["detail"]
+
+    async def test_quality_gate_rejects_project_scorecard_from_older_run(self, env):
+        # The legacy in-project rows stay honored ONLY when provenance matches the live
+        # edition — a concrete scorecard_run_seq mismatch is a stale grade sheet.
+        pid = (await _create_project(env.runtime))["project_id"]
+        rows = [{"metric": f"m{i}", "ok": True} for i in range(7)]
+        self._svc(env).atomic_update_project(
+            USER, pid, lambda p: p.update(run_seq=9, scorecard=rows, scorecard_run_seq=8)
+        )
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=pid, gate_name="QUALITY_GATE")
+        sc = next(c for c in gate["checks"] if c["name"] == "scorecard")
+        assert sc["ok"] is False and sc["severity"] == "blocking"
+        assert "scorecard_stale" in sc["detail"]
+
 
 # ── 10. Versioned chat-task run output layout ────────────────────────────────
 # Red lines of the output-layout plan: atomic per-run ``run_seq`` stamped into the driver
