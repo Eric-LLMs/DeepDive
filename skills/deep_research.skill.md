@@ -194,9 +194,16 @@ Hard boundaries:
      `asserted | supported | confident | contested` (see EVIDENCE above).
    - Name the remaining uncertainty explicitly — a good report states its gaps.
 
-9. **REVIEW — self-check before publish.** Re-read the draft for unsupported assertions.
-   If a claim is unverifiable, say "not verified" instead of hedging. Fix the draft with
-   `research_artifact create_version` rather than leaving a broken version.
+9. **REVIEW — self-check before publish, in ONE call.** Call
+   `research_artifact review_draft` (pass the report's `artifact_id`) EXACTLY ONCE.
+   The server puts the whole draft + claim graph in front of the model; it returns
+   only `{"changes": [...]}` correction instructions (no document echo); Python
+   pre-checks every anchor under the unique-match iron rule, applies them in a
+   staging copy and commits atomically — all pass → one new version, any reject →
+   nothing is written and the error lists the failed rows. On a rejection, fix ONLY
+   the listed passages with a minimal `create_version` (never re-read the whole
+   draft); on `new_version: null` the draft was fully supported — move on. If a
+   claim is unverifiable, the draft must say "not verified" instead of hedging.
 
 10. **PUBLISH.** Promote the final artifact with `research_artifact promote_to_drive`
     (`artifact_id` of the final report). Promotion marks the drive asset RAG_PENDING, so the

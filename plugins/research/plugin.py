@@ -325,8 +325,10 @@ def _adj_dump_enabled() -> bool:
     return os.environ.get("RESEARCH_ADJ_DUMP") == "1"
 
 
-async def _adjudication_llm_complete(prompt: str, system_prompt: str) -> str:
-    """One channel-aware completion for the adjudication prompt.
+async def _adjudication_llm_complete(
+    prompt: str, system_prompt: str, *, enable_thinking: bool = False
+) -> str:
+    """One channel-aware completion for a single-shot verdict/review prompt.
 
     Streamed and accumulated, NOT a single blocking ``complete()``: a thinking model
     serving one whole-batch verdict can idle past the client timeout before its first
@@ -334,6 +336,11 @@ async def _adjudication_llm_complete(prompt: str, system_prompt: str) -> str:
     EVIDENCE stall: 90 s timeout x2 retries -> 5.4 min and an error). Chunks keep the
     connection alive; the verdict payload is id-only and tiny, so accumulate-then-parse
     semantics stay exactly the same. Emits ttft/stream timing for latency forensics.
+
+    ``enable_thinking``: the id-only adjudication verdicts gain nothing from hidden
+    reasoning (Run-14: 130 s of thinking prefill for a 4 s body), so adjudicate runs
+    with thinking off; the one-shot REVIEW does real editorial reasoning and keeps the
+    model default (thinking on).
     """
     if _ADJ_LLM_CALL is not None:  # test seam
         return await _ADJ_LLM_CALL(prompt, system_prompt)
@@ -345,11 +352,9 @@ async def _adjudication_llm_complete(prompt: str, system_prompt: str) -> str:
     kwargs: dict[str, Any] = {
         "timeout": _ADJ_LLM_TIMEOUT_SECONDS,
         "max_retries": _ADJ_LLM_MAX_RETRIES,
-        # The verdict rows need no chain-of-thought: thinking only inflates the
-        # hidden prefill (the 130 s ttft in Run-14). Supported in streaming mode
-        # only — which is exactly what this call is.
-        "extra_body": {"enable_thinking": False},
     }
+    if not enable_thinking:
+        kwargs["extra_body"] = {"enable_thinking": False}
     channel = get_request_llm_channel()
     if channel is not None:
         model, base_url, api_key = channel
@@ -427,6 +432,108 @@ def _parse_adjudication_rows(raw: str) -> list:
     if not isinstance(doc, dict) or not isinstance(doc.get("results"), list):
         raise ValueError('reply must be an object shaped like {"results": [...]}')
     return doc["results"]
+
+
+# ── one-shot REVIEW (P3-9): whole draft in, patch-JSON out, staged apply ─────
+# Same transport as adjudicate (one stream-guarded call) but the opposite output
+# economics: the model NEVER echoes the document. It returns ONLY mechanical
+# change rows ({"file","target","expected_old","change"}); Python pre-checks every
+# row (unique-match iron rule), applies them in a memory staging copy, and commits
+# a new version once — all changes pass or nothing is written. A turn that used to
+# cost N LLM calls (read → think → write → think …) costs exactly one.
+_REVIEW_SYSTEM_PROMPT = (
+    "You are the pre-publish reviewer of a research report. You receive the full draft "
+    "and the claim graph. Every assertion the evidence does not support must become a "
+    "precise correction instruction — rephrase it as not verified, or replace the wrong "
+    "text. Reply with a single JSON object only: the changes array, nothing else."
+)
+REVIEW_BUDGET_TOKENS = int(os.environ.get("REVIEW_BUDGET_TOKENS", "200000"))
+_REVIEW_CHANGE_KEYS = {"file", "target", "expected_old", "change"}
+
+
+def _review_prompt(claims: list[dict], draft: str) -> str:
+    lines = [
+        "Review the draft below in ONE pass, then reply with the JSON contract.",
+        "",
+        "CLAIMS (from the evidence graph):",
+    ]
+    lines.extend(json.dumps(c, ensure_ascii=False) for c in claims)
+    lines.extend(
+        [
+            "",
+            "DRAFT (full text, verbatim):",
+            draft,
+            "",
+            'Return ONLY this JSON object: {"changes": [{"file": "<artifact_id of the '
+            'draft>", "target": "<section anchor line copied verbatim from the draft, '
+            'empty string = whole document>", "expected_old": "<the exact text to '
+            'replace>", "change": "<replacement text, empty string deletes>"}]}',
+            "Rules:",
+            "- Each change row has EXACTLY the four keys file/target/expected_old/change — "
+            "no reasoning, no explanation, no extra fields.",
+            '- "target" must appear EXACTLY ONCE in the draft (or be empty); '
+            '"expected_old" must appear EXACTLY ONCE inside that target\'s section. '
+            "Keep expected_old minimal (the shortest wrong span, <=120 chars). Zero or "
+            "multiple matches reject the whole patch.",
+            "- Emit a change ONLY where the draft contradicts the graph, overstates weak "
+            "evidence, or fails to say 'not verified' where it should; never touch text "
+            "that is already correct.",
+            '- If nothing must change, return {"changes": []} — do not invent edits.',
+            "- Do NOT restate or echo the draft; corrections only.",
+            "- Output the raw JSON object only — no prose, no markdown fences.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _parse_review_payload(raw: str) -> list:
+    """Parse one reviewer reply (tolerates code fences) into change rows; raises
+    ``ValueError`` on anything that is not ``{"changes": [...]}`` with strict rows —
+    every row must carry EXACTLY the four contract keys and string values."""
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("no JSON object found in the reply")
+    try:
+        doc = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON: {exc}") from exc
+    if not isinstance(doc, dict) or set(doc) != {"changes"} or not isinstance(
+        doc["changes"], list
+    ):
+        raise ValueError('reply must be an object shaped like {"changes": [...]}')
+    for i, row in enumerate(doc["changes"]):
+        if not isinstance(row, dict) or set(row) != _REVIEW_CHANGE_KEYS:
+            raise ValueError(
+                f"change[{i}] must have exactly the keys "
+                "file/target/expected_old/change (no extras, no prose fields)"
+            )
+        if not all(isinstance(row[k], str) for k in _REVIEW_CHANGE_KEYS):
+            raise ValueError(f"change[{i}]: all four values must be strings")
+        if not row["expected_old"]:
+            raise ValueError(f"change[{i}]: expected_old must be non-empty")
+    return doc["changes"]
+
+
+def _apply_review_change(doc: str, row: dict) -> tuple[str, str | None]:
+    """Pre-check + stage ONE change. Returns (new_doc, None) on success or
+    (doc, reject_reason) — the iron rule is exact-unique match of expected_old
+    inside the target's section; 0 or >1 matches always rejects."""
+    target, old, new = row["target"], row["expected_old"], row["change"]
+    if target:
+        if doc.count(target) != 1:
+            return doc, f"target matches {doc.count(target)} times (need exactly 1)"
+        tpos = doc.index(target)
+        # section = target line through the next top-level heading (or EOF)
+        nxt = doc.find("\n#", tpos + len(target))
+        lo, hi = (tpos, nxt if nxt != -1 else len(doc))
+    else:
+        lo, hi = 0, len(doc)
+    section = doc[lo:hi]
+    hits = section.count(old)
+    if hits != 1:
+        return doc, f"expected_old matches {hits} times in target (need exactly 1)"
+    pos = section.index(old)
+    return doc[: lo + pos] + new + doc[lo + pos + len(old):], None
 
 # ── P3-6 per-turn asset-merge buffer (process-local, memory-only) ────────────
 # ``_merge_cloud_assets`` no longer commits per call: additions accumulate here keyed by
@@ -4598,6 +4705,159 @@ class ResearchService:
             "commit": commit,
         }
 
+    async def review_draft(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        artifact_id: str,
+    ) -> dict:
+        """ONE server-side REVIEW closure: draft + claim graph in, patch-JSON out.
+
+        The P3-9 atomic action mirroring :meth:`adjudicate_evidence` for the REVIEW
+        stage, final-contract edition:
+
+        1. load the latest artifact version and every Claim node from the graph
+           (required context, bounded by ``REVIEW_BUDGET_TOKENS``);
+        2. ONE streaming LLM call over the WHOLE draft (thinking stays ON — this is
+           editorial reasoning, unlike the id-only adjudication). The reply is ONLY
+           ``{"changes": [{file,target,expected_old,change}, ...]}`` — no prose, no
+           document echo;
+        3. Python PRE-CHECKS every row (strict 4-key schema; unique-match iron rule:
+           target exactly once, expected_old exactly once inside the target section),
+           then applies them to an in-memory STAGING copy;
+        4. all-or-nothing: every row passes → ONE ``create_version`` commits the
+           staged draft (the graph is read-only here, so artifact + graph are by
+           construction in the "all landed" or "untouched" definite state); any row
+           fails → staging is discarded, nothing is written, a RuntimeError reports
+           the exact rejects.
+        """
+        # ── 1. latest version + claim graph (all inputs server-side) ──
+        artifact_dir = self._artifact_dir(owner_id, project_id, artifact_id)
+        versions = sorted(
+            (int(p.name[1:]) for p in artifact_dir.glob("v*") if p.name[1:].isdigit())
+        ) if artifact_dir.is_dir() else []
+        if not versions:
+            raise ValueError(
+                f"review_draft: artifact '{artifact_id}' has no version to review"
+            )
+        base_version = versions[-1]
+        record = self._artifact(owner_id, project_id, artifact_id, base_version)
+        draft = record.get("content") or ""
+        if not draft.strip():
+            raise ValueError("review_draft: the latest version has empty content")
+
+        graph = self._load_json(
+            self._project_dir(owner_id, project_id) / "graph.json",
+            {"nodes": [], "edges": []},
+        )
+        claims = [
+            {
+                "claim_id": n.get("id"),
+                "statement": n.get("statement") or n.get("label") or n.get("id"),
+                "strength": n.get("strength"),
+                "status": n.get("status"),
+                "citations": (n.get("citations") or [])[:6],
+            }
+            for n in graph.get("nodes", [])
+            if isinstance(n, dict) and n.get("type") == "Claim" and n.get("id")
+        ]
+
+        prompt = _review_prompt(claims, draft)
+        est_tokens = len(prompt) // _ADJ_CHARS_PER_TOKEN
+        if est_tokens > REVIEW_BUDGET_TOKENS:
+            raise ValueError(
+                f"review_draft: draft + claims context is ~{est_tokens} tokens, over "
+                f"REVIEW_BUDGET_TOKENS={REVIEW_BUDGET_TOKENS} — split the report or "
+                "raise the budget explicitly"
+            )
+
+        # ── 2. one reviewer call (repair-once, same discipline as adjudicate) ──
+        llm_calls = 0
+        t0 = time.perf_counter()
+        raw = await _adjudication_llm_complete(
+            prompt, _REVIEW_SYSTEM_PROMPT, enable_thinking=True
+        )
+        llm_calls += 1
+        t_parse = time.perf_counter()
+        try:
+            changes = _parse_review_payload(raw)
+        except ValueError as exc:
+            raw = await _adjudication_llm_complete(
+                prompt
+                + f"\n\nYour previous reply failed to parse ({exc}). "
+                  "Reply with ONLY the JSON object described above.",
+                _REVIEW_SYSTEM_PROMPT,
+                enable_thinking=True,
+            )
+            llm_calls += 1
+            try:
+                changes = _parse_review_payload(raw)
+            except ValueError as exc2:
+                raise RuntimeError(
+                    "review failed: the model returned no parseable patch JSON twice "
+                    f"({exc}; {exc2})"
+                ) from exc2
+        parse_ms = (time.perf_counter() - t_parse) * 1000
+        logger.info(
+            "review.llm done_ms=%.0f parse_ms=%.0f calls=%d draft_chars=%d claims=%d changes=%d",
+            (time.perf_counter() - t0) * 1000, parse_ms, llm_calls, len(draft),
+            len(claims), len(changes),
+        )
+
+        # ── 3+4. pre-check + staging; all-or-nothing commit ──
+        staged = draft
+        rejects: list[dict] = []
+        for i, row in enumerate(changes):
+            if row["file"] != artifact_id:
+                rejects.append({"i": i, "reason": f"file '{row['file']}' is not '{artifact_id}'"})
+                continue
+            staged, reason = _apply_review_change(staged, row)
+            if reason is not None:
+                rejects.append({
+                    "i": i,
+                    "reason": reason,
+                    "expected_old": row["expected_old"][:80],
+                })
+        if rejects:
+            # Iron rule: one bad row discards the whole staging area — the draft and
+            # the graph stay byte-identical to base_version.
+            logger.warning(
+                "review.reject %d/%d changes rejected — staging discarded, nothing written",
+                len(rejects), len(changes),
+            )
+            raise RuntimeError(
+                f"review_draft: patch rejected ({len(rejects)}/{len(changes)} rows failed) "
+                "— no version was created; " + "; ".join(
+                    f"change[{r['i']}]: {r['reason']}" for r in rejects[:5]
+                )
+            )
+        new_version = None
+        if staged != draft:
+            commit = await self.create_version(
+                owner_id, project_id, artifact_id=artifact_id, content=staged
+            )
+            new_version = commit.get("version")
+        logger.info(
+            "review.apply applied=%d changed=%s version=%s",
+            len(changes), staged != draft, new_version,
+        )
+        return {
+            "status": "ok",
+            "artifact_id": artifact_id,
+            "base_version": base_version,
+            "new_version": new_version,
+            "llm_calls": llm_calls,
+            "changes_applied": len(changes),
+            "hint": (
+                "corrections were applied and committed as one version; review the "
+                "changed passages only — do NOT re-read the whole draft"
+                if new_version else
+                "the reviewer found the draft fully supported — proceed to the next "
+                "transition, no create_version needed"
+            ),
+        }
+
     def record_execution(
         self,
         owner_id: uuid.UUID,
@@ -4720,7 +4980,7 @@ _COMMON_OBJ = {
 # ``link_edge`` / ``query_lineage`` — edges are written by ``verify`` itself and lineage is
 # internal plumbing; their handler branches and service methods stay for internal callers.
 _PROJECT_ACTIONS = ["create", "resume", "snapshot", "archive"]
-_ARTIFACT_ACTIONS = ["write_scratch", "promote_to_drive", "read", "create_version", "diff"]
+_ARTIFACT_ACTIONS = ["write_scratch", "promote_to_drive", "read", "create_version", "diff", "review_draft"]
 _STATE_ACTIONS = ["get_state", "transition_stage", "get_handoff"]
 _EVIDENCE_ACTIONS = [
     "record_node", "mutate_node", "invalidate_downstream",
@@ -4913,6 +5173,11 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 artifact_id=_require(args, "artifact_id", "research_artifact", action),
                 from_version=_require(args, "from_version", "research_artifact", action),
                 to_version=_require(args, "to_version", "research_artifact", action),
+            )
+        if action == "review_draft":
+            return await svc.review_draft(
+                user(), _project_id(args, "research_artifact", action),
+                artifact_id=_require(args, "artifact_id", "research_artifact", action),
             )
         raise _unknown_action("research_artifact", action, _ARTIFACT_ACTIONS)
 
@@ -5118,11 +5383,17 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "promote_to_drive (publish an artifact to the cloud drive — marks the asset "
             "RAG_PENDING so the projection worker indexes it; promotion is the ONLY path "
             "into the knowledge base), read (fetch a version's content), create_version "
-            "(append a new version, e.g. to fix a draft), diff (compare two versions). "
+            "(append a new version, e.g. to fix a draft), diff (compare two versions), "
+            "review_draft (REVIEW in ONE call: the server feeds the full latest draft + "
+            "the claim graph to the model, which returns ONLY {\"changes\": [{file,"
+            "target,expected_old,change}]} patch rows; Python pre-checks every anchor "
+            "(unique-match iron rule), applies them in staging and commits one new "
+            "version — all-or-nothing. Call this ONCE in REVIEW instead of re-reading "
+            "the draft yourself). "
             "Constraints: write_scratch takes the FULL text in ONE call and auto-versions — "
             "do not call it repeatedly for incremental edits; 'artifact_id' is required for "
-            "write/promote/read/create_version/diff; 'version' is optional on read (latest "
-            "when omitted)."
+            "write/promote/read/create_version/diff/review_draft; 'version' is optional on "
+            "read (latest when omitted)."
         ),
         parameters=_params(
             _ARTIFACT_ACTIONS,
