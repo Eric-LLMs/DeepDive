@@ -467,11 +467,12 @@ async def test_auto_turn_evidence_churn_without_gate_advance_stalls(service):
     assert len(graph["nodes"]) == 2
 
 
-async def test_auto_turn_progressive_no_material_settles_to_publish(service):
-    # Regression for the observed grind: a progressive run that cannot gather usable material
-    # must NOT stall mid-way. After the no-progress threshold the driver auto-settles — walks
-    # EXECUTE→…→PUBLISH recording each un-passed guarding gate as a diagnostic, writes a
-    # model-free settle_report.md, and finishes instead of leaving the task RUNNING/stalled.
+async def test_auto_turn_progressive_no_material_refuses_settle_without_report(service):
+    # G2 (the Run-14 lesson): a stalled progressive run that never produced a promoted
+    # primary report may NOT be auto-finished. The old settle walked EXECUTE->...->PUBLISH
+    # and wrote FINISHED over an empty hand (TERMINAL-UNPROMOTED). _try_settle now refuses
+    # BEFORE the walk: the stage freezes, no diagnostics are forged, no settle_report is
+    # minted, and the run stops as graded (stalled) instead of a fake PUBLISH.
     _create_project(service, "settle", stage="EXECUTE", mode="progressive")
     service.atomic_update_project(
         OWNER, "settle",
@@ -494,36 +495,77 @@ async def test_auto_turn_progressive_no_material_settles_to_publish(service):
         service, owner_id=OWNER, task_id="settle", run_id=run["run_id"],
         turn_index=2, run_turn=idle_turn,
     )
+    assert second.state == RunState.STALLED
+    assert second.action == "stalled"
+    project = service.read_project(OWNER, "settle")
+    assert project["stage"] == "EXECUTE"            # never walked to PUBLISH
+    assert not project.get("diagnostics")           # refusal happens pre-walk
+    assert list(service.list_artifacts(OWNER, "settle")) == []  # no settle_report
+    assert "active_run" not in project              # slot released, graded terminal
+    assert project["last_block"]["kind"] == "stalled"
+
+
+async def test_auto_turn_progressive_settles_when_report_promoted(service):
+    # G2 green path: once the run's primary report is bound AND promoted (real
+    # drive_asset_id on the latest version), a stalled progressive run still auto-settles:
+    # the walk crosses WRITE->REVIEW (G1 satisfied by the on-disk primary), records each
+    # un-passed gate as a diagnostic, writes the model-free settle_report.md and FINISHES.
+    _create_project(service, "settok", stage="EXECUTE", mode="progressive")
+    service.atomic_update_project(
+        OWNER, "settok",
+        lambda p: p.update(
+            gates={
+                "DESIGN_GATE": "FAIL", "EVIDENCE_GATE": "FAIL",
+                "CLAIM_GATE": "FAIL", "QUALITY_GATE": "FAIL",
+            },
+            diagnostics=[],
+        ),
+    )
+
+    async def idle_turn(prompt: str) -> RunTurnResult:
+        return RunTurnResult(final_answer="no material yet")
+
+    first, _ = await _drive(service, "settok", idle_turn, max_no_progress=2)
+    assert first.action == "continue"
+    # Produce the deliverable the gates demand: write (binds primary) + fake the promotion
+    # on disk (drive=None in this fixture — G2 only reads the record's status/asset).
+    await service.write_scratch(
+        OWNER, "settok", artifact_id="report.md", content="# 西红柿报告\n\n正文。\n"
+    )
+    v1 = service._project_dir(OWNER, "settok") / "artifacts" / "report.md" / "v1"
+    rec = service._load_json(v1, None)
+    rec.update(status="PROMOTED", drive_asset_id="fake-asset-1",
+               drive_path="research/settok/report.md")
+    service._save_json(v1, rec)
+
+    run = service.read_project(OWNER, "settok")["active_run"]
+    second = await ResearchRunDriver(max_no_progress=2).auto_turn(
+        service, owner_id=OWNER, task_id="settok", run_id=run["run_id"],
+        turn_index=2, run_turn=idle_turn,
+    )
     assert second.state == RunState.FINISHED
     assert second.action == "finished"
-    project = service.read_project(OWNER, "settle")
+    project = service.read_project(OWNER, "settok")
     assert project["stage"] == "PUBLISH"
-    assert "active_run" not in project
-    assert project["last_block"]["kind"] == "finished"
-    assert "auto-settle" in project["last_block"]["reason"]
-    # Crossing EXECUTE→EXPLAIN (EVIDENCE_GATE), WRITE→REVIEW (CLAIM_GATE) and
-    # REVIEW→REPRODUCE (QUALITY_GATE) with every gate FAIL records exactly three diagnostics.
+    assert project["primary_report_artifact_id"] == "report.md"
     assert [d["gate"] for d in (project["diagnostics"] or [])] == [
         "EVIDENCE_GATE", "CLAIM_GATE", "QUALITY_GATE",
     ]
-    # A model-free report exists and carries the gaps.
     report = next(
-        (a for a in service.list_artifacts(OWNER, "settle")
+        (a for a in service.list_artifacts(OWNER, "settok")
          if a["artifact_id"] == driver_module._SETTLE_ARTIFACT_ID),
         None,
     )
     assert report is not None and report["status"] == "DRAFT"   # never promoted to the KB
-    content = service.read_artifact(
-        OWNER, "settle", artifact_id=driver_module._SETTLE_ARTIFACT_ID
-    )["content"]
-    assert "Known gaps / unverified items" in content
-    assert "EVIDENCE_GATE" in content
+    assert "active_run" not in project
     assert second.final_answer and "auto-settled" in second.final_answer
 
 
 async def test_auto_turn_progressive_turn_cap_settles(service):
     # The settle also applies to a cap stop (not only a stall): a progressive run that hits
-    # the turn cap short of PUBLISH is finished deterministically with a report.
+    # the turn cap short of PUBLISH is finished deterministically with a report — PROVIDED
+    # the report exists promoted (G2). At WRITE with the primary on disk, the G1 hard stop
+    # is satisfied and the remaining REVIEW/REPRODUCE hops advance with diagnostics.
     _create_project(service, "capset", stage="WRITE", mode="progressive")
     service.atomic_update_project(
         OWNER, "capset",
@@ -534,11 +576,18 @@ async def test_auto_turn_progressive_turn_cap_settles(service):
             }
         ),
     )
+    run = service.begin_run(OWNER, "capset")
+    await service.write_scratch(
+        OWNER, "capset", artifact_id="report.md", content="# 草稿\n\n正文。\n"
+    )
+    v1 = service._project_dir(OWNER, "capset") / "artifacts" / "report.md" / "v1"
+    rec = service._load_json(v1, None)
+    rec.update(status="PROMOTED", drive_asset_id="fake-asset-2")
+    service._save_json(v1, rec)
 
     async def idle(prompt: str) -> RunTurnResult:
         return RunTurnResult(final_answer="done")
 
-    run = service.begin_run(OWNER, "capset")
     outcome = await ResearchRunDriver(max_turns=1).auto_turn(
         service, owner_id=OWNER, task_id="capset", run_id=run["run_id"],
         turn_index=1, run_turn=idle,
@@ -552,6 +601,28 @@ async def test_auto_turn_progressive_turn_cap_settles(service):
     ]
     assert "active_run" not in project
     assert project["last_block"]["kind"] == "finished"
+
+
+async def test_auto_turn_progressive_turn_cap_refused_without_report(service):
+    # G2 cap-path refusal (Run-14 shape): the same cap stop at WRITE WITHOUT a bound
+    # primary is never finished — G1 additionally makes the settle walk itself refuse the
+    # WRITE->REVIEW hop, so the run stalls with the stage untouched.
+    _create_project(service, "capnos", stage="WRITE", mode="progressive")
+    run = service.begin_run(OWNER, "capnos")
+
+    async def idle(prompt: str) -> RunTurnResult:
+        return RunTurnResult(final_answer="done")
+
+    outcome = await ResearchRunDriver(max_turns=1).auto_turn(
+        service, owner_id=OWNER, task_id="capnos", run_id=run["run_id"],
+        turn_index=1, run_turn=idle,
+    )
+    assert outcome.state == RunState.BLOCKED and outcome.action == "blocked"
+    project = service.read_project(OWNER, "capnos")
+    assert project["stage"] == "WRITE"
+    assert list(service.list_artifacts(OWNER, "capnos")) == []
+    assert "active_run" not in project
+    assert project["last_block"]["kind"] == "blocked"
 
 
 def test_build_settle_report_records_gaps_and_artifacts():

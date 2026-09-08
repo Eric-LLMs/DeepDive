@@ -938,21 +938,62 @@ class ResearchRunDriver:
     ) -> DriverOutcome | None:
         """Finish a stuck progressive run deterministically, or return ``None`` to stop as graded.
 
-        Only called for progressive runs whose graded stop is NOT a human decision. Walks the
-        legal ``transition_stage`` chain from the current stage to PUBLISH (each guarded hop
-        whose gate has not passed records its failed checks as a diagnostic and is granted),
-        then writes a model-free :func:`build_settle_report` into the task's artifacts (it is
-        mirrored to cloud ``outputs/`` but never RAG-promoted, so a gaps-only record can't
-        surface as evidence later) and terminalizes the run as FINISHED. Returns ``None``
-        (caller falls back to the graded stop) when the mode is strict, the run is parked on a
-        real human decision, the chain refuses a hop, or the report write fails — the run is
-        never half-finished silently.
+        Only called for progressive runs whose graded stop is NOT a human decision. The G2
+        pre-walk gate first: the run may only be finished once its PRIMARY report is bound and
+        PROMOTED (real ``drive_asset_id``) — a run that never wrote or never published its
+        report is refused a fake PUBLISH and stops as graded instead. When the gate passes,
+        walks the legal ``transition_stage`` chain from the current stage to PUBLISH (each
+        guarded hop whose gate has not passed records its failed checks as a diagnostic and is
+        granted), then writes a model-free :func:`build_settle_report` into the task's
+        artifacts (it is mirrored to cloud ``outputs/`` but never RAG-promoted, so a gaps-only
+        record can't surface as evidence later) and terminalizes the run as FINISHED. Returns
+        ``None`` (caller falls back to the graded stop) when the mode is strict, the run is
+        parked on a real human decision, the G2 published-report precondition is unmet, the
+        chain refuses a hop, or the report write fails — the run is never half-finished
+        silently.
         """
         project = service.read_project(owner_id, task_id)
         if project.get("execution_mode", "strict") != "progressive":
             return None
         if project.get("stage") == "PUBLISH":
             return None
+
+        # G2 hard gate (Run-14 lesson): auto-settle may only terminalize a run as
+        # FINISHED when the run ACTUALLY produced a published object — a primary report
+        # bound in state whose latest version is PROMOTED with a real drive_asset_id.
+        # The previous check short-circuited on ``if _primary:`` — a run whose agent
+        # never wrote a report (primary=None) walked the chain to PUBLISH and finished
+        # as a fake success. Now refused before a single hop: no bound primary, or a
+        # primary that was never promoted, stops as graded. No walk, no FINISHED,
+        # no settle_report written over an unpromised run.
+        _primary = project.get("primary_report_artifact_id")
+        if not _primary:
+            logger.warning(
+                "settle.refused task %s: G2 — no primary report bound for run_seq=%s; "
+                "a run that never wrote its report cannot settle to success",
+                task_id, project.get("run_seq"),
+            )
+            return None
+        _prec = next(
+            (
+                a for a in service.list_artifacts(owner_id, task_id)
+                if a["artifact_id"] == _primary
+            ),
+            None,
+        )
+        if (
+            _prec is None
+            or _prec.get("status") != "PROMOTED"
+            or not _prec.get("drive_asset_id")
+        ):
+            logger.warning(
+                "settle.refused task %s: G2 — primary report '%s' not promoted "
+                "(status=%s drive_asset=%s); stopping as graded, never a fake PUBLISH",
+                task_id, _primary, (_prec or {}).get("status"),
+                bool((_prec or {}).get("drive_asset_id")),
+            )
+            return None
+
         pre_walk_stage = project.get("stage", "DISCOVER")
         diagnostics_before = len(project.get("diagnostics") or [])
 
@@ -992,22 +1033,6 @@ class ResearchRunDriver:
             node_type = node.get("type") or "node"
             node_counts[node_type] = node_counts.get(node_type, 0) + 1
         artifacts = service.list_artifacts(owner_id, task_id)
-        # T3-4 hard gate: "reached PUBLISH" must mean a published object. While the
-        # task's primary report exists but was never promoted, auto-settle may NOT
-        # terminalize the run as FINISHED — return None stops the caller with the
-        # graded outcome instead (never a silent success).
-        _primary = project.get("primary_report_artifact_id")
-        if _primary:
-            _rec = next(
-                (a for a in artifacts if a["artifact_id"] == _primary), None
-            )
-            if _rec is None or _rec.get("status") != "PROMOTED":
-                logger.warning(
-                    "settle.refused task %s: primary report '%s' not promoted "
-                    "(status=%s) — stopping as graded, not marking success",
-                    task_id, _primary, (_rec or {}).get("status"),
-                )
-                return None
         content = build_settle_report(
             task_name=project.get("name", task_id),
             mode=project.get("execution_mode", "strict"),

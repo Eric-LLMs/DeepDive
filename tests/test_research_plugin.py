@@ -1119,9 +1119,16 @@ class TestExecutionMode:
         # checks (all genuinely FAIL on an empty/immature project), records the failed checks,
         # and — only then — lets the stage advance. The gate's own state is never forged to
         # PASS (it stays exactly what it was before the transition).
+        # Exception: the WRITE->REVIEW hop additionally carries the G1 hard stop (a skipped
+        # deliverable is not a waivable quality gap), so that iteration first drops a report
+        # on disk; with the primary bound, CLAIM_GATE still genuinely FAILS (claims not
+        # anchored) and is recorded + advanced like every other guard.
         for target, (gate, before) in _GUARDED.items():
             pid = (await _create_project(env.runtime, execution_mode="progressive"))["project_id"]
             self._fast_stage(env, pid, before)
+            if target == "REVIEW":
+                await _run(env.runtime, "research_artifact", action="write_scratch",
+                           project_id=pid, artifact_id="report.md", content="# 报告\n\n正文。\n")
             gates_before = self._project(env, pid)["gates"].get(gate)
             res = await _run(env.runtime, "research_state", action="transition_stage",
                              project_id=pid, target=target)
@@ -1314,13 +1321,16 @@ class TestClaimStrengthVocabulary:
 
     async def test_claim_gate_accepts_legacy_raw_strength(self, env):
         # Read-side compat: strengths stored before the alias table (raw "high") still
-        # score valid in CLAIM_GATE.
+        # score valid in CLAIM_GATE. G1 adds report_written to the same gate, so the
+        # test's WRITE-stage deliverable must exist for the gate to PASS.
         pid = (await _create_project(env.runtime))["project_id"]
         TestTransitionOutcomes._fast_stage(env, pid, "WRITE")
         res = await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
                          node={"id": "C", "type": "Claim", "label": "c", "strength": "high",
                                "citations": ["u1"]})
         assert res["node"]["strength"] == "confident"
+        await _run(env.runtime, "research_artifact", action="write_scratch", project_id=pid,
+                   artifact_id="report.md", content="# 报告\n\n草稿。\n")
         # Rewind the stored node to the pre-fix raw value, as a legacy graph would have it.
         svc = self._svc(env)
         graph = svc._load_graph(USER, pid)
@@ -3120,3 +3130,76 @@ class TestFetchCacheP32A:
             assert prov["content_hash"]            # both wrote their own receipt
         assert reg._flights == {}                  # registry self-cleaned after resolve
         assert self._store(env).lookup(cu) is not None  # CAS published once, usable
+
+
+# ── G1: WRITE -> REVIEW hard stop (primary report must be on disk) ───────────
+# Run-14 failure mode: the agent never wrote a report, CLAIM_GATE passed vacuously
+# (anchored claims only), progressive mode waived everything, and auto-settle then
+# fake-published. G1 makes the deliverable non-waivable in BOTH modes, ignoring the
+# cached gate state.
+class TestG1ReportHardStop:
+    @staticmethod
+    def _project(env, pid: str) -> dict:
+        return ResearchService._load_json(env.scratch / str(USER) / pid / "project.json", None)
+
+    async def test_blocks_write_to_review_in_both_modes(self, env):
+        for mode in ("strict", "progressive"):
+            pid = (await _create_project(
+                env.runtime, **({} if mode == "strict" else {"execution_mode": mode})
+            ))["project_id"]
+            TestExecutionMode._fast_stage(env, pid, "WRITE")
+            res = await _run(env.runtime, "research_state", action="transition_stage",
+                             project_id=pid, target="REVIEW")
+            assert res["granted"] is False, mode
+            assert res["transition"] == "GATE_BLOCKED", (mode, res)
+            assert res["gate"] == "CLAIM_GATE"
+            assert "G1 hard-stop" in res["reason"]
+            assert self._project(env, pid)["stage"] == "WRITE"
+
+    async def test_ignores_stale_pass_gate_cache(self, env):
+        # A CLAIM_GATE state left PASS by an earlier edition must not smuggle an
+        # agent without a report through WRITE -> REVIEW.
+        pid = (await _create_project(env.runtime))["project_id"]
+        TestExecutionMode._fast_stage(env, pid, "WRITE")
+        svc = TestExecutionMode._svc(env)
+        svc.atomic_update_project(
+            USER, pid, lambda p: p["gates"].update(CLAIM_GATE="PASS")
+        )
+        res = await _run(env.runtime, "research_state", action="transition_stage",
+                         project_id=pid, target="REVIEW")
+        assert res["granted"] is False and "G1 hard-stop" in res["reason"]
+
+    async def test_claim_gate_exposes_report_written_check(self, env):
+        # check_gate surfaces the new row so diagnostics/handoff name the real gap.
+        pid = (await _create_project(env.runtime))["project_id"]
+        TestExecutionMode._fast_stage(env, pid, "WRITE")
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node={"id": "C", "type": "Claim", "label": "c",
+                         "strength": "supported", "citations": ["u1"]})
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=pid, gate_name="CLAIM_GATE")
+        assert gate["status"] == "FAIL"
+        rows = {c["name"]: c for c in gate["checks"]}
+        assert set(rows) == {"claims_anchored", "report_written"}
+        assert rows["claims_anchored"]["ok"] is True
+        assert rows["report_written"]["ok"] is False
+        assert rows["report_written"]["severity"] == "blocking"
+        assert "no primary report bound" in rows["report_written"]["detail"]
+
+    async def test_advances_once_report_written_and_anchored(self, env):
+        # The compliant WRITE turn: anchored claims + report -> gate PASSes and the
+        # strict transition proceeds as before.
+        pid = (await _create_project(env.runtime))["project_id"]
+        TestExecutionMode._fast_stage(env, pid, "WRITE")
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=pid,
+                   node={"id": "C", "type": "Claim", "label": "c",
+                         "strength": "supported", "citations": ["u1"]})
+        await _run(env.runtime, "research_artifact", action="write_scratch", project_id=pid,
+                   artifact_id="report.md", content="# 西红柿报告\n\n正文。\n")
+        gate = await _run(env.runtime, "research_gate", action="check",
+                          project_id=pid, gate_name="CLAIM_GATE")
+        assert gate["status"] == "PASS"
+        res = await _run(env.runtime, "research_state", action="transition_stage",
+                         project_id=pid, target="REVIEW")
+        assert res["transition"] == "ADVANCED" and res["granted"] is True
+        assert self._project(env, pid)["primary_report_artifact_id"] == "report.md"

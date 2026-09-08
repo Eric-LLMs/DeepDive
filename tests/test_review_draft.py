@@ -230,3 +230,62 @@ async def test_budget_guard(monkeypatch, env):
     _seam(monkeypatch, ['{"changes": []}'])
     with pytest.raises(ValueError, match="REVIEW_BUDGET_TOKENS"):
         await svc.review_draft(USER, task_id, artifact_id="report.md")
+
+
+# ── G3: run_seq provenance + ghost-tree isolation ────────────────────────────
+
+async def test_write_and_version_records_carry_current_run_seq(env):
+    svc, task_id = await _project_with_draft(env, "draft\n", {"c1": "x"})
+    proj = svc.read_project(USER, task_id)
+    rec = svc._load_json(
+        env.scratch / str(USER) / task_id / "artifacts" / "report.md" / "v1", None
+    )
+    assert rec.get("run_seq") == proj["run_seq"]
+
+
+async def test_g3_review_rejects_ghost_from_older_edition(env, monkeypatch):
+    # A draft physically produced by a previous edition (run_seq 5) must not be
+    # reviewable when the live run is edition 9 — this is the Run-13/14 "reviewed the
+    # wrong object" failure, now blocked at the source.
+    svc, task_id = await _project_with_draft(env, "ghost draft X\n", {"c1": "x"})
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(run_seq=p["run_seq"] + 1))
+    _seam(monkeypatch, ['{"changes": []}'])
+    with pytest.raises(ValueError, match="ghost"):
+        await svc.review_draft(USER, task_id, artifact_id="report.md")
+
+
+async def test_g3_promote_rejects_ghost_from_older_edition(env):
+    svc, task_id = await _project_with_draft(env, "ghost draft X\n", {"c1": "x"})
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(run_seq=p["run_seq"] + 1))
+    with pytest.raises(ValueError, match="ghost"):
+        await svc.promote_to_drive(USER, task_id, artifact_id="report.md")
+
+
+async def test_g3_untagged_legacy_version_is_grandfathered(env, monkeypatch):
+    # A pre-G3 version has no run_seq key at all (None) — not a concrete contradiction,
+    # so it is accepted (G1 already guarantees a compliant run rewrote its own draft).
+    svc, task_id = await _project_with_draft(env, "legacy draft X\n", {"c1": "x"})
+    vpath = env.scratch / str(USER) / task_id / "artifacts" / "report.md" / "v1"
+    rec = svc._load_json(vpath, None)
+    rec.pop("run_seq", None)
+    svc._save_json(vpath, rec)
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(run_seq=p["run_seq"] + 1))
+    _seam(monkeypatch, [json.dumps({"changes": [_change(old="legacy", new="LEGACY")]})])
+    out = await svc.review_draft(USER, task_id, artifact_id="report.md")
+    assert out["status"] == "ok" and out["new_version"] == 2
+
+
+async def test_g3_identical_rewrite_reclaims_run_seq(env, monkeypatch):
+    # Byte-identical re-produce under a new edition re-stamps the version to the current
+    # run (so the compliant replay is owned by this edition, not flagged as a ghost).
+    draft = "stable draft X\n"
+    svc, task_id = await _project_with_draft(env, draft, {"c1": "x"})
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(run_seq=p["run_seq"] + 1))
+    await svc.write_scratch(USER, task_id, artifact_id="report.md", content=draft)
+    rec = svc._load_json(
+        env.scratch / str(USER) / task_id / "artifacts" / "report.md" / "v1", None
+    )
+    assert rec["run_seq"] == svc.read_project(USER, task_id)["run_seq"]
+    _seam(monkeypatch, [json.dumps({"changes": [_change(old="stable", new="STABLE")]})])
+    out = await svc.review_draft(USER, task_id, artifact_id="report.md")
+    assert out["status"] == "ok"

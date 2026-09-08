@@ -1348,6 +1348,22 @@ class ResearchService:
     # an auto-settle can never self-authorize the published report (T3-4).
     _SETTLE_ARTIFACT_ID = "settle_report.md"
 
+    @staticmethod
+    def _is_ghost_run_seq(version_run_seq: object, current_run_seq: object) -> bool:
+        """True when a version's provenance run_seq concretely contradicts the current run.
+
+        G3 ghost-tree isolation. A version is a *ghost* only when it is explicitly tagged
+        with a DIFFERENT run_seq than the run now active (i.e. ``7 != 9`` — an older
+        edition's leftover). An UNTAGGED version (``None``) predates the run_seq stamp and
+        is grandfathered as compatible, because G1 already forces the current run to write
+        its own report (which rebinds the primary and becomes the latest version) — so a
+        None-legacy version can never be the primary's latest under a compliant run.
+        """
+        if version_run_seq is None or current_run_seq is None:
+            return False
+        return version_run_seq != current_run_seq
+
+
     def _bind_primary_report(
         self, owner_id: uuid.UUID, project_id: str, project: dict, artifact_id: str
     ) -> None:
@@ -1403,6 +1419,12 @@ class ResearchService:
         v1 = self._load_json(v1_path, None)
         new_artifact = v1 is None  # only a genuinely-new artifact is a progress event (not an overwrite)
         if v1 is not None and v1.get("content") == content:
+            # G3: a byte-identical re-produce under a NEW edition still makes the current
+            # run the owner of this version — re-stamp, or the replay would be rejected
+            # downstream as a ghost by review/promote's run_seq filter.
+            if v1.get("run_seq") != project.get("run_seq"):
+                v1["run_seq"] = project.get("run_seq")
+                self._save_json(v1_path, v1)
             self._bind_primary_report(owner_id, project_id, project, artifact_id)
             return {
                 "artifact_id": v1["artifact_id"],
@@ -1423,6 +1445,11 @@ class ResearchService:
             "name": artifact_id,
             "version": 1,
             "status": "DRAFT",
+            # G3 provenance: which run edition physically produced this version. review
+            # (:meth:`review_draft`) and promote (:meth:`promote_to_drive`) default to
+            # accepting ONLY the current run_seq, so a stale cross-edition tree (a ghost
+            # left by an earlier run) can no longer be reviewed or published by accident.
+            "run_seq": project.get("run_seq"),
             "content": content,
             "idempotency_key": idempotency_key,
             "generated_by_execution": generated_by_execution,
@@ -1500,6 +1527,14 @@ class ResearchService:
         record = self._load_json(version_paths[-1], None)
         if record is None:
             raise ValueError(f"artifact not found: {artifact_id}")
+        # G3 ghost-tree isolation: PUBLISH must never promote a version physically
+        # produced by an older run edition.
+        if self._is_ghost_run_seq(record.get("run_seq"), project.get("run_seq")):
+            raise ValueError(
+                f"promote_to_drive: '{artifact_id}' v{record.get('version')} is a ghost — "
+                f"written by run_seq={record.get('run_seq')} but this is run_seq="
+                f"{project.get('run_seq')}; refusing to publish a stale cross-run report"
+            )
         if record.get("status") == "PROMOTED" and record.get("drive_asset_id"):
             return self._promoted_view(record, idempotent=True)
         if project.get("cloud_folder_id"):
@@ -1691,6 +1726,8 @@ class ResearchService:
                 "artifact_id": artifact_id,
                 "version": next_version,
                 "status": "DRAFT",
+                # G3 provenance: this version was physically minted by the current run.
+                "run_seq": project.get("run_seq"),
                 "content": content,
                 "idempotency_key": idempotency_key,
                 "drive_asset_id": None,
@@ -2172,6 +2209,7 @@ class ResearchService:
                     "task_id": task_id,
                     "version": record["version"],
                     "status": record["status"],
+                    "run_seq": record.get("run_seq"),
                     "drive_asset_id": record.get("drive_asset_id"),
                     "drive_path": record.get("drive_path"),
                     "rag_status": record.get("rag_status"),
@@ -2470,6 +2508,29 @@ class ResearchService:
                 "requested": target, "transition": "ILLEGAL", "granted": False, "stage": current,
                 "reason": f"illegal transition {current} -> {target}",
             }
+        if target == "REVIEW":
+            # G1 hard-stop (Run-14 lesson): WRITE -> REVIEW physically requires the
+            # task's primary report — ``primary_report_artifact_id`` bound AND at least
+            # one version on disk. CLAIM_GATE alone was vacuous for the deliverable
+            # itself (anchored claims PASSed while no report had been written at all),
+            # and progressive mode waived it anyway. A skipped deliverable is not a
+            # quality gap: this stop applies in BOTH modes and ignores the cached gate
+            # state, so an agent can no longer stroll out of WRITE with an empty hand.
+            primary = project.get("primary_report_artifact_id")
+            adir = self._artifact_dir(owner_id, project_id, primary) if primary else None
+            landed = bool(
+                adir and adir.is_dir()
+                and any(p.name[1:].isdigit() for p in adir.glob("v*"))
+            )
+            if not landed:
+                return {
+                    "requested": target, "transition": "GATE_BLOCKED", "granted": False,
+                    "stage": current, "gate": "CLAIM_GATE",
+                    "reason": "G1 hard-stop: WRITE -> REVIEW requires the primary report "
+                    f"on disk (primary_report_artifact_id={primary!r}); write it via "
+                    "research_artifact action=write_scratch first — not waivable by "
+                    "progressive mode",
+                }
         gate = _GATE_BEFORE.get(target)
         gate_state = project["gates"].get(gate) if gate else None
         progressive = project.get("execution_mode", "strict") == "progressive"
@@ -2959,7 +3020,9 @@ class ResearchService:
         elif gate_name == "DESIGN_GATE":
             checks = self._design_checks(graph)
         elif gate_name == "CLAIM_GATE":
-            checks = self._claim_checks(graph)
+            checks = self._claim_checks(
+                graph, owner_id=owner_id, project_id=project_id, project=project
+            )
         else:  # QUALITY_GATE
             checks = self._quality_checks(project)
         ok = all(c["ok"] for c in checks)
@@ -2984,22 +3047,51 @@ class ResearchService:
             }
         ]
 
-    @staticmethod
-    def _claim_checks(graph: dict) -> list[dict]:
+    def _claim_checks(
+        self, graph: dict, *, owner_id: uuid.UUID, project_id: str, project: dict
+    ) -> list[dict]:
         claims = [n for n in graph["nodes"] if n["type"] == "Claim"]
         # Read-side normalization: strengths stored before the alias table existed (raw
         # "high"/"medium") count as valid here, so legacy graphs are not held hostage by
         # the vocabulary fix.
-        ok = bool(claims) and all(
+        anchored = bool(claims) and all(
             c.get("citations") and normalize_claim_strength(c.get("strength")) is not None
             for c in claims
         )
+        # G1: the WRITE -> REVIEW guard is no longer purely epistemic. The report is a
+        # REQUIRED deliverable of WRITE, so CLAIM_GATE also asserts the primary report is
+        # bound in state AND physically on disk. A bound-but-empty tree (or None) fails.
+        primary = project.get("primary_report_artifact_id")
+        adir = self._artifact_dir(owner_id, project_id, primary) if primary else None
+        landed = bool(
+            adir and adir.is_dir()
+            and any(p.name[1:].isdigit() for p in adir.glob("v*"))
+        )
+        report_written = bool(primary) and landed
         return [
             {
                 "name": "claims_anchored",
-                "ok": ok,
+                "ok": anchored,
                 "detail": "every Claim has citations and an allowed strength",
-            }
+            },
+            {
+                "name": "report_written",
+                "ok": report_written,
+                "severity": "blocking",
+                "detail": (
+                    "primary_report_artifact_id is bound and has >=1 version on disk"
+                    if report_written
+                    else (
+                        "no primary report bound: write the WRITE-stage report (which "
+                        "binds primary_report_artifact_id) before advancing to REVIEW"
+                        if not primary
+                        else (
+                            f"primary report '{primary}' is bound but has no version on "
+                            "disk (corrupt/missing artifact tree)"
+                        )
+                    )
+                ),
+            },
         ]
 
     @staticmethod
@@ -3139,7 +3231,11 @@ class ResearchService:
         if gate_name == "DESIGN_GATE":
             return self._design_checks(self._load_graph(owner_id, project_id))
         if gate_name == "CLAIM_GATE":
-            return self._claim_checks(self._load_graph(owner_id, project_id))
+            return self._claim_checks(
+                self._load_graph(owner_id, project_id),
+                owner_id=owner_id, project_id=project_id,
+                project=self._load_project(owner_id, project_id),
+            )
         if gate_name == "QUALITY_GATE":
             return self._quality_checks(self._load_project(owner_id, project_id))
         raise ValueError(f"unknown gate: {gate_name}")
@@ -4944,6 +5040,15 @@ class ResearchService:
             )
         base_version = versions[-1]
         record = self._artifact(owner_id, project_id, artifact_id, base_version)
+        # G3 ghost-tree isolation: never review a version physically produced by a
+        # different run edition. Combined with G1 (which forces the current run to write
+        # its own report before REVIEW), the primary's latest version is always current.
+        if self._is_ghost_run_seq(record.get("run_seq"), _proj.get("run_seq")):
+            raise ValueError(
+                f"review_draft: '{artifact_id}' v{base_version} is a ghost — it was "
+                f"written by run_seq={record.get('run_seq')} but this is run_seq="
+                f"{_proj.get('run_seq')}. Write the current run's report in WRITE first."
+            )
         draft = record.get("content") or ""
         if not draft.strip():
             raise ValueError("review_draft: the latest version has empty content")
