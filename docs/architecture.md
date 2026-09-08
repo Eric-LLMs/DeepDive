@@ -1227,7 +1227,8 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Lazy-load a skill body | `skill` meta-tool over `SkillCatalog.render()` compressed index |
 | Reconfigure retrieval at runtime | `app_settings["rag"]` + `rag.config_store` (validated against the registry, cached; a save clears the retriever lru_cache) |
 | Measure retrieval quality | `rag.eval` golden-set regression (asset-level Recall@k / Precision@k / MRR); admin **Eval** tab or `scripts/eval_rag.py` |
-| Mount the research OS plugin | factory-built `plugins/research/` Cordis plugin (`build_research_plugin(ctx)`), lazy capability resolution over `drive` / `research_scratch`; 6 tools: `research_project` / `artifact` / `state` / `evidence` / `gate` / `run` — see [docs/research/](research/) |
+| Mount the research OS plugin | factory-built `plugins/research/` Cordis plugin (`build_research_plugin(ctx)`), lazy capability resolution over `drive` / `research_scratch`; 7 tools: `research_project` / `artifact` / `state` / `evidence` / `gate` / `run` / `scrape` — see [docs/research/](research/) |
+| Close a research stage in ONE call | server-side atomic closures instead of per-claim/per-page retail loops: EVIDENCE = `research_evidence adjudicate` (fetch → deterministic chunk → one streaming LLM pass → one `verify_batch` commit), REVIEW = `research_artifact review_draft` (one LLM pass emits `{"changes": […]}` patch rows, pre-checked under the unique-match iron rule, committed all-or-nothing) — see §17 |
 | Govern a research stage | mechanical `research_gate` checks (deterministic, no LLM judgment); a FAIL override always spawns a PENDING `ResearchApproval` that only a human resolves (never self-approve) — see [docs/research/](research/) |
 | Delete a message's owned screenshot | `messages.attach_asset_id` → cascade soft-delete by id (folder-agnostic); `?delete_assets=0` on edit-reask keeps it; the stable `RAG/images` copy an imported Q&A references is a separate asset row that survives the delete (§18.2) |
 | Save a derived asset with its source | `assets.source_asset_id` (FK `ON DELETE CASCADE`) + content-hash dedup (`get_by_source_content`) |
@@ -2163,8 +2164,9 @@ the first moment (and every later mirror independently back-fills a missing fold
 holding that run's working copies (`write_scratch` / `create_version` intermediates land in
 `temp/v{run_version}/<id>.md`, updated in place within a run, never clobbering an earlier run's
 folder) and the batch-fetched **evidence drafts** under `temp/v{run_version}/scrape/` (full page
-text captured **server-side** by `research_scrape fetch` — ≤3 URLs per call, cleaned — each usable
-draft persisted alongside a per-run provenance row, see the EVIDENCE paragraph below); and `outputs/<stem>_v<N>.md` — a run's promote **Create-New** final, versioned
+text captured **server-side** by the EVIDENCE pipeline's `fetch_save_batch` — ≤5 URLs per internal
+fetch batch, cleaned — each usable draft persisted alongside a per-run provenance row, see the
+EVIDENCE paragraph below); and `outputs/<stem>_v<N>.md` — a run's promote **Create-New** final, versioned
 per run: the first promote of a run mints `outputs/<stem>_vN.md` and RAG-pends that asset, a
 re-promote inside the same run refreshes it in place (never a `_vN+1`), and a later run writes a fresh
 `_v{N+1}` that never overwrites or reuses an earlier final. Independent of promote, **report
@@ -2185,39 +2187,105 @@ Trash, scratch removed), so no half-built task is ever left behind; the cloud fo
 the Drive's collision-safe naming and the `drive.download` permission gate doubles as the material
 tenancy check.
 
-**EVIDENCE — wholesale batch, one idempotent verify.** The EVIDENCE stage is where the driver
-moves from *discovery* to *loading the evidence base*, and the whole chain is batched so the agent
-doesn't round-trip a short prompt per URL. For every claimed source the driver decides is load-bearing,
-it first `record_node`s a `Claim` (a `claim_id` minted from the driver's own edge bookkeeping — model
-claims enter the graph *only* as driver-authored claim nodes). A Claim's `strength` uses the
-canonical vocabulary `asserted | supported | confident | contested`; report-style
-`high / medium / low` are accepted and **normalized at the single ingestion point** (`record_node` /
-`mutate_node`), an unrecognized value is refused with a repair hint instead of being stored and
-silently dooming `CLAIM_GATE`, `verify` never promotes or rewrites a claim's strength, and the gate's
-read side applies the same mapping so graphs recorded before the vocabulary fix still score valid. It then issues a single
-`research_scrape fetch` per URL-cluster that re-runs the real page fetch **server-side**: ≤3 URLs per
-call, **parallel inside the call only** — the ≤3 URLs are fetched and HTML-cleaned concurrently (one
-`asyncio.gather`, capped at 6) and their usable drafts are then **saved concurrently** in a second
-gather (E10; a single page or a failed drive write never fails the batch — that URL is just left
-without a provenance row), while the results keep the input order so the claim↔source pairing stays
-stable; the run's agent turns themselves remain strictly serial (one `research_drive` job at a time,
-never a per-claim fan-out). Each call's returned view JSON is capped at 7200 bytes; fetch concurrency
-is SSRF-guarded by the same `web_fetch` domain allow-list the tools use, HTML stripped to clean text,
-and each usable draft
-persisted under `temp/v{run}/scrape/` as a `fetch_<host>_<hex>.md` draft (the legacy agent-saved
-`save_scrape` captures keep their `<source>_<query>_<n>.md` naming) alongside a per-canonical-URL
-provenance row in the run's `_fetch_provenance` ledger (see the storage-mapping paragraph above).
-Verification then happens **once per evidence row**: one `research_evidence verify` per cluster maps
-each canonical URL to an evidence row whose id is a **stable hash of `(claim_id, canonical_url)`**, so
-the whole call is idempotent — a re-run in a fresh edition re-hashes to the same ids and upserts in
-place instead of duplicating. The `verified` label therefore means *server-side provenance only*: the
-run ledger has a row (fetch returned ok, draft was usable, `full_char_len ≥ MIN`, and the model judged
-the claim with a `supports`/`contradicts` verdict) — the model's self-report about having "read" or
-"checked" a page is never enough. A `neutral` verdict is a note on an already-verified evidence row and
-creates no claim edge; a failed fetch simply leaves no row, so a claim silently has "no evidence yet".
-Two hard rules keep the graph honest: verify never creates or rewrites claims (a claim's only writer is
-the driver), and the WRITE stage may cite a page only through `research_scrape read`, which is scoped
-to the current run's own provenance rows — the agent can't cite a URL it never actually loaded this run.
+**EVIDENCE — one `adjudicate` call closes the whole chunk.** The EVIDENCE stage is where the driver
+moves from *discovery* to *loading the evidence base*, and the design collapses the entire
+per-chunk chain — fetch, extract, judge, commit — into a **single**
+`research_evidence action="adjudicate"` call so the agent never round-trips a short prompt per URL
+or per claim. For every claim the driver decides is load-bearing it first `record_node`s a `Claim`
+(a `claim_id` minted from the driver's own edge bookkeeping — model claims enter the graph *only*
+as driver-authored claim nodes). A Claim's `strength` uses the canonical vocabulary
+`asserted | supported | confident | contested`; report-style `high / medium / low` are accepted and
+**normalized at the single ingestion point** (`record_node` / `mutate_node`), an unrecognized value
+is refused with a repair hint instead of being stored and silently dooming `CLAIM_GATE`, and the
+gate's read side applies the same mapping so graphs recorded before the vocabulary fix still score
+valid. The one `adjudicate` call takes `urls` (any count) + `claim_ids` (the chunk's pending ids)
+and then runs entirely server-side:
+
+1. **Fetch** — every source goes through `fetch_save_batch` in internal batches of ≤5
+   (`FETCH_MAX_URLS`, the body-budget invariant `n_urls × max_chars ≤ 150k`), parallel inside each
+   batch; each usable draft is persisted under `temp/v{run}/scrape/` alongside a per-canonical-URL
+   provenance row in the run's `_fetch_provenance` ledger, and a URL already fetched this run is
+   reused from the ledger, never re-fetched. A failed/unusable page (403, empty, interstitial) is
+   reported under `skipped_sources` and is **terminal for that source in this run** — it never
+   stalls the batch.
+2. **Extract** — ONE **deterministic representative chunk per page** (a 900-char Python slice,
+   `ADJUDICATION_SNIPPET_CHARS`): never a whole page, never an LLM summary.
+3. **Judge** — relevance + verdict are decided in a **single batched LLM pass** over the chunk's
+   sources; a greedy budget split (`ADJUDICATION_BUDGET_TOKENS = 5000`, claims riding every batch
+   as fixed context) adds extra passes **only on token-budget overflow** — the normal case is
+   literally one call. The model replies with a minimal id-only payload,
+   `{"results": [{"s", "c", "v"}]}` — short `S#`/`C#` transport ids mapped back to real
+   `canonical_url`/`claim_id` before anything touches the graph (a hallucinated or malformed id is
+   server-rejected and reported as `dropped_rows`, never guessed); `insufficient` is a
+   relevance-only annotation that creates no edge.
+4. **Commit** — ALL verdicts land in ONE atomic `verify_batch(server_authored=True)` transaction:
+   evidence ids are a **stable hash of `(claim_id, canonical_url)`** so the whole call is idempotent
+   across editions, Sources/Evidence nodes and claim edges are written by the commit itself (no
+   hand-linking), and already-committed unchanged claims come back `skipped_unchanged` with zero
+   writes. The reply is a compact per-claim summary (`supports` / `contradicts` / `insufficient`
+   URLs, plus `skipped_sources`, `dropped_rows`, `no_verdict_claims`), so a claim-level retry
+   re-adjudicates just that `claim_id` with better URLs instead of re-running the chunk.
+
+The inner LLM transport is **streaming** (`complete_stream`) with a per-call 180 s timeout,
+`max_retries=1`, and `enable_thinking:false` injected via `extra_body` — an id-only verdict gains
+nothing from hidden reasoning, and the streaming keep-alive is what removed the silent
+idle-past-client-timeout stall a non-streaming whole-batch call could hit. The `verified` label
+therefore means *server-side provenance only*: the run ledger has a row (fetch returned ok, draft
+was usable, and the model judged the claim `supports`/`contradicts`) — the model's self-report about
+having "read" a page is never enough, and only ledger-confirmed URLs become edges. Two hard rules
+keep the graph honest: adjudication never creates or rewrites claims (a claim's only writer is
+`record_node`, and its `citations` + canonical `strength` go on **before** adjudication —
+post-commit graph patching is forbidden), and the WRITE stage may cite a page only through
+`research_scrape read`, which is scoped to the current run's own provenance rows — the agent can't
+cite a URL it never actually loaded this run. Every stage leg is instrumented —
+`adjudicate.fetch fetch_ms`, `adjudicate.llm ttft_ms/stream_ms/chars`, `adjudicate.parse
+parse_ms/batches/llm_calls/dropped_rows` — and `RESEARCH_ADJ_DUMP=1` additionally dumps the full
+system+input prompt and the verbatim reply to the log for offline prompt auditing.
+
+```text
+ agent turn                ONE research_evidence adjudicate call (all server-side)
+┌───────────┐   ┌──────────────────────────────────────────────────────────────────┐
+│ get_state │──►│ fetch_save_batch (≤5/batch, parallel) ─► 900-char deterministic   │
+│ pending   │   │        representative chunk (pure Python slice)                   │
+│ chunk     │   │ ─► ONE streaming LLM pass (s/c/v id-only rows, thinking off, 180s)│
+└───────────┘   │ ─► S#/C# mapped back to real url/claim ─► ONE verify_batch commit │
+                └────────────────────────────┬─────────────────────────────────────┘
+                                             ▼
+                  per_claim summary + skipped_sources + dropped_rows (zero round-trips)
+```
+
+**REVIEW — one `review_draft` call, all-or-nothing staged commit.** The REVIEW stage closes in
+exactly **one** `research_artifact action="review_draft"` call (passing the report's
+`artifact_id`) — no per-page read loop, no hand-authored review versions. Server-side: the latest
+artifact version plus the full Claim graph (`claim_id/statement/strength/status/citations`) are fed
+verbatim into ONE streaming LLM call — here **thinking stays enabled**, because editorial reasoning
+is the point of this call — and the prompt size is bound by `REVIEW_BUDGET_TOKENS` (env, default
+200k; estimate = chars/4) which raises before any call if the draft would overflow. The reply is
+ONLY a patch script, `{"changes": [{"file","target","expected_old","change"}, …]}` — top level is
+exactly `changes`, every row exactly those 4 string keys with a non-empty `expected_old`; a
+non-conforming reply gets exactly one repair retry, a second failure aborts. Python then
+**pre-checks every row against the unique-match iron rule** before touching anything: `file` must be the
+reviewed artifact, `target` must occur **exactly once** in the document, and `expected_old` must
+occur **exactly once inside the target's section** (target line up to the next `#` heading) — a
+0-match or multi-match row is a reject. Accepted rows are applied to an **in-memory staging copy**;
+if ANY row is rejected the staging copy is discarded whole — no artifact write, no graph write, and
+a `RuntimeError` names the exact failed rows (`patch rejected (k/n rows failed)`), so the base
+version is never half-landed. All rows pass → **one** `create_version` commit (base version left
+untouched); `changes: []` → `new_version: null`, meaning the draft was fully supported. Timing is
+logged per call (`review.llm done_ms/parse_ms/calls`, `review.apply applied/version`), and the
+worker's auto-turn brief carries this one-call mandate in the stage command itself — the tool
+schema and skill doc alone proved insufficient to stop a retail read/verify loop.
+
+```text
+ research_artifact review_draft (ONE call)
+        │  draft vN + Claim graph ──► ONE streaming LLM pass (thinking ON)
+        │  ◄── {"changes":[{file,target,expected_old,change}…]}  (malformed → 1 repair)
+        ▼
+ per-row pre-check: target unique in doc ∧ expected_old unique inside target's section
+        │                                    any reject ─► discard staging, RuntimeError(rows)
+        ▼ all pass
+ apply every row to an in-memory staging copy ─► ONE create_version (vN+1; vN untouched)
+```
 
 **Session isolation.** Every task binds a single dedicated chat session (1:1, `bind_session`).
 The kind lives in the DB — `sessions.type` (migration `0017_sessions_type.sql`; 0 = chat,
@@ -2374,10 +2442,12 @@ publishing is best-effort and a no-op when no bus is installed).
 `deletion_requested` in `project.json`, soft-deletes the whole cloud task folder into the Trash,
 clears the session routing index, hard-removes scratch, and **deletes the task's bound chat
 sessions** with it: `delete_task` returns the session ids from the routing index and the router
-removes every row that is owned by the caller and `type=1` (messages + `session_events` cascade
-via the FK; screenshots owned by those messages are soft-deleted best-effort, folder-agnostic as
-in §12.5; a type-0 session is never touched here, and a per-session failure is logged without
-failing the task delete). Restoring the Trash folder never resurrects the task. Two **409** guards
+removes every one of those rows that is owned by the caller — the type flag is **not** a filter
+here (the binding in the index is the authority; a session bound to the task is deleted whether it
+was ever marked `type=1` or still carries `type=0`, while the ownership re-check keeps another
+user's session untouchable). Messages + `session_events` cascade via the FK; screenshots owned by
+those messages are soft-deleted best-effort, folder-agnostic as in §12.5; a per-session failure is
+logged without failing the task delete. Restoring the Trash folder never resurrects the task. Two **409** guards
 refuse deletion: a task with a live run (the `active_run`
 slot — an orphaned per-tool RUNNING execution left by a run that stopped mid-step does not block,
 it is wiped by teardown) and a report the Knowledge Base has already indexed ("Please remove from
