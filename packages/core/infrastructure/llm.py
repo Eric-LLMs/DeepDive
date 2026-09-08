@@ -150,6 +150,7 @@ class OpenAILLM:
         api_key: str | None = None,
         timeout: float | None = None,
         max_retries: int | None = None,
+        extra_body: dict | None = None,
     ) -> AsyncIterator[str]:
         # Per-call timeout/max_retries overrides force a fresh client (the shared
         # self.client carries process-wide settings); otherwise reuse it.
@@ -168,6 +169,7 @@ class OpenAILLM:
             messages=self._messages(prompt, system_prompt),
             temperature=0.3,
             stream=True,
+            **({"extra_body": extra_body} if extra_body else {}),
         )
         async for chunk in stream:
             if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:

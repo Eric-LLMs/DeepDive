@@ -153,6 +153,8 @@ services:
       # aggregate active when neither is set.
       WEB_SEARCH_PROVIDER: ${WEB_SEARCH_PROVIDER:-aggregate}
       WEB_SEARCH_API_KEY: ${WEB_SEARCH_API_KEY:-}
+      # Ops: dump the full adjudication prompt + raw LLM reply to the worker log.
+      RESEARCH_ADJ_DUMP: ${RESEARCH_ADJ_DUMP:-1}
     volumes:
       # Share the audio/image caches with the host-run FastAPI gateway, which serves /audio
       # and /images from the same directories.

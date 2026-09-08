@@ -319,6 +319,12 @@ _ADJ_LLM_TIMEOUT_SECONDS = 180.0
 _ADJ_LLM_MAX_RETRIES = 1
 
 
+def _adj_dump_enabled() -> bool:
+    # Ops switch: RESEARCH_ADJ_DUMP=1 logs the FULL adjudication input prompt and the
+    # raw streamed reply so the output contract can be eyeballed in the worker log.
+    return os.environ.get("RESEARCH_ADJ_DUMP") == "1"
+
+
 async def _adjudication_llm_complete(prompt: str, system_prompt: str) -> str:
     """One channel-aware completion for the adjudication prompt.
 
@@ -339,11 +345,18 @@ async def _adjudication_llm_complete(prompt: str, system_prompt: str) -> str:
     kwargs: dict[str, Any] = {
         "timeout": _ADJ_LLM_TIMEOUT_SECONDS,
         "max_retries": _ADJ_LLM_MAX_RETRIES,
+        # The verdict rows need no chain-of-thought: thinking only inflates the
+        # hidden prefill (the 130 s ttft in Run-14). Supported in streaming mode
+        # only — which is exactly what this call is.
+        "extra_body": {"enable_thinking": False},
     }
     channel = get_request_llm_channel()
     if channel is not None:
         model, base_url, api_key = channel
         kwargs.update({"model": model or None, "base_url": base_url, "api_key": api_key})
+    if _adj_dump_enabled():
+        logger.info("adjudicate.dump system>>>\n%s\n<<<\ninput>>>\n%s\n<<<input",
+                    system_prompt, prompt)
     t0 = time.perf_counter()
     ttft_ms: float | None = None
     parts: list[str] = []
@@ -353,6 +366,8 @@ async def _adjudication_llm_complete(prompt: str, system_prompt: str) -> str:
         parts.append(piece)
     text = "".join(parts).strip()
     stream_ms = (time.perf_counter() - t0) * 1000
+    if _adj_dump_enabled():
+        logger.info("adjudicate.dump reply>>>\n%s\n<<<reply", text or "(empty)")
     logger.info(
         "adjudicate.llm ttft_ms=%s stream_ms=%.0f chars=%d",
         f"{ttft_ms:.0f}" if ttft_ms is not None else "none",
