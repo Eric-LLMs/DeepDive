@@ -42,6 +42,7 @@ __all__ = [
     "EvidenceChunk",
     "suggest_chunks",
     "MAX_CHUNK_CLAIMS",
+    "EXHAUSTED_ATTEMPTS",
     "DEFAULT_BUDGET_TOKENS",
 ]
 
@@ -130,10 +131,24 @@ def evidence_fingerprint(graph: dict, claim_id: str) -> str:
     return _sha(json.dumps(sorted(set(items)), ensure_ascii=False))
 
 
+# P3-10 stall breaker: consecutive adjudication attempts for the same claim that
+# produce no committed ticket AND no evidence_fingerprint growth trip the claim's
+# gap to ``evidence_exhausted`` — an honest known gap, never a refutation.
+EXHAUSTED_ATTEMPTS = 2
+
+
 def compute_pending(
-    stored_fp: str | None, current_fp: str, gate_ok: bool
+    stored_fp: str | None, current_fp: str, gate_ok: bool, terminal: bool = False
 ) -> bool:
-    """The frozen constraint-2 rule; see module docstring for the three clauses."""
+    """The frozen constraint-2 rule; see module docstring for the three clauses.
+
+    P3-10 stall breaker: a claim whose gap is terminal (``evidence_exhausted``)
+    leaves the pending set regardless — re-verifying it has already produced no
+    committed evidence twice running. "Evidence insufficient" stays a KNOWN GAP,
+    never a refutation; it is simply not pending work anymore.
+    """
+    if terminal:
+        return False  # evidence_exhausted: honest gap, stop burning adjudications
     if stored_fp is None:
         return True  # never batch-committed: no baseline exists to compare against
     if not gate_ok:

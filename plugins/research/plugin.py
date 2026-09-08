@@ -66,6 +66,7 @@ from core.infrastructure.web_fetch import (
     canonical_url as canonicalize,
 )
 from plugins.research.batch import (
+    EXHAUSTED_ATTEMPTS,
     MAX_CHUNK_CLAIMS,
     compute_pending,
     evidence_fingerprint,
@@ -339,8 +340,10 @@ async def _adjudication_llm_complete(
 
     ``enable_thinking``: the id-only adjudication verdicts gain nothing from hidden
     reasoning (Run-14: 130 s of thinking prefill for a 4 s body), so adjudicate runs
-    with thinking off; the one-shot REVIEW does real editorial reasoning and keeps the
-    model default (thinking on).
+    with thinking off; Run-13 measured the same 453 s prefill tax on the one-shot
+    REVIEW (thinking on, 501 s stream) while its anchors were 100% verbatim — the
+    patch quality came from the draft+graph context, not the hidden reasoning, so
+    REVIEW also runs with thinking off (P3-10).
     """
     if _ADJ_LLM_CALL is not None:  # test seam
         return await _ADJ_LLM_CALL(prompt, system_prompt)
@@ -451,7 +454,7 @@ REVIEW_BUDGET_TOKENS = int(os.environ.get("REVIEW_BUDGET_TOKENS", "200000"))
 _REVIEW_CHANGE_KEYS = {"file", "target", "expected_old", "change"}
 
 
-def _review_prompt(claims: list[dict], draft: str) -> str:
+def _review_prompt(claims: list[dict], draft: str, artifact_id: str) -> str:
     lines = [
         "Review the draft below in ONE pass, then reply with the JSON contract.",
         "",
@@ -464,10 +467,11 @@ def _review_prompt(claims: list[dict], draft: str) -> str:
             "DRAFT (full text, verbatim):",
             draft,
             "",
-            'Return ONLY this JSON object: {"changes": [{"file": "<artifact_id of the '
-            'draft>", "target": "<section anchor line copied verbatim from the draft, '
+            f'Return ONLY this JSON object: {{"changes": [{{"file": "{artifact_id}", '
+            '"target": "<section anchor line copied verbatim from the draft, '
             'empty string = whole document>", "expected_old": "<the exact text to '
-            'replace>", "change": "<replacement text, empty string deletes>"}]}',
+            'replace>", "change": "<replacement text, empty string deletes>"}]} '
+            '— copy the "file" value EXACTLY as given above; it is fixed.',
             "Rules:",
             "- Each change row has EXACTLY the four keys file/target/expected_old/change — "
             "no reasoning, no explanation, no extra fields.",
@@ -1340,6 +1344,32 @@ class ResearchService:
         return {"project_id": project["id"], "status": "ARCHIVED"}
 
     # ── research_artifact ─────────────────────────────────────────────────
+    # The driver's model-free gap record — excluded from primary-report binding so
+    # an auto-settle can never self-authorize the published report (T3-4).
+    _SETTLE_ARTIFACT_ID = "settle_report.md"
+
+    def _bind_primary_report(
+        self, owner_id: uuid.UUID, project_id: str, project: dict, artifact_id: str
+    ) -> None:
+        """T3 authority: the FIRST report-named artifact the task writes becomes its
+        ``primary_report_artifact_id`` — a plain ``project.json`` key (no new model,
+        no version system). WRITE binds it here; REVIEW (:meth:`review_draft`) and
+        PUBLISH (:meth:`promote_to_drive`) force-bind to it, and the driver's settle
+        refuses to mark success while it stays unpromoted."""
+        if project.get("primary_report_artifact_id"):
+            return  # first write wins; later report-named artifacts never steal the crown
+        if artifact_id == self._SETTLE_ARTIFACT_ID or not _is_report_artifact(artifact_id):
+            return
+        def _bind(proj: dict):
+            if proj.get("primary_report_artifact_id"):
+                return False  # raced with another binder: no-op, no revision bump
+            proj["primary_report_artifact_id"] = artifact_id
+            return None
+        self.atomic_update_project(owner_id, project_id, _bind)
+        logger.info(
+            "artifact.primary_bound task=%s artifact_id=%s", project_id, artifact_id
+        )
+
     async def write_scratch(
         self,
         owner_id: uuid.UUID,
@@ -1354,6 +1384,9 @@ class ResearchService:
         if idempotency_key:
             existing = self._find_by_idempotency(owner_id, "artifact", idempotency_key)
             if existing is not None:
+                self._bind_primary_report(
+                    owner_id, project_id, project, existing["artifact_id"]
+                )
                 return {
                     "artifact_id": existing["artifact_id"],
                     "project_id": project_id,
@@ -1370,6 +1403,7 @@ class ResearchService:
         v1 = self._load_json(v1_path, None)
         new_artifact = v1 is None  # only a genuinely-new artifact is a progress event (not an overwrite)
         if v1 is not None and v1.get("content") == content:
+            self._bind_primary_report(owner_id, project_id, project, artifact_id)
             return {
                 "artifact_id": v1["artifact_id"],
                 "project_id": project_id,
@@ -1414,6 +1448,7 @@ class ResearchService:
                 stage=project.get("stage"),
                 project=project,
             )
+        self._bind_primary_report(owner_id, project_id, project, artifact_id)
         return {
             "artifact_id": artifact_id,
             "project_id": project_id,
@@ -1446,6 +1481,16 @@ class ResearchService:
           ``research/<project_id>/`` and mirrored into a scratch ``outputs/`` projection.
         """
         project = self._load_project(owner_id, project_id)
+        # T3 force-bind: PUBLISH promotes the PRIMARY report's latest version (which
+        # is exactly the version REVIEW committed, if any) — never a guessed id.
+        _primary = project.get("primary_report_artifact_id")
+        if _primary and artifact_id != _primary:
+            logger.warning(
+                "promote.artifact_rebind: artifact_id=%r rebound to "
+                "primary_report_artifact_id=%r (task %s)",
+                artifact_id, _primary, project_id,
+            )
+            artifact_id = _primary
         version_paths = sorted(
             (self._artifact_dir(owner_id, project_id, artifact_id)).glob("v*"),
             key=lambda p: int(p.name[1:]),
@@ -1922,8 +1967,10 @@ class ResearchService:
         Two shapes (chat-task path only; a task without a ``cloud_folder_path`` is a no-op):
 
         - **Versioned run** (``driver.run_version`` set): the working copy mirrors into
-          ``temp/v{N}/<artifact_id>.md``. Report artifacts additionally mirror into
-          ``outputs/<task name>.md`` (same folder/ledger mechanism, no version suffix). The
+          ``temp/v{N}/<stem>.md`` (``_report_stem`` — an id already ending in ``.md`` gains
+          exactly one suffix, never ``.md.md``). Report artifacts additionally mirror into
+          ``outputs/<task name>_v{N}.md`` — the run version rides the FILENAME (T2: this is
+          what makes the outputs file traceable back to ``temp/v{N}``). The
           run's ``cloud_assets`` ledger holds the temp/out asset ids so a same-run rewrite
           updates in place and a *later* run writes a new file (the ids are
           deliberately NOT stored on the shared version record — that would leak one run's
@@ -1974,21 +2021,22 @@ class ResearchService:
 
             created_new = False
             try:
+                # T1: stem first — ``corpus.md`` mirrors as ``corpus.md``, not ``corpus.md.md``.
                 created_new |= await _mirror(
-                    f"temp/v{rv}", f"{_safe_filename(record['artifact_id'])}.md", "temp_asset"
+                    f"temp/v{rv}", f"{_report_stem(record['artifact_id'])}.md", "temp_asset"
                 )
             except Exception:
                 logger.exception("research run-temp mirror failed for %s", record["artifact_id"])
                 return False
             if _is_report_artifact(record["artifact_id"]):
                 try:
-                    # Filename = the task name (no version suffix): the first report write of
-                    # a run creates ``outputs/<task name>.md``; later writes of the SAME run
-                    # update it in place (``out_asset``); a NEW run's report lands as a new
-                    # file (fresh ledger → ``save_artifact`` auto-suffixes the busy name).
+                    # T2: filename = task name + run version (``<task>_v{N}.md``): the first
+                    # report write of a run creates it; later writes of the SAME run update it
+                    # in place (``out_asset``); a NEW run lands as its own ``_v{N+1}`` file —
+                    # traceable 1:1 to the run's ``temp/v{N}`` folder.
                     created_new |= await _mirror(
                         "outputs",
-                        f"{_safe_filename(project.get('name') or 'report')}.md",
+                        f"{_safe_filename(project.get('name') or 'report')}_v{rv}.md",
                         "out_asset",
                     )
                 except Exception:
@@ -2285,6 +2333,9 @@ class ResearchService:
             "stage": project["stage"],
             "status": project["status"],
             "gates": project["gates"],
+            # T3: authoritative report identity — null until the first report-named
+            # write_scratch binds it; REVIEW/PUBLISH force-bind to this id.
+            "primary_report_artifact_id": project.get("primary_report_artifact_id"),
         }
         # P1-C: a tiny Claim digest so a fresh (auto) turn can SEE the claims an
         # earlier turn already recorded — cross-turn context is cleared and no other
@@ -2327,9 +2378,16 @@ class ResearchService:
             if n.get("type") != "Claim":
                 continue
             fp = evidence_fingerprint(graph, n["id"])
+            # P3-10 stall breaker: a terminal gap (evidence_exhausted) leaves the
+            # pending set for good — the claim is Known-Gaps material for the draft,
+            # never pending work. Read-only here; the breaker stamps it in
+            # adjudicate_evidence.
+            gap_row = n.get("gap") if isinstance(n.get("gap"), dict) else None
+            terminal = bool(gap_row and gap_row.get("status"))
             pending = compute_pending(
                 stored_fps.get(n["id"]), fp,
                 _batch_gate_ok(n, normalize_claim_strength),
+                terminal,
             )
             claims.append({
                 "id": n["id"],
@@ -2342,6 +2400,9 @@ class ResearchService:
                 # dropping either field can never change correctness, and the
                 # commit-time skip rule (compute_pending) is the real gate.
                 "last_verdict": sorted(verdicts_by_claim.get(n["id"], set())) or None,
+                # P3-10: surface the terminal status so the agent treats the claim as
+                # Known-Gaps material instead of re-adjudication work.
+                "gap": (gap_row.get("status") if terminal else None),
             })
         # Deterministic chunk packing over the pending set (pure suggest_chunks): the
         # digest tells the agent which claims belong to one verify_batch call without
@@ -2648,6 +2709,22 @@ class ResearchService:
             target = next((n for n in graph["nodes"] if n["id"] == node_id), None)
             if target is None:
                 raise ValueError(f"node not found: {node_id}")
+            # P3-10: an evidence_exhausted Claim is a KNOWN GAP, not a claim to be
+            # tuned. Block citations/strength churn (the Run-13 harassment pattern);
+            # revival goes only through genuinely new adjudicated evidence.
+            gap = target.get("gap")
+            if (
+                target.get("type") == "Claim"
+                and isinstance(gap, dict)
+                and gap.get("status") == "evidence_exhausted"
+                and (set(patch) & {"citations", "strength"})
+            ):
+                raise ValueError(
+                    f"claim {node_id} is evidence_exhausted (known gap after "
+                    f"{gap.get('attempts', '?')} adjudications): report it under Known "
+                    "Gaps in the draft — citations/strength may only change through "
+                    "genuinely new adjudicated evidence, not patching."
+                )
             to_invalid = "status" in patch and patch["status"] == "INVALID"
             protected = {"id", "type"}
             effective = patch
@@ -4396,7 +4473,13 @@ class ResearchService:
                 current_fp = evidence_fingerprint(graph, claim_id)
                 stored = new_fps.get(claim_id)
                 gate = _batch_gate_ok(node, normalize_claim_strength)
-                if not compute_pending(stored, current_fp, gate):
+                # P3-10: a terminal-gap claim is never pending work — even an
+                # explicitly re-sent item commits as skipped, not re-adjudicated.
+                gap_node = node.get("gap") if isinstance(node.get("gap"), dict) else None
+                if not compute_pending(
+                    stored, current_fp, gate,
+                    bool(gap_node and gap_node.get("status")),
+                ):
                     _push({"item_id": item_id, "claim_id": claim_id, "status": "skipped_unchanged",
                            "pending": False, "evidence_fingerprint": current_fp})
                     continue
@@ -4503,8 +4586,20 @@ class ResearchService:
             for n in graph.get("nodes", [])
             if isinstance(n, dict) and n.get("type") == "Claim" and n.get("id")
         }
+        # P3-10 stall breaker: claims already carrying a terminal gap never re-enter
+        # adjudication — the cross-stage "gather better URLs" loop stops here.
+        claim_gap = {
+            n["id"]: (n["gap"].get("status") or "")
+            for n in graph.get("nodes", [])
+            if isinstance(n, dict) and n.get("type") == "Claim" and n.get("id")
+            and isinstance(n.get("gap"), dict) and n["gap"].get("status")
+        }
+        exhausted_skipped = sorted(claim_gap)
         if claim_ids:
-            wanted = [str(c).strip() for c in claim_ids if str(c).strip()]
+            wanted = [
+                str(c).strip() for c in claim_ids
+                if str(c).strip() and str(c).strip() not in claim_gap
+            ]
             missing = sorted({c for c in wanted if c not in claim_nodes})
             if missing:
                 raise ValueError(
@@ -4513,8 +4608,17 @@ class ResearchService:
                 )
             claim_ids = sorted(set(wanted))
         else:
-            claim_ids = sorted(claim_nodes)
+            claim_ids = sorted(c for c in claim_nodes if c not in claim_gap)
         if not claim_ids:
+            if claim_nodes:  # everything requested was already terminal
+                return {
+                    "status": "all_exhausted",
+                    "exhausted_claims": exhausted_skipped,
+                    "llm_calls": 0,
+                    "hint": "every requested claim is evidence_exhausted — a known gap. "
+                            "Report it under Known Gaps in the draft (insufficient evidence "
+                            "is never a refutation); do not re-adjudicate or patch it.",
+                }
             raise ValueError("adjudicate needs at least one recorded Claim node")
         if len(claim_ids) > ADJUDICATION_MAX_CLAIMS:
             raise ValueError(
@@ -4655,8 +4759,10 @@ class ResearchService:
                     dropped_rows += 1  # a hallucinated id never reaches the graph
                     continue
                 verdicts.setdefault(cid, {}).setdefault(cu_of_sid[sid], verdict)
-        logger.info("adjudicate.parse parse_ms=%.0f batches=%d llm_calls=%d dropped_rows=%d",
-                    parse_ms_total, len(batches), llm_calls, dropped_rows)
+        logger.info("adjudicate.parse parse_ms=%.0f batches=%d llm_calls=%d dropped_rows=%d "
+                    "slice_chars=%d",
+                    parse_ms_total, len(batches), llm_calls, dropped_rows,
+                    sum(len(s) for s in snippets.values()))
 
         # ── 6. merge every batch back into per-claim findings; ONE atomic commit ──
         items: list[dict] = []
@@ -4678,6 +4784,75 @@ class ResearchService:
                 items.append({"item_id": cid, "claim": {"id": cid}, "findings": findings})
             else:
                 no_verdict_claims.append(cid)
+
+        # ── P3-10 stall breaker: one CAS transaction stamping per-Claim attempt
+        # state after the verdicts are known. A claim that produced no
+        # supports/contradicts ticket for ``EXHAUSTED_ATTEMPTS`` consecutive
+        # adjudications WITHOUT its evidence_fingerprint moving becomes
+        # ``gap = evidence_exhausted`` — an honest known gap, deliberately NOT a
+        # refutation: it must surface in the report's Known Gaps and is excluded
+        # from every future pending set / chunk hint. Any real ticket (genuinely
+        # new evidence) clears the gap again. ──
+        exhausted_newly: list[str] = []
+
+        def _stamp(project: dict, extras: dict):
+            g = self._graph_from_extras(extras)
+            changed = False
+            for cid in claim_ids:
+                node = next(
+                    (n for n in g["nodes"]
+                     if isinstance(n, dict) and n.get("id") == cid and n.get("type") == "Claim"),
+                    None,
+                )
+                if node is None:
+                    continue
+                pairs = verdicts.get(cid) or {}
+                if any(v in ("supports", "contradicts") for v in pairs.values()):
+                    # Substantive support/contradiction: the watch resets, and a
+                    # previously exhausted gap is revived by real evidence.
+                    if (
+                        node.pop("_adj_streak", None) is not None
+                        or node.pop("_adj_fp", None) is not None
+                    ):
+                        changed = True
+                    gap = node.get("gap")
+                    if isinstance(gap, dict) and gap.get("status") == "evidence_exhausted":
+                        node.pop("gap", None)
+                        changed = True
+                    continue
+                fp_now = evidence_fingerprint(g, cid)
+                prev = node.get("_adj_streak")
+                prev = prev if isinstance(prev, int) else 0
+                streak = prev + 1 if node.get("_adj_fp") == fp_now else 1
+                node["_adj_streak"] = streak
+                node["_adj_fp"] = fp_now
+                changed = True
+                gap = node.get("gap")
+                if (
+                    streak >= EXHAUSTED_ATTEMPTS
+                    and not (isinstance(gap, dict) and gap.get("status"))
+                ):
+                    node["gap"] = {"status": "evidence_exhausted", "attempts": streak}
+                    exhausted_newly.append(cid)
+                    logger.info(
+                        "adjudicate.exhausted claim=%s attempts=%d — terminal known gap",
+                        cid, streak,
+                    )
+            return None if changed else False
+
+        commit = None
+        if items:
+            commit = self.verify_batch(
+                owner_id, project_id, batch=items, server_authored=True
+            )
+        self.atomic_update_project(
+            owner_id, project_id, _stamp, extra_files=["graph.json"]
+        )
+        exhausted_hint = (
+            " Newly exhausted (report as Known Gaps, never re-adjudicate or patch): "
+            + ", ".join(exhausted_newly)
+            if exhausted_newly else ""
+        )
         if not items:
             return {
                 "status": "no_verdicts",
@@ -4687,12 +4862,11 @@ class ResearchService:
                 "skipped_sources": skipped_sources,
                 "dropped_rows": dropped_rows,
                 "per_claim": per_claim,
+                "exhausted_claims": exhausted_newly,
                 "hint": "the adjudicator related none of the fetched sources to any "
-                        "claim — find better sources or record the gap and move on",
+                        "claim — find better sources or record the gap and move on."
+                        + exhausted_hint,
             }
-        commit = self.verify_batch(
-            owner_id, project_id, batch=items, server_authored=True
-        )
         return {
             "status": "ok",
             "batches": len(batches),
@@ -4702,7 +4876,13 @@ class ResearchService:
             "dropped_rows": dropped_rows,
             "no_verdict_claims": no_verdict_claims,
             "per_claim": per_claim,
+            "exhausted_claims": exhausted_newly,
             "commit": commit,
+            "hint": (
+                "Report any exhausted claim under Known Gaps — insufficient evidence "
+                "is not refutation." + exhausted_hint
+                if exhausted_newly else None
+            ),
         }
 
     async def review_draft(
@@ -4719,8 +4899,10 @@ class ResearchService:
 
         1. load the latest artifact version and every Claim node from the graph
            (required context, bounded by ``REVIEW_BUDGET_TOKENS``);
-        2. ONE streaming LLM call over the WHOLE draft (thinking stays ON — this is
-           editorial reasoning, unlike the id-only adjudication). The reply is ONLY
+        2. ONE streaming LLM call over the WHOLE draft (thinking OFF — Run-13
+           measured a 453 s prefill tax on the full-draft prompt; the 46-row patch
+           output came from the draft+graph context, not hidden reasoning). The
+           reply is ONLY
            ``{"changes": [{file,target,expected_old,change}, ...]}`` — no prose, no
            document echo;
         3. Python PRE-CHECKS every row (strict 4-key schema; unique-match iron rule:
@@ -4733,6 +4915,20 @@ class ResearchService:
            the exact rejects.
         """
         # ── 1. latest version + claim graph (all inputs server-side) ──
+        # T3 force-bind: once the run has a primary report, REVIEW never touches
+        # another tree — a mismatched guess is rebound (warned + reported), so a
+        # stale cross-edition artifact can no longer be reviewed by accident.
+        _proj = self._load_project(owner_id, project_id)
+        _primary = _proj.get("primary_report_artifact_id")
+        artifact_rebound: str | None = None
+        if _primary and artifact_id != _primary:
+            logger.warning(
+                "review.artifact_rebind: artifact_id=%r rebound to "
+                "primary_report_artifact_id=%r (task %s)",
+                artifact_id, _primary, project_id,
+            )
+            artifact_rebound = artifact_id
+            artifact_id = _primary
         artifact_dir = self._artifact_dir(owner_id, project_id, artifact_id)
         versions = sorted(
             (int(p.name[1:]) for p in artifact_dir.glob("v*") if p.name[1:].isdigit())
@@ -4763,7 +4959,7 @@ class ResearchService:
             if isinstance(n, dict) and n.get("type") == "Claim" and n.get("id")
         ]
 
-        prompt = _review_prompt(claims, draft)
+        prompt = _review_prompt(claims, draft, artifact_id)
         est_tokens = len(prompt) // _ADJ_CHARS_PER_TOKEN
         if est_tokens > REVIEW_BUDGET_TOKENS:
             raise ValueError(
@@ -4776,7 +4972,7 @@ class ResearchService:
         llm_calls = 0
         t0 = time.perf_counter()
         raw = await _adjudication_llm_complete(
-            prompt, _REVIEW_SYSTEM_PROMPT, enable_thinking=True
+            prompt, _REVIEW_SYSTEM_PROMPT, enable_thinking=False
         )
         llm_calls += 1
         t_parse = time.perf_counter()
@@ -4788,7 +4984,7 @@ class ResearchService:
                 + f"\n\nYour previous reply failed to parse ({exc}). "
                   "Reply with ONLY the JSON object described above.",
                 _REVIEW_SYSTEM_PROMPT,
-                enable_thinking=True,
+                enable_thinking=False,
             )
             llm_calls += 1
             try:
@@ -4810,8 +5006,18 @@ class ResearchService:
         rejects: list[dict] = []
         for i, row in enumerate(changes):
             if row["file"] != artifact_id:
-                rejects.append({"i": i, "reason": f"file '{row['file']}' is not '{artifact_id}'"})
-                continue
+                # Compat fallback: the model may still echo the contract's generic
+                # word "draft". Map it onto the current base artifact, but never
+                # silently — the prompt was supposed to carry the real id.
+                if row["file"] == "draft":
+                    logger.warning(
+                        "review.placeholder_drift prompt-placeholder-drift: "
+                        "change[%d] file='draft' mapped to artifact_id=%r",
+                        i, artifact_id,
+                    )
+                else:
+                    rejects.append({"i": i, "reason": f"file '{row['file']}' is not '{artifact_id}'"})
+                    continue
             staged, reason = _apply_review_change(staged, row)
             if reason is not None:
                 rejects.append({
@@ -4828,7 +5034,9 @@ class ResearchService:
             )
             raise RuntimeError(
                 f"review_draft: patch rejected ({len(rejects)}/{len(changes)} rows failed) "
-                "— no version was created; " + "; ".join(
+                "— no version was created "
+                + (f"(artifact_id rebound to primary {_primary!r}) " if artifact_rebound else "")
+                + "; ".join(
                     f"change[{r['i']}]: {r['reason']}" for r in rejects[:5]
                 )
             )
@@ -4845,6 +5053,7 @@ class ResearchService:
         return {
             "status": "ok",
             "artifact_id": artifact_id,
+            "rebound_from": artifact_rebound,
             "base_version": base_version,
             "new_version": new_version,
             "llm_calls": llm_calls,

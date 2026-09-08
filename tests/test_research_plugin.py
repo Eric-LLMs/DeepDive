@@ -1567,9 +1567,10 @@ class TestRunOutputLayout:
         assert out_id == promoted["drive_asset_id"]
         assert await env.drive.read_text(USER, uuid.UUID(out_id)) == "# final v1"
         # The temp working copy is intact — promotion never moves/renames it (red line 2).
-        # (The mirror keeps the raw artifact id + ``.md``, so ``draft.md`` -> ``draft.md.md``.)
+        # (T1: the mirror stems the id first, so ``draft.md`` -> ``draft.md``, never
+        # the old ``draft.md.md`` double suffix.)
         assert {a["name"] for a in await self._files_in(env, f"{cloud_root}/temp/v1")} == {
-            "draft.md.md"
+            "draft.md"
         }
 
         # Re-promote without changes is a record-level no-op (no second _v1 file).
@@ -1604,14 +1605,14 @@ class TestRunOutputLayout:
 
         outs = {a["name"]: a for a in await self._files_in(env, f"{cloud_root}/outputs")}
         # Beyond the promoted per-version finals, the ``report`` artifact also auto-mirrors
-        # into ``outputs/<task name>.md``:
-        # run 1 creates it, run 2's fresh report is a new file (same-run rewrites would
-        # update in place instead).
+        # into ``outputs/<task name>_v{run}.md`` (T2: the version in the FILENAME keeps the
+        # mirror traceable to the run's temp/v{N} folder — one file per run, in place
+        # updates for same-run rewrites).
         assert set(outs) == {
             "report_v1.md",
             "report_v2.md",
-            "task.md",
-            "task(1).md",
+            "task_v1.md",
+            "task_v2.md",
         }
         # v1 is never overwritten or reused — both versioned finals coexist with their bytes.
         assert await env.drive.read_text(USER, uuid.UUID(outs["report_v1.md"]["id"])) == "# final v1"
@@ -2374,13 +2375,15 @@ class TestGetStateClaimsDigest:
         claims = state["claims"]
         assert [c["id"] for c in claims] == ["C1", "C2"]  # only Claims, in graph order
         # P3-1 additive contract: evidence_fingerprint + pending join the digest;
-        # P3-4 adds the derived hint fields last_verdict + chunk_hint.
+        # P3-4 adds the derived hint fields last_verdict + chunk_hint;
+        # P3-10 adds gap (terminal status, None until a claim is evidence_exhausted).
         assert all(set(c) == {
             "id", "label", "anchored", "evidence_fingerprint", "pending",
-            "last_verdict", "chunk_hint",
+            "last_verdict", "chunk_hint", "gap",
         } for c in claims)
         assert all(c["pending"] is True for c in claims)  # no _verify_fps baseline yet
         assert all(c["last_verdict"] is None for c in claims)  # nothing committed yet
+        assert all(c["gap"] is None for c in claims)  # no terminal gaps recorded
         # both pending claims share one hint chunk (they fit the default budget)
         assert claims[0]["chunk_hint"] == claims[1]["chunk_hint"] is not None
         assert claims[0]["label"] == long_label[:80]  # display cap, not the identity

@@ -522,7 +522,9 @@ def auto_turn_prompt(
         "(3) One compact per-claim verdict summary comes back (supports/contradicts/"
         "insufficient + the URLs used per claim); insufficient / unrelated pairs add "
         "no ticket edge. If a claim got NO verdict, gather better source URLs and "
-        "adjudicate again with just that claim_id, or note the gap and move on. "
+        "adjudicate again with just that claim_id — at most once more: after two dry "
+        "rounds the server locks the claim as evidence_exhausted, a KNOWN GAP to "
+        "report in the draft (never a refutation), not pending work. "
         "Citations and strength belong on the claim BEFORE you adjudicate (set them "
         "at record_node); NEVER patch the graph after a commit. Single-claim \"verify\" "
         "and raw \"verify_batch\" are manual-path only — do not use them in EVIDENCE. "
@@ -537,7 +539,9 @@ def auto_turn_prompt(
         "WRITE, before you quote or cite a fetched source, read its full draft back with "
         "research_scrape action \"read\" (canonical_url from fetch) so the citation is grounded "
         "in the whole page, not just the snippet. In REVIEW, close the WHOLE stage in ONE "
-        "research_artifact action \"review_draft\" call (artifact_id = the report draft): "
+        "research_artifact action \"review_draft\" call (artifact_id = the "
+        "primary_report_artifact_id reported by research_state get_state — REVIEW and "
+        "PUBLISH force-bind to that id, any other guess is rebound server-side): "
         "server-side it feeds the full draft + claim graph to one LLM pass, receives only "
         "{\"changes\": [...]} correction rows, pre-checks every anchor (unique-match iron "
         "rule), applies them in staging and atomically commits the corrected version — you "
@@ -554,8 +558,11 @@ def auto_turn_prompt(
         "Check gates when a transition needs one (research_gate action check); if a gate "
         "fails, first use explain_failure and actually fix the underlying work; request a "
         f"human override only if a real human decision is required.{push}\n"
-        "Keep going to PUBLISH: write the report artifact and promote the final report to the "
-        "drive. When you write it, read the project diagnostics (research_project snapshot) and "
+        "Keep going to PUBLISH: write the report artifact (the first report-named write "
+        "becomes the primary_report_artifact_id) and promote THAT id — promote_to_drive "
+        "binds to the primary's latest version, and a run whose primary report stays "
+        "un-promoted cannot settle as finished. When you write it, read the project "
+        "diagnostics (research_project snapshot) and "
         "close the report with a 'Known gaps / unverified items' list — one entry per recorded "
         "diagnostic (gate + stage + the failed checks), each labeled unverified, so the user "
         "sees exactly which stage could not be sourced and why.\n"
@@ -985,6 +992,22 @@ class ResearchRunDriver:
             node_type = node.get("type") or "node"
             node_counts[node_type] = node_counts.get(node_type, 0) + 1
         artifacts = service.list_artifacts(owner_id, task_id)
+        # T3-4 hard gate: "reached PUBLISH" must mean a published object. While the
+        # task's primary report exists but was never promoted, auto-settle may NOT
+        # terminalize the run as FINISHED — return None stops the caller with the
+        # graded outcome instead (never a silent success).
+        _primary = project.get("primary_report_artifact_id")
+        if _primary:
+            _rec = next(
+                (a for a in artifacts if a["artifact_id"] == _primary), None
+            )
+            if _rec is None or _rec.get("status") != "PROMOTED":
+                logger.warning(
+                    "settle.refused task %s: primary report '%s' not promoted "
+                    "(status=%s) — stopping as graded, not marking success",
+                    task_id, _primary, (_rec or {}).get("status"),
+                )
+                return None
         content = build_settle_report(
             task_name=project.get("name", task_id),
             mode=project.get("execution_mode", "strict"),
