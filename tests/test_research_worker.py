@@ -195,8 +195,9 @@ class TestCrossStepSchemaStatics:
         # Spot-check the deep tree survived untouched (not a name-stub projection).
         ev = next(t["function"] for t in step2 if t["function"]["name"] == "research_evidence")
         assert ev["parameters"]["properties"]["action"]["enum"] == [
-            "record_node", "mutate_node", "invalidate_downstream", "verify",
-            "verify_batch",  # P3-1 additive contract
+            "record_node", "mutate_node", "invalidate_downstream",
+            "adjudicate",  # P3-8: the atomic EVIDENCE closure
+            "verify", "verify_batch",  # P3-1 additive contract
         ]
         assert "link_edge" not in str(step2)  # hidden actions absent from the whole array
 

@@ -34,6 +34,7 @@ MUTATING_ACTIONS: dict[str, set[str]] = {
         "link_edge",
         "mutate_node",
         "invalidate_downstream",
+        "adjudicate",  # P3-8: commits through the same graph transaction as verify_batch
         "verify",
         "verify_batch",  # P3-1: same user-visible graph commit as verify -> same wake-up
     },

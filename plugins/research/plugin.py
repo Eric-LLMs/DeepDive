@@ -53,7 +53,10 @@ from agent.plugins.base import Plugin
 from agent.tools.definition import ToolOutput, define_tool
 from agent.tools.tool_permissions import ToolPermission
 from core.application.drive_service import DriveError
-from core.infrastructure.request_context import get_request_user_id
+from core.infrastructure.request_context import (
+    get_request_llm_channel,
+    get_request_user_id,
+)
 from core.infrastructure.web_fetch import (
     DEFAULT_TEXT_TARGET,
     MIN_FETCH_TEXT_CHARS,
@@ -283,6 +286,100 @@ FETCH_BATCH_CHAR_CAP = FETCH_MAX_URLS * FETCH_MAX_PAGE_CHARS  # 150_000
 # window returns the complete page (no loss), while the explicit offset/max_chars
 # contract keeps the return bounded if the store ceiling ever grows.
 READ_DEFAULT_WINDOW_CHARS = 4_000
+
+# ── P3-8 EVIDENCE atomic closure (single-LLM-first, budget-adaptive splitting) ─
+# The whole fetch -> representative-chunk -> batched adjudication -> ONE commit
+# pipeline runs inside ``ResearchService.adjudicate_evidence``: the outer agent
+# triggers exactly ONE EVIDENCE action and has ZERO awareness of any internal
+# batch split. Budget sizing sits in the P3-4 DEFAULT_BUDGET_TOKENS band
+# (4000-6000): one representative chunk per source (never a whole page, never a
+# per-source LLM summary — extraction is pure Python slicing of the cleaned draft).
+ADJUDICATION_BUDGET_TOKENS = 5_000
+ADJUDICATION_SNIPPET_CHARS = 900
+# Server-authored safety bound on one adjudication commit (the model-facing
+# verify_batch cap stays MAX_CHUNK_CLAIMS — this only bounds the trusted path).
+ADJUDICATION_MAX_CLAIMS = 64
+_ADJ_CHARS_PER_TOKEN = 4
+# Verdicts the adjudicator may emit; "insufficient" is a relevance-only answer —
+# it maps onto verify's neutral semantics (annotation, never a ticket edge, E2).
+_ADJ_VERDICTS = {"supports", "contradicts", "insufficient"}
+
+# Adjudicator LLM seam. Production lazy-builds the shared OpenAILLM client and
+# rides the per-request channel (worker research_drive / host /chat set it via
+# set_request_llm_channel — the same mechanism as agent_factory._ChannelAwareLLM,
+# replicated here so the plugin never imports apps/*). Tests replace
+# ``_ADJ_LLM_CALL`` with a stub; nothing hits the network offline.
+_ADJ_LLM_CALL: Any | None = None
+_LLM_SINGLETON: Any | None = None
+
+
+async def _adjudication_llm_complete(prompt: str, system_prompt: str) -> str:
+    """One channel-aware completion for the adjudication prompt."""
+    if _ADJ_LLM_CALL is not None:  # test seam
+        return await _ADJ_LLM_CALL(prompt, system_prompt)
+    from core.infrastructure.llm import OpenAILLM
+
+    global _LLM_SINGLETON
+    if _LLM_SINGLETON is None:
+        _LLM_SINGLETON = OpenAILLM()
+    channel = get_request_llm_channel()
+    if channel is not None:
+        model, base_url, api_key = channel
+        return await _LLM_SINGLETON.complete(
+            prompt, system_prompt, model=model or None, base_url=base_url, api_key=api_key
+        )
+    return await _LLM_SINGLETON.complete(prompt, system_prompt)
+
+
+_ADJ_SYSTEM_PROMPT = (
+    "You are the evidence adjudicator for a research claim graph. For each source, "
+    "decide which claims it is topically related to and what it does to each claim. "
+    "Reply with a single JSON object only."
+)
+
+
+def _adjudication_prompt(
+    claims: list[tuple[str, str]], sources: list[tuple[str, str]]
+) -> str:
+    """The locked single-pass adjudication contract (explicit ids, never positions)."""
+    claim_lines = "\n".join(
+        json.dumps({"claim_id": cid, "statement": stmt}, ensure_ascii=False)
+        for cid, stmt in claims
+    )
+    source_lines = "\n".join(
+        json.dumps({"source_id": sid, "snippet": snip}, ensure_ascii=False)
+        for sid, snip in sources
+    )
+    return (
+        "Adjudicate every (source, claim) pair below in one pass.\n\n"
+        "CLAIMS:\n" + claim_lines + "\n\n"
+        "SOURCES (one representative chunk per fetched page):\n" + source_lines + "\n\n"
+        'Return ONLY this JSON object: {"results": [{"source_id": "...", '
+        '"claim_id": "...", "verdict": "supports" | "contradicts" | "insufficient"}]}\n'
+        "Rules:\n"
+        '- "supports": the source provides evidence FOR the claim; "contradicts": AGAINST '
+        'it; "insufficient": topically related but not decisive either way.\n'
+        "- Include a pair ONLY when the source is topically related to the claim; omit "
+        "every unrelated pair.\n"
+        "- Copy source_id and claim_id EXACTLY as given; never invent, renumber or "
+        "shorten ids.\n"
+        "- Output the raw JSON object only — no prose, no markdown fences."
+    )
+
+
+def _parse_adjudication_rows(raw: str) -> list:
+    """Parse one adjudicator reply into result rows (tolerates code fences); raises
+    ``ValueError`` on anything that is not ``{"results": [...]}``."""
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("no JSON object found in the reply")
+    try:
+        doc = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON: {exc}") from exc
+    if not isinstance(doc, dict) or not isinstance(doc.get("results"), list):
+        raise ValueError('reply must be an object shaped like {"results": [...]}')
+    return doc["results"]
 
 # ── P3-6 per-turn asset-merge buffer (process-local, memory-only) ────────────
 # ``_merge_cloud_assets`` no longer commits per call: additions accumulate here keyed by
@@ -4016,6 +4113,7 @@ class ResearchService:
         project_id: str,
         *,
         batch: list[dict],
+        server_authored: bool = False,
     ) -> dict:
         """Commit a batch of per-claim verifications in ONE atomic transaction (P3-1).
 
@@ -4047,10 +4145,16 @@ class ResearchService:
         ``citations`` JSON array inside an item is un-wrapped ONCE before those checks
         (audited via a per-item ``coerced`` tag); unparseable or wrong-container inputs
         reject exactly as before.
+
+        ``server_authored`` (internal, P3-8) lifts ONLY the ≤8 item cap: the cap bounds
+        a model-authored payload; a batch built by ``adjudicate_evidence`` is
+        server-bounded already and must still commit in ONE transaction. Every other
+        invariant (validation, delta-pending, fingerprint, single CAS commit) is
+        identical on both paths.
         """
         if not isinstance(batch, list) or not batch:
             raise ValueError("verify_batch needs 'batch' as a non-empty list of items")
-        if len(batch) > self._VERIFY_BATCH_MAX:
+        if not server_authored and len(batch) > self._VERIFY_BATCH_MAX:
             raise ValueError(
                 f"verify_batch accepts at most {self._VERIFY_BATCH_MAX} items per call "
                 f"(got {len(batch)}); split the claims into batches of ≤{self._VERIFY_BATCH_MAX}"
@@ -4187,6 +4291,251 @@ class ResearchService:
             "revision_after": project.get("project_revision"),
         }
 
+    async def adjudicate_evidence(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        urls: list[str],
+        claim_ids: list[str] | None = None,
+    ) -> dict:
+        """ONE server-side EVIDENCE closure: fetch → chunks → adjudicate → one commit.
+
+        The P3-8 atomic action that replaces the model-driven fetch/adjudicate/
+        verify_batch retail chain. The outer agent triggers exactly ONE call; every
+        step runs inside this plugin:
+
+        1. fetch every source through :meth:`fetch_save_batch` (the P3-5 cap-5 is an
+           internal loop detail — zero LLM round-trips per fetch batch);
+        2. extract ONE deterministic representative chunk per page by Python slicing
+           of the cleaned draft (per-source ``ADJUDICATION_SNIPPET_CHARS`` cap — no
+           LLM summarisation anywhere in stage one);
+        3. size the payload against ``ADJUDICATION_BUDGET_TOKENS`` and default to a
+           SINGLE batch LLM call; greedy source-splitting adds a call ONLY on budget
+           overflow (claims are the fixed per-batch context);
+        4. collect and validate every reply (explicit source/claim ids — a
+           hallucinated id is dropped, never trusted; ``insufficient`` is a
+           relevance-only answer mapping onto verify's neutral no-ticket semantics);
+        5. reconcile in Python memory and commit ALL verdicts through exactly ONE
+           ``verify_batch(server_authored=True)`` — the unchanged P3-1 no-LLM commit
+           core (constraint 1 preserved: the LLM here PREPARES findings; the commit
+           stays deterministic CAS).
+
+        The agent has ZERO awareness of any split: it sees one action and a compact
+        per-claim verdict summary back.
+        """
+        # ── 1. normalize the requested source set (canonical-dedup, caller order) ──
+        cu_list: list[str] = []
+        seen_cu: set[str] = set()
+        for u in urls or []:
+            if not isinstance(u, str) or not u.strip():
+                continue
+            cu = canonicalize(u.strip())
+            if cu and cu not in seen_cu:
+                seen_cu.add(cu)
+                cu_list.append(cu)
+        if not cu_list:
+            raise ValueError("adjudicate needs a non-empty 'urls' list of source pages")
+
+        # ── 2. resolve the claim set from the graph (server-side; statements the
+        # model sent carry no authority here) ──
+        graph = self._load_json(
+            self._project_dir(owner_id, project_id) / "graph.json",
+            {"nodes": [], "edges": []},
+        )
+        claim_nodes = {
+            n.get("id"): (n.get("statement") or n.get("label") or n.get("id"))
+            for n in graph.get("nodes", [])
+            if isinstance(n, dict) and n.get("type") == "Claim" and n.get("id")
+        }
+        if claim_ids:
+            wanted = [str(c).strip() for c in claim_ids if str(c).strip()]
+            missing = sorted({c for c in wanted if c not in claim_nodes})
+            if missing:
+                raise ValueError(
+                    f"adjudicate: unknown claim id(s) {missing} — claims must be recorded "
+                    "first with research_evidence record_node (type 'Claim')"
+                )
+            claim_ids = sorted(set(wanted))
+        else:
+            claim_ids = sorted(claim_nodes)
+        if not claim_ids:
+            raise ValueError("adjudicate needs at least one recorded Claim node")
+        if len(claim_ids) > ADJUDICATION_MAX_CLAIMS:
+            raise ValueError(
+                f"adjudicate covers at most {ADJUDICATION_MAX_CLAIMS} claims per call "
+                f"(got {len(claim_ids)})"
+            )
+
+        # ── 3. fetch every source through the existing batch machinery ──
+        skipped_sources: list[dict] = []
+        snippets: dict[str, str] = {}  # canonical_url -> representative chunk
+        for i in range(0, len(cu_list), FETCH_MAX_URLS):
+            views = await self.fetch_save_batch(
+                owner_id, project_id, urls=cu_list[i : i + FETCH_MAX_URLS]
+            )
+            for v in views:
+                cu = v.get("canonical_url") or ""
+                if not cu:
+                    continue
+                if v.get("already_fetched"):
+                    # P3-7A ref view carries no text — re-read one bounded window from
+                    # the run's ledger-saved draft (drive read, never a network re-fetch).
+                    try:
+                        page = await self.read_fetch(
+                            owner_id, project_id, canonical_url=cu,
+                            offset=0, max_chars=ADJUDICATION_SNIPPET_CHARS,
+                        )
+                    except ValueError as exc:
+                        skipped_sources.append(
+                            {"url": cu, "reason": f"stored draft unreadable: {exc}"}
+                        )
+                        continue
+                    chunk = (page.get("content") or "").strip()
+                elif v.get("status") == "ok" and v.get("saved"):
+                    chunk = (v.get("text") or "").strip()
+                else:
+                    skipped_sources.append({
+                        "url": cu,
+                        "reason": str(
+                            v.get("reason")
+                            or (v.get("error") or {}).get("message")
+                            or f"unusable fetch (status={v.get('status')}, "
+                               f"content_status={v.get('content_status')})"
+                        ),
+                    })
+                    continue
+                chunk = chunk[:ADJUDICATION_SNIPPET_CHARS]
+                if chunk:
+                    snippets[cu] = chunk
+                else:
+                    skipped_sources.append(
+                        {"url": cu, "reason": "empty representative chunk"}
+                    )
+        if not snippets:
+            return {
+                "status": "no_sources",
+                "claims": len(claim_ids),
+                "skipped_sources": skipped_sources,
+                "llm_calls": 0,
+                "hint": "no fetched page produced usable text — widen the source "
+                        "set or note the gap and move on",
+            }
+
+        # ── 4. budget-driven greedy split over SOURCES (claims ride every batch as
+        # the fixed context): default ONE batch; overflow is the only split axis ──
+        source_cus = sorted(snippets)  # deterministic order (canonical url)
+        sid_of = {cu: f"S{i + 1}" for i, cu in enumerate(source_cus)}
+        claims_cost = sum(
+            len(claim_nodes[c]) // _ADJ_CHARS_PER_TOKEN + 20 for c in claim_ids
+        )
+        batches: list[list[str]] = []
+        current: list[str] = []
+        current_cost = 0
+        for cu in source_cus:
+            cost = len(snippets[cu]) // _ADJ_CHARS_PER_TOKEN + 10
+            if current and claims_cost + current_cost + cost > ADJUDICATION_BUDGET_TOKENS:
+                batches.append(current)
+                current, current_cost = [], 0
+            current.append(cu)
+            current_cost += cost
+        if current:
+            batches.append(current)
+
+        # ── 5. one single-pass relevance+adjudication LLM call per batch ──
+        verdicts: dict[str, dict[str, str]] = {}  # claim_id -> {canonical_url: verdict}
+        dropped_rows = 0
+        llm_calls = 0
+        claim_payload = [(c, claim_nodes[c]) for c in claim_ids]
+        for batch_cus in batches:
+            source_payload = [(sid_of[cu], snippets[cu]) for cu in batch_cus]
+            prompt = _adjudication_prompt(claim_payload, source_payload)
+            raw = await _adjudication_llm_complete(prompt, _ADJ_SYSTEM_PROMPT)
+            llm_calls += 1
+            try:
+                rows = _parse_adjudication_rows(raw)
+            except ValueError as exc:
+                # ONE format repair call is allowed: by design only a budget split
+                # multiplies LLM calls; a malformed reply is fixed, not fanned out.
+                raw = await _adjudication_llm_complete(
+                    prompt
+                    + f"\n\nYour previous reply failed to parse ({exc}). "
+                      "Reply with ONLY the JSON object described above.",
+                    _ADJ_SYSTEM_PROMPT,
+                )
+                llm_calls += 1
+                try:
+                    rows = _parse_adjudication_rows(raw)
+                except ValueError as exc2:
+                    raise RuntimeError(
+                        "adjudication failed: the model returned no parseable JSON "
+                        f"twice ({exc}; {exc2})"
+                    ) from exc2
+            cu_of_sid = {sid_of[cu]: cu for cu in batch_cus}
+            for r in rows:
+                if not isinstance(r, dict):
+                    dropped_rows += 1
+                    continue
+                sid = r.get("source_id")
+                cid = r.get("claim_id")
+                verdict = r.get("verdict")
+                verdict = verdict.strip().lower() if isinstance(verdict, str) else ""
+                if (
+                    not isinstance(sid, str) or sid not in cu_of_sid
+                    or not isinstance(cid, str) or cid not in claim_nodes
+                    or verdict not in _ADJ_VERDICTS
+                ):
+                    dropped_rows += 1  # a hallucinated id never reaches the graph
+                    continue
+                verdicts.setdefault(cid, {}).setdefault(cu_of_sid[sid], verdict)
+
+        # ── 6. merge every batch back into per-claim findings; ONE atomic commit ──
+        items: list[dict] = []
+        per_claim: list[dict] = []
+        no_verdict_claims: list[str] = []
+        for cid in claim_ids:
+            pairs = verdicts.get(cid) or {}
+            per_claim.append({
+                "claim_id": cid,
+                "supports": sorted(u for u, v in pairs.items() if v == "supports"),
+                "contradicts": sorted(u for u, v in pairs.items() if v == "contradicts"),
+                "insufficient": sorted(u for u, v in pairs.items() if v == "insufficient"),
+            })
+            findings = [
+                {"url": cu, "verdict": "neutral" if v == "insufficient" else v}
+                for cu, v in sorted(pairs.items())
+            ]
+            if findings:
+                items.append({"item_id": cid, "claim": {"id": cid}, "findings": findings})
+            else:
+                no_verdict_claims.append(cid)
+        if not items:
+            return {
+                "status": "no_verdicts",
+                "batches": len(batches),
+                "llm_calls": llm_calls,
+                "sources_used": len(snippets),
+                "skipped_sources": skipped_sources,
+                "dropped_rows": dropped_rows,
+                "per_claim": per_claim,
+                "hint": "the adjudicator related none of the fetched sources to any "
+                        "claim — find better sources or record the gap and move on",
+            }
+        commit = self.verify_batch(
+            owner_id, project_id, batch=items, server_authored=True
+        )
+        return {
+            "status": "ok",
+            "batches": len(batches),
+            "llm_calls": llm_calls,
+            "sources_used": len(snippets),
+            "skipped_sources": skipped_sources,
+            "dropped_rows": dropped_rows,
+            "no_verdict_claims": no_verdict_claims,
+            "per_claim": per_claim,
+            "commit": commit,
+        }
+
     def record_execution(
         self,
         owner_id: uuid.UUID,
@@ -4311,7 +4660,10 @@ _COMMON_OBJ = {
 _PROJECT_ACTIONS = ["create", "resume", "snapshot", "archive"]
 _ARTIFACT_ACTIONS = ["write_scratch", "promote_to_drive", "read", "create_version", "diff"]
 _STATE_ACTIONS = ["get_state", "transition_stage", "get_handoff"]
-_EVIDENCE_ACTIONS = ["record_node", "mutate_node", "invalidate_downstream", "verify", "verify_batch"]
+_EVIDENCE_ACTIONS = [
+    "record_node", "mutate_node", "invalidate_downstream",
+    "adjudicate", "verify", "verify_batch",
+]
 _GATE_ACTIONS = ["check", "explain_failure", "request_override", "resolve_override"]
 _RUN_ACTIONS = ["record_execution", "finish_execution", "execute_sandbox_script"]
 _SCRAPE_ACTIONS = ["save_scrape", "fetch", "read"]
@@ -4548,6 +4900,12 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                 user(), _project_id(args, "research_evidence", action),
                 node_id=_require(args, "node_id", "research_evidence", action),
             )
+        if action == "adjudicate":
+            return await svc.adjudicate_evidence(
+                user(), _project_id(args, "research_evidence", action),
+                urls=_require(args, "urls", "research_evidence", action),
+                claim_ids=args.get("claim_ids"),
+            )
         if action == "verify":
             return svc.ingest_evidence(
                 user(), _project_id(args, "research_evidence", action),
@@ -4756,10 +5114,18 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
     research_evidence_tool = _make_tool(
         name="research_evidence",
         description=(
-            "Evidence-graph writes, batch verification, and staleness cascade. "
+            "Evidence-graph writes, the atomic EVIDENCE closure, batch verification, and "
+            "staleness cascade. "
             "Supported actions: record_node (insert/update a graph node), mutate_node (patch "
             "a recorded node — mutating an upstream node STALE-cascades to its epistemic "
-            "dependents), invalidate_downstream (mark a node's dependents INVALID), verify "
+            "dependents), invalidate_downstream (mark a node's dependents INVALID), "
+            "adjudicate (the whole EVIDENCE batch pipeline in ONE call — pass every "
+            "candidate source 'urls' for the claim set; the server fetches all pages, "
+            "extracts one deterministic representative chunk each, adjudicates "
+            "relevance+verdict in one batched LLM pass (splitting internally only on "
+            "token-budget overflow), and commits EVERYTHING in ONE atomic verify_batch — "
+            "you never fetch, judge or commit the chunk by hand, and you never see the "
+            "split), verify "
             "(batch-EVIDENCE ingest for ONE claim), verify_batch (the same ingest rules for "
             "UP TO 8 claims committed in ONE atomic transaction — prefer it over one verify "
             "per claim; claims whose stored evidence fingerprint is unchanged and already "
@@ -4800,6 +5166,21 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                     "never pre-encode it as a JSON string. The service checks each URL "
                     "against this run's server-side fetch ledger — your content_status/"
                     "length assertions carry no authority.",
+                },
+                "urls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "adjudicate: ALL candidate source URLs for the claim "
+                    "set (any count — the server batches the fetches internally). Each "
+                    "page is fetched once this run, cleaned, and adjudicated from one "
+                    "representative chunk.",
+                },
+                "claim_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "adjudicate: optional explicit subset of already-"
+                    "recorded claim ids to adjudicate (default: every recorded Claim "
+                    "node). Use the pending ids from research_state get_state's digest.",
                 },
                 "batch": {
                     "type": "array",
@@ -4891,7 +5272,8 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "parameter error, duplicate URLs in one batch are rejected too; a URL this "
             "run already fetched comes back as an 'already_fetched' reference WITHOUT "
             "text (never re-delivered). Batch a chunk's sources in ONE fetch call, then "
-            "research_evidence verify_batch; a URL whose fetch failed can never be "
+            "research_evidence action \"adjudicate\" to close the loop (or verify_batch "
+            "for a hand-authored batch); a URL whose fetch failed can never be "
             "verified. 'read' addresses only pages this run fetched (canonical_url / "
             "asset_id / name) and returns a bounded window (offset/max_chars)."
         ),

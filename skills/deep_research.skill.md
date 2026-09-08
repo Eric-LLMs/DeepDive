@@ -48,15 +48,16 @@ the at-a-glance map.
 | `research_project` | `create` · `resume` · `snapshot` · `archive` |
 | `research_artifact` | `write_scratch` · `promote_to_drive` · `read` · `create_version` · `diff` |
 | `research_state` | `get_state` · `get_handoff` · `transition_stage` |
-| `research_evidence` | `record_node` · `mutate_node` · `invalidate_downstream` · `verify` · `verify_batch` |
+| `research_evidence` | `record_node` · `mutate_node` · `invalidate_downstream` · `adjudicate` · `verify` · `verify_batch` |
 | `research_gate` | `check` · `explain_failure` · `request_override` · `resolve_override` |
 | `research_run` | `record_execution` · `finish_execution` · `execute_sandbox_script` |
 | `research_scrape` | `save_scrape` · `fetch` · `read` |
 
 Hard boundaries:
 
-- **No manual graph edges.** There is no link / edge / lineage action — `verify` /
-  `verify_batch` write Sources/Evidence nodes and claim edges themselves. Do not invent
+- **No manual graph edges.** There is no link / edge / lineage action — `adjudicate` /
+  `verify` / `verify_batch` write Sources/Evidence nodes and claim edges themselves. Do not
+  invent
   verbs like `list`, `get`,
   `status`, `show`, `inspect`, `query`, `add_node`, `lineage`, `transitions` — none exist.
 - **`bash` / `read_file` / `tool_search` do not exist in this workflow.** Never attempt
@@ -64,8 +65,10 @@ Hard boundaries:
   nothing to shell out to, and scratch files are read only through `research_scrape read` /
   `research_artifact read`.
 - **Batch per chunk, not per claim.** EVIDENCE runs the deterministic pipeline
-  `pending → one concurrent fetch → one adjudication round-trip → one verify_batch commit`
+  `pending → one research_evidence adjudicate call per chunk`
   (the EVIDENCE PROTOCOL in step 5) — never a per-claim fetch/verify/mutate retail chain.
+  The fetch, representative-chunk extraction, batched adjudication, and the single
+  verify_batch commit all happen server-side inside that one action.
   One `write_scratch` with the full text per artifact
   (it auto-versions — do not stream incremental writes).
 - **One `get_handoff` before each `transition_stage`**, and `ADVANCED` ends the turn —
@@ -100,66 +103,66 @@ Hard boundaries:
    question you will answer) and `scope.md` (what is in and out of bounds). Changing the
    question later needs an approval — so get it right here.
 
-5. **EVIDENCE — adjudicate in wholesale batches.** This stage is governed by a strict
-   operational protocol, not a suggestion. Work the pipeline
-   `get_state → pending claims → concurrent fetch → single adjudication → verify_batch`
+5. **EVIDENCE — close each chunk in ONE atomic action.** This stage is governed by a
+   strict operational protocol, not a suggestion. Work the pipeline
+   `get_state → pending claims → ONE research_evidence adjudicate call per chunk`
    exactly as written:
 
-   **EVIDENCE PROTOCOL (mandatory, 11 rules)**
+   **EVIDENCE PROTOCOL (mandatory, 10 rules)**
 
    1. **Pending first.** Start every EVIDENCE turn with `research_state get_state`: the
       `claims` digest marks each claim `pending` (true only when it has no valid
       committed verdict, or its evidence fingerprint moved since the last commit) and
       groups the pending ones by `chunk_hint`. The digest fields are hints for
       efficiency; the server re-checks the pending rule at commit time regardless.
-   2. **No pending evidence, no verify call.** If the digest lists no pending claims,
+   2. **No pending evidence, no adjudicate call.** If the digest lists no pending claims,
       do NOT call any `verify`-family action at all — finish the stage instead.
    3. **Reuse before you create.** A claim already in the digest keeps its exact `id`
       — `record_node` ONLY for claims not yet listed; never mint a shadow id for an
       existing claim. The `id` is the sole anchor; `label` is display-only.
-   4. **One fetch call per chunk.** Gather the candidate source URLs for the whole
-      chunk and fetch them in ONE `research_scrape` `action: "fetch"` call
-      (`urls: [≤5]`, unique per call, fetched concurrently server-side, each cleaned to
-      a `temp/vN/scrape/` draft plus a returned snippet with `canonical_url` and
-      `content_status`). A URL the run already fetched comes back as an
-      `already_fetched` reference WITHOUT text — reuse its ids instead of re-fetching.
-      Never one fetch per claim.
-   5. **One adjudication round-trip per chunk.** Judge every returned snippet of the
-      chunk in a single pass and produce the findings for ALL its claims together —
-      one LLM round-trip per batch, never one question per claim.
-   6. **`verify_batch` is the only commit verb.** Submit the chunk with
-      `research_evidence` `action: "verify_batch"`: up to 8 items
-      `[{item_id, claim: {id}, findings: [{url, verdict, facts?, excerpt?}],
-      citations?, strength?}]`, committed by a single writer in ONE atomic
-      `atomic_update_project` transaction (one revision bump). Single-claim `verify`
-      is legacy — do not use it in EVIDENCE.
-   7. **Never patch after committing.** Citations and strength ride as per-item
-      patches in the SAME `verify_batch` call. `mutate_node` after a verify is the
-      retired double-anchor chain and is forbidden; when you pass a `strength`, use
-      the canonical vocabulary `asserted | supported | confident | contested`.
-   8. **Never resubmit unchanged evidence.** An item whose committed evidence is
-      unchanged returns `skipped_unchanged` with zero writes — do not re-issue a
-      successfully committed item, and do not re-fetch pages the fetch cache already
-      holds.
-   9. **Item-level failure isolation.** A rejected item (structural error, unrecorded
-      claim) never invalidates the batch: retry ONLY the rejected `item_id`s in the
-      next call. Never re-run the whole batch because one item failed.
-   10. **Source-scoped failures are terminal for that source.** A 403, `empty`, or
-       `interstitial` source is dead for this run: do not retry it in-run and never
-       let one page stall or kill the task — note the gap and proceed with the other
-       sources. `search_social` signals the same contract with a `terminal_for_run`
-       item in its results: when you see it, stop querying that platform this run.
-   11. **Explicit ids, never positions.** Every batch item carries a unique
-       `item_id`; match results by `item_id` and claim `id`, never by array order or
-       label text.
+   4. **One `adjudicate` call is the whole chunk.** Submit
+      `research_evidence` `action: "adjudicate"` with `urls` = every candidate source
+      URL for the chunk (any count — the server batches the fetches itself) and
+      `claim_ids` = the chunk's pending ids. Server-side, in that ONE call: every page
+      is fetched and saved, ONE deterministic representative chunk per page is
+      extracted by Python (never an LLM summary), relevance+verdict are judged in a
+      single batched LLM pass (split into more passes ONLY if the token budget is
+      exceeded — invisible to you), and ALL verdicts commit in ONE atomic
+      `verify_batch` transaction. Do NOT call `research_scrape fetch` for
+      adjudication, do NOT judge snippets in the conversation, and do NOT hand-build
+      a `verify_batch` in EVIDENCE (`verify`/`verify_batch` stay for manual paths).
+   5. **The reply is a compact verdict summary.** `per_claim` lists each claim's
+      supports / contradicts / insufficient URLs, plus `skipped_sources` (per-URL
+      fetch failures), `dropped_rows` (invalid ids the model emitted — server-rejected)
+      and `no_verdict_claims` (no source related to them). `insufficient` is
+      relevance-only — it never creates a ticket edge.
+   6. **Citations and strength go on BEFORE you adjudicate.** A Claim must carry its
+      `citations` and canonical `strength` (`asserted | supported | confident |
+      contested`) at `record_node` time. Patching the graph after a commit is the
+      retired double-anchor chain and is forbidden.
+   7. **Never re-adjudicate committed evidence.** Claims whose committed evidence is
+      unchanged come back `skipped_unchanged` inside the commit with zero writes, and
+      pages the run already fetched are reused from the ledger, never re-fetched.
+   8. **Claim-level retry.** If `no_verdict_claims` names a claim (or the commit
+      rejects one), gather BETTER source URLs and call `adjudicate` again with just
+      that `claim_id` — never re-run the whole chunk for one claim.
+   9. **Source-scoped failures are terminal for that source.** A 403, `empty`, or
+      `interstitial` source is dead for this run: it appears under
+      `skipped_sources`; do not retry it in-run and never
+      let one page stall or kill the task — note the gap and proceed with the other
+      sources. `search_social` signals the same contract with a `terminal_for_run`
+      item in its results: when you see it, stop querying that platform this run.
+   10. **Explicit ids, never positions.** Match every result by `claim_id` and source
+       `url` / `canonical_url`, never by array order or label text.
 
-   Supporting semantics the service enforces: `verify_batch` anchors to already
+   Supporting semantics the service enforces: adjudication anchors to already
    recorded claim ids and never creates claims; a page supporting a claim gets
-   verdict `supports`, contradicting `contradicts`, genuinely neither `neutral`, and a
-   login/empty/JS-only shell is unusable (never submitted as a finding) — only URLs
+   verdict `supports`, contradicting `contradicts`, genuinely related-but-thin
+   `insufficient` (a neutral annotation, no ticket), and a
+   login/empty/JS-only shell is unusable (never adjudicated) — only URLs
    the server-side fetch ledger confirms as fetched-ok and usable become edges, so
    your own content assertions carry no authority. Do NOT hand-record Source/Evidence
-   nodes or hand-link claim edges; `verify_batch` writes them idempotently.
+   nodes or hand-link claim edges; the commit writes them idempotently.
    - Keep a source ledger in `sources.md`; mark each source's authority and independence.
    - Deliberately search for disagreement — a missing contradiction is weaker evidence
      than an active search that found none.
