@@ -1438,6 +1438,24 @@ class ResearchService:
         # Producer invariant (docs/research/04 §5): agent output carries a non-null
         # generated_by_execution; user intake carries a non-null created_by and a null
         # generated_by_execution.
+        # Scoped v1 immutability (Run-16 residual): the primary report's v1 is the DRAFT
+        # slot — freely (re)writable through the WRITE stage, but from REVIEW onward it is
+        # the audited base REVIEW read (and what the v2 lineage points back to). Letting a
+        # late write_scratch fork it would make disk v1 diverge from the reviewed draft —
+        # exactly the "reviewed one object, kept another" class. Later changes MUST go
+        # through create_version (explicit v2+); identical bytes still take the idempotent
+        # re-stamp return above, so crash-reruns are unaffected.
+        if (
+            v1 is not None
+            and project.get("primary_report_artifact_id") == artifact_id
+            and project.get("stage") in _STAGES[_STAGES.index("REVIEW"):]
+        ):
+            raise ValueError(
+                f"write_scratch: '{artifact_id}' v1 is IMMUTABLE at stage "
+                f"{project.get('stage')} (the primary report's reviewed draft base) — "
+                "never overwrite the v1 slot; commit the new text with research_artifact "
+                "action=create_version (explicit v2+) instead"
+            )
         record = {
             "artifact_id": artifact_id,
             "project_id": project_id,

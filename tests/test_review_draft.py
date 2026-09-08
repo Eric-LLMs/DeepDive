@@ -352,6 +352,7 @@ async def test_g3_new_edition_archives_old_primary_tree(env, monkeypatch):
     assert live == []  # draft slot starts EMPTY — the old v1/v2 can no longer hijack a base
     archived = env.scratch / str(USER) / task_id / "archive" / f"run{seq1}" / "report.md"
     assert (archived / "v1").is_file() and (archived / "v2").is_file()  # moved, never deleted
+    frozen = {n: (archived / n).read_bytes() for n in ("v1", "v2")}  # cross-run history seal
 
     # Literal Run-16 acceptance chain: write -> v1, review -> v2.
     await svc.write_scratch(USER, task_id, artifact_id="report.md", content="edition two draft\n")
@@ -361,3 +362,74 @@ async def test_g3_new_edition_archives_old_primary_tree(env, monkeypatch):
     _seam(monkeypatch, [json.dumps({"changes": [_change(old="edition two", new="polished two")]})])
     out = await svc.review_draft(USER, task_id, artifact_id="report.md")
     assert out["base_version"] == 1 and out["new_version"] == 2
+    # The current edition's full v1->v2 lifecycle never touched, reversed, or re-hijacked
+    # the archived previous-edition tree (byte-for-byte identical).
+    assert {n: (archived / n).read_bytes() for n in ("v1", "v2")} == frozen
+
+
+# ── v1 lifecycle (Run-16 residual): scoped immutability + archive untouchability ──
+
+async def test_v1_write_stage_allows_repeated_updates(env):
+    # Before REVIEW the v1 slot is the live draft: multiple differing writes must
+    # overwrite v1 in place (never mint v2).
+    svc, task_id = await _project_with_draft(env, "draft A\n", {"c1": "x"})
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(stage="WRITE"))
+    await svc.write_scratch(USER, task_id, artifact_id="report.md", content="draft B\n")
+    res = await svc.write_scratch(USER, task_id, artifact_id="report.md", content="draft C\n")
+    assert res["version"] == 1 and not res.get("idempotent")
+    adir = env.scratch / str(USER) / task_id / "artifacts" / "report.md"
+    assert svc._load_json(adir / "v1", None)["content"] == "draft C\n"
+    assert not (adir / "v2").exists()
+
+
+async def test_v1_immutable_from_review_overwrite_refused(env):
+    # The audited base: once the project is at REVIEW+, a DIFFERENT primary-report
+    # write_scratch must be refused — corrections take the explicit create_version path.
+    svc, task_id = await _project_with_draft(env, "reviewed base\n", {"c1": "x"})
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(stage="REVIEW"))
+    with pytest.raises(ValueError, match="IMMUTABLE"):
+        await svc.write_scratch(USER, task_id, artifact_id="report.md", content="forked v1\n")
+    adir = env.scratch / str(USER) / task_id / "artifacts" / "report.md"
+    assert svc._load_json(adir / "v1", None)["content"] == "reviewed base\n"  # untouched
+    # The prescribed escape hatch works and yields v2:
+    commit = await svc.create_version(USER, task_id, artifact_id="report.md", content="fixed v2\n")
+    assert commit["version"] == 2
+
+
+async def test_v1_identical_rewrite_still_idempotent_at_review(env):
+    # Crash-rerun discipline survives the guard: byte-identical content at REVIEW+
+    # returns idempotent (with run_seq re-stamp), it does NOT hit the IMMUTABLE refusal.
+    draft = "replayed draft\n"
+    svc, task_id = await _project_with_draft(env, draft, {"c1": "x"})
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(stage="REVIEW"))
+    res = await svc.write_scratch(USER, task_id, artifact_id="report.md", content=draft)
+    assert res["idempotent"] is True and res["version"] == 1
+
+
+async def test_non_primary_artifacts_unaffected_after_review(env):
+    # The guard is scoped to the PRIMARY report only — the scorecard and companions
+    # keep being recordable at REVIEW/PUBLISH (QUALITY_GATE depends on it).
+    svc, task_id = await _project_with_draft(env, "base\n", {"c1": "x"})
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(stage="PUBLISH"))
+    res = await svc.write_scratch(
+        USER, task_id, artifact_id="scorecard.md", content="| # | C | S | F | N |\n"
+    )
+    assert res["version"] == 1 and res["status"] == "DRAFT"
+
+
+async def test_publish_promotes_current_tagged_latest_not_stale_higher(env):
+    # Acceptance 4 kept rigid: at PUBLISH the promoted version is THIS run's tagged
+    # LATEST (v2, the review output), never a stale higher-numbered leftover (v3).
+    svc, task_id = await _project_with_draft(env, "v1 draft\n", {"c1": "x"})
+    await svc.create_version(USER, task_id, artifact_id="report.md", content="v2 reviewed\n")
+    # Ghost at the NUMERIC max: an untagged stale v3 from an older edition.
+    adir = env.scratch / str(USER) / task_id / "artifacts" / "report.md"
+    ghost = dict(svc._load_json(adir / "v1", None))
+    ghost.update(version=3, content="STALE older-edition v3\n")
+    ghost.pop("run_seq", None)
+    svc._save_json(adir / "v3", ghost)
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(stage="PUBLISH"))
+    out = await svc.promote_to_drive(USER, task_id, artifact_id="report.md")
+    assert out["version"] == 2 and "v2 reviewed" in (
+        svc._load_json(adir / "v2", None).get("content") or "")
+    assert svc._load_json(adir / "v3", None).get("status") != "PROMOTED"

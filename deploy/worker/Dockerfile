@@ -14,6 +14,13 @@ COPY apps ./apps
 # at runtime, and they are file-backed modules (not pip-packaged) — copy the tree verbatim.
 COPY plugins ./plugins
 
-RUN pip install --no-cache-dir "."
+RUN pip install --no-cache-dir -e "." \
+    # Editable install: /app/packages (+ /app/apps, /app/packages/shared/proto) become the
+    # ONE import source — no frozen copies in site-packages to double-write against.
+    # Hatchling's generated .pth only lists the package parents and puts /app/apps before
+    # /app/packages, which would shadow the proto `retrieval` with the apps/retrieval app.
+    # Pin the order explicitly (proto first) so every top-level name resolves to source.
+    && printf '/app/packages/shared/proto\n/app/apps\n/app/packages\n' \
+       > /usr/local/lib/python3.12/site-packages/_editable_impl_deepdive.pth
 
 CMD ["python", "-m", "apps.worker.main"]
