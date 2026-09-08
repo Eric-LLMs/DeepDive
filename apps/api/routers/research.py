@@ -198,11 +198,16 @@ async def delete_task(
     drive: DriveService = Depends(get_drive_service),
 ):
     """Cascade-delete a research task: cloud task folder → Trash, scratch state removed,
-    and its bound type-1 chat session(s) deleted (messages cascade via the FK).
+    and every chat session bound to the task deleted (messages cascade via the FK).
 
     409 Conflict when the task is RUNNING or its report is already indexed by RAG; 404 for a
     missing task / owner traversal. ``delete_task`` raises ``ValueError`` for all three and the
     message discriminates 409 (guard) from 404 (not found).
+
+    The session list comes from the task's own binding ledger (``session_ids``), so it is
+    authoritative regardless of the row's ``type`` flag: headless/script-created tasks may
+    carry type-0 bound sessions, and those must still go with the task (only ownership is
+    re-checked here).
     """
     try:
         result = await _service(drive).delete_task(user.user_id, task_id)
@@ -212,7 +217,7 @@ async def delete_task(
             try:
                 async with SessionLocal() as db:
                     sess = await db.get(SessionModel, uuid.UUID(sid))
-                    if sess is None or sess.user_id != user.user_id or sess.type != 1:
+                    if sess is None or sess.user_id != user.user_id:
                         continue
                     attach = (
                         await db.execute(

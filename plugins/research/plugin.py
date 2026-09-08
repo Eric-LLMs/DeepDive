@@ -311,10 +311,24 @@ _ADJ_VERDICTS = {"supports", "contradicts", "insufficient"}
 # ``_ADJ_LLM_CALL`` with a stub; nothing hits the network offline.
 _ADJ_LLM_CALL: Any | None = None
 _LLM_SINGLETON: Any | None = None
+# Inner-adjudication transport guards: the 90 s global LLM timeout was tuned for the
+# outer chat loop; one whole-batch thinking-model verdict needs a longer budget, and
+# the SDK's default 2 retries re-queue the FULL generation each time — worse than
+# failing fast. 180 s + a single retry bounds one call at ~6 min worst case.
+_ADJ_LLM_TIMEOUT_SECONDS = 180.0
+_ADJ_LLM_MAX_RETRIES = 1
 
 
 async def _adjudication_llm_complete(prompt: str, system_prompt: str) -> str:
-    """One channel-aware completion for the adjudication prompt."""
+    """One channel-aware completion for the adjudication prompt.
+
+    Streamed and accumulated, NOT a single blocking ``complete()``: a thinking model
+    serving one whole-batch verdict can idle past the client timeout before its first
+    token lands, and the SDK then re-queues the FULL generation on retry (the Run-13
+    EVIDENCE stall: 90 s timeout x2 retries -> 5.4 min and an error). Chunks keep the
+    connection alive; the verdict payload is id-only and tiny, so accumulate-then-parse
+    semantics stay exactly the same. Emits ttft/stream timing for latency forensics.
+    """
     if _ADJ_LLM_CALL is not None:  # test seam
         return await _ADJ_LLM_CALL(prompt, system_prompt)
     from core.infrastructure.llm import OpenAILLM
@@ -322,19 +336,36 @@ async def _adjudication_llm_complete(prompt: str, system_prompt: str) -> str:
     global _LLM_SINGLETON
     if _LLM_SINGLETON is None:
         _LLM_SINGLETON = OpenAILLM()
+    kwargs: dict[str, Any] = {
+        "timeout": _ADJ_LLM_TIMEOUT_SECONDS,
+        "max_retries": _ADJ_LLM_MAX_RETRIES,
+    }
     channel = get_request_llm_channel()
     if channel is not None:
         model, base_url, api_key = channel
-        return await _LLM_SINGLETON.complete(
-            prompt, system_prompt, model=model or None, base_url=base_url, api_key=api_key
-        )
-    return await _LLM_SINGLETON.complete(prompt, system_prompt)
+        kwargs.update({"model": model or None, "base_url": base_url, "api_key": api_key})
+    t0 = time.perf_counter()
+    ttft_ms: float | None = None
+    parts: list[str] = []
+    async for piece in _LLM_SINGLETON.complete_stream(prompt, system_prompt, **kwargs):
+        if ttft_ms is None:
+            ttft_ms = (time.perf_counter() - t0) * 1000
+        parts.append(piece)
+    text = "".join(parts).strip()
+    stream_ms = (time.perf_counter() - t0) * 1000
+    logger.info(
+        "adjudicate.llm ttft_ms=%s stream_ms=%.0f chars=%d",
+        f"{ttft_ms:.0f}" if ttft_ms is not None else "none",
+        stream_ms,
+        len(text),
+    )
+    return text
 
 
 _ADJ_SYSTEM_PROMPT = (
     "You are the evidence adjudicator for a research claim graph. For each source, "
     "decide which claims it is topically related to and what it does to each claim. "
-    "Reply with a single JSON object only."
+    "Reply with a single JSON object only — bare id-and-verdict rows, nothing else."
 )
 
 
@@ -354,15 +385,16 @@ def _adjudication_prompt(
         "Adjudicate every (source, claim) pair below in one pass.\n\n"
         "CLAIMS:\n" + claim_lines + "\n\n"
         "SOURCES (one representative chunk per fetched page):\n" + source_lines + "\n\n"
-        'Return ONLY this JSON object: {"results": [{"source_id": "...", '
-        '"claim_id": "...", "verdict": "supports" | "contradicts" | "insufficient"}]}\n'
+        'Return ONLY this JSON object: {"results": [{"s": "<source_id>", '
+        '"c": "<claim_id>", "v": "supports" | "contradicts" | "insufficient"}]}\n'
         "Rules:\n"
-        '- "supports": the source provides evidence FOR the claim; "contradicts": AGAINST '
-        'it; "insufficient": topically related but not decisive either way.\n'
+        '- "v": "supports" means the source provides evidence FOR the claim; '
+        '"contradicts": AGAINST it; "insufficient": topically related but not decisive.\n'
         "- Include a pair ONLY when the source is topically related to the claim; omit "
         "every unrelated pair.\n"
-        "- Copy source_id and claim_id EXACTLY as given; never invent, renumber or "
-        "shorten ids.\n"
+        "- Copy s and c EXACTLY as given; never invent, renumber or shorten ids.\n"
+        "- Each result row is THREE keys only (s, c, v) — no reasoning, no explanation, "
+        "no quoted text, no extra fields.\n"
         "- Output the raw JSON object only — no prose, no markdown fences."
     )
 
@@ -2112,8 +2144,9 @@ class ResearchService:
 
         # Scratch is runtime state: clear the session routing index, then hard-delete the
         # task directory. Restoring the Trash folder cannot resurrect the task. The bound
-        # session ids are returned so the router can delete the type-1 chat rows too
-        # (task deletion must not leave orphaned sessions behind).
+        # session ids are returned so the router can delete the chat rows too
+        # (task deletion must not leave orphaned sessions behind — regardless of the
+        # rows' type flag, this ledger is the authority on what the task bound).
         index = self._load_session_index(owner_id)
         bound_sessions = [k for k, v in index.items() if v == task_id]
         cleaned = {k: v for k, v in index.items() if v != task_id}
@@ -4368,6 +4401,7 @@ class ResearchService:
             )
 
         # ── 3. fetch every source through the existing batch machinery ──
+        t_fetch = time.perf_counter()
         skipped_sources: list[dict] = []
         snippets: dict[str, str] = {}  # canonical_url -> representative chunk
         for i in range(0, len(cu_list), FETCH_MAX_URLS):
@@ -4412,6 +4446,7 @@ class ResearchService:
                     skipped_sources.append(
                         {"url": cu, "reason": "empty representative chunk"}
                     )
+        fetch_ms = (time.perf_counter() - t_fetch) * 1000
         if not snippets:
             return {
                 "status": "no_sources",
@@ -4443,18 +4478,23 @@ class ResearchService:
             batches.append(current)
 
         # ── 5. one single-pass relevance+adjudication LLM call per batch ──
+        logger.info("adjudicate.fetch fetch_ms=%.0f urls=%d snippets=%d skipped=%d",
+                    fetch_ms, len(cu_list), len(snippets), len(skipped_sources))
         verdicts: dict[str, dict[str, str]] = {}  # claim_id -> {canonical_url: verdict}
         dropped_rows = 0
         llm_calls = 0
+        parse_ms_total = 0.0
         claim_payload = [(c, claim_nodes[c]) for c in claim_ids]
         for batch_cus in batches:
             source_payload = [(sid_of[cu], snippets[cu]) for cu in batch_cus]
             prompt = _adjudication_prompt(claim_payload, source_payload)
             raw = await _adjudication_llm_complete(prompt, _ADJ_SYSTEM_PROMPT)
             llm_calls += 1
+            t_parse = time.perf_counter()
             try:
                 rows = _parse_adjudication_rows(raw)
             except ValueError as exc:
+                parse_ms_total += (time.perf_counter() - t_parse) * 1000
                 # ONE format repair call is allowed: by design only a budget split
                 # multiplies LLM calls; a malformed reply is fixed, not fanned out.
                 raw = await _adjudication_llm_complete(
@@ -4464,6 +4504,7 @@ class ResearchService:
                     _ADJ_SYSTEM_PROMPT,
                 )
                 llm_calls += 1
+                t_parse = time.perf_counter()
                 try:
                     rows = _parse_adjudication_rows(raw)
                 except ValueError as exc2:
@@ -4471,14 +4512,18 @@ class ResearchService:
                         "adjudication failed: the model returned no parseable JSON "
                         f"twice ({exc}; {exc2})"
                     ) from exc2
+            parse_ms_total += (time.perf_counter() - t_parse) * 1000
             cu_of_sid = {sid_of[cu]: cu for cu in batch_cus}
             for r in rows:
                 if not isinstance(r, dict):
                     dropped_rows += 1
                     continue
-                sid = r.get("source_id")
-                cid = r.get("claim_id")
-                verdict = r.get("verdict")
+                # The contract is the minimal {"s","c","v"} row; the historical full-key
+                # spelling stays accepted so a model echoing its own input keys is not
+                # punished with a dropped row.
+                sid = r.get("s") if "s" in r else r.get("source_id")
+                cid = r.get("c") if "c" in r else r.get("claim_id")
+                verdict = r.get("v") if "v" in r else r.get("verdict")
                 verdict = verdict.strip().lower() if isinstance(verdict, str) else ""
                 if (
                     not isinstance(sid, str) or sid not in cu_of_sid
@@ -4488,6 +4533,8 @@ class ResearchService:
                     dropped_rows += 1  # a hallucinated id never reaches the graph
                     continue
                 verdicts.setdefault(cid, {}).setdefault(cu_of_sid[sid], verdict)
+        logger.info("adjudicate.parse parse_ms=%.0f batches=%d llm_calls=%d dropped_rows=%d",
+                    parse_ms_total, len(batches), llm_calls, dropped_rows)
 
         # ── 6. merge every batch back into per-claim findings; ONE atomic commit ──
         items: list[dict] = []

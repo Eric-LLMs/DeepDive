@@ -148,14 +148,21 @@ class OpenAILLM:
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> AsyncIterator[str]:
+        # Per-call timeout/max_retries overrides force a fresh client (the shared
+        # self.client carries process-wide settings); otherwise reuse it.
         client = self.client
-        if base_url or api_key:
-            client = AsyncOpenAI(
-                base_url=base_url or settings.llm_base_url,
-                api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
-                timeout=settings.llm_timeout_seconds,
-            )
+        if base_url or api_key or timeout is not None or max_retries is not None:
+            kwargs: dict = {
+                "base_url": base_url or settings.llm_base_url,
+                "api_key": api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+                "timeout": timeout if timeout is not None else settings.llm_timeout_seconds,
+            }
+            if max_retries is not None:
+                kwargs["max_retries"] = max_retries
+            client = AsyncOpenAI(**kwargs)
         stream = await client.chat.completions.create(
             model=model or self.model,
             messages=self._messages(prompt, system_prompt),
