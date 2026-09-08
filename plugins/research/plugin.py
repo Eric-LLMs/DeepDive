@@ -3334,6 +3334,11 @@ class ResearchService:
                 project["diagnostics"] = []
                 project["last_block"] = None
                 project["status"] = "ACTIVE"
+                # T3: the report authority is run-scoped too — a new edition's first
+                # report-named write must be free to re-bind it (the previous edition's
+                # artifact trees stay on disk for history, but they are no longer the
+                # REVIEW/PUBLISH target).
+                project.pop("primary_report_artifact_id", None)
                 # The evidence graph is per-task shared state (graph.json, not versioned):
                 # empty it so the new edition re-gathers sources instead of inheriting the
                 # finished edition's STALE/CANDIDATE nodes as if they were current evidence.
