@@ -247,6 +247,10 @@ deepdive/
 > no nested `deepdive` package layer.
 > Generated proto stubs live under `packages/shared/proto` and are imported as
 > `retrieval.v1.retrieval_pb2` (a real package on the editable-install path, no `sys.path` hack).
+> The worker image follows the same rule: `pip install -e .` with the generated `.pth` rewritten to
+> pin the search order `/app/packages/shared/proto → /app/apps → /app/packages`, so `/app` source is
+> the *single* import source inside the container — no frozen site-packages copies to double-write
+> against, and top-level `retrieval` always resolves to the proto stub, not the same-named app.
 
 [↑ Back to top](#table-of-contents)
 
@@ -2153,7 +2157,8 @@ authoritative state lives in server scratch (`<research_scratch>/<owner>/<task_i
 `active_run`, `deletion_requested`, and `run_seq` — the monotonic per-run version minted atomically
 inside `begin_run`'s single-writer mutate and copied to the driver checkpoint as `run_version`, never
 read-modify-written outside that lock), `graph.json`, `executions.json`, `approvals.json`,
-`artifacts/<id>/v<N>` (versioned), `task_spec.json` / `session_history.json` (also mirrored to the
+`artifacts/<id>/v<N>` (versioned — every version record is stamped with the minting `run_seq`, the
+provenance the artifact-chain hard stops consult, see below), `task_spec.json` / `session_history.json` (also mirrored to the
 cloud), the append-only `run_events.json` progress log (see the run-lifecycle paragraph below), and
 `_session_index.json` (the session→task routing map). The user-visible **cloud task folder** lives in
 My Drive under the parent the user picked — the three work folders (`materials/`, `outputs/`,
@@ -2256,8 +2261,10 @@ system+input prompt and the verbatim reply to the log for offline prompt auditin
 
 **REVIEW — one `review_draft` call, all-or-nothing staged commit.** The REVIEW stage closes in
 exactly **one** `research_artifact action="review_draft"` call (passing the report's
-`artifact_id`) — no per-page read loop, no hand-authored review versions. Server-side: the latest
-artifact version plus the full Claim graph (`claim_id/statement/strength/status/citations`) are fed
+`artifact_id`) — no per-page read loop, no hand-authored review versions. Server-side: the base is
+the report's **newest version tagged to the current `run_seq`** (a version stamped to a different
+run is a ghost and never the base; plain-latest is the fallback only for legacy unprovenanced
+artifacts), fed together with the full Claim graph (`claim_id/statement/strength/status/citations`)
 verbatim into ONE streaming LLM call — here **thinking stays enabled**, because editorial reasoning
 is the point of this call — and the prompt size is bound by `REVIEW_BUDGET_TOKENS` (env, default
 200k; estimate = chars/4) which raises before any call if the draft would overflow. The reply is
@@ -2271,7 +2278,13 @@ occur **exactly once inside the target's section** (target line up to the next `
 if ANY row is rejected the staging copy is discarded whole — no artifact write, no graph write, and
 a `RuntimeError` names the exact failed rows (`patch rejected (k/n rows failed)`), so the base
 version is never half-landed. All rows pass → **one** `create_version` commit (base version left
-untouched); `changes: []` → `new_version: null`, meaning the draft was fully supported. Timing is
+untouched); `changes: []` → `new_version: null`, meaning the draft was fully supported. The reviewed
+base is protected after the fact too: from REVIEW onward the primary report's **v1 is immutable to
+`write_scratch`** — it is the draft of record, so corrections must land as `create_version` (v2+) or
+the write is refused with a pointer to that escape hatch; a byte-identical re-write stays
+idempotent (a crash-rerun of a committed write re-stamps rather than errors) and non-primary
+artifacts (e.g. `scorecard.md`) are unaffected, while during WRITE — before REVIEW — v1 updates
+freely until the draft is committed. Timing is
 logged per call (`review.llm done_ms/parse_ms/calls`, `review.apply applied/version`), and the
 worker's auto-turn brief carries this one-call mandate in the stage command itself — the tool
 schema and skill doc alone proved insufficient to stop a retail read/verify loop.
@@ -2313,8 +2326,13 @@ job** — one arq job per agent turn (`apps/worker/tasks.py` `research_drive`: i
 `auto_turn` for one `execution_id`, then mirrors the answer into the session and enqueues the next
 turn when the driver says `continue`) — so a single chat prompt can drive a task **all the way to
 PUBLISH with no client attached**. Worker turns run `research_driver_turn_max_steps` (25) vs the
-interactive 5, under caps: `research_driver_max_turns` (8), `research_driver_max_no_progress_turns`
-(2), `research_driver_max_attempts` (3), and an optional `research_driver_max_cost_usd`. A
+interactive 5, under caps: `research_driver_max_turns` (14), `research_driver_max_no_progress_turns`
+(2), `research_driver_max_attempts` (3), and a cost ceiling `research_driver_max_cost_usd` (default
+$0.40) enforced as a **pre-call hard gate**: at the turn seam the run refuses to *start* a turn once
+cumulative spend has reached the cap — `CostLimitExceeded`, deliberately kept outside the
+transient-error hints so a budget stop can never be retried away — and every turn's step loop
+receives `max_budget_usd = cap − spent`, so a mid-turn call is refused before it is billed;
+over-spending the cap is structurally impossible. A
 `RunState` driver (`plugins/research/driver.py`) derives `idle | running | finished | blocked |
 stalled | cancelled | error` from the persisted run slot; after each successful turn a fixed
 grading chain fixes the state — cancel requested → CANCELLED, stage PUBLISH → FINISHED,
@@ -2421,11 +2439,34 @@ transition's gate has not passed, i.e. the run's failure control flow is one of 
   for a non-human reason is deterministically **auto-settled** instead (the Run-lifecycle paragraph
   below).
 
-**Gate checks carry a severity.** A `QUALITY_GATE` whose project has *no scorecard recorded at all*
-emits its failed check as `severity: diagnostic_only` — a provisioning gap of the current toolset,
+**The artifact chain has three hard stops (G1–G3).** Gates and terminal grading refuse to bless an
+artifact chain that does not exist on disk:
+**G1** — `CLAIM_GATE` carries a `report_written` blocking check: the task's primary report must be
+bound in project state *and* have at least one version physically on disk before the gate can pass,
+so a claim graph can never complete on top of a missing draft.
+**G2** — auto-settle may only terminalize a run as FINISHED when the run actually produced a
+published object — a bound primary whose latest version is `PROMOTED` with a real `drive_asset_id`;
+otherwise the settle is **refused** (`settle.refused`) before a single chain hop and the run stops
+graded, never a fake PUBLISH with a settle report written over an unpromised run.
+**G3** — versions are provenance-stamped by their minting `run_seq`, and the chain-closing calls
+(REVIEW's `review_draft`, PUBLISH's promote) bind **only the current run's tagged latest**: a
+higher-numbered version left behind by an older edition is a ghost — neither a base nor a promotion
+candidate. A **new-edition `begin_run`** (entered at PUBLISH) first *moves* the previous edition's
+primary-report version tree into `<project>/archive/run{N-1}/<artifact>/` — archived, never deleted —
+so each edition's `v1 → v2 …` numbering starts from a clean slate.
+
+**QUALITY_GATE resolves the scorecard of record, per edition.** The gate reads a fixed priority
+chain: (1) the **newest `scorecard.md` version** first — tagged to the current `run_seq` it is the
+authoritative grade sheet, parsed as a markdown table and passing only at ≥7 digit-indexed rows
+with zero fatal findings (its verdict is `blocking`); (2) a newest `scorecard.md` stamped to a
+different run fails `blocking` as `scorecard_stale`, and one carrying no provenance stamp fails
+`blocking` as `scorecard_unprovenanced` — a borrowed or unattributed grade sheet is never silently
+accepted; (3) failing any `scorecard.md`, the legacy in-project `project["scorecard"]` rows are
+honored only when their own `scorecard_run_seq` stamp is absent (pre-stamp data) or equals the
+current run; (4) only a project with **no scorecard at all** emits the historical
+`severity: diagnostic_only` `scorecard_missing` verdict — a provisioning gap of the current toolset,
 not agent misconduct — so progressive diagnostics and review notes can tell it apart from a real
-scorecard FAIL (`severity: blocking`, e.g. fewer than 7 rows or a fatal finding); strict-mode
-blocking semantics are identical for both.
+scorecard FAIL (`severity: blocking`); strict-mode blocking semantics are identical for all.
 
 **Live monitor & per-process logs.** `GET /research/tasks/{id}/monitor` is an SSE stream that
 subscribes to the Redis channel `research:monitor:{task_id}` *before* emitting a `snapshot`, then
@@ -2938,7 +2979,7 @@ re-exports, so older import sites keep working without duplicating logic.
 |---|---|
 | Definition / states | `workflow_spec` mirrors the DAG's `_LEGAL_NEXT` parity table — an import-time + parity-tested check keeps the spec and the domain state machine from diverging |
 | `LeaseStore` | `ResearchLeaseStore` — folds the lease into the existing `active_run` + driver checkpoint, committed by the portalocker `project_revision` CAS |
-| `Executor` binding | spec activity `auto_turn` → logical id `research-agent-kernel`; the adapter builds a `MappingRegistry` binding that id to `_RunTurnExecutor`, which wraps **one agent-kernel turn** — the prompt rides in `TaskRequest` (opaque to the core), and the per-turn LLM step cap is runtime config (`research_driver_turn_max_steps = 25` for auto-drive vs the interactive default of 5), never part of the spec |
+| `Executor` binding | spec activity `auto_turn` → logical id `research-agent-kernel`; the adapter builds a `MappingRegistry` binding that id to `_RunTurnExecutor`, which wraps **one agent-kernel turn** behind an injected `pre_gate` callable — the cost hard gate, raised at the turn seam *before* the turn starts — and the prompt rides in `TaskRequest` (opaque to the core), and the per-turn LLM step cap is runtime config (`research_driver_turn_max_steps = 25` for auto-drive vs the interactive default of 5), never part of the spec |
 | `ProgressProbe` | `_ResearchProgressProbe` — stage / gate milestone diff: progress means the run moved a phase or cleared a gate, not token churn |
 | `business_facts` | `finished` = the task reached PUBLISH; `pending_signals` = open gate overrides awaiting review → `WAITING` park; human approval of an override starts a *new* execution from `IDLE` |
 | `TerminalHook` | the **progressive mode** mechanism: an about-to-`FAILED` gate iteration is rewritten to continue (a replacement grade with `state None` — gap recorded honestly, run auto-settles forward), plus `build_settle_report` finalization at terminal — this is why progressive runs reach PUBLISH with disclosed gaps instead of deadlocking |
