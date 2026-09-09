@@ -27,6 +27,7 @@ Design notes (spike decisions, all auditable):
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -42,10 +43,144 @@ import portalocker
 
 from workflow.ledger import finish_into as ledger_finish_into
 from workflow.ledger import record_into as ledger_record_into
+from workflow.leases import LeaseConfig, heartbeat_age_s
 
 from plugins.research.workflow_spec import RESEARCH_WORKFLOW
 
 logger = logging.getLogger(__name__)
+
+# ── F2 auto-run authority fence ───────────────────────────────────────────────
+# A ContextVar carrying the (owner, task, run, execution) identity of the auto-run
+# turn CURRENTLY executing in this task. The worker's lease/heartbeat layer fences
+# every settle with the execution identity; this fence extends the same rule to the
+# research authority plane: every in-turn commit (project.json via the central seam
+# below, plus artifact/executions file writes checked at their entry points) is
+# refused with :class:`OwnershipLost` once a reclaim has moved the lease on. Context
+# propagates into asyncio tasks created after it is set (the executor's run_task),
+# and interactive/API writes never set it, so they are exempt by construction.
+_AUTO_RUN_FENCE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "research_auto_run_fence", default=None
+)
+
+
+class OwnershipLost(RuntimeError):
+    """The auto-run execution performing this write no longer holds the lease.
+
+    Raised by the fenced commit paths (F2) when the on-disk ``active_run`` / driver
+    identity no longer matches the in-context fence: a superseded (zombie) worker may
+    not write authoritative state, artifacts, or terminal records. Callers treat it as
+    a drop signal, never as a retryable fault.
+    """
+
+
+def set_auto_run_fence(
+    *, owner_id: Any, task_id: str, run_id: str, execution_id: str | None
+) -> contextvars.Token:
+    return _AUTO_RUN_FENCE.set(
+        {
+            "owner_id": str(owner_id),
+            "task_id": str(task_id),
+            "run_id": str(run_id),
+            "execution_id": execution_id,
+        }
+    )
+
+
+def clear_auto_run_fence(token: contextvars.Token) -> None:
+    _AUTO_RUN_FENCE.reset(token)
+
+
+def get_auto_run_fence() -> dict | None:
+    return _AUTO_RUN_FENCE.get()
+
+
+# Lease knobs for READ-SIDE staleness only (F1-a/F3). The single source of truth for
+# the executor's own lease remains the adapter's LeaseConfig with these same defaults.
+_LEASE_KNOBS = LeaseConfig()
+
+
+def _run_stale(project: dict, *, now_epoch: float | None = None) -> bool:
+    """F3 read-side derivation: a RUNNING slot whose lease heartbeat has lapsed.
+
+    Pure derivation from persisted facts — it never writes and never changes what
+    ``active_run`` says; the 2h adoption window and RESUMABLE semantics are untouched.
+    A slot whose driver ledger belongs to another run (the begin_run window before the
+    seed lands) is treated as fresh.
+    """
+    active = project.get("active_run")
+    if not active or active.get("status") != "RUNNING":
+        return False
+    led = project.get("driver") or {}
+    if led.get("run_id") != active.get("run_id"):
+        return False
+    return _LEASE_KNOBS.is_stale(
+        led.get("updated_at"),
+        now_epoch=time.time() if now_epoch is None else now_epoch,
+    )
+
+
+def _settled_cancel_needs_finalize(project: dict, active: dict) -> bool:
+    """W3 crash signature: Stop settled the lease, terminalization never landed."""
+    led = project.get("driver") or {}
+    lb = project.get("last_block") or {}
+    return (
+        led.get("run_id") == active.get("run_id")
+        and bool(led.get("cancel_requested"))
+        and led.get("turn_state") == "done"
+        and lb.get("run_id") != active.get("run_id")
+    )
+
+
+def plan_cancel_wake(project: dict, *, now_epoch: float | None = None) -> dict:
+    """F1-b: decide how a Stop flag will be consumed, purely from on-disk lease facts.
+
+    The replay parameter follows the ``workflow.leases.acquire`` state machine exactly
+    (never a blind +1):
+
+    * live ``running`` lease            — the owner's heartbeat watcher honours the
+      flag within one refresh interval; no extra job may be minted (it would only be a
+      live-duplicate drop);
+    * stale ``running`` lease           — replay the SAME iteration index: ``acquire``
+      reclaims it and, seeing the cancel flag with no live owner, terminalizes;
+    * settled ``done`` lease            — the NEXT expected iteration (index + 1):
+      ``acquire`` grants it, sees the flag, and terminalizes with the cancel;
+    * no active run / no ledger run     — nothing to wake; the flag resets with the
+      next ``begin_run`` (edition isolation).
+
+    Queue probing is deliberately NOT consulted: per the red line, the probe may only
+    inform diagnostics; correctness here rides solely on the lease CAS — a duplicate
+    wake job is always safe (dropped by ``acquire``).
+    """
+    led = project.get("driver") or {}
+    active = project.get("active_run") or {}
+    now = time.time() if now_epoch is None else now_epoch
+    run_id = led.get("run_id") or active.get("run_id")
+    if not active or not run_id:
+        return {
+            "nudge": False, "effective": "idle", "turn_index": None, "run_id": run_id,
+            "reason": "no active run to stop; the flag resets with the next begin_run",
+        }
+    state = led.get("turn_state") or "done"
+    index = int(led.get("turn_index") or 0)
+    if state == "running" and not _LEASE_KNOBS.is_stale(led.get("updated_at"), now_epoch=now):
+        return {
+            "nudge": False, "effective": "live", "turn_index": None, "run_id": run_id,
+            "reason": "a live executor holds the lease; its watcher applies the stop "
+                      "within one heartbeat refresh",
+        }
+    if state == "running":
+        return {
+            "nudge": True, "effective": "pending-reclaim", "turn_index": index,
+            "run_id": run_id,
+            "reason": "lease is stale-RUNNING: wake a consumer to reclaim this iteration "
+                      "and terminalize on the cancel flag",
+        }
+    return {
+        "nudge": True, "effective": "pending-arrival", "turn_index": index + 1,
+        "run_id": run_id,
+        "reason": "lease is settled-done: wake the next expected iteration; acquire() "
+                  "terminalizes it on the cancel flag without executing",
+    }
 
 from agent.engine.context import current_turn
 from agent.engine.decisions import ToolExecution, text_block
@@ -818,6 +953,47 @@ class ResearchService:
     def _project_json_path(self, owner_id: uuid.UUID, project_id: str) -> Path:
         return self._project_dir(owner_id, project_id) / "project.json"
 
+    # -- F2 fence enforcement --------------------------------------------------
+    def _fence_for(self, owner_id: uuid.UUID, project_id: str) -> dict | None:
+        """The in-context auto-run fence if it targets THIS task (else None = exempt)."""
+        fence = _AUTO_RUN_FENCE.get()
+        if (
+            fence is not None
+            and fence["task_id"] == str(project_id)
+            and fence["owner_id"] == str(owner_id)
+        ):
+            return fence
+        return None
+
+    @staticmethod
+    def _fence_intact(project: dict, fence: dict) -> bool:
+        """True while the on-disk authority still names the fence's execution."""
+        active = project.get("active_run") or {}
+        led = project.get("driver") or {}
+        return (
+            active.get("run_id") == fence["run_id"]
+            and led.get("run_id") == fence["run_id"]
+            and led.get("execution_id") == fence["execution_id"]
+        )
+
+    def assert_auto_run_authority(self, owner_id: uuid.UUID, project_id: str) -> None:
+        """Pre-write fence for file writes that bypass :meth:`atomic_update_project`.
+
+        Artifact version files, the run-events log, and executions rows are written
+        straight to disk; per the ownership red line the check MUST run BEFORE any
+        finalize / rename / publish side effect, so a superseded worker only ever
+        reaches these paths while it still holds the lease. No-op outside an
+        auto-run turn (no fence in context).
+        """
+        fence = self._fence_for(owner_id, project_id)
+        if fence is not None and not self._fence_intact(
+            self._load_project(owner_id, project_id), fence
+        ):
+            raise OwnershipLost(
+                f"auto-run execution {fence['execution_id']} lost ownership of task "
+                f"{project_id} (reclaimed or superseded) — authoritative write refused"
+            )
+
     def atomic_update_project(
         self,
         owner_id: uuid.UUID,
@@ -877,6 +1053,16 @@ class ResearchService:
                     raise RevisionConflictError(
                         f"project {project_id} revision changed: expected {expected_revision}, "
                         f"got {project.get('project_revision', 0)}"
+                    )
+                # F2 central seam: an in-turn auto-run commit is only authoritative while
+                # the on-disk lease still names its execution. Checked INSIDE the lock on
+                # the FRESH load, so a reclaim that landed before us turns the zombie's
+                # write into OwnershipLost instead of a dirty commit.
+                fence = self._fence_for(owner_id, project_id)
+                if fence is not None and not self._fence_intact(project, fence):
+                    raise OwnershipLost(
+                        f"auto-run execution {fence['execution_id']} lost ownership of "
+                        f"task {project_id} — commit refused"
                     )
                 # P3-6 flush point: buffered asset-merges ride this commit — merged into
                 # the FRESH in-lock project before the mutation, so the ledger mirror
@@ -1101,17 +1287,26 @@ class ResearchService:
         *,
         patch: dict,
         expected_revision: int | None = None,
+        keep_lease_heartbeat: bool = False,
     ) -> dict:
         """Merge ``patch`` into the driver checkpoint and persist atomically.
 
         ``expected_revision`` enables optimistic CAS (see the driver: a stale job's write
         must fail rather than clobber a newer one). Returns the fresh driver checkpoint.
+
+        ``keep_lease_heartbeat`` preserves the pre-merge ``updated_at`` inside the SAME
+        atomic commit — for writes by NON-owners (a Stop flag): ``updated_at`` is the
+        lease liveness proof of the owner's heartbeat watcher; a foreign write that
+        re-stamped it would make a crashed slot look freshly-lived.
         """
         def mutate(project: dict) -> None:
             base = project.get("driver")
             if not isinstance(base, dict):
                 base = self._empty_driver()
+            prev_beat = base.get("updated_at")
             merged = {**base, **patch, "updated_at": _now_iso()}
+            if keep_lease_heartbeat and prev_beat:
+                merged["updated_at"] = prev_beat
             project["driver"] = merged
 
         project = self.atomic_update_project(
@@ -1122,10 +1317,16 @@ class ResearchService:
     def request_cancel(
         self, owner_id: uuid.UUID, project_id: str, expected_revision: int | None = None
     ) -> dict:
-        """Set ``driver.cancel_requested`` (idempotent) so the loop stops at its next safe point."""
+        """Set ``driver.cancel_requested`` (idempotent) so the loop stops at its next safe point.
+
+        The heartbeat must NOT be re-stamped here: it is the OWNER's liveness proof.
+        A Stop that made a crashed slot look freshly-lived would strand the flag
+        again (exactly the W1 orphan bug the wake planner must see through).
+        """
         return self.set_driver_checkpoint(
             owner_id, project_id, patch={"cancel_requested": True},
             expected_revision=expected_revision,
+            keep_lease_heartbeat=True,
         )
 
     def read_project_revision(self, owner_id: uuid.UUID, project_id: str) -> int:
@@ -1396,6 +1597,7 @@ class ResearchService:
         idempotency_key: str | None = None,
         generated_by_execution: str | None = None,
     ) -> dict:
+        self.assert_auto_run_authority(owner_id, project_id)  # F2: fence before any write
         project = self._load_project(owner_id, project_id)
         if idempotency_key:
             existing = self._find_by_idempotency(owner_id, "artifact", idempotency_key)
@@ -1437,8 +1639,7 @@ class ResearchService:
             }
         # Producer invariant (docs/research/04 §5): agent output carries a non-null
         # generated_by_execution; user intake carries a non-null created_by and a null
-        # generated_by_execution.
-        # Scoped v1 immutability (Run-16 residual): the primary report's v1 is the DRAFT
+        # generated_by_execution.        # Scoped v1 immutability (Run-16 residual): the primary report's v1 is the DRAFT
         # slot — freely (re)writable through the WRITE stage, but from REVIEW onward it is
         # the audited base REVIEW read (and what the v2 lineage points back to). Letting a
         # late write_scratch fork it would make disk v1 diverge from the reviewed draft —
@@ -1479,6 +1680,9 @@ class ResearchService:
         # Project the draft into the task's cloud projection (best-effort; scratch is the
         # authority). In a versioned run the working copy lands in temp/vN and the id is kept on
         # the run ledger, not this record; legacy tasks keep the in-place outputs/ id on record.
+        # The draft projection into the cloud is an irreversible side effect: re-check
+        # the fence immediately before it (F2 "fence before finalize/publish").
+        self.assert_auto_run_authority(owner_id, project_id)
         await self._mirror_output(owner_id, project, record, content)
         self._save_json(
             self._artifact_dir(owner_id, project_id, artifact_id) / "v1", record
@@ -1525,6 +1729,7 @@ class ResearchService:
         - **Skill project** (created via ``research_project``): the report is uploaded to
           ``research/<project_id>/`` and mirrored into a scratch ``outputs/`` projection.
         """
+        self.assert_auto_run_authority(owner_id, project_id)  # F2: fence before publish
         project = self._load_project(owner_id, project_id)
         # T3 force-bind: PUBLISH promotes the PRIMARY report's latest version (which
         # is exactly the version REVIEW committed, if any) — never a guessed id.
@@ -1597,6 +1802,8 @@ class ResearchService:
             record["updated_at"] = _now_iso()
             self._save_json(version_paths[-1], record)
             return self._promoted_view(record, idempotent=False)
+        # Last gate before the irreversible drive upload (F2 fence-before-publish).
+        self.assert_auto_run_authority(owner_id, project_id)
         asset = await self.drive.save_artifact(
             owner_id,
             name=f"{artifact_id}.md",
@@ -1634,6 +1841,7 @@ class ResearchService:
         run_version: int,
         promote_idempotency_key: str | None,
     ) -> dict:
+        self.assert_auto_run_authority(owner_id, project_id)  # F2: fence before asset create
         """Create/refresh the ONE versioned final asset for this artifact+run in ``outputs/``.
 
         First promote of a run mints ``outputs/<stem>_v{run_version}.md`` (Create-New). Any
@@ -1718,6 +1926,7 @@ class ResearchService:
         content: str,
         idempotency_key: str | None = None,
     ) -> dict:
+        self.assert_auto_run_authority(owner_id, project_id)  # F2: fence before v2+ write
         if idempotency_key:
             existing = self._find_by_idempotency(owner_id, "artifact", idempotency_key)
             if existing is not None:
@@ -1819,6 +2028,9 @@ class ResearchService:
             "cloud_folder_path": project.get("cloud_folder_path"),
             "deletion_requested": project.get("deletion_requested", False),
             "is_running": project.get("active_run") is not None,
+            # F3 read-only derivation: RUNNING lease whose heartbeat lapsed past the
+            # stale window (crashed owner awaiting reclaim). Diagnostic badge only.
+            "run_stale": _run_stale(project),
             "created_at": project.get("created_at"),
             "updated_at": project.get("updated_at"),
             # The most recent terminal run outcome (finished/blocked/stalled/cancelled/error);
@@ -3513,9 +3725,30 @@ class ResearchService:
                     time.gmtime(time.time() - stale_after_seconds),
                 )
                 stale = not started or started < cutoff
-                if not stale:
+                # W3 reconciliation: a Stop can settle the lease (turn_state=done, flag
+                # set) and then crash BEFORE the terminalization commit lands, leaving a
+                # RUNNING slot nobody will ever consume again — and that state is NOT
+                # resumable (the lease is already settled). Recover it on the next
+                # begin_run IMMEDIATELY (no 2h wait): finalize idempotently inside THIS
+                # CAS commit, then adopt. Ordinary crashed-but-resumable slots keep the
+                # existing stale-window semantics untouched (red line 8).
+                settled_cancel = _settled_cancel_needs_finalize(project, active)
+                if settled_cancel:
+                    logger.warning(
+                        "research begin_run recovered settled-but-unfinalized cancel: %s",
+                        active,
+                    )
+                    project["last_block"] = {
+                        "kind": "cancelled",
+                        "reason": "stop settled the lease; terminalization recovered at adoption",
+                        "at": _now_iso(),
+                        "run_id": active.get("run_id"),
+                        "execution_id": (project.get("driver") or {}).get("execution_id"),
+                    }
+                if not (stale or settled_cancel):
                     raise ValueError("Research task is already running")
-                logger.warning("research begin_run adopted stale active_run: %s", active)
+                if not settled_cancel:
+                    logger.warning("research begin_run adopted stale active_run: %s", active)
                 # The dead process's RUNNING executions are stale too — unblock the delete guard.
                 exec_path = self._project_dir(owner_id, project_id) / "executions.json"
                 data = self._load_json(exec_path, {"executions": []})
@@ -3772,6 +4005,7 @@ class ResearchService:
         query: str,
         content: str,
     ) -> dict:
+        self.assert_auto_run_authority(owner_id, project_id)  # F2: fence before scrape write
         """Store one retrieved page's *content* into ``temp/v{N}/scrape/<source>_<query>_<n>.md``.
 
         Agent-invocable capture of what a web/social search actually returned. Writes a small
@@ -5153,6 +5387,7 @@ class ResearchService:
            fails → staging is discarded, nothing is written, a RuntimeError reports
            the exact rejects.
         """
+        self.assert_auto_run_authority(owner_id, project_id)  # F2: fence before REVIEW stage
         # ── 1. latest version + claim graph (all inputs server-side) ──
         # T3 force-bind: once the run has a primary report, REVIEW never touches
         # another tree — a mismatched guess is rebound (warned + reported), so a
@@ -5344,6 +5579,7 @@ class ResearchService:
         and one appended row. The record/finish algorithm itself lives in the domain-free
         Workflow Core (``workflow.ledger``); this shell owns loading and persistence.
         """
+        self.assert_auto_run_authority(owner_id, project_id)  # F2: fence before audit row
         self._load_project(owner_id, project_id)
         path = self._project_dir(owner_id, project_id) / "executions.json"
         data = self._load_json(path, {"executions": []})
@@ -5366,6 +5602,7 @@ class ResearchService:
     def finish_execution(
         self, owner_id: uuid.UUID, project_id: str, *, execution_id: str, result: Any
     ) -> dict:
+        self.assert_auto_run_authority(owner_id, project_id)  # F2: fence before audit write
         path = self._project_dir(owner_id, project_id) / "executions.json"
         data = self._load_json(path, {"executions": []})
         row = ledger_finish_into(

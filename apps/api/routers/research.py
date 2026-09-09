@@ -24,14 +24,16 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 import uuid
 
 from api.auth import AuthUser, require_user
-from api.deps import get_drive_service
+from api.deps import get_drive_service, get_task_queue
 from api.schemas_research import TaskCreateRequest
 from core.application.drive_service import DriveError, DriveService
 from core.config import settings
 from core.infrastructure.db import MessageModel, SessionLocal, SessionModel
+from core.infrastructure.jobs import RESEARCH_DRIVE, TaskQueue
 from core.infrastructure.memory import create_session
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -42,7 +44,8 @@ from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
 from plugins.research.monitor import task_channel
-from plugins.research.plugin import ResearchService
+from plugins.research.plugin import ResearchService, plan_cancel_wake
+from workflow.leases import heartbeat_age_s
 
 router = APIRouter(prefix="/research", tags=["research"])
 
@@ -252,6 +255,7 @@ async def cancel_task(
     task_id: str,
     user: AuthUser = Depends(require_user),
     drive: DriveService = Depends(get_drive_service),
+    queue: TaskQueue = Depends(get_task_queue),
 ):
     """Request a stop for a task's auto-continue run.
 
@@ -259,6 +263,17 @@ async def cancel_task(
     mid-execution ends its current step, then the driver releases the slot and publishes
     ``run.cancelled``; a Stop between turns is honoured by the next job's claim. The task is
     never forcibly killed mid-write.
+
+    F1-b (orphan-flag closure): the flag alone is only consumed by a job that *arrives*.
+    When the lease says nobody will arrive — the running lease is stale (its executor
+    crashed) or the iteration is already settled ``done`` with no continuation pending —
+    this endpoint mints exactly one wake job through the same ``RESEARCH_DRIVE`` chain.
+    The replay index follows the lease ``acquire`` state machine (never a blind +1):
+    stale-running replays the SAME index (acquire reclaims and terminalizes on the flag),
+    done replays the NEXT expected index (acquire grants, sees the flag, terminalizes
+    without executing). A duplicate wake job is always safe — ``acquire`` drops it (live
+    twin / stale twin / out-of-order). Queue probing is NOT consulted: correctness rides
+    solely on the lease CAS; the response reports what the lease says (F1-a facts).
     """
     service = _service(drive)
     try:
@@ -267,10 +282,64 @@ async def cancel_task(
     except ValueError as exc:
         raise _not_found(exc)
     project = service.read_project(user.user_id, task_id)
+    plan = plan_cancel_wake(project)
+    effective = plan["effective"]
+    heartbeat_age = (
+        heartbeat_age_s(checkpoint.get("updated_at"), now_epoch=time.time())
+        if checkpoint.get("updated_at") else None
+    )
+    if heartbeat_age is not None and heartbeat_age == float("inf"):
+        heartbeat_age = None  # unparseable stamp: report "unknown", not a broken JSON number
+
+    if plan["nudge"]:
+        active = project.get("active_run") or {}
+        try:
+            await queue.enqueue(
+                RESEARCH_DRIVE,
+                {
+                    "user_id": str(user.user_id),
+                    "task_id": task_id,
+                    "run_id": plan["run_id"],
+                    "session_id": active.get("session_id"),
+                    "turn_index": plan["turn_index"],
+                    # No channel pin: a lease-cancelling wake never reaches the LLM —
+                    # acquire() terminalizes on the flag before any executor runs.
+                    "model": None,
+                    "base_url": None,
+                    "api_key": None,
+                },
+                user_id=user.user_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - never strand a RUNNING slot on wake failure
+            logger.warning("research cancel-wake enqueue failed for %s: %s", task_id, exc)
+            if active.get("status") != "RUNNING":
+                raise _http_error(exc)
+            # The queue is down and the flag has no consumer: terminalize honestly as a
+            # cancelled block so the user is not left holding a slot no executor will
+            # ever settle. Fenced inside: an owner that comes back mid-race still holds
+            # the lease and keeps the cooperative-stop semantics.
+            from plugins.research.driver import ResearchRunDriver, RunState
+
+            ResearchRunDriver().abort_run(
+                service, user.user_id, task_id,
+                run_id=plan["run_id"],
+                execution_id=checkpoint.get("execution_id"),
+                state=RunState.CANCELLED,
+                reason=f"stop could not be scheduled to a consumer: {exc}",
+            )
+            effective = "terminalized (wake enqueue failed)"
+            project = service.read_project(user.user_id, task_id)
+
     return {
         "task_id": task_id,
         "cancel_requested": checkpoint["cancel_requested"],
         "is_running": project.get("active_run") is not None,
+        # F1-a facts: how the flag WILL be consumed, per the on-disk lease.
+        "effective": effective,
+        "wake_enqueued": bool(plan["nudge"]),
+        "wake_reason": plan["reason"],
+        "turn_index": plan["turn_index"],
+        "heartbeat_age_s": heartbeat_age,
     }
 
 

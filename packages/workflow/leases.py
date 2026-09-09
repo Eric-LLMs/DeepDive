@@ -3,7 +3,7 @@
 A run's progress ledger says which iteration is pending/running/done and who owns it.
 Exactly one worker may hold the lease for a given iteration: :func:`acquire` is the pure
 decision core of that contest (the adapter runs it inside its own atomic commit). The
-three verdicts an arriving job can get mirror mature engines —
+three outcomes an arriving job can get mirror mature engines —
 
 * ``granted``   — the ledger expects exactly this iteration (Temporal "start an activity
   task", Conductor "poll and receive the next task");
@@ -153,8 +153,20 @@ def acquire(
     )
 
 
-def renew(ledger: LeaseLedger, *, now_iso: str) -> LeaseLedger:
-    """Heartbeat: prove the current owner is alive without touching anything else."""
+def renew(
+    ledger: LeaseLedger,
+    *,
+    now_iso: str,
+    owner_execution: str | None = None,
+) -> LeaseLedger:
+    """Heartbeat: prove the current owner is alive without touching anything else.
+
+    Fencing (F2): when the caller hands in its own ``owner_execution`` identity, a lease
+    already stamped with a DIFFERENT execution id means ownership moved (a reclaim after
+    a lapse) — the stale owner's heartbeat is refused as a no-op, never applied.
+    """
+    if owner_execution is not None and ledger.execution_id != owner_execution:
+        return ledger
     return dataclasses.replace(ledger, updated_at=now_iso)
 
 
@@ -163,8 +175,16 @@ def mark_done(
     *,
     execution_id: str | None = None,
     now_iso: str,
+    owner_execution: str | None = None,
 ) -> LeaseLedger:
-    """Settle the current iteration (success path or terminalization bookkeeping)."""
+    """Settle the current iteration (success path or terminalization bookkeeping).
+
+    Fencing (F2): with ``owner_execution`` given, only the execution holding the lease
+    may settle it; a superseded (zombie) owner's settle is a no-op, so its late decision
+    can never flip a live successor's ``running`` lease.
+    """
+    if owner_execution is not None and ledger.execution_id != owner_execution:
+        return ledger
     fields: dict = {"state": STATE_DONE, "updated_at": now_iso}
     if execution_id is not None:
         fields["execution_id"] = execution_id

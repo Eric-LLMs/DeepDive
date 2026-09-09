@@ -416,7 +416,7 @@
       row.classList.toggle("selected", selectedTask && selectedTask.task_id === t.task_id);
       const main = el("div", "research-row-main");
       main.appendChild(el("div", "research-row-title", t.name || t.task_id));
-      main.appendChild(el("div", "research-row-sub", `Stage ${t.stage} · ${t.status}${t.is_running ? " · RUNNING" : ""}${timeAgo(t.updated_at) ? ` · ${timeAgo(t.updated_at)}` : ""}`));
+      main.appendChild(el("div", "research-row-sub", `Stage ${t.stage} · ${t.status}${t.is_running ? " · RUNNING" : ""}${t.is_running && t.run_stale ? " · STALE" : ""}${timeAgo(t.updated_at) ? ` · ${timeAgo(t.updated_at)}` : ""}`));
       row.appendChild(main);
       const del = el("button", "research-row-del", "🗑");
       del.title = "Delete task";
@@ -513,7 +513,10 @@
     statusBody.innerHTML = "";
     const head = el("div", "research-status-head");
     head.appendChild(el("div", "research-status-name", detail.name || detail.task_id));
-    const sub = el("div", "research-status-sub", `${detail.status}${detail.is_running ? " — running" : ""}${detail.description ? ` — ${detail.description}` : ""}`);
+    const sub = el("div", "research-status-sub", `${detail.status}${detail.is_running ? " — running" : ""}${detail.is_running && detail.run_stale ? " — stale lease" : ""}${detail.description ? ` — ${detail.description}` : ""}`);
+    if (detail.is_running && detail.run_stale) {
+      sub.title = "Lease heartbeat lapsed: the executor crashed; a waking or arriving job reclaims the iteration (F3 read-only badge — no manual repair needed)";
+    }
     head.appendChild(sub);
     statusBody.appendChild(head);
     const banner = renderLastBlock(detail);

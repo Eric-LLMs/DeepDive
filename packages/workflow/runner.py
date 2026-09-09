@@ -167,25 +167,45 @@ async def drive_iteration(deps: RunnerDeps, req: IterationRequest) -> IterationO
     value: str | None = None
     interrupted_by_cancel = False
     while True:
-        result, error, was_cancelled = await _execute_once(deps, req, attempt)
+        result, error, was_cancelled = await _execute_once(deps, req, attempt, execution_id)
         if error is not None:
             transient = deps.retry.is_transient(error)
             if deps.retry.should_retry(error, attempt):
                 attempt += 1
+                prev_execution = execution_id
                 execution_id = f"{req.run_id}:{req.index}:{attempt}"
-                deps.store.atomic(
-                    lambda ledger: renew(
-                        dataclasses.replace(
-                            ledger, attempt=attempt, state=STATE_RUNNING,
-                            execution_id=execution_id,
-                        ),
-                        now_iso=_now_iso(),
+
+                def _rearm(
+                    ledger: LeaseLedger, _prev: str = prev_execution,
+                    _new: str = execution_id, _attempt: int = attempt,
+                ) -> LeaseLedger:
+                    if ledger.execution_id != _prev:
+                        return ledger  # fenced: ownership moved while we were down
+                    return dataclasses.replace(
+                        ledger, attempt=_attempt, state=STATE_RUNNING,
+                        execution_id=_new, updated_at=_now_iso(),
                     )
-                )
+
+                deps.store.atomic(_rearm)
+                if _ownership_lost(deps, execution_id):
+                    return _dropped(
+                        req, counters,
+                        "ownership lost (reclaimed by a successor) during retry re-arm",
+                    )
                 await asyncio.sleep(deps.retry.wait_s(attempt))
                 continue
             # Retries exhausted OR non-transient: settle the ledger either way.
-            deps.store.atomic(lambda ledger: mark_done(ledger, now_iso=_now_iso()))
+            deps.store.atomic(
+                lambda ledger: mark_done(
+                    ledger, now_iso=_now_iso(), owner_execution=execution_id
+                )
+            )
+            if _ownership_lost(deps, execution_id):
+                # A zombie's failure outcome must not terminalize a live successor's run.
+                return _dropped(
+                    req, counters,
+                    f"ownership lost while settling failed iteration: {error}",
+                )
             reason = (
                 f"transient failures exhausted after {attempt} attempt(s): {error}"
                 if transient else f"iteration failed: {error}"
@@ -233,7 +253,15 @@ async def drive_iteration(deps: RunnerDeps, req: IterationRequest) -> IterationO
 
     # ── 4. settle: continue marker or terminal outcome, hook gets the last look ─
     if grade.state is None:
-        deps.store.atomic(lambda ledger: mark_done(ledger, now_iso=_now_iso()))
+        deps.store.atomic(
+            lambda ledger: mark_done(
+                ledger, now_iso=_now_iso(), owner_execution=execution_id
+            )
+        )
+        if _ownership_lost(deps, execution_id):
+            return _dropped(
+                req, counters, "ownership lost during settle (successor reclaimed)"
+            )
         await deps.publisher.publish(kind="continue", revision=None)
         return IterationOutcome(
             state=WorkflowState.RUNNING, action="continue",
@@ -254,7 +282,15 @@ async def drive_iteration(deps: RunnerDeps, req: IterationRequest) -> IterationO
         if rewritten is not None:
             grade = rewritten
         if grade.state is None:  # the hook turned the stop back into a continuation
-            deps.store.atomic(lambda ledger: mark_done(ledger, now_iso=_now_iso()))
+            deps.store.atomic(
+                lambda ledger: mark_done(
+                    ledger, now_iso=_now_iso(), owner_execution=execution_id
+                )
+            )
+            if _ownership_lost(deps, execution_id):
+                return _dropped(
+                    req, counters, "ownership lost during hook-rewritten settle"
+                )
             return IterationOutcome(
                 state=WorkflowState.RUNNING, action="continue",
                 run_id=req.run_id, index=req.index, attempt=attempt,
@@ -264,7 +300,17 @@ async def drive_iteration(deps: RunnerDeps, req: IterationRequest) -> IterationO
             )
 
     validate_transition(WorkflowState.RUNNING, grade.state)
-    deps.store.atomic(lambda ledger: mark_done(ledger, now_iso=_now_iso()))
+    deps.store.atomic(
+        lambda ledger: mark_done(
+            ledger, now_iso=_now_iso(), owner_execution=execution_id
+        )
+    )
+    if _ownership_lost(deps, execution_id):
+        # The settle above was fenced: our outcome is stale — the successor owns the
+        # fate. Do NOT publish, do NOT return a terminal decision.
+        return _dropped(
+            req, counters, "ownership lost before terminal settle (decision discarded)"
+        )
     await deps.publisher.publish(kind=grade.state.value, revision=None)
     return IterationOutcome(
         state=grade.state, action=grade.state.value,
@@ -276,10 +322,14 @@ async def drive_iteration(deps: RunnerDeps, req: IterationRequest) -> IterationO
 
 
 # ── one attempt: heartbeat + cooperative cancel around the black box ─────────
-async def _execute_once(deps: RunnerDeps, req: IterationRequest, attempt: int):
+async def _execute_once(
+    deps: RunnerDeps, req: IterationRequest, attempt: int, execution_id: str | None = None
+):
     cancel_event = asyncio.Event()
     stop = asyncio.Event()
-    watcher = asyncio.create_task(_lease_watcher(deps, req, stop, cancel_event))
+    watcher = asyncio.create_task(
+        _lease_watcher(deps, req, stop, cancel_event, execution_id)
+    )
     prompt = deps.compose_prompt(req, attempt)
     run_task = asyncio.create_task(deps.executor.execute(TaskRequest(prompt=prompt)))
     cancel_waiter = asyncio.create_task(cancel_event.wait())
@@ -312,7 +362,7 @@ async def _execute_once(deps: RunnerDeps, req: IterationRequest, attempt: int):
 
 async def _lease_watcher(
     deps: RunnerDeps, req: IterationRequest, stop: asyncio.Event,
-    cancel_event: asyncio.Event,
+    cancel_event: asyncio.Event, execution_id: str | None = None,
 ) -> None:
     """Heartbeat the lease; flag an external cancel; stand down when ownership moved."""
     while not stop.is_set():
@@ -326,10 +376,40 @@ async def _lease_watcher(
             continue
         if ledger.run_id not in (None, req.run_id) or ledger.index != req.index:
             return  # ownership moved (new run / next iteration) — stop touching the ledger
+        if execution_id is not None and ledger.execution_id != execution_id:
+            return  # fenced: a successor reclaimed this iteration (attempt moved on)
         if ledger.cancel_requested:
             cancel_event.set()
             return
-        deps.store.atomic(lambda ledger: renew(ledger, now_iso=_now_iso()))
+        deps.store.atomic(
+            lambda ledger: renew(
+                ledger, now_iso=_now_iso(), owner_execution=execution_id
+            )
+        )
+
+
+# ── F2 fencing helpers ────────────────────────────────────────────────────────
+def _ownership_lost(deps: RunnerDeps, execution_id: str | None) -> bool:
+    """True once the on-disk lease no longer names our execution as its holder.
+
+    Read failures never fabricate a loss: only a definite different identity fences us.
+    """
+    if execution_id is None:
+        return False
+    try:
+        fresh = deps.store.read()
+    except Exception:  # noqa: BLE001 — a transient read error must not invent ownership loss
+        return False
+    return fresh.execution_id != execution_id
+
+
+def _dropped(
+    req: IterationRequest, counters: RunCounters, reason: str
+) -> IterationOutcome:
+    return IterationOutcome(
+        state=WorkflowState.RUNNING, action="dropped", dropped=True,
+        reason=reason, run_id=req.run_id, index=req.index, counters=counters,
+    )
 
 
 async def _snapshot(deps: RunnerDeps) -> Mapping[str, Any]:

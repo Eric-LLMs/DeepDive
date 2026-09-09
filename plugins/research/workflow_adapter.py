@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import enum
 import logging
 from collections.abc import Awaitable, Callable
@@ -46,9 +47,12 @@ from uuid import UUID
 logger = logging.getLogger(__name__)
 
 from plugins.research.plugin import (
+    OwnershipLost,
     ProjectLockError,
     RevisionConflictError,
     _now_iso,
+    clear_auto_run_fence,
+    set_auto_run_fence,
 )
 from plugins.research.workflow_spec import (
     AUTO_TURN_TASK,
@@ -870,6 +874,21 @@ class ResearchRunDriver:
             turn_index=turn_index, reason=self._translate_drop_reason(store, core_reason),
         )
 
+    def _fence_dropped_outcome(
+        self, service, owner_id, task_id, run_id, turn_index, reason
+    ) -> DriverOutcome:
+        """Fold a fenced (zombie) execution into a silent drop — the lease fence tripped
+        after a successor reclaimed this iteration: the successor owns the fate, so this
+        job writes NOTHING and reports no verdict."""
+        try:
+            state = observe_run_state(service.read_project(owner_id, task_id), run_id)
+        except Exception:  # noqa: BLE001 - task may have been deleted under us
+            state = RunState.IDLE
+        return DriverOutcome(
+            state=state, action="dropped", dropped=True, run_id=run_id,
+            turn_index=turn_index, reason=reason,
+        )
+
     def _finalize_pre_turn_cancel(
         self, service, owner_id: UUID, task_id: str, *, run_id: str, turn_index: int,
         execution_id: str | None,
@@ -1181,6 +1200,9 @@ class ResearchRunDriver:
         # Fresh authoritative facts for grading; also remembered so the terminal
         # translation can restate stop texts in the historical human-visible words.
         facts_box: dict[str, Any] = {"stage": project.get("stage", "DISCOVER"), "pending": 0}
+        # Fence tokens minted per attempt in ``compose_prompt`` (see there); reset in
+        # the ``finally`` below so post-return worker settle writes are never fenced.
+        _fence_tokens: list[contextvars.Token] = []
 
         def business_facts() -> dict[str, Any]:
             fresh = service.read_project(owner_id, task_id)
@@ -1194,6 +1216,16 @@ class ResearchRunDriver:
             }
 
         def compose_prompt(req, attempt) -> str:
+            # F2 fence: minted per attempt on THIS task, immediately before the core
+            # ``create_task(executor.execute(...))`` — asyncio snapshots the context, so
+            # every tool commit inside the turn carries this execution's identity. The
+            # authority seam (plugin.atomic_update_project) and the write-entry asserts
+            # refuse any commit whose fence no longer matches the on-disk lease: a
+            # reclaimed (zombie) execution can at most leave temp files, never finalize.
+            _fence_tokens.append(set_auto_run_fence(
+                owner_id=owner_id, task_id=task_id, run_id=run_id,
+                execution_id=f"{run_id}:{turn_index}:{attempt}",
+            ))
             return auto_turn_prompt(
                 task_name=project.get("name", task_id),
                 project_id=task_id,
@@ -1251,131 +1283,156 @@ class ResearchRunDriver:
         )
 
         try:
-            out = await drive_iteration(
-                deps, IterationRequest(run_id=run_id, index=turn_index, counters=counters)
-            )
-        except ExecutionFailed as ef:
-            # Non-transient fault: the core already settled the lease honestly —
-            # record the research terminalization, then fail the job row loudly.
-            self._terminal_error(
-                service, owner_id, task_id,
-                reason=f"turn failed: {ef.cause}",
-                outcome=DriverOutcome(
-                    state=RunState.RUNNING, action="continue", run_id=run_id,
-                    turn_index=turn_index, turn_attempt=ef.outcome.attempt,
-                    execution_id=ef.outcome.execution_id,
-                ),
-                cumulative=ef.outcome.counters.total_spend, consecutive=consecutive,
-            )
-            raise ef.cause
-        except RevisionConflictError:
-            # A competing job committed between our read and this CAS — it won.
-            return DriverOutcome(
-                state=RunState.RUNNING, action="dropped", reason="revision conflict (another job claimed)"
-            )
+            try:
+                out = await drive_iteration(
+                    deps, IterationRequest(run_id=run_id, index=turn_index, counters=counters)
+                )
+            except ExecutionFailed as ef:
+                if isinstance(ef.cause, OwnershipLost):
+                    # A tool-side write tripped the authority seam: our execution was
+                    # reclaimed while the turn ran — a zombie must NOT terminalize a
+                    # live successor's run. Fold to a silent drop.
+                    return self._fence_dropped_outcome(
+                        service, owner_id, task_id, run_id, turn_index,
+                        "execution fenced (OwnershipLost) during the turn",
+                    )
+                # Non-transient fault: the core already settled the lease honestly —
+                # record the research terminalization, then fail the job row loudly.
+                self._terminal_error(
+                    service, owner_id, task_id,
+                    reason=f"turn failed: {ef.cause}",
+                    outcome=DriverOutcome(
+                        state=RunState.RUNNING, action="continue", run_id=run_id,
+                        turn_index=turn_index, turn_attempt=ef.outcome.attempt,
+                        execution_id=ef.outcome.execution_id,
+                    ),
+                    cumulative=ef.outcome.counters.total_spend, consecutive=consecutive,
+                )
+                raise ef.cause
+            except RevisionConflictError:
+                # A competing job committed between our read and this CAS — it won.
+                return DriverOutcome(
+                    state=RunState.RUNNING, action="dropped", reason="revision conflict (another job claimed)"
+                )
+            except OwnershipLost as ol:
+                # Post-iteration commit raced a reclaim: ownership moved before we could
+                # settle — the successor owns the fate. Verdict discarded, no writes.
+                return self._fence_dropped_outcome(
+                    service, owner_id, task_id, run_id, turn_index,
+                    f"ownership lost before post-iteration settle: {ol}",
+                )
 
-        run_counters = out.counters
+            run_counters = out.counters
 
-        if out.dropped:
-            return self._dropped_outcome(
-                service, owner_id, task_id, run_id, turn_index, store, out.reason
-            )
-        if out.reason == "cancel requested before this iteration started":
-            # Pre-turn Stop observed by the contest: no execution ever ran.
-            return self._finalize_pre_turn_cancel(
-                service, owner_id, task_id, run_id=run_id, turn_index=turn_index,
-                execution_id=out.execution_id,
-            )
-        if out.cause == "transient_exhausted":
-            # Retries exhausted → a graded terminal stop (slot released, job succeeds
-            # with run.error — the run never silently retries forever).
-            return self._terminal_error(
-                service, owner_id, task_id,
-                reason=out.reason,
-                outcome=DriverOutcome(
-                    state=RunState.RUNNING, action="continue", run_id=run_id,
-                    turn_index=turn_index, turn_attempt=out.attempt,
+            if out.dropped:
+                return self._dropped_outcome(
+                    service, owner_id, task_id, run_id, turn_index, store, out.reason
+                )
+            if out.reason == "cancel requested before this iteration started":
+                # Pre-turn Stop observed by the contest: no execution ever ran.
+                return self._finalize_pre_turn_cancel(
+                    service, owner_id, task_id, run_id=run_id, turn_index=turn_index,
                     execution_id=out.execution_id,
-                ),
-                cumulative=run_counters.total_spend, consecutive=consecutive,
-            )
+                )
+            if out.cause == "transient_exhausted":
+                # Retries exhausted → a graded terminal stop (slot released, job succeeds
+                # with run.error — the run never silently retries forever).
+                return self._terminal_error(
+                    service, owner_id, task_id,
+                    reason=out.reason,
+                    outcome=DriverOutcome(
+                        state=RunState.RUNNING, action="continue", run_id=run_id,
+                        turn_index=turn_index, turn_attempt=out.attempt,
+                        execution_id=out.execution_id,
+                    ),
+                    cumulative=run_counters.total_spend, consecutive=consecutive,
+                )
 
-        if out.action == "continue":
-            # The core already flipped the lease to done; write the research-private
-            # meters and let the worker enqueue N+1.
-            self._persist_ledger(
-                service, owner_id, task_id,
-                patch={
-                    "turn_state": "done",
-                    "cumulative_cost_usd": run_counters.total_spend,
-                    "pricing_unknown_turns": run_counters.unknown_spend_count,
-                    "consecutive_no_progress": run_counters.consecutive_no_progress,
-                    "execution_id": out.execution_id,
-                    "next_scheduled": _now_iso(),
-                    "updated_at": _now_iso(),
-                },
+            if out.action == "continue":
+                # The core already flipped the lease to done; write the research-private
+                # meters and let the worker enqueue N+1.
+                self._persist_ledger(
+                    service, owner_id, task_id,
+                    patch={
+                        "turn_state": "done",
+                        "cumulative_cost_usd": run_counters.total_spend,
+                        "pricing_unknown_turns": run_counters.unknown_spend_count,
+                        "consecutive_no_progress": run_counters.consecutive_no_progress,
+                        "execution_id": out.execution_id,
+                        "next_scheduled": _now_iso(),
+                        "updated_at": _now_iso(),
+                    },
+                )
+                return DriverOutcome(
+                    state=RunState.RUNNING, action="continue",
+                    run_id=run_id, turn_index=turn_index, turn_attempt=out.attempt,
+                    execution_id=out.execution_id, progress=out.progress,
+                    cumulative_cost_usd=run_counters.total_spend, final_answer=out.value,
+                    next_turn_index=out.next_index,
+                    consecutive_no_progress=run_counters.consecutive_no_progress,
+                )
+
+            # ── graded terminal stop → research vocabulary ──
+            state = _GRADE_CAUSE_TO_RUN[out.cause]
+            tf = TurnFacts(
+                stage=facts_box["stage"], pending_overrides=facts_box["pending"],
+                cancel_requested=False, progress=out.progress,
+                consecutive_no_progress=consecutive, turn_index=turn_index,
+                cumulative_cost_usd=run_counters.total_spend,
+                max_turns=self.max_turns, max_no_progress=self.max_no_progress,
+                max_cost_usd=self.max_cost_usd,
             )
-            return DriverOutcome(
-                state=RunState.RUNNING, action="continue",
+            reason = _research_stop_text(out.cause, tf, run_counters.consecutive_no_progress)
+
+            # ── deterministic auto-settle (progressive runs only) ──
+            # A progressive run that would otherwise stop short of PUBLISH for a NON-human
+            # reason (no-progress stall or a turn/cost cap) is finished deterministically
+            # instead: walk the legal chain to PUBLISH recording gate diagnostics, then write
+            # an auto-settled report. Strict runs — and runs parked on a real pending human
+            # decision — keep the graded stop below. On any failure _try_settle returns None
+            # and we fall through to it.
+            if (
+                state in (RunState.STALLED, RunState.BLOCKED)
+                and out.cause != CAUSE_PENDING_SIGNAL
+                and facts_box["pending"] == 0
+            ):
+                settled = await self._try_settle(
+                    service, owner_id, task_id,
+                    run_id=run_id, turn_index=turn_index, turn_attempt=out.attempt,
+                    execution_id=out.execution_id,
+                    grade=Grade(state, reason, run_counters.consecutive_no_progress),
+                    cumulative=run_counters.total_spend, consecutive=consecutive,
+                )
+                if settled is not None:
+                    return settled
+
+            final_answer = out.value
+            if not final_answer:
+                final_answer = _terminal_message(state, reason)
+            outcome = DriverOutcome(
+                state=state, action=state.value,
                 run_id=run_id, turn_index=turn_index, turn_attempt=out.attempt,
                 execution_id=out.execution_id, progress=out.progress,
-                cumulative_cost_usd=run_counters.total_spend, final_answer=out.value,
-                next_turn_index=out.next_index,
+                cumulative_cost_usd=run_counters.total_spend, final_answer=final_answer,
+                reason=reason,
                 consecutive_no_progress=run_counters.consecutive_no_progress,
             )
-
-        # ── graded terminal stop → research vocabulary ──
-        state = _GRADE_CAUSE_TO_RUN[out.cause]
-        tf = TurnFacts(
-            stage=facts_box["stage"], pending_overrides=facts_box["pending"],
-            cancel_requested=False, progress=out.progress,
-            consecutive_no_progress=consecutive, turn_index=turn_index,
-            cumulative_cost_usd=run_counters.total_spend,
-            max_turns=self.max_turns, max_no_progress=self.max_no_progress,
-            max_cost_usd=self.max_cost_usd,
-        )
-        reason = _research_stop_text(out.cause, tf, run_counters.consecutive_no_progress)
-
-        # ── deterministic auto-settle (progressive runs only) ──
-        # A progressive run that would otherwise stop short of PUBLISH for a NON-human
-        # reason (no-progress stall or a turn/cost cap) is finished deterministically
-        # instead: walk the legal chain to PUBLISH recording gate diagnostics, then write
-        # an auto-settled report. Strict runs — and runs parked on a real pending human
-        # decision — keep the graded stop below. On any failure _try_settle returns None
-        # and we fall through to it.
-        if (
-            state in (RunState.STALLED, RunState.BLOCKED)
-            and out.cause != CAUSE_PENDING_SIGNAL
-            and facts_box["pending"] == 0
-        ):
-            settled = await self._try_settle(
+            self._finish_run(
                 service, owner_id, task_id,
-                run_id=run_id, turn_index=turn_index, turn_attempt=out.attempt,
-                execution_id=out.execution_id,
-                grade=Grade(state, reason, run_counters.consecutive_no_progress),
-                cumulative=run_counters.total_spend, consecutive=consecutive,
+                outcome=outcome, reason=reason or "",
+                cumulative_cost_usd=run_counters.total_spend,
+                consecutive_no_progress=run_counters.consecutive_no_progress,
             )
-            if settled is not None:
-                return settled
-
-        final_answer = out.value
-        if not final_answer:
-            final_answer = _terminal_message(state, reason)
-        outcome = DriverOutcome(
-            state=state, action=state.value,
-            run_id=run_id, turn_index=turn_index, turn_attempt=out.attempt,
-            execution_id=out.execution_id, progress=out.progress,
-            cumulative_cost_usd=run_counters.total_spend, final_answer=final_answer,
-            reason=reason,
-            consecutive_no_progress=run_counters.consecutive_no_progress,
-        )
-        self._finish_run(
-            service, owner_id, task_id,
-            outcome=outcome, reason=reason or "",
-            cumulative_cost_usd=run_counters.total_spend,
-            consecutive_no_progress=run_counters.consecutive_no_progress,
-        )
-        return outcome
+            return outcome
+        finally:
+            # The fence must never outlive this execution: the worker's post-return
+            # settle writes (next-turn enqueue bookkeeping, mirrors) belong to no
+            # iteration owner. Tokens were minted in THIS task's context, so
+            # resetting them here is well-formed; already-ended run_task snapshots
+            # simply vanish.
+            for token in reversed(_fence_tokens):
+                with contextlib.suppress(ValueError):
+                    clear_auto_run_fence(token)
 
     def _terminal_error(
         self, service, owner_id, task_id, *, reason, outcome, cumulative, consecutive

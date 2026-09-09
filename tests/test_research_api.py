@@ -17,6 +17,7 @@ The router is exercised through a minimal FastAPI app (no main-app lifespan / DB
 """
 from __future__ import annotations
 
+import time as _time
 import uuid
 from types import SimpleNamespace
 
@@ -496,3 +497,104 @@ class TestSessionIsolation:
         monkeypatch.setattr(sessions_module, "list_sessions", _fake_list_sessions)
         result = await sessions_module.get_sessions(user=_auth(USER), q=None)
         assert [s["id"] for s in result["sessions"]] == [normal_id]
+
+
+# ── 8. Stop route wake semantics (F1-a facts + F1-b state-machine nudge) ────
+from api.deps import get_task_queue as _get_task_queue  # noqa: E402
+
+
+class _FakeQueue:
+    def __init__(self, fail: bool = False):
+        self.jobs: list[tuple[str, dict]] = []
+        self.fail = fail
+
+    async def enqueue(self, kind, payload, *, user_id=None):
+        if self.fail:
+            raise ConnectionError("redis down")
+        self.jobs.append((kind, payload))
+
+
+class TestCancelWake:
+    def _setup(self, env):
+        client = _make_client(env.drive, env.scratch)
+        task_id = client.post("/research/tasks", json={"title": "wake"}).json()["task_id"]
+        service = ResearchService(env.drive, env.scratch)
+        return client, service, task_id
+
+    def _client_with_queue(self, env, queue):
+        client = _make_client(env.drive, env.scratch)
+        client.app.dependency_overrides[_get_task_queue] = lambda: queue
+        return client
+
+    def test_live_lease_no_wake_reports_facts(self, env):
+        client, service, task_id = self._setup(env)
+        run = service.begin_run(USER, task_id)
+        rid = run["run_id"]
+        service.request_cancel(USER, task_id)  # not via route — set the stage
+        service.set_driver_checkpoint(
+            USER, task_id,
+            patch={"run_id": rid, "turn_index": 2, "turn_attempt": 1,
+                   "turn_state": "running", "execution_id": f"{rid}:2:1"})
+        queue = _FakeQueue()
+        client = self._client_with_queue(env, queue)
+        body = client.post(f"/research/tasks/{task_id}/cancel").json()
+        assert body["effective"] == "live" and body["wake_enqueued"] is False
+        assert body["cancel_requested"] is True and body["is_running"] is True
+        assert body["heartbeat_age_s"] is not None
+        assert queue.jobs == []  # a live owner is never double-woken
+
+    def test_done_lease_wakes_next_index(self, env):
+        client, service, task_id = self._setup(env)
+        run = service.begin_run(USER, task_id)
+        rid = run["run_id"]
+        service.set_driver_checkpoint(
+            USER, task_id,
+            patch={"run_id": rid, "turn_index": 3, "turn_attempt": 1,
+                   "turn_state": "done", "execution_id": f"{rid}:3:1"})
+        queue = _FakeQueue()
+        client = self._client_with_queue(env, queue)
+        body = client.post(f"/research/tasks/{task_id}/cancel").json()
+        assert body["effective"] == "pending-arrival" and body["wake_enqueued"] is True
+        assert body["turn_index"] == 4  # NEXT expected index (acquire's done rule)
+        kind, payload = queue.jobs[0]
+        assert kind == "research_drive"
+        assert payload["run_id"] == rid and payload["turn_index"] == 4
+        assert payload["task_id"] == task_id and payload["model"] is None
+
+    def test_stale_lease_wakes_same_index(self, env):
+        client, service, task_id = self._setup(env)
+        run = service.begin_run(USER, task_id)
+        rid = run["run_id"]
+        service.set_driver_checkpoint(
+            USER, task_id,
+            patch={"run_id": rid, "turn_index": 2, "turn_attempt": 1,
+                   "turn_state": "running", "execution_id": f"{rid}:2:1"})
+        # The owner crashes: heartbeat frozen 400s in the past.
+        stale_iso = _time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_time.time() - 400))
+        service.atomic_update_project(
+            USER, task_id,
+            lambda p: p["driver"].update(updated_at=stale_iso))
+        queue = _FakeQueue()
+        client = self._client_with_queue(env, queue)
+        body = client.post(f"/research/tasks/{task_id}/cancel").json()
+        # request_cancel must NOT re-stamp the lease heartbeat — a Stop that made a
+        # crashed slot look fresh would strand the flag again (the W1 orphan bug).
+        assert service.read_project(USER, task_id)["driver"]["updated_at"] == stale_iso
+        assert body["effective"] == "pending-reclaim" and body["wake_enqueued"] is True
+        assert body["turn_index"] == 2  # SAME index — reclaim, never a blind +1
+        assert queue.jobs[0][1]["turn_index"] == 2
+        assert body["heartbeat_age_s"] > 150
+
+    def test_enqueue_failure_terminalizes_cancelled(self, env):
+        client, service, task_id = self._setup(env)
+        run = service.begin_run(USER, task_id)
+        rid = run["run_id"]
+        queue = _FakeQueue(fail=True)
+        client = self._client_with_queue(env, queue)
+        body = client.post(f"/research/tasks/{task_id}/cancel").json()
+        assert body["effective"].startswith("terminalized")
+        project = service.read_project(USER, task_id)
+        assert project.get("active_run") is None
+        assert project["last_block"]["kind"] == "cancelled"
+        assert project["last_block"]["run_id"] == rid
