@@ -412,3 +412,54 @@ async def test_two_auto_turns_same_index_single_winner(service):
     project = service.read_project(OWNER, "rr")
     assert project["driver"]["run_id"] == rid
     assert project.get("active_run") is not None
+
+
+# ── Stop-latency fix (path 1): the lease watcher survives a transient renew failure ──
+class _FakeLedger:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _FlakyStore:
+    """read() walks a scripted ledger list (last one sticks); the first atomic() —
+    the heartbeat renew — raises once, mimicking a drvfs-interrupted ProjectLockError."""
+
+    def __init__(self, read_results):
+        self._reads = list(read_results)
+        self.atomic_calls = 0
+
+    def read(self):  # sync, exactly as the watcher calls it
+        if len(self._reads) > 1:
+            return self._reads.pop(0)
+        return self._reads[0]
+
+    def atomic(self, fn):  # sync
+        self.atomic_calls += 1
+        if self.atomic_calls == 1:
+            raise RuntimeError("drvfs lock — transient renew failure")
+
+
+def test_watcher_survives_transient_renew_and_still_consumes_cancel():
+    from types import SimpleNamespace
+
+    from workflow.runner import _lease_watcher
+
+    run_id, index, exec_id = "rw", 1, "rw:1:1"
+    live = _FakeLedger(run_id=run_id, index=index, execution_id=exec_id,
+                       cancel_requested=False)
+    cancelled = _FakeLedger(run_id=run_id, index=index, execution_id=exec_id,
+                            cancel_requested=True)
+    store = _FlakyStore([live, cancelled])
+    deps = SimpleNamespace(store=store, lease=SimpleNamespace(refresh_s=0.001))
+    req = SimpleNamespace(run_id=run_id, index=index)
+    stop, cancel_event = asyncio.Event(), asyncio.Event()
+
+    # Without the guard the raised RuntimeError escapes the finally (which only
+    # suppresses CancelledError) and tears down the iteration — stranding a RUNNING
+    # slot with an unconsumed cancel flag. With the guard the watcher retries next
+    # refresh, sees the flag, and hands off to the cooperative stop.
+    async def _drive():
+        await _lease_watcher(deps, req, stop, cancel_event, exec_id)
+
+    asyncio.run(_drive())  # returns normally iff the renew failure was contained
+    assert cancel_event.is_set(), "the transient renew failure must not strand the cancel"

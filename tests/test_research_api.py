@@ -514,6 +514,48 @@ class _FakeQueue:
         self.jobs.append((kind, payload))
 
 
+class TestInteractiveTurnRelease:
+    """Stop-race fix (path 2): ``_maybe_continue_research`` must release the active-run
+    slot BEFORE publishing the terminal event, so a monitor refetch triggered by that
+    event can never observe a stale RUNNING slot and re-green the desktop Run button."""
+
+    async def test_cancelled_turn_pops_slot_before_publishing_event(self, env):
+        from api.routers.chat import _maybe_continue_research
+
+        client = _make_client(env.drive, env.scratch)
+        task_id = client.post("/research/tasks", json={"title": "stop"}).json()["task_id"]
+        service = ResearchService(env.drive, env.scratch)
+        rid = service.begin_run(USER, task_id, session_id="s")["run_id"]
+        service.request_cancel(USER, task_id)  # sets driver.cancel_requested
+
+        order: list[str] = []
+        real_end_run = service.end_run
+
+        def end_run_spy(*a, **k):
+            order.append("end_run")
+            return real_end_run(*a, **k)
+
+        service.end_run = end_run_spy
+
+        async def publish_spy(user_id, task_id, *, kind="state"):
+            order.append(f"publish:{kind}")
+            return service.read_project(user_id, task_id)["project_revision"]
+
+        service.publish_change = publish_spy
+
+        result = await _maybe_continue_research(
+            service, _FakeQueue(), user_id=USER, task_id=task_id,
+            run_id=rid, session_id="s", channel=(None, None, None),
+        )
+
+        assert result is False
+        # The slot is released…
+        assert service.read_project(USER, task_id).get("active_run") is None
+        # …strictly before the terminal event lands (the fix), so any refetch the event
+        # triggers already sees ``is_running=false``. Order, not just final state, is the point.
+        assert order == ["end_run", "publish:run.cancelled"]
+
+
 class TestCancelWake:
     def _setup(self, env):
         client = _make_client(env.drive, env.scratch)

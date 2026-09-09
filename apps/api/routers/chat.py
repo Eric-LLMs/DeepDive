@@ -200,13 +200,26 @@ async def _maybe_continue_research(
         with contextlib.suppress(Exception):
             await service.publish_change(user_id, task_id, kind=kind)
 
+    async def _release_and_publish(kind: str) -> None:
+        # Release the active-run slot BEFORE publishing the terminal event. The caller
+        # runs ``end_run`` only after this returns, so a monitor refetch triggered by the
+        # event could otherwise observe a still-RUNNING slot (the pop hadn't committed),
+        # re-green the desktop Run button, and then never be corrected — end_run's own
+        # revision bump publishes no event. Popping first guarantees any refetch sees
+        # ``is_running=false``. end_run is idempotent, so the caller's later end_run no-ops.
+        try:
+            service.end_run(user_id, task_id)
+        except Exception as exc:  # noqa: BLE001 - the caller still attempts the release
+            logger.warning("research pre-event slot release failed: %s", exc)
+        await _publish_async(kind)
+
     ledger = service.get_driver_checkpoint(user_id, task_id)
     if ledger.get("cancel_requested"):
-        await _publish_async("run.cancelled")
+        await _release_and_publish("run.cancelled")
         return False
     project = service.read_project(user_id, task_id)
     if project.get("stage") == "PUBLISH":
-        await _publish_async("run.finished")
+        await _release_and_publish("run.finished")
         return False
     if service.pending_overrides(user_id, task_id):
         # A run parked on a gate must explain itself in the task chat first: write the
@@ -217,7 +230,7 @@ async def _maybe_continue_research(
                 await service.emit_gate_notes(SessionLocal, user_id, task_id, session_id)
             except Exception as exc:  # noqa: BLE001 - never fail the parking decision
                 logger.warning("research gate note emission failed: %s", exc)
-        await _publish_async("run.blocked")
+        await _release_and_publish("run.blocked")
         return False
 
     # Persist the interactive turn (turn 0) as the chain's starting ledger, then schedule

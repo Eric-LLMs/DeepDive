@@ -381,11 +381,19 @@ async def _lease_watcher(
         if ledger.cancel_requested:
             cancel_event.set()
             return
-        deps.store.atomic(
-            lambda ledger: renew(
-                ledger, now_iso=_now_iso(), owner_execution=execution_id
+        # The heartbeat is advisory: a transient lock/IO failure renewing the lease must
+        # NOT tear down the iteration. It propagates through the ``finally`` (which only
+        # suppresses CancelledError), killing the turn and stranding a RUNNING slot whose
+        # cancel flag then has no in-process consumer — the exact "stop → can't re-run"
+        # dead-end. Retry next refresh instead; the next ``read`` still picks the flag up.
+        try:
+            deps.store.atomic(
+                lambda ledger: renew(
+                    ledger, now_iso=_now_iso(), owner_execution=execution_id
+                )
             )
-        )
+        except Exception:  # noqa: BLE001 — advisory heartbeat; keep the turn alive
+            continue
 
 
 # ── F2 fencing helpers ────────────────────────────────────────────────────────
