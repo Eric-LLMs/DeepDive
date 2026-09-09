@@ -1870,7 +1870,8 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     video, and audio play in window.
   - **Research tab** (`research.js`) — a **Research** tab joins the sidebar (the chat header also
     gains a **＋ Research** button, §17). The sidebar holds the **task list** — stage, status,
-    updated time, a live **RUNNING** badge (`is_running` from the API), and a **🗑** delete that
+    updated time, a live **RUNNING** badge (`is_running` from the API, with a **STALE** tag when
+    the lease heartbeat has lapsed — §17 F3), and a **🗑** delete that
     confirms first and surfaces a 409's reason verbatim — above a slimmed **status pane**
     (`loadStatus`) that renders name/status, the stage-DAG nodes, gates, and any terminal
     **`last_block` banner** (`.rtv-banner`); selecting a task opens its dedicated session in the
@@ -1896,11 +1897,16 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     **⏹ Stop** button (`.run-ctl.run-stop`) shown while a run is in flight — `requestStop` →
     `POST …/cancel`, "Stop requested — finishing the current step…" — and **🗑 Delete task**. **Run
     is click-to-run** — it opens the task's dedicated session and auto-sends the run instruction.
-    The controls stay disabled for the whole background chain: `syncRunCtl` mirrors Stop off Run,
+    Run state is tracked **per task**: the renderer keeps a `runningTasks` set keyed by `task_id`,
+    fed by the authoritative `detail.is_running` on each task view and by the per-task
+    `researchRunActive` / `researchReleaseIfIdle` chat hooks — so one task's in-flight run never
+    disables another task's controls, and Run/Stop/Delete reflect only the selected task. The
+    controls stay disabled for the whole background chain: `syncRunCtl` mirrors Stop off Run,
     the chat `done` frame's `research_continuing` keeps Run/Delete disabled until a turn really
     ends, task-refresh `is_running` disables them, and `researchReleaseIfIdle` re-enables once the
-    chain drops to idle. A run parked on an un-clearable gate renders **Approve / Reject** cards
-    (`.research-gate-card`, `rga-*`) in the task's chat under the agent's ask
+    chain drops to idle. A failed task-list fetch shows an inline **↻ Retry** instead of stranding
+    the panel until a full reload. A run parked on an un-clearable gate renders **Approve / Reject**
+    cards (`.research-gate-card`, `rga-*`) in the task's chat under the agent's ask
     (`showResearchGateCard`): Approve `POST …/approvals/{id}` then auto-resumes the run, Reject
     keeps the gate FAIL and asks the agent for a different approach. The **chat header** is
     two-layer: a top control bar (`#chat-topbar`: session actions + window controls — **New chat**
@@ -2366,7 +2372,12 @@ from an older run are skipped (never re-shown) while still consuming the cursor.
 allows one live run at a time, **`is_running` stays true across the whole background chain**
 (surfaced in every task view), a fresh chat-triggered run while one is active is a **409
 conflict**, and the chat `done` frame carries `research_continuing: true` when the worker keeps
-chaining, so a client keeps run controls disabled.
+chaining, so a client keeps run controls disabled. When the interactive turn's handoff decision
+finds the chain over instead — cancel requested, stage at PUBLISH, or a pending gate override
+parking the run — the API **releases the slot before publishing the terminal event**
+(`end_run`, then the `run.cancelled` / `run.finished` / `run.blocked` SSE frame): an
+event-triggered client refetch races the publish, so ordering guarantees the refetch already
+sees `is_running = false` and the Run control re-enables in the same round-trip.
 
 **One-writer atomicity across processes.** Task state mutations go through
 `ResearchService.atomic_update_project` — a single-writer primitive (a cross-process `portalocker`
@@ -2377,11 +2388,107 @@ timeout is graded transient. **Runs survive crashes**: the driver heartbeat refr
 `running` ledger older than 150 s is treated as a crashed predecessor and **re-run idempotently**
 on the same turn (`turn_attempt + 1`), a fresh `running` ledger is a live twin and is dropped, and
 `begin_run` adopts an `active_run` older than the 2 h stale window and ABORTs its orphaned
-executions — so the delete guard can never block forever.
+executions — so the delete guard can never block forever. Staleness is also **observable without
+being actionable**: task list/detail carry a read-only `run_stale` flag (a RUNNING slot whose
+lease heartbeat has lapsed), rendered as a "STALE" badge — a pure derivation that never writes and
+never touches the 2 h adoption semantics; recovery stays automatic via reclaim. In-turn writes by
+an auto-run execution are fenced by the same identity (§19.3): once a reclaim moves the lease on,
+the execution's commits raise `OwnershipLost` and the job drops silently instead of dirty-writing
+authoritative state.
 
-**Cooperative Stop & human gate decisions.** `POST /research/tasks/{id}/cancel` requests a
-**cooperative stop** — it sets `driver.cancel_requested`, never kills a mid-write, is idempotent,
-and returns `cancel_requested` + `is_running`. When the agent can't clear a stage gate it calls
+**Stop design — a flag, never a signal.** Stopping a research run is the single most
+safety-critical transition in the module, because the writer of the stop (an API process, a UI
+click) and the consumer of the stop (a worker turn, possibly on another machine, possibly
+*already dead*) share nothing but the durable lease ledger. The design therefore treats Stop as
+**a persisted cooperative flag plus a guaranteed consumer plan** — no signals, no kills, no
+mid-write interruption, and no reliance on anyone being alive to notice.
+
+*The write.* `request_cancel` flips one field, `driver.cancel_requested`, through the same
+portalocker CAS that owns all task state; it is idempotent (a second Stop is a no-op on the
+state, though it re-plans consumption). It carries `keep_lease_heartbeat`: the commit preserves
+the *previous* `updated_at` instead of re-stamping it. `updated_at` is the **owner's liveness
+proof** — a foreign write that refreshed it would make a crashed slot look freshly-lived, which
+is precisely the W1 orphan bug: the slot then appears to have a live consumer, no wake job is
+minted, and the flag strands forever.
+
+*The consumption plan.* A Stop flag is only ever acted on by a job that **arrives** and runs
+`acquire`; the cancel endpoint therefore derives, purely from on-disk lease facts, who that
+consumer will be, mirroring the `acquire` state machine exactly (never a blind `+1`):
+
+| Lease state | Consumer | Wake job |
+|---|---|---|
+| live `RUNNING` (heartbeat fresh) | the holder's own `_lease_watcher` applies the stop within one refresh interval (`refresh_s = 20`) | none — minting one would only produce a live-duplicate drop |
+| stale `RUNNING` (holder crashed) | a wake job replaying the **same** index: `acquire` reclaims it and terminalizes on the flag | 1 |
+| settled `done` (between iterations, nothing chained) | a wake job for the **next expected** index: `acquire` grants it, sees the flag, terminalizes **without executing** | 1 |
+| no active run / ledger belongs to another run | nothing to wake — the flag resets with the next `begin_run` (edition isolation) | none |
+
+```text
+        POST /research/tasks/{id}/cancel
+        request_cancel: flag=1, heartbeat preserved
+                     │
+        plan_cancel_wake(project) ──── pure read of the lease ledger
+                     │
+     ┌───────────────┼───────────────────┬──────────────────┐
+     ▼               ▼                   ▼                  ▼
+  live RUNNING   stale RUNNING       settled DONE       idle / foreign
+  no mint        mint wake          mint wake           flag resets at
+  (owner's       index = SAME       index = NEXT        next begin_run
+   watcher)      (reclaim →         (grant → cancel
+                  cancel)            without executing)
+     │               │                   │
+     └─────── enqueue fails & slot RUNNING ──► fenced abort_run(CANCELLED)
+```
+
+Two guarantees make this safe to fire blindly. **A duplicate wake job is always harmless** —
+`acquire` drops it (live twin / stale twin / out-of-order index) — so the endpoint never needs
+to coordinate with itself across retried clicks. And **queue probing is deliberately not
+consulted**: a peek at the queue can only inform diagnostics, because between probe and enqueue
+the lease can move; correctness rides solely on the lease CAS, the one atomic authority.
+
+*Mid-turn consumption.* Inside a live holder, the watcher reads the flag on its next refresh and
+sets the cancel event; `_execute_once` races it against the turn task, cancels the task
+cooperatively at the step boundary, and grading ORs `business_facts ∪ ledger flag ∪
+interrupted_by_cancel` so a cancelled run **cannot accidentally continue** — if the policy chain
+produces no terminal grade, the runner forces `CANCELLED`. Terminalization then follows the
+common settle path: `last_block = {kind: "cancelled", …}`, lease `mark_done` (fenced), slot
+released, `run.cancelled` published. A zombie whose iteration was reclaimed mid-stop folds to a
+silent drop (§19.3) — its cancel verdict never terminalizes a live successor's run.
+
+*The crash-signature closures.* **W1** (flag stranded by a heartbeat re-stamped by a foreign
+write) is prevented by `keep_lease_heartbeat` above. **W3** is the remaining hole: Stop settled
+the lease (`done` + flag) but the process died *before* the terminalization commit landed — a
+slot that is RUNNING yet **not resumable** (the lease is already settled, so no reclaim will
+ever come). `begin_run` recognizes the signature (same-run ledger, flag set, `turn_state=done`,
+`last_block` belonging to a different run) and **finalizes it inside the same CAS commit
+immediately — no 2 h wait** — recording `last_block: cancelled`, then adopts. Ordinary
+crashed-but-resumable slots keep the stale-window semantics untouched (red line: fast adoption
+is reserved for the settled-cancel signature, never for a live-looking resumable slot).
+
+*The interactive chain-end ordering.* A Stop can also arrive while the run is still in its
+**chat-handoff turn** (turn 0, before any worker job exists). The `/chat` continuation checks
+the fresh ledger first: `cancel_requested` → release-then-publish — `end_run` **before** the
+`run.cancelled` SSE event. The ordering is the contract: an event-triggered client refetch races
+the publish itself, and `end_run`'s own revision bump emits no event, so a publish-first order
+can leave the desktop seeing `is_running = true` with no later frame to correct it — the exact
+green-button strand this closed. The same release-before-publish applies to the finished
+(`stage == PUBLISH`) and blocked (`pending_overrides`) chain-ends.
+
+*The response contract.* The cancel endpoint answers with the decision plus the **F1-a facts**
+that make the stop observable: `cancel_requested`, `is_running` (after planning), `effective`
+(`live` / `pending-reclaim` / `pending-arrival` / idle note / `terminalized (wake enqueue
+failed)`), `wake_enqueued`, `wake_reason`, the planned `turn_index`, and `heartbeat_age_s`
+(`null` when unparseable — "unknown", never a broken JSON number). If the wake enqueue itself
+fails while the slot is still RUNNING, the endpoint terminalizes the run as CANCELLED through
+the fenced `abort_run` path rather than return success over a slot no executor will ever settle.
+
+*The front end.* The **⏹ Stop** button exists only while *this task* is running (§15 per-task
+set), `requestStop` fires the POST and toasts "Stop requested — finishing the current step…" —
+it never locally flips the control state. Release of the Run control waits for server truth:
+the monitor's `run.cancelled` frame, the per-task `researchReleaseIfIdle`, or the next detail
+fetch's `is_running = false`; the terminal `last_block` banner ("stopped") explains the stop on
+re-open.
+
+**Human gate decisions.** When the agent can't clear a stage gate it calls
 `research_gate request_override`, which writes a **PENDING** row to `approvals.json` and parks the
 run BLOCKED while any override is pending; a human resolves it via
 `POST /research/tasks/{id}/approvals/{approval_id}` with `{"approve": bool}` (a non-PENDING id is
@@ -2430,7 +2537,7 @@ transition's gate has not passed, i.e. the run's failure control flow is one of 
 - **strict** — an un-passed guard gate **blocks** the transition: `research_state transition_stage`
   refuses, and the run stalls at the stage until the agent actually fixes the underlying work and the
   gate passes, or the agent calls `research_gate request_override` and a human Approve flips the gate
-  to OVERRIDE (the Cooperative-Stop paragraph above). A strict run that stalls or hits a cap stops
+  to OVERRIDE (the Stop-design paragraph above). A strict run that stalls or hits a cap stops
   graded (STALLED / BLOCKED) and never advances on gaps — a failed gate there is a genuine
   human-decision point.
 - **progressive** — a FAIL loses its blocking consequence but not its record: the deterministic
@@ -2813,6 +2920,32 @@ Reclaim-on-stale-heartbeat is what makes crash recovery idempotent: a wedged job
 adopted on the *same* iteration with `attempt+1`, so the run continues where it stopped
 without ever two writers running concurrently.
 
+**Execution fencing.** Every lease mutation beyond `acquire` — `renew` (heartbeat) and
+`mark_done` (settle) — takes the holder's `owner_execution` identity, and a ledger already
+stamped with a *different* execution id makes the mutation a fenced no-op: a stale owner
+whose iteration was reclaimed can neither heartbeat the successor's lease back to life nor
+settle it. The identity is `{run_id}:{index}:{attempt}`, re-minted on every reclaim and every
+retry re-arm (§19.8), so "who holds the slot right now" is always answerable from one field.
+Fencing is enforced at two depths:
+
+- **Core depth** — the runner checks ownership before it lets any outcome escape: after a
+  failed settle, a continue settle, or a terminal settle, if the on-disk lease no longer
+  names its execution, the outcome is folded into a silent `dropped` (no publish, no terminal
+  decision) — a zombie's grade never terminalizes a live successor's run. A read error never
+  fabricates a loss; only a definite different identity fences.
+- **Domain depth (research)** — the same rule extends past the lease to the authority plane:
+  a per-attempt `ContextVar` fence makes every in-turn commit (the `atomic_update_project`
+  seam, checked inside the lock on the fresh load, plus artifact / run-events / executions
+  write entry points, checked before any finalize side effect) raise `OwnershipLost` once a
+  reclaim has moved the lease on. A superseded worker can at most leave temp files — never a
+  dirty authoritative write. Interactive/API writes never set the fence, so they are exempt
+  by construction; the adapter folds an `OwnershipLost` into the same silent drop.
+
+Non-owner writes (a Stop flag) carry `keep_lease_heartbeat`: they preserve the previous
+`updated_at` inside the same atomic commit, because the heartbeat is the *owner's* liveness
+proof — a foreign write that re-stamped it would make a crashed slot look freshly-lived and
+strand the cancel flag with no consumer to wake it.
+
 [↑ Back to top](#table-of-contents)
 
 ### 19.4 Ledger — idempotent tool-execution record
@@ -2925,10 +3058,17 @@ supply *behavior and values*.
 2. **Execute loop** — snapshot the probe, call the `Executor`; on a transient failure that
    `should_retry`, bump `attempt`, **re-mint the `execution_id`**
    (`{run_id}:{index}:{attempt}`), persist the renewed lease (attempt + new execution id +
-   heartbeat) in one atomic section, sleep `retry.wait_s`, and try again — so each attempt gets
-   its own ledger identity. A terminal attempt failure releases the lease and either returns
-   (transient exhausted) or raises `ExecutionFailed` (non-transient) per §19.5. A success
-   absorbs `result.spend` into the counters.
+   heartbeat) in one atomic **fenced** re-arm (applied only while the ledger still names the
+   previous execution — if ownership moved while the retry was in flight the job drops),
+   sleep `retry.wait_s`, and try again — so each attempt gets its own ledger identity. A
+   terminal attempt failure releases the lease (ownership re-checked after the settle) and
+   either returns (transient exhausted) or raises `ExecutionFailed` (non-transient) per §19.5.
+   A success absorbs `result.spend` into the counters. Running behind every attempt: a lease
+   watcher that renews the heartbeat, flags an external cancel into the cooperative-cancel
+   event, and stands down the moment the ledger's identity no longer matches its own
+   execution. The heartbeat is **advisory**: a transient lock/IO failure renewing the lease
+   retries on the next refresh instead of tearing the turn down — killing the watcher would
+   strand a RUNNING slot whose cancel flag then has no in-process consumer.
 3. **Grade** — snapshot the probe again (`progress = changed(before, after)`), read the lease
    ledger, and assemble `IterationFacts` from the probe result, the counters, and the adapter's
    fresh `business_facts()`; `cancel_requested` is the OR of the business facts, the
@@ -2941,7 +3081,11 @@ supply *behavior and values*.
    continue path), `validate_transition` the final hop, publish the state event, and return the
    outcome. Releasing the slot durably (marking the run's state back to `IDLE` in the
    adapter's checkpoint) and enqueueing the next job are the adapter's job — the core only
-   decides *what* the state should be and *that* a follow-up must exist.
+   decides *what* the state should be and *that* a follow-up must exist. Every settle in the
+   phase — continue, hook-rewritten continue, and terminal — is followed by an ownership
+   re-check (§19.3 fencing): if a successor reclaimed the iteration meanwhile, the outcome is
+   discarded as `dropped` before any event publishes, so exactly one writer's verdict ever
+   reaches the outside.
 
 `IterationOutcome` is the single return record of the choreography: `state / action / dropped /
 reason / cause / run_id / index / attempt / execution_id / progress / counters /
@@ -2985,7 +3129,7 @@ re-exports, so older import sites keep working without duplicating logic.
 | Core concept | Research binding |
 |---|---|
 | Definition / states | `workflow_spec` mirrors the DAG's `_LEGAL_NEXT` parity table — an import-time + parity-tested check keeps the spec and the domain state machine from diverging |
-| `LeaseStore` | `ResearchLeaseStore` — folds the lease into the existing `active_run` + driver checkpoint, committed by the portalocker `project_revision` CAS |
+| `LeaseStore` | `ResearchLeaseStore` — folds the lease into the existing `active_run` + driver checkpoint, committed by the portalocker `project_revision` CAS; the fence asserts of §19.3 guard the domain writes on the same identity |
 | `Executor` binding | spec activity `auto_turn` → logical id `research-agent-kernel`; the adapter builds a `MappingRegistry` binding that id to `_RunTurnExecutor`, which wraps **one agent-kernel turn** behind an injected `pre_gate` callable — the cost hard gate, raised at the turn seam *before* the turn starts — and the prompt rides in `TaskRequest` (opaque to the core), and the per-turn LLM step cap is runtime config (`research_driver_turn_max_steps = 25` for auto-drive vs the interactive default of 5), never part of the spec |
 | `ProgressProbe` | `_ResearchProgressProbe` — stage / gate milestone diff: progress means the run moved a phase or cleared a gate, not token churn |
 | `business_facts` | `finished` = the task reached PUBLISH; `pending_signals` = open gate overrides awaiting review → `WAITING` park; human approval of an override starts a *new* execution from `IDLE` |
