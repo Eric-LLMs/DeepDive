@@ -1857,7 +1857,12 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     **batch bar** (Download / Open / Share / Rename / Move / Trash; in Trash: Restore / Delete
     permanently / Empty Trash). A toolbar offers **⚙ Manage** (workspace members + activity logs,
     role-gated `canManage`), **＋ New folder**, **＋ New text**, and **⬆ Upload** (role-gated
-    `canWrite`). The **Query Repo** column renders a status cell — `✓ In Knowledge` /
+    `canWrite`) — **upload is multi-file**: both the toolbar button and a folder's right-click
+    **📤 Upload files** open the native picker with `multiple`, the chosen files then upload
+    **sequentially** through the same init-upload → chunked PUT → complete flow (status line
+    carries an `[i/N]` prefix, the drive list re-polls once at the end, per-file dedup rename
+    hints are preserved, and a partial failure reports `Uploaded k/N` with the failed names
+    rather than aborting the batch). The **Query Repo** column renders a status cell — `✓ In Knowledge` /
     `Importing…` / `Processing… (ETA)` / `＋ Import to Knowledge` / `Not supported` — driven by
     `ragCell(f)` + `ingestEtaSuffix`, with a 5 s `pollWhileWorking` re-poll. Clicking a
     `.md`/`.txt`/code row opens the in-window **note editor** (`#note-editor`); any other file is
@@ -2495,7 +2500,9 @@ it is wiped by teardown) and a report the Knowledge Base has already indexed ("P
 Knowledge Base first").
 
 **User-facing entry point:** two ways in — the chat-created **task** (＋ Research → pick a My
-Drive parent folder + title/description + cloud materials → the task's dedicated session
+Drive parent folder + title/description + cloud materials — the dialog's material list is a
+~4-row scrolling window with a per-row **× remove** button, so a large or mistaken pick never
+pushes the Create/Cancel actions out of view — → the task's dedicated session
 auto-opens and resumes the `deep_research` skill) and the skill-driven **project**
 (`research_project` under the `deep_research` skill,
 [skills/deep_research.skill.md](../skills/deep_research.skill.md) — clarify → plan → discover →
