@@ -103,8 +103,13 @@
   // activated it by typing in the task's session (sendChat attaches the research handoff).
   // While running, the Run + Delete Task controls stay disabled and the Run button shows its
   // running style; the Activity feed below mirrors the live run events.
-  let researchRunning = false;
-  let runningTaskId = null;      // task the in-flight run belongs to (blocks deleting it)
+  // Per-task run bookkeeping: task_ids the client currently believes are RUNNING. The
+  // backend permits several tasks to run concurrently (T4), so a single global
+  // ``researchRunning`` flag used to bleed one task's "Running…" / disabled state onto every
+  // other task's header controls — the "start a task → all tasks look green / this one won't
+  // start" symptom. Keyed by task_id, each view reflects only its own task's run state.
+  const runningTasks = new Set();
+  const isTaskRunning = (taskId) => !!taskId && runningTasks.has(taskId);
   let activityEl = null;         // live Activity section (survives same-task pane re-renders)
   let activityForTask = null;    // task_id the current activity feed belongs to
   // Live revision monitor (one SSE stream per selected task): the server sends a snapshot
@@ -188,41 +193,43 @@
   // mirrors each streamed event via researchActivityEvent; the 10s status poll re-asserts a run
   // that is already RUNNING server-side. Starting a run always funnels through
   // window.startResearchRun (app.js), which opens the session then auto-sends the run message.
-  function runStartText() { return researchRunning ? "● Running…" : "▶ Run"; }
+  // The header controls always belong to the currently selected task, so "running" is that
+  // task's own state — never another task's in-flight run.
+  function runStartText() {
+    return isTaskRunning(selectedTask && selectedTask.task_id) ? "● Running…" : "▶ Run";
+  }
 
   function syncRunCtl() {
+    const viewRunning = isTaskRunning(selectedTask && selectedTask.task_id);
     document.querySelectorAll(".run-ctl").forEach((btn) => {
       if (btn.classList.contains("run-stop")) {
-        // Stop is the mirror of Run: only actionable while a run is in flight.
-        btn.disabled = !researchRunning;
+        // Stop is the mirror of Run: only actionable while THIS task's run is in flight.
+        btn.disabled = !viewRunning;
       } else if (btn.classList.contains("run-start")) {
-        btn.disabled = researchRunning;
-        btn.textContent = runStartText();
-        btn.classList.toggle("running", researchRunning);
+        btn.disabled = viewRunning;
+        btn.textContent = viewRunning ? "● Running…" : "▶ Run";
+        btn.classList.toggle("running", viewRunning);
       } else {
-        btn.disabled = researchRunning; // Delete Task / other run-scoped controls
+        btn.disabled = viewRunning; // Delete Task / other run-scoped controls
       }
     });
   }
 
   // Research runs that are already RUNNING on the server (adopted when a task view renders).
   // Server truth wins both ways: an active run keeps the controls disabled, and a freshly
-  // released slot (worker finished / cancelled) re-enables them.
+  // released slot (worker finished / cancelled) re-enables them. Per-task: another task's run
+  // is never cleared or asserted by this task's snapshot.
   function syncRunFromDetail(detail) {
     if (!detail) return;
-    if (detail.is_running) {
-      researchRunning = true;
-      runningTaskId = detail.task_id;
-    } else if (researchRunning && runningTaskId === detail.task_id) {
-      researchRunning = false;
-      runningTaskId = null;
-    }
+    if (detail.is_running) runningTasks.add(detail.task_id);
+    else runningTasks.delete(detail.task_id);
     syncRunCtl();
-    if (activityEl) {
-      activityEl.classList.toggle("running", researchRunning);
+    if (activityEl && activityForTask === detail.task_id) {
+      const running = isTaskRunning(detail.task_id);
+      activityEl.classList.toggle("running", running);
       const meta = activityEl._meta;
       if (meta && meta.dataset.hold !== "true") {
-        meta.textContent = researchRunning ? "Running…" : "Idle";
+        meta.textContent = running ? "Running…" : "Idle";
       }
     }
   }
@@ -265,23 +272,23 @@
   }
 
   window.researchRunActive = (taskId, on) => {
-    researchRunning = !!(taskId && on);
-    if (on && taskId) runningTaskId = taskId;
+    if (!taskId) return;
+    if (on) runningTasks.add(taskId); else runningTasks.delete(taskId);
     // A Run click restarts the task server-side (begin_run bumps the project revision). The
     // monitor may have silently died while the task sat finished — reconnect it now (no backoff
     // wait) so it catches that bump, and refetch the authoritative status right away. Without
     // this the status card keeps showing the stale Finished view until a manual reload.
-    if (on && taskId && monitorTaskId === taskId) {
+    if (on && monitorTaskId === taskId) {
       scheduleRefresh(taskId);
       if (!monitorLive) startMonitor(taskId);
     }
     syncRunCtl();
-    if (activityEl) {
-      activityEl.classList.toggle("running", researchRunning);
+    if (activityEl && activityForTask === taskId) {
+      activityEl.classList.toggle("running", on);
       const meta = activityEl._meta;
-      if (researchRunning && meta && meta.dataset.hold !== "true") meta.textContent = "Running…";
+      if (on && meta && meta.dataset.hold !== "true") meta.textContent = "Running…";
       // Run start reveals the collapsed feed so the user watches the live actions.
-      if (researchRunning && activityForTask === taskId) setActivityCollapsed(activityEl, false);
+      if (on) setActivityCollapsed(activityEl, false);
     }
   };
 
@@ -289,11 +296,10 @@
   // task is no longer RUNNING). A different task's in-flight run is never cleared by it, so the
   // chip poll can safely re-enable a chained run without undoing another task's controls.
   window.researchReleaseIfIdle = (taskId) => {
-    if (!researchRunning || runningTaskId !== taskId) return;
-    researchRunning = false;
-    runningTaskId = null;
+    if (!isTaskRunning(taskId)) return;
+    runningTasks.delete(taskId);
     syncRunCtl();
-    if (activityEl) {
+    if (activityEl && activityForTask === taskId) {
       activityEl.classList.toggle("running", false);
       const meta = activityEl._meta;
       if (meta && meta.dataset.hold !== "true") meta.textContent = "Idle";
@@ -352,7 +358,7 @@
       activityForTask = taskId;
       // A run may already be in flight when the view is first opened (e.g. the user typed in
       // the session, then selected the task): reveal the feed so the live actions are visible.
-      if (researchRunning && runningTaskId === taskId) setActivityCollapsed(activityEl, false);
+      if (isTaskRunning(taskId)) setActivityCollapsed(activityEl, false);
     }
     return activityEl;
   }
@@ -402,6 +408,10 @@
     } catch (e) {
       if (seq !== loadTasksSeq) return;
       tasksList.appendChild(el("div", "research-empty", `Tasks unavailable: ${e.message}`));
+      // A transient backend/db blip left the list stuck with no way back; give a manual retry.
+      const retry = el("button", "ghost research-empty", "↻ Retry");
+      retry.addEventListener("click", () => loadTasks());
+      tasksList.appendChild(retry);
       return;
     }
     if (seq !== loadTasksSeq) return; // a newer load is in flight — drop this stale render
@@ -443,7 +453,7 @@
   // removed. A 409 (task RUNNING, or the report is in the Knowledge Base) keeps the task and
   // surfaces the server's reason verbatim.
   async function deleteTask(t) {
-    if (researchRunning && t && t.task_id === runningTaskId) {
+    if (t && isTaskRunning(t.task_id)) {
       toast("A research run is in progress — wait for it to finish before deleting the task.");
       return;
     }
@@ -982,8 +992,8 @@
     actions.appendChild(modeChip);
     // Run starts (or resumes) the task's run in one click; Stop requests the cooperative cancel
     // of the in-flight run; Delete cascades the cloud folder + state. Run and Delete disable
-    // while a run is in flight (researchRunning), Run switches to its running style, and Stop is
-    // its mirror — only actionable while the run is live.
+    // while THIS task's run is in flight (isTaskRunning(selectedTask)), Run switches to its
+    // running style, and Stop is its mirror — only actionable while the run is live.
     const openBtn = el("button", "run-ctl run-start", runStartText());
     openBtn.addEventListener("click", () =>
       window.startResearchRun(detail.task_id, detail.name || detail.task_id, detail.session_id)
