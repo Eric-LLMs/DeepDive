@@ -1477,7 +1477,7 @@ body.resizing-ew { cursor: ew-resize; }
 }
 .modal textarea:focus { outline: none; border-color: var(--accent); }
 .cd-prompt-modal { width: 380px; }
-.cd-prompt-modal.lg { width: 500px; max-width: 92vw; }
+.cd-prompt-modal.lg { width: 500px; max-width: 92vw; max-height: 90vh; overflow-y: auto; }
 .cd-prompt-modal.lg .cd-prompt-input { font-size: 13px; }
 .cd-prompt-hint { margin: 0; font-size: 11px; color: var(--fg-dim); line-height: 1.5; }
 .cd-confirm-msg { margin: 0; font-size: 13px; color: var(--fg); }
@@ -2905,7 +2905,12 @@ body.resizing-ew { cursor: ew-resize; }
   white-space: nowrap;
 }
 .rq-files { margin-top: 10px; }
-.rq-files-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+/* Scrolling window capped at ~4 rows so a big material pick never pushes the
+   Cancel / Create-task buttons out of view. */
+.rq-files-list {
+  display: flex; flex-direction: column; gap: 4px; margin-top: 6px;
+  max-height: 120px; overflow-y: auto;
+}
 /* Execution-mode choice in the "＋ Research" dialog: chosen once at creation, then the task is
    locked to it (Strict default). Overrides the generic .modal label/input styles above. */
 .rq-mode { display: block; margin-top: 12px; }
@@ -2921,16 +2926,31 @@ body.resizing-ew { cursor: ew-resize; }
 .rq-mode-opt strong { font-size: 12px; color: var(--fg); }
 .rq-mode-opt small { font-size: 11px; color: var(--fg-dim); line-height: 1.4; }
 .rq-file {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex: 0 0 auto;
   font-size: 12px;
   color: var(--fg);
   background: var(--bg-soft-2);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 4px 8px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
+.rq-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rq-file-rm {
+  flex: 0 0 auto;
+  width: 18px; height: 18px;
+  padding: 0; line-height: 16px;
+  font-size: 13px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.rq-file-rm:hover { border-color: #c94f4f; color: #c94f4f; }
 
 /* ── Run control (research task view / sidebar status) ──
    Run is green by default and switches to an amber running style while a run is in flight;

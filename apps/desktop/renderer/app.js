@@ -2469,18 +2469,38 @@
         ? `My Drive / ${parentFolderPath.split("/").join(" / ")}`
         : "Cloud Drive (root)";
     });
+    // Re-render the chosen-materials list; each row carries a × remove button so a wrong
+    // pick can be dropped before creating the task. The list itself is a 4-row scrolling
+    // window (CSS) so the modal height — and the Cancel/Create buttons — stay stable.
+    const renderChosenFiles = () => {
+      filesListEl.innerHTML = "";
+      for (const c of chosen) {
+        const row = document.createElement("div");
+        row.className = "rq-file";
+        const name = document.createElement("span");
+        name.className = "rq-file-name";
+        name.textContent = `📎 ${c.name}`;
+        name.title = c.name;
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.className = "rq-file-rm";
+        rm.title = "Remove this file";
+        rm.textContent = "×";
+        rm.addEventListener("click", () => {
+          const i = chosen.findIndex((x) => x.id === c.id);
+          if (i >= 0) chosen.splice(i, 1);
+          renderChosenFiles();
+        });
+        row.append(name, rm);
+        filesListEl.appendChild(row);
+      }
+    };
     overlay.querySelector("#rq-add-files").addEventListener("click", async () => {
       const picked = await window.pickCloudFiles({ title: "Add research materials", okLabel: "Add" });
       for (const f of picked) {
         if (!chosen.some((c) => c.id === f.id)) chosen.push({ id: f.id, name: f.name || "file" });
       }
-      filesListEl.innerHTML = "";
-      for (const c of chosen) {
-        const row = document.createElement("div");
-        row.className = "rq-file";
-        row.textContent = `📎 ${c.name}`;
-        filesListEl.appendChild(row);
-      }
+      renderChosenFiles();
     });
     const createBtn = overlay.querySelector("#rq-create");
     createBtn.addEventListener("click", async () => {

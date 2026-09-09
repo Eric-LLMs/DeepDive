@@ -701,7 +701,7 @@
     const folderLoc = { kind: "folder", ws, path };
     ctxMenuEl.appendChild(mk("📄 New text file", () => createTextFile(folderLoc)));
     ctxMenuEl.appendChild(mk("📁 New folder", () => createFolder(folderLoc)));
-    ctxMenuEl.appendChild(mk("📤 Upload file", () => uploadFile(folderLoc)));
+    ctxMenuEl.appendChild(mk("📤 Upload files", () => uploadFile(folderLoc)));
     if (file) {
       const sep = document.createElement("div");
       sep.className = "drive-ctxmenu-sep";
@@ -1088,76 +1088,97 @@
     return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
-  // ── Upload a local file to the cloud drive ──
-  // Mirrors the web console: a hidden <input type="file"> (native OS dialog), then the
-  // same init-upload → chunked PUT → complete flow as createTextFile. The server is the
-  // single source of truth, so a dedup-renamed name is surfaced via renameHint.
-  function pickLocalFile() {
+  // ── Upload local files to the cloud drive ──
+  // Mirrors the web console: a hidden <input type="file" multiple> (native OS dialog),
+  // then the same init-upload → chunked PUT → complete flow per file as createTextFile.
+  // The server is the single source of truth, so a dedup-renamed name is surfaced via
+  // renameHint. One picker accepts many files; uploads run sequentially (the chunked PUT
+  // loop is already per-file, and serializing keeps the status line readable).
+  function pickLocalFiles() {
     return new Promise((resolve) => {
       const input = document.createElement("input");
       input.type = "file";
+      input.multiple = true;
       input.style.display = "none";
       input.addEventListener("change", () => {
-        const f = input.files && input.files[0] ? input.files[0] : null;
+        const files = input.files ? Array.from(input.files) : [];
         input.remove();
-        resolve(f);
+        resolve(files);
       });
       document.body.appendChild(input);
       input.click();
     });
   }
 
+  async function uploadOne(file, ws, parent, prefix) {
+    setStatus(`${prefix}Uploading "${file.name}"…`);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const hex = toHex(await crypto.subtle.digest("SHA-256", bytes));
+    const init = await apiFetch("/files/init-upload", {
+      method: "POST",
+      body: JSON.stringify({
+        sha256: hex,
+        size: bytes.length,
+        name: file.name,
+        folder_path: parent,
+        workspace_id: ws,
+        mime_type: file.type || null,
+      }),
+    });
+    let created;
+    if (init.status !== "instant") {
+      const chunkSize = init.chunk_size || 5 * 1024 * 1024;
+      const num = init.num_chunks || Math.ceil(bytes.length / chunkSize);
+      for (let i = 0; i < num; i++) {
+        const start = i * chunkSize;
+        const slice = bytes.slice(start, Math.min(bytes.length, start + chunkSize));
+        const headers = { Authorization: `Bearer ${getToken()}` };
+        const put = await fetch(`/api/files/${init.asset_id}/chunks/${i}`, {
+          method: "PUT",
+          headers,
+          body: new Blob([slice]),
+        });
+        if (!put.ok) throw new Error(`chunk ${i} failed (${put.status})`);
+        setStatus(`${prefix}Uploading "${file.name}" ${i + 1}/${num}…`);
+      }
+      await apiFetch(`/files/${init.asset_id}/complete`, { method: "POST" });
+      created = await apiFetch(`/files/${init.asset_id}`);
+    } else {
+      created = init.asset || await apiFetch(`/files/${init.asset_id}`);
+    }
+    renameHint(file.name, created.name);
+    setStatus(init.status === "instant"
+      ? `${prefix}Uploaded instantly (deduplicated) "${created.name}".`
+      : `${prefix}Uploaded "${created.name}".`);
+  }
+
   async function uploadFile(loc) {
     if (!getToken()) { Viewer.toast("Sign in to upload files."); return; }
-    const file = await pickLocalFile();
-    if (!file) return;
+    const files = await pickLocalFiles();
+    if (!files.length) return;
     const ws = locKindWs(loc);
     const parent = locFolderPath(loc);
-    setStatus(`Uploading "${file.name}"…`);
-    try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const hex = toHex(await crypto.subtle.digest("SHA-256", bytes));
-      const init = await apiFetch("/files/init-upload", {
-        method: "POST",
-        body: JSON.stringify({
-          sha256: hex,
-          size: bytes.length,
-          name: file.name,
-          folder_path: parent,
-          workspace_id: ws,
-          mime_type: file.type || null,
-        }),
-      });
-      let created;
-      if (init.status !== "instant") {
-        const chunkSize = init.chunk_size || 5 * 1024 * 1024;
-        const num = init.num_chunks || Math.ceil(bytes.length / chunkSize);
-        for (let i = 0; i < num; i++) {
-          const start = i * chunkSize;
-          const slice = bytes.slice(start, Math.min(bytes.length, start + chunkSize));
-          const headers = { Authorization: `Bearer ${getToken()}` };
-          const put = await fetch(`/api/files/${init.asset_id}/chunks/${i}`, {
-            method: "PUT",
-            headers,
-            body: new Blob([slice]),
-          });
-          if (!put.ok) throw new Error(`chunk ${i} failed (${put.status})`);
-          setStatus(`Uploading "${file.name}" ${i + 1}/${num}…`);
-        }
-        await apiFetch(`/files/${init.asset_id}/complete`, { method: "POST" });
-        created = await apiFetch(`/files/${init.asset_id}`);
-      } else {
-        created = init.asset || await apiFetch(`/files/${init.asset_id}`);
+    if (parent) drive.expanded.add(expKey(ws, parent));
+    let ok = 0;
+    const failed = [];
+    for (let n = 0; n < files.length; n++) {
+      const file = files[n];
+      const prefix = files.length > 1 ? `[${n + 1}/${files.length}] ` : "";
+      try {
+        await uploadOne(file, ws, parent, prefix);
+        ok += 1;
+      } catch (e) {
+        failed.push({ name: file.name, msg: e.message });
       }
-      if (parent) drive.expanded.add(expKey(ws, parent));
-      renameHint(file.name, created.name);
-      setStatus(init.status === "instant"
-        ? `Uploaded instantly (deduplicated) "${created.name}".`
-        : `Uploaded "${created.name}".`);
-      loadDrive();
-    } catch (e) {
-      setStatus(`Upload failed: ${e.message}`);
     }
+    if (files.length === 1) {
+      if (failed.length) setStatus(`Upload failed: ${failed[0].msg}`);
+    } else {
+      setStatus(failed.length
+        ? `Uploaded ${ok}/${files.length}. Failed: ${failed.map((f) => `${f.name} (${f.msg})`).join("; ")}`
+        : `Uploaded ${ok} files.`);
+    }
+    loadDrive();
   }
 
   // ── Workspaces ──

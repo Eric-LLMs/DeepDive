@@ -1531,7 +1531,7 @@ const Viewer = (() => {
     } else {
       if (canWrite) tool.appendChild(btn("＋ New folder", "Create a new folder here", () => onAction("new-folder")));
       if (canWrite) tool.appendChild(btn("＋ New text", "Create a new text file here", () => onAction("new-text")));
-      if (canWrite) tool.appendChild(btn("⬆ Upload", "Upload a file here", () => onAction("upload"), "primary"));
+      if (canWrite) tool.appendChild(btn("⬆ Upload", "Upload files here", () => onAction("upload"), "primary"));
     }
     el.appendChild(tool);
 
