@@ -18,6 +18,7 @@ from api.permissions import (
 )
 from api.schemas_drive import (
     ContentUpdate,
+    CopyRequest,
     FileRename,
     FolderCreate,
     FolderMoveRequest,
@@ -341,6 +342,23 @@ async def move_file(
     drive: DriveService = Depends(get_drive_service),
 ):
     return await drive.move_file(
+        user.user_id, asset_id, body.workspace_id, body.folder_path
+    )
+
+
+@files.post("/{asset_id}/copy")
+async def copy_file(
+    asset_id: UUID,
+    body: CopyRequest,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+):
+    """Copy a file: new logical row sharing the same object (ref_count + 1).
+
+    The authoritative same-name check is done server-side right before the insert
+    (``_unique_name`` in the service), never delegated to a client pre-check.
+    """
+    return await drive.copy_file(
         user.user_id, asset_id, body.workspace_id, body.folder_path
     )
 

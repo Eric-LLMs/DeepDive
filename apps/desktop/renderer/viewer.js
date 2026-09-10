@@ -1551,6 +1551,7 @@ const Viewer = (() => {
         add("🔗 Share", "Share the selected file", () => onBatch("share"), "", count !== 1 || !canWrite);
         add("✏ Rename", "Rename the selected file", () => onBatch("rename"), "", count !== 1 || !canWrite);
         add("⇄ Move", "Move selected files to another folder or workspace", () => onBatch("move"), "", count === 0 || !canWrite);
+        add("⧉ Copy", "Copy selected files to a My Drive folder (shares storage, ref +1)", () => onBatch("copy"), "", count === 0 || !canWrite);
         add("🗑 Delete", "Move selected files to Trash", () => onBatch("delete"), "danger", count === 0 || !canWrite);
       }
       el.appendChild(bb);

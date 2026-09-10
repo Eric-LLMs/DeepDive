@@ -61,5 +61,10 @@ class MoveRequest(BaseModel):
     folder_path: str | None  # required; null = workspace root
 
 
+class CopyRequest(BaseModel):
+    workspace_id: UUID | None = None  # None = My Drive
+    folder_path: str | None  # required; null = workspace root
+
+
 class FolderMoveRequest(BaseModel):
     parent_path: str | None = None  # folder to move this folder into (''/None = My Drive root)

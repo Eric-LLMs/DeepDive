@@ -1693,6 +1693,16 @@ Sources: `migrations/0004_drive_objects.sql`, `0006_folders.sql`, `0007_workspac
 - **Folder semantics** — paths are full relative paths inside a scope; creating `English/Vocab`
   also upserts the `English` ancestor. Rename / move are **prefix rewrites** on both
   `folders.path` and `assets.folder_path` (`move_subtree`), so children follow automatically.
+- **Copy & move (desktop Cloud view)** — the file tree's context menu and the batch bar offer
+  **Copy** (files only) and **Move to…** (files and folders, with the subtree), both targeting a
+  My Drive folder via the shared tree picker. `copy_file` (`POST /files/{id}/copy`) is the pure
+  logical half of dedup: it inserts a new asset row pointing at the source's `object_sha256` and
+  runs `objects.upsert_and_increment`, so the physical blob is shared and its `ref_count` goes
+  up; deleting either row later releases exactly one reference (`_purge_asset`). Move is a pure
+  address rewrite (`workspace_id` / `folder_path`). Both rely on the server-side `_unique_name`
+  as the authoritative conflict check right before the write (busy name → `a(1).ext`, flagged
+  `renamed`); there is no overwrite/skip semantic and no client pre-check. The internal
+  `copy_to_folder` (RAG image archive: content-idempotent, same-workspace) is unchanged.
 - **Trash & retention** — `delete_asset` moves a file to the trash (soft delete only, no
   ref-count change). Trash supports **restore** (to the original workspace, falling back to My
   Drive if that workspace is gone or the user is no longer a member) and **purge** (hard delete
@@ -1757,7 +1767,7 @@ The Vite dev proxy strips `/api`; the backend mounts the drive routers at the ro
 |------|-----------|
 | Workspaces | `GET/POST /workspaces`, `PATCH/DELETE /workspaces/{id}` (owner), `GET/POST /workspaces/{id}/members` (manager), `PATCH/DELETE /workspaces/{id}/members/{uid}` (manager; admin members owner-only), `GET /workspaces/{id}/activity` (manager) |
 | User lookup | `GET /users/search?q=` — resolve a username / user-id fragment to a UUID when adding members |
-| Files | `POST /files/init-upload`, `GET /files`, `GET /files/{id}`, `PUT /files/{id}/chunks/{i}`, `GET /files/{id}/chunks`, `POST /files/{id}/complete`, `POST /files/{id}/abort`, `GET /files/{id}/download`, `GET /files/{id}/content` (read a text note), `PUT /files/{id}/content` (overwrite a text note; re-enqueues `ASSET_INGEST`), `PATCH /files/{id}` (rename), `DELETE /files/{id}` (→ trash), `POST /files/{id}/move`, `POST /files/{id}/share`, `DELETE /files/{id}/share/{grantee}`, `GET /files/{id}/shares`, `GET /files/{id}/ingest-status` |
+| Files | `POST /files/init-upload`, `GET /files`, `GET /files/{id}`, `PUT /files/{id}/chunks/{i}`, `GET /files/{id}/chunks`, `POST /files/{id}/complete`, `POST /files/{id}/abort`, `GET /files/{id}/download`, `GET /files/{id}/content` (read a text note), `PUT /files/{id}/content` (overwrite a text note; re-enqueues `ASSET_INGEST`), `PATCH /files/{id}` (rename), `DELETE /files/{id}` (→ trash), `POST /files/{id}/move`, `POST /files/{id}/copy` (new logical row sharing the object, `ref_count` +1, busy name auto-suffixed), `POST /files/{id}/share`, `DELETE /files/{id}/share/{grantee}`, `GET /files/{id}/shares`, `GET /files/{id}/ingest-status` |
 | Folders | `GET/POST /folders`, `PATCH/DELETE /folders/{id}`, `POST /folders/{id}/move` (move a subtree to a new parent, cycle-refused) |
 | Trash | `GET /trash`, `POST /trash/{id}/restore`, `DELETE /trash/{id}` (purge), `DELETE /trash` (empty) |
 

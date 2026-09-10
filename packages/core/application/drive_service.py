@@ -920,6 +920,54 @@ class DriveService:
         )
         return self._asset_dict(moved)
 
+    async def copy_file(
+        self,
+        user_id: UUID,
+        asset_id: UUID,
+        workspace_id: UUID | None,
+        folder_path: str | None,
+    ) -> dict:
+        """Copy a file to any location as a NEW asset row sharing the same object bytes.
+
+        Pure logical operation: no blob re-upload, the copy points at the source's
+        ``object_sha256`` and the physical object's ``ref_count`` is incremented (CAS
+        upsert). The source stays untouched. A busy destination name is auto-suffixed
+        ``stem(n)ext`` via ``_unique_name`` (the returned dict carries ``renamed``).
+        Folder copy is not supported — folders move only.
+        """
+        asset = await self.ensure_asset_readable(user_id, asset_id)
+        if asset.object_sha256 is None:
+            raise DriveError("asset has no stored object", 409)
+        folder_path = self._validate_folder_path(folder_path)
+        if workspace_id is not None:
+            await self.ensure_workspace_member(user_id, workspace_id)
+        digest = asset.object_sha256
+        await self.objects.upsert_and_increment(
+            digest,
+            asset.size or 0,
+            object_key(digest),
+            asset.mime_type or "application/octet-stream",
+        )
+        name = await self._unique_name(user_id, workspace_id, folder_path, asset.name)
+        copy = await self.assets.create(
+            user_id,
+            name,
+            workspace_id=workspace_id,
+            folder_path=folder_path,
+            mime_type=asset.mime_type,
+            size=asset.size,
+            object_sha256=digest,
+            file_status=READY,
+            rag_status=RAG_NOT_STARTED,
+        )
+        await self._log(
+            user_id, workspace_id, "file.copy", "file", copy.id, copy.name,
+            f"copied to {folder_path or '(root)'}",
+        )
+        result = self._asset_dict(copy)
+        result["renamed"] = name != asset.name
+        return result
+
     async def copy_to_folder(self, user_id: UUID, asset_id: UUID, folder_path: str) -> AssetModel:
         """Copy an asset into ``folder_path`` as a NEW asset row sharing the same object bytes.
 

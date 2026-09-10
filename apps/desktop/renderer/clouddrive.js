@@ -706,11 +706,25 @@
       const sep = document.createElement("div");
       sep.className = "drive-ctxmenu-sep";
       ctxMenuEl.appendChild(sep);
+      if (!ctx.trash) {
+        // Right-clicking a row inside the edit-mode selection acts on the whole
+        // selection (multi-file copy/move); otherwise just the clicked file.
+        const t = drive.selected.has(file.id)
+          ? selectedFilesArr().map((f) => ({ kind: "file", id: f.id, name: f.name }))
+          : [{ kind: "file", id: file.id, name: file.name }];
+        ctxMenuEl.appendChild(mk("⧉ Copy", () => openCopyMoveModal(t, "copy")));
+        ctxMenuEl.appendChild(mk("⇄ Move to…", () => openCopyMoveModal(t, "move")));
+      }
       ctxMenuEl.appendChild(mk("🗑 Delete file", () => deleteFile(file)));
     } else if (folder) {
       const sep = document.createElement("div");
       sep.className = "drive-ctxmenu-sep";
       ctxMenuEl.appendChild(sep);
+      if (!ctx.trash) {
+        const name = folder.name || (path ? path.split("/").pop() : "");
+        ctxMenuEl.appendChild(mk("⇄ Move to…", () => openCopyMoveModal(
+          [{ kind: "folder", id: folder.id || null, path, ws, name }], "move")));
+      }
       ctxMenuEl.appendChild(mk("🗑 Delete folder", () => deleteFolder(folder)));
     }
     // Export the clicked entity to local disk (right-click a file or a folder). Trash is
@@ -1475,6 +1489,7 @@
       }
       case "rename": renameTarget(); break;
       case "move": moveTargets(); break;
+      case "copy": copyTargets(); break;
       case "delete": deleteSelected(); break;
       case "restore": restoreSelected(); break;
       case "purge": purgeSelected(); break;
@@ -1542,7 +1557,12 @@
   async function moveTargets() {
     const files = selectedFilesArr();
     if (!files.length) return;
-    openMoveModal(files);
+    openCopyMoveModal(files.map((f) => ({ kind: "file", id: f.id, name: f.name })), "move");
+  }
+  async function copyTargets() {
+    const files = selectedFilesArr();
+    if (!files.length) return;
+    openCopyMoveModal(files.map((f) => ({ kind: "file", id: f.id, name: f.name })), "copy");
   }
   async function deleteSelected() {
     const fs = selectedFilesArr();
@@ -1639,68 +1659,74 @@
     return { overlay, modal, close: () => overlay.remove() };
   }
 
-  function openMoveModal(files) {
-    const ws = drive.loc.kind === "trash" ? null : drive.loc.ws;
-    const path = drive.loc.kind === "folder" ? drive.loc.path : "";
-    const { close } = openModal(files.length > 1 ? `Move ${files.length} files` : "Move file", () => {
-      const body = document.createElement("div");
-      body.className = "cdt-modal-body";
-      const wsLabel = document.createElement("label");
-      wsLabel.textContent = "Destination workspace";
-      const wsSel = document.createElement("select");
-      const rootOpt = document.createElement("option");
-      rootOpt.value = "";
-      rootOpt.textContent = "My Drive";
-      wsSel.appendChild(rootOpt);
-      for (const w of drive.workspaces) {
-        const o = document.createElement("option");
-        o.value = w.id;
-        o.textContent = w.name;
-        if (w.id === ws) o.selected = true;
-        wsSel.appendChild(o);
-      }
-      wsLabel.appendChild(wsSel);
-      const pathLabel = document.createElement("label");
-      pathLabel.textContent = "Folder path (within workspace; empty = root)";
-      const pathInput = document.createElement("input");
-      pathInput.value = path;
-      pathInput.placeholder = "e.g. English/Vocab";
-      pathLabel.appendChild(pathInput);
-      const err = document.createElement("p");
-      err.className = "cfg-status";
-      const actions = document.createElement("div");
-      actions.className = "modal-actions";
-      const cancel = document.createElement("button");
-      cancel.type = "button";
-      cancel.textContent = "Cancel";
-      cancel.onclick = close;
-      const save = document.createElement("button");
-      save.type = "button";
-      save.className = "primary";
-      save.textContent = "Move";
-      save.onclick = async () => {
-        err.textContent = "";
-        try {
-          const workspace_id = wsSel.value ? wsSel.value : null;
-          const folder_path = pathInput.value.trim() ? pathInput.value.trim() : null;
-          for (const f of files) {
-            await apiFetch(`/files/${f.id}/move`, {
-              method: "POST",
-              body: JSON.stringify({ workspace_id, folder_path }),
-            });
+  // ── Copy / Move-to dialog (context menu + batch bar) ──
+  // Destination is picked from the My Drive folder tree via pickDriveFolderModal.
+  // Conflicts are NOT pre-checked client-side: the server runs the authoritative
+  // _unique_name right before the write and auto-suffixes; renameHint surfaces it.
+  // Copy is files-only (shares the object, ref_count + 1); folders move only.
+  async function openCopyMoveModal(items, kind) {
+    const n = items.length;
+    const noun = kind === "copy" ? (n > 1 ? `${n} files` : "file") : (n > 1 ? `${n} items` : "item");
+    const chosen = await window.pickDriveFolderModal(
+      `${kind === "copy" ? "Copy" : "Move"} ${noun} to…`,
+      { prompt: false, okLabel: kind === "copy" ? "Copy here" : "Move here" },
+    );
+    if (!chosen) return;
+    const parent = chosen.folderPath; // null = My Drive root
+    let done = 0;
+    const notes = [];
+    for (const it of items) {
+      try {
+        if (it.kind === "file") {
+          const body = JSON.stringify({ workspace_id: null, folder_path: parent });
+          const res = await apiFetch(`/files/${it.id}/${kind === "copy" ? "copy" : "move"}`,
+            { method: "POST", body });
+          renameHint(it.name, res.name);
+          done++;
+        } else {
+          if (it.ws) { notes.push(`"${it.name}": workspace folders move within their workspace only`); continue; }
+          if (kind === "copy") { notes.push(`"${it.name}": folders cannot be copied`); continue; }
+          if (parent && (parent === it.path || parent.startsWith(it.path + "/"))) {
+            notes.push(`"${it.name}": can't move a folder into itself`);
+            continue;
           }
-          close();
-          setStatus(`Moved ${files.length} file${files.length > 1 ? "s" : ""}.`);
-          loadDrive();
-        } catch (e) {
-          err.textContent = e.message || String(e);
-          err.className = "cfg-status err";
+          if (it.id) {
+            const res = await apiFetch(`/folders/${it.id}/move`,
+              { method: "POST", body: JSON.stringify({ parent_path: parent }) });
+            renameHint(it.name, res.name || String(res.path || "").split("/").pop());
+          } else {
+            // Virtual folder (implied by file prefixes only): re-parent every file under it.
+            const name = it.path.split("/").pop();
+            const newPath = parent ? `${parent}/${name}` : name;
+            let renamed = null;
+            for (const f of drive.files) {
+              if (f.workspace_id) continue;
+              const fp = f.folder_path || "";
+              if (fp === it.path || fp.startsWith(it.path + "/")) {
+                const suffix = fp === it.path ? "" : fp.slice(it.path.length);
+                const res = await apiFetch(`/files/${f.id}/move`, {
+                  method: "POST",
+                  body: JSON.stringify({ workspace_id: null, folder_path: (newPath + suffix) || null }),
+                });
+                if (res.name !== f.name) renamed = res.name;
+              }
+            }
+            if (renamed) renameHint(name, renamed);
+          }
+          done++;
         }
-      };
-      actions.append(cancel, save);
-      body.append(wsLabel, pathLabel, err, actions);
-      return body;
-    });
+      } catch (e) {
+        notes.push(`${it.name}: ${e.message}`);
+      }
+    }
+    const verb = kind === "copy" ? "Copied" : "Moved";
+    if (done) {
+      setStatus(`${verb} ${done}${n > 1 ? ` of ${n}` : ""}${notes.length ? `; ${notes[0]}` : ""}.`);
+    } else {
+      setStatus(`Nothing ${kind === "copy" ? "copied" : "moved"}${notes.length ? `: ${notes[0]}` : ""}.`);
+    }
+    drive.selected = new Set();
+    loadDrive(); // server is the source of truth; refresh the whole tree
   }
 
   function openShareModal(f) {
