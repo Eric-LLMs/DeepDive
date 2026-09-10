@@ -1695,7 +1695,9 @@ Sources: `migrations/0004_drive_objects.sql`, `0006_folders.sql`, `0007_workspac
   `folders.path` and `assets.folder_path` (`move_subtree`), so children follow automatically.
 - **Copy & move (desktop Cloud view)** — the file tree's context menu and the batch bar offer
   **Copy** (files only) and **Move to…** (files and folders, with the subtree), both targeting a
-  My Drive folder via the shared tree picker. `copy_file` (`POST /files/{id}/copy`) is the pure
+  My Drive folder via the shared tree picker (`pickDriveFolderModal`); right-clicking a file that
+  is part of the edit-mode selection acts on the whole selection. `copy_file`
+  (`POST /files/{id}/copy`) is the pure
   logical half of dedup: it inserts a new asset row pointing at the source's `object_sha256` and
   runs `objects.upsert_and_increment`, so the physical blob is shared and its `ref_count` goes
   up; deleting either row later releases exactly one reference (`_purge_asset`). Move is a pure
@@ -2279,6 +2281,33 @@ system+input prompt and the verbatim reply to the log for offline prompt auditin
                                              ▼
                   per_claim summary + skipped_sources + dropped_rows (zero round-trips)
 ```
+
+**Materials are first-class sources — `research_scrape action="fetch_materials"`.** Every file
+sitting in a task's `materials/` folder enters the same evidence chain as a web page, through one
+server-side action that extracts all of them and writes them onto the run's existing
+`_fetch_provenance` ledger under **`material://<cloud_asset_id>/<safe_name>`** pseudo-URLs — so
+`read`, `adjudicate`, and `verify_batch` reuse the trust machinery unchanged and `source_type`
+(`"material"` vs `"web"`) is identity labeling only, never a second code path. Extraction is decided
+by **magic-byte content sniffing, never the file name**: plain text (UTF-8 with GBK fallback), PDF
+via a **two-pass** extractor (body text first; vision transcription through `extract_pdf_document`
+only when tables are detected *and* the text layer is degraded), and Excel via openpyxl in
+`read_only` + `data_only` mode (capped: `EXCEL_MAX_SHEETS = 8`, `EXCEL_MAX_ROWS = 2000` with an
+`[rows truncated]` marker). Unsupported binaries are refused with an explicit reason
+(`.docx` / `.pptx` / legacy `.xls` → "resave as .xlsx"). Budgets are enforced before the pipeline:
+each file is truncated at `MATERIALS_MAX_FILE_CHARS = 100_000` with a `[TRUNCATED]` tail and
+`is_truncated: True` on the ledger entry (never silent), and one call never exceeds the aggregate
+`MATERIALS_MAX_TOTAL_CHARS = 400_000` — a server-side consume loop pages through the folder
+(`MATERIALS_MAX_FILES_PER_BATCH = 10` per internal page) until all materials are extracted, so the
+agent triggers one call for the whole folder. Failure handling is per-file: a corrupt / timed-out /
+unextractable file lands in `skipped: [{name, reason}]` and never breaks the batch — **except**
+`OwnershipLost`, which the fencing check re-raises to abort the whole run rather than laundering a
+tenancy loss into a `skipped` row. Provenance is确权 at write time and re-validated at read time:
+each ledger entry carries `{source_type, project_id, run_seq, source_asset_id, cloud_asset_id}`, and
+both `read_fetch` and the `_apply_findings` commit path re-check that a `material://` key belongs to
+*this* project's materials folder before any drive read or graph edge is allowed. The same hint
+mechanics surface materials to the agent: handoff / `auto_turn_prompt` inject a "fetch your
+materials first" line only when the task actually carries materials, and `snapshot` / `resume`
+expose them as `{name, mime}` only.
 
 **REVIEW — one `review_draft` call, all-or-nothing staged commit.** The REVIEW stage closes in
 exactly **one** `research_artifact action="review_draft"` call (passing the report's
