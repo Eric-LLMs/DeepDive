@@ -291,6 +291,42 @@ async def test_g3_identical_rewrite_reclaims_run_seq(env, monkeypatch):
     assert out["status"] == "ok"
 
 
+async def test_g3_mid_chain_resume_restamps_primary_tree(env, monkeypatch):
+    # Run-0910 lesson: a mid-chain resume (stop / stalled re-ignite) moves run_seq for the
+    # process LEASE, not the edition. The edition's own versions written BEFORE the stop
+    # must not come back as ghosts in review/promote afterwards.
+    svc, task_id = await _project_with_draft(env, "resumed draft X\n", {"c1": "x"})
+    await svc.create_version(USER, task_id, artifact_id="report.md", content="resumed v2 X\n")
+    adir = env.scratch / str(USER) / task_id / "artifacts" / "report.md"
+    seq = svc.read_project(USER, task_id)["run_seq"]
+    svc.end_run(USER, task_id)
+    svc.begin_run(USER, task_id)  # plain resume: same unfinished edition, new lease
+    assert svc.read_project(USER, task_id)["run_seq"] == seq + 1
+    for name in ("v1", "v2"):
+        rec = svc._load_json(adir / name, None)
+        assert rec["run_seq"] == seq + 1  # restamped, not orphaned
+    _seam(monkeypatch, [json.dumps({"changes": [_change(old="resumed", new="RESUMED")]})])
+    out = await svc.review_draft(USER, task_id, artifact_id="report.md")
+    assert out["status"] == "ok" and out["base_version"] == 2  # no ghost refusal
+    promoted = await svc.promote_to_drive(USER, task_id, artifact_id="report.md")
+    assert promoted["status"] == "PROMOTED"
+
+
+async def test_g3_new_edition_resume_does_not_restamp_archived_tree(env):
+    # The restamp must NOT leak across editions: a new-edition begin_run archives the old
+    # primary tree instead, and the archived records keep their original provenance.
+    svc, task_id = await _project_with_draft(env, "edition one X\n", {"c1": "x"})
+    adir = env.scratch / str(USER) / task_id / "artifacts" / "report.md"
+    seq = svc.read_project(USER, task_id)["run_seq"]
+    before = svc._load_json(adir / "v1", None)
+    svc.atomic_update_project(USER, task_id, lambda p: p.update(stage="PUBLISH"))
+    svc.end_run(USER, task_id)
+    svc.begin_run(USER, task_id, new_edition=True)
+    assert not (adir / "v1").exists()
+    archived = env.scratch / str(USER) / task_id / "archive" / f"run{seq}" / "report.md" / "v1"
+    assert svc._load_json(archived, None)["run_seq"] == before["run_seq"] == seq
+
+
 # ── G3 hardening (Run-15 closure): tagged-base preference + new_edition archive ─
 
 def _plant_stale_v2(svc, env, task_id, content="STALE older-edition final\n"):

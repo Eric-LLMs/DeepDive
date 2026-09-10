@@ -913,16 +913,38 @@ class ResearchService:
             os.close(dir_fd)
 
     @staticmethod
+    def _replace_durable(src: Path, dst: Path) -> None:
+        """``os.replace`` that survives a transient sharing violation.
+
+        On a Windows / drvfs bind mount a concurrent READER (the host-side API monitor
+        polling the same ``project.json``) can hold the destination open for the few
+        milliseconds of the rename, surfacing as ``PermissionError`` — a busy file, not
+        a corrupt one. Retry with a small exponential backoff (~0.6 s window); the tmp
+        is already fsync'd, so every retry is safe. A rename still refused after the
+        window re-raises, leaving the durable tmp on disk for forensics.
+        """
+        for attempt in range(6):
+            try:
+                os.replace(src, dst)
+                return
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.02 * (2 ** attempt))
+
+    @staticmethod
     def _save_json(path: Path, data: Any) -> None:
         """Durably persist ``data``: write ``.tmp`` -> ``fsync`` -> ``os.replace``.
 
         The tmp + atomic-replace ordering survives a power loss mid-write (either the old
         file or the fully written new file is present, never a torn one); ``fsync`` before
         the rename flushes the bytes to disk. The parent-directory ``fsync`` is best-effort
-        (it needs ``O_DIRECTORY``, which Windows lacks).
+        (it needs ``O_DIRECTORY``, which Windows lacks). The rename goes through
+        :meth:`_replace_durable` so a transient reader on the mounted volume cannot doom
+        a whole run.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(ResearchService._dump_tmp(path, data), path)
+        ResearchService._replace_durable(ResearchService._dump_tmp(path, data), path)
         ResearchService._fsync_dir(path.parent)
 
     def _txn_write(self, saves: list[tuple[Path, Any]]) -> None:
@@ -941,7 +963,7 @@ class ResearchService:
             path.parent.mkdir(parents=True, exist_ok=True)
             staged.append((path, self._dump_tmp(path, data)))
         for path, tmp in staged:
-            os.replace(tmp, path)
+            self._replace_durable(tmp, path)
         for path, _tmp in staged:
             self._fsync_dir(path.parent)
 
@@ -1435,6 +1457,49 @@ class ResearchService:
     def _save_graph(self, owner_id: uuid.UUID, project_id: str, graph: dict) -> None:
         self._save_json(self._project_dir(owner_id, project_id) / "graph.json", graph)
 
+    # ── node-entry checkpoints (stage transaction) ───────────────────────────
+    # A stage commits ONLY by advancing, so "the state of the last completed node"
+    # is exactly the epistemic state captured the moment the stage was ENTERED
+    # (task creation for DISCOVER, every ADVANCED commit for the target stage).
+    # begin_run rolls the shared graph back to that snapshot and un-runs every gate
+    # guarding a transition BEYOND the current stage: a stop / crash in the middle
+    # of a node leaves the node as if it had never run, while all completed
+    # upstream nodes' state (claims, edges, their gates' PASS/OVERRIDE) stands.
+    def _stage_snapshot_path(self, owner_id: uuid.UUID, project_id: str, stage: str) -> Path:
+        return self._project_dir(owner_id, project_id) / "snapshots" / f"{stage}.json"
+
+    def _write_stage_snapshot(self, owner_id: uuid.UUID, project_id: str, stage: str) -> None:
+        self._save_json(
+            self._stage_snapshot_path(owner_id, project_id, stage),
+            {"stage": stage, "at": _now_iso(), "graph": self._load_graph(owner_id, project_id)},
+        )
+
+    def _restart_current_stage(self, project: dict, owner_id: uuid.UUID, project_id: str) -> None:
+        """Roll back the in-progress node's state, inside a lock critical section.
+
+        Called from ``begin_run``'s mutate (single-writer). When no snapshot exists
+        yet (a task created before checkpointing), the CURRENT state is captured as
+        this node's entry point instead of rolling back — legacy work is never
+        destroyed by adopting the new semantics mid-flight.
+        """
+        stage = project.get("stage") or "DISCOVER"
+        snap = self._load_json(self._stage_snapshot_path(owner_id, project_id, stage), None)
+        if snap is None:
+            self._write_stage_snapshot(owner_id, project_id, stage)
+            return
+        if self._load_graph(owner_id, project_id) != snap.get("graph"):
+            self._save_graph(owner_id, project_id, snap.get("graph") or {"nodes": [], "edges": []})
+            logger.info("research node restart: rolled %s graph back to stage-entry snapshot", stage)
+        try:
+            pos = _STAGES.index(stage)
+        except ValueError:
+            return
+        for guarded_target, gate in _GATE_BEFORE.items():
+            if gate and _STAGES.index(guarded_target) > pos:
+                gates = project.setdefault("gates", {})
+                if gates.get(gate) not in (None, "NOT_RUN"):
+                    gates[gate] = "NOT_RUN"
+
     def _artifact_dir(self, owner_id: uuid.UUID, project_id: str, artifact_id: str) -> Path:
         return self._resolve_owned_path(owner_id, project_id, "artifacts", artifact_id)
 
@@ -1593,6 +1658,30 @@ class ResearchService:
             return False
         return version_run_seq != current_run_seq
 
+    def _restamp_primary_tree(
+        self, owner_id: uuid.UUID, project_id: str, artifact_id: str, run_seq: int
+    ) -> None:
+        """Re-tag every versioned record under the primary report's tree with ``run_seq``.
+
+        Used by ``begin_run`` on a mid-chain resume (G3 continuation restamp): the resume
+        bumps ``run_seq`` for the process lease, not for a new edition, so the edition's
+        own pre-stop drafts would otherwise fail review/promote's ghost filter
+        (Run-0910: v1 written at run_seq=6 was "ghosted" from 7 onward, stalling REVIEW
+        for two editions). A genuinely cross-edition tree cannot reach this path — a new
+        edition archives the previous primary tree before the pop. Untagged (grandfathered
+        pre-G3) records are left untouched.
+        """
+        adir = self._artifact_dir(owner_id, project_id, artifact_id)
+        if not adir.is_dir():
+            return
+        for vp in adir.glob("v*"):
+            if not vp.is_file() or not vp.name[1:].isdigit():
+                continue
+            rec = self._load_json(vp, None)
+            if rec is not None and rec.get("run_seq") is not None \
+                    and rec["run_seq"] != run_seq:
+                rec["run_seq"] = run_seq
+                self._save_json(vp, rec)
 
     def _bind_primary_report(
         self, owner_id: uuid.UUID, project_id: str, project: dict, artifact_id: str
@@ -2168,6 +2257,8 @@ class ResearchService:
                     await self.drive.create_folder(owner_id, None, cloud_folder["path"], sub)
             self._save_project(project)
             self._save_graph(owner_id, task_id, {"nodes": [], "edges": []})
+            # DISCOVER-entry checkpoint: the baseline the first node restarts to.
+            self._write_stage_snapshot(owner_id, task_id, "DISCOVER")
             task_spec = {
                 "title": title.strip(),
                 "description": (description or "").strip(),
@@ -2856,6 +2947,10 @@ class ResearchService:
             }
 
         # ── ADVANCED: the commit succeeded; only now may we announce it ──
+        # Node-entry checkpoint: the state as of THIS commit is what a later
+        # restart of the new stage rolls back to (the previous node just
+        # completed — its epistemic state is the new node's baseline).
+        self._write_stage_snapshot(owner_id, project_id, project["stage"])
         self._log_stage_event(
             owner_id, project_id, current=current, target=target, project=project
         )
@@ -3848,6 +3943,22 @@ class ResearchService:
                 # empty it so the new edition re-gathers sources instead of inheriting the
                 # finished edition's STALE/CANDIDATE nodes as if they were current evidence.
                 self._save_graph(owner_id, project_id, {"nodes": [], "edges": []})
+            else:
+                # G3 continuation restamp: a non-new-edition begin_run is a RESUME of the
+                # same unfinished edition (mid-chain stop / stalled re-ignite / plain chat
+                # message). run_seq advanced for the lease, not the edition — re-stamp the
+                # primary tree so review/promote never ghost this run's own drafts.
+                primary = project.get("primary_report_artifact_id")
+                if primary:
+                    self._restamp_primary_tree(
+                        owner_id, project_id, primary, run_seq
+                    )
+            # Node restart (stage transaction): the CURRENT stage has not committed
+            # unless/until it advances, so a fresh run re-enters it from its entry
+            # snapshot — a half-done node (stop or crash) is treated as never run,
+            # while completed upstream nodes' state stands. (No-op vs. fresh
+            # snapshots; new_edition above already reset the whole chain.)
+            self._restart_current_stage(project, owner_id, project_id)
             # Reset the driver ledger for this run: a new run = a new run_id, and the old
             # run's turn/cost/no-progress state must never leak into it.
             project["driver"] = {
@@ -4709,7 +4820,52 @@ class ResearchService:
             raise ValueError(
                 "fetch_materials needs a versioned cloud task run (no fetch provenance this run)"
             )
-        rows = [r for r in (project.get("materials") or []) if isinstance(r, dict)]
+        table_rows = [r for r in (project.get("materials") or []) if isinstance(r, dict)]
+        by_ca = {str(r.get("cloud_asset_id") or ""): r for r in table_rows}
+        # Live membership: the materials/ cloud FOLDER is the truth. Users swap files
+        # in the Cloud view between runs (delete stale copies, drop new ones) — a
+        # create-time provenance table alone keeps pointing at purged asset ids and
+        # every fetch then dies "asset not found" (run-6: 18/18 stale while the folder
+        # already held new material). Enumerate the folder NOW; the table only
+        # enriches rows with the original source asset_id / display name.
+        mat_dir = f"{cloud_root}/materials"
+        try:
+            live_files = [
+                f for f in await self.drive.list_files(owner_id)
+                if (f.get("folder_path") or "") == mat_dir
+            ]
+        except Exception as exc:  # noqa: BLE001 - listing is an optimization, table is the fallback
+            logger.warning("materials listing failed (%s); falling back to the provenance table", exc)
+            live_files = None
+        if live_files is not None:
+            rows: list[dict] = []
+            for f in live_files:
+                ca = str(f.get("id") or "")
+                if not ca:
+                    continue
+                src = by_ca.get(ca) or {}
+                rows.append({
+                    "cloud_asset_id": ca,
+                    "name": str(src.get("name") or f.get("name") or ca),
+                    "asset_id": src.get("asset_id"),
+                    "mime": f.get("mime_type") or src.get("mime"),
+                })
+            if {r["cloud_asset_id"] for r in rows} != {k for k in by_ca if k}:
+                # Re-register the live set as the task's materials table so the
+                # read-time 确权 check (which reads THIS table) follows the folder.
+                def _reseat(p: dict) -> None:
+                    cur = {
+                        str(r.get("cloud_asset_id") or ""): r
+                        for r in (p.get("materials") or []) if isinstance(r, dict)
+                    }
+                    p["materials"] = [
+                        {**cur.get(r["cloud_asset_id"], {}), **r} for r in rows
+                    ]
+
+                self.atomic_update_project(owner_id, project_id, _reseat)
+                project = self._overlay_pending(self._load_project(owner_id, project_id))
+        else:
+            rows = table_rows
         if names:
             wanted = {str(n).strip().lower() for n in names if str(n).strip()}
             if wanted:
@@ -5955,27 +6111,46 @@ class ResearchService:
             )
 
         # ── 2. one reviewer call (repair-once, same discipline as adjudicate) ──
+        # Trace (observation only): the FULL reviewer prompt + raw reply land in the
+        # task's llm_trace.jsonl (sink bound by the worker job) — the REVIEW stage's
+        # server-side LLM is invisible in the agent-loop trace, so it instruments here.
+        from agent.engine import llm_trace
+
         llm_calls = 0
         t0 = time.perf_counter()
         raw = await _adjudication_llm_complete(
             prompt, _REVIEW_SYSTEM_PROMPT, enable_thinking=False
         )
         llm_calls += 1
+        llm_trace.emit({
+            "kind": "review_llm", "call": llm_calls, "artifact_id": artifact_id,
+            "base_version": base_version, "claims_n": len(claims),
+            "draft_chars": len(draft), "system": _REVIEW_SYSTEM_PROMPT,
+            "prompt": prompt, "raw": raw,
+        })
         t_parse = time.perf_counter()
         try:
             changes = _parse_review_payload(raw)
         except ValueError as exc:
-            raw = await _adjudication_llm_complete(
+            repair_prompt = (
                 prompt
                 + f"\n\nYour previous reply failed to parse ({exc}). "
-                  "Reply with ONLY the JSON object described above.",
-                _REVIEW_SYSTEM_PROMPT,
-                enable_thinking=False,
+                  "Reply with ONLY the JSON object described above."
+            )
+            raw = await _adjudication_llm_complete(
+                repair_prompt, _REVIEW_SYSTEM_PROMPT, enable_thinking=False
             )
             llm_calls += 1
+            llm_trace.emit({
+                "kind": "review_llm", "call": llm_calls, "parse_error": str(exc),
+                "system": _REVIEW_SYSTEM_PROMPT, "prompt": repair_prompt, "raw": raw,
+            })
             try:
                 changes = _parse_review_payload(raw)
             except ValueError as exc2:
+                llm_trace.emit({
+                    "kind": "review_unparseable", "error": f"{exc}; {exc2}", "raw": raw,
+                })
                 raise RuntimeError(
                     "review failed: the model returned no parseable patch JSON twice "
                     f"({exc}; {exc2})"
@@ -6014,6 +6189,11 @@ class ResearchService:
         if rejects:
             # Iron rule: one bad row discards the whole staging area — the draft and
             # the graph stay byte-identical to base_version.
+            llm_trace.emit({
+                "kind": "review_apply", "discarded": True,
+                "changes_n": len(changes), "rejects": rejects,
+                "changes": changes,
+            })
             logger.warning(
                 "review.reject %d/%d changes rejected — staging discarded, nothing written",
                 len(rejects), len(changes),
@@ -6032,6 +6212,11 @@ class ResearchService:
                 owner_id, project_id, artifact_id=artifact_id, content=staged
             )
             new_version = commit.get("version")
+        llm_trace.emit({
+            "kind": "review_apply", "discarded": False,
+            "changes_n": len(changes), "applied": staged != draft,
+            "new_version": new_version, "changes": changes,
+        })
         logger.info(
             "review.apply applied=%d changed=%s version=%s",
             len(changes), staged != draft, new_version,
