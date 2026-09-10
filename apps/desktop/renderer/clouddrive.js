@@ -20,6 +20,7 @@
   const cdNewFolder = document.getElementById("cd-new-folder");
   const cdNewText = document.getElementById("cd-new-text");
   const cdNewWs = document.getElementById("cd-new-workspace");
+  const cdRefresh = document.getElementById("cd-refresh");
   const cdSearch = document.getElementById("cd-search");
   const cdSearchClear = document.getElementById("cd-search-clear");
   const cdSuggest = document.getElementById("cd-suggest");
@@ -2287,6 +2288,7 @@
   cdNewFolder.addEventListener("click", () => createFolder(drive.loc));
   cdNewText.addEventListener("click", () => createTextFile(drive.loc));
   if (cdNewWs) cdNewWs.addEventListener("click", createWorkspace);
+  if (cdRefresh) cdRefresh.addEventListener("click", () => loadDrive());
   cdListEl.addEventListener("contextmenu", (e) => {
     e.preventDefault();
     // Right-click a folder → create inside it / delete it; a file → create in its
