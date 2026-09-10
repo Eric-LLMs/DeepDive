@@ -412,6 +412,19 @@ FETCH_MAX_URLS = 5
 FETCH_MAX_PAGE_CHARS = 30_000
 FETCH_BATCH_CHAR_CAP = FETCH_MAX_URLS * FETCH_MAX_PAGE_CHARS  # 150_000
 
+# ── Materials budget (research_scrape fetch_materials — local files as sources) ──
+# The task's ``materials/`` files join the web pages in ONE Sources pool: same drafts,
+# same ledger, same adjudicate/verify semantics. ``source_type`` labels provenance only.
+# Extraction budgets (OOM / token fusing): per-file 100k chars hard-truncated BEFORE the
+# text enters any evidence/LLM path (with an explicit [TRUNCATED] tail marker and
+# ``is_truncated`` on the ledger entry + view), and one call never exceeds the aggregate
+# budget. ``MATERIALS_MAX_FILES_PER_BATCH`` bounds one internal consume-loop page.
+MATERIALS_PROTO = "material://"
+MATERIALS_MAX_FILES_PER_BATCH = 10
+MATERIALS_MAX_FILE_CHARS = 100_000
+MATERIALS_MAX_TOTAL_CHARS = 400_000
+MATERIALS_PER_FILE_TIMEOUT_S = 120.0
+
 # ── P3-7B read-fetch window (telemetry-derived, not a gut number) ────────────
 # Source: data/audit.jsonl context_profile on 140 turn-end rows (Runs incl. 9/10):
 # per-turn tool_result_chars med=2,160 p75=22,365 p90=46,386 max=84,668; the largest
@@ -1510,6 +1523,20 @@ class ResearchService:
                             return record
         return None
 
+    @staticmethod
+    def _materials_view(project: dict) -> list[dict]:
+        """Agent-facing materials listing: names + mime ONLY.
+
+        Asset ids deliberately stay server-side — fetch_materials resolves the whole
+        set itself, so the model never needs (and never gets) an id it could try to
+        reference outside the确权 path.
+        """
+        return [
+            {"name": str(r.get("name") or ""), "mime": str(r.get("mime") or "")}
+            for r in (project.get("materials") or [])
+            if isinstance(r, dict)
+        ]
+
     def resume_project(self, owner_id: uuid.UUID, project_id: str) -> dict:
         project = self._load_project(owner_id, project_id)
         return {
@@ -1522,6 +1549,7 @@ class ResearchService:
             "execution_mode": project.get("execution_mode", "strict"),
             "gates": project["gates"],
             "updated_at": project["updated_at"],
+            "materials": self._materials_view(project),
         }
 
     def snapshot_project(self, owner_id: uuid.UUID, project_id: str) -> dict:
@@ -1535,6 +1563,7 @@ class ResearchService:
             "execution_mode": project.get("execution_mode", "strict"),
             "node_count": len(graph["nodes"]),
             "edge_count": len(graph["edges"]),
+            "materials": self._materials_view(project),
         }
 
     def archive_project(self, owner_id: uuid.UUID, project_id: str) -> dict:
@@ -2884,12 +2913,21 @@ class ResearchService:
 
     def get_handoff(self, owner_id: uuid.UUID, project_id: str) -> dict:
         project = self._load_project(owner_id, project_id)
-        return {
+        handoff = {
             "project_id": project["id"],
             "stage": project["stage"],
             "next_stage": _LEGAL_NEXT.get(project["stage"]),
             "gate_required": _GATE_BEFORE.get(_LEGAL_NEXT.get(project["stage"]) or ""),
         }
+        # Conditional materials hint: only tasks that actually carry materials get the
+        # fetch-first instruction — an empty materials list must never bait a wasted
+        # fetch_materials round-trip.
+        if project["stage"] == "EVIDENCE" and bool(project.get("materials")):
+            handoff["materials_hint"] = (
+                "First run research_scrape action=fetch_materials — task materials are "
+                "first-class sources (material:// urls)."
+            )
+        return handoff
 
     # ── research_evidence ─────────────────────────────────────────────────
     @staticmethod
@@ -4123,7 +4161,7 @@ class ResearchService:
     @staticmethod
     def _already_fetched_view(url: str, entry: dict) -> dict:
         """P3-7A ref-only view: identity + sizes, never the page text again."""
-        return {
+        view = {
             "url": url,
             "canonical_url": entry.get("canonical_url", ""),
             "status": "ok",
@@ -4140,6 +4178,15 @@ class ResearchService:
             "hint": "this run already fetched this page — its text is not re-delivered; "
             "reuse the ids from the first fetch, or research_scrape read for the draft",
         }
+        # Material pages carry their provenance labels (identity only — the ref view
+        # semantics are identical for web and material sources).
+        if entry.get("source_type"):
+            view["source_type"] = entry["source_type"]
+        if entry.get("file"):
+            view["file"] = entry["file"]
+        if entry.get("is_truncated"):
+            view["is_truncated"] = True
+        return view
 
     async def fetch_save_batch(
         self,
@@ -4308,6 +4355,20 @@ class ResearchService:
             resolver_eff = resolver or _FETCH_RESOLVER_OVERRIDE
 
             async def _net(i: int) -> dict:
+                # material:// is a local-source pseudo-scheme: it may ONLY arrive here
+                # already saved by fetch_materials (P3-7A dedup catches that case above).
+                # A material key that never went through fetch_materials must never
+                # reach the network stack — reject with a repair hint instead.
+                if cu_of[i].startswith(MATERIALS_PROTO):
+                    return {
+                        "url": raw[i], "canonical_url": cu_of[i], "status": "error",
+                        "error": {"type": "scheme", "message":
+                                  "material:// is not fetchable — save it first with "
+                                  "research_scrape action=fetch_materials"},
+                        "title": "", "http_status": None, "final_url": cu_of[i],
+                        "content_status": "n/a", "full_char_len": 0, "char_len": 0,
+                        "text": "", "truncated": False,
+                    }
                 envs = await fetch_clean_urls(
                     [raw[i]], transport=transport_eff, resolver=resolver_eff
                 )
@@ -4410,6 +4471,10 @@ class ResearchService:
                 "saved": False,
                 "asset_id": None,
                 "cache_hit": i in hits,  # P3-2A: server-set; a hit still re-materializes
+                # Provenance label only (report/sourcing/dedup); web and material
+                # sources are otherwise processed with IDENTICAL evidence semantics.
+                "source_type": "web",
+                "is_truncated": False,
             }
             if o.get("content_status") != "usable":
                 additions[cu] = entry  # fetched but unusable → recorded, never verifiable
@@ -4471,6 +4536,397 @@ class ResearchService:
                 for i, u in enumerate(raw_all)
             ]
         return views
+
+    # ── research_scrape fetch_materials (task materials as first-class sources) ──
+    @staticmethod
+    def _material_key(cloud_asset_id: str, name: str) -> str:
+        """Canonical pseudo-URL for one material file.
+
+        ``canonicalize()`` passes non-http(s) schemes through unchanged (web_fetch), so
+        this string keys the SAME ``_fetch_provenance`` ledger the web path uses —
+        read/adjudicate/verify need no new trust machinery. Dedup is by
+        ``cloud_asset_id`` (callers check ledger entries), never the renameable
+        filename segment.
+        """
+        return f"{MATERIALS_PROTO}{cloud_asset_id}/{_safe_filename(name) or 'file'}"
+
+    @staticmethod
+    def _sniff_material(content: bytes) -> str:
+        """Format sniff by CONTENT (magic bytes / decodeability), never by file name.
+
+        Returns ``pdf | xlsx | docx | pptx | xls-legacy | text | binary``. Zip
+        containers are classified from member names; ``text`` only when the bytes
+        decode (utf-8 / gbk) with no NULs.
+        """
+        head = content[:8] if content else b""
+        if head.startswith(b"%PDF"):
+            return "pdf"
+        if head[:2] == b"PK":
+            import io
+            import zipfile
+            try:
+                with zipfile.ZipFile(io.BytesIO(content)) as z:
+                    names = z.namelist()
+            except Exception:  # noqa: BLE001 - truncated/encrypted zip
+                return "binary"
+            if any(n == "xl/workbook.xml" or n.startswith("xl/") for n in names):
+                return "xlsx"
+            if any(n == "word/document.xml" or n.startswith("word/") for n in names):
+                return "docx"
+            if any(n == "ppt/presentation.xml" or n.startswith("ppt/") for n in names):
+                return "pptx"
+            return "binary"
+        if head == bytes.fromhex("d0cf11e0a1b11ae1"):
+            return "xls-legacy"  # OLE container (.xls / encrypted office)
+        sample = content[:65_536]
+        if b"\x00" in sample:
+            return "binary"
+        for enc in ("utf-8-sig", "gbk"):
+            try:
+                sample.decode(enc)
+                return "text"
+            except UnicodeDecodeError:
+                continue
+        return "binary"
+
+    @staticmethod
+    def _garbling_ratio(text: str) -> float:
+        """Share of control/replacement characters — the per-page garbling gauge."""
+        if not text:
+            return 1.0
+        bad = sum(
+            1 for ch in text
+            if ch == "" or (ord(ch) < 32 and ch not in "\t\n\r")
+        )
+        return bad / len(text)
+
+    @staticmethod
+    def _vision_llm():
+        """The shared single-shot LLM (same singleton the adjudicator uses), or None."""
+        global _LLM_SINGLETON
+        try:
+            if _LLM_SINGLETON is None:
+                from core.infrastructure.llm import OpenAILLM
+                _LLM_SINGLETON = OpenAILLM()
+            return _LLM_SINGLETON
+        except Exception as exc:  # noqa: BLE001 - vision is an upgrade, never a dependency
+            logger.warning("research material vision llm unavailable: %s", exc)
+            return None
+
+    async def _extract_material(self, content: bytes) -> tuple[str | None, str | None]:
+        """Extract readable text from a material file. Returns ``(text, error_reason)``.
+
+        PDF is two-pass: body text first; vision transcription only fires when a table
+        IS detected AND the first pass degraded (too short / garbled) — ordinary text
+        PDFs never spend a vision call. Office/textless containers are refused with a
+        precise reason; a lossy text fallback for a binary is forbidden by contract.
+        """
+        from core.infrastructure.ingest import UnsupportedFileType, extract_text
+        from core.infrastructure.pdf import (
+            detect_tables,
+            extract_pdf_document,
+            extract_pdf_text,
+        )
+
+        kind = self._sniff_material(content)
+        if kind == "pdf":
+            try:
+                text = extract_pdf_text(content)
+            except Exception as exc:  # noqa: BLE001 - corrupt/truncated PDF
+                return None, f"corrupt or unreadable PDF ({type(exc).__name__})"
+            if not (
+                len(text.strip()) >= MIN_FETCH_TEXT_CHARS
+                and self._garbling_ratio(text) < 0.05
+            ):
+                try:
+                    tables = detect_tables(content, max_tables=2)
+                except Exception:  # noqa: BLE001 - detection hiccup → keep first pass
+                    tables = []
+                if tables:
+                    llm = self._vision_llm()
+                    if llm is not None:
+                        try:
+                            upgraded = await extract_pdf_document(content, llm)
+                            text = upgraded or text
+                        except Exception as exc:  # noqa: BLE001 - degrade, never fail
+                            logger.warning("research material pdf vision failed: %s", exc)
+            return text, None
+        if kind == "text":
+            try:
+                # Content already sniffed text-decodable; dispatch the pure-text family.
+                return extract_text(content, "material.txt"), None
+            except UnsupportedFileType:
+                return None, "unsupported: unrecognized text subtype"
+            except Exception as exc:  # noqa: BLE001
+                return None, f"text decode failed ({type(exc).__name__})"
+        if kind == "xlsx":
+            from core.infrastructure.ingest import _extract_excel
+            try:
+                return _extract_excel(content), None
+            except Exception as exc:  # noqa: BLE001
+                return None, f"corrupt or unreadable Excel ({type(exc).__name__})"
+        if kind == "docx":
+            return None, "unsupported: .docx not supported"
+        if kind == "pptx":
+            return None, "unsupported: .pptx not supported"
+        if kind == "xls-legacy":
+            return None, "unsupported: legacy .xls not supported, resave as .xlsx"
+        return None, "unsupported: binary format not text-extractable"
+
+    async def fetch_materials(
+        self,
+        owner_id: uuid.UUID,
+        project_id: str,
+        *,
+        names: list[str] | None = None,
+    ) -> dict:
+        """Fetch every file under the task's ``materials/`` into this run's source pool.
+
+        The agent triggers ONE call; the server consumes the whole list itself, page by
+        page (``MATERIALS_MAX_FILES_PER_BATCH`` per internal page), until all materials
+        are done or the aggregate budget trips (``budget_stopped`` + ``remaining``):
+        - dedup by ``cloud_asset_id`` — an already-fetched material returns a
+          text-free ``already_fetched`` reference; a rename never mints a second source;
+        - per-file fault isolation — corrupt/timeout/unsupported files land in
+          ``skipped: [{name, reason}]`` and never break the batch;
+        - the 100k per-file truncation happens BEFORE the evidence pipeline: the stored
+          draft ends with ``[TRUNCATED]`` and the ledger entry + view carry
+          ``is_truncated: True`` (never silently);
+        - F2: ``assert_auto_run_authority`` gates every download AND every drive write;
+          ledger additions merge through the P3-6 pending overlay (flushed inside the
+          next fenced ``atomic_update_project``), so a reclaimed zombie is refused.
+
+        Ledger entries carry the full确权 set (``source_type="material"``,
+        ``project_id``, ``run_seq``, ``source_asset_id``, ``cloud_asset_id``) that
+        read_fetch/adjudicate re-validate; web entries carry ``source_type="web"``.
+        """
+        from core.infrastructure.ingest import _CONTROL_STRIP_RE
+
+        project = self._overlay_pending(self._load_project(owner_id, project_id))
+        cloud_root = project.get("cloud_folder_path")
+        rv = self._run_version_of(project)
+        if not cloud_root or not rv:
+            raise ValueError(
+                "fetch_materials needs a versioned cloud task run (no fetch provenance this run)"
+            )
+        rows = [r for r in (project.get("materials") or []) if isinstance(r, dict)]
+        if names:
+            wanted = {str(n).strip().lower() for n in names if str(n).strip()}
+            if wanted:
+                rows = [r for r in rows if str(r.get("name") or "").lower() in wanted]
+        # Absolute dedup key: cloud_asset_id (a rename must not mint a second source).
+        picked: dict[str, dict] = {}
+        for r in rows:
+            ca = str(r.get("cloud_asset_id") or "")
+            if ca and ca not in picked:
+                picked[ca] = r
+        if not picked:
+            return {
+                "fetched": 0, "remaining": 0, "budget_stopped": False,
+                "results": [], "skipped": [],
+                "reason": "no materials attached to this task",
+            }
+        rel_dir = f"temp/v{rv}/{_SCRAPE_SUBDIR}"
+        folder_path = f"{cloud_root}/{rel_dir}"
+        try:
+            await self._ensure_cloud_dir(owner_id, project, rel_dir)
+        except Exception as exc:  # noqa: BLE001 - one precise error, not N silent skips
+            raise ValueError(f"materials scrape folder unavailable: {exc}") from exc
+        run_seq = int(project.get("run_seq") or 0)
+        prov = self._fetch_provenance(project)
+        additions: dict[str, dict] = {}
+        views: list[dict] = []
+        skipped: list[dict] = []
+        consumed_chars = 0
+        attempted = 0
+        budget_stopped = False
+        items = list(picked.items())
+        idx = 0
+        while idx < len(items) and not budget_stopped:
+            page = items[idx: idx + MATERIALS_MAX_FILES_PER_BATCH]
+            idx += len(page)
+            for cloud_asset_id, row in page:
+                orig_name = str(row.get("name") or cloud_asset_id)
+                # Idempotent across re-calls in the same run, keyed on cloud_asset_id.
+                prior = next(
+                    (
+                        e for e in prov.values()
+                        if isinstance(e, dict)
+                        and e.get("source_type") == "material"
+                        and e.get("cloud_asset_id") == cloud_asset_id
+                        and e.get("saved") and e.get("asset_id")
+                    ),
+                    None,
+                )
+                if prior is not None:
+                    views.append(
+                        self._already_fetched_view(prior.get("canonical_url", ""), prior)
+                    )
+                    attempted += 1
+                    continue
+                # Budget gate projects the per-file hard cap: a file can never add more
+                # than MATERIALS_MAX_FILE_CHARS (truncation is enforced before), so one
+                # call can at most reach TOTAL + CAP; the old ``>= consumed`` test let
+                # 4x99,991 slip just under the cap and still admit a fifth file.
+                if consumed_chars + MATERIALS_MAX_FILE_CHARS > MATERIALS_MAX_TOTAL_CHARS:
+                    budget_stopped = True
+                    break
+                attempted += 1
+                try:
+                    self.assert_auto_run_authority(owner_id, project_id)
+
+                    async def _dl_extract(ca: str = cloud_asset_id) -> tuple[str | None, str | None]:
+                        _mime, _nm, content = await self.drive.download(
+                            owner_id, uuid.UUID(ca)
+                        )
+                        if not content:
+                            return None, "empty file bytes"
+                        return await self._extract_material(content)
+
+                    text, err = await asyncio.wait_for(
+                        _dl_extract(), MATERIALS_PER_FILE_TIMEOUT_S
+                    )
+                except asyncio.TimeoutError:
+                    skipped.append({"name": orig_name, "reason": "per-file timeout"})
+                    continue
+                except DriveError as exc:
+                    skipped.append({"name": orig_name, "reason": f"drive read failed: {exc}"})
+                    continue
+                except OwnershipLost:
+                    # The F2 fence is not a per-file fault — a reclaimed execution must
+                    # abort the whole batch (the caller folds to a silent drop), never
+                    # launder ownership loss into a ``skipped`` row.
+                    raise
+                except Exception as exc:  # noqa: BLE001 - isolate; one bad file never sinks the batch
+                    skipped.append({"name": orig_name, "reason": f"{type(exc).__name__}: {exc}"})
+                    continue
+                if text is None:
+                    skipped.append({"name": orig_name, "reason": err or "not text-extractable"})
+                    continue
+                # NUL/control hygiene before the draft enters storage (PG-backed paths
+                # downstream refuse NUL in TEXT; same strip as the RAG extractor).
+                text = _CONTROL_STRIP_RE.sub("", text)
+                is_truncated = False
+                if len(text) > MATERIALS_MAX_FILE_CHARS:
+                    text = text[: MATERIALS_MAX_FILE_CHARS - 20].rstrip() + "\n[TRUNCATED]"
+                    is_truncated = True
+                if (
+                    len(text.strip()) < MIN_FETCH_TEXT_CHARS
+                    or self._garbling_ratio(text) >= 0.5
+                ):
+                    skipped.append({
+                        "name": orig_name,
+                        "reason": "no usable text (empty or binary/garbled extraction)",
+                    })
+                    continue
+                consumed_chars += len(text)
+                try:
+                    # Ownership red line: assert BEFORE the finalize (save_artifact).
+                    self.assert_auto_run_authority(owner_id, project_id)
+                    safe = _safe_filename(orig_name) or "material"
+                    dname = f"fetch_material_{safe[:60]}_{uuid.uuid4().hex[:10]}.md"
+                    header = (
+                        f"<!-- DeepDive research scrape\n"
+                        f"Source: material\n"
+                        f"File: {orig_name}\n"
+                        f"Cloud_asset_id: {cloud_asset_id}\n"
+                        f"Run_version: {rv}\n"
+                        f"Retrieved_at: {_now_iso()}\n"
+                        f"-->\n\n"
+                    )
+                    asset = await self.drive.save_artifact(
+                        owner_id,
+                        name=dname,
+                        mime_type="text/markdown",
+                        content=(header + text).encode("utf-8"),
+                        folder_path=folder_path,
+                        workspace_id=None,
+                    )
+                except OwnershipLost:
+                    raise  # fence loss aborts the batch (see the download guard above)
+                except Exception as exc:  # noqa: BLE001 - E10: a failed save is not ledgered
+                    skipped.append({"name": orig_name, "reason": f"drive write failed: {exc}"})
+                    continue
+                cu = self._material_key(cloud_asset_id, orig_name)
+                entry = {
+                    "url": cu,
+                    "canonical_url": cu,
+                    "fetch_status": "ok",
+                    "http_status": None,
+                    "content_status": "usable",
+                    "full_char_len": len(text),
+                    "saved": True,
+                    "asset_id": str(asset.id),
+                    "name": dname,
+                    "path": f"{folder_path}/{dname}",
+                    "cache_hit": False,
+                    "fetched_at": _now_iso(),
+                    "retrieved_at": _now_iso(),
+                    "source_type": "material",
+                    "file": orig_name,
+                    "is_truncated": is_truncated,
+                    "project_id": str(project_id),
+                    "run_seq": run_seq,
+                    "source_asset_id": str(row.get("asset_id") or ""),
+                    "cloud_asset_id": cloud_asset_id,
+                }
+                additions[cu] = entry
+                views.append(self._fetch_view(
+                    {
+                        "url": cu, "canonical_url": cu, "status": "ok",
+                        "content_status": "usable", "title": orig_name,
+                        "http_status": None, "final_url": cu,
+                        "full_char_len": len(text),
+                        "char_len": min(len(text), DEFAULT_TEXT_TARGET),
+                        "text": text[:DEFAULT_TEXT_TARGET],
+                        "truncated": is_truncated or len(text) > DEFAULT_TEXT_TARGET,
+                    },
+                    saved=True, asset_id=entry["asset_id"], path=entry["path"],
+                    name=dname, source_type="material", file=orig_name,
+                    is_truncated=True if is_truncated else None,
+                ))
+        if additions:
+            self._merge_cloud_assets(
+                owner_id, project_id, {_FETCH_PROVENANCE_KEY: additions}
+            )
+        return {
+            "fetched": len(additions),
+            "already_fetched": sum(1 for v in views if v.get("already_fetched")),
+            "budget_stopped": budget_stopped,
+            "remaining": max(0, len(items) - attempted),
+            "results": views,
+            "skipped": skipped,
+        }
+
+    def _assert_material_confirmed(self, project: dict, project_id: str, cu: str) -> None:
+        """material:// pages must be确权 to THIS task before any read-back.
+
+        A pseudo-URL string is never authority by itself: the resolved ledger entry must
+        carry ``source_type="material"``, name this project, and its ``cloud_asset_id``
+        must still sit in the task's materials list. Web pages skip this check entirely
+        (their URL-keyed provenance path is unchanged).
+        """
+        if not cu.startswith(MATERIALS_PROTO):
+            return
+        entry = self._fetch_provenance(project).get(cu)
+        if not isinstance(entry, dict) or entry.get("source_type") != "material":
+            raise ValueError(
+                f"material source {cu!r} has no material provenance this run — "
+                "save it first with research_scrape fetch_materials"
+            )
+        if str(entry.get("project_id") or "") != str(project_id):
+            raise ValueError(
+                f"material source {cu!r} belongs to another project — cross-project reads are refused"
+            )
+        allowed = {
+            str(r.get("cloud_asset_id") or "")
+            for r in (project.get("materials") or [])
+            if isinstance(r, dict)
+        }
+        if not entry.get("cloud_asset_id") or entry.get("cloud_asset_id") not in allowed:
+            raise ValueError(
+                f"material source {cu!r} is no longer attached to this task's materials"
+            )
 
     async def read_fetch(
         self,
@@ -4539,6 +4995,8 @@ class ResearchService:
             if match is None:
                 raise ValueError(f"no fetch asset named {name!r} this run")
             asset_id, cu = match["asset_id"], match["canonical_url"]
+        # material:// 确权 (project + materials membership) before any drive read.
+        self._assert_material_confirmed(project, project_id, cu)
         try:
             full = await self.drive.read_text(owner_id, uuid.UUID(asset_id))
         except Exception as exc:
@@ -4615,7 +5073,8 @@ class ResearchService:
                 )
             prov = self._fetch_provenance(project)
             res = self._apply_findings(
-                graph, claim_id, claim_node.get("label") or claim_id, prov, findings
+                graph, claim_id, claim_node.get("label") or claim_id, prov, findings,
+                project=project,
             )
             out.update(res)
             return None if res["changed"] else False
@@ -4640,6 +5099,8 @@ class ResearchService:
         claim_label: str,
         prov: dict,
         findings: list[dict],
+        *,
+        project: dict | None = None,
     ) -> dict:
         """The shared E1/E2/E7 ingest core — the SINGLE business path of ``verify`` and
         ``verify_batch`` (P3-1 constraints 7+8: batch ≡ sequential, never a copy).
@@ -4684,6 +5145,24 @@ class ResearchService:
                     {"cu": cu, "reason": "no fetch provenance this run (fetch the URL with research_scrape fetch first)"}
                 )
                 continue
+            # material:// 确权: a pseudo-URL string is never authority by itself — the
+            # ledger entry must name THIS project and its cloud_asset_id must still be
+            # attached to the task's materials (a web URL skips this — unchanged path).
+            if cu.startswith(MATERIALS_PROTO):
+                _rows = [r for r in ((project or {}).get("materials") or []) if isinstance(r, dict)]
+                _allowed = {str(r.get("cloud_asset_id") or "") for r in _rows}
+                if (
+                    entry.get("source_type") != "material"
+                    or str(entry.get("project_id") or "") != str((project or {}).get("id") or "")
+                    or not entry.get("cloud_asset_id")
+                    or entry.get("cloud_asset_id") not in _allowed
+                ):
+                    rejected.append({
+                        "cu": cu,
+                        "reason": "material source not confirmed for this task — "
+                                  "re-save it with research_scrape fetch_materials",
+                    })
+                    continue
             fetch_ok = entry.get("fetch_status") == "ok"
             content_ok = (
                 fetch_ok
@@ -4716,13 +5195,22 @@ class ResearchService:
                         source = {
                             "id": source_id,
                             "type": "Source",
-                            "label": (f.get("source_label") or "").strip() or cu,
+                            # Material sources carry their original file name as label so
+                            # report citations read like sources, not pseudo-URLs.
+                            "label": (f.get("source_label") or "").strip()
+                            or entry.get("file") or cu,
                             "url": cu,
                             "verification_status": "verified",
                             "canonical_url": cu,
                             "full_char_len": entry.get("full_char_len"),
                             "content_status": entry.get("content_status"),
                             "asset_id": entry.get("asset_id"),
+                            # Provenance labels — identity/display only; never change
+                            # evidence processing (material ≡ web in the Sources pool).
+                            "source_type": entry.get("source_type") or "web",
+                            "file": entry.get("file"),
+                            "is_truncated": bool(entry.get("is_truncated", False)),
+                            "cloud_asset_id": entry.get("cloud_asset_id"),
                             "status": "VALID",
                         }
                         graph["nodes"].append(source)
@@ -4957,7 +5445,10 @@ class ResearchService:
                            "pending": False, "evidence_fingerprint": current_fp})
                     continue
 
-                out = self._apply_findings(graph, claim_id, node.get("label") or claim_id, prov, findings)
+                out = self._apply_findings(
+                    graph, claim_id, node.get("label") or claim_id, prov, findings,
+                    project=project,
+                )
                 item_changed = out["changed"]
                 if citations is not None:
                     node["citations"] = citations
@@ -5694,7 +6185,7 @@ _EVIDENCE_ACTIONS = [
 ]
 _GATE_ACTIONS = ["check", "explain_failure", "request_override", "resolve_override"]
 _RUN_ACTIONS = ["record_execution", "finish_execution", "execute_sandbox_script"]
-_SCRAPE_ACTIONS = ["save_scrape", "fetch", "read"]
+_SCRAPE_ACTIONS = ["save_scrape", "fetch", "fetch_materials", "read"]
 
 
 def _params(actions: list[str], extra: dict, required: list[str]) -> dict:
@@ -6035,6 +6526,19 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                     user(), _project_id(args, "research_scrape", action), urls=urls
                 )
             }
+        if action == "fetch_materials":
+            # One call, server-side full consumption of the task's materials/ (see
+            # ResearchService.fetch_materials). Silent by contract (like fetch).
+            names = args.get("names")
+            if names is not None and (
+                not isinstance(names, list) or any(not isinstance(n, str) for n in names)
+            ):
+                raise ValueError(
+                    "research_scrape fetch_materials needs 'names' as an optional list of file names"
+                )
+            return await svc.fetch_materials(
+                user(), _project_id(args, "research_scrape", action), names=names
+            )
         if action == "read":
             return await svc.read_fetch(
                 user(), _project_id(args, "research_scrape", action),
@@ -6303,7 +6807,12 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
             "Supported actions: save_scrape (file a retrieved page's raw content under "
             "`temp/vN/scrape/`), fetch (server-side real-fetch of a claim's source URLs — "
             "concurrent, SSRF-guarded, cleaned to core text, recorded in this run's "
-            "fetch ledger, snippets returned), read (read back a full draft this run "
+            "fetch ledger, snippets returned), fetch_materials (one call: the server "
+            "extracts EVERY file under this task's materials/ — pdf/xlsx/xlsm/md/txt/"
+            "csv, detected by content not by name — and saves each as a first-class "
+            "source in the same ledger with a material:// url, budgeted and truncated "
+            "per file; corrupt/unsupported files are listed in 'skipped', never fatal), "
+            "read (read back a full draft this run "
             "fetched). "
             "Constraints: save_scrape requires 'source', 'query' and 'content' ('url' "
             "optional); content must be extracted text/markdown, never raw JSON. 'fetch' "
@@ -6341,6 +6850,13 @@ def build_research_plugin(ctx: Any | None = None) -> Plugin:
                     "description": "fetch: ≤5 unique URLs to real-fetch this run (P3-5; "
                     "SSRF-guarded, concurrent, cleaned to core text; already-fetched "
                     "URLs return a text-free reference).",
+                },
+                "names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "fetch_materials: OPTIONAL filter — original file "
+                    "names to fetch (default: every material attached to this task; "
+                    "the server consumes them page by page within one call).",
                 },
                 "offset": {
                     "type": "integer",

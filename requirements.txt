@@ -38,6 +38,9 @@ jieba>=0.42
 # core/infrastructure/{pdf,ingest}.py so the API stays light until a file is ingested.
 PyMuPDF>=1.24
 python-docx>=1.1
+# Excel (.xlsx/.xlsm) for the research materials path — openpyxl read-only streaming
+# (lazy-imported in core/infrastructure/ingest.py::_extract_excel).
+openpyxl>=3.1
 
 # Slide generation: python-pptx backs the doc_slides agent tool (text-only .pptx) and
 # desktop Generate PPT. Lazy-imported in core/infrastructure/media.py.

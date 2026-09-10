@@ -25,6 +25,13 @@ from core.infrastructure import media
 
 _SUBTITLE_EXTS = {".srt", ".vtt", ".lrc"}
 _TEXT_EXTS = {".txt", ".md", ".markdown", ".text", ".log", ".json", ".csv"}
+_EXCEL_EXTS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+
+# Excel read budget: the research materials path feeds the extracted grid straight into
+# the evidence pipeline, so bound the read — read_only streaming (no formula tree, no
+# styles) plus sheet/row caps keep a pathological workbook from blowing up memory.
+EXCEL_MAX_SHEETS = 8
+EXCEL_MAX_ROWS = 2_000
 
 # C0 control characters except the whitespace ones (\t \n \r) plus DEL. Broken PDF glyph
 # mappings (e.g. inline math in some fonts) decode to control chars like NUL; PostgreSQL
@@ -43,7 +50,7 @@ def supported_extensions() -> set[str]:
     Single source of truth for the clients: the toolkit config endpoint surfaces these so
     the desktop picker can grey out files a generation job would refuse.
     """
-    return _TEXT_EXTS | _SUBTITLE_EXTS | {".pdf", ".docx"}
+    return _TEXT_EXTS | _SUBTITLE_EXTS | _EXCEL_EXTS | {".pdf", ".docx"}
 
 
 @dataclass
@@ -74,6 +81,11 @@ def extract_text(content: bytes, name: str, *, para_markers: bool = False) -> st
     RAG chunks can be attributed to the paragraph they cover (see ``build_chunks(on_split=)``).
     """
     ext = Path(name).suffix.lower()
+    if ext in _EXCEL_EXTS:
+        # Binary container — must be dispatched BEFORE the generic decode below.
+        return _extract_excel(content)
+    if ext == ".xls":
+        raise UnsupportedFileType("legacy .xls is not supported — resave as .xlsx")
     text = _decode(content)
     if ext == ".vtt":
         cues = media.parse_vtt_text(text)
@@ -112,6 +124,40 @@ def _extract_docx(content: bytes, *, para_markers: bool = False) -> str:
             cells = [c.text for c in row.cells]
             parts.append(" | ".join(cells))
     return "\n".join(p for p in parts if p)
+
+
+def _extract_excel(content: bytes) -> str:
+    """Extract a tab-separated grid from an .xlsx/.xlsm (``openpyxl`` read-only stream).
+
+    ``read_only=True, data_only=True``: rows stream off the shared-strings table without
+    building the formula tree or loading styles, and cached values are read instead of
+    ``=FORMULA`` strings. Caps: first :data:`EXCEL_MAX_SHEETS` sheets, first
+    :data:`EXCEL_MAX_ROWS` rows per sheet (an overrun row is emitted as
+    ``[rows truncated]`` so downstream consumers see the boundary, never silently).
+    """
+    import io
+
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    parts: list[str] = []
+    try:
+        for ws in wb.worksheets[:EXCEL_MAX_SHEETS]:
+            parts.append(f"## sheet: {ws.title}")
+            n = 0
+            for row in ws.iter_rows(values_only=True):
+                if n >= EXCEL_MAX_ROWS:
+                    parts.append("[rows truncated]")
+                    break
+                cells = ["" if v is None else str(v) for v in row]
+                if any(cells):
+                    parts.append("\t".join(cells))
+                n += 1
+        if len(wb.worksheets) > EXCEL_MAX_SHEETS:
+            parts.append(f"[{len(wb.worksheets) - EXCEL_MAX_SHEETS} sheets truncated]")
+    finally:
+        wb.close()
+    return "\n".join(parts)
 
 
 async def extract_document_text(

@@ -478,6 +478,7 @@ def auto_turn_prompt(
     stage: str,
     turn_index: int,
     consecutive_no_progress: int = 0,
+    has_materials: bool = False,
 ) -> str:
     """The driver directive handed to the model for one autonomous continuation turn.
 
@@ -485,6 +486,10 @@ def auto_turn_prompt(
     turn re-arms the same resume contract but tells the model to keep going without asking the
     user, and to be honest about stopping (it may request a gate override only when a human
     decision is genuinely required).
+
+    ``has_materials`` gates the EVIDENCE materials hint: it is injected ONLY when the task
+    actually carries materials — an empty materials list must never bait a wasted
+    ``fetch_materials`` round-trip.
     """
     push = (
         "\nNOTE: The previous auto turn made no visible progress on the task files — the stage "
@@ -496,6 +501,16 @@ def auto_turn_prompt(
         "un-passed gate checks into the project diagnostics and grants the move. Never loop "
         "inside a single stage."
         if consecutive_no_progress > 0
+        else ""
+    )
+    materials_line = (
+        "In EVIDENCE, if the task carries materials, FIRST call research_scrape action "
+        "\"fetch_materials\" — task materials land in the run's provenance ledger under "
+        "material:// urls and are first-class sources with the same standing as web pages: "
+        "pass those urls to adjudicate alongside web urls, and read them back with "
+        "research_scrape read before citing. source_type is identity only — it never "
+        "changes how evidence is verified. "
+        if has_materials
         else ""
     )
     return (
@@ -519,7 +534,7 @@ def auto_turn_prompt(
         "research_state incl. get_state/get_handoff/transition_stage, research_evidence "
         "record_node/adjudicate, research_gate check, research_artifact, research_run, "
         "research_scrape, rag_search, web_search, search_social), reading the task state each "
-        "turn. In EVIDENCE run the wholesale ATOMIC pipeline — pending -> ONE "
+        "turn. " + materials_line + "In EVIDENCE run the wholesale ATOMIC pipeline — pending -> ONE "
         "research_evidence \"adjudicate\" call per chunk — never per-claim "
         "retail: (1) call research_state get_state first: its claims digest marks each "
         "claim pending (no valid committed verdict, or evidence fingerprint moved since "
@@ -1232,6 +1247,7 @@ class ResearchRunDriver:
                 stage=project.get("stage", "DISCOVER"),
                 turn_index=turn_index,
                 consecutive_no_progress=counters.consecutive_no_progress,
+                has_materials=bool(project.get("materials")),
             )
 
         retry = RetryPolicy(

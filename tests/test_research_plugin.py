@@ -41,10 +41,13 @@ from plugins.research.plugin import (
     _RUN_ACTIONS,
     _SCRAPE_ACTIONS,
     _STATE_ACTIONS,
+    OwnershipLost,
     ResearchService,
     _unknown_action,
+    clear_auto_run_fence,
     compose_gate_review_note,
     register_research_plugins,
+    set_auto_run_fence,
 )
 from tests._drive_fakes import make_drive
 
@@ -3284,3 +3287,374 @@ class TestG1ReportHardStop:
                          project_id=pid, target="REVIEW")
         assert res["transition"] == "ADVANCED" and res["granted"] is True
         assert self._project(env, pid)["primary_report_artifact_id"] == "report.md"
+
+
+# ── 9. Materials as first-class research sources (fetch_materials) ───────────
+class TestResearchMaterials:
+    """Task materials join the web pages in ONE Sources pool via ``material://`` ledger keys.
+
+    Every case sniffs by CONTENT, never by file name; the ledger entry carries the full
+    确权 set; budgets, fences and per-file isolation are exercised end to end.
+    """
+
+    @staticmethod
+    def _md(k: str, reps: int) -> str:
+        sentence = f"# material {k}\n This is material body {k} with plenty of distinct words to read. "
+        return sentence * reps
+
+    @staticmethod
+    def _xlsx_bytes(n_rows: int = 1) -> bytes:
+        import io
+
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Data"
+        for i in range(n_rows):
+            ws.append(["col-a", f"row-{i}", i])
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    @staticmethod
+    def _pdf_bytes(text: str) -> bytes:
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_textbox(pymupdf.Rect(40, 40, 560, 800), text)
+        data = doc.tobytes()
+        doc.close()
+        return data
+
+    @staticmethod
+    def _zip_bytes(prefix: str) -> bytes:
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("[Content_Types].xml", "<types/>")
+            z.writestr(f"{prefix}document.xml", "body" * 300)
+        return buf.getvalue()
+
+    @staticmethod
+    def _svc(env) -> ResearchService:
+        return ResearchService(env.drive, env.scratch)
+
+    async def _task_with(self, env, mats: list[tuple[str, bytes]]) -> tuple[ResearchService, str]:
+        svc = self._svc(env)
+        ids = []
+        for name, content in mats:
+            a = await env.drive.save_artifact(
+                USER, name=name, mime_type="application/octet-stream", content=content
+            )
+            ids.append(str(a.id))
+        created = await svc.create_task(USER, title="mats", material_asset_ids=ids)
+        svc.begin_run(USER, created["task_id"])
+        return svc, created["task_id"]
+
+    @staticmethod
+    def _prov(env, task_id: str) -> dict:
+        p = ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "project.json", {}
+        )
+        ResearchService._overlay_pending(p)
+        return (p.get("driver") or {}).get("cloud_assets", {}).get("_fetch_provenance", {})
+
+    # ── content sniffing (never the file name) ──────────────────────────────
+    async def test_sniff_dispatches_by_content_not_name(self):
+        assert ResearchService._sniff_material(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n") == "pdf"
+        assert ResearchService._sniff_material(self._xlsx_bytes()) == "xlsx"
+        assert ResearchService._sniff_material(self._zip_bytes("word/")) == "docx"
+        assert ResearchService._sniff_material(self._zip_bytes("ppt/")) == "pptx"
+        assert ResearchService._sniff_material(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1junk") == "xls-legacy"
+        assert ResearchService._sniff_material("# heading\ntext 世界\n".encode()) == "text"
+        assert ResearchService._sniff_material(b"\x00\x01\x02\xff\xfe") == "binary"
+
+    async def test_runtime_action_fetch_materials_dispatches(self, env):
+        # The tool layer routes the new action through the same research_scrape schema.
+        svc = self._svc(env)
+        a = await env.drive.save_artifact(
+            USER, name="a.md", mime_type="text/markdown", content=self._md("a", 8).encode()
+        )
+        task_id = (await svc.create_task(
+            USER, title="rt", material_asset_ids=[str(a.id)]
+        ))["task_id"]
+        svc.begin_run(USER, task_id)
+        res = await _run(
+            env.runtime, "research_scrape", action="fetch_materials", project_id=task_id
+        )
+        assert res["fetched"] == 1
+        assert res["results"][0]["canonical_url"].startswith("material://")
+        bad = await env.runtime.execute(ToolExecution(
+            call_id=str(uuid.uuid4()), name="research_scrape",
+            arguments={"action": "fetch_materials", "project_id": task_id, "names": "not-a-list"},
+        ))
+        assert bad.is_error is True
+
+    async def test_docx_and_binary_refused_with_precise_reasons(self, env):
+        svc = self._svc(env)
+        text, err = await svc._extract_material(self._zip_bytes("word/"))
+        assert text is None and err == "unsupported: .docx not supported"
+        text, err = await svc._extract_material(b"\x00\x01\x02\x03binary junk")
+        assert text is None and "binary" in err
+
+    # ── fetch → ledger → read round-trip ────────────────────────────────────
+    async def test_fetch_materials_ledgers_all_and_reads_back(self, env):
+        pdf = self._pdf_bytes("Research materials report. " * 30)
+        svc, task_id = await self._task_with(env, [
+            ("deck.zip", pdf),                       # PDF bytes, wrong name -> still PDF
+            ("data.bin", self._xlsx_bytes(20)),      # xlsx bytes, wrong name -> Excel
+            ("notes.md", self._md("md", 8).encode()),
+            ("junk.bin", b"\x00\x01\x02\x03\x04binary"),
+        ])
+        res = await svc.fetch_materials(USER, task_id)
+        assert res["fetched"] == 3
+        assert [s["name"] for s in res["skipped"]] == ["junk.bin"]
+        assert res["remaining"] == 0 and res["budget_stopped"] is False
+
+        keys = {v["canonical_url"] for v in res["results"]}
+        assert all(k.startswith("material://") for k in keys)
+        for v in res["results"]:
+            assert v["source_type"] == "material" and v["saved"] is True
+
+        prov = self._prov(env, task_id)
+        assert set(prov) == keys
+        for cu, e in prov.items():
+            assert e["source_type"] == "material"
+            assert e["project_id"] == task_id
+            assert e["run_seq"] == 1
+            assert e["cloud_asset_id"] and e["source_asset_id"]
+            assert e["saved"] is True and e["asset_id"]
+
+        # Read back through the SAME ledger as a web page: material:// passes
+        # canonicalize untouched.
+        md_cu = next(
+            cu for cu, e in prov.items()
+            if e["file"] == "notes.md"
+        )
+        from core.infrastructure.web_fetch import canonical_url
+        assert canonical_url(md_cu) == md_cu
+        view = await svc.read_fetch(USER, task_id, canonical_url=md_cu)
+        assert "material md" in view["content"]
+        window = await svc.read_fetch(USER, task_id, canonical_url=md_cu, offset=10, max_chars=50)
+        assert window["total_chars"] == len(view["content"])
+        assert window["content"] == view["content"][10:60]
+
+        # The draft on the drive carries the material provenance header.
+        e = prov[md_cu]
+        stored = await env.drive.read_text(USER, uuid.UUID(e["asset_id"]))
+        assert "Source: material" in stored and "File: notes.md" in stored
+
+        # Snapshot/resume expose materials as name+mime only (ids withheld).
+        snap = svc.snapshot_project(USER, task_id)
+        assert {m["name"] for m in snap["materials"]} == {
+            "deck.zip", "data.bin", "notes.md", "junk.bin"
+        }
+        assert all("asset_id" not in m and "cloud_asset_id" not in m for m in snap["materials"])
+
+    async def test_fetch_save_batch_refuses_unsaved_material_url_without_network(
+        self, env, monkeypatch
+    ):
+        svc, task_id = await self._task_with(env, [("a.md", self._md("a", 8).encode())])
+        views = await svc.fetch_save_batch(
+            USER, task_id, urls=["material://deadbeef/a.md"]
+        )
+        assert views[0]["status"] == "error"
+        assert "fetch_materials" in views[0]["error"]["message"]
+
+    # ── dedup / idempotency ─────────────────────────────────────────────────
+    async def test_refetch_same_run_returns_already_fetched(self, env):
+        svc, task_id = await self._task_with(env, [("a.md", self._md("a", 8).encode())])
+        first = await svc.fetch_materials(USER, task_id)
+        assert first["fetched"] == 1
+        second = await svc.fetch_materials(USER, task_id)
+        assert second["fetched"] == 0
+        assert second["already_fetched"] == 1
+        assert second["results"][0]["already_fetched"] is True
+        assert second["results"][0]["text"] == ""
+        assert second["results"][0]["source_type"] == "material"
+
+    async def test_duplicate_material_rows_collapse_by_cloud_asset_id(self, env):
+        svc = self._svc(env)
+        a = await env.drive.save_artifact(
+            USER, name="a.md", mime_type="text/markdown", content=self._md("a", 8).encode()
+        )
+        created = await svc.create_task(USER, title="dup", material_asset_ids=[str(a.id)])
+        task_id = created["task_id"]
+        svc.atomic_update_project(
+            USER, task_id,
+            lambda p: p.__setitem__("materials", list(p["materials"]) * 2),
+        )
+        svc.begin_run(USER, task_id)
+        res = await svc.fetch_materials(USER, task_id)
+        assert res["fetched"] == 1 and len(res["results"]) == 1
+
+    # ── budgets / truncation / isolation ────────────────────────────────────
+    async def test_oversize_file_truncated_before_pipeline(self, env):
+        big = self._md("big", 2000)  # ~209k chars
+        assert len(big) > 100_000
+        svc, task_id = await self._task_with(env, [("big.md", big.encode())])
+        res = await svc.fetch_materials(USER, task_id)
+        assert res["fetched"] == 1
+        assert res["results"][0]["is_truncated"] is True
+        prov = self._prov(env, task_id)
+        entry = next(iter(prov.values()))
+        assert entry["is_truncated"] is True
+        assert entry["full_char_len"] <= 100_000
+        stored = await env.drive.read_text(USER, uuid.UUID(entry["asset_id"]))
+        assert stored.endswith("[TRUNCATED]")
+
+    async def test_eleven_materials_all_consumed_server_side(self, env):
+        mats = [(f"m{i}.md", self._md(f"m{i}", 8).encode()) for i in range(11)]
+        svc, task_id = await self._task_with(env, mats)
+        res = await svc.fetch_materials(USER, task_id)
+        assert res["fetched"] == 11
+        assert res["remaining"] == 0 and res["budget_stopped"] is False
+
+    async def test_aggregate_budget_stops_page_loop(self, env):
+        # 5 × ~180k usable chars (100k after truncation): the 5th crosses
+        # MATERIALS_MAX_TOTAL_CHARS -> the server page loop stops, never consuming it
+        # (no download, no ledger entry).
+        mats = [(f"b{i}.md", self._md(f"b{i}", 3000).encode()) for i in range(5)]
+        svc, task_id = await self._task_with(env, mats)
+        res = await svc.fetch_materials(USER, task_id)
+        assert res["fetched"] == 4
+        assert res["budget_stopped"] is True
+        assert res["remaining"] == 1
+        assert len(self._prov(env, task_id)) == 4
+
+    async def test_corrupt_pdf_isolated_not_batch_failure(self, env):
+        import core.infrastructure.pdf as pdf_mod
+
+        def _boom(content, **kw):
+            raise ValueError("corrupt")
+
+        orig = pdf_mod.extract_pdf_text
+        pdf_mod.extract_pdf_text = _boom
+        try:
+            svc, task_id = await self._task_with(env, [
+                ("broken.pdf", b"%PDF-1.4 broken"),
+                ("ok.md", self._md("ok", 8).encode()),
+            ])
+            res = await svc.fetch_materials(USER, task_id)
+        finally:
+            pdf_mod.extract_pdf_text = orig
+        assert res["fetched"] == 1
+        assert res["skipped"][0]["name"] == "broken.pdf"
+        assert "corrupt" in res["skipped"][0]["reason"]
+
+    async def test_vision_only_when_degraded_pdf_with_tables(self, env, monkeypatch):
+        import types
+
+        import core.infrastructure.pdf as pdf_mod
+
+        calls = {"vision": 0, "detect": 0}
+
+        async def _fake_doc(content, llm, **kw):
+            calls["vision"] += 1
+            return "transcribed table text " * 30
+
+        def _detect(content, **kw):
+            calls["detect"] += 1
+            return [{"page": 0}]
+
+        good = "clean report text. " * 50  # > MIN floor, not garbled
+        degraded = "x"
+
+        def _extract(content, **kw):
+            return good if b"GOOD" in content else degraded
+
+        monkeypatch.setattr(pdf_mod, "extract_pdf_text", _extract)
+        monkeypatch.setattr(pdf_mod, "detect_tables", _detect)
+        monkeypatch.setattr(pdf_mod, "extract_pdf_document", _fake_doc)
+        monkeypatch.setattr(
+            ResearchService, "_vision_llm", staticmethod(lambda: types.SimpleNamespace())
+        )
+        svc = self._svc(env)
+        text, err = await svc._extract_material(b"%PDF-1.4 GOOD")
+        assert err is None and text == good
+        assert calls == {"vision": 0, "detect": 0}  # text PDF: no table probe, no vision
+        text, err = await svc._extract_material(b"%PDF-1.4 BAD")
+        assert err is None and calls["vision"] == 1 and calls["detect"] == 1
+
+    # ── 确权 enforcement ────────────────────────────────────────────────────
+    async def test_cross_project_material_key_refused(self, env):
+        svc, task_a = await self._task_with(env, [("a.md", self._md("a", 8).encode())])
+        await svc.fetch_materials(USER, task_a)
+        cu = next(iter(self._prov(env, task_a)))
+        b = await svc.create_task(USER, title="b")
+        task_b = b["task_id"]
+        svc.begin_run(USER, task_b)
+        with pytest.raises(ValueError, match="no usable fetch recorded"):
+            await svc.read_fetch(USER, task_b, canonical_url=cu)
+
+    async def test_detached_material_refused(self, env):
+        svc, task_id = await self._task_with(env, [("a.md", self._md("a", 8).encode())])
+        await svc.fetch_materials(USER, task_id)
+        cu = next(iter(self._prov(env, task_id)))
+        svc.atomic_update_project(
+            USER, task_id, lambda p: p.__setitem__("materials", [])
+        )
+        with pytest.raises(ValueError, match="no longer attached"):
+            await svc.read_fetch(USER, task_id, canonical_url=cu)
+
+    # ── F2 zombie fence ─────────────────────────────────────────────────────
+    async def test_reclaimed_execution_blocked_before_download(self, env):
+        svc = self._svc(env)
+        a = await env.drive.save_artifact(
+            USER, name="a.md", mime_type="text/markdown", content=self._md("a", 8).encode()
+        )
+        created = await svc.create_task(USER, title="fence", material_asset_ids=[str(a.id)])
+        task_id = created["task_id"]
+        run = svc.begin_run(USER, task_id)
+        rid = run["run_id"]
+        base = svc.get_driver_checkpoint(USER, task_id)
+        svc.atomic_update_project(
+            USER, task_id,
+            lambda p: p.__setitem__(
+                "driver", {**base, "run_id": rid, "execution_id": f"{rid}:1:1"}
+            ),
+        )
+        token = set_auto_run_fence(
+            owner_id=USER, task_id=task_id, run_id=rid, execution_id=f"{rid}:1:1"
+        )
+        orig_download = env.drive.download
+
+        async def _no_download(*args, **kw):
+            raise AssertionError("a fenced zombie must never reach drive.download")
+
+        env.drive.download = _no_download
+        try:
+            # Lease reclaimed by a successor execution.
+            svc.atomic_update_project(
+                USER, task_id,
+                lambda p: p.__setitem__(
+                    "driver", {**base, "run_id": rid, "execution_id": f"{rid}:1:2"}
+                ),
+            )
+            with pytest.raises(OwnershipLost):
+                await svc.fetch_materials(USER, task_id)
+            assert self._prov(env, task_id) == {}  # nothing ledgered
+        finally:
+            env.drive.download = orig_download
+            clear_auto_run_fence(token)
+
+    # ── handoff / state visibility ──────────────────────────────────────────
+    async def test_handoff_materials_hint_only_with_materials_at_evidence(self, env):
+        svc = self._svc(env)
+        a = await env.drive.save_artifact(
+            USER, name="a.md", mime_type="text/markdown", content=self._md("a", 8).encode()
+        )
+        with_mat = (await svc.create_task(USER, title="wm", material_asset_ids=[str(a.id)]))["task_id"]
+        no_mat = (await svc.create_task(USER, title="nm"))["task_id"]
+        # DISCOVER: never a hint, even with materials.
+        assert "materials_hint" not in svc.get_handoff(USER, with_mat)
+        # EVIDENCE with materials -> hint; without -> no hint.
+        svc.atomic_update_project(USER, with_mat, lambda p: p.update(stage="EVIDENCE"))
+        svc.atomic_update_project(USER, no_mat, lambda p: p.update(stage="EVIDENCE"))
+        assert "fetch_materials" in svc.get_handoff(USER, with_mat)["materials_hint"]
+        assert "materials_hint" not in svc.get_handoff(USER, no_mat)
+

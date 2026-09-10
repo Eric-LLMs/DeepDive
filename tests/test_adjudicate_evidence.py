@@ -427,3 +427,112 @@ class TestInputHygiene:
         svc, task_id = await _new_run(env)
         with pytest.raises(ValueError, match="at least one recorded Claim"):
             await svc.adjudicate_evidence(USER, task_id, urls=["https://good1.example/a"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Materials as first-class sources: material:// through the SAME adjudicate path
+# (source_type is identity only — evidence processing is the web path unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _material_task(env, name: str, content: bytes) -> tuple[ResearchService, str]:
+    svc = _svc(env)
+    a = await env.drive.save_artifact(
+        USER, name=name, mime_type="application/octet-stream", content=content
+    )
+    task_id = (await svc.create_task(
+        USER, title="mat-adj", material_asset_ids=[str(a.id)]
+    ))["task_id"]
+    svc.begin_run(USER, task_id)
+    return svc, task_id
+
+
+class TestAdjudicateMaterials:
+    async def test_material_and_web_adjudicate_in_one_pool(self, env, monkeypatch):
+        body = (
+            "# Internal benchmark notes\n\n"
+            "internal-fact-7788: the in-house eval showed a 12 percent recall gain. "
+        ) * 6
+        svc, task_id = await _material_task(env, "notes.md", body.encode())
+        res = await svc.fetch_materials(USER, task_id)
+        assert res["fetched"] == 1
+        mat_cu = res["results"][0]["canonical_url"]
+
+        _record_claim(svc, task_id, "c1", "internal eval improved recall")
+        _install_fetch(monkeypatch)
+        llm = _install_llm(monkeypatch, json.dumps({"results": [
+            {"source_id": "S1", "claim_id": "c1", "verdict": "supports"},
+            {"source_id": "S2", "claim_id": "c1", "verdict": "supports"},
+        ]}))
+        out = await svc.adjudicate_evidence(
+            USER, task_id, urls=[mat_cu, "https://good1.example/a"]
+        )
+        assert out["status"] == "ok" and out["sources_used"] == 2
+        # the material's representative chunk came from the stored draft, in the prompt
+        assert "internal-fact-7788" in llm.prompts[0]
+        sup = sorted(out["per_claim"][0]["supports"])
+        assert sup == sorted([mat_cu, "https://good1.example/a"])
+
+        g = _graph(env, task_id)
+        assert _ticket_edges(g, "c1") == ["supports", "supports"]
+        mat_src = next(n for n in g["nodes"] if n.get("url") == mat_cu)
+        assert mat_src["type"] == "Source"
+        assert mat_src["source_type"] == "material"          # real material citation
+        assert mat_src["verification_status"] == "verified"
+        assert mat_src["label"] == "notes.md"                # file name, not the pseudo-URL
+        assert mat_src["file"] == "notes.md"
+        assert mat_src["cloud_asset_id"]
+        web_src = next(n for n in g["nodes"] if n.get("url") == "https://good1.example/a")
+        assert web_src["source_type"] == "web"               # same pool, different label
+
+    async def test_foreign_material_key_without_provenance_is_rejected(self, env, monkeypatch):
+        # task A fetches a real material; task B never did — the key string buys nothing.
+        svc_a, task_a = await _material_task(
+            env, "a.md", (b"# a\n internal-fact-a " + b"x" * 300)
+        )
+        res = await svc_a.fetch_materials(USER, task_a)
+        mat_cu = res["results"][0]["canonical_url"]
+
+        svc_b, task_b = await _new_run(env)
+        _record_claim(svc_b, task_b, "c1", "one")
+        _install_fetch(monkeypatch)
+        _install_llm(monkeypatch, _supports("c1", "S1"))
+        out = await svc_b.adjudicate_evidence(
+            USER, task_b, urls=[mat_cu, "https://good1.example/a"]
+        )
+        assert out["sources_used"] == 1
+        assert [s["url"] for s in out["skipped_sources"]] == [mat_cu]
+        g = _graph(env, task_b)
+        assert not [n for n in g["nodes"] if n.get("url") == mat_cu]
+        assert _ticket_edges(g, "c1") == ["supports"]        # only the web edge
+
+    async def test_forged_ledger_entry_fails_confirmation(self, env, monkeypatch):
+        # A material:// entry planted in B's ledger for an asset NOT in B's materials list
+        # must be refused by 确权 — the URL string is never authority by itself.
+        svc, task_b = await _new_run(env)
+        _record_claim(svc, task_b, "c1", "one")
+        forged_cu = f"material://{uuid.uuid4()}/x.md"
+        draft = await env.drive.save_artifact(
+            USER, name="x.md", mime_type="text/markdown", content=b"# x\n some body text"
+        )
+        entry = {
+            "url": forged_cu, "canonical_url": forged_cu, "fetch_status": "ok",
+            "http_status": None, "content_status": "usable", "full_char_len": 300,
+            "saved": True, "asset_id": str(draft.id), "name": "x.md",
+            "path": "x.md", "cache_hit": False, "source_type": "material",
+            "file": "x.md", "is_truncated": False,
+            "project_id": task_b, "run_seq": 1,
+            "source_asset_id": "", "cloud_asset_id": str(draft.id),
+        }
+        svc._merge_cloud_assets(USER, task_b, {"_fetch_provenance": {forged_cu: entry}})
+        _install_fetch(monkeypatch)
+        _install_llm(monkeypatch, json.dumps({"results": [
+            {"source_id": "S1", "claim_id": "c1", "verdict": "supports"},
+            {"source_id": "S2", "claim_id": "c1", "verdict": "supports"},
+        ]}))
+        out = await svc.adjudicate_evidence(
+            USER, task_b, urls=[forged_cu, "https://good1.example/a"]
+        )
+        assert out["sources_used"] == 1
+        assert [s["url"] for s in out["skipped_sources"]] == [forged_cu]
+        g = _graph(env, task_b)
+        assert not [n for n in g["nodes"] if n.get("url") == forged_cu]

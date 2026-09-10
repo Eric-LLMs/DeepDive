@@ -492,10 +492,12 @@ class TestP37AReferenceDedup:
         proj_dir = env.scratch / str(USER) / task_id
         before = {f.name for f in proj_dir.glob("*.json")}
         (v,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
+        # source_type is the identity label material/web share (display only — the
+        # ref-view semantics are unchanged); file/is_truncated appear only for material.
         assert set(v) == {
             "url", "canonical_url", "status", "content_status", "saved", "asset_id",
             "name", "path", "full_char_len", "char_len", "text", "truncated",
-            "already_fetched", "hint",
+            "already_fetched", "hint", "source_type",
         }
         # the ref path creates no new project-dir files — memory-level only, no schema
         assert {f.name for f in proj_dir.glob("*.json")} == before

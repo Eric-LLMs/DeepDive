@@ -51,7 +51,7 @@ the at-a-glance map.
 | `research_evidence` | `record_node` · `mutate_node` · `invalidate_downstream` · `adjudicate` · `verify` · `verify_batch` |
 | `research_gate` | `check` · `explain_failure` · `request_override` · `resolve_override` |
 | `research_run` | `record_execution` · `finish_execution` · `execute_sandbox_script` |
-| `research_scrape` | `save_scrape` · `fetch` · `read` |
+| `research_scrape` | `save_scrape` · `fetch` · `fetch_materials` · `read` |
 
 Hard boundaries:
 
@@ -108,8 +108,15 @@ Hard boundaries:
    `get_state → pending claims → ONE research_evidence adjudicate call per chunk`
    exactly as written:
 
-   **EVIDENCE PROTOCOL (mandatory, 10 rules)**
+   **EVIDENCE PROTOCOL (mandatory, 11 rules)**
 
+   0. **Materials first.** If `get_handoff` / `get_state` shows a `materials_hint` (the task
+      carries materials), start the stage with `research_scrape` `action: "fetch_materials"`
+      (optional `names` filter) — it extracts every task material server-side into the run's
+      provenance ledger under `material://` urls. Materials are first-class sources with the
+      exact same standing as web pages: pass the returned `material://` urls to `adjudicate`
+      alongside web urls, and cite them only after `research_scrape read` (same as web
+      pages). `source_type` is identity only — it never changes how evidence is verified.
    1. **Pending first.** Start every EVIDENCE turn with `research_state get_state`: the
       `claims` digest marks each claim `pending` (true only when it has no valid
       committed verdict, or its evidence fingerprint moved since the last commit) and
