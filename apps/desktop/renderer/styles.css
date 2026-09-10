@@ -2784,8 +2784,24 @@ body.resizing-ew { cursor: ew-resize; }
 .rtv-col-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--fg); }
 .rtv-col-count { flex: none; font-size: 11px; color: var(--fg-dim); }
 .rtv-col-hint { flex: none; margin-left: auto; font-size: 11px; color: var(--fg-dim); text-transform: none; letter-spacing: 0; }
-.rtv-preview-close { flex: none; margin-left: 4px; padding: 1px 7px; font-size: 13px; line-height: 1.2; cursor: pointer; color: var(--fg-dim); }
-.rtv-preview-close:hover { color: var(--fg); border-color: var(--accent); }
+/* Close is the primary right-most control: full-strength glyph, turns red on hover. */
+.rtv-preview-close { flex: none; margin-left: 4px; padding: 1px 8px; font-size: 15px; font-weight: 700; line-height: 1.2; cursor: pointer; color: var(--fg); }
+.rtv-preview-close:hover { color: #e5484d; border-color: #e5484d; }
+.rtv-preview-fs { flex: none; margin-left: 4px; padding: 1px 7px; font-size: 13px; line-height: 1.2; cursor: pointer; color: var(--fg-dim); }
+.rtv-preview-fs:hover { color: var(--fg); border-color: var(--accent); }
+/* Preview fullscreen: lift the column out of the workbench split into a window-covering overlay
+   (set by research.js ⤢ / Esc). Fixed positioning takes it out of the flex row, so the tree
+   column keeps its slot underneath and exiting restores the split untouched. */
+.rtv-preview-col.rtv-preview-fs-on {
+  position: fixed;
+  inset: 12px;
+  /* Above the workbench chrome but *below* the modal scrim (z-index 1000), so dialogs and
+     confirmations still render on top of the fullscreen preview. */
+  z-index: 900;
+  flex: none;
+  min-width: 0;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
 .rtv-tree-col { flex: 3 1 0; min-width: 220px; }
 .rtv-preview-col { flex: 5 1 0; min-width: 0; }
 /* Tree scroll region: only the tree scrolls vertically; wide long names scroll horizontally. */

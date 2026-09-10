@@ -134,6 +134,7 @@
   let previewBodyEl = null;       // its scrollable content area
   let previewState = { taskId: null, file: null, size: null };
   let previewRefreshedAt = 0;     // throttle: don't refetch an open file more than ~1/s
+  let previewFsEscBound = false;  // Esc-to-exit-fullscreen listener attached once
   // Evidence-graph detail drawer: the status panel only shows compact counts + a "View graph"
   // button; the full Source–Evidence–Claim mapping renders in a right-hand drawer. The body is
   // always rebuilt from the freshest task detail (never cached across renders), so an edition
@@ -1257,6 +1258,15 @@
     head.appendChild(el("span", "rtv-col-title", "File preview"));
     const hint = el("span", "rtv-col-hint", "click a file to preview");
     head.appendChild(hint);
+    // ⤢ lifts the preview column into a window-covering overlay (Esc exits) — the split column
+    // is often too narrow to read a long report. Shown only while a file is open, like the ×.
+    // It sits to the LEFT of the close button so the rightmost control is always "×".
+    const fsBtn = el("button", "ghost rtv-preview-fs", "⤢");
+    fsBtn.type = "button";
+    fsBtn.title = "Fullscreen (Esc to exit)";
+    fsBtn.classList.add("hidden");
+    fsBtn.addEventListener("click", () => setPreviewFs(col, !col.classList.contains("rtv-preview-fs-on")));
+    head.appendChild(fsBtn);
     const closeBtn = el("button", "ghost rtv-preview-close", "×");
     closeBtn.type = "button";
     closeBtn.title = "Close the open file preview";
@@ -1273,8 +1283,28 @@
     col._title = head.querySelector(".rtv-col-title");
     col._hint = hint;
     col._closeBtn = closeBtn;
+    col._fsBtn = fsBtn;
     col._body = body;
     return col;
+  }
+
+  // Enter / exit preview fullscreen. The flag is kept on the column node so a live re-render
+  // (which re-attaches the same node) preserves the state; task switches build a fresh column
+  // and start back in the split layout. Esc is bound once at module level.
+  function setPreviewFs(col, on) {
+    col.classList.toggle("rtv-preview-fs-on", on);
+    if (col._fsBtn) {
+      col._fsBtn.textContent = on ? "⤡" : "⤢";
+      col._fsBtn.title = on ? "Exit fullscreen (Esc)" : "Fullscreen (Esc to exit)";
+    }
+    if (on && !previewFsEscBound) {
+      previewFsEscBound = true;
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && previewColEl && previewColEl.classList.contains("rtv-preview-fs-on")) {
+          setPreviewFs(previewColEl, false);
+        }
+      });
+    }
   }
 
   // Close the currently open file: clear the selection back to the empty placeholder state. The
@@ -1287,6 +1317,10 @@
     if (previewTitleEl) previewTitleEl.textContent = "File preview";
     if (previewColEl._hint) previewColEl._hint.textContent = "click a file to preview";
     if (previewColEl._closeBtn) previewColEl._closeBtn.classList.add("hidden");
+    if (previewColEl._fsBtn) {
+      previewColEl._fsBtn.classList.add("hidden");
+      setPreviewFs(previewColEl, false); // closing the file always drops back to the split view
+    }
     previewPlaceholder("Select a file in the Working directory to preview its contents here.");
   }
 
@@ -1317,9 +1351,10 @@
     if (previewTitleEl) {
       previewTitleEl.textContent = `${f.folder_path ? f.folder_path + "/" : ""}${f.name}`;
     }
-    // A file is now open: drop the hint and surface the close (×) control in the header.
+    // A file is now open: drop the hint and surface the fullscreen + close (×) controls in the header.
     if (previewColEl._hint) previewColEl._hint.textContent = "";
     if (previewColEl._closeBtn) previewColEl._closeBtn.classList.remove("hidden");
+    if (previewColEl._fsBtn) previewColEl._fsBtn.classList.remove("hidden");
     previewPlaceholder("Loading…");
     let res;
     try {
