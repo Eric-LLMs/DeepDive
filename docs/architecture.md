@@ -2411,6 +2411,15 @@ stop. Terminal states are recorded in `last_block` (`{kind, reason, at,
 run_id, execution_id}`), the slot is released via `end_run`, and the terminal message is mirrored
 to the session.
 
+**Creation-time data is loaded by the run, not the chat.** The task's persisted brief
+(`task_spec.json`: title + description, written atomically at creation) reaches every unattended
+node through the pipeline itself: `run_node` reads it missing-safe into the node context before
+dispatching any handler, and the generation prompts quote it verbatim (§20.2.2). ▶ Run therefore
+starts a task on equal footing with a chat-driven turn — an instruction stored at creation ("write
+the report in Chinese", scope wording, format demands) is honored by the code-driven chain without
+any chat history, and the same read is what the task-detail view surfaces, so what the user sees
+on creation is exactly what the run consumes.
+
 **Run progress — appended, never replaced.** A run's milestones — a granted stage transition, a
 progressive gate diagnostic recording failed checks, a genuinely new artifact/version, or the graded
 terminal state — append one lightweight row to the task's scratch `run_events.json` at the point each
@@ -2551,12 +2560,17 @@ the monitor's `run.cancelled` frame, the per-task `researchReleaseIfIdle`, or th
 fetch's `is_running = false`; the terminal `last_block` banner ("stopped") explains the stop on
 re-open.
 
-**Human gate decisions.** When the agent can't clear a stage gate it calls
+**Human gate decisions.** When a guarding gate cannot be cleared — by the interactive agent
+after a `research_gate` check, or mechanically by the pipeline's transition fence (§20.2.1)
+on the unattended run — the override is requested through
 `research_gate request_override`, which writes a **PENDING** row to `approvals.json` and parks the
 run BLOCKED while any override is pending; a human resolves it via
 `POST /research/tasks/{id}/approvals/{approval_id}` with `{"approve": bool}` (a non-PENDING id is
 a 409). Approve atomically flips the gate to OVERRIDE and the run resumes; reject leaves the gate
-FAIL and the agent proposes a different approach (resumed by another chat message). Task views
+FAIL and the agent proposes a different approach (resumed by another chat message). On the
+pipeline path a resume is free of rework: the parked node's outputs already landed before the
+park, so the turn after approval **advances without re-running the handler** and re-entry while
+still pending costs 0 LLM (§20.2.1). Task views
 expose the terminal `last_block` banner and `pending_overrides` (`{approval_id, gate_name,
 reason}`), so a blocked run tells the user exactly what it's waiting on.
 
@@ -2602,7 +2616,16 @@ transition's gate has not passed, i.e. the run's failure control flow is one of 
 - **strict** — an un-passed guard gate **blocks** the transition: `research_state transition_stage`
   refuses, and the run stalls at the stage until the agent actually fixes the underlying work and the
   gate passes, or the agent calls `research_gate request_override` and a human Approve flips the gate
-  to OVERRIDE (the Stop-design paragraph above). A strict run that stalls or hits a cap stops
+  to OVERRIDE (the Stop-design paragraph above). On the **code-driven pipeline** the fence closes
+  the evaluation gap deterministically: before requesting each guarded transition the pipeline
+  **mechanically evaluates a NOT_RUN guard gate** (`check_gate`, 0 LLM) — EXECUTE←DESIGN_GATE,
+  EXPLAIN←EVIDENCE_GATE, REVIEW←CLAIM_GATE, REPRODUCE←QUALITY_GATE — and a checked-and-FAIL gate is
+  **not a structural death**: the node requests the override itself, records
+  `pipeline["awaiting_override"] = {gate, approval_id, stage, target}` and returns a park outcome;
+  re-entry while the gate is still un-cleared runs no handler and no LLM; once the gate reads
+  PASS/OVERRIDE the marker clears and the stage advances without replaying the completed node.
+  Only fence refusals with a **non-gate cause** (e.g. G1's physically missing report) keep the
+  terminal `structural_stop` semantics. A strict run that stalls or hits a cap stops
   graded (STALLED / BLOCKED) and never advances on gaps — a failed gate there is a genuine
   human-decision point.
 - **progressive** — a FAIL loses its blocking consequence but not its record: the deterministic
@@ -2620,7 +2643,12 @@ transition's gate has not passed, i.e. the run's failure control flow is one of 
 artifact chain that does not exist on disk:
 **G1** — `CLAIM_GATE` carries a `report_written` blocking check: the task's primary report must be
 bound in project state *and* have at least one version physically on disk before the gate can pass,
-so a claim graph can never complete on top of a missing draft.
+so a claim graph can never complete on top of a missing draft. The binding itself is a
+first-writer on the **report name**: the first `write_scratch` whose artifact stem contains
+`report` claims `primary_report_artifact_id` (v1 only — a bound primary is never silently
+re-bound), which is why the pipeline's EXECUTE-stage write is deliberately named
+`execution_notes.md` — an execution log that matched the report-name binder would hijack the
+binding, leaving the actual paper unbound, unreviewed and unpromoted.
 **G2** — auto-settle may only terminalize a run as FINISHED when the run actually produced a
 published object — a bound primary whose latest version is `PROMOTED` with a real `drive_asset_id`;
 otherwise the settle is **refused** (`settle.refused`) before a single chain hop and the run stops
@@ -2641,8 +2669,10 @@ different run fails `blocking` as `scorecard_stale`, and one carrying no provena
 accepted; (3) failing any `scorecard.md`, the legacy in-project `project["scorecard"]` rows are
 honored only when their own `scorecard_run_seq` stamp is absent (pre-stamp data) or equals the
 current run; (4) only a project with **no scorecard at all** emits the historical
-`severity: diagnostic_only` `scorecard_missing` verdict — a provisioning gap of the current toolset,
-not agent misconduct — so progressive diagnostics and review notes can tell it apart from a real
+`severity: diagnostic_only` `scorecard_missing` verdict — reachable today only on legacy or
+toolset-less paths, because the code-driven pipeline's REVIEW node **renders `scorecard.md`
+mechanically** (§20.2.2) for every edition — so progressive diagnostics and review notes can tell it
+apart from a real
 scorecard FAIL (`severity: blocking`); strict-mode blocking semantics are identical for all.
 
 **Live monitor & per-process logs.** `GET /research/tasks/{id}/monitor` is an SSE stream that
@@ -3263,7 +3293,10 @@ an LLM.
   * **Immediate Terminal Halts (`StructuralStop`):** If a fatal structural precondition is
     violated (e.g., an empty corpus, a missing research question, or the absence of a valid
     draft), the pipeline immediately halts in the `BLOCKED` terminal state. Unrecoverable
-    failures are never retried.
+    failures are never retried. A **guard-gate failure at the transition fence is not a
+    structural halt**: strict-mode park semantics (§17, Execution mode) route it to a PENDING
+    human override with zero rework on resume — the dead-node terminalization is reserved for
+    genuinely unrecoverable preconditions.
   * **Honest Degradation via `failure_ledger`:** Non-critical defects and unresolvable
     repairs are recorded in the structured `failure_ledger`. The pipeline continues
     downstream with explicit degradation markers rather than fabricating false-positive
@@ -3287,6 +3320,9 @@ capacity strictly where semantic reasoning adds genuine value.
 
 * **LLM Responsibilities (Semantic Inference & Synthesis):**
   * Research topic / candidate-source triage and question formulation (`DISCOVER` / `FRAME`)
+  * Analysis design under a fixed **8-field contract** — method / steps / data_needed /
+    success_criteria plus register / estimand / identification / risk — recorded as a
+    `Design` graph node so `DESIGN_GATE` has a mechanically checkable subject (§20.2.2)
   * Batch evidence adjudication across heterogeneous sources (`EVIDENCE`)
   * Two-pass action planning and execution summary (`EXECUTE`)
   * Causal and counterfactual reasoning (`EXPLAIN`)
@@ -3299,6 +3335,19 @@ capacity strictly where semantic reasoning adds genuine value.
     checks to eliminate zombie writes, and atomic persistence.
   * **Deterministic Patching:** Exact `expected_old` matching to ensure that each patch
     target resolves to exactly one location, eliminating ambiguous or fuzzy replacements.
+  * **Creation-time brief, entry-path independent:** `run_node` loads the task's persisted
+    `task_spec.json` (title + description, missing-safe read) into **every node's context**
+    on every execution path — ▶ Run button, driver replay, or chat — and the five generation
+    prompts (FRAME / DESIGN / EXECUTE / EXPLAIN / WRITE) carry the user's brief verbatim plus
+    an output-language directive (an instruction like 「写一个中文报告」 determines the paper's
+    language; absent a directive, text follows the brief's own language). A task with no brief
+    produces byte-identical prompts to the pre-brief baseline. User constraints never depend
+    on chat history surviving — that was an agent-era implicit dependency and it leaked.
+  * **Mechanical grade sheet:** REVIEW closes by rendering `scorecard.md` deterministically
+    from already-landed facts (0 LLM) — ≥7 table rows over corpus / sources / claims /
+    anchoring / verdict coverage / primary binding / review outcome, `Fatal=yes` reserved for
+    true structural gaps — run_seq-stamped by the same write path, so `QUALITY_GATE` always
+    finds a real sheet for the edition.
   * **Audit Trails:** Generating deterministic, idempotent `execution_id` values and
     append-only execution audit records.
   * **Zero-LLM Stages:** `REPRODUCE` (a pure-code integrity audit of the primary report, its
