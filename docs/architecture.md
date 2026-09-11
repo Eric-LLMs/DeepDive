@@ -2389,7 +2389,12 @@ the turn seam the run refuses to *start* a turn once cumulative spend has reache
 `CostLimitExceeded`, deliberately kept outside the transient-error hints so a budget stop can
 never be retried away — and inside the node every model call transits the stage's `llm_gate`,
 which checks remaining budget **before** the request leaves the transport layer; over-spending
-the cap is structurally impossible. A
+the cap is structurally impossible. Two retry layers exist at **different levels and must not be
+confused**: `research_driver_max_attempts` is the *workflow scheduling* retry — a transient
+failure or a crashed lease re-dispatches the same turn under a bumped `turn_attempt` of the
+`execution_id` fence, handled by the runner core (§19.5); the node's own business repair is
+exactly the ONE Attempt-2 of the pipeline's bounded model (§20) — a node never retries its
+semantics three times, and a structural stop is retried by neither layer. A
 `RunState` driver (`plugins/research/driver.py`) derives `idle | running | finished | blocked |
 stalled | cancelled | error` from the persisted run slot; after each successful turn a fixed
 grading chain fixes the state — cancel requested → CANCELLED, stage PUBLISH *with the pipeline's
@@ -3304,9 +3309,9 @@ capacity strictly where semantic reasoning adds genuine value.
 * **Predictable Latency & Costs:** Eliminating trial-and-error agent loops significantly
   reduces token waste, making end-to-end latency, execution costs, and failure boundaries
   substantially more predictable.
-* **Deterministic Traceability:** State transitions are idempotent and replayable. Every
-  stage produces verifiable audit records and structured ledger entries that can be asserted
-  deterministically in integration test suites.
+* **Deterministic Traceability:** State transitions are deterministic, idempotent, and fully
+  traceable. Every stage produces verifiable audit records and structured ledger entries that
+  can be asserted deterministically in integration test suites.
 * **Clean Separation of Execution Models:** Interactive chat continues to utilize
   `ReactLoopAgent` for open-ended exploration, while the automated research pipeline operates
   as a deterministic state machine. This is an intentional architectural split rather than a
