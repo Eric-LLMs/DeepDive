@@ -72,16 +72,19 @@ def _seam(monkeypatch, replies):
 
 
 async def _task(env, stage: str, *, question: str | None = None,
-                claims=(), pipeline_seed: dict | None = None):
+                claims=(), pipeline_seed: dict | None = None,
+                mode: str = "progressive", description: str = ""):
     svc = ResearchService(drive=env.drive, scratch_root=env.scratch)
-    # The pipeline deployment runs auto-runs PROGRESSIVE: the guard gates'
+    # The pipeline deployment historically auto-ran PROGRESSIVE: the guard gates'
     # deterministic checks still run and their failures land in diagnostics —
     # only the blocking consequence moves to the business layer, where the
     # pipeline expresses structural inability via StructuralStop. G1 (a report
     # must exist on disk to enter REVIEW) still binds, satisfied by WRITE's
-    # deterministic report.md landing below.
+    # deterministic report.md landing below. STRICT tasks (gate-wiring tests)
+    # flip this to exercise the fence auto-check + override park.
     task = (await svc.create_task(
-        USER, title="tomato research", execution_mode="progressive",
+        USER, title="tomato research", description=description,
+        execution_mode=mode,
     ))["task_id"]
     rid = svc.begin_run(USER, task)["run_id"]
     base = svc.get_driver_checkpoint(USER, task)
@@ -131,6 +134,10 @@ async def test_design_normal_path_exactly_one_llm(env, monkeypatch):
         "steps": ["verdict statistics", "evidence table", "coverage report"],
         "data_needed": ["corpus", "claim graph"],
         "success_criteria": "every claim carries a verdict or an honest gap",
+        "register": "recorded claim statements scored against fetched corpus text",
+        "estimand": "the aggregate verdict distribution answering the question",
+        "identification": "a claim is supported only when a verdict links it to evidence",
+        "risk": "corpus coverage gaps and single-source claims drive the outcome",
     })
     seen = _seam(monkeypatch, [reply])
     out = await _run(svc, task, rid)
@@ -140,6 +147,12 @@ async def test_design_normal_path_exactly_one_llm(env, monkeypatch):
     art = svc.read_artifact(USER, task, artifact_id="design.md")
     assert "## Success criteria" in art["content"]
     assert svc.read_project(USER, task)["pipeline"]["design"]["steps"]
+    # DESIGN_GATE's epistemic four fields now ride the graph Design node the
+    # handler records (the gate can no longer guard a transition the pipeline
+    # cannot itself satisfy).
+    d = next(n for n in svc._load_graph(USER, task)["nodes"]
+             if n.get("type") == "Design")
+    assert all(d.get(f) for f in ("register", "estimand", "identification", "risk"))
 
 
 async def test_design_repair_once_then_mechanical_fallback(env, monkeypatch):
@@ -197,8 +210,11 @@ async def test_execute_two_beats_fill_budget_with_python_audit_chain(env, monkey
     # the dropped non-whitelisted op is an honest ledger line, not a silent pass
     assert any(e["error_class"] == "degraded_decision" and "rm_rf_root" in e["detail"]
                for e in out.ledger)
-    art = svc.read_artifact(USER, task, artifact_id="execution_report.md")
+    art = svc.read_artifact(USER, task, artifact_id="execution_notes.md")
     assert "2 claims, none ticketed" in art["content"]
+    # the execution log must never win the primary binding (run-17/18 hijack):
+    assert svc.read_project(USER, task).get("primary_report_artifact_id") != \
+        "execution_notes.md"
 
 
 async def test_execute_invalid_plan_falls_back_to_full_op_sweep(env, monkeypatch):
@@ -334,3 +350,188 @@ async def test_write_without_question_structural_zero_llm(env, monkeypatch):
     out = await _run(svc, task, rid)
     assert out.kind == "blocked" and out.structural["missing"] == "research_question"
     assert seen == [] and _budget(svc, task)["calls"] == 0
+
+
+# ── creation-time brief must reach every generation prompt ────────────────────
+#
+# Root cause of the Run-19/20 English-paper defect: task_spec.json (title +
+# description) was persisted and UI-visible but read by NOTHING in the LLM
+# path — the entry path (Run button, driver replay, chat) never loaded it into
+# the node context. These tests pin the fix: the pipeline injects the brief
+# into ctx.facts for EVERY node, and the WRITE prompt carries the verbatim
+# instruction plus the output-language directive.
+
+async def test_brief_injected_into_prompt_and_directive_present(env, monkeypatch):
+    svc, task, rid = await _task(
+        env, "WRITE", question="西红柿怎么做最好吃？",
+        claims=[("k1", "cooking raises lycopene")],
+        description="写一个中文报告",
+    )
+    reply = json.dumps({"title": "西红柿研究报告", "md": _good_draft()})
+    seen = _seam(monkeypatch, [reply])
+    out = await _run(svc, task, rid)
+    assert out.kind == "advanced"
+    prompt = seen[0]
+    assert "写一个中文报告" in prompt                    # verbatim user instruction
+    assert "User brief" in prompt                      # block marker
+    assert "output language" in prompt                 # language directive
+    assert '"user_brief"' in prompt                    # structured record too
+    assert "tomato research" in prompt                 # title included
+
+
+async def test_no_brief_prompt_stays_at_baseline(env, monkeypatch):
+    svc, task, rid = await _task(
+        env, "WRITE", question="Does home cooking raise lycopene?",
+        claims=[("k1", "x")],
+    )
+    # legacy task without a creation brief at all: blank the task_spec on disk
+    (svc._project_dir(USER, task) / "task_spec.json").write_text("{}", encoding="utf-8")
+    reply = json.dumps({"title": "t", "md": _good_draft()})
+    seen = _seam(monkeypatch, [reply])
+    out = await _run(svc, task, rid)
+    assert out.kind == "advanced"
+    assert "User brief" not in seen[0]                 # no block: pre-brief baseline
+    assert '"user_brief": {}' in seen[0]               # record key present, empty
+
+
+async def test_read_task_spec_missing_safe(env):
+    svc = ResearchService(drive=env.drive, scratch_root=env.scratch)
+    assert svc.read_task_spec(USER, str(uuid.uuid4())) == {}   # unknown project
+
+
+# ── and the driver path (not chat) is where the Run button executes ───────────
+
+
+async def test_brief_reaches_frame_prompt_via_run_node(env, monkeypatch):
+    # FRAME is the first LLM node on the Run-button path: if the brief is missing
+    # here, the question gets minted in the wrong language and WRITE inherits it.
+    svc, task, rid = await _task(env, "FRAME", description="写一个中文报告")
+    cu = "https://good1.example/a"
+    await svc.write_scratch(
+        USER, task, artifact_id="corpus.md",
+        content="# Research corpus\n\n## G1\nSource: " + cu + "\n\nlycopene facts.",
+    )
+    svc.atomic_update_project(
+        USER, task,
+        lambda p: p.setdefault("pipeline", {})
+        .__setitem__("corpus", {"query": "tomatoes", "urls": [cu]}),
+    )
+    reply = json.dumps({
+        "question": "home cooking lycopene bioavailability in tomatoes?",
+        "in_scope": "cooking", "out_of_scope": "marketing", "claims": [],
+    })
+    seen = _seam(monkeypatch, [reply])
+    out = await _run(svc, task, rid)
+    assert out.kind == "advanced"
+    assert "写一个中文报告" in seen[0] and "User brief" in seen[0]
+
+
+# ════════════ STRICT gate wiring: fence auto-check, override park, resume ═════
+#
+# The strict contract: an unevaluated guard gate is MECHANICALLY evaluated at
+# the pipeline's transition fence (0 LLM); a checked-and-FAILED gate blocks the
+# transition and parks the chain on a PENDING human override — re-entry runs no
+# handler body and no LLM until a decision lands, and a resolved override
+# advances WITHOUT replaying the completed node. Progressive must be untouched.
+
+_DESIGN_8 = json.dumps({
+    "method": "Adjudicate each claim against the corpus and aggregate verdicts.",
+    "steps": ["claim_stats", "coverage_report"],
+    "data_needed": ["corpus", "claim graph"],
+    "success_criteria": "every claim carries a verdict or an honest gap",
+    "register": "recorded claim statements scored against the fetched corpus",
+    "estimand": "the aggregate verdict distribution answering the question",
+    "identification": "a claim counts only when a verdict links it to evidence",
+    "risk": "corpus coverage gaps and single-source claims drive the result",
+})
+
+
+async def test_strict_fence_evaluates_design_gate(env, monkeypatch):
+    svc, task, rid = await _task(
+        env, "DESIGN", mode="strict",
+        question="Does home cooking increase lycopene bioavailability?",
+        claims=[("k1", "cooking raises lycopene")],
+    )
+    seen = _seam(monkeypatch, [_DESIGN_8])
+    out = await _run(svc, task, rid)
+    assert out.kind == "advanced" and out.next_stage == "EXECUTE"
+    assert len(seen) == 1                                  # gate check: 0 LLM
+    proj = svc.read_project(USER, task)
+    assert proj["gates"]["DESIGN_GATE"] == "PASS"          # evaluated at the fence
+    assert "awaiting_override" not in proj["pipeline"]
+    # the node's own ledger never saw a transition_refused
+    assert not any(e["error_class"] == "transition_refused"
+                   for e in proj["pipeline"].get("failure_ledger") or [])
+
+
+async def test_strict_gate_fail_parks_override_then_resume_advances(env, monkeypatch):
+    svc, task, rid = await _task(
+        env, "EXECUTE", mode="strict", question="q?",
+        claims=[("k1", "one")],                            # no citations/Source
+        pipeline_seed={"design": {"method": "m", "steps": ["claim_stats"]}},
+    )
+    seen = _seam(monkeypatch, [json.dumps({"steps": [{"op": "claim_stats"}]}),
+                               json.dumps({"summary": "1 claim, 0 ticketed."})])
+    out = await _run(svc, task, rid)
+    assert out.kind == "blocked" and out.structural is None   # PARKED, not dead
+    assert out.ledger[-1]["error_class"] == "gate_awaiting_override"
+    proj = svc.read_project(USER, task)
+    assert proj["stage"] == "EXECUTE"                         # no forged advance
+    assert proj["gates"]["EVIDENCE_GATE"] == "FAIL"           # honestly evaluated
+    aw = proj["pipeline"]["awaiting_override"]
+    assert aw["gate"] == "EVIDENCE_GATE" and aw["target"] == "EXPLAIN"
+    assert [a["id"] for a in svc.pending_overrides(USER, task)] == [aw["approval_id"]]
+    assert "structural_stop" not in proj["pipeline"]          # first-and-only intact
+    beats = len(seen)
+    assert beats == 2
+
+    # Re-entry while the approval is PENDING: parked BEFORE the handler — 0 LLM.
+    out2 = await _run(svc, task, rid)
+    assert out2.kind == "blocked" and "PARKED" in out2.turn_value
+    assert len(seen) == beats and out2.ledger == [] and out2.cost_usd == 0.0
+
+    # Human approves on the desktop card → OVERRIDE; the completed node advances
+    # WITHOUT a handler replay.
+    svc.resolve_override(USER, aw["approval_id"], approve=True, project_id=task)
+    out3 = await _run(svc, task, rid)
+    assert out3.kind == "advanced" and out3.next_stage == "EXPLAIN"
+    assert len(seen) == beats                                 # never re-ran EXECUTE
+    proj = svc.read_project(USER, task)
+    assert "awaiting_override" not in proj["pipeline"]
+    assert proj["stage"] == "EXPLAIN"
+
+
+async def test_strict_reject_after_park_then_reject_path_keeps_structural(env, monkeypatch):
+    # A human REJECTS the override: the gate stays FAIL, the chain stays parked
+    # (no death flag, no LLM) — the run terminalizes honestly at the approval.
+    svc, task, rid = await _task(
+        env, "EXECUTE", mode="strict", question="q?", claims=[("k1", "one")],
+        pipeline_seed={"design": {"method": "m", "steps": ["claim_stats"]}},
+    )
+    _seam(monkeypatch, [json.dumps({"steps": [{"op": "claim_stats"}]}),
+                        json.dumps({"summary": "s"})])
+    out = await _run(svc, task, rid)
+    aw = svc.read_project(USER, task)["pipeline"]["awaiting_override"]
+    svc.resolve_override(USER, aw["approval_id"], approve=False, project_id=task)
+    out2 = await _run(svc, task, rid)
+    assert out2.kind == "blocked" and "PARKED" in out2.turn_value
+    proj = svc.read_project(USER, task)
+    assert proj["stage"] == "EXECUTE"
+    assert "awaiting_override" in proj["pipeline"]            # still parked, honest
+
+
+async def test_progressive_fence_never_evaluates_or_parks(env, monkeypatch):
+    svc, task, rid = await _task(
+        env, "EXECUTE", mode="progressive", question="q?",
+        claims=[("k1", "one")],
+        pipeline_seed={"design": {"method": "m", "steps": ["claim_stats"]}},
+    )
+    seen = _seam(monkeypatch, [json.dumps({"steps": [{"op": "claim_stats"}]}),
+                               json.dumps({"summary": "s"})])
+    out = await _run(svc, task, rid)
+    assert out.kind == "advanced" and out.next_stage == "EXPLAIN"
+    proj = svc.read_project(USER, task)
+    assert proj["gates"]["EVIDENCE_GATE"] == "NOT_RUN"     # never evaluated there
+    assert "awaiting_override" not in proj.get("pipeline", {})
+    assert not svc.pending_overrides(USER, task)
+    assert len(seen) == 2                                  # unchanged quota

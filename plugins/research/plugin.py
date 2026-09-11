@@ -1460,6 +1460,22 @@ class ResearchService:
         """The task's authoritative ``project.json`` (read-only convenience)."""
         return self._load_project(owner_id, project_id)
 
+    def read_task_spec(self, owner_id: uuid.UUID, project_id: str) -> dict:
+        """The task's persisted user brief (``task_spec.json``: title + description).
+
+        Missing/corrupt file degrades to ``{}`` — the brief is an optional input, the
+        pipeline must still run without it. This is the single read path for *every*
+        execution entry (Run button / driver / chat): the user's creation-time data is
+        loaded regardless of where the run was triggered from.
+        """
+        try:
+            spec = self._load_json(
+                self._project_dir(owner_id, project_id) / "task_spec.json", {}
+            )
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return spec if isinstance(spec, dict) else {}
+
     def pending_overrides(self, owner_id: uuid.UUID, project_id: str) -> list[dict]:
         """Gate overrides awaiting a human decision (approvals.json ``PENDING``).
 
@@ -3979,6 +3995,12 @@ class ResearchService:
                 project["diagnostics"] = []
                 project["last_block"] = None
                 project["status"] = "ACTIVE"
+                # The pipeline ledger is run-scoped too: a prior edition's
+                # ``structural_stop`` would make every re-entered node return
+                # "already structurally blocked" (pipeline.run_node re-entry guard),
+                # and its failure_ledger lines would leak into the new report's
+                # honest-gap section. Both start empty for the new edition.
+                project["pipeline"] = {}
                 # T3: the report authority is run-scoped too — a new edition's first
                 # report-named write must be free to re-bind it (the previous edition's
                 # artifact trees stay on disk for history, but they are no longer the

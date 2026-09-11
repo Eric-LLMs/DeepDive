@@ -154,6 +154,39 @@ def _latest_artifact_text(service: Any, owner_id: Any, project_id: str,
     return record.get("content")
 
 
+def _user_brief(ctx: "NodeCtx") -> str:
+    """The creation-time user brief (task_spec title + description) as a prompt block.
+
+    Loaded into every node's ctx.facts by the pipeline regardless of entry path
+    (Run button / driver replay / chat), so the user's verbatim constraints —
+    above all an explicit output-language instruction like 「写一个中文报告」 —
+    reach every LLM decision. Empty string when the task carries no brief at all,
+    which keeps prompts byte-identical to the pre-brief baseline.
+    """
+    spec = ctx.facts.get("task_spec") or {}
+    title = str(spec.get("title") or "").strip()
+    desc = str(spec.get("description") or "").strip()
+    if not title and not desc:
+        return ""
+    return (
+        "User brief (verbatim, captured at task creation):\n"
+        f"Title: {title}\n"
+        f"Description: {desc}\n"
+        "Honor every explicit instruction in this brief. If it names an output "
+        "language (e.g. 中文), all free text you generate for this task "
+        "(question wording, report body, titles) must use that language; "
+        "otherwise write in the language the brief/question is written in.\n\n"
+    )
+
+
+def _brief_dict(ctx: "NodeCtx") -> dict:
+    """Same brief as a JSON-able record for structured prompt payloads."""
+    spec = ctx.facts.get("task_spec") or {}
+    title = str(spec.get("title") or "").strip()
+    desc = str(spec.get("description") or "").strip()
+    return {"title": title, "description": desc} if (title or desc) else {}
+
+
 # ══════════════════════════════ DISCOVER ═════════════════════════════════════
 
 DISCOVER_SYSTEM = (
@@ -235,6 +268,30 @@ async def node_discover(ctx: NodeCtx) -> None:
             else:
                 views[cu] = v
 
+    # ── 2b. persist the MECHANICAL corpus before any semantic call ────────────
+    # The corpus is FRAME's structural deliverable. Writing it only after triage
+    # raced the node's wall-clock floor (Run-15 field lesson: the 60s wait_for
+    # cancelled the handler between the triage reply and this write, so DISCOVER
+    # "advanced with honest gaps" carrying no corpus at all). Persisting first
+    # makes a timeout degrade to "no triage filter", never to "no corpus".
+    async def _persist_corpus(keep: list[str], notes: str, key_suffix: str) -> None:
+        corpus_md = _render_corpus(query, keep, views, notes)
+        await ctx.service.write_scratch(
+            ctx.owner_id, ctx.project_id, artifact_id="corpus.md", content=corpus_md,
+            idempotency_key=(
+                f"pipeline:DISCOVER:{ctx.facts.get('run_id')}:"
+                f"{ctx.facts.get('turn_index')}{key_suffix}"
+            ),
+        )
+
+        def _mutate(p: dict) -> None:
+            p.setdefault("pipeline", {})["corpus"] = {
+                "query": query, "urls": keep, "channels_ran": ran,
+            }
+        ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _mutate)
+
+    await _persist_corpus(list(views), "", "")
+
     # ── 3. the node's ONE semantic call: triage (repair-once at most) ────────
     notes = ""
     if views:
@@ -272,24 +329,18 @@ async def node_discover(ctx: NodeCtx) -> None:
     else:
         keep = []
 
-    corpus_md = _render_corpus(query, keep, views, notes)
-    await ctx.service.write_scratch(
-        ctx.owner_id, ctx.project_id, artifact_id="corpus.md", content=corpus_md,
-        idempotency_key=f"pipeline:DISCOVER:{ctx.facts.get('run_id')}:{ctx.facts.get('turn_index')}",
-    )
-
-    def _persist_corpus(p: dict) -> None:
-        p.setdefault("pipeline", {})["corpus"] = {
-            "query": query, "urls": keep, "channels_ran": ran,
-        }
-    ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist_corpus)
+    # Re-persist the TRIAGED corpus (dedup-safe: new version only if the
+    # keep-list/notes actually changed the render).
+    await _persist_corpus(keep, notes, ":triaged")
 
 
 # ═══════════════════════════════ FRAME ═══════════════════════════════════════
 
 FRAME_SYSTEM = (
     "You frame a research task. From the corpus, produce a FALSIFIABLE core "
-    "research question and the claims the research must adjudicate. Reply with "
+    "research question and the claims the research must adjudicate. If the user "
+    "brief names an output language, word the question (and claims) in that "
+    "language. Reply with "
     'ONLY a JSON object: {"question": "...", "in_scope": "...", '
     '"out_of_scope": "...", "claims": [{"id": "k1", "statement": "...", '
     '"strength": "low|medium|high", "citations": ["<corpus URL>", ...]}]}'
@@ -314,7 +365,8 @@ async def node_frame(ctx: NodeCtx) -> None:
     prompt = (
         f"Research topic: {corpus.get('query') or ctx.project.get('name') or ''}\n\n"
         f"Corpus (truncated):\n{corpus_md[:FRAME_CORPUS_CHARS]}\n\n"
-        "Reply with the JSON object described in the system message."
+        + _user_brief(ctx)
+        + "Reply with the JSON object described in the system message."
     )
 
     def _validate(payload: dict) -> list[str]:
@@ -478,9 +530,22 @@ DESIGN_SYSTEM = (
     "You design the method for a research task. Reply with ONLY a JSON object: "
     '{"method": "<concrete approach>", "steps": ["<ordered analysis steps>", '
     '...], "data_needed": ["..."], "success_criteria": "<how we know the '
-    'question is answered>"}'
+    'question is answered>", "register": "<which observations count as '
+    'evidence, and at what grain>", "estimand": "<the conclusion this design '
+    'targets>", "identification": "<the rule that ties each claim to its '
+    'evidence>", "risk": "<the main threat to validity>"}'
 )
 DESIGN_MIN_METHOD = 20
+# The four epistemic fields DESIGN_GATE's mechanical check reads off the graph
+# Design node; they are part of the decision contract so the gate can never
+# guard a transition the pipeline itself cannot satisfy.
+DESIGN_CONTRACT_FIELDS = (
+    ("register", "which observations count as evidence, and at what grain"),
+    ("estimand", "the conclusion this design targets"),
+    ("identification", "the rule that ties each claim to its evidence"),
+    ("risk", "the main threat to validity"),
+)
+DESIGN_CONTRACT_MIN = 10
 
 
 @register_handler("DESIGN")
@@ -513,17 +578,23 @@ async def node_design(ctx: NodeCtx) -> None:
         sc = p.get("success_criteria")
         if not isinstance(sc, str) or not sc.strip():
             v.append("'success_criteria' is required")
+        for f, hint in DESIGN_CONTRACT_FIELDS:
+            val = p.get(f)
+            if not isinstance(val, str) or len(val.strip()) < DESIGN_CONTRACT_MIN:
+                v.append(f"'{f}' must be a string (≥{DESIGN_CONTRACT_MIN} chars): {hint}")
         return v
 
     prompt = (
-        template + "\nDesign the analysis method for this question. "
+        template + _user_brief(ctx) + "\nDesign the analysis method for this question. "
         "Reply with the JSON object described in the system message."
     )
     try:
         decision = await ctx.decide(prompt, system=DESIGN_SYSTEM, validate=_validate)
     except DegradedDecision as exc:
         # DESIGN is degradable: mechanical fallback plan from the claim chunks,
-        # ledger the failure honestly, advance.
+        # ledger the failure honestly, advance. The fallback carries ALL EIGHT
+        # schema fields with static, gate-satisfying text (≥10 chars each) — the
+        # degraded path must never fail its own contract.
         ctx.record(attempt=2, error_class="degraded_decision", detail=str(exc),
                    impact="mechanical generic design used")
         decision = {
@@ -534,13 +605,29 @@ async def node_design(ctx: NodeCtx) -> None:
                       "list unresolved gaps"],
             "data_needed": ["corpus", "claim graph"],
             "success_criteria": "every claim carries a verdict or an honest gap",
+            "register": "Recorded corpus passages, one claim verdict per claim.",
+            "estimand": "Aggregated verdict statistics as the answer form.",
+            "identification": "Claims adjudicate only against cited corpus passages.",
+            "risk": "Corpus coverage gaps and single-source unsupported claims.",
         }
+
+    # The gate's epistemic four fields, normalized once for node + artifact + state.
+    design_contract = {
+        f: str(decision[f]).strip() for f, _hint in DESIGN_CONTRACT_FIELDS
+    }
+    ctx.service.record_node(
+        ctx.owner_id, ctx.project_id,
+        node={"id": "design", "type": "Design",
+              "label": design_contract["estimand"][:80], **design_contract},
+    )
 
     body = (
         f"# Research design\n\n## Method\n{decision['method'].strip()}\n\n"
         "## Steps\n" + "".join(f"- {s}\n" for s in decision["steps"])
         + f"\n## Data needed\n{', '.join(map(str, decision.get('data_needed') or []))}\n\n"
-        f"## Success criteria\n{decision['success_criteria'].strip()}\n"
+        f"## Success criteria\n{decision['success_criteria'].strip()}\n\n"
+        "## Design contract\n"
+        + "".join(f"- {f.title()}: {design_contract[f]}\n" for f in design_contract)
     )
     await ctx.service.write_scratch(
         ctx.owner_id, ctx.project_id, artifact_id="design.md", content=body,
@@ -550,6 +637,7 @@ async def node_design(ctx: NodeCtx) -> None:
     def _persist(p: dict) -> None:
         p.setdefault("pipeline", {})["design"] = {
             "method": decision["method"], "steps": decision["steps"],
+            **design_contract,
         }
     ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
 
@@ -634,7 +722,8 @@ async def node_execute(ctx: NodeCtx) -> None:
         f"Question: {ctx.project.get('research_question') or ''}\n"
         f"Design steps: {(ctx.project.get('pipeline') or {}).get('design', {}).get('steps') or []}\n"
         f"Valid ops with their meaning: {json.dumps({k: 'python analysis snapshot' for k in ops})}\n"
-        "Plan the deterministic execution steps."
+        "Plan the deterministic execution steps.\n\n"
+        + _user_brief(ctx)
     )
     raw = await ctx.complete(prompt, system=EXECUTE_PLAN_SYSTEM)
     try:
@@ -692,8 +781,11 @@ async def node_execute(ctx: NodeCtx) -> None:
         summary = raw2.strip()[:600]
 
     await ctx.service.write_scratch(
-        ctx.owner_id, ctx.project_id, artifact_id="execution_report.md",
-        content="# Execution report\n\n## Summary\n" + summary
+        ctx.owner_id, ctx.project_id, artifact_id="execution_notes.md",
+        # NOT named like a report on purpose: "report" in the stem would let this
+        # EXECUTE-stage artifact win the first-write primary binding and leave
+        # WRITE's actual paper (report.md) unbound, unreviewed and unpromoted.
+        content="# Execution notes\n\n## Summary\n" + summary
                 + "\n\n## Outputs\n```json\n"
                 + json.dumps(outputs, ensure_ascii=False, indent=1)[:6000] + "\n```\n",
         idempotency_key=f"pipeline:EXECUTE:{rid}:{ti}",
@@ -754,7 +846,8 @@ async def node_explain(ctx: NodeCtx) -> None:
         f"Claim ids: {sorted(claim_ids)}\n"
         f"Verdict tickets: {json.dumps(evidence_rows, ensure_ascii=False)}\n"
         f"Execution summary: {((ctx.project.get('pipeline') or {}).get('execution') or {}).get('summary', '')[:800]}\n"
-        "Explain the causal lines. Reply with the JSON object in the system message."
+        "Explain the causal lines. Reply with the JSON object in the system message.\n\n"
+        + _user_brief(ctx)
     )
     decision = await ctx.decide(prompt, system=EXPLAIN_SYSTEM, validate=_validate)
 
@@ -801,7 +894,9 @@ async def node_explain(ctx: NodeCtx) -> None:
 WRITE_SYSTEM = (
     "You write the research draft. Using ONLY the supplied evidence record, "
     "produce a structured markdown report that answers the research question, "
-    "states every verdict and every known gap honestly. Reply with ONLY a JSON "
+    "states every verdict and every known gap honestly. Write the title and "
+    "body in the output language the user brief demands (e.g. 中文 for "
+    "「写一个中文报告」); keep URLs and citations verbatim. Reply with ONLY a JSON "
     'object: {"title": "...", "md": "<full markdown draft with >=3 ## '
     'sections; cite sources inline>"}'
 )
@@ -831,6 +926,7 @@ async def node_write(ctx: NodeCtx) -> None:
 
     record = {
         "question": question,
+        "user_brief": _brief_dict(ctx),
         "claims": [
             {"id": n.get("id"), "statement": n.get("statement") or n.get("label"),
              "citations": n.get("citations") or [],
@@ -844,7 +940,8 @@ async def node_write(ctx: NodeCtx) -> None:
     prompt = (
         "Evidence record (authoritative, do not invent claims):\n"
         + json.dumps(record, ensure_ascii=False)[:12000]
-        + f"\n\nWrite the draft answering: {question}"
+        + "\n\n" + _user_brief(ctx)
+        + f"Write the draft answering: {question}"
     )
     try:
         decision = await ctx.decide(prompt, system=WRITE_SYSTEM, validate=_validate)
@@ -880,6 +977,85 @@ async def node_write(ctx: NodeCtx) -> None:
 
 
 # ═════════════════════════════ REVIEW (thinking OFF, tri-state + physical lock) ═
+
+
+def _render_scorecard(ctx: NodeCtx) -> str:
+    """Mechanical QUALITY_GATE scorecard — 0 LLM, deterministic from persisted facts.
+
+    Format contract (``plugin._parse_scorecard_rows``): pipe table, first cell an
+    integer, FOURTH column the Fatal flag. Exactly 8 dimension rows always satisfy
+    the >=7 bar. Blocking severity lives ONLY in Fatal 'yes' and is reserved for
+    DISQUALIFYING absences (no verified source, no claim, no/empty report) —
+    ordinary quality gaps (unreviewed edition, anchoring < 100%) score low with
+    Fatal 'no' so a flaw never blocks the chain: that is the gate's own
+    fatal==0 verdict, aligned with the strict park semantics.
+    """
+    project = ctx.service.read_project(ctx.owner_id, ctx.project_id)
+    graph = ctx.service._load_graph(ctx.owner_id, ctx.project_id)
+    pipe = project.get("pipeline") or {}
+    nodes = [n for n in graph.get("nodes") or [] if isinstance(n, dict)]
+    by_type = lambda t: [n for n in nodes if n.get("type") == t]  # noqa: E731
+    sources, claims = by_type("Source"), by_type("Claim")
+    verified = [s for s in sources if s.get("verification_status") == "verified"]
+    anchored = [c for c in claims if c.get("citations") and c.get("strength")]
+    tickets: dict[str, list[str]] = {}
+    for e in graph.get("edges") or []:
+        if isinstance(e, dict) and e.get("kind") in ("supports", "contradicts"):
+            tickets.setdefault(str(e.get("dst")), []).append(e["kind"])
+    covered = [c for c in claims if tickets.get(str(c.get("id")))]
+    urls = (pipe.get("corpus") or {}).get("urls") or []
+    gaps = pipe.get("known_gaps") or []
+    ledger = pipe.get("failure_ledger") or []
+    review = pipe.get("review") or {}
+
+    report_ok = False
+    primary = (project.get("primary_report_artifact_id") or "").strip()
+    if primary:
+        try:
+            d = ctx.service._artifact_dir(ctx.owner_id, ctx.project_id, primary)
+            vs = sorted(int(p.name[1:]) for p in d.glob("v*") if p.name[1:].isdigit())
+            rec = (ctx.service._artifact(ctx.owner_id, ctx.project_id, primary, vs[-1])
+                   if vs else None)
+            report_ok = bool(rec and (rec.get("content") or "").strip())
+        except Exception:  # noqa: BLE001 — absence is a fatal row, never a crash
+            report_ok = False
+
+    def _cell(s: object) -> str:
+        return str(s).replace("|", "/").strip()
+
+    rows = [
+        ("Corpus assembled for adjudication", f"{len(urls)} urls", False,
+         f"known gaps recorded: {len(gaps)}"),
+        ("Evidence sources verified", f"{len(verified)}/{len(sources)}",
+         len(verified) == 0, "every Source must carry verification_status=verified"),
+        ("Claims recorded", f"{len(claims)}", len(claims) == 0,
+         "claims frame the research question"),
+        ("Claims anchored (citations + strength)", f"{len(anchored)}/{len(claims)}",
+         False, "a gap when <n/n; disclosed, never hidden"),
+        ("Claims with verdict or honest gap", f"{len(covered)}/{len(claims)}",
+         False, f"verdict tickets + {len(gaps)} gap entries"),
+        ("Primary report bound and non-empty", "yes" if report_ok else "no",
+         not report_ok, "the deliverable CLAIM_GATE hard-stops on"),
+        ("Edition reviewed", review.get("status", "missing"), False,
+         _cell(review.get("verdict") or "no review verdict")),
+        ("Failure ledger disclosed", f"{len(ledger)} lines", False,
+         "degradations surface in the report's honest-gap section"),
+    ]
+    lines = [
+        "# Quality scorecard",
+        "",
+        "Mechanical (0-LLM): computed from persisted graph/ledger state at REVIEW "
+        "close.", "Blocking is Fatal only; quality gaps score low, never fatal.",
+        "",
+        "| # | Criterion | Score | Fatal | Note |",
+        "|---|---|---|---|---|",
+    ]
+    lines += [
+        f"| {i} | {_cell(c)} | {_cell(sc)} | {'yes' if ftl else 'no'} | {_cell(nt)} |"
+        for i, (c, sc, ftl, nt) in enumerate(rows, 1)
+    ]
+    return "\n".join(lines) + "\n"
+
 
 @register_handler("REVIEW")
 async def node_review(ctx: NodeCtx) -> None:
@@ -934,6 +1110,24 @@ async def node_review(ctx: NodeCtx) -> None:
             "llm_calls": CONTRACTS["REVIEW"].llm_calls - ctx.gate.remaining,
         }
     ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
+
+    # ── QUALITY_GATE feed: mechanical scorecard (0 LLM) ──────────────────────
+    # write_scratch stamps the current run_seq (G3), the exact provenance the
+    # gate's per-edition scope demands. A render failure is a ledger line — the
+    # gate then sees scorecard_missing, parks on FAIL (strict), never crashes.
+    try:
+        await ctx.service.write_scratch(
+            ctx.owner_id, ctx.project_id, artifact_id="scorecard.md",
+            content=_render_scorecard(ctx),
+            idempotency_key=(
+                f"pipeline:REVIEW:{ctx.facts.get('run_id')}:"
+                f"{ctx.facts.get('turn_index')}:scorecard"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — honest gap, handled by the gate
+        ctx.record(attempt=1, error_class="handler_error",
+                   detail=f"scorecard render failed: {type(exc).__name__}: {exc}"[:500],
+                   impact="QUALITY_GATE has no scorecard for this edition")
 
 
 # ═════════════════════════════ REPRODUCE (pure Python, 0 LLM declared) ═════════

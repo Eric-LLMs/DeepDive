@@ -18,6 +18,13 @@ activation at node entry (:func:`node_entry_fence`), and the two stop classes:
   ["structural_stop"]``; the SAME grading pass terminates the run
   BLOCKED-once via ``CAUSE_STRUCTURAL`` (workflow/policy chain slot 4). The dead
   node is never re-run by a next iteration.
+* **Gate park** (strict mode only): a checked-and-FAILED guard gate at the
+  transition fence parks the chain on a PENDING human override — the strict
+  contract is "block the transition and wait for the human decision", never
+  death. While unresolved, re-entry runs no handler body and no LLM; once the
+  approval resolves (gate PASS/OVERRIDE) the already-persisted node outputs
+  advance WITHOUT re-running the handler. Progressive mode is untouched: its
+  fence diagnostics keep advancing (marker/approval paths unreachable there).
 
 Every semantic LLM completion rides the pre-commit infrastructure: the run-level
 :class:`RunBudget` hard fuse (>= cap → ``CostLimitExceeded`` power-cut BEFORE the
@@ -40,6 +47,7 @@ from typing import Any, Awaitable, Callable
 
 from plugins.research.llm_budget import RunBudget, StageBudgetExceeded, StageGate
 from plugins.research.plugin import (
+    _GATE_BEFORE,
     _gated_llm_complete,
     node_entry_fence,
     OwnershipLost,
@@ -128,6 +136,7 @@ _ERROR_CLASSES = frozenset({
     "source_unavailable",    # per-source fetch degrade (never kills the node)
     "handler_error",         # unexpected handler fault
     "transition_refused",    # force-advance itself blocked
+    "gate_awaiting_override",  # guard gate FAIL: parked on a PENDING human decision
     "missing_handler",       # wiring gap for this stage
 })
 
@@ -344,6 +353,37 @@ async def run_node(
                 None, [], existing,
             )
 
+        # ── gate-park re-entry (strict contract, see module docstring) ─────────
+        # Set only by the park branch below (strict); while a PENDING override
+        # is unresolved this short-circuits BEFORE the handler: 0 LLM, no body.
+        # A resolved override (gate PASS/OVERRIDE) clears the marker and the
+        # ALREADY-PERSISTED node outputs advance without re-running the handler.
+        strict = project.get("execution_mode", "strict") == "strict"
+        awaiting = (project.get("pipeline") or {}).get("awaiting_override")
+        resume_advance = False
+        if awaiting:
+            parked_gate = awaiting["gate"]
+            parked_state = (project.get("gates") or {}).get(parked_gate)
+            if parked_state in ("PASS", "OVERRIDE"):
+                def _clear(p: dict) -> None:
+                    (p.get("pipeline") or {}).pop("awaiting_override", None)
+                project = service.atomic_update_project(
+                    owner_id, project_id, _clear,
+                )
+                resume_advance = True
+                logger.info(
+                    "pipeline.node %s: %s override resolved (%s) — advancing "
+                    "without re-running the handler",
+                    stage, parked_gate, parked_state,
+                )
+            else:
+                return NodeOutcome(
+                    "blocked", stage, awaiting.get("target"),
+                    f"PIPELINE {stage}: PARKED at {parked_gate} — awaiting human "
+                    f"override {awaiting.get('approval_id')} (0 LLM while parked)",
+                    0.0, [], None,
+                )
+
         contract = CONTRACTS[stage]
         run = RunBudget(
             cap_usd=max_cost_usd, start_spent_usd=start_spent_usd, run_id=run_id,
@@ -354,6 +394,9 @@ async def run_node(
             contract=contract, run=run, gate=gate, project=project,
         )
         ctx.facts.update({"run_id": run_id, "turn_index": turn_index})
+        # The user's creation-time brief rides every node's context regardless of entry
+        # path (Run button, driver replay, chat): task_spec.json is the single source.
+        ctx.facts.setdefault("task_spec", service.read_task_spec(owner_id, project_id))
         if extras:
             ctx.facts.update(extras)  # deployment surfaces: channels etc. (see docstring)
         t0 = time.monotonic()
@@ -375,44 +418,49 @@ async def run_node(
             )
 
         fault: dict | None = None
-        try:
-            await asyncio.wait_for(handler(ctx), timeout=contract.node_budget_s)
-        except (CostLimitExceeded, OwnershipLost):
-            # Run-level fences never degrade to a ledger line: the hard cost fuse
-            # powers the whole run down; OwnershipLost is a drop signal.
-            _persist(ctx, structural=None)
-            raise
-        except StructuralStop as st:
-            structural = {"stage": st.stage, "missing": st.missing, "detail": st.detail}
-            _persist(ctx, structural=structural)
-            logger.warning("pipeline.structural stage=%s missing=%s", st.stage, st.missing)
-            return NodeOutcome(
-                "blocked", stage, _next_of(stage),
-                f"PIPELINE {stage}: STRUCTURAL STOP — {st}" + render_ledger(ctx.ledger),
-                run.spent, ctx.ledger, structural,
-            )
-        except asyncio.TimeoutError:
-            fault = ctx.record(
-                attempt=1, error_class="node_timeout",
-                detail=f"node exceeded {contract.node_budget_s:.0f}s floor",
-                impact="stage outputs partial; advancing with honest gaps",
-            )
-        except StageBudgetExceeded as exc:
-            fault = ctx.record(
-                attempt=1, error_class="llm_budget_exceeded", detail=str(exc),
-                impact="declared stage budget spent; further semantic work skipped",
-            )
-        except DegradedDecision as exc:
-            fault = ctx.record(
-                attempt=2, error_class="degraded_decision", detail=str(exc),
-                impact="fallback content used for this stage",
-            )
-        except Exception as exc:  # noqa: BLE001 — degrade honestly, never stall the chain
-            fault = ctx.record(
-                attempt=1, error_class="handler_error",
-                detail=f"{type(exc).__name__}: {exc}",
-                impact="stage work lost; advancing with honest gaps",
-            )
+        if not resume_advance:
+            # The park-resume replay above carries the node's outputs on disk
+            # already; a fresh node run gets exactly ONE honest attempt.
+            try:
+                await asyncio.wait_for(handler(ctx), timeout=contract.node_budget_s)
+            except (CostLimitExceeded, OwnershipLost):
+                # Run-level fences never degrade to a ledger line: the hard cost fuse
+                # powers the whole run down; OwnershipLost is a drop signal.
+                _persist(ctx, structural=None)
+                raise
+            except StructuralStop as st:
+                structural = {"stage": st.stage, "missing": st.missing, "detail": st.detail}
+                _persist(ctx, structural=structural)
+                logger.warning(
+                    "pipeline.structural stage=%s missing=%s", st.stage, st.missing,
+                )
+                return NodeOutcome(
+                    "blocked", stage, _next_of(stage),
+                    f"PIPELINE {stage}: STRUCTURAL STOP — {st}" + render_ledger(ctx.ledger),
+                    run.spent, ctx.ledger, structural,
+                )
+            except asyncio.TimeoutError:
+                fault = ctx.record(
+                    attempt=1, error_class="node_timeout",
+                    detail=f"node exceeded {contract.node_budget_s:.0f}s floor",
+                    impact="stage outputs partial; advancing with honest gaps",
+                )
+            except StageBudgetExceeded as exc:
+                fault = ctx.record(
+                    attempt=1, error_class="llm_budget_exceeded", detail=str(exc),
+                    impact="declared stage budget spent; further semantic work skipped",
+                )
+            except DegradedDecision as exc:
+                fault = ctx.record(
+                    attempt=2, error_class="degraded_decision", detail=str(exc),
+                    impact="fallback content used for this stage",
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade honestly, never stall the chain
+                fault = ctx.record(
+                    attempt=1, error_class="handler_error",
+                    detail=f"{type(exc).__name__}: {exc}",
+                    impact="stage work lost; advancing with honest gaps",
+                )
 
         # ── force advance: the chain NEVER parks mid-stage on a degradable fault ──
         nxt = _next_of(stage)
@@ -423,11 +471,79 @@ async def run_node(
                 f"PIPELINE {stage}: terminal stage reached" + render_ledger(ctx.ledger),
                 run.spent, ctx.ledger,
             )
+
+        # ── strict fence pre-check: evaluate an unevaluated guard gate NOW ─────
+        # The code-driven chain owns the duty the old agent flow discharged via
+        # the research_gate tool: a guarded transition's cached NOT_RUN gate gets
+        # its deterministic, zero-LLM verdict before the fence decides. PASS
+        # opens the fence; FAIL parks below on a PENDING override. Progressive is
+        # untouched — transition_stage keeps running its read-only diagnostics.
+        gate_checks: dict | None = None
+        if strict:
+            guard = _GATE_BEFORE.get(nxt)
+            if guard:
+                cached = (service.read_project(owner_id, project_id).get("gates")
+                          or {}).get(guard)
+                if cached in (None, "NOT_RUN"):
+                    try:
+                        gate_checks = service.check_gate(
+                            owner_id, project_id, gate_name=guard,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — fence decides honestly
+                        ctx.record(
+                            attempt=1, error_class="handler_error",
+                            detail=f"gate check {guard}: {type(exc).__name__}: {exc}"[:500],
+                            impact="guard gate could not be evaluated; "
+                                   "fence decides on the cached state",
+                        )
         res = service.transition_stage(
             owner_id, project_id, target=nxt, expected_current_stage=stage,
         )
         verb = res.get("transition")
         if verb != "ADVANCED":
+            guard = res.get("gate")
+            gstate = None
+            if guard:
+                gstate = (service.read_project(owner_id, project_id).get("gates")
+                          or {}).get(guard)
+            if strict and guard and gstate == "FAIL":
+                # The strict contract: a CHECKED-AND-FAILED guard gate blocks the
+                # transition and parks the chain on a PENDING human override —
+                # the desktop shows the review note (emit_gate_notes), approval
+                # resumes the advance without re-running this handler. A non-gate
+                # refusal (G1 hard-stop, CONFLICT, ILLEGAL) keeps its honest
+                # structural death below: first-and-only semantics unchanged.
+                failed = [c for c in (gate_checks or {}).get("checks", [])
+                          if not c.get("ok")]
+                summary = ("; ".join(
+                    f"{c['name']}: {c['detail']}" for c in failed
+                ) or str(res.get("reason") or ""))[:400]
+                approval = service.request_override(
+                    owner_id, project_id, gate_name=guard,
+                    reason=f"strict pipeline parked at {stage}->{nxt}: {summary}",
+                )
+
+                def _mark(p: dict) -> None:
+                    p.setdefault("pipeline", {})["awaiting_override"] = {
+                        "gate": guard, "stage": stage, "target": nxt,
+                        "approval_id": approval["approval_id"],
+                    }
+                service.atomic_update_project(owner_id, project_id, _mark)
+                ctx.record(
+                    attempt=1, error_class="gate_awaiting_override",
+                    detail=f"{guard} FAIL at {stage}->{nxt}: {summary}",
+                    missing=guard,
+                    impact="chain parked on a PENDING human override (strict "
+                           "contract); 0 LLM until resolved; not a structural death",
+                )
+                _persist(ctx, structural=None)
+                return NodeOutcome(
+                    "blocked", stage, nxt,
+                    f"PIPELINE {stage}: PARKED at {guard} — override "
+                    f"{approval['approval_id']} awaiting a human decision"
+                    + render_ledger(ctx.ledger),
+                    run.spent, ctx.ledger, None,
+                )
             ctx.record(
                 attempt=1, error_class="transition_refused",
                 detail=f"transition {stage}->{nxt} reported {verb!r}: "
