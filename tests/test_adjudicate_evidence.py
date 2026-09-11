@@ -536,3 +536,60 @@ class TestAdjudicateMaterials:
         assert [s["url"] for s in out["skipped_sources"]] == [forged_cu]
         g = _graph(env, task_b)
         assert not [n for n in g["nodes"] if n.get("url") == forged_cu]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# llm_gate threading (pipeline pre-commit): every internal pass rides the gate
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestLlmGateThreading:
+    async def test_batch_call_and_repair_both_metered(self, env, monkeypatch):
+        from plugins.research.llm_budget import RunBudget, StageGate
+
+        svc, task_id = await _new_run(env)
+        _record_claim(svc, task_id, "c1", "tomatoes are a fruit")
+        _install_fetch(monkeypatch)
+        llm = _install_llm(monkeypatch, "prose, not JSON", _supports("c1", "S1"))
+        run = RunBudget(cap_usd=None, model="gpt-4o-mini")  # priced, per-1M table
+        gate = StageGate(run, stage="EVIDENCE", max_calls=2)
+        out = await svc.adjudicate_evidence(
+            USER, task_id, urls=["https://good1.example/a"], llm_gate=gate
+        )
+        # the closure made exactly 2 completions and the gate saw exactly both
+        assert out["llm_calls"] == 2 and len(llm.prompts) == 2
+        assert gate.calls == 2 and run.calls == 2
+        assert run.tokens_in == sum(len(p) // 4 for p in llm.prompts)
+        assert run.spent > 0.0 and run.pricing_unknown_calls == 0
+
+    async def test_budget_breach_kills_the_repair_before_commit(self, env, monkeypatch):
+        from plugins.research.llm_budget import RunBudget, StageBudgetExceeded, StageGate
+
+        svc, task_id = await _new_run(env)
+        _record_claim(svc, task_id, "c1", "tomatoes are a fruit")
+        _install_fetch(monkeypatch)
+        llm = _install_llm(monkeypatch, "prose, not JSON", _supports("c1", "S1"))
+        gate = StageGate(RunBudget(cap_usd=None), stage="EVIDENCE", max_calls=1)
+        with pytest.raises(StageBudgetExceeded):
+            await svc.adjudicate_evidence(
+                USER, task_id, urls=["https://good1.example/a"], llm_gate=gate
+            )
+        # repair never issued, nothing committed
+        assert len(llm.prompts) == 1
+        assert _ticket_edges(_graph(env, task_id), "c1") == []
+
+    async def test_cost_fuse_power_cuts_before_first_completion(self, env, monkeypatch):
+        from plugins.research.llm_budget import RunBudget, StageGate
+        from plugins.research.workflow_adapter import CostLimitExceeded
+
+        svc, task_id = await _new_run(env)
+        _record_claim(svc, task_id, "c1", "tomatoes are a fruit")
+        _install_fetch(monkeypatch)
+        llm = _install_llm(monkeypatch, _supports("c1", "S1"))
+        run = RunBudget(cap_usd=0.40, start_spent_usd=0.40, run_id="r-fuse")
+        with pytest.raises(CostLimitExceeded):
+            await svc.adjudicate_evidence(
+                USER, task_id, urls=["https://good1.example/a"],
+                llm_gate=StageGate(run, stage="EVIDENCE", max_calls=2),
+            )
+        assert llm.prompts == []  # the transport was never touched
+        assert run.calls == 0

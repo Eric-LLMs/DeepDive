@@ -27,6 +27,7 @@ Design notes (spike decisions, all auditable):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import hashlib
 import json
@@ -92,6 +93,33 @@ def clear_auto_run_fence(token: contextvars.Token) -> None:
 
 def get_auto_run_fence() -> dict | None:
     return _AUTO_RUN_FENCE.get()
+
+
+@contextlib.contextmanager
+def node_entry_fence(
+    *, owner_id: Any, task_id: str, run_id: str, execution_id: str | None
+):
+    """F2 fence activation for a pipeline node body (sealed-spec constraint #4).
+
+    The pipeline is designed to run inside ``ResearchRunDriver.auto_turn``, whose
+    ``compose_prompt`` already mints a per-attempt fence — in that case this simply
+    INHERITS the live fence (never overrides the driver's identity, so the ledger
+    CAS match keeps working). Called standalone (direct node execution, tests), it
+    MINTS from the given identity so no authoritative write ever lands unfenced on
+    the pipeline path — closing the "assert_auto_run_authority is a no-op outside
+    an auto-run turn" hole.
+    """
+    live = get_auto_run_fence()
+    if live is not None:
+        yield live
+        return
+    token = set_auto_run_fence(
+        owner_id=owner_id, task_id=task_id, run_id=run_id, execution_id=execution_id
+    )
+    try:
+        yield get_auto_run_fence()
+    finally:
+        clear_auto_run_fence(token)
 
 
 # Lease knobs for READ-SIDE staleness only (F1-a/F3). The single source of truth for
@@ -531,6 +559,40 @@ async def _adjudication_llm_complete(
         len(text),
     )
     return text
+
+
+async def _gated_llm_complete(
+    prompt: str,
+    system_prompt: str,
+    *,
+    enable_thinking: bool = False,
+    llm_gate: Any = None,
+) -> str:
+    """The single choke point for every semantic LLM completion in this plugin.
+
+    Sealed-spec constraint #1: when a pipeline stage passes an ``llm_gate`` (duck-
+    typed ``.admit()`` / ``.settle(prompt, reply)`` — see
+    :mod:`plugins.research.llm_budget`), NO completion may bypass it: ``admit``
+    enforces the run-level cost hard fuse and the stage's declared call budget
+    BEFORE the call, ``settle`` meters the token estimate after (a failed call
+    settles with ``reply=None``, never goes un-counted). ``llm_gate=None`` keeps
+    the interactive/legacy path byte-identical — the pipeline thread supplies the
+    gate. All internal call sites go through here, which is what makes "hidden LLM
+    passes" structurally impossible.
+    """
+    if llm_gate is not None:
+        llm_gate.admit()
+    try:
+        raw = await _adjudication_llm_complete(
+            prompt, system_prompt, enable_thinking=enable_thinking
+        )
+    except BaseException:
+        if llm_gate is not None:
+            llm_gate.settle(prompt, None)
+        raise
+    if llm_gate is not None:
+        llm_gate.settle(prompt, raw)
+    return raw
 
 
 _ADJ_SYSTEM_PROMPT = (
@@ -5656,8 +5718,17 @@ class ResearchService:
         *,
         urls: list[str],
         claim_ids: list[str] | None = None,
+        llm_gate: Any = None,
     ) -> dict:
         """ONE server-side EVIDENCE closure: fetch → chunks → adjudicate → one commit.
+
+        ``llm_gate`` (optional, duck-typed ``.admit()``/``.settle()``, see
+        :mod:`plugins.research.llm_budget`): when given, EVERY internal verdict/
+        repair completion is admitted before and metered after — batch splits and
+        format repairs included. Budget breaches (``StageBudgetExceeded``) and the
+        run-level cost fuse (``CostLimitExceeded``) propagate to the caller; the
+        pipeline node decides degrade vs terminate. ``None`` (tool/legacy path)
+        keeps behavior byte-identical.
 
         The P3-8 atomic action that replaces the model-driven fetch/adjudicate/
         verify_batch retail chain. The outer agent triggers exactly ONE call; every
@@ -5834,7 +5905,9 @@ class ResearchService:
         for batch_cus in batches:
             source_payload = [(sid_of[cu], snippets[cu]) for cu in batch_cus]
             prompt = _adjudication_prompt(claim_payload, source_payload)
-            raw = await _adjudication_llm_complete(prompt, _ADJ_SYSTEM_PROMPT)
+            raw = await _gated_llm_complete(
+                prompt, _ADJ_SYSTEM_PROMPT, llm_gate=llm_gate
+            )
             llm_calls += 1
             t_parse = time.perf_counter()
             try:
@@ -5843,11 +5916,12 @@ class ResearchService:
                 parse_ms_total += (time.perf_counter() - t_parse) * 1000
                 # ONE format repair call is allowed: by design only a budget split
                 # multiplies LLM calls; a malformed reply is fixed, not fanned out.
-                raw = await _adjudication_llm_complete(
+                raw = await _gated_llm_complete(
                     prompt
                     + f"\n\nYour previous reply failed to parse ({exc}). "
                       "Reply with ONLY the JSON object described above.",
                     _ADJ_SYSTEM_PROMPT,
+                    llm_gate=llm_gate,
                 )
                 llm_calls += 1
                 t_parse = time.perf_counter()
@@ -6011,8 +6085,13 @@ class ResearchService:
         project_id: str,
         *,
         artifact_id: str,
+        llm_gate: Any = None,
     ) -> dict:
         """ONE server-side REVIEW closure: draft + claim graph in, patch-JSON out.
+
+        ``llm_gate`` follows the same contract as
+        :meth:`adjudicate_evidence`: the reviewer call AND its single format-repair
+        ride the gate — no un-metered completion leaves this method.
 
         The P3-9 atomic action mirroring :meth:`adjudicate_evidence` for the REVIEW
         stage, final-contract edition:
@@ -6118,8 +6197,8 @@ class ResearchService:
 
         llm_calls = 0
         t0 = time.perf_counter()
-        raw = await _adjudication_llm_complete(
-            prompt, _REVIEW_SYSTEM_PROMPT, enable_thinking=False
+        raw = await _gated_llm_complete(
+            prompt, _REVIEW_SYSTEM_PROMPT, enable_thinking=False, llm_gate=llm_gate
         )
         llm_calls += 1
         llm_trace.emit({
@@ -6137,8 +6216,9 @@ class ResearchService:
                 + f"\n\nYour previous reply failed to parse ({exc}). "
                   "Reply with ONLY the JSON object described above."
             )
-            raw = await _adjudication_llm_complete(
-                repair_prompt, _REVIEW_SYSTEM_PROMPT, enable_thinking=False
+            raw = await _gated_llm_complete(
+                repair_prompt, _REVIEW_SYSTEM_PROMPT,
+                enable_thinking=False, llm_gate=llm_gate,
             )
             llm_calls += 1
             llm_trace.emit({

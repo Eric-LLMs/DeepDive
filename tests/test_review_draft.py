@@ -207,6 +207,52 @@ async def test_malformed_reply_gets_one_repair_then_commits(env, monkeypatch):
     assert "Reply with ONLY the JSON object" in seen[1][0]
 
 
+# ── llm_gate threading (pipeline pre-commit): no hidden reviewer pass ────────
+
+async def test_review_gate_meters_main_and_repair_call(env, monkeypatch):
+    from plugins.research.llm_budget import RunBudget, StageGate
+
+    svc, task_id = await _project_with_draft(env, "aaa bbb\n", {"c1": "x"})
+    replies = ["prose…", json.dumps({"changes": [_change(old="bbb", new="ccc")]})]
+    seen = _seam(monkeypatch, replies)
+    run = RunBudget(cap_usd=None, model="gpt-4o-mini")
+    gate = StageGate(run, stage="REVIEW", max_calls=2)
+    out = await svc.review_draft(USER, task_id, artifact_id="report.md", llm_gate=gate)
+    assert out["llm_calls"] == 2 and len(seen) == 2
+    assert gate.calls == 2 and run.calls == 2
+    assert run.tokens_in == sum(len(p) // 4 for p, _ in seen)
+    assert run.tokens_out == sum(len(r) // 4 for r in replies)
+    assert run.spent > 0.0 and run.pricing_unknown_calls == 0
+
+
+async def test_review_gate_budget_breach_writes_no_version(env, monkeypatch):
+    from plugins.research.llm_budget import RunBudget, StageBudgetExceeded, StageGate
+
+    svc, task_id = await _project_with_draft(env, "aaa bbb\n", {"c1": "x"})
+    _seam(monkeypatch, ["prose…", json.dumps({"changes": [_change(old="bbb", new="ccc")]})])
+    gate = StageGate(RunBudget(cap_usd=None), stage="REVIEW", max_calls=1)
+    with pytest.raises(StageBudgetExceeded):
+        await svc.review_draft(USER, task_id, artifact_id="report.md", llm_gate=gate)
+    assert svc.read_artifact(USER, task_id, artifact_id="report.md")["version"] == 1
+
+
+async def test_review_gate_pricing_unknown_is_explicit_not_zero(env, monkeypatch):
+    # No channel and no injected price: spend stays 0 BUT the gap is counted —
+    # PRICING_UNKNOWN never launders into "free" (driver-ledger discipline).
+    from plugins.research.llm_budget import RunBudget, StageGate
+
+    svc, task_id = await _project_with_draft(env, "aaa bbb\n", {"c1": "x"})
+    _seam(monkeypatch, [json.dumps({"changes": []})])
+    run = RunBudget(cap_usd=None, model="unpriced-model-zzz")
+    out = await svc.review_draft(
+        USER, task_id, artifact_id="report.md",
+        llm_gate=StageGate(run, stage="REVIEW", max_calls=2),
+    )
+    assert out["llm_calls"] == 1
+    assert run.calls == 1 and run.tokens_in > 0
+    assert run.spent == 0.0 and run.pricing_unknown_calls == 1
+
+
 async def test_double_malformed_raises(env, monkeypatch):
     svc, task_id = await _project_with_draft(env, "aaa\n", {"c1": "x"})
     _seam(monkeypatch, ["prose", "still prose"])
