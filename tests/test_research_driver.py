@@ -805,7 +805,6 @@ def test_settings_driver_defaults_present():
     # Guard the config knobs the driver reads at construction actually exist.
     assert settings.research_driver_max_turns >= 1
     assert settings.research_driver_max_no_progress_turns >= 1
-    assert settings.research_driver_turn_max_steps >= 1
 
 
 # ── PRE-CALL cost hard gate (Run-15 closure: $ cap = electric brake, not a stat) ─

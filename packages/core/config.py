@@ -103,20 +103,19 @@ class Settings(BaseSettings):
     research_scratch_dir: Path = Path("data/research_scratch")  # research scratch root (spike)
 
     # ── Research auto-run driver (T0) ──
-    # The driver chains background agent turns ("one-click run to PUBLISH") behind a
-    # single-flight run_id. These knobs bound how far a chain may go before it must stop
-    # and hand control back to a human — never a silent infinite loop.
+    # The driver chains background pipeline node executions ("one-click run to PUBLISH")
+    # behind a single-flight run_id. These knobs bound how far a chain may go before it
+    # must stop and hand control back to a human — never a silent infinite loop.
     research_driver_max_turns: int = 14        # max chained worker turns per run_id (10-stage
     #   chain needs >=10 turns even with ZERO retries — Run 15 died at 8 with a clean path;
     #   14 = clean walk + ~4 turns of per-stage retry slack. The real runaway brake stays the
     #   no-progress fuse + the PRE-CALL cost gate below, not this absolute cap.)
     research_driver_max_no_progress_turns: int = 2  # consecutive no-progress turns → STALLED
-    research_driver_turn_max_steps: int = 25   # per worker-turn LLM step cap (interactive stays at 5)
     research_driver_max_attempts: int = 3      # transient retries per turn_index (turn_attempt cap)
     research_driver_max_cost_usd: float | None = 0.40  # cumulative auto-run cost cap. NOT a
     #   passive billing stat: enforced as a hard PRE-CALL gate — the driver refuses to start a
-    #   turn once cumulative >= cap (CostLimitExceeded), and each turn's step loop gets
-    #   turn.max_budget_usd = remaining so no further LLM request leaves the loop at cap.
+    #   turn once cumulative >= cap (CostLimitExceeded), and every model call inside a node
+    #   transits the stage llm_gate, which checks remaining budget before transport dispatch.
 
     # ── Runtime logging (core.logger) ──
     log_level: str = "INFO"                    # root logger level (DEBUG/INFO/WARNING/ERROR/CRITICAL)

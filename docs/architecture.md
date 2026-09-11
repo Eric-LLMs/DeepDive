@@ -2377,21 +2377,25 @@ below keeps only the research-visible consequences.
 not the SSE pipe: closing the chat, navigating away, or dropping the network never cancels an
 active run. Each run starts from a **chat-handoff turn** (`/chat` or `/chat/stream`); once that
 interactive turn ends, the API decides whether to hand the run to a **`research_drive` worker
-job** — one arq job per agent turn (`apps/worker/tasks.py` `research_drive`: it runs the driver's
-`auto_turn` for one `execution_id`, then mirrors the answer into the session and enqueues the next
+job** — one arq job per **pipeline node execution** (`apps/worker/tasks.py` `research_drive`: it
+runs the driver's `auto_turn` for one `execution_id`, whose turn is exactly one
+`pipeline.run_node` (see [§20](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline)),
+then mirrors the node's outcome line into the session and enqueues the next
 turn when the driver says `continue`) — so a single chat prompt can drive a task **all the way to
-PUBLISH with no client attached**. Worker turns run `research_driver_turn_max_steps` (25) vs the
-interactive 5, under caps: `research_driver_max_turns` (14), `research_driver_max_no_progress_turns`
-(2), `research_driver_max_attempts` (3), and a cost ceiling `research_driver_max_cost_usd` (default
-$0.40) enforced as a **pre-call hard gate**: at the turn seam the run refuses to *start* a turn once
-cumulative spend has reached the cap — `CostLimitExceeded`, deliberately kept outside the
-transient-error hints so a budget stop can never be retried away — and every turn's step loop
-receives `max_budget_usd = cap − spent`, so a mid-turn call is refused before it is billed;
-over-spending the cap is structurally impossible. A
+PUBLISH with no client attached**. Every node runs under caps: `research_driver_max_turns` (14),
+`research_driver_max_no_progress_turns` (2), `research_driver_max_attempts` (3), and a cost
+ceiling `research_driver_max_cost_usd` (default $0.40) enforced as a **pre-call hard gate**: at
+the turn seam the run refuses to *start* a turn once cumulative spend has reached the cap —
+`CostLimitExceeded`, deliberately kept outside the transient-error hints so a budget stop can
+never be retried away — and inside the node every model call transits the stage's `llm_gate`,
+which checks remaining budget **before** the request leaves the transport layer; over-spending
+the cap is structurally impossible. A
 `RunState` driver (`plugins/research/driver.py`) derives `idle | running | finished | blocked |
 stalled | cancelled | error` from the persisted run slot; after each successful turn a fixed
-grading chain fixes the state — cancel requested → CANCELLED, stage PUBLISH → FINISHED,
-`pending_overrides` > 0 → BLOCKED, consecutive no-progress over the cap → STALLED, turn/cost cap →
+grading chain fixes the state — cancel requested → CANCELLED, stage PUBLISH *with the pipeline's
+honest promotion record* → FINISHED, a pipeline `structural_stop` → BLOCKED (same grading pass,
+no re-run of the dead node), `pending_overrides` > 0 → BLOCKED, consecutive no-progress over the
+cap → STALLED, turn/cost cap →
 BLOCKED, else the run continues. A progressive run that stops short of PUBLISH for a non-human
 reason (a no-progress stall or a turn/cost cap) is never left mid-way: the driver **auto-settles**
 it (the Execution-mode paragraph above) — it walks the remaining legal chain to PUBLISH, records
@@ -2828,7 +2832,7 @@ The layering is enforced by construction, not convention:
   arrives through the injected ports (§19.7); the runner only sequences them.
 
 **Activity ≠ Executor.** In a spec, an activity declares *what* the iteration does (research:
-task name `auto_turn`); its `executor` field is a **logical identity** (`research-agent-kernel`)
+task name `auto_turn`); its `executor` field is a **logical identity** (`research-pipeline`)
 resolved through the adapter-built registry — once per drive job in `runtime.build_deps`
 (`resolve_executor`), so the runner's execute phase only ever calls the pre-bound executor,
 never a lookup (§19.10). They are one declaration→binding pair, not two serial business
@@ -2851,7 +2855,7 @@ Research Workflow Adapter
    └─ Research-specific translation / settle
         │
         │ build_deps — resolves the activity ONCE per drive job:
-        │              "auto_turn" → logical id "research-agent-kernel" → implementation
+        │              "auto_turn" → logical id "research-pipeline" → implementation
         ▼
 Generic Workflow Runtime / Runner
         │
@@ -2864,12 +2868,10 @@ Generic Workflow Runtime / Runner
         ├─ execute ─────► Executor (_RunTurnExecutor)      ← the black-box edge:
         │                     │                               opaque prompt in,
         │                     ▼                               value + spend out
-        │              Research Agent (one kernel turn)
-        │                     │ Skill = methodology / prompt guidance + tool scoping
+        │              Research Pipeline (one node execution, §20)
+        │                     │ stage contract = LLM budget gate + failure ledger
         │                     ▼
-        │                  LLM steps
-        │                     ▼
-        │                   Tool
+        │        gated LLM decisions (semantic only) + deterministic Python work
         │                     ▼
         │     ResearchService / RAG / Web / Drive
         ├─ heartbeat / cancel
@@ -2888,19 +2890,23 @@ Generic Workflow Runtime / Runner
 Four confusions this view is built to prevent: the **Definition is a declaration, not a
 node** (read/validated each acquire — it never sits in the call chain); the **Adapter is the
 seam** between the core and research (that is where every port binds); **Skill is a
-constraint/methodology, not an execution node** (it guides the prompt and scopes the tools —
-only Tools act on services); and the **workflow's loop closes via grade → continue → next
-job back to the Worker** (flow control lives in the runner, delivery lives in the worker).
+constraint/methodology, not an execution node** (on the interactive path it guides the prompt
+and scopes the tools — on the auto-run the pipeline's own stage contracts play that role);
+and the **workflow's loop closes via grade → continue → next job back to the Worker** (flow
+control lives in the runner, delivery lives in the worker).
 
 The corollary of the loop's endpoints: **the workflow ends at the `Executor` call boundary**
-— everything below it is the agent system, which the core sees as one black-box function.
-Neither the worker nor the workflow ever moves a research stage: stage and gate transitions
-happen *only* when the agent invokes a research tool; the workflow just observes via the
-`ProgressProbe` and grades what the `business_facts` callable reports.
+— everything below it the core sees as one black-box function. For research that black box is
+a deterministic **pipeline node execution** (§20); the interactive Chat path's kernel turn is a
+different implementation of the same edge. Neither the worker nor the workflow ever moves a
+research stage: stage and gate transitions happen *only* inside that box — `pipeline.run_node`
+forces the legal single-step advance, or, interactively, the agent invoking a research tool;
+the workflow just observes via the `ProgressProbe` and grades what the `business_facts`
+callable reports.
 
 A one-line roster of each layer's job: **Workflow Core** = generic flow machinery ·
-**Research workflow** = the domain definition + adapter (§19.10) · **Agent** = an executor
-implementation · **Skill** = methodology · **Tool** = action · **Plugin runtime** =
+**Research workflow** = the domain definition + adapter (§19.10) · **Pipeline / Agent** = the
+executor implementations · **Skill** = methodology · **Tool** = action · **Plugin runtime** =
 capability registration (tools/skills/guards/listeners per [§6.3](#63-plugins); executors
 bind through the adapter's registry, not `PluginManager`) · **Worker** = job delivery ·
 **Service** = domain invariants.
