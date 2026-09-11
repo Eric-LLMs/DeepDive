@@ -195,7 +195,7 @@ deepdive/
 │   └── desktop/                  # Electron workbench (file tree + media viewer + chat; proxies API to the backend)
 ├── packages/
 │   ├── agent/                    # package `agent`: kernel + DI + loop + runtime + memory + skills + prompt
-│   │   ├── engine/               # Agent Kernel: kernel.py (AgentKernel composition root) + loop.py (ReactLoopAgent step loop) + loop_guard.py + context.py (AgentTurn) + decisions.py + runtime.py (ToolRuntime lifecycle) + events.py + sessions.py + telemetry.py
+│   │   ├── engine/               # Agent Kernel: kernel.py (AgentKernel composition root) + loop.py (ReactLoopAgent step loop) + loop_guard.py + context.py (AgentTurn) + decisions.py + runtime.py (ToolRuntime lifecycle) + events.py + sessions.py + telemetry.py + llm_trace.py (opt-in request/response trace sink)
 │   │   ├── prompt/               # system_prompt.py: PromptZone + CacheBoundaryAssembler (inject / snapshot_key / refresh_dynamic)
 │   │   ├── tools/                # definition.py (ToolDefinition / define_tool) + tool_gateway.py (ToolCatalog + ToolGateway + tool_search) + tool_permissions.py (READ/WRITE/NETWORK) + fs_tools.py (read_file / edit_file / bash) + bash_sandbox.py + subagent.py + plan_tool.py + checkpoints.py + project_context.py
 │   │   ├── skills/               # registry.py: Skill + SkillRegistry + SkillCatalog + skill meta-tool (lazy load)
@@ -2187,7 +2187,8 @@ inside `begin_run`'s single-writer mutate and copied to the driver checkpoint as
 read-modify-written outside that lock), `graph.json`, `executions.json`, `approvals.json`,
 `artifacts/<id>/v<N>` (versioned — every version record is stamped with the minting `run_seq`, the
 provenance the artifact-chain hard stops consult, see below), `task_spec.json` / `session_history.json` (also mirrored to the
-cloud), the append-only `run_events.json` progress log (see the run-lifecycle paragraph below), and
+cloud), the append-only `run_events.json` progress log (see the run-lifecycle paragraph below),
+the opt-in `llm_trace.jsonl` per-call LLM request/response trace (also below), and
 `_session_index.json` (the session→task routing map). The user-visible **cloud task folder** lives in
 My Drive under the parent the user picked — the three work folders (`materials/`, `outputs/`,
 `temp/`) are **get-or-created by exact path when the task is created**, so the layout is stable from
@@ -2421,6 +2422,15 @@ replacing prior chat lines) and advances the cursor only past the rows it commit
 leaves the cursor before the failing row so the retry re-emits exactly that row, and rows left over
 from an older run are skipped (never re-shown) while still consuming the cursor.
 
+**Per-task LLM trace — observation-only, opt-in.** `agent.engine.llm_trace` is a contextvar
+sink seam: `emit()` is a no-op when no sink is bound, and a sink error never propagates into
+the run. The worker's `research_drive` job binds a file sink for the whole job, appending each
+traced call as one JSON line to the task's scratch `llm_trace.jsonl` — request, response (or
+error), usage, duration, plus `stage` / `run_id` / `turn_index` tags. Emission sites today: the
+`ReactLoopAgent` step loop (streaming and non-streaming, success and fatal paths — i.e. the
+interactive Chat turn) and the REVIEW stage's internal reviewer passes in `review_draft` — the
+evidence channel for post-hoc "why did this node stall / cost what it cost" analysis.
+
 `begin_run`/`end_run` keep the `active_run` record in `project.json`; a task
 allows one live run at a time, **`is_running` stays true across the whole background chain**
 (surfaced in every task view), a fresh chat-triggered run while one is active is a **409
@@ -2582,7 +2592,9 @@ the word "stage".
 
 **Execution mode — two gate-control pipelines (strict | progressive), locked at creation.** A task's
 `execution_mode` is chosen when it is created (the desktop ＋Research dialog offers both, defaulting
-to `progressive`; the plugin/API default is `strict`) and locked for the task's whole life. It never
+to `progressive`; the API default is `progressive` too — the unattended auto-run is the code-driven
+pipeline, whose doctrine is degrade-honestly-and-advance (§20); `strict` remains selectable for
+gate-blocking control) and locked for the task's whole life. It never
 changes *how* a stage is worked — both modes run identical stage work and the identical deterministic
 gate checks (read-only; a gate's state is never forged) — it changes only what happens when a guarded
 transition's gate has not passed, i.e. the run's failure control flow is one of two pipelines:
