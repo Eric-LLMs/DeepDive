@@ -142,6 +142,10 @@ def _install_llms(monkeypatch):
                 "steps": ["claim_stats", "coverage_report"],
                 "data_needed": ["corpus", "claim graph"],
                 "success_criteria": "every claim carries a verdict or an honest gap",
+                "register": "recorded claim statements scored against corpus passages",
+                "estimand": "the aggregate verdict distribution answering the question",
+                "identification": "a claim counts only when a verdict links evidence",
+                "risk": "corpus coverage gaps and single-source claims drive result",
             })
         if "Valid ops with their meaning" in prompt:
             return json.dumps({"steps": [{"op": "claim_stats"}, {"op": "coverage_report"}]})
@@ -203,11 +207,11 @@ def _install_fetch(monkeypatch):
     monkeypatch.setattr(handlers, "_social_channel", none)
 
 
-async def _make_task(env):
+async def _make_task(env, *, mode: str = "progressive"):
     svc = ResearchService(drive=env.drive, scratch_root=env.scratch)
     task = (await svc.create_task(
         USER, title="health effects of cooking tomatoes",
-        execution_mode="progressive",
+        execution_mode=mode,
     ))["task_id"]
     rid = svc.begin_run(USER, task)["run_id"]
     return svc, task, rid
@@ -221,11 +225,12 @@ def _rag_channel_factory(user_id):
     return _ch
 
 
-async def _drive_chain(env, monkeypatch, *, stop_after: int | None = None):
+async def _drive_chain(env, monkeypatch, *, stop_after: int | None = None,
+                       mode: str = "progressive"):
     """The worker loop shape: one auto_turn per iteration until terminal."""
     calls = _install_llms(monkeypatch)
     _install_fetch(monkeypatch)
-    svc, task, rid = await _make_task(env)
+    svc, task, rid = await _make_task(env, mode=mode)
     driver = ResearchRunDriver()
 
     async def run_turn(prompt: str) -> RunTurnResult:
@@ -260,6 +265,69 @@ async def _drive_chain(env, monkeypatch, *, stop_after: int | None = None):
                            outcomes=outcomes, llm_prompts=calls)
 
 
+# ════════════════ STRICT: the four guard gates, wired end to end ═══════════════
+
+async def test_strict_e2e_all_four_gates_pass(env, monkeypatch):
+    """The gap this pins: strict was never driven through a guarded transition.
+
+    Direct run_node loop (the driver's park semantics are pinned in
+    test_pipeline_batch2): each iteration first resolves any PENDING override
+    (the desktop "Approve" click), then runs one node. The stub graph is
+    genuinely complete — DESIGN node recorded, adjudicated sources verified,
+    the claim cited, the report landed, the mechanical scorecard clean — so
+    the expectation here is FOUR REAL PASSes and ZERO parks.
+    """
+    calls = _install_llms(monkeypatch)
+    _install_fetch(monkeypatch)
+    svc, task, rid = await _make_task(env, mode="strict")
+    # this loop bypasses the driver, so nothing rotates the lease: pin the
+    # on-disk driver execution_id to the constant fence the commits are checked
+    # against (mirrors test_pipeline_batch2's seeding).
+    _base = svc.get_driver_checkpoint(USER, task) or {}
+    svc.atomic_update_project(
+        USER, task,
+        lambda p: p.__setitem__("driver", {**_base, "run_id": rid,
+                                           "execution_id": f"{rid}:1:1"}),
+    )
+
+    visited: list[str] = ["DISCOVER"]
+    parks: list[str] = []
+    for ti in range(1, 25):
+        for a in svc.pending_overrides(USER, task):
+            parks.append(a["gate_name"])
+            svc.resolve_override(USER, a["id"], approve=True, project_id=task)
+        led = svc.get_driver_checkpoint(USER, task) or {}
+        out = await pipeline.run_node(
+            svc, USER, task, run_id=rid,
+            # constant lease id (the driver would rotate it per turn; this loop
+            # bypasses the driver — the F2 fence compares commits to the lease)
+            execution_id=led.get("execution_id") or f"{rid}:1:1",
+            turn_index=ti,
+        )
+        assert out.structural is None, out.turn_value
+        stage_now = svc.read_project(USER, task).get("stage")
+        if visited[-1] != stage_now:
+            visited.append(stage_now)
+        if stage_now == "PUBLISH" and out.kind == "advanced" and out.next_stage is None:
+            break
+
+    proj = svc.read_project(USER, task)
+    assert parks == []
+    assert visited == STAGE_SEQUENCE, visited
+    g = proj["gates"]
+    assert g["DESIGN_GATE"] == "PASS" and g["EVIDENCE_GATE"] == "PASS"
+    assert g["CLAIM_GATE"] == "PASS" and g["QUALITY_GATE"] == "PASS"
+    assert "structural_stop" not in proj["pipeline"]
+    assert "awaiting_override" not in proj["pipeline"]
+    pub = proj["pipeline"]["publish"]
+    assert pub["status"] == "PROMOTED"
+    # the promoted deliverable is the PAPER, not the execution log (run-17/18 hijack)
+    assert pub["artifact"] == "report.md" == proj["primary_report_artifact_id"]
+    # the mechanical scorecard the gate consumed is THIS edition's artifact
+    sc = svc.read_artifact(USER, task, artifact_id="scorecard.md")
+    assert sc["content"].count("\n| ") >= 8
+
+
 # ═══════════════════════ the golden path: 10 stages, FINISHED ═════════════════
 
 async def test_stub_e2e_exact_ten_stage_sequence_to_finished(env, monkeypatch):
@@ -281,6 +349,9 @@ async def test_stub_e2e_exact_ten_stage_sequence_to_finished(env, monkeypatch):
     # the terminal gate's own proof: a promoted, drive-backed artifact
     pub = proj["pipeline"]["publish"]
     assert pub["status"] == "PROMOTED" and pub["drive_asset_id"]
+    # the promoted deliverable is the PAPER, not the execution log (run-17/18
+    # hijack: execution_report.md matched the report-name binder first)
+    assert pub["artifact"] == "report.md" == proj["primary_report_artifact_id"]
     # the review verdict rode the whole chain honestly
     assert proj["pipeline"]["review"]["status"] == "pass"
     # and the reproducibility audit is all green
@@ -377,7 +448,12 @@ async def test_structural_stop_terminalizes_immediately_no_rerun(env, monkeypatc
             return json.dumps({
                 "method": "Adjudicate each claim against the corpus and aggregate verdicts.",
                 "steps": ["claim_stats"], "data_needed": ["corpus"],
-                "success_criteria": "verdicts or honest gaps"})
+                "success_criteria": "verdicts or honest gaps",
+                "register": "claim statements scored against the fetched corpus text",
+                "estimand": "aggregate verdict distribution as the answer",
+                "identification": "verdicts link a claim to evidence or nothing",
+                "risk": "corpus coverage gaps and single-source claims",
+            })
         if "Valid ops with their meaning" in prompt:
             return json.dumps({"steps": [{"op": "claim_stats"}]})
         if prompt.startswith("Execution outputs:"):

@@ -143,6 +143,43 @@ def _ok_keep(*urls):
 
 # ═════════════════════════════ DISCOVER ══════════════════════════════════════
 
+async def test_discover_triage_timeout_keeps_mechanical_corpus(env, monkeypatch):
+    """Run-15 field regression: the node's 60s floor cancelled the handler between
+    the triage reply and the corpus persistence — DISCOVER "advanced with honest
+    gaps" carrying NO corpus, and FRAME then structural-stopped on missing=corpus.
+    The mechanical corpus must be persisted BEFORE the semantic call, so a timeout
+    degrades to "no triage filter", never to "nothing to frame against"."""
+    from plugins.research.pipeline import CONTRACTS, StageContract
+
+    svc, task, rid = await _task(env, title="health effects of tomatoes")
+    _install_fetch(monkeypatch)
+    monkeypatch.setitem(
+        CONTRACTS, "DISCOVER", StageContract("DISCOVER", 2, node_budget_s=0.1)
+    )
+
+    async def web(q):
+        return [{"url": "https://good1.example/a", "title": "G1", "text": "snippet"}]
+
+    async def slow_seam(prompt: str, system: str) -> str:
+        await asyncio.sleep(0.5)          # outlives the node floor
+        return _ok_keep("https://good1.example/a")
+
+    async def empty(q):
+        return []
+
+    monkeypatch.setattr(pipeline, "PIPELINE_LLM_CALL", slow_seam)
+    out = await _run(svc, task, rid, extras={
+        "channel_web": web, "channel_social": empty, "channel_rag": empty,
+    })
+    assert out.kind == "advanced"                       # floor never parks the chain
+    assert out.ledger[0]["error_class"] == "node_timeout"
+    # the deliverable survived the cancellation:
+    corpus = svc.read_project(USER, task)["pipeline"]["corpus"]
+    assert corpus["urls"] == [canonicalize("https://good1.example/a")]
+    art = svc.read_artifact(USER, task, artifact_id="corpus.md")
+    assert "good1" in art["content"]
+
+
 async def test_discover_normal_path_exactly_one_llm(env, monkeypatch):
     svc, task, rid = await _task(env, title="health effects of tomatoes")
     fetched: list[str] = []

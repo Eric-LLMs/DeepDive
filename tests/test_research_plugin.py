@@ -3664,3 +3664,171 @@ class TestResearchMaterials:
         assert "fetch_materials" in svc.get_handoff(USER, with_mat)["materials_hint"]
         assert "materials_hint" not in svc.get_handoff(USER, no_mat)
 
+    # ── the live materials/ FOLDER is the truth (users swap files between runs) ─
+    async def test_live_folder_swap_outruns_stale_create_table(self, env):
+        # Run-6 failure mode: the create-time table froze 18 asset ids; the user
+        # deleted them and dropped new files — every fetch died "asset not found".
+        svc = self._svc(env)
+        a = await env.drive.save_artifact(
+            USER, name="old.md", mime_type="text/markdown", content=self._md("old", 8).encode()
+        )
+        created = await svc.create_task(USER, title="swap", material_asset_ids=[str(a.id)])
+        task_id = created["task_id"]
+        project = svc._load_project(USER, task_id)
+        stale_ca = project["materials"][0]["cloud_asset_id"]
+        cloud_root = project["cloud_folder_path"]
+        # User swaps the folder contents BEFORE this run starts.
+        await env.drive.delete_asset(USER, uuid.UUID(stale_ca))
+        new = await env.drive.save_artifact(
+            USER, name="new.md", mime_type="text/markdown",
+            content=self._md("new", 8).encode(),
+            folder_path=f"{cloud_root}/materials",
+        )
+        svc.begin_run(USER, task_id)
+        res = await svc.fetch_materials(USER, task_id)
+        assert res["fetched"] == 1 and res["skipped"] == []
+        cu = res["results"][0]["canonical_url"]
+        assert str(new.id) in cu and stale_ca not in cu
+        # The确权 table reseats to the live set, so read_fetch accepts the new material.
+        table = {r["cloud_asset_id"] for r in svc._load_project(USER, task_id)["materials"]}
+        assert table == {str(new.id)}
+        view = await svc.read_fetch(USER, task_id, canonical_url=cu)
+        assert "material new" in view["content"]
+
+    async def test_live_folder_emptied_reports_no_materials(self, env):
+        # Deleted everything, dropped nothing: a clean "no materials", never an
+        # asset-not-found skip storm from stale table ids.
+        svc, task_id = await self._task_with(env, [("a.md", self._md("a", 8).encode())])
+        await svc.fetch_materials(USER, task_id)
+        for r in svc._load_project(USER, task_id)["materials"]:
+            await env.drive.delete_asset(USER, uuid.UUID(r["cloud_asset_id"]))
+        res = await svc.fetch_materials(USER, task_id)
+        assert res["fetched"] == 0 and res["skipped"] == []
+        assert res["reason"] == "no materials attached to this task"
+        assert svc._load_project(USER, task_id)["materials"] == []
+
+
+# ── 10. Stage-as-transaction: node-entry checkpoints + begin_run restart ──────
+class TestStageNodeCheckpoint:
+    """A stage commits ONLY by advancing; begin_run re-enters the CURRENT stage from
+    its entry snapshot — a half-done node (stop or crash) restarts as if never run,
+    while every completed upstream node's state stands."""
+
+    @staticmethod
+    def _svc(env) -> ResearchService:
+        return ResearchService(env.drive, env.scratch)
+
+    @staticmethod
+    def _graph(env, task_id: str) -> dict:
+        return ResearchService._load_json(
+            env.scratch / str(USER) / task_id / "graph.json", {"nodes": [], "edges": []}
+        )
+
+    async def test_begin_run_rolls_graph_back_to_stage_entry(self, env):
+        svc = self._svc(env)
+        task_id = (await svc.create_task(USER, title="ckpt"))["task_id"]
+        svc.begin_run(USER, task_id)
+        svc.record_node(USER, task_id, node={"id": "n1", "type": "Source", "label": "1"})
+        assert svc.transition_stage(USER, task_id, target="FRAME")["transition"] == "ADVANCED"
+        assert svc.transition_stage(USER, task_id, target="EVIDENCE")["transition"] == "ADVANCED"
+        # Half-done work inside EVIDENCE: must not survive a restart of the node.
+        svc.record_node(USER, task_id, node={"id": "n2", "type": "Claim", "label": "2"})
+        svc.end_run(USER, task_id)
+        svc.begin_run(USER, task_id)
+        ids = [n["id"] for n in self._graph(env, task_id)["nodes"]]
+        assert ids == ["n1"]
+
+    async def test_completed_upstream_state_survives_restart(self, env):
+        # Restarting DESIGN never rewinds nodes recorded in earlier, completed stages.
+        svc = self._svc(env)
+        task_id = (await svc.create_task(USER, title="ckpt2"))["task_id"]
+        svc.begin_run(USER, task_id)
+        svc.record_node(USER, task_id, node={"id": "n1", "type": "Source", "label": "1"})
+        assert svc.transition_stage(USER, task_id, target="FRAME")["granted"]
+        svc.record_node(USER, task_id, node={"id": "n2", "type": "Claim", "label": "2"})
+        assert svc.transition_stage(USER, task_id, target="EVIDENCE")["granted"]
+        svc.record_node(USER, task_id, node={"id": "n3", "type": "Source", "label": "3"})
+        assert svc.transition_stage(USER, task_id, target="DESIGN")["granted"]
+        svc.record_node(USER, task_id, node={"id": "n4", "type": "Claim", "label": "4"})
+        svc.end_run(USER, task_id)
+        svc.begin_run(USER, task_id)
+        ids = [n["id"] for n in self._graph(env, task_id)["nodes"]]
+        assert ids == ["n1", "n2", "n3"]
+
+    async def test_gates_beyond_current_stage_unrun_on_restart(self, env):
+        svc = self._svc(env)
+        task_id = (await svc.create_task(USER, title="gates"))["task_id"]
+
+        def seed(p: dict) -> None:
+            p["stage"] = "EXPLAIN"
+            p["gates"] = {
+                "DESIGN_GATE": "PASS", "EVIDENCE_GATE": "OVERRIDE",
+                "CLAIM_GATE": "PASS", "QUALITY_GATE": "PASS",
+            }
+
+        svc.atomic_update_project(USER, task_id, seed)
+        # A real EXECUTE->EXPLAIN ADVANCED would have written this entry snapshot.
+        svc._write_stage_snapshot(USER, task_id, "EXPLAIN")
+        svc.begin_run(USER, task_id)
+        gates = svc._load_project(USER, task_id)["gates"]
+        # EVIDENCE_GATE guards ENTRY into the current stage (its closure belongs to
+        # the completed EXECUTE node) -> preserved across the restart.
+        assert gates["EVIDENCE_GATE"] == "OVERRIDE"
+        assert gates["DESIGN_GATE"] == "PASS"  # guards EXECUTE entry: upstream, stands
+        # Gates guarding LATER transitions must be re-earned by this re-run node.
+        assert gates["CLAIM_GATE"] == "NOT_RUN"
+        assert gates["QUALITY_GATE"] == "NOT_RUN"
+
+    async def test_legacy_task_without_snapshot_adopts_current_state(self, env):
+        import shutil
+
+        svc = self._svc(env)
+        task_id = (await svc.create_task(USER, title="legacy"))["task_id"]
+        svc.record_node(USER, task_id, node={"id": "n1", "type": "Source", "label": "1"})
+        shutil.rmtree(env.scratch / str(USER) / task_id / "snapshots")
+        svc.begin_run(USER, task_id)
+        # Adopting the new semantics mid-flight never destroys existing work: the
+        # CURRENT state becomes this node's entry point.
+        ids = [n["id"] for n in self._graph(env, task_id)["nodes"]]
+        assert ids == ["n1"]
+        assert (env.scratch / str(USER) / task_id / "snapshots" / "DISCOVER.json").exists()
+
+
+# ── 11. Durable rename: transient sharing violations must not doom a run ──────
+def test_save_json_retries_transient_permission(tmp_path, monkeypatch):
+    import plugins.research.plugin as rp
+
+    calls = {"replace": 0, "sleep": 0}
+    real_replace = rp.os.replace
+
+    def _flaky(src, dst, *a, **kw):
+        calls["replace"] += 1
+        if calls["replace"] == 1:
+            raise PermissionError(13, "Permission denied", str(dst))
+        return real_replace(src, dst, *a, **kw)
+
+    def _no_sleep(_s):
+        calls["sleep"] += 1
+
+    monkeypatch.setattr(rp.os, "replace", _flaky)
+    monkeypatch.setattr(rp.time, "sleep", _no_sleep)
+    path = tmp_path / "proj" / "project.json"
+    ResearchService._save_json(path, {"ok": 1})
+    assert calls == {"replace": 2, "sleep": 1}
+    assert json.loads(path.read_text(encoding="utf-8")) == {"ok": 1}
+
+
+def test_save_json_reraises_after_retry_window_exhausted(tmp_path, monkeypatch):
+    import plugins.research.plugin as rp
+
+    def _always_busy(src, dst, *a, **kw):
+        raise PermissionError(13, "Permission denied", str(dst))
+
+    monkeypatch.setattr(rp.os, "replace", _always_busy)
+    monkeypatch.setattr(rp.time, "sleep", lambda _s: None)
+    path = tmp_path / "project.json"
+    with pytest.raises(PermissionError):
+        ResearchService._save_json(path, {"ok": 1})
+    # The durable tmp is left on disk for forensics (the rename never consumed it).
+    assert path.with_suffix(path.suffix + ".tmp").exists()
+
