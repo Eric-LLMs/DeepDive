@@ -2811,7 +2811,7 @@ in the package.
 ### 19.1 Layering and hard rules
 
 ```
-Agent (domain logic)          ← what one "step" of work actually is
+Executor (domain logic)       ← what one "step" of work actually is
   ▲
 Worker (apps/worker)          ← arq jobs; calls the adapter's drive entry once per job
   ▲
