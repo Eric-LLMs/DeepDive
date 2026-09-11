@@ -7,8 +7,11 @@ handed in as data (:class:`IterationFacts`). Priority chain, most-significant fi
 1. ``cancel``     — an external stop always wins, over every other consideration.
 2. ``finished``   — the definition's own success predicate fired (adapter's call).
 3. ``signal``     — the execution is parked on an external condition (WAITING).
-4. ``no-progress``— the brake: consecutive iterations without a visible milestone.
-5. ``turn cap`` / ``spend cap`` — policy-detected inability to continue.
+4. ``structural`` — the adapter declared the run structurally unable to complete
+   (a required deliverable is absent): terminal immediately, FAILED + cause, so
+   the same dead node never rides another iteration.
+5. ``no-progress``— the brake: consecutive iterations without a visible milestone.
+6. ``turn cap`` / ``spend cap`` — policy-detected inability to continue.
 
 Calibration #1 (terminal vocabulary): a cap firing is NOT intrinsically "waiting" — it is
 a policy-detected inability to continue, so the generic outcome is
@@ -38,6 +41,7 @@ CAUSE_PENDING_SIGNAL = "pending_signal"
 CAUSE_NO_PROGRESS = "no_progress"
 CAUSE_TURN_CAP = "turn_cap_exceeded"
 CAUSE_SPEND_CAP = "spend_cap_exceeded"
+CAUSE_STRUCTURAL = "structural_stop"
 
 CAP_REASON = "budget_or_turn_cap_exceeded"
 
@@ -63,6 +67,10 @@ class IterationFacts:
     consecutive_no_progress: int = 0
     index: int = 1
     total_spend: float | None = 0.0
+    # Adapter-computed "the run can never structurally complete" verdict (e.g. a
+    # required deliverable is absent). Fires ONCE, immediately, before the stall
+    # brake and the caps can start a retry carousel over the same dead node.
+    structural_stop: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -115,6 +123,13 @@ class LoopPolicy:
                          f"{facts.pending_signals} external signal(s) awaiting a decision",
                          consecutive)
         new_consecutive = consecutive + 1 if not facts.progress else 0
+        if facts.structural_stop:
+            # Terminal on FIRST occurrence — an honest inability to produce the
+            # deliverable is not a transient fault, so it outranks the counters.
+            return Grade(WorkflowState.FAILED, CAUSE_STRUCTURAL,
+                         "a required structural deliverable is missing "
+                         "(terminal stop, no re-run of the dead iteration)",
+                         new_consecutive)
         if self.caps.max_no_progress and new_consecutive >= self.caps.max_no_progress:
             return Grade(WorkflowState.FAILED, CAUSE_NO_PROGRESS,
                          f"no visible progress across {new_consecutive} consecutive "

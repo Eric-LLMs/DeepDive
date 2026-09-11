@@ -67,6 +67,7 @@ from workflow.policy import (
     CAUSE_NO_PROGRESS,
     CAUSE_PENDING_SIGNAL,
     CAUSE_SPEND_CAP,
+    CAUSE_STRUCTURAL,
     CAUSE_TURN_CAP,
     IterationFacts,
     LoopCaps,
@@ -210,6 +211,7 @@ class TurnFacts:
     max_turns: int | None = None
     max_no_progress: int | None = None
     max_cost_usd: float | None = None
+    structural_stop: bool = False   # adapter-declared inability to complete honestly
 
 
 @dataclass
@@ -231,6 +233,10 @@ _GRADE_CAUSE_TO_RUN: dict[str, RunState] = {
     CAUSE_NO_PROGRESS: RunState.STALLED,
     CAUSE_TURN_CAP: RunState.BLOCKED,
     CAUSE_SPEND_CAP: RunState.BLOCKED,
+    # Structural absence (no honest draft / no promotable artifact) is a FIRST-AND-
+    # ONLY terminal stop parked on the human who must supply the missing input —
+    # never an in-place retry of the dead node (sealed-spec ruling #1).
+    CAUSE_STRUCTURAL: RunState.BLOCKED,
 }
 
 
@@ -249,6 +255,12 @@ def _research_stop_text(cause: str, facts: TurnFacts, consecutive: int) -> str:
         )
     if cause == CAUSE_TURN_CAP:
         return f"reached the auto-run turn cap ({facts.max_turns} turns)"
+    if cause == CAUSE_STRUCTURAL:
+        return (
+            "blocked on a structural stop — a required deliverable is missing at "
+            f"{facts.stage} (see the pipeline failure ledger; the run ended on the "
+            "first occurrence, the dead node was not re-run)"
+        )
     return f"reached the auto-run cost cap (${facts.cumulative_cost_usd:.4f})"
 
 
@@ -289,6 +301,7 @@ def grade_turn(facts: TurnFacts) -> Grade:
         consecutive_no_progress=facts.consecutive_no_progress,
         index=facts.turn_index,
         total_spend=facts.cumulative_cost_usd,
+        structural_stop=facts.structural_stop,
     ))
     if grade.state is None:
         return Grade(None, None, grade.consecutive_no_progress)
@@ -1224,10 +1237,18 @@ class ResearchRunDriver:
             pending = len(service.pending_overrides(owner_id, task_id))
             facts_box["stage"] = fresh.get("stage", "DISCOVER")
             facts_box["pending"] = pending
+            # Pipeline structural stop: written by run_node on the FIRST honest
+            # inability to produce a required deliverable. It suppresses the
+            # success predicate (arriving at PUBLISH without a promotable report
+            # is NOT finished) and terminates the run in the same grading pass.
+            structural = bool((fresh.get("pipeline") or {}).get("structural_stop"))
             return {
-                "finished": fresh.get("stage", "DISCOVER") == "PUBLISH",
+                "finished": (
+                    fresh.get("stage", "DISCOVER") == "PUBLISH" and not structural
+                ),
                 "pending_signals": pending,
                 "cancel_requested": False,  # the core ORs the fresh lease ledger itself
+                "structural_stop": structural,
             }
 
         def compose_prompt(req, attempt) -> str:
@@ -1410,6 +1431,7 @@ class ResearchRunDriver:
             if (
                 state in (RunState.STALLED, RunState.BLOCKED)
                 and out.cause != CAUSE_PENDING_SIGNAL
+                and out.cause != CAUSE_STRUCTURAL
                 and facts_box["pending"] == 0
             ):
                 settled = await self._try_settle(
