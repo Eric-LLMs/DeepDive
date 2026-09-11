@@ -84,6 +84,11 @@
   - [19.8 drive_iteration — per-job choreography](#198-drive_iteration--per-job-choreography)
   - [19.9 Definition and fingerprint — drift detection](#199-definition-and-fingerprint--drift-detection)
   - [19.10 The research adapter](#1910-the-research-adapter)
+- [20. Research Execution: From Agent-Driven Control Flow to a Deterministic Pipeline](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline)
+  - [20.1 Context & Motivation](#201-context--motivation)
+  - [20.2 Architectural Decisions](#202-architectural-decisions)
+  - [20.3 Architectural Benefits](#203-architectural-benefits)
+  - [20.4 Summary](#204-summary)
 
 [↑ Back to top](#table-of-contents)
 
@@ -3169,9 +3174,9 @@ re-exports, so older import sites keep working without duplicating logic.
 |---|---|
 | Definition / states | `workflow_spec` mirrors the DAG's `_LEGAL_NEXT` parity table — an import-time + parity-tested check keeps the spec and the domain state machine from diverging |
 | `LeaseStore` | `ResearchLeaseStore` — folds the lease into the existing `active_run` + driver checkpoint, committed by the portalocker `project_revision` CAS; the fence asserts of §19.3 guard the domain writes on the same identity |
-| `Executor` binding | spec activity `auto_turn` → logical id `research-agent-kernel`; the adapter builds a `MappingRegistry` binding that id to `_RunTurnExecutor`, which wraps **one agent-kernel turn** behind an injected `pre_gate` callable — the cost hard gate, raised at the turn seam *before* the turn starts — and the prompt rides in `TaskRequest` (opaque to the core), and the per-turn LLM step cap is runtime config (`research_driver_turn_max_steps = 25` for auto-drive vs the interactive default of 5), never part of the spec |
+| `Executor` binding | spec activity `auto_turn` → logical id `research-pipeline`; the adapter builds a `MappingRegistry` binding that id to `_RunTurnExecutor`, which wraps **one pipeline node execution** (`pipeline.run_node`) behind an injected `pre_gate` callable — the cost hard gate, raised at the turn seam *before* the turn starts — and the prompt rides in `TaskRequest` (opaque to the core); the auto-run never constructs the agent kernel (see [§20](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline)) |
 | `ProgressProbe` | `_ResearchProgressProbe` — stage / gate milestone diff: progress means the run moved a phase or cleared a gate, not token churn |
-| `business_facts` | `finished` = the task reached PUBLISH; `pending_signals` = open gate overrides awaiting review → `WAITING` park; human approval of an override starts a *new* execution from `IDLE` |
+| `business_facts` | `finished` = the task reached PUBLISH **and** the PUBLISH node recorded an honest promotion (`pipeline.publish.status == "PROMOTED"`) — arriving at the stage alone is never a fake finish; `pending_signals` = open gate overrides awaiting review → `WAITING` park; human approval of an override starts a *new* execution from `IDLE` |
 | `TerminalHook` | the **progressive mode** mechanism: an about-to-`FAILED` gate iteration is rewritten to continue (a replacement grade with `state None` — gap recorded honestly, run auto-settles forward), plus `build_settle_report` finalization at terminal — this is why progressive runs reach PUBLISH with disclosed gaps instead of deadlocking |
 | Grade vocabulary | `grade_turn` re-expresses the domain gate/stage outcomes onto the core's `Grade` / `CAUSE_*` codes |
 | Choreography | `research_drive` runs exactly one `drive_iteration` per arq job and schedules the next on `continue` |
@@ -3181,5 +3186,131 @@ The net effect for the user-visible behavior described in [§17](#17-research-os
 stall recovery, double-run prevention, cooperative cancellation, strict-vs-progressive gate
 handling, and honest cap failures all come from this core — §17's Run-lifecycle paragraph
 reports only their research-level consequences.
+
+[↑ Back to top](#table-of-contents)
+
+## 20. Research Execution: From Agent-Driven Control Flow to a Deterministic Pipeline
+
+> **Design-decision record.** This section preserves *why* the research auto-run is a
+> deterministic Python pipeline with the LLM confined to semantic work — so the rationale
+> stays available when the design is reviewed, extended, or challenged later.
+
+### 20.1 Context & Motivation
+
+Early iterations of the Research subsystem relied on a generic, ReAct-style agent loop for
+autonomous execution. The LLM was simultaneously responsible for global workflow
+orchestration, tool routing, and domain-level semantic reasoning. In a multi-stage
+(10-stage) research lifecycle, this approach introduced three fundamental engineering
+problems:
+
+* **Unstable Control Flow and Runaway Loops:** Delegating macro-level stage transitions to
+  probabilistic models frequently caused circular retries, hallucinated stage skips, and
+  non-deterministic state machine transitions, leading to erratic latency and runaway token
+  costs.
+* **Inefficiency for Deterministic Operations:** LLMs are inherently less reliable and
+  significantly slower than native code when executing strictly deterministic operations such
+  as deduplication, schema validation, authorization checks, and state persistence.
+* **Unbounded Costs and Failure Boundaries:** Hidden internal LLM calls inside tool
+  implementations and unrestricted retry logic broke cost predictability and made
+  deterministic failure handling impossible.
+
+The research execution lifecycle has a well-defined topological order. Its stage transitions
+follow an invariant dependency structure and do not require probabilistic decision-making by
+an LLM.
+
+> **Core Architectural Principle:** Research is not about eliminating LLMs; it is about
+> strictly constraining their responsibilities. The Python orchestration layer governs
+> deterministic control flow and mechanical execution, while the LLM is reserved strictly for
+> high-density semantic inference, causal reasoning, and synthesis.
+
+### 20.2 Architectural Decisions
+
+#### 20.2.1 Deterministic Control Plane
+
+* **Stage-Contract-Driven Orchestration:** The overall workflow is driven by the Python
+  orchestration layer according to a predefined sequence of explicit Stage Contracts. The LLM
+  has zero authority over workflow control or stage transitions:
+  `DISCOVER` → `FRAME` → `EVIDENCE` → `DESIGN` → `EXECUTE` → `EXPLAIN` → `WRITE` → `REVIEW` →
+  `REPRODUCE` → `PUBLISH`
+* **Bounded Attempt Model:** Every node adheres strictly to a bounded execution and
+  remediation model: `Attempt 1` → `Validation` → `Attempt 2 (Repair-Once)`
+  * **Constrained Repair Scope:** Attempt 2 is strictly limited to fixing structural,
+    formatting, and schema-level errors. It must not rerun full semantic analysis, execute
+    external queries, or expand prompt context.
+  * **Immediate Terminal Halts (`StructuralStop`):** If a fatal structural precondition is
+    violated (e.g., an empty corpus, a missing research question, or the absence of a valid
+    draft), the pipeline immediately halts in the `BLOCKED` terminal state. Unrecoverable
+    failures are never retried.
+  * **Honest Degradation via `failure_ledger`:** Non-critical defects and unresolvable
+    repairs are recorded in the structured `failure_ledger`. The pipeline continues
+    downstream with explicit degradation markers rather than fabricating false-positive
+    passes.
+  * **Hard Publication Gate:** The `PUBLISH` stage deterministically verifies the state and
+    integrity of generated assets. Publication is blocked unless the current run has a valid
+    primary artifact and that artifact has been successfully promoted. The success predicate
+    is gated on this stage's own promotion record — merely *arriving* at the PUBLISH stage is
+    never treated as finished.
+
+#### 20.2.2 Separation of Semantic vs. Deterministic Concerns
+
+The deterministic pipeline unburdens the LLM from workflow coordination, focusing model
+capacity strictly where semantic reasoning adds genuine value.
+
+> **Abstraction Boundaries:** Stage, Skill, Tool, and LLM have distinct responsibilities: a
+> **Stage** defines workflow control and lifecycle boundaries; a **Skill** provides domain
+> methodology and instructions; a **Tool** performs a concrete business or external action;
+> and the **LLM** performs semantic reasoning or generation where deterministic code is
+> insufficient.
+
+* **LLM Responsibilities (Semantic Inference & Synthesis):**
+  * Research topic / candidate-source triage and question formulation (`DISCOVER` / `FRAME`)
+  * Batch evidence adjudication across heterogeneous sources (`EVIDENCE`)
+  * Two-pass action planning and execution summary (`EXECUTE`)
+  * Causal and counterfactual reasoning (`EXPLAIN`)
+  * Multi-source report synthesis (`WRITE`; the only stage with extended reasoning enabled)
+  * Semantic and factual consistency review (`REVIEW`; structured patch generation only)
+* **Python Responsibilities (Deterministic Tooling & Infrastructure):**
+  * **Ingestion:** Concurrent fan-out across Web, Social, RAG, and Materials channels,
+    per-channel micro-timeouts, content hashing, deduplication, and chunking.
+  * **State & Isolation:** Strict schema validation of every model reply, F2 fence/lease
+    checks to eliminate zombie writes, and atomic persistence.
+  * **Deterministic Patching:** Exact `expected_old` matching to ensure that each patch
+    target resolves to exactly one location, eliminating ambiguous or fuzzy replacements.
+  * **Audit Trails:** Generating deterministic, idempotent `execution_id` values and
+    append-only execution audit records.
+  * **Zero-LLM Stages:** `REPRODUCE` (a pure-code integrity audit of the primary report, its
+    on-disk edition, and the settled execution chain) and `PUBLISH` (asset verification and
+    state finalization) execute with **0 LLM calls**.
+
+#### 20.2.3 Centralized Gate & Budget Enforcement
+
+* **Single Ingress (`llm_gate`):** Every model invocation across the entire research
+  runtime — including internal utilities like evidence adjudication and review — must
+  transit through `llm_gate`. Hidden direct calls and implicit recursive sub-agent loops are
+  eliminated by construction.
+* **Pre-Transport Budget Cutoff:** A global ceiling (default: `$0.40 USD`) is enforced. When
+  cumulative spend reaches the configured ceiling, `CostLimitExceeded` is raised before the
+  next request is sent to the model transport layer, guaranteeing that no further outbound
+  requests are dispatched.
+
+### 20.3 Architectural Benefits
+
+* **Predictable Latency & Costs:** Eliminating trial-and-error agent loops significantly
+  reduces token waste, making end-to-end latency, execution costs, and failure boundaries
+  substantially more predictable.
+* **Deterministic Traceability:** State transitions are idempotent and replayable. Every
+  stage produces verifiable audit records and structured ledger entries that can be asserted
+  deterministically in integration test suites.
+* **Clean Separation of Execution Models:** Interactive chat continues to utilize
+  `ReactLoopAgent` for open-ended exploration, while the automated research pipeline operates
+  as a deterministic state machine. This is an intentional architectural split rather than a
+  limitation of the shared runtime: Research requires deterministic, auditable execution,
+  while Chat benefits from open-ended, adaptive agent behavior.
+
+### 20.4 Summary
+
+Research uses Workflow/Pipeline to control deterministic execution, native code to perform
+deterministic work, and LLMs only for non-trivial semantic reasoning and generation. Chat
+continues to use the Agent Loop for open-ended interaction.
 
 [↑ Back to top](#table-of-contents)
