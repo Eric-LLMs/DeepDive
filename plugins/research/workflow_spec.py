@@ -30,10 +30,14 @@ _STAGE_CHAIN: dict[str, str | None] = {
     "PUBLISH": None,  # terminal
 }
 
-# The one activity the auto-run flow executes; the agent kernel behind this logical
-# id does all reasoning — the workflow only ever decides WHEN a turn runs, never HOW.
+# The one activity the auto-run flow executes. The executor behind this logical
+# id is now the CODE-DRIVEN PIPELINE (:mod:`plugins.research.pipeline`): one
+# declared-budget stage node per iteration (Python prep → gated LLM decisions →
+# ledger + force advance). The agent ReAct kernel serves the interactive Chat
+# path only — the auto-run flow no longer executes it, which is what the
+# pipeline refactor's definition change (and fingerprint bump) declares.
 AUTO_TURN_TASK = "auto_turn"
-RESEARCH_EXECUTOR_ID = "research-agent-kernel"
+RESEARCH_EXECUTOR_ID = "research-pipeline"
 
 
 class ResearchWorkflow:

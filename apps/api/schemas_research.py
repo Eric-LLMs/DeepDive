@@ -18,7 +18,10 @@ class TaskCreateRequest(BaseModel):
     # The cloud-drive working directory (My Drive) the task folder lands in; empty = root.
     parent_folder_path: str = Field(default="", max_length=500)
     material_asset_ids: list[str] = Field(default_factory=list, max_length=20)
-    # Execution control-flow mode: 'strict' (default) or 'progressive'. The agent reads it at
+    # Execution control-flow mode: 'progressive' (default) or 'strict'. The agent reads it at
     # resume; progressive records gate-FAIL diagnostics into project['diagnostics'] and lets
     # the stage advance (nothing parks on a human override), strict blocks on a failed gate.
-    execution_mode: Literal["strict", "progressive"] = "strict"
+    # The auto-run is now the code-driven pipeline, whose doctrine is degrade-honestly-and-
+    # advance (failure ledger + force advance; structural inability terminalizes via
+    # StructuralStop), so the entry default is 'progressive'; strict remains selectable.
+    execution_mode: Literal["strict", "progressive"] = "progressive"

@@ -67,7 +67,7 @@ class IterationFacts:
     consecutive_no_progress: int = 0
     index: int = 1
     total_spend: float | None = 0.0
-    # Adapter-computed "the run can never structurally complete" verdict (e.g. a
+    # Adapter-computed "the run can never structurally complete" signal (e.g. a
     # required deliverable is absent). Fires ONCE, immediately, before the stall
     # brake and the caps can start a retry carousel over the same dead node.
     structural_stop: bool = False

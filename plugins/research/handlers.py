@@ -1,4 +1,23 @@
-"""Batch-1 business handlers: DISCOVER / FRAME / EVIDENCE (sealed spec).
+"""Batch 1+2+3 business handlers: DISCOVER … PUBLISH (sealed spec).
+
+Batch 3 (REVIEW / REPRODUCE / PUBLISH) closes the chain:
+
+* **REVIEW** delegates its ENTIRE LLM throughput to the service's
+  ``review_draft`` closure (thinking OFF) riding this stage's gate: one
+  reviewer call + one format-only repair (input = broken patch + the parse
+  error, never context expansion). The patch-application physical lock
+  (expected_old unique match == 1 inside the target) lives inside that
+  closure. Tri-state outcome: clean → ``pass``, committed corrections →
+  ``pass(after_fix)``, rejected/unparseable patch → ``review_incomplete``
+  ledger line + honest advance — an UNREVIEWED edition is a quality gap,
+  never a faked pass and never a pipeline blocker.
+* **REPRODUCE** verifies artifact + audit integrity in PURE Python: the
+  declared budget is 0 calls, so even a hypothetical straggler completion
+  would hit the gate ceiling before the transport.
+* **PUBLISH** is the terminal hard gate, 0 LLM: it verifies the current
+  run's primary report (bound, current-edition, non-empty content) and
+  promotes it. No legitimate substance → StructuralStop → BLOCKED; the
+  gate never disguises an empty hand as a finished run.
 
 One node, one honest attempt. The hard budget line each handler must honor:
 
@@ -29,6 +48,7 @@ from typing import Any, Awaitable, Callable
 from core.infrastructure.web_fetch import canonical_url as canonicalize
 
 from plugins.research.pipeline import (
+    CONTRACTS,
     DegradedDecision,
     NodeCtx,
     StructuralStop,
@@ -855,5 +875,215 @@ async def node_write(ctx: NodeCtx) -> None:
     def _persist(p: dict) -> None:
         p.setdefault("pipeline", {})["write"] = {
             "artifact": "report.md", "title": title, "chars": len(md),
+        }
+    ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
+
+
+# ═════════════════════════════ REVIEW (thinking OFF, tri-state + physical lock) ═
+
+@register_handler("REVIEW")
+async def node_review(ctx: NodeCtx) -> None:
+    """Zero own completions: the node's ENTIRE LLM throughput is the service's
+    ``review_draft`` closure (reviewer + single format-only repair), riding this
+    stage's gate. The unique-match patch lock (expected_old count == 1 inside
+    the target) is enforced inside that closure — all-or-nothing staging.
+
+    Tri-state verdict, mapped honestly:
+      1. no corrections                -> ``pass``
+      2. corrections applied & committed -> ``pass(after_fix)``
+      3. patch rejected / invalid twice -> ``review_incomplete``: a
+         ``degraded_decision`` ledger line + honest advance (the published
+         edition is UNREVIEWED — constraint #3 forbids faking a pass, and
+         an unreviewed report is a quality gap, not a structural absence).
+    """
+    primary = (ctx.project.get("primary_report_artifact_id") or "").strip()
+    if not primary:
+        # No deliverable at all by the time REVIEW opens: G1 physically blocks
+        # WRITE->REVIEW, so reaching here means state corruption, not a quality
+        # gap — there is nothing an honest advance could carry forward.
+        raise StructuralStop("REVIEW", "report", "no primary report bound to review")
+
+    try:
+        res = await ctx.service.review_draft(
+            ctx.owner_id, ctx.project_id, artifact_id=primary, llm_gate=ctx.gate,
+        )
+    except RuntimeError as exc:
+        # review_draft's honest "nothing was written" outcome: rejected patch
+        # rows or two invalid replies. Degrade + advance; never retry the stage.
+        ctx.record(attempt=2, error_class="degraded_decision",
+                   detail=f"review_incomplete: {exc}"[:500],
+                   impact="report stays UNREVIEWED; published edition carries no "
+                          "reviewer corrections")
+        status, verdict = "unreviewed", "review_incomplete"
+        new_version = None
+        changes = 0
+        res: dict = {}
+    else:
+        new_version = res.get("new_version")
+        changes = int(res.get("changes_applied") or 0)
+        if new_version:
+            status, verdict = "pass_after_fix", f"pass(after_fix): v{new_version}"
+        else:
+            status, verdict = "pass", "pass: no corrections required"
+
+    def _persist(p: dict) -> None:
+        p.setdefault("pipeline", {})["review"] = {
+            "status": status, "verdict": verdict, "artifact": primary,
+            "base_version": res.get("base_version"),
+            "new_version": new_version, "changes_applied": changes,
+            "llm_calls": CONTRACTS["REVIEW"].llm_calls - ctx.gate.remaining,
+        }
+    ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
+
+
+# ═════════════════════════════ REPRODUCE (pure Python, 0 LLM declared) ═════════
+
+@register_handler("REPRODUCE")
+async def node_reproduce(ctx: NodeCtx) -> None:
+    """Artifact + audit integrity verification — 100% Python. The declared
+    budget is ZERO calls: the stage gate would cut off any hypothetical
+    completion before the transport, and this handler never even touches it."""
+    project = ctx.service.read_project(ctx.owner_id, ctx.project_id)
+    pipe = project.get("pipeline") or {}
+    primary = (project.get("primary_report_artifact_id") or "").strip()
+
+    checks: list[dict] = []
+
+    def _check(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail[:300]})
+        if not ok:
+            ctx.record(attempt=1, error_class="handler_error",
+                       detail=f"integrity: {name}: {detail}"[:500],
+                       impact=f"reproducibility record incomplete at {name}")
+
+    # 1. the deliverable exists and belongs to THIS run edition (G3 tag).
+    record: dict | None = None
+    if primary:
+        try:
+            d = ctx.service._artifact_dir(ctx.owner_id, ctx.project_id, primary)
+            versions = sorted(
+                (int(p.name[1:]) for p in d.glob("v*") if p.name[1:].isdigit()),
+            )
+            if versions:
+                record = ctx.service._artifact(
+                    ctx.owner_id, ctx.project_id, primary, versions[-1],
+                )
+        except Exception:  # noqa: BLE001 — absence is a failed check, not a crash
+            record = None
+    _check("primary_report_bound", bool(primary), f"primary={primary!r}")
+    _check("report_version_on_disk", record is not None,
+           "no artifact version found" if record is None else "")
+    _check("report_edition_matches",
+           record is not None and not ctx.service._is_ghost_run_seq(
+               record.get("run_seq"), project.get("run_seq")),
+           "" if record is not None else "no record to compare")
+    _check("report_content_non_empty",
+           bool((record or {}).get("content", "").strip()),
+           "latest version carries empty content")
+
+    # 2. the audit chain finished: no execution row left RUNNING mid-flight.
+    execs = ctx.service._load_json(
+        ctx.service._project_dir(ctx.owner_id, ctx.project_id) / "executions.json",
+        {"executions": []},
+    ).get("executions") or []
+    unfinished = [
+        r.get("tool", "?") for r in execs
+        if isinstance(r, dict) and str(r.get("status") or "").upper() == "RUNNING"
+    ]
+    _check("audit_chain_settled", not unfinished,
+           f"running executions: {unfinished[:5]}")
+
+    # 3. the REVIEW verdict was honestly recorded (pass or unreviewed — either
+    #    way an attempt exists; a silent skip is the integrity fault).
+    review = pipe.get("review") or {}
+    _check("review_attempt_recorded", bool(review.get("status")),
+           "pipeline.review missing — REVIEW never reported a verdict")
+
+    body = (
+        "# Reproduction record\n\n"
+        "Deterministic integrity audit of the research chain (0 LLM).\n\n"
+        + "".join(
+            f"- [{'x' if c['ok'] else ' '}] {c['name']}"
+            + (f" — {c['detail']}" if c["detail"] and not c["ok"] else "") + "\n"
+            for c in checks
+        )
+        + f"\nExecutions audited: {len(execs)}\n"
+        + f"Known gaps carried: {len(pipe.get('known_gaps') or [])}\n"
+        + f"Failure ledger lines: {len(pipe.get('failure_ledger') or [])}\n"
+    )
+    await ctx.service.write_scratch(
+        ctx.owner_id, ctx.project_id, artifact_id="reproduce.md", content=body,
+        idempotency_key=f"pipeline:REPRODUCE:{ctx.facts.get('run_id')}:{ctx.facts.get('turn_index')}",
+    )
+
+    def _persist(p: dict) -> None:
+        p.setdefault("pipeline", {})["reproduce"] = {
+            "checks": checks, "executions": len(execs),
+        }
+    ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
+
+
+# ═════════════════════════════ PUBLISH (terminal hard gate, 0 LLM) ══════════════
+
+@register_handler("PUBLISH")
+async def node_publish(ctx: NodeCtx) -> None:
+    """The absolute terminal gate (constraint #3): pure Python verification of
+    the run's substance, then the drive promotion. A legitimate, promotable
+    primary report -> promoted (the framework then leaves the chain finished);
+    anything less -> StructuralStop -> BLOCKED. Missing substance is NEVER
+    disguised — the gate's whole purpose is that an empty hand cannot pass."""
+    project = ctx.service.read_project(ctx.owner_id, ctx.project_id)
+    primary = (project.get("primary_report_artifact_id") or "").strip()
+
+    def _stop(detail: str) -> StructuralStop:
+        return StructuralStop("PUBLISH", "promoted_artifact", detail)
+
+    if not primary:
+        raise _stop("no primary report bound — nothing was ever written to publish")
+
+    record: dict | None = None
+    try:
+        d = ctx.service._artifact_dir(ctx.owner_id, ctx.project_id, primary)
+        versions = sorted(
+            (int(p.name[1:]) for p in d.glob("v*") if p.name[1:].isdigit()),
+        )
+        if versions:
+            record = ctx.service._artifact(ctx.owner_id, ctx.project_id, primary, versions[-1])
+    except Exception:  # noqa: BLE001 — a missing tree is a stop, not a crash
+        record = None
+    if record is None or not (record.get("content") or "").strip():
+        raise _stop(f"'{primary}' has no version with real content on disk")
+    if ctx.service._is_ghost_run_seq(record.get("run_seq"), project.get("run_seq")):
+        raise _stop(
+            f"'{primary}' v{record.get('version')} is a ghost (run_seq="
+            f"{record.get('run_seq')} != {project.get('run_seq')}) — a stale "
+            "cross-edition report must never be published as this run's output"
+        )
+
+    try:
+        view = await ctx.service.promote_to_drive(
+            ctx.owner_id, ctx.project_id, artifact_id=primary,
+            promote_idempotency_key=f"research:{ctx.project_id}:{primary}:{record.get('version')}",
+        )
+    except ValueError as exc:
+        # promote_to_drive's honest refusals (no content / ghost / drive-side
+        # pre-check): still no promotable substance — terminal, never disguised.
+        raise _stop(f"promotion refused: {exc}") from exc
+
+    if view.get("status") != "PROMOTED" or not view.get("drive_asset_id"):
+        raise _stop(
+            f"promotion returned no promoted identity (status={view.get('status')!r}, "
+            f"drive_asset_id={view.get('drive_asset_id')!r})"
+        )
+
+    def _persist(p: dict) -> None:
+        p.setdefault("pipeline", {})["publish"] = {
+            "status": "PROMOTED",
+            "artifact": view.get("artifact_id"),
+            "version": view.get("version"),
+            "drive_asset_id": view.get("drive_asset_id"),
+            "drive_path": view.get("drive_path"),
+            "rag_status": view.get("rag_status"),
+            "idempotent": bool(view.get("idempotent")),
         }
     ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)

@@ -1242,9 +1242,17 @@ class ResearchRunDriver:
             # success predicate (arriving at PUBLISH without a promotable report
             # is NOT finished) and terminates the run in the same grading pass.
             structural = bool((fresh.get("pipeline") or {}).get("structural_stop"))
+            pipe = fresh.get("pipeline") or {}
+            # A pipeline-managed run is only FINISHED once the PUBLISH node's own
+            # deterministic hard gate has recorded an honest promotion. Arriving at
+            # the stage is NOT completion — never a fake PUBLISH. Projects that
+            # never ran the pipeline (no block) keep the historical predicate.
+            publish_settled = (pipe.get("publish") or {}).get("status") == "PROMOTED"
             return {
                 "finished": (
-                    fresh.get("stage", "DISCOVER") == "PUBLISH" and not structural
+                    fresh.get("stage", "DISCOVER") == "PUBLISH"
+                    and not structural
+                    and (publish_settled or not pipe)
                 ),
                 "pending_signals": pending,
                 "cancel_requested": False,  # the core ORs the fresh lease ledger itself

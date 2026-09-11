@@ -230,16 +230,19 @@ class TestCreateTask:
 
 
 class TestCreateTaskExecutionMode:
-    def test_default_create_is_strict_everywhere(self, env):
+    def test_default_create_is_progressive_everywhere(self, env):
+        # The auto-run is the code-driven pipeline; its entry default is
+        # 'progressive' (degrade-honestly-and-advance doctrine, see
+        # apps/api/schemas_research.py). Strict stays selectable per-task.
         client = _make_client(env.drive, env.scratch)
-        created = client.post("/research/tasks", json={"title": "strict-by-default"}).json()
+        created = client.post("/research/tasks", json={"title": "prog-by-default"}).json()
         task_id = created["task_id"]
-        assert created["execution_mode"] == "strict"
-        assert client.get("/research/tasks").json()["tasks"][0]["execution_mode"] == "strict"
-        assert client.get(f"/research/tasks/{task_id}").json()["execution_mode"] == "strict"
-        # Persisted: a later agent resume on this task reads strict too.
+        assert created["execution_mode"] == "progressive"
+        assert client.get("/research/tasks").json()["tasks"][0]["execution_mode"] == "progressive"
+        assert client.get(f"/research/tasks/{task_id}").json()["execution_mode"] == "progressive"
+        # Persisted: a later agent resume on this task reads progressive too.
         svc = ResearchService(env.drive, env.scratch)
-        assert svc.resume_project(USER, task_id)["execution_mode"] == "strict"
+        assert svc.resume_project(USER, task_id)["execution_mode"] == "progressive"
 
     def test_create_progressive_persists_and_echoes(self, env):
         client = _make_client(env.drive, env.scratch)

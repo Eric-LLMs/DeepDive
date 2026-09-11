@@ -61,7 +61,6 @@ from core.logger import reset_log_context, set_log_context
 from rag.query_cache import bump_corpus_version
 
 from apps.worker.rag_images import save_images, scan_embedded_images
-from apps.worker.tool_audit import install as install_tool_call_audit
 
 # Image-attribution sentinels inserted by ``extract_document_text(page_markers=True)`` (PDF
 # → ``[[PAGE:n]]``, DOCX → ``[[PARA:n]]``). The annotator below strips them from stored
@@ -1063,47 +1062,21 @@ async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
     return await _run(ctx, job_id, work())
 
 
-def _research_visible_tools(kernel) -> list[dict]:
-    """The fixed, skill-scoped tool set for a research auto-run turn.
-
-    The interactive path lets the model mount tools via ``tool_search``; an unattended
-    auto-run must not browse its way to ``bash`` / ``read_file`` — every extra visible
-    schema is both a prompt-dilution tax and an action-space drift risk (the ReAct loop
-    spends one LLM call per attempt, and hallucinated tools burn whole turns). So the
-    worker passes an explicit ``tools=`` set built from ``deep_research``'s declared
-    ``allowed_tools`` — which ``loop._step_tools`` returns verbatim every step, giving
-    structural cross-step schema statics (prefix-cache friendly, drift-proof).
-
-    Order discipline (hard constraint): the list mirrors ``skill.allowed_tools`` in its
-    declared order with the ``skill`` loader appended LAST — never sorted or reshuffled,
-    so the tools array is byte-stable across runs. Schemas are single-sourced from
-    ``kernel.runtime.schemas()`` — nothing is hand-written or copied here. A missing
-    skill or unregistered tool fails the turn fast (RuntimeError → honest job failure)
-    rather than silently degrading the action space.
-    """
-    skill = kernel.skills.get("deep_research")
-    names = list(skill.allowed_tools) if skill else []
-    if not names:
-        raise RuntimeError(
-            "research auto-run needs the deep_research skill with declared allowed_tools"
-        )
-    names.append("skill")  # the loader itself, appended last — never reordered
-    found = {s["name"]: s for s in kernel.runtime.schemas()}
-    missing = [n for n in names if n not in found]
-    if missing:
-        raise RuntimeError(f"research auto-run tools not registered: {missing}")
-    return [{"type": "function", "function": found[n]} for n in names]
-
-
 async def research_drive(ctx, job_id: str, payload: dict) -> dict:
     """Run one auto-continue worker turn of a Research OS task run (the T0 chain).
 
-    One job = one :class:`~plugins.research.driver.ResearchRunDriver.auto_turn` execution
-    (one ``execution_id``). The driver owns every state transition under the single-flight
-    CAS (claim, ledger, ``last_block``, slot release); this task supplies the LLM turn, then
-    mirrors the model's answer into the task's session mirror, schedules the *next* auto turn
-    when the driver says continue, and publishes the wake-up event so the desktop monitor
-    refetches.
+    One job = ONE code-driven pipeline node (:func:`plugins.research.pipeline.
+    run_node`) executed inside one :class:`~plugins.research.driver.ResearchRunDriver.
+    auto_turn` lease (one ``execution_id``). The driver owns every state transition
+    under the single-flight CAS (claim, ledger, ``last_block``, slot release); this
+    task supplies the node turn, then mirrors the node's outcome line into the
+    task's session mirror, schedules the *next* auto turn when the driver says
+    continue, and publishes the wake-up event so the desktop monitor refetches.
+
+    The pre-pipeline ReAct composition (kernel turn + skill-scoped tool whitelist)
+    is retired from this path: the auto-run never constructs the agent kernel
+    (hard-asserted in tests/test_pipeline_worker_wiring.py). The Chat path
+    (:func:`run_agent_turn`) keeps the kernel untouched.
 
     Payload: ``user_id``, ``task_id``, ``run_id``, ``turn_index`` (+ optional ``session_id``
     and ``model`` / ``base_url`` / ``api_key`` pinning the interactive run's LLM channel).
@@ -1174,89 +1147,87 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
             run_id=run_id,
         )
 
+        # History is NOT loaded for the auto-run anymore: the code-driven pipeline
+        # composes its prompts deterministically from the project state — the DB
+        # conversation belongs to the interactive Chat path only.
         # The driver mirror (append_session_turn) keys off the DB session id; the task keeps
         # its own task-local session_history.json projection. The session must be bound to this
         # task (chat binds it when the user started the run) for the mirror to land.
         service = ResearchService(get_drive_service(), settings.research_scratch_dir)
         driver = ResearchRunDriver()
 
-        # History for the model = the real DB conversation (the interactive human turns). We
-        # deliberately do NOT pass SessionMemoryStore as the kernel's session_memory: the auto
-        # driver prompt is synthetic and would otherwise be persisted as a fake user message in
-        # the DB session. The assistant answers still reach the task-local mirror below.
-        history: list[dict] = []
-        if session_id:
-            store = SessionMemoryStore(
-                ctx["session_factory"], ctx["embedder"], ctx["llm"],
-                UUID(session_id), user_id,
-            )
-            history = await store.load_messages()
-
         # Bind an approval store so the bridge never DENYs an ASK'd tool for lack of a bound
         # store; resolutions route through the shared Redis broker (configured at startup).
         set_request_approval(ApprovalStore(get_approval_bridge().broker, user_id=str(user_id)))
 
-        async def run_turn(prompt: str) -> RunTurnResult:
-            # Compose the turn the way AgentKernel.run does — _build_turn (pricing pin,
-            # budget, audit sink, context bind) + workspace snapshot + loop.run — but with
-            # two research-auto-run additions: the deep_research skill is pre-activated
-            # (so its allowed_tools scope is live from step 0, closing the "callable before
-            # mount" hole), and the visible tool set is the fixed skill-scoped list (order
-            # locked to SKILL.md, schemas single-sourced from the runtime; see
-            # _research_visible_tools). kernel.run exposes neither tools= nor turn=, so the
-            # composition lives here; loop._ensure_turn keeps the provided turn as-is.
-            kernel = get_agent_kernel()
-            # P0 observability (Phase 2B): one "tool-call-detail" audit line per tool
-            # call via the runtime's pre-execute/result lifecycle hooks. Idempotent,
-            # execution-semantics-neutral — see apps/worker/tool_audit.py.
-            install_tool_call_audit(kernel)
-            visible_tools = _research_visible_tools(kernel)
-            context = {
-                "handoff": {
-                    "kind": "research",
-                    "project_id": task_id,
-                    "mode": "research_resume",
-                }
-            }
-            turn = kernel._build_turn(
-                prompt, history, None, None, model, base_url, api_key, None, context,
-            )
-            # PRE-CALL cost hard gate (run-level). The driver executor also gates at the
-            # turn seam; this wires the SAME cap into the step loop so that every
-            # would-be LLM request inside the turn is refused once the run's cumulative
-            # spend reaches it: ``loop._budget_exceeded`` checks cost >= max_budget_usd
-            # BEFORE issuing, i.e. turn budget = remaining run budget, not a stat.
-            from plugins.research.workflow_adapter import CostLimitExceeded
+        # ── the code-driven pipeline seam (sealed spec) ──────────────────────
+        # One job = ONE pipeline node (``pipeline.run_node``): Python input prep →
+        # gated structured decisions → fixed failure ledger → honest force advance.
+        # The ReAct kernel (``get_agent_kernel()`` / ``ReactLoopAgent``) is NOT
+        # constructed nor invoked on this path anymore — the batch-3 hard assertion
+        # (tests/test_pipeline_worker_wiring.py) pins that to zero. The Chat path
+        # (``run_agent_turn`` above) keeps the kernel untouched.
+        from plugins.research import handlers as _research_handlers  # noqa: F401 — side effect: registers all 10 nodes
+        from plugins.research import pipeline
 
-            _cap = settings.research_driver_max_cost_usd
-            if _cap is not None:
-                _ck = service.get_driver_checkpoint(user_id, task_id) or {}
-                _spent = float(_ck.get("cumulative_cost_usd") or 0.0)
-                if _spent >= _cap:
-                    raise CostLimitExceeded(
-                        f"research run {run_id} turn {turn_index}: cumulative "
-                        f"${_spent:.4f} >= cap ${_cap:.4f} — no LLM call is made"
-                    )
-                turn.max_budget_usd = min(
-                    _cap - _spent, settings.max_budget_per_turn_usd or _cap - _spent
-                )
-            turn.activate_skill("deep_research")
-            await kernel._snapshot_workspace(turn)
-            result = await kernel.loop.run(
-                prompt,
-                history=history,
-                session_memory=None,
-                model=model,
-                base_url=base_url,
-                api_key=api_key,
-                turn=turn,
-                tools=visible_tools,
-                max_steps=settings.research_driver_turn_max_steps,
+        def _rag_channel_factory():
+            """The retrieval channel over the shared kernel's ``retrieval`` seam.
+
+            Resolved LAZILY (per call, never at job start) and degraded honestly:
+            a down retrieval stack yields a channel error, which the DISCOVER
+            node folds into a ``source_unavailable`` ledger line — web/social/
+            materials still run. Hits are keyed by their chunk id so the same
+            material is never re-fetched: the fetch ledger owns provenance.
+            """
+            async def _ch(query: str) -> list[dict]:
+                try:
+                    retriever = get_agent_kernel().ctx.resolve("retrieval")
+                    hits = await retriever.retrieve(query, 5, {"user_id": user_id})
+                except Exception as exc:  # noqa: BLE001 — degrade, never kill the node
+                    raise RuntimeError(f"retrieval unavailable: {exc}") from exc
+                items: list[dict] = []
+                for h in hits or []:
+                    if not isinstance(h, dict):
+                        continue
+                    meta = h.get("meta") or {}
+                    asset_id = meta.get("asset_id") or h.get("asset_id")
+                    if not asset_id:
+                        continue  # no stable identity → not a citable source
+                    items.append({
+                        "url": f"asset://{asset_id}",
+                        "title": meta.get("title") or f"asset {str(asset_id)[:8]}",
+                        "text": h.get("text") or "",
+                    })
+                return items
+            return _ch
+
+        async def run_turn(prompt: str) -> RunTurnResult:
+            # One node per job. ``execution_id`` is this attempt's fence identity,
+            # already minted by the driver's compose_prompt — read it from the
+            # ledger so run_node inherits the SAME F2 identity instead of minting
+            # a divergent one (the per-attempt CAS has committed it by now).
+            from core.config import settings as _settings
+
+            led = service.get_driver_checkpoint(user_id, task_id) or {}
+            execution_id = led.get("execution_id") or f"{run_id}:{turn_index}:1"
+            cap = _settings.research_driver_max_cost_usd
+            spent = float(led.get("cumulative_cost_usd") or 0.0)
+            out = await pipeline.run_node(
+                service, user_id, task_id,
+                run_id=run_id, execution_id=execution_id, turn_index=turn_index,
+                max_cost_usd=cap, start_spent_usd=spent,
+                extras={
+                    # The ONE sanctioned injection point for deployment surfaces
+                    # (batch-1 leftover, closed here): the four DISCOVER channels.
+                    # web/social/materials keep the handlers' production defaults;
+                    # rag rides the shared retrieval seam (explicit ledger if down).
+                    "channel_rag": _rag_channel_factory(),
+                },
             )
             return RunTurnResult(
-                final_answer=result.final_answer or "",
+                final_answer=out.turn_value,
                 # float | None: None = PRICING_UNKNOWN (kept distinct from a real 0.0).
-                cost_usd=result.cost_usd,
+                cost_usd=out.cost_usd,
             )
 
         try:

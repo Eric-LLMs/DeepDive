@@ -83,7 +83,7 @@ CONTRACTS: dict[str, StageContract] = {
     "EXPLAIN":   StageContract("EXPLAIN", 2),
     "WRITE":     StageContract("WRITE", 2, thinking=True, node_budget_s=120.0),
     "REVIEW":    StageContract("REVIEW", 2),                      # main + 1 repair, inside review_draft
-    "REPRODUCE": StageContract("REPRODUCE", 2),
+    "REPRODUCE": StageContract("REPRODUCE", 0, node_budget_s=30.0), # integrity audit — code-only
     "PUBLISH":   StageContract("PUBLISH", 0, node_budget_s=30.0), # code-only
 }
 
