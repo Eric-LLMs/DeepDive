@@ -3130,6 +3130,12 @@ class TestFetchCacheP32A:
 
         calls = self._install_counting_fetch(monkeypatch)
         svc.begin_run(USER, task_id)
+        # Stage-as-transaction: run A never advanced the stage, so its in-node graph
+        # state rolled back to the entry snapshot. The replayed node re-records its
+        # Claim, while the FETCH CACHE (run-scoped-neutral) still serves the hit.
+        await _run(env.runtime, "research_evidence", action="record_node", project_id=task_id,
+                   node={"id": claim_id, "type": "Claim", "label": "tomato fact",
+                         "statement": "botanically, tomatoes are fruits"})
         (vB,) = await svc.fetch_save_batch(USER, task_id, urls=[cu])
         assert len(calls) == 0 and vB["cache_hit"] is True  # the hit receipt
         outB = svc.ingest_evidence(
