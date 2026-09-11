@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -31,6 +32,7 @@ from plugins.research.pipeline import (
     DegradedDecision,
     NodeCtx,
     StructuralStop,
+    parse_json_reply,
     register_handler,
 )
 
@@ -448,3 +450,410 @@ async def node_evidence(ctx: NodeCtx) -> None:
                                    "(a gap, never a refutation)"}
                         for cid in sorted(set(no_verdict)) if cid not in existing)
         ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _gaps)
+
+
+# ═════════════════════════════ DESIGN ════════════════════════════════════════
+
+DESIGN_SYSTEM = (
+    "You design the method for a research task. Reply with ONLY a JSON object: "
+    '{"method": "<concrete approach>", "steps": ["<ordered analysis steps>", '
+    '...], "data_needed": ["..."], "success_criteria": "<how we know the '
+    'question is answered>"}'
+)
+DESIGN_MIN_METHOD = 20
+
+
+@register_handler("DESIGN")
+async def node_design(ctx: NodeCtx) -> None:
+    """Python prepares the template; ONE decision call (repair-once at most)."""
+    question = (ctx.project.get("research_question") or "").strip()
+    state = ctx.service.get_state(ctx.owner_id, ctx.project_id)
+    claims = state.get("claims") or []
+    if not question:
+        raise StructuralStop("DESIGN", "research_question",
+                             "FRAME left no research question to design against")
+
+    template = (
+        f"Research question: {question}\n"
+        f"Claims recorded: {len(claims)} "
+        f"(pending verification: {sum(1 for c in claims if c.get('pending'))})\n"
+        "Known gaps so far: "
+        f"{[g.get('claim_id') or g.get('claim') for g in (ctx.project.get('pipeline') or {}).get('known_gaps') or []][:10]}\n"
+    )
+
+    def _validate(p: dict) -> list[str]:
+        v: list[str] = []
+        m = p.get("method")
+        if not isinstance(m, str) or len(m.strip()) < DESIGN_MIN_METHOD:
+            v.append(f"'method' must describe the approach (≥{DESIGN_MIN_METHOD} chars)")
+        s = p.get("steps")
+        if not isinstance(s, list) or not s or not all(
+                isinstance(x, str) and x.strip() for x in s):
+            v.append("'steps' must be a non-empty list of step strings")
+        sc = p.get("success_criteria")
+        if not isinstance(sc, str) or not sc.strip():
+            v.append("'success_criteria' is required")
+        return v
+
+    prompt = (
+        template + "\nDesign the analysis method for this question. "
+        "Reply with the JSON object described in the system message."
+    )
+    try:
+        decision = await ctx.decide(prompt, system=DESIGN_SYSTEM, validate=_validate)
+    except DegradedDecision as exc:
+        # DESIGN is degradable: mechanical fallback plan from the claim chunks,
+        # ledger the failure honestly, advance.
+        ctx.record(attempt=2, error_class="degraded_decision", detail=str(exc),
+                   impact="mechanical generic design used")
+        decision = {
+            "method": "Adjudicate every recorded claim against the corpus and "
+                      "aggregate verdicts per claim.",
+            "steps": ["aggregate claim verdict statistics",
+                      "build the evidence table", "report citation coverage",
+                      "list unresolved gaps"],
+            "data_needed": ["corpus", "claim graph"],
+            "success_criteria": "every claim carries a verdict or an honest gap",
+        }
+
+    body = (
+        f"# Research design\n\n## Method\n{decision['method'].strip()}\n\n"
+        "## Steps\n" + "".join(f"- {s}\n" for s in decision["steps"])
+        + f"\n## Data needed\n{', '.join(map(str, decision.get('data_needed') or []))}\n\n"
+        f"## Success criteria\n{decision['success_criteria'].strip()}\n"
+    )
+    await ctx.service.write_scratch(
+        ctx.owner_id, ctx.project_id, artifact_id="design.md", content=body,
+        idempotency_key=f"pipeline:DESIGN:{ctx.facts.get('run_id')}:{ctx.facts.get('turn_index')}",
+    )
+
+    def _persist(p: dict) -> None:
+        p.setdefault("pipeline", {})["design"] = {
+            "method": decision["method"], "steps": decision["steps"],
+        }
+    ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
+
+
+# ═════════════════════════════ EXECUTE (two-beat, hard ceiling) ══════════════
+#
+# Beat 1 = Action Plan, Beat 2 = Summary: the stage's FULL declared budget.
+# Each beat is ONE bare ``ctx.complete`` — never ``decide()`` (a repair pass
+# would eat the other beat's budget). No third call is possible: the stage
+# gate (max_calls=2) power-cuts any hidden extra completion into the ledger.
+# Between the beats everything is Python: whitelisted deterministic steps,
+# each wrapped in the record_execution/finish_execution audit chain, 0 LLM.
+
+EXECUTE_PLAN_SYSTEM = (
+    "You plan deterministic analysis steps for the EXECUTE stage. Reply with "
+    'ONLY a JSON object: {"steps": [{"op": "<op name>", "args": {}}]} — valid '
+    "ops are listed in the prompt; any other op is dropped. No LLM-using steps "
+    "may be planned: this stage runs Python analysis only."
+)
+EXECUTE_SUMMARY_SYSTEM = (
+    "You summarize executed analysis results for the research record. Reply "
+    'with ONLY a JSON object: {"summary": "<dense factual summary>"}.'
+)
+
+
+def _claim_stats(graph: dict) -> dict:
+    claims = [n for n in graph.get("nodes", [])
+              if isinstance(n, dict) and n.get("type") == "Claim"]
+    tickets: dict[str, list[str]] = {}
+    for e in graph.get("edges", []):
+        if isinstance(e, dict) and e.get("kind") in ("supports", "contradicts"):
+            tickets.setdefault(e.get("src"), []).append(e["kind"])
+    return {
+        "claims": len(claims),
+        "with_supports": sum(1 for c in claims if "supports" in tickets.get(c["id"], [])),
+        "with_contradicts": sum(1 for c in claims if "contradicts" in tickets.get(c["id"], [])),
+        "no_ticket": sum(1 for c in claims if not tickets.get(c["id"])),
+    }
+
+
+def _evidence_table(graph: dict) -> dict:
+    ev = {n.get("id"): n for n in graph.get("nodes", [])
+          if isinstance(n, dict) and n.get("type") == "Evidence"}
+    rows = []
+    for e in graph.get("edges", []):
+        if isinstance(e, dict) and e.get("kind") in ("supports", "contradicts"):
+            node = ev.get(e.get("dst")) or {}
+            rows.append({"claim": e.get("src"), "kind": e["kind"],
+                         "verdict": node.get("verdict") or "",
+                         "url": node.get("url") or ""})
+    return {"rows": rows[:50], "total": len(rows)}
+
+
+def _coverage_report(service: Any, ctx: NodeCtx) -> dict:
+    state = service.get_state(ctx.owner_id, ctx.project_id)
+    claims = state.get("claims") or []
+    return {
+        "anchored": sum(1 for c in claims if c.get("anchored")),
+        "unanchored": [c["id"] for c in claims if not c.get("anchored")][:20],
+        "gapped": [c["id"] for c in claims if c.get("gap")][:20],
+    }
+
+
+def _gap_list(ctx: NodeCtx) -> dict:
+    gaps = (ctx.project.get("pipeline") or {}).get("known_gaps") or []
+    return {"known_gaps": gaps[:30], "total": len(gaps)}
+
+
+@register_handler("EXECUTE")
+async def node_execute(ctx: NodeCtx) -> None:
+    rid, ti = ctx.facts.get("run_id"), ctx.facts.get("turn_index")
+    graph = ctx.service._load_graph(ctx.owner_id, ctx.project_id)
+    ops: dict[str, Callable[[], dict]] = {
+        "claim_stats": lambda: _claim_stats(graph),
+        "evidence_table": lambda: _evidence_table(graph),
+        "coverage_report": lambda: _coverage_report(ctx.service, ctx),
+        "gap_list": lambda: _gap_list(ctx),
+    }
+
+    # ── beat 1: Action Plan (ONE bare completion, no repair budget exists) ───
+    prompt = (
+        f"Question: {ctx.project.get('research_question') or ''}\n"
+        f"Design steps: {(ctx.project.get('pipeline') or {}).get('design', {}).get('steps') or []}\n"
+        f"Valid ops with their meaning: {json.dumps({k: 'python analysis snapshot' for k in ops})}\n"
+        "Plan the deterministic execution steps."
+    )
+    raw = await ctx.complete(prompt, system=EXECUTE_PLAN_SYSTEM)
+    try:
+        plan = parse_json_reply(raw)
+        assert isinstance(plan.get("steps"), list)
+    except (ValueError, AssertionError) as exc:
+        ctx.record(attempt=1, error_class="degraded_decision",
+                   detail=f"invalid action plan (no repair allowed — budget): {exc}"[:500],
+                   impact="default full op sweep executed instead")
+        plan = {"steps": [{"op": k} for k in ops]}
+
+    # ── middle: deterministic execution + audit chain (0 LLM) ────────────────
+    outputs: dict[str, dict] = {}
+    skipped: list[str] = []
+    for i, step in enumerate(plan.get("steps") or []):
+        op = step.get("op") if isinstance(step, dict) else None
+        if op not in ops:
+            skipped.append(str(op))
+            continue
+        exec_id = f"{rid}:{ti}:exec:{op}:{i}"
+        ctx.service.record_execution(ctx.owner_id, ctx.project_id,
+                                     tool=f"pipeline.execute.{op}", args=dict(step.get("args") or {}),
+                                     execution_id=exec_id)
+        try:
+            result = ops[op]()
+            ctx.service.finish_execution(ctx.owner_id, ctx.project_id,
+                                         execution_id=exec_id, result={"status": "ok", **result})
+            outputs[op] = result
+        except Exception as exc:  # noqa: BLE001 — a dead step is a ledger line, not a dead node
+            ctx.service.finish_execution(ctx.owner_id, ctx.project_id,
+                                         execution_id=exec_id,
+                                         result={"status": "error", "error": f"{type(exc).__name__}: {exc}"[:300]})
+            ctx.record(attempt=1, error_class="handler_error",
+                       detail=f"execute step {op}: {type(exc).__name__}: {exc}"[:500],
+                       impact=f"analysis output {op} missing from the record")
+    if skipped:
+        ctx.record(attempt=1, error_class="degraded_decision",
+                   detail=f"plan steps outside the deterministic whitelist dropped: {skipped[:6]}"[:500],
+                   impact="unplanned work absent from this stage's outputs")
+
+    # ── beat 2: Summary (the SECOND and LAST completion of this node) ────────
+    summary = ""
+    raw2 = await ctx.complete(
+        "Execution outputs:\n" + json.dumps(outputs, ensure_ascii=False)[:4000]
+        + "\nSummarize what this execution established for the research record.",
+        system=EXECUTE_SUMMARY_SYSTEM,
+    )
+    try:
+        s = parse_json_reply(raw2)
+        summary = str(s.get("summary") or "").strip()
+    except ValueError as exc:
+        ctx.record(attempt=2, error_class="degraded_decision",
+                   detail=f"invalid summary payload: {exc}"[:500],
+                   impact="raw summary text used verbatim")
+        summary = raw2.strip()[:600]
+
+    await ctx.service.write_scratch(
+        ctx.owner_id, ctx.project_id, artifact_id="execution_report.md",
+        content="# Execution report\n\n## Summary\n" + summary
+                + "\n\n## Outputs\n```json\n"
+                + json.dumps(outputs, ensure_ascii=False, indent=1)[:6000] + "\n```\n",
+        idempotency_key=f"pipeline:EXECUTE:{rid}:{ti}",
+    )
+
+    def _persist(p: dict) -> None:
+        p.setdefault("pipeline", {})["execution"] = {
+            "outputs": outputs, "summary": summary, "skipped_steps": skipped,
+        }
+    ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
+
+
+# ═════════════════════════════ EXPLAIN ═══════════════════════════════════════
+
+EXPLAIN_SYSTEM = (
+    "You derive causal explanations from adjudicated evidence. Reply with ONLY "
+    'a JSON object: {"explanations": [{"claim_id": "<existing claim id>", '
+    '"causal_line": "<mechanism from evidence to claim>", "confidence": '
+    '"low|medium|high"}], "open_questions": ["<question the evidence cannot '
+    'answer>"]}'
+)
+
+
+@register_handler("EXPLAIN")
+async def node_explain(ctx: NodeCtx) -> None:
+    graph = ctx.service._load_graph(ctx.owner_id, ctx.project_id)
+    claim_ids = {n.get("id") for n in graph.get("nodes", [])
+                 if isinstance(n, dict) and n.get("type") == "Claim"}
+    if not claim_ids:
+        raise StructuralStop("EXPLAIN", "claims",
+                             "no claims to explain — EVIDENCE left the graph empty")
+
+    def _validate(p: dict) -> list[str]:
+        v: list[str] = []
+        ex = p.get("explanations")
+        if not isinstance(ex, list):
+            v.append("'explanations' must be a list")
+        else:
+            bad = [i for i, r in enumerate(ex)
+                   if not (isinstance(r, dict) and isinstance(r.get("claim_id"), str)
+                           and isinstance(r.get("causal_line"), str)
+                           and r["causal_line"].strip())]
+            if bad:
+                v.append(f"explanation rows {bad[:5]} need claim_id + non-empty causal_line")
+        if not isinstance(p.get("open_questions"), list):
+            v.append("'open_questions' must be a list")
+        return v
+
+    evidence_rows = [
+        {"claim": e.get("src"), "kind": e.get("kind"),
+         "verdict": ({n.get("id"): n for n in graph.get("nodes", [])
+                      if isinstance(n, dict)}.get(e.get("dst")) or {}).get("verdict", "")}
+        for e in graph.get("edges", [])
+        if isinstance(e, dict) and e.get("kind") in ("supports", "contradicts")
+    ][:40]
+    prompt = (
+        f"Question: {ctx.project.get('research_question') or ''}\n"
+        f"Claim ids: {sorted(claim_ids)}\n"
+        f"Verdict tickets: {json.dumps(evidence_rows, ensure_ascii=False)}\n"
+        f"Execution summary: {((ctx.project.get('pipeline') or {}).get('execution') or {}).get('summary', '')[:800]}\n"
+        "Explain the causal lines. Reply with the JSON object in the system message."
+    )
+    decision = await ctx.decide(prompt, system=EXPLAIN_SYSTEM, validate=_validate)
+
+    kept: list[dict] = []
+    ghost: list[str] = []
+    for row in decision.get("explanations") or []:
+        if row.get("claim_id") in claim_ids:
+            kept.append(row)
+        else:
+            ghost.append(str(row.get("claim_id")))
+    opens = [str(q) for q in decision.get("open_questions") or [] if str(q).strip()]
+
+    if ghost or opens:
+        def _gaps(p: dict) -> None:
+            gaps = p.setdefault("pipeline", {}).setdefault("known_gaps", [])
+            gaps.extend({"stage": "EXPLAIN", "claim_id": g,
+                         "reason": "explanation referenced a claim that does not exist"}
+                        for g in sorted(set(ghost)))
+            gaps.extend({"stage": "EXPLAIN", "question": q,
+                         "reason": "open question — evidence cannot settle it"}
+                        for q in opens)
+        ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _gaps)
+
+    body = (
+        f"# Causal explanations\n\nQuestion: {ctx.project.get('research_question') or ''}\n\n"
+        + "".join(f"## {r['claim_id']} ({r.get('confidence', '?')})\n{r['causal_line']}\n\n"
+                  for r in kept)
+        + ("## Open questions\n" + "".join(f"- {q}\n" for q in opens) if opens else "")
+    )
+    await ctx.service.write_scratch(
+        ctx.owner_id, ctx.project_id, artifact_id="explain.md", content=body,
+        idempotency_key=f"pipeline:EXPLAIN:{ctx.facts.get('run_id')}:{ctx.facts.get('turn_index')}",
+    )
+
+    def _persist(p: dict) -> None:
+        p.setdefault("pipeline", {})["explain"] = {
+            "explanations": kept, "open_questions": opens, "ghost_claims": sorted(set(ghost)),
+        }
+    ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
+
+
+# ═════════════════════════════ WRITE (Thinking ON, hard gate) ════════════════
+
+WRITE_SYSTEM = (
+    "You write the research draft. Using ONLY the supplied evidence record, "
+    "produce a structured markdown report that answers the research question, "
+    "states every verdict and every known gap honestly. Reply with ONLY a JSON "
+    'object: {"title": "...", "md": "<full markdown draft with >=3 ## '
+    'sections; cite sources inline>"}'
+)
+WRITE_MIN_CHARS = 800
+
+
+@register_handler("WRITE")
+async def node_write(ctx: NodeCtx) -> None:
+    """The ONLY thinking-on generation node. Two failed drafts is a STRUCTURAL
+    fatal: without an honest draft the run cannot complete — terminal BLOCKED,
+    never a force-advance of an empty stage."""
+    question = (ctx.project.get("research_question") or "").strip()
+    graph = ctx.service._load_graph(ctx.owner_id, ctx.project_id)
+    pipe = ctx.project.get("pipeline") or {}
+    if not question:
+        raise StructuralStop("WRITE", "research_question",
+                             "nothing to write against — the question is absent")
+
+    def _validate(p: dict) -> list[str]:
+        v: list[str] = []
+        md = p.get("md")
+        if not isinstance(md, str) or len(md.strip()) < WRITE_MIN_CHARS:
+            v.append(f"'md' must be a full draft of at least {WRITE_MIN_CHARS} characters")
+        elif md.count("\n## ") < 3:
+            v.append("the draft needs at least 3 '## ' sections")
+        return v
+
+    record = {
+        "question": question,
+        "claims": [
+            {"id": n.get("id"), "statement": n.get("statement") or n.get("label"),
+             "citations": n.get("citations") or [],
+             "gap": (n.get("gap") or {}).get("status") if isinstance(n.get("gap"), dict) else None}
+            for n in graph.get("nodes", [])
+            if isinstance(n, dict) and n.get("type") == "Claim"
+        ][:60],
+        "known_gaps": pipe.get("known_gaps") or [],
+        "execution_summary": (pipe.get("execution") or {}).get("summary", "")[:1200],
+    }
+    prompt = (
+        "Evidence record (authoritative, do not invent claims):\n"
+        + json.dumps(record, ensure_ascii=False)[:12000]
+        + f"\n\nWrite the draft answering: {question}"
+    )
+    try:
+        decision = await ctx.decide(prompt, system=WRITE_SYSTEM, validate=_validate)
+    except DegradedDecision as exc:
+        raise StructuralStop(
+            "WRITE", "draft",
+            f"no compliant draft after one repair — {exc}",
+        ) from exc
+
+    md = decision["md"].strip()
+    title = str(decision.get("title") or question)[:120]
+    from plugins.research.plugin import get_auto_run_fence  # audited producer identity
+    # report-named artifact: the first write binds primary_report_artifact_id (T3),
+    # so the WRITE->REVIEW G1 physical check is satisfied by THIS landing — its
+    # version stamping and cloud mirroring stay 100% Python (0 LLM).
+    await ctx.service.write_scratch(
+        ctx.owner_id, ctx.project_id, artifact_id="report.md",
+        content=f"# {title}\n\n{md}\n",
+        idempotency_key=f"pipeline:WRITE:{ctx.facts.get('run_id')}:{ctx.facts.get('turn_index')}",
+        generated_by_execution=(get_auto_run_fence() or {}).get("execution_id"),
+    )
+    ctx.service.record_node(
+        ctx.owner_id, ctx.project_id,
+        node={"id": "draft-1", "type": "Draft", "label": title,
+              "artifact": "report.md"},
+    )
+
+    def _persist(p: dict) -> None:
+        p.setdefault("pipeline", {})["write"] = {
+            "artifact": "report.md", "title": title, "chars": len(md),
+        }
+    ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
