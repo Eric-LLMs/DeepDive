@@ -313,8 +313,13 @@ async def run_node(
     max_cost_usd: float | None = None,
     start_spent_usd: float = 0.0,
     handlers: dict[str, Handler] | None = None,
+    extras: dict[str, Any] | None = None,
 ) -> NodeOutcome:
     """Execute exactly one stage node, then advance it or stop the run.
+
+    ``extras`` is merged into ``ctx.facts`` before the handler runs — the ONE
+    sanctioned injection point for deployment surfaces (search/retrieval
+    channels in tests and worker wiring); handlers never import fakes.
 
     Called from the worker's ``run_turn`` seam INSIDE ``ResearchRunDriver.
     auto_turn`` — the per-attempt fence composed by the driver is inherited here;
@@ -349,6 +354,8 @@ async def run_node(
             contract=contract, run=run, gate=gate, project=project,
         )
         ctx.facts.update({"run_id": run_id, "turn_index": turn_index})
+        if extras:
+            ctx.facts.update(extras)  # deployment surfaces: channels etc. (see docstring)
         t0 = time.monotonic()
 
         handler = (handlers or HANDLERS).get(stage)
