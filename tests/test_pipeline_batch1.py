@@ -223,6 +223,130 @@ async def test_discover_normal_path_exactly_one_llm(env, monkeypatch):
     assert corpus["channels_ran"] == {"web": 3, "social": 1, "rag": 1, "materials": 0}
 
 
+async def test_discover_materials_from_provenance_table_reach_corpus(env, monkeypatch):
+    """Run-18 field regression: materials-table rows carry cloud_asset_id + name
+    only (no url field), so the channel must SYNTHESIZE the material:// key — and
+    the draft must join the corpus via fetch_materials + read_fetch, NOT via
+    fetch_save_batch (whose P3-7A dedup view is text-free by design). Before the
+    fix the 4 attached PDFs were fetched and saved yet appeared nowhere in
+    corpus.md, so the report could not cite them."""
+    svc, task, rid = await _task(env, title="agent system design")
+    fetched: list[str] = []
+    _install_fetch(monkeypatch, fetched)
+    svc.atomic_update_project(USER, task, lambda p: p.__setitem__("materials", [
+        {"cloud_asset_id": "ca-111", "name": "Paper One.pdf",
+         "asset_id": None, "mime": "application/pdf"},
+        {"cloud_asset_id": "ca-222", "name": "Paper Two.pdf",
+         "asset_id": None, "mime": "application/pdf"},
+    ]))
+    pool_calls: list[str] = []
+
+    async def fake_fm(self, owner_id, project_id, *, names=None):
+        pool_calls.append("fetch_materials")
+        return {"fetched": 2, "remaining": 0, "budget_stopped": False,
+                "results": [], "skipped": []}
+
+    async def fake_read(self, owner_id, project_id, *, canonical_url=None,
+                        asset_id=None, name=None, offset=0, max_chars=900):
+        return {"canonical_url": canonical_url or "", "content":
+                f"draft body of {canonical_url}", "total_chars": 40,
+                "offset": 0, "truncated": False}
+
+    monkeypatch.setattr(ResearchService, "fetch_materials", fake_fm)
+    monkeypatch.setattr(ResearchService, "read_fetch", fake_read)
+
+    async def web(q):
+        return [{"url": "https://good1.example/a", "title": "W1", "text": "sn"}]
+
+    async def empty(q):
+        return []
+
+    _seam(monkeypatch, [_ok_keep(
+        "material://ca-111/Paper One.pdf", "material://ca-222/Paper Two.pdf",
+        "https://good1.example/a",
+    )])
+    out = await _run(svc, task, rid, extras={
+        "channel_web": web, "channel_social": empty, "channel_rag": empty,
+    })
+    assert out.kind == "advanced"
+    assert pool_calls == ["fetch_materials"]
+    corpus = svc.read_project(USER, task)["pipeline"]["corpus"]
+    assert corpus["channels_ran"]["materials"] == 2
+    # materials claim the FRONT slots of the cap:
+    assert corpus["urls"][:2] == ["material://ca-111/Paper One.pdf",
+                                  "material://ca-222/Paper Two.pdf"]
+    md = svc.read_artifact(USER, task, artifact_id="corpus.md")["content"]
+    assert "draft body of material://ca-111" in md
+    assert "draft body of material://ca-222" in md
+    # material:// never went to the network fetch stack:
+    assert not any("material://" in f for f in fetched)
+
+
+async def test_discover_materials_pool_failure_degrades_not_kills(env, monkeypatch):
+    """fetch_materials raising (e.g. no versioned cloud run) must land ONE honest
+    ledger line — the node still advances on web/social/rag alone."""
+    svc, task, rid = await _task(env, title="agent system design")
+    _install_fetch(monkeypatch)
+    svc.atomic_update_project(USER, task, lambda p: p.__setitem__("materials", [
+        {"cloud_asset_id": "ca-111", "name": "Paper One.pdf",
+         "asset_id": None, "mime": "application/pdf"},
+    ]))
+
+    async def boom_fm(self, owner_id, project_id, *, names=None):
+        raise ValueError("fetch_materials needs a versioned cloud task run")
+
+    monkeypatch.setattr(ResearchService, "fetch_materials", boom_fm)
+
+    async def web(q):
+        return [{"url": "https://good1.example/a", "title": "W1", "text": "sn"}]
+
+    async def empty(q):
+        return []
+
+    _seam(monkeypatch, [_ok_keep("https://good1.example/a")])
+    out = await _run(svc, task, rid, extras={
+        "channel_web": web, "channel_social": empty, "channel_rag": empty,
+    })
+    assert out.kind == "advanced"
+    assert any(r.get("missing") == "materials" for r in out.ledger)
+    md = svc.read_artifact(USER, task, artifact_id="corpus.md")["content"]
+    assert "material://" not in md and "good1" in md
+
+
+async def test_discover_rag_asset_urls_join_corpus_with_inline_text(env, monkeypatch):
+    """Deployment rag (apps/worker _rag_channel_factory) yields asset:// pseudo
+    urls whose retrieval chunk IS the content — handing them to fetch_save_batch
+    only produced transport failures, so rag hits could never be cited. They must
+    join the corpus from the inline row text without touching the network."""
+    svc, task, rid = await _task(env, title="rag corpus")
+    fetched: list[str] = []
+    _install_fetch(monkeypatch, fetched)
+
+    async def web(q):
+        return [{"url": "https://good1.example/a", "title": "W1", "text": "sn"}]
+
+    async def rag(q):
+        return [{"url": "asset://cafe1234", "title": "KB chunk",
+                 "text": "retrieved passage body"}]
+
+    async def empty(q):
+        return []
+
+    _seam(monkeypatch, [_ok_keep(
+        "https://good1.example/a", "asset://cafe1234",
+    )])
+    out = await _run(svc, task, rid, extras={
+        "channel_web": web, "channel_social": empty, "channel_rag": rag,
+    })
+    assert out.kind == "advanced"
+    corpus = svc.read_project(USER, task)["pipeline"]["corpus"]
+    assert "asset://cafe1234" in corpus["urls"]
+    md = svc.read_artifact(USER, task, artifact_id="corpus.md")["content"]
+    assert "retrieved passage body" in md
+    # the asset:// url was NEVER handed to the network fetch stack:
+    assert not any("asset://" in f for f in fetched)
+
+
 async def test_discover_channel_micro_timeout_degrades_not_kills(env, monkeypatch):
     svc, task, rid = await _task(env, title="health effects of tomatoes")
     _install_fetch(monkeypatch)

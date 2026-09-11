@@ -47,6 +47,8 @@ from typing import Any, Awaitable, Callable
 
 from core.infrastructure.web_fetch import canonical_url as canonicalize
 
+from plugins.research.plugin import MATERIALS_PROTO
+
 from plugins.research.pipeline import (
     CONTRACTS,
     DegradedDecision,
@@ -61,6 +63,7 @@ logger = logging.getLogger("research.handlers")
 Channel = Callable[[str], Awaitable[list[dict]]]  # (query) -> [{url,title,text}]
 
 CHANNEL_TIMEOUT_S = 20.0      # per-channel micro-timeout (constraint #2)
+MATERIALS_INGEST_TIMEOUT_S = 60.0  # fetch_materials + read-back ceiling (PDF extraction is slow)
 DISCOVER_MAX_SOURCES = 10     # deduped URL ceiling handed to the fetch stage
 CORPUS_SNIPPET_CHARS = 900    # per-source window inside corpus.md
 FRAME_CORPUS_CHARS = 6000     # corpus window handed to the framing decision
@@ -115,9 +118,21 @@ def _materials_channel(project: dict) -> Channel:
     async def _ch(_query: str) -> list[dict]:
         out: list[dict] = []
         for m in project.get("materials") or []:
-            if isinstance(m, dict) and (m.get("url") or m.get("material_url")):
+            if not isinstance(m, dict):
+                continue
+            url = m.get("url") or m.get("material_url")
+            if not url:
+                # The provenance table carries identity fields ONLY
+                # (cloud_asset_id + name, run-18 field lesson); the material://
+                # pseudo-url is exactly what fetch_materials and the ledger key
+                # on, so synthesize it here instead of dropping the row.
+                ca = str(m.get("cloud_asset_id") or "")
+                name = str(m.get("name") or "")
+                if ca and name:
+                    url = f"{MATERIALS_PROTO}{ca}/{name}"
+            if url:
                 out.append({
-                    "url": m.get("url") or m["material_url"],
+                    "url": url,
                     "title": m.get("name") or m.get("title") or "material",
                     "text": m.get("summary") or "",
                 })
@@ -243,19 +258,84 @@ async def node_discover(ctx: NodeCtx) -> None:
                    detail="channel rag: not wired in this deployment",
                    missing="rag", impact="retrieval channel skipped — web/social/materials still ran")
 
-    # ── 2. deterministic dedup + fetch (0 LLM) ────────────────────────────────
+    # ── 2. deterministic dedup + channel-aware ingest (0 LLM) ─────────────────
     known: dict[str, dict] = {}
     for h in hits:
-        # canonicalize only folds http(s); pseudo-urls (social://) keep their raw key
+        # canonicalize only folds http(s); pseudo-urls (material://, social://,
+        # asset://) keep their raw key
         cu = canonicalize(str(h["url"])) or str(h["url"]).strip()
         if cu and cu not in known:
             known[cu] = h
-    urls = list(known)[:DISCOVER_MAX_SOURCES]
+    # User-attached materials are first-class sources: they claim slots at the
+    # FRONT of the cap so a noisy web/social fan-out can never crowd them out
+    # (run-18: 4 task PDFs fetched and saved, yet absent from every corpus).
+    _channel_prio = {"materials": 0, "rag": 1, "web": 2, "social": 3}
+    ordered = sorted(known.items(),
+                     key=lambda kv: _channel_prio.get(kv[1].get("channel"), 9))
+    urls = [cu for cu, _h in ordered][:DISCOVER_MAX_SOURCES]
 
     views: dict[str, dict] = {}
-    for i in range(0, len(urls), 5):  # FETCH_MAX_URLS cap lives inside fetch_save_batch
+    plain: list[str] = []
+    mats: list[str] = []
+    for cu in urls:
+        h = known[cu]
+        if cu.startswith(MATERIALS_PROTO):
+            mats.append(cu)
+        elif "://" in cu and not cu.startswith(("http://", "https://")):
+            # Inline-text pseudo source (asset:// rag chunks, social:// posts):
+            # there is no network body to fetch — the retrieval row IS the content.
+            body = (h.get("text") or "").strip()
+            if body:
+                views[cu] = {"title": h.get("title") or cu, "text": body}
+            else:
+                ctx.record(attempt=1, error_class="source_unavailable",
+                           detail=f"inline source carries no text: {cu}"[:500],
+                           missing=cu, impact="source absent from the corpus")
+        else:
+            plain.append(cu)
+
+    if mats:
+        # Material pages join the corpus through the READ path, not the fetch
+        # path: fetch_save_batch's P3-7A dedup view is deliberately text-free
+        # for pages this run already saved, so the draft must come back via
+        # read_fetch (which re-validates the material:// 确权 on every read).
+        async def _ingest_materials() -> None:
+            await ctx.service.fetch_materials(ctx.owner_id, ctx.project_id)
+            for cu in mats:
+                try:
+                    rd = await ctx.service.read_fetch(
+                        ctx.owner_id, ctx.project_id, canonical_url=cu,
+                        max_chars=CORPUS_SNIPPET_CHARS,
+                    )
+                    body = (rd.get("content") or "").strip()
+                    if body:
+                        views[cu] = {"title": known[cu].get("title") or cu,
+                                     "text": body}
+                    else:
+                        ctx.record(attempt=1, error_class="source_unavailable",
+                                   detail=f"material draft empty: {cu}"[:500],
+                                   missing=cu, impact="source absent from the corpus")
+                except Exception as exc:  # noqa: BLE001 — per-file isolation, never sinks the batch
+                    ctx.record(attempt=1, error_class="source_unavailable",
+                               detail=f"material read degraded: {cu} ({exc})"[:500],
+                               missing=cu, impact="source absent from the corpus")
+        try:
+            await asyncio.wait_for(_ingest_materials(),
+                                   timeout=MATERIALS_INGEST_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            ctx.record(attempt=1, error_class="source_unavailable",
+                       detail=f"channel materials: exceeded {MATERIALS_INGEST_TIMEOUT_S:.0f}s ingest timeout",
+                       missing="materials",
+                       impact="material pages dropped from the corpus; other channels kept")
+        except Exception as exc:  # noqa: BLE001 — pool failure degrades, never kills the node
+            ctx.record(attempt=1, error_class="source_unavailable",
+                       detail=f"channel materials: fetch_materials: {type(exc).__name__}: {exc}"[:500],
+                       missing="materials",
+                       impact="task materials unavailable — web/social/rag still ran")
+
+    for i in range(0, len(plain), 5):  # FETCH_MAX_URLS cap lives inside fetch_save_batch
         got = await ctx.service.fetch_save_batch(
-            ctx.owner_id, ctx.project_id, urls=urls[i:i + 5],
+            ctx.owner_id, ctx.project_id, urls=plain[i:i + 5],
         )
         for v in got or []:
             cu = v.get("canonical_url") or ""
