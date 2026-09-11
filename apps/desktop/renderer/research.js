@@ -112,14 +112,16 @@
   const isTaskRunning = (taskId) => !!taskId && runningTasks.has(taskId);
   let activityEl = null;         // live Activity section (survives same-task pane re-renders)
   let activityForTask = null;    // task_id the current activity feed belongs to
-  // Live revision monitor (one SSE stream per selected task): the server sends a snapshot
-  // then only revision-increments, so the desktop refetches the authoritative status exactly
-  // when something changed — never on a blind timer. Stale/duplicate hints are dropped.
+  // Live revision monitor (short-poll while a task is selected): each tick is a plain GET of
+  // the task detail whose project_revision is compared against the last rendered floor, so the
+  // desktop refetches the authoritative status exactly when something changed. No persistent
+  // stream — the old SSE /monitor design leaked upstream sockets on every task switch (Electron
+  // 31 does not propagate protocol-request cancellation to the main-process proxy), saturating
+  // Chromium's 6-per-origin HTTP/1.1 pool and hanging every later /api fetch behind "Loading…".
   let monitorTaskId = null;
-  let monitorAbort = null;       // AbortController for the open monitor stream
-  let monitorRevision = 0;       // last applied project_revision (stale events ignored)
-  let monitorLive = false;       // an SSE connection is open right now (false → reconnect on Run)
-  let monitorRetryTimer = null;  // pending reconnect backoff timeout (cleared by stopMonitor)
+  let monitorRevision = 0;       // last applied project_revision (stale polls ignored)
+  let monitorPollTimer = null;   // pending poll timeout (cleared by stopMonitor)
+  let monitorWasRunning = false; // previous poll's is_running (transition → Activity notice)
   let refreshQueued = false;     // throttle: coalesce change bursts into ≤2s refetches
   let refreshTimer = null;
   // Working-directory tree expansion, keyed per task, survives live re-renders.
@@ -252,14 +254,7 @@
     }
   }
 
-  // A terminal run event from the monitor (run.finished / blocked / stalled / cancelled /
-  // error) lands as an Activity notice so the user sees why the run stopped.
-  function handleRunEvent(taskId, kind) {
-    const verb = (kind || "run.?").replace("run.", "");
-    const text = { finished: "Run finished", blocked: "Run paused", stalled: "Run stalled",
-      cancelled: "Run stopped", error: "Run errored" }[verb] || `Run ${verb}`;
-    activityNotice(taskId, `⏹ ${text}.`);
-  }
+  // (Terminal-run notices are derived in pollMonitor from the running→idle transition.)
 
   function activityNotice(taskId, text) {
     if (!activityEl || activityForTask !== taskId) return;
@@ -275,13 +270,14 @@
   window.researchRunActive = (taskId, on) => {
     if (!taskId) return;
     if (on) runningTasks.add(taskId); else runningTasks.delete(taskId);
-    // A Run click restarts the task server-side (begin_run bumps the project revision). The
-    // monitor may have silently died while the task sat finished — reconnect it now (no backoff
-    // wait) so it catches that bump, and refetch the authoritative status right away. Without
-    // this the status card keeps showing the stale Finished view until a manual reload.
+    // A Run click restarts the task server-side (begin_run bumps the project revision). Restart
+    // the poll loop so it immediately catches that bump with the fast running interval, and
+    // refetch the authoritative status right away. Without this the status card keeps showing
+    // the stale Finished view until a manual reload.
     if (on && monitorTaskId === taskId) {
       scheduleRefresh(taskId);
-      if (!monitorLive) startMonitor(taskId);
+      if (monitorPollTimer) clearTimeout(monitorPollTimer);
+      monitorPollTimer = setTimeout(pollMonitor, 0);
     }
     syncRunCtl();
     if (activityEl && activityForTask === taskId) {
@@ -472,7 +468,7 @@
       if (selectedTask && selectedTask.task_id === t.task_id) {
         selectedTask = null;
         window.currentResearchTask = null;
-        stopMonitor(); // the deleted task's live stream is gone
+        stopMonitor(); // the deleted task's poll loop is gone
         if (statusBody) statusBody.innerHTML = "";
         // Drop the main-pane task view and restore the empty-state guide card.
         const pane = document.getElementById("research-task-view");
@@ -1393,111 +1389,66 @@
     }
   }
 
-  // ── live revision monitor ────────────────────────────────────────────────
-  // One SSE stream per selected task. The server endpoint subscribes to the task's Redis wake-up
-  // channel *before* snapshotting, so a change committing in the subscribe→snapshot gap is never
-  // missed. The stream is an invalidation hint, not the data: a snapshot seeds the revision
-  // floor; a change whose project_revision strictly exceeds the last one applied schedules one
-  // coalesced refetch of the authoritative status (never a blind timer). Terminal run events
-  // also land an Activity notice so a run's stop is never unexplained.
-  const TERMINAL_RUN_KINDS = new Set([
-    "run.finished", "run.blocked", "run.stalled", "run.cancelled", "run.error",
-  ]);
+  // ── live revision monitor (short-poll) ───────────────────────────────────
+  // The selected task is watched by periodically GET-ing its detail endpoint — each request
+  // completes in milliseconds and releases its socket right away, so no connection is ever
+  // pinned to a task (the old per-task SSE stream leaked upstream sockets on task switches and
+  // saturated Chromium's 6-per-origin pool after ~6 clicks). Each tick compares the
+  // authoritative project_revision against the last rendered floor; a strictly-newer revision
+  // schedules one coalesced refetch. The interval adapts to run state: fast while RUNNING,
+  // slow when idle, and it stops entirely when no task is selected (stopMonitor).
+  const POLL_RUNNING_MS = 1500;
+  const POLL_IDLE_MS = 5000;
 
-  // The live monitor reconnects itself: an SSE stream left open across an idle stretch (e.g. a
-  // task that reached PUBLISH and sat finished) can be dropped by the server or the network, and
-  // without a retry the panel would freeze on the stale terminal view until a manual reload. Each
-  // attempt opens a fresh stream; on any drop/error it backs off and reconnects while the task
-  // stays selected, so a later "Run" click's revision bump is always caught.
   function startMonitor(taskId) {
     stopMonitor();
     monitorTaskId = taskId;
     if (!bearerToken()) return; // guests have no tasks — nothing to watch
-    connectMonitor(taskId, 0);
+    monitorWasRunning = isTaskRunning(taskId);
+    monitorPollTimer = setTimeout(pollMonitor, 0);
   }
 
-  async function connectMonitor(taskId, attempt) {
+  function scheduleNextPoll() {
+    if (!monitorTaskId) return;
+    if (monitorPollTimer) clearTimeout(monitorPollTimer);
+    monitorPollTimer = setTimeout(pollMonitor,
+      isTaskRunning(monitorTaskId) ? POLL_RUNNING_MS : POLL_IDLE_MS);
+  }
+
+  async function pollMonitor() {
+    monitorPollTimer = null;
+    const taskId = monitorTaskId;
+    if (!taskId) return;
     const token = bearerToken();
     if (!token) return;
-    if (attempt > 0) {
-      // Back off between attempts (0.5s, 1s, 2s, … capped at 10s). The pending timeout is stored
-      // so stopMonitor can clear it — a task switch cancels the retry immediately.
-      await new Promise((resolve) => {
-        monitorRetryTimer = setTimeout(resolve, Math.min(500 * 2 ** (attempt - 1), 10_000));
-      });
-      if (monitorTaskId !== taskId) return; // the user switched tasks during the backoff
-    }
-    const abort = new AbortController();
-    monitorAbort = abort;
-    monitorLive = false;
     try {
-      const res = await fetch(`/api/research/tasks/${encodeURIComponent(taskId)}/monitor`, {
+      const res = await fetch(`/api/research/tasks/${encodeURIComponent(taskId)}`, {
         headers: { Authorization: `Bearer ${token}` },
-        signal: abort.signal,
       });
-      if (res.status === 401 || res.status === 404) { abort.abort(); return; } // auth/task gone
-      if (!res.ok) throw new Error(`monitor http ${res.status}`);
-      monitorLive = true;
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-        let idx;
-        while ((idx = buf.indexOf("\n\n")) !== -1) {
-          handleMonitorBlock(buf.slice(0, idx));
-          buf = buf.slice(idx + 2);
+      if (res.status === 401 || res.status === 404) return; // auth/task gone — stop watching
+      if (res.ok) {
+        const d = await res.json();
+        if (monitorTaskId !== taskId) return; // the user switched tasks during the request
+        const wasRunning = monitorWasRunning;
+        monitorWasRunning = !!d.is_running;
+        if (wasRunning && !d.is_running) {
+          activityNotice(taskId, "⏹ Run ended — status refreshed.");
+        }
+        const rev = Number(d.project_revision || 0);
+        if (rev > monitorRevision) {
+          monitorRevision = rev; // floor moves now; the refetch below is idempotent on it
+          scheduleRefresh(taskId);
         }
       }
-      if (buf.trim()) handleMonitorBlock(buf);
-    } catch { /* network drop / server restart → reconnect below */ }
-    finally {
-      if (monitorAbort === abort) {
-        monitorAbort = null;
-        monitorLive = false;
-      }
-    }
-    if (monitorTaskId === taskId && !abort.signal.aborted) connectMonitor(taskId, attempt + 1);
+    } catch { /* transient network/backend error — next tick retries */ }
+    scheduleNextPoll();
   }
 
   function stopMonitor() {
     monitorTaskId = null;
     refreshQueued = false;
     if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
-    if (monitorRetryTimer) { clearTimeout(monitorRetryTimer); monitorRetryTimer = null; }
-    if (monitorAbort) { monitorAbort.abort(); monitorAbort = null; }
-    monitorLive = false;
-  }
-
-  function handleMonitorBlock(block) {
-    // SSE frames: comment lines (": keep-alive") and the "data:" JSON payload. Only the data
-    // frame matters — heartbeats and stray frames are ignored.
-    let raw = null;
-    for (const line of block.split("\n")) {
-      const l = line.trim();
-      if (l.startsWith("data:")) raw = l.slice(5).trim();
-    }
-    if (raw == null) return;
-    let evt;
-    try { evt = JSON.parse(raw); } catch { return; }
-    if (evt.type === "snapshot") {
-      // (Re)connecting: the server's current revision is the new floor. If it is ahead of what
-      // we last rendered, a change landed between our fetch and the server's subscribe —
-      // reconcile with one authoritative refetch so we never sit on a stale view.
-      const rev = Number(evt.project_revision || 0);
-      if (rev > monitorRevision && monitorTaskId) scheduleRefresh(monitorTaskId);
-      monitorRevision = rev;
-      return;
-    }
-    if (evt.type !== "change") return;
-    const rev = Number(evt.project_revision || 0);
-    if (rev <= monitorRevision) return; // stale / duplicate hint — already applied
-    monitorRevision = rev;
-    const kind = evt.kind || "";
-    if (TERMINAL_RUN_KINDS.has(kind)) handleRunEvent(monitorTaskId, kind);
-    if (monitorTaskId) scheduleRefresh(monitorTaskId);
+    if (monitorPollTimer) { clearTimeout(monitorPollTimer); monitorPollTimer = null; }
   }
 
   // Coalesced authoritative refetch: a burst of change hints (e.g. a tool round touching several

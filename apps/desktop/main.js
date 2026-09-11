@@ -67,6 +67,13 @@ protocol.registerSchemesAsPrivileged([
 
 async function proxy(target, request) {
   const init = { method: request.method, headers: request.headers };
+  // Propagate the renderer's cancellation (fetch abort / page navigation) to the
+  // upstream request. Without this, an abandoned long-lived stream — the research
+  // /monitor SSE re-opens on every task switch — keeps its upstream connection
+  // alive forever. Chromium allows 6 concurrent connections per HTTP/1.1 origin:
+  // six leaked streams saturate the pool and EVERY later /api fetch queues behind
+  // them, freezing the whole UI in "Loading…" with a perfectly healthy backend.
+  try { if (request.signal) init.signal = request.signal; } catch { /* older Electron: no signal */ }
   // net.fetch defaults to GET; forward the body for anything that has one.
   if (request.method !== "GET" && request.method !== "HEAD") {
     init.headers = new Headers(request.headers);
