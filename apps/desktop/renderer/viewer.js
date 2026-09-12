@@ -200,8 +200,14 @@ const Viewer = (() => {
     return "unknown";
   }
 
+  // Optional render target: when set, every renderer mounts into this element instead
+  // of the main-window #viewer (used by the research workbench preview column, so task
+  // files get identical format support there). Any render()/renderFolder() call resets
+  // it — callers that want the main window simply pass no mount.
+  let mount = null;
+
   function viewerEl() {
-    return document.getElementById("viewer");
+    return mount || document.getElementById("viewer");
   }
 
   function clear() {
@@ -213,11 +219,14 @@ const Viewer = (() => {
   // Close the current document: wipe the viewer and restore the empty state.
   function close() {
     if (!state.path) return;
+    const mounted = mount;
     const el = clear();
+    mount = null;
     state.path = null;
     state.name = null;
     state.kind = null;
     state.openPath = null;
+    if (mounted) return; // a column-mounted doc leaves no "empty state" in the main viewer
     const empty = document.createElement("div");
     empty.id = "viewer-empty";
     empty.className = "empty";
@@ -1310,7 +1319,8 @@ const Viewer = (() => {
     }
   }
 
-  function render(filePath, name) {
+  function render(filePath, name, opts) {
+    mount = (opts && opts.mount) || null;
     state.path = filePath;
     state.name = name;
     state.kind = kindFor(name);
@@ -1360,6 +1370,8 @@ const Viewer = (() => {
     state.name = segs.length ? segs[segs.length - 1] : rootName;
     state.kind = "folder";
 
+    // Folder browsing always belongs in the main window: drop any column mount.
+    mount = null;
     const el = clear();
 
     // The cloud drive view renders its own toolbar (view toggle / search / actions),

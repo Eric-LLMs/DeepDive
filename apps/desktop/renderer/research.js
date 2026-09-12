@@ -1310,6 +1310,7 @@
     if (!previewColEl) return;
     previewState = { taskId: previewColEl._taskId, file: null, size: null };
     previewRefreshedAt = 0;
+    Viewer.close(); // release a column-mounted document (resets mount/zoom/sidecar state)
     if (previewTitleEl) previewTitleEl.textContent = "File preview";
     if (previewColEl._hint) previewColEl._hint.textContent = "click a file to preview";
     if (previewColEl._closeBtn) previewColEl._closeBtn.classList.add("hidden");
@@ -1341,6 +1342,12 @@
     previewBodyEl.scrollTop = 0;
   }
 
+  // Markdown/text render in-column from the content endpoint (richer than the main
+  // viewer's plain <pre>). EVERYTHING ELSE (pdf / image / video / audio / docx / doc /
+  // sheet / pptx / unknown) must open with the same format support as the files
+  // directory in the main window: the main process caches the cloud asset to a temp
+  // path (the viewer streams via local:// and reads the PDF annotation sidecar from
+  // that path), then Viewer.render draws it INTO the preview column via { mount }.
   async function previewFile(taskId, f) {
     if (!previewBodyEl || !previewColEl || previewColEl._taskId !== taskId) return;
     previewState = { taskId, file: f, size: f.size != null ? f.size : null };
@@ -1351,21 +1358,41 @@
     if (previewColEl._hint) previewColEl._hint.textContent = "";
     if (previewColEl._closeBtn) previewColEl._closeBtn.classList.remove("hidden");
     if (previewColEl._fsBtn) previewColEl._fsBtn.classList.remove("hidden");
+    // Release any previously mounted main-window document so its state/zoom/sidecar
+    // do not leak into this preview (no-op when the column only holds markdown).
+    Viewer.close();
     previewPlaceholder("Loading…");
-    let res;
+    if (Viewer.kindFor(f.name) === "text") {
+      let res;
+      try {
+        res = await apiFetch(`/files/${encodeURIComponent(f.id)}/content`);
+      } catch (e) {
+        if (previewState.file && previewState.file.id === f.id) previewPlaceholder(`Content unavailable: ${e.message}`);
+        return;
+      }
+      if (!previewState.file || previewState.file.id !== f.id) return; // a newer selection won
+      if (!previewBodyEl) return;
+      previewBodyEl.innerHTML = "";
+      const doc = el("div", "rtv-preview-doc");
+      doc.innerHTML = renderMarkdown(res.content);
+      previewBodyEl.appendChild(doc);
+      previewBodyEl.scrollTop = 0;
+      return;
+    }
+    let cres;
     try {
-      res = await apiFetch(`/files/${encodeURIComponent(f.id)}/content`);
+      cres = await window.desktopAPI.cloudCache(f.id, f.name, bearerToken());
     } catch (e) {
-      if (previewState.file && previewState.file.id === f.id) previewPlaceholder(`Content unavailable: ${e.message}`);
+      if (previewState.file && previewState.file.id === f.id) previewPlaceholder(`Open failed: ${e.message}`);
       return;
     }
     if (!previewState.file || previewState.file.id !== f.id) return; // a newer selection won
     if (!previewBodyEl) return;
-    previewBodyEl.innerHTML = "";
-    const doc = el("div", "rtv-preview-doc");
-    doc.innerHTML = renderMarkdown(res.content);
-    previewBodyEl.appendChild(doc);
-    previewBodyEl.scrollTop = 0;
+    if (!cres || !cres.ok) {
+      previewPlaceholder(`Open failed: ${(cres && cres.error) || "unknown error"}`);
+      return;
+    }
+    Viewer.render(cres.path, f.name, { mount: previewBodyEl });
   }
 
   // After a monitor refetch, live-refresh the open file if the agent rewrote it (size changed).
