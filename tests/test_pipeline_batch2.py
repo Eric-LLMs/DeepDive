@@ -520,6 +520,72 @@ async def test_strict_reject_after_park_then_reject_path_keeps_structural(env, m
     assert "awaiting_override" in proj["pipeline"]            # still parked, honest
 
 
+async def test_strict_restart_keeps_approved_override_then_resume_advances(env, monkeypatch):
+    # Incident pin: the human approves the parked override, then clicks Run before
+    # the parked re-entry consumed the marker. begin_run's restart used to wipe the
+    # OVERRIDE chip to NOT_RUN while ``awaiting_override`` still referenced the
+    # APPROVED approval — every following turn parked at 0 LLM forever (deadlock).
+    svc, task, rid = await _task(
+        env, "EXECUTE", mode="strict", question="q?", claims=[("k1", "one")],
+        pipeline_seed={"design": {"method": "m", "steps": ["claim_stats"]}},
+    )
+    seen = _seam(monkeypatch, [json.dumps({"steps": [{"op": "claim_stats"}]}),
+                               json.dumps({"summary": "s"})])
+    out = await _run(svc, task, rid)
+    aw = svc.read_project(USER, task)["pipeline"]["awaiting_override"]
+    assert aw["gate"] == "EVIDENCE_GATE"
+    # A stage-entry snapshot exists (production: written by the ADVANCED commits).
+    svc._write_stage_snapshot(USER, task, "EXECUTE")
+    svc.resolve_override(USER, aw["approval_id"], approve=True, project_id=task)
+
+    svc.end_run(USER, task)                                      # stalled run terminalized
+    run2 = svc.begin_run(USER, task)                             # the Run click
+    base2 = svc.get_driver_checkpoint(USER, task)
+
+    def _bind(p: dict) -> None:                                  # driver binds the turn
+        p["driver"] = {**base2, "run_id": run2["run_id"],
+                       "execution_id": f"{run2['run_id']}:1:1"}
+
+    svc.atomic_update_project(USER, task, _bind)
+    proj = svc.read_project(USER, task)
+    assert proj["gates"]["EVIDENCE_GATE"] == "OVERRIDE"          # verdict survives
+    assert "awaiting_override" in proj["pipeline"]               # marker for re-entry
+
+    out2 = await pipeline.run_node(
+        svc, USER, task, run_id=run2["run_id"],
+        execution_id=f"{run2['run_id']}:1:1", turn_index=1,
+    )
+    assert out2.kind == "advanced" and out2.next_stage == "EXPLAIN"
+    proj = svc.read_project(USER, task)
+    assert "awaiting_override" not in proj["pipeline"]
+    assert proj["gates"]["EVIDENCE_GATE"] == "OVERRIDE"
+    assert len(seen) == 2                                        # no EXECUTE replay
+
+
+async def test_strict_stale_notrun_chip_self_heals_from_ledger(env, monkeypatch):
+    # Legacy-state pin: data written by the buggy restart (chip NOT_RUN, approval
+    # APPROVED). run_node consults the ledger, restores OVERRIDE, and advances.
+    svc, task, rid = await _task(
+        env, "EXECUTE", mode="strict", question="q?", claims=[("k1", "one")],
+        pipeline_seed={"design": {"method": "m", "steps": ["claim_stats"]}},
+    )
+    _seam(monkeypatch, [json.dumps({"steps": [{"op": "claim_stats"}]}),
+                        json.dumps({"summary": "s"})])
+    out = await _run(svc, task, rid)
+    aw = svc.read_project(USER, task)["pipeline"]["awaiting_override"]
+    svc.resolve_override(USER, aw["approval_id"], approve=True, project_id=task)
+
+    def _wipe(p: dict) -> None:                                  # simulate old begin_run
+        p["gates"]["EVIDENCE_GATE"] = "NOT_RUN"
+
+    svc.atomic_update_project(USER, task, _wipe)
+    out2 = await _run(svc, task, rid)
+    assert out2.kind == "advanced" and out2.next_stage == "EXPLAIN"
+    proj = svc.read_project(USER, task)
+    assert proj["gates"]["EVIDENCE_GATE"] == "OVERRIDE"          # healed verdict kept
+    assert "awaiting_override" not in proj["pipeline"]
+
+
 async def test_progressive_fence_never_evaluates_or_parks(env, monkeypatch):
     svc, task, rid = await _task(
         env, "EXECUTE", mode="progressive", question="q?",

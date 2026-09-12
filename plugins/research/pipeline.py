@@ -364,6 +364,28 @@ async def run_node(
         if awaiting:
             parked_gate = awaiting["gate"]
             parked_state = (project.get("gates") or {}).get(parked_gate)
+            if parked_state not in ("PASS", "OVERRIDE"):
+                # Self-heal a lost verdict: the ledger says APPROVED but the chip
+                # was reset (legacy begin_run restarts wiped it to NOT_RUN while
+                # the marker persisted → permanent 0-LLM park). The human's word
+                # lives in approvals.json; restore the verdict instead of parking
+                # forever on a stale chip.
+                if service.approval_status(
+                    owner_id, project_id, awaiting.get("approval_id")
+                ) == "APPROVED":
+                    logger.warning(
+                        "pipeline.node %s: override %s APPROVED in ledger but chip "
+                        "%s was %r — restoring OVERRIDE",
+                        stage, awaiting.get("approval_id"), parked_gate, parked_state,
+                    )
+
+                    def _restore(p: dict) -> None:
+                        p.setdefault("gates", {})[parked_gate] = "OVERRIDE"
+
+                    project = service.atomic_update_project(
+                        owner_id, project_id, _restore,
+                    )
+                    parked_state = "OVERRIDE"
             if parked_state in ("PASS", "OVERRIDE"):
                 def _clear(p: dict) -> None:
                     (p.get("pipeline") or {}).pop("awaiting_override", None)

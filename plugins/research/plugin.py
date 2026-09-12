@@ -1488,6 +1488,24 @@ class ResearchService:
         )
         return [a for a in approvals["approvals"] if a.get("status") == "PENDING"]
 
+    def approval_status(
+        self, owner_id: uuid.UUID, project_id: str, approval_id: str | None
+    ) -> str | None:
+        """The recorded verdict of one gate override (``PENDING/APPROVED/REJECTED``), or None.
+
+        ``approvals.json`` is the human's ledger — the authoritative source when a gate chip
+        and the ledger disagree (e.g. legacy ``begin_run`` restarts that wiped the chip).
+        """
+        if not approval_id:
+            return None
+        approvals = self._load_json(
+            self._project_dir(owner_id, project_id) / "approvals.json", {"approvals": []}
+        )
+        for a in approvals["approvals"]:
+            if a.get("id") == approval_id:
+                return a.get("status")
+        return None
+
     async def project_fingerprint(self, owner_id: uuid.UUID, project_id: str) -> dict:
         """Cheap monotone fingerprint of *visible* task progress, for the driver's no-progress gate.
 
@@ -1572,11 +1590,26 @@ class ResearchService:
             pos = _STAGES.index(stage)
         except ValueError:
             return
+        aw = (project.get("pipeline") or {}).get("awaiting_override") or {}
         for guarded_target, gate in _GATE_BEFORE.items():
             if gate and _STAGES.index(guarded_target) > pos:
                 gates = project.setdefault("gates", {})
-                if gates.get(gate) not in (None, "NOT_RUN"):
-                    gates[gate] = "NOT_RUN"
+                if gates.get(gate) in (None, "NOT_RUN"):
+                    continue
+                # A restart must never erase a human's resolved override. The park
+                # marker is consumed by the pipeline's re-entry, which reads this
+                # chip: wiping an APPROVED verdict to NOT_RUN while the marker still
+                # references it deadlocks every following turn at 0 LLM.
+                if aw.get("gate") == gate:
+                    status = self.approval_status(
+                        owner_id, project_id, aw.get("approval_id")
+                    )
+                    if status == "APPROVED":
+                        gates[gate] = "OVERRIDE"
+                        continue
+                    if status == "PENDING":
+                        continue  # still awaiting the human — leave the verdict
+                gates[gate] = "NOT_RUN"
 
     def _artifact_dir(self, owner_id: uuid.UUID, project_id: str, artifact_id: str) -> Path:
         return self._resolve_owned_path(owner_id, project_id, "artifacts", artifact_id)
