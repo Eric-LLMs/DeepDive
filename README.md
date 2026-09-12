@@ -57,7 +57,10 @@ DeepDive is a persistent AI tutor that helps you deeply understand your material
 
 ![Platform architecture — tenants & workspaces, access layer, core application (agent runtime · dual-track memory · configurable RAG · cloud workspace · processing), self-hosted data & AI services](./docs/images/deepdive-architecture-platform-diagram.png)
 
-Full design: [docs/architecture.md](docs/architecture.md).
+* **Module architecture & flow diagrams** (agent kernel · memory · prompt · RAG): see [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md).
+* **Tech-stack rationale**: see [`docs/architecture.md §2 Tech Stack`](docs/architecture.md#2-tech-stack).
+* **Monorepo repository layout**: see [`docs/architecture.md §3`](docs/architecture.md#3-repository-structure-monorepo).
+* **Full design specification**: see [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
