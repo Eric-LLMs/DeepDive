@@ -12,7 +12,7 @@
 
 It is a document and media workspace too: PDFs, Office documents, video, audio, and images open directly in DeepDive — select a passage or a frame and ask in context, no external viewer needed. One platform, one stack: files & cloud drive, chat & memory, RAG search, and a research workspace — all self-hosted, so your data stays on your own infrastructure.
 
-Dive deeper: [**What you can do**](#what-you-can-do) explores the product, [**Engineering highlights**](#-engineering-highlights) breaks down the system, and [docs/architecture.md](docs/architecture.md) documents the full design.
+Dive deeper: [**What you can do**](#what-you-can-do) explores the product, [**Engineering highlights**](#-engineering-highlights) breaks down the system, and [**Architecture at a glance**](#-architecture-at-a-glance) provides the system overview, with [docs/architecture.md](docs/architecture.md) documenting the full design.
 
 ## What is DeepDive?
 
