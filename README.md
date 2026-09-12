@@ -109,20 +109,6 @@ See [docs/architecture.md §Implementation Status](docs/architecture.md#implemen
 
 ---
 
-## 🧩 Architecture & Flows
-
-Per-module architecture and flow logic (agent kernel · memory · prompt · RAG): [docs/architecture-diagrams.md](docs/architecture-diagrams.md).
-
----
-
-## 🧰 Tech Stack
-
-Which technologies DeepDive uses and why each was chosen — see [docs/architecture.md §2 Tech Stack](docs/architecture.md#2-tech-stack).
-
-## 📂 Repository Structure
-
-How the monorepo is laid out and what each module owns — see [docs/architecture.md §3](docs/architecture.md#3-repository-structure-monorepo).
-
 ## 📚 Documentation
 
 - [docs/architecture.md](docs/architecture.md) — full system design (single source of truth): tech stack, repository layout, agent-kernel internals, tool runtime, data model, deployment, and the implemented-vs-designed matrix.
