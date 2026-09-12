@@ -8,9 +8,9 @@
 [![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**DeepDive** is a **multi-tenant AI learning and research platform** — a persistent AI tutor that learns from your materials, remembers how you learn, actively gathers sources and investigates topics for you, and helps you understand, research, and create.
+DeepDive is an **AI-native learning and research workspace** — a self-hosted environment for reading, watching, understanding, researching, and creating with your own materials, designed to keep your data and AI workloads within your own infrastructure and under your control. It combines a document and media workspace with AI chat, memory, RAG, agents, research workflows, and persistent knowledge, so your materials become an active part of the AI interaction rather than just file attachments.
 
-It is a document and media workspace too: PDFs, Office documents, video, audio, and images open directly in DeepDive — select a passage or a frame and ask in context, no external viewer needed. One platform, one stack: files & cloud drive, chat & memory, RAG search, and a research workspace — all self-hosted, so your data stays on your own infrastructure.
+DeepDive supports PDFs, Office documents, video, audio, and images directly in the workspace, with integrated file management and personal cloud storage. Select a passage, page, or video moment and ask in context — then research beyond your materials, save durable insights, and turn conversations into reusable knowledge and artifacts.
 
 Dive deeper: [**What you can do**](#what-you-can-do) explores the product, [**Engineering highlights**](#engineering-highlights) breaks down the system, and [**Architecture at a glance**](#architecture-at-a-glance) provides the system overview, with [docs/architecture.md](docs/architecture.md) documenting the full design.
 

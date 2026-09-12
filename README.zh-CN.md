@@ -8,9 +8,9 @@
 [![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**DeepDive 是一个支持多租户的 AI 学习与研究平台**——它是一个具备持久记忆的 AI 导师，能够吸收你的已有资料、记住你的认知习惯，主动为你搜集材料并探究课题，并在你的个人知识库中协助你进行深度理解、研究与内容创作。
+DeepDive 是一个 **AI 原生的学习与研究工作空间**——一个可自托管的环境，让你基于自己的资料进行阅读、观看、理解、研究与创作，并将数据与 AI 工作负载运行在自己的基础设施之中，并由自己掌控。它将文档与媒体工作空间，与 AI 对话、记忆、RAG、Agent、研究工作流和持久化知识结合起来，让你的资料不再只是上传给 AI 的文件，而是成为 AI 交互与持续工作的核心上下文。
 
-它同时也是一个全能的文档与影音工作区：PDF、Office 文档、视频、音频与图片均可直接在 DeepDive 内打开，随时划选段落或音视频片段即时提问，无需切换外部播放器与阅读器。一个平台，一套技术栈：聚合文件网盘、对话与记忆、RAG 检索及深度研究空间——全部支持私有化部署，核心数据不出你的基础设施。
+DeepDive 原生支持 PDF、Office 文档、视频、音频和图片，并提供集成式文件管理与个人云盘存储。你可以直接划选一段文字、特定页面或视频中的某个时刻，在当前上下文中提问；还可以进一步拓展到资料之外进行研究，沉淀长期洞见，并将对话成果转化为可复用的知识与内容产物。
 
 进一步了解 DeepDive：**[你能做什么](#你能做什么)** 演示完整产品体验，**[工程亮点](#engineering-highlights)** 拆解系统核心机制，**[架构一览](#architecture-at-a-glance)** 纵览系统全貌，完整设计文档请参考 [docs/architecture.md](docs/architecture.md)。
 
