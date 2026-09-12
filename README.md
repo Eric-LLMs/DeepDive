@@ -12,7 +12,7 @@
 
 It is a document and media workspace too: PDFs, Office documents, video, audio, and images open directly in DeepDive — select a passage or a frame and ask in context, no external viewer needed. One platform, one stack: files & cloud drive, chat & memory, RAG search, and a research workspace — all self-hosted, so your data stays on your own infrastructure.
 
-Dive deeper: [**What you can do**](#what-you-can-do) explores the product, [**Engineering highlights**](#-engineering-highlights) breaks down the system, and [**Architecture at a glance**](#-architecture-at-a-glance) provides the system overview, with [docs/architecture.md](docs/architecture.md) documenting the full design.
+Dive deeper: [**What you can do**](#what-you-can-do) explores the product, [**Engineering highlights**](#engineering-highlights) breaks down the system, and [**Architecture at a glance**](#architecture-at-a-glance) provides the system overview, with [docs/architecture.md](docs/architecture.md) documenting the full design.
 
 ## What is DeepDive?
 
@@ -53,7 +53,7 @@ DeepDive is a persistent AI tutor that helps you deeply understand your material
 
 ---
 
-## 🏗️ Architecture at a glance
+## <a id="architecture-at-a-glance"></a>🏗️ Architecture at a glance
 
 ![Platform architecture — tenants & workspaces, access layer, core application (agent runtime · dual-track memory · configurable RAG · cloud workspace · processing), self-hosted data & AI services](./docs/images/deepdive-architecture-platform-diagram.png)
 
@@ -64,7 +64,7 @@ DeepDive is a persistent AI tutor that helps you deeply understand your material
 
 ---
 
-## 🔧 Engineering highlights
+## <a id="engineering-highlights"></a>🔧 Engineering highlights
 
 DeepDive implements a controllable agent runtime rather than delegating orchestration to a rigid framework. Core architectural decisions and their production-grade implementations:
 

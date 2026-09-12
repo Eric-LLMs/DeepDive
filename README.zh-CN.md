@@ -12,7 +12,7 @@
 
 它同时也是一个全能的文档与影音工作区：PDF、Office 文档、视频、音频与图片均可直接在 DeepDive 内打开，随时划选段落或音视频片段即时提问，无需切换外部播放器与阅读器。一个平台，一套技术栈：聚合文件网盘、对话与记忆、RAG 检索及深度研究空间——全部支持私有化部署，核心数据不出你的基础设施。
 
-进一步了解 DeepDive：**[你能做什么](#你能做什么)** 演示完整产品体验，**[工程亮点](#-工程亮点)** 拆解系统核心机制，**[架构一览](#-架构一览)** 纵览系统全貌，完整设计文档请参考 [docs/architecture.md](docs/architecture.md)。
+进一步了解 DeepDive：**[你能做什么](#你能做什么)** 演示完整产品体验，**[工程亮点](#engineering-highlights)** 拆解系统核心机制，**[架构一览](#architecture-at-a-glance)** 纵览系统全貌，完整设计文档请参考 [docs/architecture.md](docs/architecture.md)。
 
 ---
 
@@ -54,7 +54,7 @@ DeepDive 是一位具备持久记忆的 AI 导师，帮助你深度理解材料�
 
 ---
 
-## 🏗️ 架构一览
+## <a id="architecture-at-a-glance"></a>🏗️ 架构一览
 
 ![平台架构 —— 租户与工作区、访问层、核心应用（agent 运行时 · 双轨记忆 · 可配置 RAG · 云工作区 · 处理）、自托管数据与 AI 服务](./docs/images/deepdive-architecture-platform-diagram.png)
 
@@ -65,7 +65,7 @@ DeepDive 是一位具备持久记忆的 AI 导师，帮助你深度理解材料�
 
 ---
 
-## 🔧 工程亮点
+## <a id="engineering-highlights"></a>🔧 工程亮点
 
 DeepDive 自研了高可控的 Agent 运行时，拒绝将核心编排委托给僵化的第三方框架。以下是系统的核心架构决策及生产级实现：
 
