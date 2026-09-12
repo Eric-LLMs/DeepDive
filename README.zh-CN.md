@@ -61,6 +61,7 @@ DeepDive 是一位具备持久记忆的 AI 导师，帮助你深度理解材料�
 * **各模块架构与流程图**（Agent 内核 · 记忆 · Prompt · RAG）：请参阅 [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md)。
 * **技术选型考量**：请参阅 [`docs/architecture.md §2 Tech Stack`](docs/architecture.md#2-tech-stack)。
 * **Monorepo 仓库结构**：请参阅 [`docs/architecture.md §3`](docs/architecture.md#3-repository-structure-monorepo)。
+* **完整设计规范**：请参阅 [`docs/architecture.md`](docs/architecture.md)。
 
 ---
 
@@ -90,8 +91,6 @@ DeepDive 自研了高可控的 Agent 运行时，拒绝将核心编排委托给�
 * **多租户数据隔离，检索不失边界**：请求身份经 ContextVar 传递——RAG 与记忆召回器是进程级单例，无法构造注入用户，`/chat` 端点写入 ContextVar、召回器兜底读取。同一条可见性谓词写成两份（SQLAlchemy 表达式 + 原生 SQL 片段），确保走 tsvector/pgvector 原生 SQL 的召回与 ORM 查询遵守完全一致的三通道（本人拥有 / 工作区成员 / 文件级 ACL 含公开链接）；chunk 级谓词直接基于 `chunks.user_id` 判定，使无 asset_id 的学习 / 对话 chunk 不会越出所有者边界。词汇语料采用部分唯一索引：公共行全局唯一、私有行按用户唯一，不同用户可各自拥有同名词条而不冲突。
 * **Local-First 客户端配合私有化部署**：Electron 工作台支持离线文件工作流（文件树浏览、多格式查看器、视频逐帧截图）；大体积媒体在客户端本地预处理并回传分析产物，常规计算任务由服务端承载。视频可一键生成 PPT/PDF 学习册：基于字幕时间戳抽取关键帧，每页一帧加对应字幕文本，并内置 CJK 字体保证中文渲染不乱码；TTS 支持中英文声线自动切换、按句流式合成（首句秒回），并通过内容哈希缓存波形实现重放零延迟。完整后端技术栈（PostgreSQL/pgvector、Redis、TEI 向量推理、Kokoro TTS 与 LiteLLM 网关）支持通过 `docker-compose` 一键拉起，确保所有数据完全留存在你自己的基础设施之内。
 * **三层存储架构：权威状态、交互投影与检索索引彻底分家**：系统在架构上界定清晰的数据边界：服务器本地沙箱（Scratch）独占任务状态与产物版本的唯一真理；网盘目录只作呈现给用户的外显视图，配置与历史原地覆写，不产生资产碎片；研究成果必须经过显式确认（Promote）标记为待入库后，才会按需触发向量化，彻底封堵旧版直传路径，从源头防止过程草稿污染全局知识库。
-
-> 完整设计规范请参考：[`docs/architecture.md`](docs/architecture.md)。
 
 ---
 

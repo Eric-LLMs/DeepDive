@@ -57,6 +57,8 @@ DeepDive is a persistent AI tutor that helps you deeply understand your material
 
 ![Platform architecture — tenants & workspaces, access layer, core application (agent runtime · dual-track memory · configurable RAG · cloud workspace · processing), self-hosted data & AI services](./docs/images/deepdive-architecture-platform-diagram.png)
 
+Full design: [docs/architecture.md](docs/architecture.md).
+
 ---
 
 ## 🔧 Engineering highlights
@@ -85,8 +87,6 @@ DeepDive implements a controllable agent runtime rather than delegating orchestr
 - **Tenant-safe data isolation.** Request identity rides a ContextVar because the RAG and memory recallers are process-wide singletons that cannot take per-request constructor arguments; the same visibility predicate is written twice — once as a SQLAlchemy expression, once as a raw-SQL fragment — so the tsvector/pgvector recall path enforces the identical three channels (ownership, workspace membership, per-asset ACL with public links). Chunk-level predicates filter on `chunks.user_id` directly, so learning/chat chunks without an asset_id cannot leak past their owner. The vocabulary corpus uses partial unique indexes: public rows stay globally unique while each user's private rows are unique per user, so two users can each own a same-named term without colliding.
 - **Local-first client, self-hostable infrastructure.** The Electron workbench supports offline file workflows (file tree, multi-format viewer, video frame capture); large media is processed on the client and the resulting artifacts submitted back to the server, while most content-processing workloads run server-side. Videos become PPT/PDF study booklets: subtitle timestamps drive keyframe extraction, one frame plus its caption per page, with CJK-safe fonts so Chinese renders correctly; TTS auto-switches Chinese/English voices, synthesizes sentence-by-sentence so the first sentence plays back immediately, and caches waveforms by content hash for zero-latency replays. The complete backend stack — PostgreSQL/pgvector, Redis, TEI embeddings, Kokoro TTS, and LiteLLM gateway — deploys seamlessly via `docker-compose`, keeping your data fully within your infrastructure.
 - **Authority / projection / index separation.** Three layers are explicitly decoupled: the server scratch directory is the single authority for task state and artifacts, the cloud-drive task folder is the user-visible projection (spec and session history update in place, and report artifacts mirror live into `outputs/<task name>.md` — no asset explosion), and promotion mints a per-run versioned `outputs/<stem>_vN.md` final flipped to RAG-pending to trigger indexing — the original upload path is no longer used.
-
-Full design: [docs/architecture.md](docs/architecture.md).
 
 ## ✅ Implementation status
 
