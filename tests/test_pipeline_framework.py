@@ -362,4 +362,6 @@ def test_contracts_declared_budgets_match_sealed_spec():
     assert CONTRACTS["PUBLISH"].llm_calls == 0
     assert CONTRACTS["WRITE"].thinking is True
     assert all(not c.thinking for s, c in CONTRACTS.items() if s != "WRITE")
-    assert all(0 < c.node_budget_s <= 120 for c in CONTRACTS.values())
+    assert all(0 < c.node_budget_s <= 300 for c in CONTRACTS.values())
+    # Run-23: the 120s floor cut a streaming draft mid-reply; WRITE fits two full attempts.
+    assert CONTRACTS["WRITE"].node_budget_s == 300.0

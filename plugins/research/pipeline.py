@@ -89,7 +89,7 @@ CONTRACTS: dict[str, StageContract] = {
     "DESIGN":    StageContract("DESIGN", 2),
     "EXECUTE":   StageContract("EXECUTE", 2, node_budget_s=90.0), # two beats, full budget, no repair
     "EXPLAIN":   StageContract("EXPLAIN", 2),
-    "WRITE":     StageContract("WRITE", 2, thinking=True, node_budget_s=120.0),
+    "WRITE":     StageContract("WRITE", 2, thinking=True, node_budget_s=300.0),  # Run-23: 120s cut a streaming draft mid-reply (materials grew the report) — floor must fit both attempts
     "REVIEW":    StageContract("REVIEW", 2),                      # main + 1 repair, inside review_draft
     "REPRODUCE": StageContract("REPRODUCE", 0, node_budget_s=30.0), # integrity audit — code-only
     "PUBLISH":   StageContract("PUBLISH", 0, node_budget_s=30.0), # code-only
