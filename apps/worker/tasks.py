@@ -1156,6 +1156,30 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
         service = ResearchService(get_drive_service(), settings.research_scratch_dir)
         driver = ResearchRunDriver()
 
+        # LLM trace (observation only): every agent-loop request/response AND the REVIEW
+        # stage's internal reviewer prompt/reply append as one JSON line to the task's
+        # ``llm_trace.jsonl``, each tagged with the live stage — the evidence channel for
+        # "why did this node stall". Never raises into the run (emit() swallows sink errors).
+        from agent.engine import llm_trace
+
+        _trace_dir = service._project_dir(user_id, task_id)
+        _trace_path = _trace_dir / "llm_trace.jsonl"
+
+        def _trace_sink(entry: dict) -> None:
+            try:
+                entry["stage"] = json.loads(
+                    (_trace_dir / "project.json").read_text(encoding="utf-8")
+                ).get("stage")
+            except Exception:  # noqa: BLE001 - stage tagging is best-effort
+                pass
+            entry["run_id"] = run_id
+            entry["turn_index"] = turn_index
+            _trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(_trace_path, "a", encoding="utf-8", newline="") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+
+        llm_trace.set_llm_trace_sink(_trace_sink)
+
         # Bind an approval store so the bridge never DENYs an ASK'd tool for lack of a bound
         # store; resolutions route through the shared Redis broker (configured at startup).
         set_request_approval(ApprovalStore(get_approval_bridge().broker, user_id=str(user_id)))

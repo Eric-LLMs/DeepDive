@@ -36,6 +36,7 @@ from agent.engine.decisions import (
     ToolFailure,
 )
 from agent.engine.loop_guard import ToolLoopTracker
+from agent.engine import llm_trace
 from agent.engine.runtime import ToolRuntime
 from agent.engine.sessions import SessionLog
 from agent.engine.telemetry import (
@@ -389,11 +390,23 @@ class ReactLoopAgent:
                     error = str(exc)
                     log_error(kind="llm_fatal", message=error)
                     turn.span.record_error(kind="llm_fatal", message=error)
+                    llm_trace.emit({
+                        "kind": "agent_llm", "stream": True, "step": step, "model": model,
+                        "request": request, "error": error or type(exc).__name__,
+                        "duration_ms": round((time.monotonic() - t0) * 1000),
+                    })
                     yield {"type": "error", "data": {"message": error}}
                     break
 
                 turn.add_usage(step_usage)
                 self._log(turn, "llm-call", tool_calls=len(tool_calls))
+                llm_trace.emit({
+                    "kind": "agent_llm", "stream": True, "step": step, "model": model,
+                    "request": request,
+                    "response": {"content": content, "tool_calls": tool_calls},
+                    "usage": step_usage,
+                    "duration_ms": round((time.monotonic() - t0) * 1000),
+                })
                 turn.span.record_llm(duration_ms=(time.monotonic() - t0) * 1000)
 
                 assistant: dict = {"role": "assistant", "content": content or None}
@@ -615,11 +628,28 @@ class ReactLoopAgent:
         """
         request = [{"role": "system", "content": system}] + self._snip_messages(messages)
         t_llm = time.monotonic()
-        resp = await self.llm.chat(request, tools=tools, model=model, base_url=base_url, api_key=api_key)
+        try:
+            resp = await self.llm.chat(
+                request, tools=tools, model=model, base_url=base_url, api_key=api_key
+            )
+        except (LLMFatalError, LLMTemporaryError) as exc:
+            # Opt-in trace: the FULL failing request + the error (never emitted by default).
+            llm_trace.emit({
+                "kind": "agent_llm", "stream": False, "step": step, "model": model,
+                "request": request, "error": str(exc) or type(exc).__name__,
+                "duration_ms": round((time.monotonic() - t_llm) * 1000),
+            })
+            raise
         llm_duration_ms = (time.monotonic() - t_llm) * 1000
         tool_calls = resp.get("tool_calls") or []
         usage = resp.get("usage")
         self._log(turn, "llm-call", tool_calls=len(tool_calls))
+        llm_trace.emit({
+            "kind": "agent_llm", "stream": False, "step": step, "model": model,
+            "request": request,
+            "response": {"content": resp["content"], "tool_calls": tool_calls},
+            "usage": usage, "duration_ms": round(llm_duration_ms),
+        })
 
         assistant: dict = {"role": "assistant", "content": resp["content"]}
         if tool_calls:
