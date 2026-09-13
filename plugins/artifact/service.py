@@ -280,7 +280,10 @@ class ArtifactCompileService:
             section_plans.append(SectionPlan(
                 section_id=s.section_id,
                 parent_id=None if i == 0 else root_id,
-                order=i,
+                # sibling order is 0-based PER PARENT (validator contract): the
+                # root holds order 0, its children restart at 0 — a global
+                # counter would start them at 1 and break multi-H1 manuscripts.
+                order=0 if i == 0 else i - 1,
                 title=head if i == 0 else head or s.section_id,
                 content_mode="synthesis",
             ))

@@ -148,6 +148,17 @@ def test_projection_errors():
         project_manuscript_to_ast("orphan body\n", artifact_id="a")
 
 
+def test_duplicate_h1_titles_mint_unique_section_ids():
+    # A real manuscript repeating the same H1 (found in the tomato edition) must
+    # not yield duplicate section_ids — the section-tree contract rejects them.
+    doc = project_manuscript_to_ast(
+        "# T\n\n## A\nbody one\n\n# T\n\nbody two\n", artifact_id="a",
+    )
+    ids = [s.section_id for s in doc.sections]
+    assert len(ids) == len(set(ids)) == 2  # "T" appears twice → second gets -2
+    assert _all_text(doc).count("T") >= 2  # titles themselves untouched
+
+
 # ── end-to-end: projection is the authoritative content source (requirement 3) ─
 
 def test_compiled_pdf_source_comes_from_projection():

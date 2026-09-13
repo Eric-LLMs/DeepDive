@@ -196,6 +196,7 @@ def project_manuscript_to_ast(
     sections: list[SectionAST] = []
     cur_blocks: list = []
     cur_section_id: str | None = None
+    sec_seen: dict[str, int] = {}  # collision-safe minting (deterministic, text-untouched)
     para_buf: list[str] = []
 
     def _require_section() -> None:
@@ -257,7 +258,14 @@ def project_manuscript_to_ast(
             level, title = len(hm.group(1)), hm.group(2)
             if level == 1:
                 flush_section()
-                cur_section_id = f"sec-{hashlib.sha256(title.encode('utf-8')).hexdigest()[:10]}"
+                base = f"sec-{hashlib.sha256(title.encode('utf-8')).hexdigest()[:10]}"
+                # Two same-titled H1s would mint the same content id; disambiguate
+                # deterministically (nth occurrence gets an -n suffix). The section
+                # tree contract (and every downstream block_id reference) requires
+                # unique ids; the TITLE TEXT itself is never touched.
+                n = sec_seen.get(base, 0) + 1
+                sec_seen[base] = n
+                cur_section_id = base if n == 1 else f"{base}-{n}"
             if cur_section_id is None:
                 raise ProjectionError(
                     "content before the first level-1 heading — the publication "

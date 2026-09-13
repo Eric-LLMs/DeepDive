@@ -87,7 +87,8 @@ def env(tmp_path):
 
 
 async def _ready_project(env, *, with_graph: bool = True, with_report: bool = True,
-                         pdf_report: bool = False, primary: bool = True) -> str:
+                         pdf_report: bool = False, primary: bool = True,
+                         content: str | None = None) -> str:
     """A PUBLISH-ready edition: report.md v1 drafted, graph seeded, primary bound."""
     svc = ResearchService(drive=env.drive, scratch_root=env.scratch)
     task = (await svc.create_task(
@@ -105,7 +106,8 @@ async def _ready_project(env, *, with_graph: bool = True, with_report: bool = Tr
             p["pdf_report"] = True
     svc.atomic_update_project(USER, task, _seed)
     if with_report:
-        await svc.write_scratch(USER, task, artifact_id="report.md", content=MANUSCRIPT)
+        await svc.write_scratch(USER, task, artifact_id="report.md",
+                                content=content or MANUSCRIPT)
     if not primary:
         # write_scratch's T3 force-bind is undone last: the "nothing bound" case
         svc.atomic_update_project(
@@ -163,6 +165,26 @@ async def test_compile_real_typst_produces_promoted_pdf(env):
     state = store.get_run(ref["run_id"])
     assert state["state"] == "completed"
     assert RunStore.is_publishable(state)
+
+
+@requires_typst
+async def test_compile_multi_h1_duplicate_titles(env):
+    """Regression (real tomato v5): repeated same-titled H1s must mint unique
+    section_ids AND the mirrored plan must use per-parent 0-based sibling
+    orders — the section-tree contract rejected both bugs pre-fix."""
+    task = await _ready_project(env, content=(
+        "# Tomato Study\n\nIntro text.\n\n"
+        "# Methods\n\nProtocol details.\n\n"
+        "# Methods\n\nSecond chapter reusing the title.\n"
+    ))
+    ref = await _service(env).compile_project_pdf(USER, task)
+    assert ref["state"] == "completed"
+
+    store = RunStore(env.runs)
+    ids = [s["section_id"] for s in store.get_document(ref["run_id"], "ast.json")["sections"]]
+    assert len(ids) == len(set(ids)) == 3
+    orders = [s["order"] for s in store.get_document(ref["run_id"], "plan.json")["sections"]]
+    assert orders == [0, 0, 1]  # root 0; children restart per-parent at 0
 
 
 @requires_typst
