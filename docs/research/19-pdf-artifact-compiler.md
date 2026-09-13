@@ -81,6 +81,15 @@ flowchart LR
 10. **`QA_PASSED`/`QA_FAILED` are transient outcomes, never persisted RunStates.**
     Repair is **patch application** in Core; the LLM that authors the replacement lives in
     the Skill/agent layer.
+11. **PDF = deterministic projection of the finalized manuscript.** The default content
+    path is `Research OS finalized manuscript → project_manuscript_to_ast (pure, Core)
+    → DocumentAST → Typst/visual render → PDF`. The projection preserves textual
+    content and structure with NO LLM rewriting, summarization, paraphrasing or
+    semantic generation, and MUST NOT change WRITE/REVIEW semantics. The projected AST
+    is the authoritative content source of the PDF; LLM rewriting may only ever be an
+    explicit opt-in workflow that never silently replaces the finalized manuscript.
+    Provenance is preserved, not re-derived: the adapter maps graph claim/citation
+    anchors into `citation_markers` verbatim.
 
 ## 4. Canonical ID topology
 
@@ -138,6 +147,7 @@ DeepDive rules bolted on:
 | `visual.py` | `Asset` | `format` default `svg`; claim/evidence refs min 1 |
 | `validators.py` | `validate_section_tree` | single root, acyclic, no orphans, sibling `order` unique & contiguous |
 | | `validate_plan_references` | claim-req parents exist; all evidence ids resolve in the EvidenceSet |
+| `projection.py` | `project_manuscript_to_ast` (inv. 11) | pure markdown→AST: verbatim text, syntax-only transforms, fail-closed on body-before-title; `citation_markers` carries graph anchors through unchanged |
 
 ## 8. Visual engine (decided: worker-bundled mmdc + chromium)
 
@@ -181,9 +191,12 @@ image is accepted cost; isolation is enforced in-process instead:
 - `skills/research-artifact/` — the workflow policy: plan outline, per-section evidence
   packs, parallel writing (p-limit equivalent), judge prompting, repair-regeneration.
   Registered under SkillScopeEnforcer's `allowed_tools`.
-- Research-pipeline hook: PUBLISH gains an optional artifact-compiler branch — when a run
-  exists for the edition, it promotes the run's `report.pdf` as the manuscript artifact;
-  Markdown remains the default, so rollout is per-project, not breaking.
+- Research-pipeline hook: PUBLISH gains an optional artifact-compiler branch — the
+  finalized manuscript (the edition's `primary_report_artifact_id` bytes) is projected
+  via `project_manuscript_to_ast` as the run's authoritative content source (inv. 11),
+  compiled, and `report.pdf` promoted as a sibling publication artifact; Markdown
+  remains the default, so rollout is per-project, not breaking. WRITE/REVIEW semantics
+  are unchanged; LLM re-authoring is opt-in only and never on the default path.
 
 ## 11. Phases
 
@@ -191,6 +204,7 @@ image is accepted cost; isolation is enforced in-process instead:
 |---|---|---|
 | 0 | Contracts + validators + states/RunStore + preflight (this commit block) | unit tests green |
 | 1 | Typst compiler pure fn + template v1 + mmdc runner + sanitizer + QA reducer + patch applier | AST golden snapshot byte-exact; fixtures-internal tests |
+| 1.5 | Manuscript projection boundary (inv. 11): `project_manuscript_to_ast` + golden AST snapshot + token-loss guard | byte-identical AST for identical manuscript; zero invented prose |
 | 2 | `plugins/artifact/` thin tools + service wiring + drive promotion | plugin integration tests, registration OK |
 | 3 | `skills/research-artifact/` workflow + repair loop policy | SkillScopeEnforcer compliance; E2E on fixture corpus |
 | DoD | pytest fixtures 01–07 (basic / nested-tree / conflict / visual / layout / repair / **invalid-contract negative**) + `test_workflow_purity`-style guard: Core import graph contains no LLM/network clients | full matrix green |

@@ -1,0 +1,259 @@
+{
+  "artifact_id": "art-p",
+  "sections": [
+    {
+      "blocks": [
+        {
+          "block_id": "h-3731c65d5a",
+          "citations": null,
+          "claim_ids": null,
+          "level": 1,
+          "text": "番茄盆栽产量研究",
+          "type": "heading"
+        },
+        {
+          "block_id": "p-99307781a0",
+          "citations": null,
+          "claim_ids": null,
+          "inlines": [
+            {
+              "bold": true,
+              "citations": null,
+              "claim_ids": null,
+              "code": null,
+              "text": "发布稿 — 2026 春季期。"
+            },
+            {
+              "bold": null,
+              "citations": null,
+              "claim_ids": null,
+              "code": null,
+              "text": " 本稿由 WRITE/REVIEW 定稿,Artifact Compiler 仅做排版投影。"
+            }
+          ],
+          "type": "paragraph"
+        },
+        {
+          "block_id": "h-22b9f0b662",
+          "citations": null,
+          "claim_ids": null,
+          "level": 2,
+          "text": "方法",
+          "type": "heading"
+        },
+        {
+          "block_id": "p-46e45f4d85",
+          "citations": null,
+          "claim_ids": null,
+          "inlines": [
+            {
+              "bold": null,
+              "citations": null,
+              "claim_ids": null,
+              "code": null,
+              "text": "试验采用随机区组设计,共 "
+            },
+            {
+              "bold": null,
+              "citations": null,
+              "claim_ids": null,
+              "code": true,
+              "text": "4"
+            },
+            {
+              "bold": null,
+              "citations": null,
+              "claim_ids": null,
+              "code": null,
+              "text": " 个处理组:"
+            }
+          ],
+          "type": "paragraph"
+        },
+        {
+          "block_id": "l-40319deb67",
+          "citations": null,
+          "claim_ids": null,
+          "items": [
+            {
+              "inlines": [
+                {
+                  "bold": null,
+                  "citations": [
+                    "c1"
+                  ],
+                  "claim_ids": null,
+                  "code": null,
+                  "text": "滴灌 + 全光谱 "
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "bold": null,
+                  "citations": null,
+                  "claim_ids": null,
+                  "code": null,
+                  "text": "滴灌 + 红蓝光谱"
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "bold": null,
+                  "citations": null,
+                  "claim_ids": null,
+                  "code": null,
+                  "text": "漫灌 + 全光谱"
+                }
+              ]
+            },
+            {
+              "inlines": [
+                {
+                  "bold": null,
+                  "citations": [
+                    "c2"
+                  ],
+                  "claim_ids": null,
+                  "code": null,
+                  "text": "对照组 "
+                }
+              ]
+            }
+          ],
+          "ordered": false,
+          "type": "list"
+        },
+        {
+          "block_id": "t-3b9f32e6d1",
+          "caption": null,
+          "citations": null,
+          "claim_ids": null,
+          "headers": [
+            "组别",
+            "kg/株",
+            "相对增量"
+          ],
+          "rows": [
+            [
+              "Treated A",
+              "2.9",
+              "+38%"
+            ],
+            [
+              "Control",
+              "2.1",
+              "—"
+            ]
+          ],
+          "type": "table"
+        },
+        {
+          "block_id": "q-362ddd1d13",
+          "citations": null,
+          "claim_ids": null,
+          "inlines": [
+            {
+              "bold": null,
+              "citations": null,
+              "claim_ids": null,
+              "code": null,
+              "text": "观察:光照周期 12h 组的果实糖度显著更高。"
+            }
+          ],
+          "type": "paragraph"
+        },
+        {
+          "block_id": "h-bb7ef73495",
+          "citations": null,
+          "claim_ids": null,
+          "level": 2,
+          "text": "结果",
+          "type": "heading"
+        },
+        {
+          "block_id": "p-ea8514bc69",
+          "citations": null,
+          "claim_ids": null,
+          "inlines": [
+            {
+              "bold": null,
+              "citations": null,
+              "claim_ids": null,
+              "code": null,
+              "text": "产量提升 *38%* 在 p<0.01 水平显著,详见 Field Report (https://example.org/report)。"
+            }
+          ],
+          "type": "paragraph"
+        },
+        {
+          "block_id": "code-0b1b7683e0",
+          "citations": null,
+          "claim_ids": null,
+          "inlines": [
+            {
+              "bold": null,
+              "citations": null,
+              "claim_ids": null,
+              "code": true,
+              "text": "yield_gain = (2.9 - 2.1) / 2.1  # +38%"
+            }
+          ],
+          "type": "paragraph"
+        },
+        {
+          "block_id": "h-688f892378",
+          "citations": null,
+          "claim_ids": null,
+          "level": 3,
+          "text": "限制",
+          "type": "heading"
+        },
+        {
+          "block_id": "p-4143edae2e",
+          "citations": null,
+          "claim_ids": null,
+          "inlines": [
+            {
+              "bold": null,
+              "citations": null,
+              "claim_ids": null,
+              "code": null,
+              "text": "样本量偏小,结论强度受 CLAIM_GATE 约束。"
+            }
+          ],
+          "type": "paragraph"
+        },
+        {
+          "block_id": "h-14163a5df2",
+          "citations": null,
+          "claim_ids": null,
+          "level": 2,
+          "text": "结论",
+          "type": "heading"
+        },
+        {
+          "block_id": "p-c7e8832980",
+          "citations": null,
+          "claim_ids": null,
+          "inlines": [
+            {
+              "bold": null,
+              "citations": [
+                "c3"
+              ],
+              "claim_ids": null,
+              "code": null,
+              "text": "滴灌与光谱组合是最有效的干预 ,建议下一季扩大样本复现。"
+            }
+          ],
+          "type": "paragraph"
+        }
+      ],
+      "section_id": "sec-3731c65d5a"
+    }
+  ]
+}

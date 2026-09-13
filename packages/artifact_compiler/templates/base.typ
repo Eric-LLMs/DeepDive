@@ -1,0 +1,101 @@
+// base.typ — versioned layout template for the Research Artifact Compiler.
+// v1 (docs/research/19 §9). Style-only: contains #set/#show/#let definitions and
+// nothing else; the compiler emits this file followed by the deterministic document
+// body. Golden-snapshot tests pin the compiled output byte-for-byte — bump
+// TEMPLATE_VERSION below whenever this file changes (the compiler stamps it).
+//
+// Design rules encoded here:
+//   * font split: Latin serif / CJK serif / mono — preflight probes the same stack
+//   * widow/orphan protection for headings (keep with following text)
+//   * figure + caption stay on one page (breakable: false wrapper)
+//   * callout boxes carry provenance-neutral styling by variant
+
+#let TEMPLATE_VERSION = 1
+
+// ── page & document chrome ───────────────────────────────────────────────────
+#set page(
+  paper: "a4",
+  margin: (top: 2.4cm, bottom: 2.2cm, left: 2.3cm, right: 2.3cm),
+  numbering: "1",
+  header: context {
+    if counter(page).get().first() > 1 [
+      #set text(size: 8pt, fill: gray)
+      #h(1fr) #counter(page).display("1", both: false)
+    ]
+  },
+)
+
+#set text(
+  font: ("Libertinus Serif", "Noto Serif SC", "DejaVu Sans Mono"),
+  size: 10.5pt,
+  lang: "zh",
+  region: "cn",
+)
+#set par(justify: true, leading: 0.78em, first-line-indent: 0em)
+
+// ── headings: numbering + keep-with-next (widow/orphan protection) ──────────
+#set heading(numbering: (..nums) => {
+  let n = nums.pos.filter(v => v != none)
+  if n.len() <= 3 { n.map(v => str(v)).join(".") + "." } else { none }
+})
+#show heading: it => {
+  block(breakable: false, above: 1.2em, below: 0.6em)[#it]
+}
+#show heading.where(level: 1): it => {
+  set text(size: 16pt, weight: "bold")
+  block(breakable: false, above: 1.6em, below: 0.8em)[#it]
+}
+#show heading.where(level: 2): it => set text(size: 13pt, weight: "bold")
+#show heading.where(level: 3): it => set text(size: 11.5pt, weight: "bold")
+
+// ── table look ───────────────────────────────────────────────────────────────
+#set table(
+  stroke: 0.5pt + gray.lighten(60%),
+  inset: 6pt,
+)
+#show table.cell.where(y: 0): set text(weight: "bold")
+
+// ── figure wrapper: caption glued to the image, never split ─────────────────
+#let figBox(src, caption) = block(breakable: false, above: 1em, below: 1em)[
+  #figure(image(src, width: 100%), caption: caption)
+]
+
+// ── callout box by variant (key-finding | warning | evidence) ────────────────
+#let calloutBox(kind, title, body) = {
+  let palette = (
+    "key-finding": (fill: rgb("#eef6ff"), stroke: rgb("#3b82c4")),
+    "warning":     (fill: rgb("#fff4f4"), stroke: rgb("#c45b3b")),
+    "evidence":    (fill: rgb("#f2f7f2"), stroke: rgb("#4a8f4a")),
+  )
+  let c = palette.at(kind, palette."evidence")
+  block(
+    fill: c.fill,
+    stroke: (left: 2.5pt + c.stroke),
+    inset: (x: 10pt, y: 8pt),
+    above: 0.9em,
+    below: 0.9em,
+    breakable: true,
+  )[
+    #set par(leading: 0.7em)
+    #text(weight: "bold", size: 10pt, fill: c.stroke)[#title]
+    #v(0.4em)
+    #body
+  ]
+}
+
+// ── top warning banner (NEEDS_REVIEW diagnostics only) ───────────────────────
+#let warnBanner(text) = block(
+  fill: rgb("#fff4f4"),
+  stroke: 1pt + rgb("#c45b3b"),
+  inset: 10pt,
+  below: 1.4em,
+)[
+  #set text(fill: rgb("#8a2f14"), size: 9.5pt)
+  #text(weight: "bold")[⚠ #text]
+]
+
+// ── bibliography layout (compiler emits entries via refEntry) ────────────────
+#let refEntry(num, label) = [#text(weight: "bold")[#num] #h(0.5em) #label]
+
+// numeric citation marker rendered as a superscript in running text
+#let cnum(n) = text(size: 7pt, baseline: 45%)[#n]
