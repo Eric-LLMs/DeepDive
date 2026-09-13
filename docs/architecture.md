@@ -85,6 +85,7 @@
   - [19.9 Definition and fingerprint — drift detection](#199-definition-and-fingerprint--drift-detection)
   - [19.10 The research adapter](#1910-the-research-adapter)
 - [20. Research Execution: From Agent-Driven Control Flow to a Deterministic Pipeline](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline)
+- [21. Research Artifact Compiler (Publication PDF)](#21-research-artifact-compiler-publication-pdf)
   - [20.1 Context & Motivation](#201-context--motivation)
   - [20.2 Architectural Decisions](#202-architectural-decisions)
   - [20.3 Architectural Benefits](#203-architectural-benefits)
@@ -1243,6 +1244,7 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Save a derived asset with its source | `assets.source_asset_id` (FK `ON DELETE CASCADE`) + content-hash dedup (`get_by_source_content`) |
 | Attach document images to RAG chunks | page/para markers → chunk `meta.pages` / `meta.image_ids` (union across pages, state machine covers unmarked blocks) |
 | Route the vision tool to a model | `tools.vision.model` → catalog model → route → credential (`_resolve_vision_channel`) |
+| Compile a publication PDF from the finalized manuscript | `ArtifactCompileService.compile_project_pdf` (`plugins/artifact/`): zero-LLM deterministic projection (`project_manuscript_to_ast`, inv. 11) → Typst CLI → drive binary + `outputs/report.pdf` mirror; opt-in `pdf_report` sibling branch of the PUBLISH node; responses are `ArtifactRef` only (inv. 9) — see §21 |
 
 [↑ Back to top](#table-of-contents)
 
@@ -3384,5 +3386,116 @@ capacity strictly where semantic reasoning adds genuine value.
 Research uses Workflow/Pipeline to control deterministic execution, native code to perform
 deterministic work, and LLMs only for non-trivial semantic reasoning and generation. Chat
 continues to use the Agent Loop for open-ended interaction.
+
+[↑ Back to top](#table-of-contents)
+
+## 21. Research Artifact Compiler (Publication PDF)
+
+> Full spec: [docs/research/19-pdf-artifact-compiler.md](research/19-pdf-artifact-compiler.md).
+> This section records the module design and the implementation logic that wires it into
+> the Research OS pipeline; §20's PUBLISH node is the integration point.
+
+### 21.1 Purpose & invariants
+
+The Artifact Compiler turns a **finalized research manuscript** into a publication-grade
+PDF. Two invariants govern every design choice:
+
+* **inv. 11 — deterministic projection (zero LLM)**: the default PDF path *projects* the
+  reviewed manuscript (`project_manuscript_to_ast`: typed blocks, verbatim text, never a
+  rewrite) into a Document AST and typesets it with the Typst CLI. An LLM-authored layout
+  exists only as an explicit opt-in outside this path; the PDF therefore can never drift
+  from the reviewed text.
+* **inv. 9 — reference-only responses**: every compiler answer is an `ArtifactRef`
+  (ids, hashes, sizes, relative paths) — never host filesystem paths, never raw bytes.
+
+### 21.2 Module layout
+
+| Layer | Location | Responsibility |
+|---|---|---|
+| Core (offline, zero-LLM) | `packages/artifact_compiler/` | `doc_ast` / `plan` models, `states` machine, `runstore` (portalocker CAS, fsync, `run_revision`), `projection`, `typst_compiler` + `templates/base.typ`, `visual_engine`, `validators`, `qa`, `repair`, `preflight`, `mapping`, `source` |
+| Service | `plugins/artifact/service.py` | `ArtifactCompileService` — the 8-hop pipeline drive over a real `ResearchService`: ACL check → latest non-ghost version → projection → QA → compile → binary persistence → `ArtifactRef` |
+| Plugin surface | `plugins/artifact/plugin.py` | thin `artifact` tool: `compile_pdf(project_id[, run_id])` / `status(run_id)`; lazy `drive` / `research_scratch` injection |
+| Pipeline seam | `plugins/research/handlers.py` → `node_publish` | opt-in sibling branch after Markdown promotion (see 21.5) |
+
+Core depends on nothing from the app; the plugin holds no logic beyond argument
+marshalling — the same layering doctrine as the research plugins.
+
+### 21.3 Compilation pipeline
+
+```mermaid
+flowchart LR
+    M[finalized manuscript\nreport.md @ current edition] --> P[project_manuscript_to_ast\nzero-LLM, verbatim blocks]
+    G[graph.json\nevidence nodes] --> MP[mapping.py\nidentity: ev id == node id]
+    MP --> P
+    P --> V[AST_CONTRACT_QA\nvalidators: section tree\nplan references]
+    V --> T[Typst emit + typst CLI\npublication template]
+    T --> D[(drive asset\nresearch/&lt;proj&gt;/report.pdf\napplication/pdf)]
+    T --> O[(scratch mirror\noutputs/report.pdf)]
+    D --> R[ArtifactRef\nCOMPLETED]
+    O --> R
+    V -. hard fault .-> X[FAILED_BLOCKED\nnothing touches drive]
+    T -. hard fault .-> X
+```
+
+Run state machine: `QUEUED → PREFLIGHT → GATHERING → PLANNING → WRITING →
+AST_CONTRACT_QA → VISUAL_ENGINE → TYPST_COMPILING → COMPLETED`, with
+`FAILED_BLOCKED` as a hard-fault edge reachable from every active state (a crashed or
+rejected run terminalizes honestly — no hung intermediates, no partial drive writes).
+`preflight(require_mmdc=False)` is scoped to the no-visual-asset projection path only.
+
+Determinism contracts (all content-derived, no randomness):
+
+* **run id** = `pdf-{project_id}-r{run_seq}-m{manuscript_sha[:12]}` — the same manuscript
+  edition replays the same terminal outcome (a COMPLETED run returns its committed
+  `artifact_ref.json`; a FAILED_BLOCKED run re-raises its verdict);
+* **section ids** = `sec-{sha10(H1 title)}`, with a deterministic occurrence suffix
+  (`…-2`, `…-3`) when the same title repeats, so ids stay globally unique even for
+  duplicate headings — heading text is never altered to disambiguate;
+* **plan mirror**: the `ArtifactPlan` mirrors the projection (root = first section; the
+  rest hang under it) with **per-parent 0-based sibling order** — the tree contract
+  requires contiguous `0..n-1` under each parent;
+* **provenance**: `provenance.json` = `{evidence_id == graph node id}` identity map,
+  reload-verified byte-equal against `graph_evidence(graph)`; citation markers
+  `[ev:…]` / `[src:…]` / bare source URLs resolve to `cit-{sha10(ev_id)}`, first claim
+  wins per locator.
+
+Binary output uses the **same primitive as Markdown promotion** (`drive.save_artifact`,
+content-addressed + collision-suffixed names) plus the fixed-name scratch mirror
+`<project>/outputs/report.pdf`; `ArtifactRef` records `pdf_sha256`, `size`,
+`drive_asset_id`, `manuscript_sha256`, and the `published_from {artifact_id, version}`
+provenance pair.
+
+### 21.4 PUBLISH integration (the gate stays the sole authority)
+
+The PDF is a **post-promotion, opt-in sibling** inside `node_publish`:
+
+* default OFF — a project without `pdf_report` set behaves exactly as before this module
+  existed; the Markdown gate remains the only publication verdict;
+* the branch runs **after** the report is promoted and the project state persisted;
+* a PDF failure records one append-only ledger line (`handler_error`, "published without
+  the optional PDF sibling") — it never un-promotes, never raises a `StructuralStop`, and
+  never blocks the gate; conversely the branch never clears a gate the Markdown check
+  failed: with an empty hand the run still blocks even when the flag is on.
+
+### 21.5 Visual engine & toolchain notes
+
+* Mermaid/visual assets render with **worker-bundled mmdc + chromium** (decided against
+  a Kroki sidecar); the deterministic projection path carries zero visual specs and
+  records an honest empty `visuals` document at that hop.
+* Typesetting targets the **typst 0.15 CLI** (installed on PATH; the golden snapshot in
+  `tests/fixtures/artifact_compiler/` pins emitted source byte-for-byte).
+* QA repair loop (`qa.py` + `repair.py`): deterministic validators emit patch-targeted
+  findings; an LLM author is not invoked in this path — Phase 3 layers judge/repair on
+  top.
+
+### 21.6 Test doctrine
+
+The integration suite runs the **real typst CLI** (no mocks on the success path) and
+pins: real `%PDF` bytes in both drive and mirror, sha round-trip equality, provenance
+reload against a freshly-opened `RunStore`, replay idempotence, FAILED_BLOCKED on
+preflight/typst faults with zero drive writes, owner-scoped `status`, the default-OFF
+publish behavior, the opt-in flag persisting `pipeline.publish.pdf`, PDF-failure keeping
+the PROMOTED state, the gate-not-bypassed case, and multi-H1 / duplicate-title manuscripts
+(unique section ids + per-parent orders end-to-end).
 
 [↑ Back to top](#table-of-contents)
