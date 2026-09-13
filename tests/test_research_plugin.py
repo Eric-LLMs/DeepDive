@@ -41,6 +41,7 @@ from plugins.research.plugin import (
     _RUN_ACTIONS,
     _SCRAPE_ACTIONS,
     _STATE_ACTIONS,
+    DEFAULT_RESEARCH_DESCRIPTION,
     OwnershipLost,
     ResearchService,
     _unknown_action,
@@ -685,6 +686,59 @@ class TestChatTasks:
         listed = svc.list_tasks(USER)
         assert [t["task_id"] for t in listed] == [task_id]
         assert listed[0]["stage"] == "DISCOVER"
+
+    async def test_blank_description_materializes_default_context(self, env):
+        """An empty (or whitespace-only) Description is filled SERVER-SIDE with the
+        full default research context — the same text the dialog shows as a mere
+        placeholder. The cloud mirror + status surface carry it too, so the value
+        that reaches the pipeline is never an empty string."""
+        svc = ResearchService(env.drive, env.scratch)
+        blank = await svc.create_task(USER, title="no desc", description="   ")
+        spec = svc.read_task_spec(USER, blank["task_id"])
+        assert spec["description"] == DEFAULT_RESEARCH_DESCRIPTION
+        status = await svc.get_task_status(USER, blank["task_id"])
+        assert status["description"] == DEFAULT_RESEARCH_DESCRIPTION
+        # omitted argument behaves the same as an explicit empty string
+        omitted = await svc.create_task(USER, title="no desc 2")
+        assert (svc.read_task_spec(USER, omitted["task_id"])["description"]
+                == DEFAULT_RESEARCH_DESCRIPTION)
+        # the on-disk authoritative file carries the resolved default (not "")
+        raw = ResearchService._load_json(
+            env.scratch / str(USER) / blank["task_id"] / "task_spec.json", None)
+        assert raw["description"] == DEFAULT_RESEARCH_DESCRIPTION
+
+    async def test_custom_description_wins_verbatim_never_concatenated(self, env):
+        """User text is stored EXACTLY — the default is a fallback for blank input,
+        never an append/merge prefix or suffix."""
+        svc = ResearchService(env.drive, env.scratch)
+        created = await svc.create_task(
+            USER, title="mine", description="写一个中文报告, 3000 字以内")
+        spec = svc.read_task_spec(USER, created["task_id"])
+        assert spec["description"] == "写一个中文报告, 3000 字以内"
+        assert DEFAULT_RESEARCH_DESCRIPTION not in spec["description"]
+        # a custom description that merely STARTS like the default is still verbatim
+        partial = await svc.create_task(
+            USER, title="half", description="Please conduct a systematic review.")
+        assert (svc.read_task_spec(USER, partial["task_id"])["description"]
+                == "Please conduct a systematic review.")
+
+    def test_dialog_placeholder_is_never_a_submitted_value(self, env):
+        """The contract behind 'placeholder 不会被误判为用户输入': the desktop dialog
+        renders the default text ONLY as the textarea's ``placeholder`` attribute
+        (grey hint, not part of ``.value``), the submit path reads ``.value.trim()``,
+        and nothing ever assigns a value to ``#rq-desc``."""
+        from pathlib import Path
+        src = (Path(__file__).resolve().parents[1]
+               / "apps" / "desktop" / "renderer" / "app.js").read_text(encoding="utf-8")
+        # exact contract: the placeholder text and the backend default are one string
+        placeholder = ("Please conduct a systematic research on the topic, following "
+                       "the Research OS workflow. Gather and analyze reliable sources, "
+                       "distinguish facts from inferences, and produce a structured, "
+                       "well-supported, and traceable research result.")
+        assert placeholder == " ".join(DEFAULT_RESEARCH_DESCRIPTION.split())
+        assert f'id="rq-desc" rows="4" placeholder="{placeholder}"' in src
+        assert 'id="rq-desc".value' in src or "#rq-desc\").value" in src  # submit reads .value
+        assert '#rq-desc").value =' not in src  # never prefilled
 
     async def test_create_task_with_parent_folder(self, env):
         svc = ResearchService(env.drive, env.scratch)

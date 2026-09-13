@@ -2421,7 +2421,9 @@
           <input class="cd-prompt-input" id="rq-title" type="text" placeholder="e.g. How do vector DBs compare on recall vs latency?" />
         </label>
         <label>Description
-          <textarea class="cd-prompt-input" id="rq-desc" rows="4" placeholder="Optional context for the agent…"></textarea>
+          <!-- Placeholder only — never a value: submit reads .value (empty when untouched),
+               and the server materializes its DEFAULT_RESEARCH_DESCRIPTION for blank input. -->
+          <textarea class="cd-prompt-input" id="rq-desc" rows="4" placeholder="Please conduct a systematic research on the topic, following the Research OS workflow. Gather and analyze reliable sources, distinguish facts from inferences, and produce a structured, well-supported, and traceable research result."></textarea>
         </label>
         <div class="rq-mode">
           <span class="rq-mode-label">Execution mode</span>

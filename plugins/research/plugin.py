@@ -901,6 +901,20 @@ def _current_user() -> uuid.UUID:
     return user
 
 
+# Default research context applied when a task is created with a blank Description.
+# The web/desktop "New Research" dialog shows this exact text as the input's grey
+# PLACEHOLDER only (never as a pre-filled value), so an empty submit is indistinguishable
+# from a client that never carried the placeholder text. The backend is the single
+# authority that materializes it into ``task_spec.json`` — from there the pipeline's
+# ``_user_brief`` injects it into every stage's LLM decision as the standing instruction.
+# A user-supplied Description wins verbatim: this default is never appended or merged.
+DEFAULT_RESEARCH_DESCRIPTION = (
+    "Please conduct a systematic research on the topic, following the Research OS "
+    "workflow. Gather and analyze reliable sources, distinguish facts from inferences, "
+    "and produce a structured, well-supported, and traceable research result."
+)
+
+
 def _safe_filename(name: str) -> str:
     """Strip path/control characters and pictographic emoji so a user-supplied
     asset name stays a single clean filename (CJK and other word scripts pass
@@ -2384,7 +2398,11 @@ class ResearchService:
             self._write_stage_snapshot(owner_id, task_id, "DISCOVER")
             task_spec = {
                 "title": title.strip(),
-                "description": (description or "").strip(),
+                # A blank Description is not "no context": the server materializes the
+                # default research instruction (same text the UI shows as placeholder —
+                # which is never a submitted value). Custom text wins verbatim, never
+                # concatenated with the default.
+                "description": (description or "").strip() or DEFAULT_RESEARCH_DESCRIPTION,
                 "created_at": _now_iso(),
                 "created_by": str(owner_id),
             }

@@ -394,6 +394,25 @@ async def test_no_brief_prompt_stays_at_baseline(env, monkeypatch):
     assert '"user_brief": {}' in seen[0]               # record key present, empty
 
 
+async def test_blank_description_default_context_reaches_prompt(env, monkeypatch):
+    """An empty Description is no longer "no context": create_task materializes the
+    default research instruction, and the pipeline's brief seam carries it verbatim
+    into every node's prompt (same mechanism as a custom brief — nothing special-
+    cased in handlers/pipeline)."""
+    from plugins.research.plugin import DEFAULT_RESEARCH_DESCRIPTION
+    svc, task, rid = await _task(
+        env, "WRITE", question="Does home cooking raise lycopene?",
+        claims=[("k1", "x")],
+    )  # description omitted -> "" -> server default
+    reply = json.dumps({"title": "t", "md": _good_draft()})
+    seen = _seam(monkeypatch, [reply])
+    out = await _run(svc, task, rid)
+    assert out.kind == "advanced"
+    assert "User brief" in seen[0]
+    assert DEFAULT_RESEARCH_DESCRIPTION in seen[0]     # verbatim default context
+    assert DEFAULT_RESEARCH_DESCRIPTION in seen[0].split("Description:")[1]  # on its own line
+
+
 async def test_read_task_spec_missing_safe(env):
     svc = ResearchService(drive=env.drive, scratch_root=env.scratch)
     assert svc.read_task_spec(USER, str(uuid.uuid4())) == {}   # unknown project
