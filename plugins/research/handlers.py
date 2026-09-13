@@ -1362,12 +1362,14 @@ async def node_publish(ctx: NodeCtx) -> None:
         }
     ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
 
-    # Optional PDF sibling (docs/19 §10): only when the project opted in via the
-    # ``pdf_report`` flag — default behavior is unchanged. The Markdown promotion
-    # above remains the sole publish authority: a PDF failure is a ledger note, it
-    # never un-promotes and never raises StructuralStop (the gate is not bypassed
-    # in either direction).
-    if project.get("pdf_report"):
+    # Publication PDF sibling (docs/19 §10): default-ON since 2026-09-14 (an
+    # explicit ``pdf_report: false`` opts out). The Markdown promotion above remains
+    # the sole publish authority: the run publishes on BOTH outcomes — a PDF
+    # failure never un-promotes and never raises StructuralStop — but it must be
+    # EXPLAINABLE: the reason rides the ledger AND ``pipeline.publish.pdf_error``
+    # so the task view shows why the sibling is missing. Success clears any stale
+    # error from an earlier attempt.
+    if project.get("pdf_report", True) is not False:
         try:
             from plugins.artifact.service import ArtifactCompileService
             ref = await ArtifactCompileService.for_research(ctx.service).compile_project_pdf(
@@ -1375,9 +1377,16 @@ async def node_publish(ctx: NodeCtx) -> None:
             )
 
             def _persist_pdf(p: dict) -> None:
-                p.setdefault("pipeline", {}).setdefault("publish", {})["pdf"] = ref
+                pub = p.setdefault("pipeline", {}).setdefault("publish", {})
+                pub["pdf"] = ref
+                pub.pop("pdf_error", None)
             ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist_pdf)
         except Exception as exc:  # noqa: BLE001 — sibling fault, never the gate's verdict
+            reason = f"{type(exc).__name__}: {exc}"[:500]
             ctx.record(attempt=1, error_class="handler_error",
-                       detail=f"pdf compile failed: {type(exc).__name__}: {exc}"[:500],
-                       impact="published without the optional PDF sibling")
+                       detail=f"pdf compile failed: {reason}",
+                       impact="published without the PDF sibling")
+
+            def _persist_pdf_error(p: dict) -> None:
+                p.setdefault("pipeline", {}).setdefault("publish", {})["pdf_error"] = reason
+            ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist_pdf_error)

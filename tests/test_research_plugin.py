@@ -1645,7 +1645,10 @@ class TestRunOutputLayout:
         assert len([f for f in folders if f["path"] == f"{cloud_root}/temp/v1"]) == 1
         svc.end_run(USER, task_id)
 
-    async def test_promote_mints_outputs_vN_and_single_run_is_strongly_idempotent(self, env):
+    async def test_promote_archives_versioned_final_in_temp_vN(self, env):
+        """(2026-09-14 surface decision) the promoted .md final rides the run's
+        temp/v{N} folder as an intermediate of record; outputs/ is left for the
+        publication PDF only."""
         svc, task_id, cloud_root = await self._new_task(env)
         svc.begin_run(USER, task_id)
         # ``draft.md`` -> ``draft_v1.md`` (the raw stem, not ``draft.md_v1.md``).
@@ -1654,37 +1657,39 @@ class TestRunOutputLayout:
         promoted = await svc.promote_to_drive(USER, task_id, artifact_id="draft.md")
         assert promoted["status"] == "PROMOTED"
         assert promoted["rag_status"] == "PENDING"
-        assert promoted["drive_path"] == f"{cloud_root}/outputs/draft_v1.md"
-        outs = await self._files_in(env, f"{cloud_root}/outputs")
-        assert [a["name"] for a in outs] == ["draft_v1.md"]
-        out_id = outs[0]["id"]
+        assert promoted["drive_path"] == f"{cloud_root}/temp/v1/draft_v1.md"
+        assert await self._files_in(env, f"{cloud_root}/outputs") == []
+        temp1 = await self._files_in(env, f"{cloud_root}/temp/v1")
+        assert {a["name"] for a in temp1} == {"draft.md", "draft_v1.md"}
+        out_id = next(a["id"] for a in temp1 if a["name"] == "draft_v1.md")
         assert out_id == promoted["drive_asset_id"]
         assert await env.drive.read_text(USER, uuid.UUID(out_id)) == "# final v1"
         # The temp working copy is intact — promotion never moves/renames it (red line 2).
         # (T1: the mirror stems the id first, so ``draft.md`` -> ``draft.md``, never
         # the old ``draft.md.md`` double suffix.)
-        assert {a["name"] for a in await self._files_in(env, f"{cloud_root}/temp/v1")} == {
-            "draft.md"
-        }
+        assert await env.drive.read_text(
+            USER, uuid.UUID(next(a["id"] for a in temp1 if a["name"] == "draft.md"))
+        ) == "# final v1"
 
         # Re-promote without changes is a record-level no-op (no second _v1 file).
         again = await svc.promote_to_drive(USER, task_id, artifact_id="draft.md")
         assert again["idempotent"] is True
         assert again["drive_asset_id"] == promoted["drive_asset_id"]
-        assert len(await self._files_in(env, f"{cloud_root}/outputs")) == 1
+        assert len([a for a in await self._files_in(env, f"{cloud_root}/temp/v1")
+                    if a["name"] == "draft_v1.md"]) == 1
 
         # A genuinely-new version in the SAME run refreshes the one _v1 final in place: the
         # physical asset and filename never bump to _v2 (only a new begin_run can).
         await svc.create_version(USER, task_id, artifact_id="draft.md", content="# final v2")
         repromote = await svc.promote_to_drive(USER, task_id, artifact_id="draft.md")
-        outs = await self._files_in(env, f"{cloud_root}/outputs")
-        assert [a["name"] for a in outs] == ["draft_v1.md"]
-        assert outs[0]["id"] == out_id
-        assert repromote["drive_path"] == f"{cloud_root}/outputs/draft_v1.md"
+        temp1 = await self._files_in(env, f"{cloud_root}/temp/v1")
+        assert [a["name"] for a in temp1 if a["name"] == "draft_v1.md"] == ["draft_v1.md"]
+        assert next(a for a in temp1 if a["name"] == "draft_v1.md")["id"] == out_id
+        assert repromote["drive_path"] == f"{cloud_root}/temp/v1/draft_v1.md"
         assert await env.drive.read_text(USER, uuid.UUID(out_id)) == "# final v2"
         svc.end_run(USER, task_id)
 
-    async def test_second_run_promotes_to_outputs_v2_keeping_v1(self, env):
+    async def test_second_run_promotes_to_temp_v2_keeping_v1(self, env):
         svc, task_id, cloud_root = await self._new_task(env)
         svc.begin_run(USER, task_id)
         await svc.write_scratch(USER, task_id, artifact_id="report", content="# final v1")
@@ -1694,23 +1699,19 @@ class TestRunOutputLayout:
         svc.begin_run(USER, task_id)  # run_seq 2
         await svc.write_scratch(USER, task_id, artifact_id="report", content="# final v2")
         run2 = await svc.promote_to_drive(USER, task_id, artifact_id="report")
-        assert run2["drive_path"] == f"{cloud_root}/outputs/report_v2.md"
+        assert run2["drive_path"] == f"{cloud_root}/temp/v2/report_v2.md"
         assert run2["drive_asset_id"] != run1["drive_asset_id"]
 
-        outs = {a["name"]: a for a in await self._files_in(env, f"{cloud_root}/outputs")}
-        # Beyond the promoted per-version finals, the ``report`` artifact also auto-mirrors
-        # into ``outputs/<task name>_v{run}.md`` (T2: the version in the FILENAME keeps the
-        # mirror traceable to the run's temp/v{N} folder — one file per run, in place
-        # updates for same-run rewrites).
-        assert set(outs) == {
-            "report_v1.md",
-            "report_v2.md",
-            "task_v1.md",
-            "task_v2.md",
-        }
+        # outputs/ stays EMPTY: the run mirror special case is gone (the .md drafts
+        # are intermediates; the publication PDF owns outputs/ from now on).
+        assert await self._files_in(env, f"{cloud_root}/outputs") == []
+        v1 = {a["name"]: a for a in await self._files_in(env, f"{cloud_root}/temp/v1")}
+        v2 = {a["name"]: a for a in await self._files_in(env, f"{cloud_root}/temp/v2")}
+        assert set(v1) == {"report.md", "report_v1.md"}
+        assert set(v2) == {"report.md", "report_v2.md"}
         # v1 is never overwritten or reused — both versioned finals coexist with their bytes.
-        assert await env.drive.read_text(USER, uuid.UUID(outs["report_v1.md"]["id"])) == "# final v1"
-        assert await env.drive.read_text(USER, uuid.UUID(outs["report_v2.md"]["id"])) == "# final v2"
+        assert await env.drive.read_text(USER, uuid.UUID(v1["report_v1.md"]["id"])) == "# final v1"
+        assert await env.drive.read_text(USER, uuid.UUID(v2["report_v2.md"]["id"])) == "# final v2"
         svc.end_run(USER, task_id)
 
     async def test_save_scrape_writes_metadata_file_and_increments_per_run(self, env):

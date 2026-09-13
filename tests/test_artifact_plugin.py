@@ -87,9 +87,10 @@ def env(tmp_path):
 
 
 async def _ready_project(env, *, with_graph: bool = True, with_report: bool = True,
-                         pdf_report: bool = False, primary: bool = True,
+                         pdf_report: bool | None = None, primary: bool = True,
                          content: str | None = None) -> str:
-    """A PUBLISH-ready edition: report.md v1 drafted, graph seeded, primary bound."""
+    """A PUBLISH-ready edition: report.md v1 drafted, graph seeded, primary bound.
+    ``pdf_report=None`` leaves the create_task default (True, default-ON)."""
     svc = ResearchService(drive=env.drive, scratch_root=env.scratch)
     task = (await svc.create_task(
         USER, title="tomato research", execution_mode="progressive",
@@ -102,8 +103,8 @@ async def _ready_project(env, *, with_graph: bool = True, with_report: bool = Tr
         p["stage"] = "PUBLISH"
         p["research_question"] = "does cooking raise lycopene?"
         p["primary_report_artifact_id"] = "report.md" if primary else ""
-        if pdf_report:
-            p["pdf_report"] = True
+        if pdf_report is not None:
+            p["pdf_report"] = pdf_report
     svc.atomic_update_project(USER, task, _seed)
     if with_report:
         await svc.write_scratch(USER, task, artifact_id="report.md",
@@ -151,10 +152,12 @@ async def test_compile_real_typst_produces_promoted_pdf(env):
     assert ref["artifact_id"] == "report.md@pdf"
     assert ref["published_from"] == {"artifact_id": "report.md", "version": 1}
     assert len(ref["pdf_sha256"]) == 64 and ref["pdf_size_bytes"] > 1000
-    assert "outputs/report.pdf" == ref["outputs_relative_path"]  # relative, never host path
+    # task publications land version-named in the TASK folder's outputs/ (2026-09-14)
+    assert ref["outputs_relative_path"] == "outputs/tomato research_v1.pdf"
+    assert ref["drive_path"].endswith("/outputs/tomato research_v1.pdf")
 
     # real bytes, in BOTH homes: scratch mirror + drive asset row
-    mirror = env.svc._project_dir(USER, task) / "outputs" / "report.pdf"
+    mirror = env.svc._project_dir(USER, task) / "outputs" / "tomato research_v1.pdf"
     assert mirror.is_file() and mirror.read_bytes().startswith(b"%PDF")
     asset = await env.drive.assets.get(uuid.UUID(ref["drive_asset_id"]))
     assert asset is not None and asset.mime_type == "application/pdf"
@@ -235,9 +238,10 @@ async def test_typst_failure_terminals_blocked_and_saves_nothing(env, monkeypatc
     assert run_id and "typst compilation failed" in str(exc.value)
     assert RunStore(env.runs).get_run(run_id)["state"] == "failed_blocked"
     # the drive and the scratch mirror were never touched
-    assert not (env.svc._project_dir(USER, task) / "outputs" / "report.pdf").exists()
+    mirror = env.svc._project_dir(USER, task) / "outputs" / "tomato research_v1.pdf"
+    assert not mirror.exists()
     assert all(
-        a.name != "report.pdf" for a in env.drive.assets.rows.values()
+        not str(a.name).endswith(".pdf") for a in env.drive.assets.rows.values()
     )
 
 
@@ -287,37 +291,57 @@ def test_plugin_shape_and_tool_schema(env):
 
 # ═════════════════════════════ publish gate integration ════════════════════════
 
-async def test_publish_default_unchanged_without_flag(env, monkeypatch):
-    """pdf_report absent -> zero artifact code runs (gate byte-identical)."""
-    import plugins.artifact.service as svc_mod
-
-    def _trip(*a, **k):
-        raise AssertionError("pdf branch entered without the opt-in flag")
-
-    monkeypatch.setattr(svc_mod, "run_typst_compile", _trip)
-    await _ready_project(env)
-    out = await _run_publish(env)
-    assert out.kind == "advanced" and out.next_stage is None
-    pub = _proj(env)["pipeline"]["publish"]
-    assert pub["status"] == "PROMOTED" and "pdf" not in pub
-    assert out.ledger == []
+def test_pdf_name_versioning_and_length_cap():
+    """Naming contract: task PDFs are ``<stem>_v{run_seq}.pdf`` with the stem
+    hard-capped at 64 chars (filesystem component limit safety); a skill project
+    without a cloud task folder keeps the stable ``report.pdf``."""
+    long = "研究" + "x" * 300
+    name = ArtifactCompileService._pdf_name(
+        {"cloud_folder_path": "T/task", "name": long, "run_seq": 7}
+    )
+    stem = name[: -len("_v7.pdf")]
+    assert len(stem) <= 64 and name.endswith("_v7.pdf") and stem.startswith("研究")
+    assert ArtifactCompileService._pdf_name({"name": "t", "run_seq": 2}) == "report.pdf"
 
 
 @requires_typst
-async def test_publish_with_flag_writes_pdf_sibling(env):
-    task = await _ready_project(env, pdf_report=True)
+async def test_publish_default_on_compiles_pdf_sibling(env):
+    """Default-ON (2026-09-14): a create_task'd project carries pdf_report=True,
+    so PUBLISH promotes the .md AND compiles the versioned PDF sibling."""
+    await _ready_project(env)
+    assert _proj(env)["pdf_report"] is True  # seeded by create_task itself
     out = await _run_publish(env)
-    assert out.kind == "advanced" and out.ledger == []
+    assert out.kind == "advanced" and out.next_stage is None
+    assert out.ledger == []
     pub = _proj(env)["pipeline"]["publish"]
     assert pub["status"] == "PROMOTED"          # markdown authority intact
     assert pub["pdf"]["state"] == "completed"
-    assert pub["pdf"]["outputs_relative_path"] == "outputs/report.pdf"
-    mirror = env.svc._project_dir(USER, task) / "outputs" / "report.pdf"
-    assert mirror.is_file() and mirror.read_bytes().startswith(b"%PDF")
+    assert pub["pdf"]["outputs_relative_path"] == "outputs/tomato research_v1.pdf"
+    assert "pdf_error" not in pub
 
 
-async def test_publish_pdf_failure_never_undoes_promotion(env, monkeypatch):
-    await _ready_project(env, pdf_report=True)
+async def test_publish_opt_out_skips_pdf_entirely(env, monkeypatch):
+    """Explicit ``pdf_report: False`` -> zero artifact code runs (gate byte-identical)."""
+    import plugins.artifact.service as svc_mod
+
+    def _trip(*a, **k):
+        raise AssertionError("pdf branch entered despite the explicit opt-out")
+
+    monkeypatch.setattr(svc_mod, "run_typst_compile", _trip)
+    await _ready_project(env, pdf_report=False)
+    out = await _run_publish(env)
+    assert out.kind == "advanced" and out.next_stage is None
+    pub = _proj(env)["pipeline"]["publish"]
+    assert pub["status"] == "PROMOTED" and "pdf" not in pub and "pdf_error" not in pub
+    assert out.ledger == []
+
+
+async def test_publish_pdf_failure_still_publishes_with_visible_reason(
+    env, monkeypatch,
+):
+    """Failure doctrine: ALWAYS publish, record the reason honestly — ledger AND
+    ``pipeline.publish.pdf_error``."""
+    await _ready_project(env)
     import plugins.artifact.service as svc_mod
     monkeypatch.setattr(
         svc_mod, "run_typst_compile", lambda *a, **k: (False, "boom"),
@@ -326,6 +350,7 @@ async def test_publish_pdf_failure_never_undoes_promotion(env, monkeypatch):
     assert out.kind == "advanced"               # the gate's verdict stands
     pub = _proj(env)["pipeline"]["publish"]
     assert pub["status"] == "PROMOTED" and "pdf" not in pub
+    assert pub["pdf_error"].startswith("ArtifactCompileError") and "boom" in pub["pdf_error"]
     ledger = out.ledger
     assert any(
         e.get("error_class") == "handler_error" and "pdf compile failed" in e.get("detail", "")

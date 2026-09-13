@@ -88,7 +88,7 @@ class ArtifactCompileService:
         research_service: Any,
         runs_root: Path | str,
         typst_bin: str = "typst",
-        typst_timeout_s: float = 180.0,
+        typst_timeout_s: float = 60.0,
     ) -> None:
         self._svc = research_service
         self._store = RunStore(Path(runs_root))
@@ -352,21 +352,30 @@ class ArtifactCompileService:
         # 8. Promotion through the SAME drive primitive promote_to_drive uses; the
         #    Markdown gate already ran upstream and remains the only publish
         #    authority — this is a SIBLING artifact, never a replacement.
+        #    Placement (product decision 2026-09-14): a chat task's PDF rides the
+        #    TASK's own cloud folder — ``<task folder>/outputs/<name>_v{run_seq}.pdf``
+        #    (outputs/ holds publication files only; the reviewed .md now archives
+        #    under temp/); a skill-driven project without a cloud folder keeps the
+        #    historical ``research/<project_id>/`` layout.
+        pdf_name = self._pdf_name(project)
+        cloud_root = str(project.get("cloud_folder_path") or "").strip()
+        drive_folder = f"{cloud_root}/outputs" if cloud_root else f"research/{project_id}"
         asset = await self._svc.drive.save_artifact(
             uuid.UUID(principal.owner_id),
-            name="report.pdf", mime_type=PDF_MIME, content=pdf_bytes,
-            folder_path=f"research/{project_id}",
+            name=pdf_name, mime_type=PDF_MIME, content=pdf_bytes,
+            folder_path=drive_folder,
         )
         outputs_dir = self._svc._project_dir(uuid.UUID(principal.owner_id), project_id) / "outputs"
         outputs_dir.mkdir(parents=True, exist_ok=True)
-        (outputs_dir / "report.pdf").write_bytes(pdf_bytes)
+        (outputs_dir / pdf_name).write_bytes(pdf_bytes)
 
         ref = ArtifactRef(
             run_id=run_id, state=RunState.COMPLETED.value,
             artifact_id=f"{record['artifact_id']}@pdf", project_id=project_id,
             pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
             pdf_size_bytes=len(pdf_bytes),
-            drive_asset_id=str(asset.id), drive_path=f"research/{project_id}/{asset.name}",
+            drive_asset_id=str(asset.id), drive_path=f"{drive_folder}/{asset.name}",
+            outputs_relative_path=f"outputs/{pdf_name}",
             published_from={"artifact_id": record["artifact_id"],
                             "version": record.get("version")},
             manuscript_sha256=store.get_document(run_id, "manuscript.json")["sha256"],
@@ -384,3 +393,16 @@ class ArtifactCompileService:
             self._store.transition(principal, run_id, RunState.FAILED_BLOCKED, note=note)
         except Exception:  # noqa: BLE001
             logger.warning("artifact run %s could not terminalize: %s", run_id, note)
+
+    @staticmethod
+    def _pdf_name(project: dict) -> str:
+        """Publication file name. A chat task version-names its PDF like the
+        edition lineage: ``<task name>_v{run_seq}.pdf`` — the stem is character-
+        cleaned and hard-capped at 64 chars so the ``_v{N}.pdf`` tail never pushes
+        the name past filesystem component limits. A skill-driven project without
+        a cloud task folder keeps the stable ``report.pdf``."""
+        if not str(project.get("cloud_folder_path") or "").strip():
+            return "report.pdf"
+        from plugins.research.plugin import _safe_filename  # local: avoid import cycle
+        stem = _safe_filename(str(project.get("name") or "report"))[:64].rstrip(". ")
+        return f"{stem or 'report'}_v{int(project.get('run_seq') or 1)}.pdf"

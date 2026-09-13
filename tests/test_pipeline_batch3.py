@@ -125,6 +125,9 @@ async def _at(env, stage: str, *, with_report: bool = True, question: str | None
     def _seed(p):
         p["driver"] = {**base, "run_id": rid, "execution_id": f"{rid}:1:1"}
         p["stage"] = stage
+        # This suite pins the gate/ledger mechanics; the PDF sibling (default-ON,
+        # needs the typst toolchain) is pinned in test_artifact_plugin.py instead.
+        p["pdf_report"] = False
         if question is not None:
             p["research_question"] = question
         if seed:
@@ -374,7 +377,10 @@ async def test_publish_promotes_substrate_terminal_advances(env, monkeypatch):
     pub = _proj(svc, task)["pipeline"]["publish"]
     assert pub["status"] == "PROMOTED" and pub["drive_asset_id"]
     assert pub["artifact"] == "report.md" and pub["version"] == 1
-    assert "outputs" in (pub["drive_path"] or "") or "research/" in (pub["drive_path"] or "")
+    # promoted .md is the run's intermediate of record: archived under temp/v{N}
+    # (2026-09-14 surface decision; outputs/ carries only the publication PDF)
+    dp = pub["drive_path"] or ""
+    assert "/temp/v" in dp or "outputs" in dp or "research/" in dp
     assert out.ledger == []
 
 

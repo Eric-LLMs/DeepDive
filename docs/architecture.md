@@ -1244,7 +1244,7 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Save a derived asset with its source | `assets.source_asset_id` (FK `ON DELETE CASCADE`) + content-hash dedup (`get_by_source_content`) |
 | Attach document images to RAG chunks | page/para markers → chunk `meta.pages` / `meta.image_ids` (union across pages, state machine covers unmarked blocks) |
 | Route the vision tool to a model | `tools.vision.model` → catalog model → route → credential (`_resolve_vision_channel`) |
-| Compile a publication PDF from the finalized manuscript | `ArtifactCompileService.compile_project_pdf` (`plugins/artifact/`): zero-LLM deterministic projection (`project_manuscript_to_ast`, inv. 11) → Typst CLI → drive binary + `outputs/report.pdf` mirror; opt-in `pdf_report` sibling branch of the PUBLISH node; responses are `ArtifactRef` only (inv. 9) — see §21 |
+| Compile a publication PDF from the finalized manuscript | `ArtifactCompileService.compile_project_pdf` (`plugins/artifact/`): zero-LLM deterministic projection (`project_manuscript_to_ast`, inv. 11) → Typst CLI → drive binary + `outputs/<task name>_v{N}.pdf` mirror; **default-ON** sibling branch of the PUBLISH node (opt out with `pdf_report: false`; a PDF fault still publishes and writes `pipeline.publish.pdf_error`) — see §21 |
 
 [↑ Back to top](#table-of-contents)
 
@@ -2197,23 +2197,18 @@ My Drive under the parent the user picked — the three work folders (`materials
 the first moment (and every later mirror independently back-fills a missing folder row):
 `materials/` (copies of selected cloud assets, named
 `<asset_id>__<safe_name>`); `temp/v1/ v2/ …` — one **permanent per-run subfolder** per `run_seq`,
-holding that run's working copies (`write_scratch` / `create_version` intermediates land in
-`temp/v{run_version}/<id>.md`, updated in place within a run, never clobbering an earlier run's
-folder) and the batch-fetched **evidence drafts** under `temp/v{run_version}/scrape/` (full page
+holding that run's working copies — `write_scratch` / `create_version` intermediates **and the reviewed
+report drafts** all land in `temp/v{run_version}/<id>.md`, updated in place within a run, never clobbering an
+earlier run's folder) and the batch-fetched **evidence drafts** under `temp/v{run_version}/scrape/` (full page
 text captured **server-side** by the EVIDENCE pipeline's `fetch_save_batch` — ≤5 URLs per internal
 fetch batch, cleaned — each usable draft persisted alongside a per-run provenance row, see the
-EVIDENCE paragraph below); and `outputs/<stem>_v<N>.md` — a run's promote **Create-New** final, versioned
-per run: the first promote of a run mints `outputs/<stem>_vN.md` and RAG-pends that asset, a
-re-promote inside the same run refreshes it in place (never a `_vN+1`), and a later run writes a fresh
-`_v{N+1}` that never overwrites or reuses an earlier final. Independent of promote, **report
-artifacts auto-mirror**: any artifact whose id contains `report` (e.g. `report`, `settle_report.md`)
-additionally projects into `outputs/<task name>.md` on every write during a versioned run — no
-version suffix: the run's first report write creates the file, later writes in the same run update
-it in place (the run ledger's `out_asset`), and a NEW run's report lands as a fresh file
-(collision-safe auto-suffix on the busy name); a report-mirror failure is logged and never fails
-the run's temp mirror. Non-report artifacts are intermediate working products and stay in
-`temp/vN` (promote remains their opt-in path to `outputs/`). The transient `driver.cloud_assets` ledger
-(folder/asset ids for the current run's `temp/vN` + `scrape/` + report `outputs/` projection) is reset by every
+EVIDENCE paragraph below); and the run's **promote final** — `temp/v{N}/<stem>_v{N}.md`: the first
+promote of a run mints it and RAG-pends that asset, a re-promote inside the same run refreshes it in
+place (never a `_vN+1`), and a later run writes `temp/v{N+1}/<stem>_v{N+1}.md`, never overwriting or
+reusing an earlier final. The reviewed Markdown is the *intermediate* of publication — kept per edition —
+while `outputs/` is reserved for **publication files only** (the Artifact Compiler's versioned PDF, §21).
+Non-report artifacts are likewise intermediate working products and stay in `temp/vN`. The transient
+`driver.cloud_assets` ledger (folder/asset ids for the current run's `temp/vN` + `scrape/`) is reset by every
 `begin_run` and is never a multi-run index; inside it, the driver's `_fetch_provenance` table records
 one row per evidence `source_url` fetched this run — the whitelist `research_scrape read` and the
 `verified` boundary consult (see the EVIDENCE paragraph below). The legacy no-run projection (a task promoted outside any
@@ -3415,7 +3410,7 @@ PDF. Two invariants govern every design choice:
 | Core (offline, zero-LLM) | `packages/artifact_compiler/` | `doc_ast` / `plan` models, `states` machine, `runstore` (portalocker CAS, fsync, `run_revision`), `projection`, `typst_compiler` + `templates/base.typ`, `visual_engine`, `validators`, `qa`, `repair`, `preflight`, `mapping`, `source` |
 | Service | `plugins/artifact/service.py` | `ArtifactCompileService` — the 8-hop pipeline drive over a real `ResearchService`: ACL check → latest non-ghost version → projection → QA → compile → binary persistence → `ArtifactRef` |
 | Plugin surface | `plugins/artifact/plugin.py` | thin `artifact` tool: `compile_pdf(project_id[, run_id])` / `status(run_id)`; lazy `drive` / `research_scratch` injection |
-| Pipeline seam | `plugins/research/handlers.py` → `node_publish` | opt-in sibling branch after Markdown promotion (see 21.5) |
+| Pipeline seam | `plugins/research/handlers.py` → `node_publish` | default-ON sibling branch after Markdown promotion (see 21.4) |
 
 Core depends on nothing from the app; the plugin holds no logic beyond argument
 marshalling — the same layering doctrine as the research plugins.
@@ -3429,8 +3424,8 @@ flowchart LR
     MP --> P
     P --> V[AST_CONTRACT_QA\nvalidators: section tree\nplan references]
     V --> T[Typst emit + typst CLI\npublication template]
-    T --> D[(drive asset\nresearch/&lt;proj&gt;/report.pdf\napplication/pdf)]
-    T --> O[(scratch mirror\noutputs/report.pdf)]
+    T --> D[(drive asset\n&lt;cloud task&gt;/outputs/\n&lt;name&gt;_v{N}.pdf)]
+    T --> O[(scratch mirror\noutputs/&lt;name&gt;_v{N}.pdf)]
     D --> R[ArtifactRef\nCOMPLETED]
     O --> R
     V -. hard fault .-> X[FAILED_BLOCKED\nnothing touches drive]
@@ -3460,22 +3455,32 @@ Determinism contracts (all content-derived, no randomness):
   wins per locator.
 
 Binary output uses the **same primitive as Markdown promotion** (`drive.save_artifact`,
-content-addressed + collision-suffixed names) plus the fixed-name scratch mirror
-`<project>/outputs/report.pdf`; `ArtifactRef` records `pdf_sha256`, `size`,
+content-addressed + collision-suffixed names) into the task's own cloud folder
+`<cloud_folder_path>/outputs/`, named `<safe(task name)>_v{run_seq}.pdf` (emoji / special chars
+stripped, stem hard-capped at 64 chars so the `_v{N}.pdf` version tail always survives) with the
+matching-name scratch mirror `<project>/outputs/<same>.pdf`; a skill project without a cloud task
+folder keeps the stable `report.pdf`. `ArtifactRef` records `pdf_sha256`, `size`,
 `drive_asset_id`, `manuscript_sha256`, and the `published_from {artifact_id, version}`
 provenance pair.
 
 ### 21.4 PUBLISH integration (the gate stays the sole authority)
 
-The PDF is a **post-promotion, opt-in sibling** inside `node_publish`:
+The PDF is a **post-promotion, default-ON sibling** inside `node_publish`
+(read as `project.get("pdf_report", True)`, so it applies to new *and* existing projects;
+`pdf_report: false` opts a task out entirely and the branch byte-identically does not run):
 
-* default OFF — a project without `pdf_report` set behaves exactly as before this module
-  existed; the Markdown gate remains the only publication verdict;
-* the branch runs **after** the report is promoted and the project state persisted;
-* a PDF failure records one append-only ledger line (`handler_error`, "published without
-  the optional PDF sibling") — it never un-promotes, never raises a `StructuralStop`, and
-  never blocks the gate; conversely the branch never clears a gate the Markdown check
-  failed: with an empty hand the run still blocks even when the flag is on.
+* the branch runs **after** the report is promoted and the project state persisted — the
+  Markdown gate remains the only publication verdict, and `outputs/` is the PDF's exclusive
+  home (the promoted Markdown intermediate now archives to `temp/v{N}/`, §20);
+* **failure doctrine — always publish, name the reason honestly.** Success persists
+  `pipeline.publish.pdf = <ArtifactRef>` and clears any earlier `pdf_error`; a fault (bad
+  preflight, failed/`TimeoutExpired` Typst subprocess capped at 60 s, empty graph) still
+  promotes the Markdown and terminalizes an honest `FAILED_BLOCKED` compile run, then records
+  **both** an append-only ledger line (`handler_error`, "published without the PDF sibling")
+  **and** `pipeline.publish.pdf_error = "<Type>: <msg>"` (truncated to 500 chars) so the task
+  status surface shows *why* there is no PDF. It never un-promotes, never raises a
+  `StructuralStop`, and never blocks the gate; conversely the branch never clears a gate the
+  Markdown check failed: with an empty hand the run still blocks even with the flag on.
 
 ### 21.5 Visual engine & toolchain notes
 
@@ -3491,11 +3496,14 @@ The PDF is a **post-promotion, opt-in sibling** inside `node_publish`:
 ### 21.6 Test doctrine
 
 The integration suite runs the **real typst CLI** (no mocks on the success path) and
-pins: real `%PDF` bytes in both drive and mirror, sha round-trip equality, provenance
+pins: real `%PDF` bytes in both drive and mirror at the versioned
+`<cloud task>/outputs/<name>_v{run_seq}.pdf` path, sha round-trip equality, provenance
 reload against a freshly-opened `RunStore`, replay idempotence, FAILED_BLOCKED on
-preflight/typst faults with zero drive writes, owner-scoped `status`, the default-OFF
-publish behavior, the opt-in flag persisting `pipeline.publish.pdf`, PDF-failure keeping
-the PROMOTED state, the gate-not-bypassed case, and multi-H1 / duplicate-title manuscripts
-(unique section ids + per-parent orders end-to-end).
+preflight/typst faults with zero drive writes, owner-scoped `status`, the **default-ON**
+`create_task` seeding, an explicit `pdf_report: false` skipping the branch entirely
+(monkeypatched tripwire), a PDF fault still PROMOTING the Markdown while writing a visible
+`pipeline.publish.pdf_error` (plus the ledger line), the gate-not-bypassed case, the
+`_pdf_name` versioning / 64-char-stem / CJK / skill-fallback naming contract, and multi-H1 /
+duplicate-title manuscripts (unique section ids + per-parent orders end-to-end).
 
 [↑ Back to top](#table-of-contents)

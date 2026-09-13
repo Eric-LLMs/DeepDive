@@ -197,11 +197,21 @@ keeps the binary mandatory and bundled).
 - `skills/research-artifact/` — the workflow policy: plan outline, per-section evidence
   packs, parallel writing (p-limit equivalent), judge prompting, repair-regeneration.
   Registered under SkillScopeEnforcer's `allowed_tools`.
-- Research-pipeline hook: PUBLISH gains an optional artifact-compiler branch — the
+- Research-pipeline hook: PUBLISH gains a **default-ON** artifact-compiler branch (read as
+  `project.get("pdf_report", True)`, so it applies to new *and* existing projects; an explicit
+  `pdf_report: false` opts a task out and the branch does not run at all) — the
   finalized manuscript (the edition's `primary_report_artifact_id` bytes) is projected
   via `project_manuscript_to_ast` as the run's authoritative content source (inv. 11),
-  compiled, and `report.pdf` promoted as a sibling publication artifact; Markdown
-  remains the default, so rollout is per-project, not breaking. WRITE/REVIEW semantics
+  compiled, and the PDF saved as a sibling publication artifact in the task's own cloud
+  folder at `outputs/<safe(task name)>_v{run_seq}.pdf` (emoji/special chars stripped, stem
+  capped at 64 chars; skill projects without a cloud folder keep `report.pdf`). The
+  reviewed Markdown intermediate is no longer published into `outputs/` — it archives to
+  `temp/v{N}/`. **Failure doctrine: publishing is never held hostage by the sibling** — a
+  PDF fault (bad preflight, failed/`TimeoutExpired` Typst subprocess capped at 60 s, empty
+  graph) still promotes the Markdown and terminalizes an honest `FAILED_BLOCKED` compile run,
+  surfacing the reason in both a ledger line and `pipeline.publish.pdf_error`; success writes
+  `pipeline.publish.pdf`. Markdown remains the sole publication authority, so the gate's
+  verdict is never bypassed, delayed, or revoked. WRITE/REVIEW semantics
   are unchanged; LLM re-authoring is opt-in only and never on the default path.
 
 ## 11. Phases

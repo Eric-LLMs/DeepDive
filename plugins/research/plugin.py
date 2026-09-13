@@ -902,8 +902,11 @@ def _current_user() -> uuid.UUID:
 
 
 def _safe_filename(name: str) -> str:
-    """Strip path/control characters so a user-supplied asset name stays a single filename."""
-    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name or "file").strip()
+    """Strip path/control characters and pictographic emoji so a user-supplied
+    asset name stays a single clean filename (CJK and other word scripts pass
+    through untouched)."""
+    cleaned = re.sub(r'[\U0001F000-\U0001FAFF☀-➿️‍]', "", name or "")
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", cleaned or "file").strip()
     cleaned = cleaned.rstrip(". ")
     return (cleaned or "file")[:120]
 
@@ -2004,8 +2007,9 @@ class ResearchService:
             rv = self._run_version_of(project)
             if rv:
                 # Versioned task path: promotion CREATES a NEW versioned final asset
-                # ``outputs/<stem>_v{rv}.md`` (Create-New — never Move/Rename or reuse the
-                # temp/vN working copy, which stays intact; red line 2). The run ledger holds
+                # ``temp/v{rv}/<stem>_v{rv}.md`` (Create-New — never Move/Rename or reuse the
+                # temp working-copy file identity; red line 2 holds: promote records a fresh
+                # asset, the working copy is untouched). The run ledger holds
                 # the promoted asset so single-run retries are strongly idempotent: a re-promote
                 # in the SAME run (even after a new scratch version) updates that one asset in
                 # place instead of minting ``_v{rv+1}`` (safety rule 5); only a NEW begin_run
@@ -2071,13 +2075,16 @@ class ResearchService:
         promote_idempotency_key: str | None,
     ) -> dict:
         self.assert_auto_run_authority(owner_id, project_id)  # F2: fence before asset create
-        """Create/refresh the ONE versioned final asset for this artifact+run in ``outputs/``.
+        """Create/refresh the ONE versioned final asset for this artifact+run.
 
-        First promote of a run mints ``outputs/<stem>_v{run_version}.md`` (Create-New). Any
-        later promote inside the SAME run — including after the agent mints a new scratch
-        version — reuses that same asset (``update_content`` in place), so a run never produces
-        a second ``_v{N}`` file. The promoted id + path live on the run's ``cloud_assets``
-        ledger (persisted only when newly created).
+        Since the 2026-09-14 publication-surface decision the promoted .md is an
+        INTERMEDIATE of record, archived beside its run: first promote of a run mints
+        ``temp/v{run_version}/<stem>_v{run_version}.md`` (Create-New). Any later promote
+        inside the SAME run — including after the agent mints a new scratch version —
+        reuses that same asset (``update_content`` in place), so a run never produces a
+        second ``_v{N}`` file. The promoted id + path live on the run's ``cloud_assets``
+        ledger (persisted only when newly created). ``outputs/`` is left to the
+        publication PDF compiled by the artifact service.
         """
         cloud_root = project["cloud_folder_path"]
         # P3-6: overlay buffered merges so a same-turn re-promote still finds its entry.
@@ -2089,28 +2096,30 @@ class ResearchService:
         out_asset = entry.get("out_asset")
         out_name = entry.get("out_name")
         newly_created = False
+        rel_dir = f"temp/v{run_version}"
         if out_asset and out_name:
             # Same-run re-promote after a new scratch version: refresh in place, never a v+1.
             await self.drive.update_content(owner_id, uuid.UUID(out_asset), record["content"])
         else:
+            await self._ensure_cloud_dir(owner_id, project, rel_dir)
             out_name = f"{_report_stem(artifact_id)}_v{run_version}.md"
             asset = await self.drive.save_artifact(
                 owner_id,
                 name=out_name,
                 mime_type="text/markdown",
                 content=record["content"].encode("utf-8"),
-                folder_path=f"{cloud_root}/outputs",
+                folder_path=f"{cloud_root}/{rel_dir}",
                 workspace_id=None,
             )
             out_asset = str(asset.id)
             entry["out_asset"] = out_asset
             entry["out_name"] = out_name
-            entry["out_path"] = f"{cloud_root}/outputs/{out_name}"
+            entry["out_path"] = f"{cloud_root}/{rel_dir}/{out_name}"
             newly_created = True
         await self.drive.mark_rag_pending(uuid.UUID(out_asset))
         record["status"] = "PROMOTED"
         record["drive_asset_id"] = out_asset
-        record["drive_path"] = f"{cloud_root}/outputs/{out_name}"
+        record["drive_path"] = f"{cloud_root}/{rel_dir}/{out_name}"
         record["rag_status"] = "PENDING"
         record["promote_idempotency_key"] = promote_idempotency_key
         record["updated_at"] = _now_iso()
@@ -2345,6 +2354,9 @@ class ResearchService:
             "cloud_folder_path": cloud_folder["path"],
             "materials": [],
             "cloud_mirrors": {},
+            "pdf_report": True,         # publication PDF is default-ON (2026-09-14):
+                                        # PUBLISH compiles outputs/<name>_v{N}.pdf after
+                                        # the Markdown gate; set explicitly False to opt out
             "run_seq": 0,               # monotonic per-run version (bumped atomically in begin_run)
             "project_revision": 0,      # monotonic version; bumped by every atomic commit
             "driver": None,             # driver checkpoint (materialized on first run)
@@ -2359,7 +2371,7 @@ class ResearchService:
             # outputs or temp run yet still shows all three in the drive). ``temp/`` holds one
             # per-run ``v{N}`` subfolder (created lazily by the first run). Get-or-create by
             # exact path so a stale/trashed same-name row can never leave the task folder
-            # missing ``outputs/`` (the folder the user's reports must land in).
+            # missing ``outputs/`` (the folder the user's publication PDFs must land in).
             existing_paths = {
                 f.get("path") for f in await self.drive.list_folders(owner_id)
             }
@@ -2477,13 +2489,12 @@ class ResearchService:
 
         - **Versioned run** (``driver.run_version`` set): the working copy mirrors into
           ``temp/v{N}/<stem>.md`` (``_report_stem`` — an id already ending in ``.md`` gains
-          exactly one suffix, never ``.md.md``). Report artifacts additionally mirror into
-          ``outputs/<task name>_v{N}.md`` — the run version rides the FILENAME (T2: this is
-          what makes the outputs file traceable back to ``temp/v{N}``). The
-          run's ``cloud_assets`` ledger holds the temp/out asset ids so a same-run rewrite
-          updates in place and a *later* run writes a new file (the ids are
-          deliberately NOT stored on the shared version record — that would leak one run's
-          asset id into the next run). ``record["cloud_output_asset_id"]`` stays untouched.
+          exactly one suffix, never ``.md.md``). Report artifacts mirror there TOO — since
+          the 2026-09-14 publication-surface decision, ``outputs/`` carries PUBLICATION
+          FILES ONLY (the versioned PDF), the .md draft is an intermediate that lives with
+          the run's temp tree. The run's ``cloud_assets`` ledger holds the temp asset id so
+          a same-run rewrite updates in place. ``record["cloud_output_asset_id"]`` stays
+          untouched.
         - **Legacy / no run**: the previous in-place ``outputs/<artifact_id>.md`` projection
           with the asset id carried on the record (unchanged behaviour).
 
@@ -2537,19 +2548,7 @@ class ResearchService:
             except Exception:
                 logger.exception("research run-temp mirror failed for %s", record["artifact_id"])
                 return False
-            if _is_report_artifact(record["artifact_id"]):
-                try:
-                    # T2: filename = task name + run version (``<task>_v{N}.md``): the first
-                    # report write of a run creates it; later writes of the SAME run update it
-                    # in place (``out_asset``); a NEW run lands as its own ``_v{N+1}`` file —
-                    # traceable 1:1 to the run's ``temp/v{N}`` folder.
-                    created_new |= await _mirror(
-                        "outputs",
-                        f"{_safe_filename(project.get('name') or 'report')}_v{rv}.md",
-                        "out_asset",
-                    )
-                except Exception:
-                    logger.exception("research report-output mirror failed for %s", record["artifact_id"])
+            # (2026-09-14) no report→outputs special case: outputs/ is publication-only.
             self._merge_cloud_assets(
                 owner_id, record["project_id"], {"_dirs": dirs, key: entry}
             )
