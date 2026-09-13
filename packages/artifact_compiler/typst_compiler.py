@@ -227,7 +227,6 @@ def compile_typst(
         f"    title: \"{_string_literal(meta.title)}\",\n"
         f"    author: ({authors}),\n"
         f"    keywords: ({keywords}),\n"
-        "    creator: \"deepdive-artifact-compiler\",\n"
         ")"
     )
     if warning_banner:

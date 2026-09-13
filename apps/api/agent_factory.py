@@ -42,6 +42,7 @@ from core.infrastructure.web_search import get_web_search_provider
 from rag import RAGPipeline, build_pipeline
 from rag.query_cache import wrap_retriever
 
+from plugins.artifact.plugin import register_artifact_plugins
 from plugins.research.plugin import register_research_plugins
 
 # Lightweight singletons
@@ -220,6 +221,7 @@ def get_agent_kernel() -> AgentKernel:
     register_builtin_plugins(manager)
     register_toolkit_plugins(manager, ctx, llm)
     register_research_plugins(manager, ctx)
+    register_artifact_plugins(manager, ctx)
     manager.discover(settings.plugins_dir)
 
     # Now that every plugin/skill is discovered and registered, refuse to start when the full

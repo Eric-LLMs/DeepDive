@@ -110,7 +110,7 @@ QUEUED → ENV_PREFLIGHT → EVIDENCE_PROVIDING → PLANNING → WRITING
 | `REPAIR_LOOP` | active | targeted block/asset regen (skill-side LLM), ≤3 attempts, then global re-compile |
 | `COMPLETED` | terminal | grounding 100% supported; PDF publishable |
 | `NEEDS_REVIEW` | terminal | partial/flagged grounding; PDF publishable **with warnings banner** only |
-| `FAILED_BLOCKED` | terminal | attempts exhausted; PDF diagnostic-only, never marked valid |
+| `FAILED_BLOCKED` | terminal | attempts exhausted **or hard fault** (preflight/typst/contract failure) from any active state; PDF diagnostic-only, never marked valid |
 | `CANCELLED` | terminal | from any state |
 | `BUDGET_EXCEEDED` | terminal | from any state (RunBudget power-cut semantics) |
 
@@ -148,12 +148,18 @@ DeepDive rules bolted on:
 | `validators.py` | `validate_section_tree` | single root, acyclic, no orphans, sibling `order` unique & contiguous |
 | | `validate_plan_references` | claim-req parents exist; all evidence ids resolve in the EvidenceSet |
 | `projection.py` | `project_manuscript_to_ast` (inv. 11) | pure markdown→AST: verbatim text, syntax-only transforms, fail-closed on body-before-title; `citation_markers` carries graph anchors through unchanged |
+| `mapping.py` | `graph_evidence` / `graph_citations` / `provenance_map` | identity transport (inv. 11 req. 6): artifact `evidence_id` **==** Research OS graph node id; no re-grounding, no invented citations |
 
 ## 8. Visual engine (decided: worker-bundled mmdc + chromium)
 
 Rationale (vs Kroki sidecar): Core must stay runnable **offline / standalone / per-dev** —
 a sidecar breaks “clone, `npm i`, run tests”. The ~400 MB chromium layer in the worker
 image is accepted cost; isolation is enforced in-process instead:
+
+The preflight `mmdc` gate is configurable (`PreflightConfig.require_mmdc`, default
+`True`): the visuals-free manuscript-projection path passes `False` — a scoping of
+the gate to what the run can actually render, not a weakening (the worker image
+keeps the binary mandatory and bundled).
 
 - `asyncio.create_subprocess_exec` on `mmdc` with **timeout kill**, and OS limits:
   POSIX `preexec_fn` (`RLIMIT_AS`/`RLIMIT_CPU`); Windows dev falls back to timeout-only.

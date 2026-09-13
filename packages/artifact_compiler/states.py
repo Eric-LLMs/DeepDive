@@ -77,9 +77,14 @@ _STAGED: dict[RunState, set[RunState]] = {
     },
 }
 
-# Every active state (including REPAIR_LOOP) can also be cut short by the two interrupts.
+# Every active state (including REPAIR_LOOP) can also be cut short by the two
+# interrupts — and by FAILED_BLOCKED on a HARD fault (preflight missing a binary,
+# a failing Typst compile, an unpatchable contract violation): the run must
+# terminalize honestly, never hang or loop (docs/19 DoD terminal-state
+# compliance). The repair-budget path (REPAIR_LOOP ⇒ FAILED_BLOCKED) stays;
+# this widens only the fault source, never the terminal semantics.
 for _s in _STAGED:
-    _STAGED[_s] |= {RunState.CANCELLED, RunState.BUDGET_EXCEEDED}
+    _STAGED[_s] |= {RunState.CANCELLED, RunState.BUDGET_EXCEEDED, RunState.FAILED_BLOCKED}
 
 TRANSITIONS: dict[RunState, frozenset[RunState]] = {
     **{s: frozenset(t) for s, t in _STAGED.items()},

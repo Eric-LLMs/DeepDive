@@ -43,11 +43,10 @@ import asyncio
 import inspect
 import json
 import logging
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from core.infrastructure.web_fetch import canonical_url as canonicalize
-
-from plugins.research.plugin import MATERIALS_PROTO
 
 from plugins.research.pipeline import (
     CONTRACTS,
@@ -57,6 +56,7 @@ from plugins.research.pipeline import (
     parse_json_reply,
     register_handler,
 )
+from plugins.research.plugin import MATERIALS_PROTO
 
 logger = logging.getLogger("research.handlers")
 
@@ -169,7 +169,7 @@ def _latest_artifact_text(service: Any, owner_id: Any, project_id: str,
     return record.get("content")
 
 
-def _user_brief(ctx: "NodeCtx") -> str:
+def _user_brief(ctx: NodeCtx) -> str:
     """The creation-time user brief (task_spec title + description) as a prompt block.
 
     Loaded into every node's ctx.facts by the pipeline regardless of entry path
@@ -194,7 +194,7 @@ def _user_brief(ctx: "NodeCtx") -> str:
     )
 
 
-def _brief_dict(ctx: "NodeCtx") -> dict:
+def _brief_dict(ctx: NodeCtx) -> dict:
     """Same brief as a JSON-able record for structured prompt payloads."""
     spec = ctx.facts.get("task_spec") or {}
     title = str(spec.get("title") or "").strip()
@@ -322,7 +322,7 @@ async def node_discover(ctx: NodeCtx) -> None:
         try:
             await asyncio.wait_for(_ingest_materials(),
                                    timeout=MATERIALS_INGEST_TIMEOUT_S)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             ctx.record(attempt=1, error_class="source_unavailable",
                        detail=f"channel materials: exceeded {MATERIALS_INGEST_TIMEOUT_S:.0f}s ingest timeout",
                        missing="materials",
@@ -1074,7 +1074,7 @@ def _render_scorecard(ctx: NodeCtx) -> str:
     graph = ctx.service._load_graph(ctx.owner_id, ctx.project_id)
     pipe = project.get("pipeline") or {}
     nodes = [n for n in graph.get("nodes") or [] if isinstance(n, dict)]
-    by_type = lambda t: [n for n in nodes if n.get("type") == t]  # noqa: E731
+    by_type = lambda t: [n for n in nodes if n.get("type") == t]
     sources, claims = by_type("Source"), by_type("Claim")
     verified = [s for s in sources if s.get("verification_status") == "verified"]
     anchored = [c for c in claims if c.get("citations") and c.get("strength")]
@@ -1361,3 +1361,23 @@ async def node_publish(ctx: NodeCtx) -> None:
             "idempotent": bool(view.get("idempotent")),
         }
     ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist)
+
+    # Optional PDF sibling (docs/19 §10): only when the project opted in via the
+    # ``pdf_report`` flag — default behavior is unchanged. The Markdown promotion
+    # above remains the sole publish authority: a PDF failure is a ledger note, it
+    # never un-promotes and never raises StructuralStop (the gate is not bypassed
+    # in either direction).
+    if project.get("pdf_report"):
+        try:
+            from plugins.artifact.service import ArtifactCompileService
+            ref = await ArtifactCompileService.for_research(ctx.service).compile_project_pdf(
+                ctx.owner_id, ctx.project_id,
+            )
+
+            def _persist_pdf(p: dict) -> None:
+                p.setdefault("pipeline", {}).setdefault("publish", {})["pdf"] = ref
+            ctx.service.atomic_update_project(ctx.owner_id, ctx.project_id, _persist_pdf)
+        except Exception as exc:  # noqa: BLE001 — sibling fault, never the gate's verdict
+            ctx.record(attempt=1, error_class="handler_error",
+                       detail=f"pdf compile failed: {type(exc).__name__}: {exc}"[:500],
+                       impact="published without the optional PDF sibling")

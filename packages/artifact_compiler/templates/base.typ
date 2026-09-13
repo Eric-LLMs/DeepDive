@@ -35,7 +35,7 @@
 
 // ── headings: numbering + keep-with-next (widow/orphan protection) ──────────
 #set heading(numbering: (..nums) => {
-  let n = nums.pos.filter(v => v != none)
+  let n = nums.pos().filter(v => v != none)
   if n.len() <= 3 { n.map(v => str(v)).join(".") + "." } else { none }
 })
 #show heading: it => {
@@ -45,8 +45,14 @@
   set text(size: 16pt, weight: "bold")
   block(breakable: false, above: 1.6em, below: 0.8em)[#it]
 }
-#show heading.where(level: 2): it => set text(size: 13pt, weight: "bold")
-#show heading.where(level: 3): it => set text(size: 11.5pt, weight: "bold")
+#show heading.where(level: 2): it => {
+  set text(size: 13pt, weight: "bold")
+  it
+}
+#show heading.where(level: 3): it => {
+  set text(size: 11.5pt, weight: "bold")
+  it
+}
 
 // ── table look ───────────────────────────────────────────────────────────────
 #set table(
@@ -67,7 +73,7 @@
     "warning":     (fill: rgb("#fff4f4"), stroke: rgb("#c45b3b")),
     "evidence":    (fill: rgb("#f2f7f2"), stroke: rgb("#4a8f4a")),
   )
-  let c = palette.at(kind, palette."evidence")
+  let c = palette.at(kind, palette.at("evidence"))
   block(
     fill: c.fill,
     stroke: (left: 2.5pt + c.stroke),
@@ -98,4 +104,4 @@
 #let refEntry(num, label) = [#text(weight: "bold")[#num] #h(0.5em) #label]
 
 // numeric citation marker rendered as a superscript in running text
-#let cnum(n) = text(size: 7pt, baseline: 45%)[#n]
+#let cnum(n) = text(size: 7pt, baseline: 0.45em)[#n]

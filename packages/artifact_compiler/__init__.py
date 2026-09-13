@@ -8,6 +8,7 @@ skill layers. Semantic decisions (writing, judging, repair-regeneration) belong 
 the Skill/agent layer, which feeds validated payloads in through :mod:`runstore`.
 """
 
+from artifact_compiler.mapping import graph_citations, graph_evidence, provenance_map
 from artifact_compiler.plan import (
     ArtifactPlan,
     GenerationBudget,
@@ -65,8 +66,11 @@ __all__ = [
     "apply_patch",
     "compile_typst",
     "density_issues",
+    "graph_citations",
+    "graph_evidence",
     "load_default_template",
     "project_manuscript_to_ast",
+    "provenance_map",
     "reduce_grounding",
     "sanitize_svg",
     "validate_plan_references",

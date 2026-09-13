@@ -16,7 +16,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_PROBE_TYP = "#set page(width: 6cm, height: 3cm)\n#set text(font: (\"Libertinus Serif\", \"Noto Sans CJK SC\", \"DejaVu Sans Mono\"))\nTest 文字 123 $int_0 x$\n"
+_PROBE_TYP = "#set page(width: 6cm, height: 3cm)\n#set text(font: (\"Libertinus Serif\", \"Noto Serif SC\", \"DejaVu Sans Mono\"))\nTest 文字 123 $integral_0 x$\n"
 
 
 class PreflightFailure(RuntimeError):
@@ -30,6 +30,10 @@ class PreflightConfig:
     min_typst_version: tuple[int, ...] = (0, 11)
     font_probe: bool = True          # micro-compile that requires Latin+CJK+Mono+Math
     command_timeout_s: int = 30
+    # Visual-free runs (the manuscript-projection path never renders a Mermaid
+    # asset) may skip the mmdc gate; the worker image keeps it mandatory by
+    # default — this is scoping, not weakening.
+    require_mmdc: bool = True
 
 
 @dataclass
@@ -92,16 +96,17 @@ def run_preflight(cfg: PreflightConfig | None = None) -> PreflightReport:
         except (subprocess.TimeoutExpired, OSError) as exc:
             report.add("typst_cli", False, str(exc))
 
-    # 2. mmdc present
-    mmdc_path = shutil.which(cfg.mmdc_bin)
-    if mmdc_path is None:
-        report.add("mmdc_cli", False, f"{cfg.mmdc_bin!r} not found on PATH")
-    else:
-        try:
-            rc, out, err = _run([mmdc_path, "--version"], cfg.command_timeout_s)
-            report.add("mmdc_cli", rc == 0, (out or err).strip()[:200])
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            report.add("mmdc_cli", False, str(exc))
+    # 2. mmdc present (mandatory for runs that may render visuals)
+    if cfg.require_mmdc:
+        mmdc_path = shutil.which(cfg.mmdc_bin)
+        if mmdc_path is None:
+            report.add("mmdc_cli", False, f"{cfg.mmdc_bin!r} not found on PATH")
+        else:
+            try:
+                rc, out, err = _run([mmdc_path, "--version"], cfg.command_timeout_s)
+                report.add("mmdc_cli", rc == 0, (out or err).strip()[:200])
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                report.add("mmdc_cli", False, str(exc))
 
     # 3. font stack probe: real micro-compile (Latin + CJK + Mono + Math glyphs)
     if cfg.font_probe:
