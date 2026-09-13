@@ -4733,12 +4733,19 @@
     return !!(l && (l.status === "queued" || l.status === "running"));
   });
 
-  // Document viewer actions (pdf/docx/doc/text/sheet/pptx): Upload / Import / Generate.
-  // Cloud assets act on the existing drive asset (no re-upload); local files upload on demand.
-  Viewer.setDocumentActions(({ path, name }) => {
-    const cloud = window.__cloudDriveActive === true ? (window.__getViewerCloudFile?.() || null) : null;
+  // Document viewer actions (pdf/docx/doc/text/sheet/pptx): Download / Upload / Import / Generate.
+  // Cloud assets act on the existing drive asset — the toolbar offers Download (export a local
+  // copy) and NEVER Upload (re-uploading the file's own cloud bytes would mint a duplicate);
+  // local files still upload on demand. The viewer passes its bound cloud row (research preview)
+  // via `cloud`; the Cloud Drive panel's viewerCloudFile stays the fallback source.
+  Viewer.setDocumentActions(({ path, name, cloud: bound }) => {
+    const cloud = bound || (window.__cloudDriveActive === true ? (window.__getViewerCloudFile?.() || null) : null);
+    const isCloudAsset = !!(cloud && cloud.id);
     return {
-      upload: cloud && cloud.id ? null : () => uploadCurrentToCloud({ path, name }),
+      upload: isCloudAsset ? null : () => uploadCurrentToCloud({ path, name }),
+      download: isCloudAsset
+        ? () => { if (window.exportCloudFile) window.exportCloudFile(cloud); }
+        : null,
       importRepo: () => importFileToRepo({ path, name, cloud }),
       generate: (tool) => openFileGenerateDialog(tool, { path, name, cloud, sourceLabel: "The currently open file", jobsMap: docGenJobs }),
     };

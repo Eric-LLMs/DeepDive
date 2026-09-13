@@ -1392,7 +1392,9 @@
       previewPlaceholder(`Open failed: ${(cres && cres.error) || "unknown error"}`);
       return;
     }
-    Viewer.render(cres.path, f.name, { mount: previewBodyEl });
+    // `cloud: f` binds the rendered local cache to its Drive asset — the document
+    // toolbar then offers Download (export the asset) instead of Upload.
+    Viewer.render(cres.path, f.name, { mount: previewBodyEl, cloud: f });
   }
 
   // After a monitor refetch, live-refresh the open file if the agent rewrote it (size changed).

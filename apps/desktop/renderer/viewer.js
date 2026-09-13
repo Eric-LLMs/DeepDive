@@ -1,7 +1,7 @@
 // Viewer: dispatch a file to the right in-window renderer by extension, falling back
 // to the OS default app for formats the window can't render natively.
 const Viewer = (() => {
-  const state = { path: null, name: null, kind: null, openPath: null, zoom: 1 };
+  const state = { path: null, name: null, kind: null, openPath: null, cloudFile: null, zoom: 1 };
 
   // app.js registers this so every file toolbar can offer "attach to chat". The handler
   // receives "file" (attach the currently-open file) or "screenshot" (capture the window).
@@ -226,6 +226,7 @@ const Viewer = (() => {
     state.name = null;
     state.kind = null;
     state.openPath = null;
+    state.cloudFile = null;
     if (mounted) return; // a column-mounted doc leaves no "empty state" in the main viewer
     const empty = document.createElement("div");
     empty.id = "viewer-empty";
@@ -315,8 +316,17 @@ const Viewer = (() => {
     // drive asset directly. app.js registers docActions; opening a file never uploads it.
     const DOC_KINDS = new Set(["pdf", "docx", "doc", "text", "sheet", "pptx"]);
     if (docActions && DOC_KINDS.has(state.kind)) {
-      const acts = docActions({ path: state.openPath || state.path, name: state.name });
+      const acts = docActions({ path: state.openPath || state.path, name: state.name, cloud: state.cloudFile });
       if (acts) {
+        // A cloud asset is open: the useful action is DOWN (save a local copy) —
+        // "uploading" its own cloud bytes back would only mint a duplicate.
+        if (acts.download) {
+          const dlBtn = document.createElement("button");
+          dlBtn.textContent = "⬇ Download";
+          dlBtn.title = "Save this file to your computer";
+          dlBtn.onclick = () => acts.download();
+          bar.appendChild(dlBtn);
+        }
         if (acts.upload) {
           const upBtn = document.createElement("button");
           upBtn.textContent = "⬆ Upload";
@@ -1325,6 +1335,10 @@ const Viewer = (() => {
     state.name = name;
     state.kind = kindFor(name);
     state.openPath = filePath;
+    // The cloud asset backing this local render path, when the opener is showing a
+    // Drive file (research preview / cloud drive). Toolbars act on it directly
+    // (Download / Import / Generate) instead of treating the cache as a local upload.
+    state.cloudFile = (opts && opts.cloud) || null;
     return dispatch(state.kind, filePath, name);
   }
 
