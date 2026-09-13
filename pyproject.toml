@@ -90,6 +90,7 @@ packages = [
     "packages/rag",
     "packages/core",
     "packages/workflow",
+    "packages/artifact_compiler",
     "packages/shared/proto/retrieval",
     "apps/api",
 ]
