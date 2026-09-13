@@ -514,7 +514,7 @@
       // ``state.sessionId``) before the gate card / note logic below decides whether this task's
       // session is the one on screen. Without the await, a first open of an already-parked task
       // sees the *previous* session id and skips both the note reload and the Approve/Reject card.
-      await window.openResearchSession(detail.task_id, detail.name || detail.task_id, detail.session_id || null);
+      await window.openResearchSession(detail.task_id, detail.name || detail.task_id, detail.session_id || null, detail.description || "");
     }
     if (!statusBody) return;
     statusBody.innerHTML = "";
@@ -1005,8 +1005,45 @@
     actions.appendChild(delBtn);
     head.appendChild(actions);
     card.appendChild(head);
-    if (detail.description) {
-      const desc = el("div", "rtv-desc", detail.description);
+    // The description is the research brief fed to every run. It is a plain text input
+    // here: blur saves it via PATCH /research/tasks/{id} into task_spec.json, which the
+    // pipeline re-reads at each node — so the loop is "tweak description → ▶ Run again →
+    // the next report is generated with the updated content".
+    {
+      const desc = document.createElement("textarea");
+      desc.className = "rtv-desc rtv-desc-edit";
+      desc.rows = 3;
+      desc.value = detail.description || "";
+      desc.placeholder = "Research description — saved on blur and used by the next run";
+      desc.title = "The text every run receives as your research brief; edit and press ▶ Run to regenerate the report";
+      let lastSaved = desc.value;
+      let saving = false;
+      const save = async () => {
+        const next = desc.value.trim();
+        if (saving || next === lastSaved.trim()) return;
+        saving = true;
+        desc.disabled = true;
+        try {
+          const res = await apiFetch(`/research/tasks/${encodeURIComponent(detail.task_id)}`, {
+            method: "PATCH", body: JSON.stringify({ description: next }),
+          });
+          lastSaved = (res && res.description) || next;
+          detail.description = lastSaved;
+          toast("Description saved — the next run uses it.");
+          // Mirror the new brief onto the chat 🔬 sub-bar without a session re-open.
+          if (window.applyResearchDescription) window.applyResearchDescription(detail.task_id, lastSaved);
+        } catch (e) {
+          toast(`Description save failed: ${e.message}`);
+        } finally {
+          saving = false;
+          desc.disabled = false;
+        }
+      };
+      desc.addEventListener("blur", save);
+      desc.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); }
+        e.stopPropagation(); // typing here must not trigger global chat shortcuts
+      });
       card.appendChild(desc);
     }
     const meta = el("div", "rtv-meta");

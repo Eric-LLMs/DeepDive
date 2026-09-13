@@ -25,3 +25,14 @@ class TaskCreateRequest(BaseModel):
     # advance (failure ledger + force advance; structural inability terminalizes via
     # StructuralStop), so the entry default is 'progressive'; strict remains selectable.
     execution_mode: Literal["strict", "progressive"] = "progressive"
+
+
+class TaskBriefUpdate(BaseModel):
+    """The one human-writable field after creation: the task's description (research brief).
+
+    The pipeline re-reads ``task_spec.json`` at every node entry, so a saved edit is the
+    input to the *next* run — the loop "edit description → re-run → report improves".
+    Empty/blank resets to the server's DEFAULT_RESEARCH_DESCRIPTION (same rule as create).
+    """
+
+    description: str = Field(default="", max_length=4000)

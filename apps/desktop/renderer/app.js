@@ -1572,6 +1572,9 @@
       // auto-sent by the Run control): announce the run so Run / Delete Task disable and the
       // Run button switches to its running style on every research surface.
       if (window.researchRunActive) window.researchRunActive(research.task_id, true);
+      // Refresh the top bar on EVERY new message (repeat runs included), not only when a run
+      // starts — a description/title saved from the task view lands here on the next send.
+      updateResearchChip();
     }
     const payload = { message, session_id: state.sessionId ?? undefined, ...extra };
     if (!state.token) payload.user_id = state.guestId ?? undefined;
@@ -1800,6 +1803,11 @@
           try {
             const saved = await renameSession(state.sessionId, next);
             chatTitle.textContent = saved || next || "New chat";
+            // Keep the 🔬 sub-bar in sync when this session belongs to a research task.
+            if (state.activeResearch && state.activeResearch.session_id === state.sessionId) {
+              state.activeResearch.display_title = saved || next || "";
+              updateResearchChip();
+            }
             loadSessions();
           } catch (err) {
             chatTitle.textContent = current;
@@ -2068,7 +2076,21 @@
     const title = bar.querySelector(".crc-title");
     const st = bar.querySelector(".crc-stage");
     const m = bar.querySelector(".crc-mode");
-    if (title) title.textContent = `🔬 Research · ${info.name || info.task_id}`;
+    const d = bar.querySelector(".crc-desc");
+    // display_title: session rename made from this bar or #chat-title; the task name otherwise.
+    const shownTitle = info.display_title || info.name || info.task_id;
+    if (title) {
+      title.textContent = `🔬 Research · ${shownTitle}`;
+      title.title = "Click to rename this task's chat title";
+    }
+    // The creation-time description, echoed read-only on its own line under the title; the
+    // editor lives in the Research task view (saving there calls back into applyResearchDescription).
+    if (d) {
+      const desc = info.description || "";
+      d.textContent = desc;
+      d.classList.toggle("hidden", !desc);
+      d.title = "Description set when the task was created (edit it in the task view)";
+    }
     if (st) {
       if (stage) { st.textContent = stage; st.classList.remove("hidden"); }
       else st.classList.add("hidden");
@@ -2091,6 +2113,14 @@
     header.classList.add("research-mode"); // hides the truncated #chat-title in the top bar
   }
   window.updateResearchChip = updateResearchChip;
+  // The task view saved a new description (server truth after the PATCH): mirror it onto the
+  // chat's 🔬 sub-bar immediately, without a full session re-open.
+  window.applyResearchDescription = (taskId, desc) => {
+    if (state.activeResearch && state.activeResearch.task_id === taskId) {
+      state.activeResearch.description = desc || "";
+      updateResearchChip();
+    }
+  };
   const researchBarEl = document.getElementById("chat-research-bar");
   if (researchBarEl) {
     researchBarEl.addEventListener("click", () => {
@@ -2100,6 +2130,62 @@
         window.selectResearchTask(state.activeResearch.task_id, state.activeResearch.name);
       }
     });
+    // The title text is an inline-rename target, not part of the bar's jump-to-task gesture.
+    const researchTitleEl = researchBarEl.querySelector(".crc-title");
+    if (researchTitleEl) {
+      researchTitleEl.addEventListener("click", (e) => {
+        e.stopPropagation();
+        startResearchTitleEdit();
+      });
+    }
+  }
+
+  // Rename the 🔬 sub-bar title in place: same affordance and same backend call as clicking
+  // #chat-title in a normal chat (PATCH the task's bound session title). The new title rides
+  // state.activeResearch.display_title so re-opening the session (e.g. a repeat ▶ Run) keeps
+  // showing it; the server-side task name is untouched.
+  function startResearchTitleEdit() {
+    const info = state.activeResearch;
+    if (!info || !info.session_id || !state.token) return;
+    if (document.querySelector(".crc-title-input")) return; // already editing
+    const bar = document.getElementById("chat-research-bar");
+    const span = bar && bar.querySelector(".crc-title");
+    if (!span) return;
+    const current = info.display_title || info.name || info.task_id;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = current;
+    input.className = "crc-title-input";
+    input.maxLength = 80;
+    let done = false;
+    const finish = async (commit) => {
+      if (done) return;
+      done = true;
+      input.remove();
+      span.style.display = "";
+      if (!commit) { updateResearchChip(); return; }
+      const next = input.value.trim();
+      if (!next || next === current) { updateResearchChip(); return; }
+      try {
+        const saved = await renameSession(info.session_id, next);
+        info.display_title = saved || next;
+        if (chatTitle.textContent === current) chatTitle.textContent = info.display_title;
+      } catch (err) {
+        Viewer.toast(`Rename failed: ${err.message}`);
+      }
+      updateResearchChip();
+      loadSessions();
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") finish(true);
+      else if (e.key === "Escape") finish(false);
+    });
+    input.addEventListener("blur", () => finish(true));
+    input.addEventListener("click", (e) => e.stopPropagation());
+    span.style.display = "none";
+    span.parentNode.insertBefore(input, span.nextSibling);
+    input.focus();
+    input.select();
   }
 
   // Live stage for the 🔬 chip: while a research session is active, refresh the task's stage/
@@ -2346,11 +2432,15 @@
   // is the only way the chat enters a research session, and it always reuses the task's bound
   // session_id, so repeated opens never fork a new session. The 🔬 chip turns on; the user
   // drives the task by typing a run instruction (sendChat attaches the research handoff).
-  window.openResearchSession = async (taskId, name, sessionId) => {
+  window.openResearchSession = async (taskId, name, sessionId, description) => {
+    // Carried-forward view state for the same task (sub-bar description + any session rename).
+    const prev = state.activeResearch && state.activeResearch.task_id === taskId ? state.activeResearch : null;
+    const desc = description || (prev && prev.description) || "";
+    const dispTitle = (prev && prev.display_title) || "";
     // Already showing this task's session? Just refresh the badge — no reload, and no toast
     // even while a run streams in it (re-selecting the task during a run is harmless).
     if (sessionId && state.sessionId === sessionId) {
-      state.activeResearch = { task_id: taskId, name: name || taskId, session_id: sessionId };
+      state.activeResearch = { task_id: taskId, name: name || taskId, session_id: sessionId, description: desc, display_title: dispTitle };
       const prevKnown = window.researchSessions.get(sessionId) || {};
       window.researchSessions.set(sessionId, {
         ...prevKnown, // keep execution_mode (and anything else) already recorded for this session
@@ -2366,7 +2456,7 @@
       Viewer.toast("A research run is in progress — wait for it to finish.");
       return;
     }
-    state.activeResearch = { task_id: taskId, name: name || taskId, session_id: sessionId || null };
+    state.activeResearch = { task_id: taskId, name: name || taskId, session_id: sessionId || null, description: desc, display_title: dispTitle };
     startResearchChipPoll();
     if (sessionId) {
       const prevKnown = window.researchSessions.get(sessionId) || {};
@@ -5243,6 +5333,12 @@
       state.renderedMsgIds = new Set(); // every row below is now on screen; live refresh dedupes against it
       for (const m of data.messages) appendMsgRow(m);
       chatTitle.textContent = data.title || (data.messages[0] ? data.messages[0].content.slice(0, 30) : "Chat");
+      // Research sessions: the server-side session title is authoritative for the 🔬 sub-bar
+      // too (a rename made there survives re-opens and repeat runs).
+      if (state.activeResearch && state.activeResearch.session_id === id) {
+        state.activeResearch.display_title = data.title || "";
+        updateResearchChip();
+      }
       // Reconciliation: the buttons were rendered from state above, but re-apply so a
       // pair already in the repo can never show as importable even if a message was
       // rendered without its bound question id.

@@ -707,6 +707,28 @@ class TestChatTasks:
             env.scratch / str(USER) / blank["task_id"] / "task_spec.json", None)
         assert raw["description"] == DEFAULT_RESEARCH_DESCRIPTION
 
+    async def test_update_task_description_feeds_next_run(self, env):
+        """A saved edit rewrites ``task_spec.json`` — the single per-node read source —
+        so the NEXT run receives the updated research brief. Whitespace is trimmed, a
+        blank edit resets to the server default (never ""), title/created_* untouched,
+        and a foreign owner gets ``ValueError`` (→ 404 at the router)."""
+        svc = ResearchService(env.drive, env.scratch)
+        created = await svc.create_task(USER, title="iter", description="v1 brief")
+        tid = created["task_id"]
+        spec = await svc.update_task_description(USER, tid, "  v2 brief — focus on risks  ")
+        assert spec["description"] == "v2 brief — focus on risks"
+        disk = ResearchService._load_json(
+            env.scratch / str(USER) / tid / "task_spec.json", None)
+        assert disk["description"] == "v2 brief — focus on risks"
+        assert disk["title"] == "iter" and "created_at" in disk
+        status = await svc.get_task_status(USER, tid)
+        assert status["description"] == "v2 brief — focus on risks"
+        # blank edit → same materialization rule as create: the default, never ""
+        await svc.update_task_description(USER, tid, "   ")
+        assert svc.read_task_spec(USER, tid)["description"] == DEFAULT_RESEARCH_DESCRIPTION
+        with pytest.raises(ValueError):
+            await svc.update_task_description(uuid.UUID(int=0), tid, "x")
+
     async def test_custom_description_wins_verbatim_never_concatenated(self, env):
         """User text is stored EXACTLY — the default is a fallback for blank input,
         never an append/merge prefix or suffix."""

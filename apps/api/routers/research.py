@@ -4,7 +4,9 @@ Tasks are the unit of the chat-driven Research workflow: a user hits ``+ Researc
 desktop chat, the client POSTs ``/research/tasks`` once, and the server creates the task
 folder (``materials/`` / ``outputs/`` / ``task_spec.json`` / ``session_history.json``) and
 copies the selected cloud-drive materials atomically in that single request. The console is
-read-only for everything else: stage transitions, gate overrides, scratch writes, and new
+read-only for everything else (one narrow exception: PATCH ``/tasks/{task_id}`` edits the
+task's description — the research brief fed to the next run; see ``update_task_brief``):
+stage transitions, gate overrides, scratch writes, and new
 artifact versions are driven *only* by the agent through the six research tools under the
 ``deep_research`` skill. (One narrow exception: GET ``/tasks/{task_id}`` lazily materializes the
 deterministic gate ``system`` note for a parked task the moment it is viewed, so a task that
@@ -29,7 +31,7 @@ import uuid
 
 from api.auth import AuthUser, require_user
 from api.deps import get_drive_service, get_task_queue
-from api.schemas_research import TaskCreateRequest
+from api.schemas_research import TaskBriefUpdate, TaskCreateRequest
 from core.application.drive_service import DriveError, DriveService
 from core.config import settings
 from core.infrastructure.db import MessageModel, SessionLocal, SessionModel
@@ -190,6 +192,28 @@ async def get_task(
         # failure) is caught up the moment it is viewed — see ``_ensure_gate_note``.
         await _ensure_gate_note(service, user.user_id, task_id, detail)
         return detail
+    except ValueError as exc:
+        raise _not_found(exc)
+
+
+@router.patch("/tasks/{task_id}")
+async def update_task_brief(
+    task_id: str,
+    body: TaskBriefUpdate,
+    user: AuthUser = Depends(require_user),
+    drive: DriveService = Depends(get_drive_service),
+):
+    """The second human write (besides create): edit the task's description (research brief).
+
+    Saved into ``task_spec.json``, which the pipeline re-reads at every node entry — the
+    next run (a repeat ▶ Run) uses the new text as its user brief. Blank resets to the
+    server default (never an empty context). Title is not writable here.
+    """
+    try:
+        spec = await _service(drive).update_task_description(
+            user.user_id, task_id, body.description
+        )
+        return {"task_id": task_id, "description": spec.get("description", "")}
     except ValueError as exc:
         raise _not_found(exc)
 

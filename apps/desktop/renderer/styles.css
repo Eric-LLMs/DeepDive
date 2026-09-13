@@ -1190,6 +1190,7 @@ pre.text-viewer {
 #chat-research-bar {
   flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -1202,11 +1203,33 @@ pre.text-viewer {
   overflow: hidden;
   white-space: nowrap;
 }
+/* Description echo on its own (second) line, read-only here — the editor is the task view. */
+#chat-research-bar .crc-desc {
+  flex: 1 1 100%;
+  min-width: 0;
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+}
+#chat-research-bar .crc-desc.hidden { display: none; }
 #chat-research-bar .crc-title {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
   font-weight: 500;
+  cursor: text;
+}
+/* Inline title-rename input shown in place of .crc-title (same look as .chat-title-input). */
+#chat-research-bar .crc-title-input {
+  flex: 1 1 auto;
+  min-width: 120px;
+  font-size: 11px;
+  padding: 1px 4px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
 }
 #chat-research-bar .crc-stage {
   flex: 0 0 auto;
@@ -2853,6 +2876,22 @@ body.resizing-ew { cursor: ew-resize; }
 .rtv-chip.mode { color: var(--accent); border-color: rgba(124, 130, 255, 0.35); text-transform: none; letter-spacing: 0.2px; }
 .rtv-chip.mode.progressive { color: #8fe3b3; border-color: rgba(126, 231, 160, 0.45); }
 .rtv-desc { font-size: 12px; color: var(--fg-dim); line-height: 1.5; margin-top: 2px; }
+/* The description is now an editable brief input (saved on blur → next run's research brief). */
+textarea.rtv-desc-edit {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 48px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+textarea.rtv-desc-edit:focus { outline: none; border-color: var(--accent); }
+textarea.rtv-desc-edit::placeholder { color: var(--fg-dim); opacity: 0.7; }
 .rtv-actions { flex: none; display: flex; gap: 8px; align-items: center; }
 .rtv-actions .primary { font-size: 12px; padding: 6px 12px; }
 .rtv-actions .ghost { font-size: 12px; padding: 6px 12px; }

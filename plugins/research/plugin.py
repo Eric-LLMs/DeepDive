@@ -1493,6 +1493,29 @@ class ResearchService:
             return {}
         return spec if isinstance(spec, dict) else {}
 
+    async def update_task_description(
+        self, owner_id: uuid.UUID, task_id: str, description: str
+    ) -> dict:
+        """Persist a user edit to the task's creation-time brief (description).
+
+        ``task_spec.json`` is re-read by the pipeline at every node entry, so the saved
+        text is the research input for the *next* run — the iterate loop "edit
+        description → re-run → the report improves". Blank input resets to
+        ``DEFAULT_RESEARCH_DESCRIPTION`` (the same materialization rule as ``create_task``);
+        the title and created_* fields are never touched. The cloud mirror is best-effort
+        (scratch stays authoritative), so its return is not re-checked here — the mirror
+        row already exists from creation and is updated in place.
+        """
+        project = self._load_project(owner_id, task_id)
+        spec = dict(self.read_task_spec(owner_id, task_id))
+        spec["description"] = (description or "").strip() or DEFAULT_RESEARCH_DESCRIPTION
+        self._save_json(self._project_dir(owner_id, task_id) / "task_spec.json", spec)
+        await self._mirror_cloud(
+            owner_id, project, "task_spec.json",
+            json.dumps(spec, ensure_ascii=False, indent=2),
+        )
+        return spec
+
     def pending_overrides(self, owner_id: uuid.UUID, project_id: str) -> list[dict]:
         """Gate overrides awaiting a human decision (approvals.json ``PENDING``).
 
