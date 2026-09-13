@@ -1962,7 +1962,15 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     and `.ppt` fall back to the OS default app. The toolbar carries a **✕** close button and **Esc** also dismisses the current
     document (both guarded so they never fire while typing in a field, in fullscreen, or with a
     modal overlay open); closing wipes `#viewer` and restores its empty "Select a file…" state,
-    which also resets `state.path/kind/openPath`.
+    which also resets `state.path/kind/openPath/cloudFile`. Document toolbars offer source-aware actions
+    wired by `app.js` through `setDocumentActions`: the viewer resolves the open file's cloud
+    identity (`state.cloudFile`, carried on the `render(path, name, { cloud })` handoff — the
+    research preview and Cloud Drive pass the Drive row, so **Import to Repo / Generate** act on
+    the existing asset, not a re-upload) and branches on it — a Drive-backed file gets
+    **⬇ Download** (`exportCloudFile` → a Save dialog) and **no Upload**, since pushing its own
+    cloud bytes back would only mint a duplicate; a purely local file keeps the on-demand
+    **⬆ Upload** (picker + double-click re-entry guard). The resolved `cloud` id also feeds the
+    generate/import dialogs so they never re-stage an already-uploaded asset.
   - **Video subtitles** — auto-detects a sibling `.srt`/`.vtt`/`.lrc` via `find-subtitle`, or
     loads a user-picked file (**Add Subtitle**, picker defaulting to the video's folder). A
     **Subtitles** dropdown lists **Enable / Disable / Add / Subtitle Settings**; the style panel
