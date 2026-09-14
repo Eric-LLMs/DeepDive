@@ -2686,27 +2686,65 @@
   async function pollFileJob(jobId, tool, jobsMap) {
     const entry = { jobId, status: "queued", result: null, error: null, startedAt: Date.now() };
     if (tool && jobsMap) jobsMap[tool] = entry;
+    // The loop MUST be able to die. A fetch with no timeout can hang forever when the
+    // main-process proxy saturates Chromium's 6-per-origin connection pool, and an
+    // uncapped retry loop turns any persistent server error into a permanently busy
+    // "Generate" menu — the item stays greyed out even though the job is long dead.
+    const FETCH_TIMEOUT_MS = 10 * 1000;
+    const MAX_CONSECUTIVE_FAILURES = 30;  // ~1 min of unreachable endpoint
+    const WATCHDOG_MS = 45 * 60 * 1000;   // deck runs on huge documents still finish under this
+    let consecutive = 0;
+    const brief = (s) => {
+      s = s == null ? "unknown error" : String(s);
+      return s.length > 200 ? s.slice(0, 200) + "…" : s;
+    };
+    const giveUp = (msg) => {
+      Viewer.toast(`Generation failed: ${msg}`);
+      if (tool) { entry.status = "failed"; entry.error = msg; }
+      return null;
+    };
     for (;;) {
       await new Promise((r) => setTimeout(r, 2000));
+      if (Date.now() - entry.startedAt > WATCHDOG_MS) return giveUp("job exceeded the watchdog limit");
       let res;
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
       try {
-        res = await fetch(`/api/jobs/${jobId}`, { headers: authHeaders() });
-      } catch { continue; }  // transient network hiccup — keep waiting
+        res = await fetch(`/api/jobs/${jobId}`, { headers: authHeaders(), signal: ac.signal });
+      } catch {
+        consecutive += 1;  // transient network hiccup — keep waiting, but not forever
+        if (consecutive >= MAX_CONSECUTIVE_FAILURES) return giveUp("lost contact with the server");
+        continue;
+      } finally {
+        clearTimeout(timer);
+      }
       if (res.status === 401) {
         Viewer.toast("Session expired; log in again.");
         if (tool && jobsMap) { entry.status = "failed"; entry.error = "Session expired; log in again."; }
         return null;
       }
-      if (!res.ok) continue;  // transient server error — keep waiting
+      if (!res.ok) {
+        consecutive += 1;  // transient server error — keep waiting, but not forever
+        if (consecutive >= MAX_CONSECUTIVE_FAILURES) return giveUp("job status endpoint kept failing");
+        continue;
+      }
       let job;
-      try { job = await res.json(); } catch { continue; }
+      try {
+        job = await res.json();
+      } catch {
+        consecutive += 1;
+        if (consecutive >= MAX_CONSECUTIVE_FAILURES) return giveUp("job status responses kept failing");
+        continue;
+      }
+      consecutive = 0;  // a good poll resets the failure budget
       if (tool) entry.status = job.status;
       if (job.status === "succeeded") {
         if (tool) { entry.status = "succeeded"; entry.result = job.result || {}; }
         return job.result || {};
       }
       if (job.status === "failed") {
-        Viewer.toast(`Generation failed: ${job.error}`);
+        // job.error can carry a whole rejected model payload — keep the toast short.
+        Viewer.toast(`Generation failed: ${brief(job.error)}`);
         if (tool) { entry.status = "failed"; entry.error = job.error; }
         return null;
       }
