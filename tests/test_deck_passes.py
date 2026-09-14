@@ -157,6 +157,46 @@ class TestGenerateDeck:
         assert "failed validation" in llm.prompts[1]
 
     @pytest.mark.asyncio
+    async def test_oversized_digest_gets_targeted_corrective_instruction(self):
+        # Incident (Agent-Harness survey run, 2026-09-14): a number-dense source made
+        # deepseek emit 31..69 quantities (schema cap 30). The raw jsonschema error
+        # dumped the WHOLE array repr into the retry prompt and the model never
+        # converged (3 attempts → 23 min wasted). The retry must instead carry a
+        # short, actionable "trim this array" instruction.
+        over = _digest_json()
+        q0 = over["quantities"][0]
+        over["quantities"] = [dict(q0, quant_id=f"q{i}") for i in range(1, 32)]
+        llm = FakeLLM([over, *_digest_bad_retry()])
+        deck = await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        assert deck.slides
+        retry = llm.prompts[1]
+        assert "quantities: array is too long" in retry
+        assert "keep ONLY the most" in retry
+        assert "q31" not in retry                      # payload dump must be gone
+        assert len(retry) < 6000                       # not a 100KB error blob
+
+    @pytest.mark.asyncio
+    async def test_exhausted_too_long_retry_error_is_condensed(self):
+        # The persisted job error must be human-readable: no giant array repr in it.
+        over = _digest_json()
+        q0 = over["quantities"][0]
+        over["quantities"] = [dict(q0, quant_id=f"q{i}") for i in range(1, 32)]
+        llm = FakeLLM([over, over, over])
+        from apps.api.tools.toolkit.errors import GenerationError
+        with pytest.raises(GenerationError) as ei:
+            await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        msg = str(ei.value)
+        assert "array is too long" in msg
+        assert "q31" not in msg
+        assert len(msg) < 1500
+
+    def test_digest_prompt_pins_size_caps(self):
+        # Prevention: the caps must be stated up-front so attempt 1 has a chance.
+        from apps.api.tools.toolkit.deck import prompts as P
+        assert "facts at most 60" in P.DIGEST_SYSTEM
+        assert "quantities at most 30" in P.DIGEST_SYSTEM
+
+    @pytest.mark.asyncio
     async def test_fabricated_chart_triggers_repair_rerun(self):
         # s2 comes back as a DATA_INSIGHT citing an unknown quant → Pass D budget violation
         # → ONE corrective re-run with the violation text → fixed to steps

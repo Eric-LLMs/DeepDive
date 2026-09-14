@@ -230,6 +230,9 @@ DIGEST_SYSTEM = (
     "JSON {title, facts:[{fact_id: \"f1\"..., statement, provenance:[...], superseded_by}], "
     "concepts:[\"short bare string\", ...] — plain strings, NEVER {name, description} "
     "objects, quantities:[{quant_id: \"q1\"..., metric, value, unit, provenance:[...]}]}. "
+    "Hard size caps: facts at most 60 items, quantities at most 30. For number-dense "
+    "sources (surveys, benchmarks, financials) do NOT enumerate every number — keep only "
+    "the handful most central to the source's argument. "
     f"Facts are atomic, checkable statements grounded in the source text below. {_COMMON_RULES}"
 )
 

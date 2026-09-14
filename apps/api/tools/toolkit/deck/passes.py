@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from pydantic import ValidationError
 
@@ -71,6 +72,28 @@ def _pyd_errors(exc: ValidationError) -> list[str]:
             for e in exc.errors()]
 
 
+# jsonschema renders maxItems failures as "<path>: [giant repr of the whole array] is
+# too long". That payload dump pollutes the corrective retry prompt (tens of KB fed
+# back to the model), bloats the persisted job error, and teaches the model nothing.
+# Replace it with a short, actionable instruction; cap anything else that is huge.
+_TOO_LONG_RE = re.compile(r"^(?P<path>[^:]+): \[.*\] is too long$", re.S)
+
+
+def _condense_errors(errors: list[str]) -> list[str]:
+    out = []
+    for e in errors:
+        m = _TOO_LONG_RE.match(e)
+        if m:
+            out.append(f"{m.group('path')}: array is too long — keep ONLY the most "
+                       "decision-relevant items; drop the least important ones until "
+                       "the array fits within the allowed maximum.")
+        elif len(e) > 240:
+            out.append(e[:240] + "… (truncated)")
+        else:
+            out.append(e)
+    return out
+
+
 async def _structured(llm, *, prompt: str, system: str, schema: dict,
                       extra_check=None, label: str) -> tuple[object, dict]:
     """One LLM pass with corrective retries. ``extra_check(data) -> (errors, loaded)``
@@ -85,6 +108,7 @@ async def _structured(llm, *, prompt: str, system: str, schema: dict,
             errors, loaded = extra_check(data)
         if not errors:
             return (loaded if loaded is not None else data), data
+        errors = _condense_errors(errors)
         last_errs = errors
         logger.info("%s pass attempt %d rejected: %s", label, attempt + 1, errors[:3])
         current = P.corrective_retry_prompt(errors, prompt)
