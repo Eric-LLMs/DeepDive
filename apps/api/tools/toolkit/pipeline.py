@@ -194,7 +194,10 @@ class ToolKitPipeline:
                 target_audience=str(params.get("audience") or ""),
                 presentation_goal=str(params.get("goal") or ""),
                 target_slide_count=int(params["count"]) if params.get("count") else 8,
+                language=str(params.get("language") or ""),
+                format_mode=str(params.get("format_mode") or "detailed"),
             )
+            options.user_guidance = (params.get("prompt") or "").strip()
             hint = (params.get("prompt") or "").strip()
             deck = await generate_deck(self.llm, sources, options,
                                        deck_id=secrets.token_hex(4), hint=hint)

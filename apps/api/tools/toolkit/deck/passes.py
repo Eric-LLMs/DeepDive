@@ -74,6 +74,12 @@ def _pyd_errors(exc: ValidationError) -> list[str]:
             for e in exc.errors()]
 
 
+def _bc_directives(options: DeckOptions) -> str:
+    """Run-level language+format rules carried into the Pass B/C system prompts.
+    Pass A takes the LANGUAGE rule only — user style must not skew fact extraction."""
+    return P.language_rule(options.language) + P.format_rule(options.format_mode)
+
+
 # jsonschema renders maxItems failures as "<path>: [giant repr of the whole array] is
 # too long". That payload dump pollutes the corrective retry prompt (tens of KB fed
 # back to the model), bloats the persisted job error, and teaches the model nothing.
@@ -136,10 +142,11 @@ async def _structured(llm, *, prompt: str, system: str, schema: dict,
 # ── the three passes ──────────────────────────────────────────────────────────
 
 async def pass_a_understand(llm, sources: list[WorkspaceSource],
-                            hint: str = "") -> ContentDigest:
+                            hint: str = "", language: str = "") -> ContentDigest:
     prompt = P.digest_prompt(sources, hint)
     digest, _raw = await _structured(
-        llm, prompt=prompt, system=P.DIGEST_SYSTEM, schema=P.DIGEST_SCHEMA,
+        llm, prompt=prompt, system=P.DIGEST_SYSTEM + P.language_rule(language),
+        schema=P.DIGEST_SCHEMA,
         extra_check=lambda d: _check(d, ContentDigest), label="A/understand")
     return digest
 
@@ -147,7 +154,8 @@ async def pass_a_understand(llm, sources: list[WorkspaceSource],
 async def pass_b_outline(llm, digest: ContentDigest, options: DeckOptions) -> Outline:
     digest_json = P.dumps(digest.model_dump(mode="json", exclude_none=True))
     prompt = P.outline_prompt(digest_json, options.target_slide_count,
-                              options.target_audience, options.presentation_goal)
+                              options.target_audience, options.presentation_goal,
+                              guidance=options.user_guidance)
 
     def check(d: dict) -> tuple[list[str], object | None]:
         errs, outline = _check(d, Outline)
@@ -156,7 +164,8 @@ async def pass_b_outline(llm, digest: ContentDigest, options: DeckOptions) -> Ou
         return errs, outline
 
     outline, _raw = await _structured(
-        llm, prompt=prompt, system=P.OUTLINE_SYSTEM, schema=P.OUTLINE_SCHEMA,
+        llm, prompt=prompt, system=P.OUTLINE_SYSTEM + _bc_directives(options),
+        schema=P.OUTLINE_SCHEMA,
         extra_check=check, label="B/outline")
     return outline
 
@@ -193,14 +202,15 @@ def _c_check(item: SlideOutlineItem):
     return check
 
 
-async def _pass_c_one(llm, item, section: str, subset: dict) -> Slide:
+async def _pass_c_one(llm, item, section: str, subset: dict,
+                      directives: str) -> Slide:
     quant_lines = "; ".join(
         f"{q['quant_id']}={q['value']}{q.get('unit', '')}"
         for q in subset["quantities"]) or ""
     prompt = P.slide_prompt(P.dumps(item.model_dump(mode="json")),
                             P.dumps(subset), section)
     slide, _raw = await _structured(
-        llm, prompt=prompt, system=P.slide_system(quant_lines),
+        llm, prompt=prompt, system=P.slide_system(quant_lines, directives),
         schema=P.SLIDE_SCHEMA, extra_check=_c_check(item), label=f"C/{item.slide_id}",
         timeout=settings.deck_slide_timeout_s)
     return slide
@@ -213,7 +223,9 @@ def _effective_concurrency(n_slides: int) -> int:
     return max(1, min(caps))
 
 
-async def pass_c_expand(llm, outline: Outline, digest: ContentDigest) -> list[Slide]:
+async def pass_c_expand(llm, outline: Outline, digest: ContentDigest,
+                        options: DeckOptions | None = None) -> list[Slide]:
+    directives = _bc_directives(options) if options else ""
     jobs = []
     for sec in outline.sections:
         for item in sec.slides:
@@ -222,7 +234,7 @@ async def pass_c_expand(llm, outline: Outline, digest: ContentDigest) -> list[Sl
 
     async def one(item, section, subset):
         async with sem:
-            return await _pass_c_one(llm, item, section, subset)
+            return await _pass_c_one(llm, item, section, subset, directives)
 
     results = await asyncio.gather(*(one(i, s, f) for i, s, f in jobs),
                                    return_exceptions=True)
@@ -241,7 +253,9 @@ def pass_d_plan(slides: list[Slide], digest: ContentDigest) -> list[VisualPlan]:
 
 
 async def plan_with_repair(llm, slides: list[Slide], outline: Outline,
-                           digest: ContentDigest) -> tuple[list[Slide], list[VisualPlan]]:
+                           digest: ContentDigest,
+                           options: DeckOptions | None = None
+                           ) -> tuple[list[Slide], list[VisualPlan]]:
     """Slides whose Pass D budget check reports violations get ONE corrective re-run
     with the violation strings; a still-violating slide fails the job (no silent fix)."""
     plans = pass_d_plan(slides, digest)
@@ -249,6 +263,7 @@ async def plan_with_repair(llm, slides: list[Slide], outline: Outline,
     if not bad:
         return slides, plans
 
+    directives = _bc_directives(options) if options else ""
     items = {i.slide_id: (i, sec.title) for sec in outline.sections for i in sec.slides}
     sem = asyncio.Semaphore(_effective_concurrency(len(bad)))
 
@@ -267,7 +282,7 @@ async def plan_with_repair(llm, slides: list[Slide], outline: Outline,
             + P.dumps(slide.model_dump(mode="json", exclude_none=True)))
         async with sem:
             slide, _ = await _structured(
-                llm, prompt=prompt, system=P.slide_system(quant_lines),
+                llm, prompt=prompt, system=P.slide_system(quant_lines, directives),
                 schema=P.SLIDE_SCHEMA, extra_check=_c_check(item),
                 label=f"C-repair/{slide.slide_id}",
                 timeout=settings.deck_slide_timeout_s)
@@ -309,12 +324,12 @@ async def generate_deck(llm, sources: list[WorkspaceSource],
     """
     options = options or DeckOptions()
     t0 = time.perf_counter()
-    digest = await pass_a_understand(llm, sources, hint)
+    digest = await pass_a_understand(llm, sources, hint, language=options.language)
     t1 = time.perf_counter()
     outline = await pass_b_outline(llm, digest, options)
     t2 = time.perf_counter()
-    slides = await pass_c_expand(llm, outline, digest)
-    slides, plans = await plan_with_repair(llm, slides, outline, digest)
+    slides = await pass_c_expand(llm, outline, digest, options)
+    slides, plans = await plan_with_repair(llm, slides, outline, digest, options)
     t3 = time.perf_counter()
     logger.info(
         "deck timing %s: A=%.1fs B=%.1fs C=%.1fs (slides=%d) total=%.1fs",

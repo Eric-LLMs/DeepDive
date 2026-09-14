@@ -2790,11 +2790,12 @@
   }
 
   // Submit a cloud-file-mode toolkit job; returns the job id (throws on HTTP error).
-  async function submitCloudFilesJob(tool, fileIds, prompt, folderPath = null, name = null) {
+  // ``extra`` carries tool-specific knobs (deck: count/language/format_mode).
+  async function submitCloudFilesJob(tool, fileIds, prompt, folderPath = null, name = null, extra = {}) {
     const res = await fetch("/api/toolkit/generate", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ tool, file_ids: fileIds, folder_path: folderPath, name: name || null, prompt: prompt || null }),
+      body: JSON.stringify({ tool, file_ids: fileIds, folder_path: folderPath, name: name || null, prompt: prompt || null, ...extra }),
     });
     if (!res.ok) throw new Error(await apiErrorDetail(res));
     return (await res.json()).job_id;
@@ -4671,6 +4672,14 @@
     }
     const defaultPrompt = await fetchToolkitDefaultPrompt(tool);
 
+    // Slides gets the purpose-built NotebookLM-style dialog: business-intent knobs
+    // only (format / language / length / sources / free-text guidance); every schema
+    // or JSON concern stays backend.
+    if (tool === "slides") {
+      await openCustomizeDeckDialog({ asset, sourceLabel, jobsMap });
+      return;
+    }
+
     function sanitizeLike(title) {
       const s = (title || "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, " ").trim();
       if (!s) return "source";
@@ -4824,6 +4833,312 @@
     });
 
     refresh();
+  }
+
+  // ── Customize Slide Deck (NotebookLM-style intent dialog) ─────────────────
+  // Business-intent knobs only; the deck engine's schema/vocabulary stays invisible.
+  // Knob routing (docs/content-to-slides.md §3.3): sources→Pass A raw context,
+  // language→A/B/C directives, format→B/C directives, length→count param (+validator),
+  // describe→Pass B USER GUIDANCE.
+  async function openCustomizeDeckDialog({ asset, sourceLabel, jobsMap }) {
+    const DOC_EXT = /\.(pdf|docx?|txt|md|pptx?|srt|vtt|csv|xlsx?|epub|html?)$/i;
+    let groups = [];
+    try {
+      const res = await fetch("/api/files", { headers: authHeaders() });
+      if (res.ok) {
+        const files = ((await res.json()).files || []).filter((f) =>
+          !f.deleted_at && DOC_EXT.test(f.name || ""));
+        const byKey = new Map();
+        const stemOf = (n) => (n || "").replace(/\.[^.]+$/, "").toLowerCase();
+        for (const f of files) {
+          const key = `${f.folder_path || ""}/${stemOf(f.name)}`;
+          if (!byKey.has(key)) byKey.set(key, []);
+          byKey.get(key).push(f);
+        }
+        groups = [...byKey.entries()].map(([key, members]) => ({
+          key,
+          members,
+          label: (members.find((m) => m.id === asset.id)
+            || members.find((m) => !/\.(srt|vtt)$/i.test(m.name || ""))
+            || members[0]).name,
+          updated: Math.max(...members.map((m) => Date.parse(m.updated_at || m.created_at || "") || 0)),
+        }));
+      }
+    } catch { /* drive unreachable → fall back to the launched asset only */ }
+    if (!groups.some((g) => g.members.some((m) => m.id === asset.id))) {
+      groups.unshift({ key: `/${asset.name}`, label: asset.name, members: [asset], updated: Date.now() });
+    }
+    groups.sort((a, b) => a.label.localeCompare(b.label));
+    const startKey = (groups.find((g) => g.members.some((m) => m.id === asset.id)) || groups[0]).key;
+
+    const state = {
+      format: "detailed",            // "detailed" | "presenter"
+      language: "English",
+      length: "default",             // "default"→8 content slides, "short"→6
+      filter: "all",                 // "all" | "new" | "recent"
+      checked: new Set([startKey]),
+    };
+
+    const overlay = document.createElement("div");
+    overlay.className = "overlay";
+    const modal = document.createElement("div");
+    modal.className = "modal cd-gen-modal deck-modal";
+    const header = document.createElement("div");
+    header.className = "modal-header";
+    const h = document.createElement("h3");
+    h.textContent = "📖 Customize Slide Deck";
+    const close = document.createElement("button");
+    close.type = "button"; close.className = "modal-close"; close.innerHTML = "&times;"; close.title = "Cancel";
+    header.append(h, close);
+
+    const body = document.createElement("div");
+    body.className = "cd-gen-body";
+    const section = (text) => {
+      const l = document.createElement("div");
+      l.className = "cd-gen-label";
+      l.textContent = text;
+      return l;
+    };
+
+    // Format cards
+    body.append(section("Format"));
+    const fmtRow = document.createElement("div");
+    fmtRow.className = "deck-formats";
+    const fmtCards = {};
+    const fmtDefs = {
+      detailed: ["Detailed Deck", "A comprehensive deck with full text and details, perfect for emailing or reading on its own."],
+      presenter: ["Presenter Slides", "Clean, visual slides with key talking points to support you while you speak."],
+    };
+    for (const [mode, [title, desc]] of Object.entries(fmtDefs)) {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "deck-fmt-card";
+      card.innerHTML = `<span class="deck-fmt-check">✓</span><b>${escapeHtml(title)}</b><span>${escapeHtml(desc)}</span>`;
+      card.addEventListener("click", () => {
+        state.format = mode;
+        for (const [m, c] of Object.entries(fmtCards)) c.classList.toggle("cd-active", m === mode);
+        refreshUsage();
+      });
+      fmtCards[mode] = card;
+      fmtRow.append(card);
+    }
+    fmtCards[state.format].classList.add("cd-active");
+    body.append(fmtRow);
+
+    // Language / Length / Sources row
+    const optsRow = document.createElement("div");
+    optsRow.className = "deck-row";
+
+    const langField = document.createElement("div");
+    langField.className = "deck-field";
+    langField.append(section("Choose language"));
+    const langSel = document.createElement("select");
+    langSel.className = "deck-lang";
+    for (const [v, t] of [["English", "English"], ["中文", "中文"]]) {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = t;
+      langSel.append(o);
+    }
+    langSel.value = state.language;
+    langSel.addEventListener("change", () => { state.language = langSel.value; });
+    langField.append(langSel);
+
+    const lenField = document.createElement("div");
+    lenField.className = "deck-field";
+    lenField.append(section("Length"));
+    const seg = document.createElement("div");
+    seg.className = "deck-seg";
+    const segBtns = {};
+    const segLabel = (m) => (m === "short" ? "Short" : "Default");
+    for (const m of ["short", "default"]) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = segLabel(m);
+      b.addEventListener("click", () => {
+        state.length = m;
+        for (const [k, el] of Object.entries(segBtns)) {
+          el.classList.toggle("cd-active", k === m);
+          el.textContent = (k === m ? "✓ " : "") + segLabel(k);
+        }
+        refreshUsage();
+      });
+      segBtns[m] = b;
+      seg.append(b);
+    }
+    segBtns[state.length].classList.add("cd-active");
+    segBtns[state.length].textContent = "✓ " + segLabel(state.length);
+    lenField.append(seg);
+
+    const srcField = document.createElement("div");
+    srcField.className = "deck-field deck-src-wrap";
+    srcField.append(section("Sources"));
+    const srcBtn = document.createElement("button");
+    srcBtn.type = "button";
+    srcBtn.className = "deck-src-btn";
+    const pop = document.createElement("div");
+    pop.className = "deck-src-pop";
+    pop.hidden = true;
+    const refreshSrcBtn = () => {
+      const n = state.checked.size;
+      srcBtn.textContent = `${n} source${n === 1 ? "" : "s"} ▾`;
+    };
+    const filteredGroups = () => {
+      if (state.filter === "new") {
+        const week = Date.now() - 7 * 86400e3;
+        return groups.filter((g) => g.updated >= week);
+      }
+      if (state.filter === "recent") return [...groups].sort((a, b) => b.updated - a.updated).slice(0, 20);
+      return groups;
+    };
+    const renderPop = () => {
+      pop.textContent = "";
+      for (const [f, text] of [["all", "Show all"], ["new", "Only sources with new content"], ["recent", "Recent"]]) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "deck-src-filter";
+        row.innerHTML = `<span>${text}</span><span class="deck-src-radio${state.filter === f ? " cd-active" : ""}">●</span>`;
+        row.addEventListener("click", () => { state.filter = f; renderPop(); });
+        pop.append(row);
+      }
+      const sep = document.createElement("div");
+      sep.className = "deck-src-sep";
+      pop.append(sep);
+      for (const g of filteredGroups()) {
+        const row = document.createElement("label");
+        row.className = "deck-src-item";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = state.checked.has(g.key);
+        cb.addEventListener("change", () => {
+          if (cb.checked) state.checked.add(g.key); else state.checked.delete(g.key);
+          refreshSrcBtn();
+          refreshUsage();
+        });
+        const txt = document.createElement("span");
+        txt.innerHTML = `<span class="deck-src-name">${escapeHtml(g.label)}</span><br><span class="deck-src-sub">· ${g.members.length} source${g.members.length === 1 ? "" : "s"}</span>`;
+        row.append(cb, txt);
+        pop.append(row);
+      }
+      if (!filteredGroups().length) {
+        const empty = document.createElement("div");
+        empty.className = "deck-src-sub";
+        empty.style.padding = "10px";
+        empty.textContent = "No sources match this filter.";
+        pop.append(empty);
+      }
+    };
+    srcBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      pop.hidden = !pop.hidden;
+      if (!pop.hidden) renderPop();
+    });
+    pop.addEventListener("click", (e) => e.stopPropagation());
+    srcField.append(srcBtn, pop);
+    refreshSrcBtn();
+
+    optsRow.append(langField, lenField, srcField);
+    body.append(optsRow);
+
+    // Describe (free-text user intent → Pass B USER GUIDANCE)
+    body.append(section("Describe the slide deck you want to create"));
+    const descEl = document.createElement("textarea");
+    descEl.className = "deck-desc";
+    descEl.rows = 3;
+    descEl.spellcheck = false;
+    descEl.placeholder = 'Add a high-level outline, or guide the audience, style, and focus: "Create a deck for beginners using a bold and playful style with a focus on step-by-step instructions."';
+    body.append(descEl);
+
+    // AI usage estimate bar (relative workload preview, not billing data)
+    const foot = document.createElement("div");
+    foot.className = "deck-foot";
+    const usage = document.createElement("div");
+    usage.className = "deck-usage";
+    const usageLabel = document.createElement("span");
+    usageLabel.className = "deck-usage-cap";
+    usageLabel.textContent = "AI Usage";
+    const bar = document.createElement("div");
+    bar.className = "deck-usage-bar";
+    const used = document.createElement("div");
+    used.className = "deck-usage-used";
+    const est = document.createElement("div");
+    est.className = "deck-usage-est";
+    bar.append(used, est);
+    const legend = document.createElement("div");
+    legend.className = "deck-usage-legend";
+    legend.innerHTML = '<span><i class="dot-used"></i>Already used</span><span><i class="dot-est"></i>Estimated use</span>';
+    usage.append(usageLabel, bar, legend);
+    const refreshUsage = () => {
+      let chars = 0;
+      for (const g of groups) if (state.checked.has(g.key)) chars += g.members.reduce((a, m) => a + (m.size || 0), 0);
+      const sizeFrac = Math.min(0.6, 0.08 + Math.log10(1 + chars / 4000) * 0.18);
+      const lenFrac = state.length === "short" ? 0.6 : 1;
+      const fmtFrac = state.format === "presenter" ? 0.85 : 1;
+      used.style.width = "8%";
+      est.style.width = `${Math.round(Math.min(1, sizeFrac * lenFrac * fmtFrac + 0.15) * 100)}%`;
+    };
+    const acts = document.createElement("div");
+    acts.className = "deck-actions";
+    const laterBtn = document.createElement("button");
+    laterBtn.type = "button";
+    laterBtn.className = "deck-later";
+    laterBtn.textContent = "Generate later";
+    const nowBtn = document.createElement("button");
+    nowBtn.type = "button";
+    nowBtn.className = "deck-now";
+    nowBtn.textContent = "Generate now";
+    acts.append(laterBtn, nowBtn);
+    foot.append(usage, acts);
+
+    modal.append(header, body, foot);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    function finish() {
+      document.removeEventListener("keydown", onEsc);
+      document.removeEventListener("mousedown", onDocDown, true);
+      overlay.remove();
+    }
+    function onEsc(e) {
+      if (e.key !== "Escape") return;
+      if (!pop.hidden) { pop.hidden = true; return; }   // Esc closes the popover first
+      const overlays = document.querySelectorAll(".overlay");
+      if (overlays.length && overlays[overlays.length - 1] !== overlay) return;
+      finish();
+    }
+    function onDocDown(e) {
+      if (!pop.hidden && !pop.contains(e.target) && e.target !== srcBtn) pop.hidden = true;
+    }
+    close.addEventListener("click", finish);
+    laterBtn.addEventListener("click", finish);
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) finish(); });
+    document.addEventListener("keydown", onEsc);
+    document.addEventListener("mousedown", onDocDown, true);
+
+    nowBtn.addEventListener("click", () => {
+      const ids = [...new Set([...state.checked].flatMap((k) => (groups.find((g) => g.key === k) || { members: [] }).members.map((m) => m.id)))];
+      if (!ids.length) { Viewer.toast("Select at least one source."); return; }
+      const guidance = descEl.value.trim() || null;
+      finish();
+      Viewer.toast("Generating slides…");
+      (async () => {
+        try {
+          const jobId = await submitCloudFilesJob("slides", ids, guidance, null, null, {
+            count: state.length === "short" ? 6 : 8,
+            language: state.language,
+            format_mode: state.format,
+          });
+          const result = await pollFileJob(jobId, "slides", jobsMap);
+          if (result) showSessionArtifactResult({ label: TOOLKIT_LABELS.slides || "slides" }, result);
+        } catch (err) {
+          Viewer.toast(`Generation failed: ${err.message}`);
+          if (jobsMap) {
+            jobsMap.slides = { jobId: null, status: "failed", result: null, error: err.message, startedAt: Date.now() };
+          }
+        }
+      })();
+    });
+
+    refreshUsage();
   }
 
   // The video's whole subtitle file, always a local sibling; no chat session, no upload

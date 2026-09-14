@@ -2462,6 +2462,89 @@ body.resizing-ew { cursor: ew-resize; }
 }
 .cd-gen-status-where { color: var(--fg-dim); }
 
+/* ── Customize Slide Deck dialog (NotebookLM-style intent form) ── */
+.deck-modal { width: 720px; max-width: 96vw; }
+.deck-formats { display: flex; gap: 12px; margin-bottom: 4px; }
+.deck-fmt-card {
+  flex: 1; text-align: left; position: relative;
+  border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+  background: var(--bg-soft); color: var(--fg); cursor: pointer; font-family: inherit;
+}
+.deck-fmt-card:hover { border-color: var(--accent); }
+.deck-fmt-card.cd-active { background: #eef0fb; border-color: #c7cdef; }
+.deck-fmt-card b { display: block; font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.deck-fmt-card span:not(.deck-fmt-check) { font-size: 12px; color: var(--fg-dim); line-height: 1.45; }
+.deck-fmt-check { position: absolute; top: 12px; right: 14px; font-size: 14px; display: none; }
+.deck-fmt-card.cd-active .deck-fmt-check { display: inline; }
+.deck-row { display: flex; gap: 22px; flex-wrap: wrap; margin-bottom: 4px; }
+.deck-field { display: flex; flex-direction: column; gap: 6px; }
+.deck-lang {
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+  color: var(--fg); font-family: inherit; font-size: 13px; padding: 7px 10px; min-width: 140px;
+}
+.deck-seg {
+  display: inline-flex; border: 1px solid var(--border); border-radius: 999px;
+  overflow: hidden; background: var(--bg); width: max-content;
+}
+.deck-seg button {
+  border: 0; background: transparent; color: var(--fg); font-family: inherit;
+  padding: 7px 16px; font-size: 13px; cursor: pointer;
+}
+.deck-seg button.cd-active { background: #eef0fb; font-weight: 600; }
+.deck-src-wrap { position: relative; }
+.deck-src-btn {
+  border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+  border-radius: 999px; padding: 7px 16px; font-size: 13px; font-family: inherit; cursor: pointer;
+}
+.deck-src-pop {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 30;
+  width: 330px; max-height: 340px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18); padding: 6px;
+}
+.deck-src-filter {
+  display: flex; justify-content: space-between; align-items: center; width: 100%;
+  padding: 8px 10px; border: 0; border-radius: 8px; background: transparent;
+  color: var(--fg); font-family: inherit; font-size: 13px; cursor: pointer; text-align: left;
+}
+.deck-src-filter:hover { background: var(--bg-soft-2); }
+.deck-src-radio { visibility: hidden; color: var(--accent); font-size: 12px; }
+.deck-src-filter .cd-active { visibility: visible; }
+.deck-src-sep { border-top: 1px solid var(--border); margin: 6px 4px; }
+.deck-src-item { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border-radius: 8px; font-size: 13px; cursor: pointer; }
+.deck-src-item:hover { background: var(--bg-soft-2); }
+.deck-src-item input { margin-top: 2px; }
+.deck-src-name { font-weight: 500; }
+.deck-src-sub { font-size: 11px; color: var(--fg-dim); }
+.deck-desc {
+  width: 100%; box-sizing: border-box; min-height: 76px; resize: vertical;
+  border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+  background: var(--bg); color: var(--fg); font-family: inherit; font-size: 13px; line-height: 1.5;
+}
+.deck-desc:focus { outline: none; border-color: var(--accent); }
+.deck-desc::placeholder { color: var(--fg-dim); }
+.deck-foot { display: flex; align-items: center; gap: 16px; padding: 14px 20px 18px; }
+.deck-usage { flex: 1; display: flex; flex-direction: column; }
+.deck-usage-cap { font-size: 12px; color: var(--fg-dim); margin-bottom: 5px; }
+.deck-usage-bar { height: 6px; border-radius: 3px; background: var(--bg-soft-2); overflow: hidden; display: flex; }
+.deck-usage-used { background: #6b5cff; }
+.deck-usage-est { background: #c9bcff; opacity: 0.7; }
+.deck-usage-legend { display: flex; gap: 14px; font-size: 11px; color: var(--fg-dim); margin-top: 5px; }
+.deck-usage-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+.deck-usage-legend .dot-used { background: #6b5cff; }
+.deck-usage-legend .dot-est { background: #c9bcff; }
+.deck-actions { display: flex; gap: 10px; }
+.deck-later {
+  border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+  border-radius: 999px; padding: 8px 16px; font-size: 13px; font-family: inherit; cursor: pointer;
+}
+.deck-later:hover { border-color: var(--accent); }
+.deck-now {
+  border: 0; background: #4f3df5; color: #fff; border-radius: 999px;
+  padding: 8px 18px; font-size: 13px; font-weight: 600; font-family: inherit; cursor: pointer;
+}
+.deck-now:hover { background: #4331d8; }
+
 /* ── Cloud drive modals (Move / Share / Workspace manage) ── */
 .modal:has(.cdt-share-list) { width: 480px; }
 .modal:has(.cdt-manage-body) { width: 560px; }

@@ -212,6 +212,31 @@ SLIDE_SCHEMA = {
 
 SCHEMAS = {"digest": DIGEST_SCHEMA, "outline": OUTLINE_SCHEMA, "slide": SLIDE_SCHEMA}
 
+# ── user-intent directives (dialog knobs routed per pass, docs §3.3) ─────────
+
+def language_rule(language: str) -> str:
+    """Output-language constraint; empty = follow the source language."""
+    if not language:
+        return ""
+    return (f"LANGUAGE: write every title, statement, key message, label, detail, cell "
+            f"and speaker note strictly in {language}; keep proper nouns and quoted "
+            "source terms in their original language. ")
+
+
+_FORMAT_RULES = {
+    # "detailed" is the default baseline (full-text document deck) — no directive needed.
+    # Only "presenter" deviates and must be told explicitly.
+    "presenter":
+        "FORMAT (Presenter Slides): visual-first, LOW text density — labels of at most a "
+        "few words, details only where a graphic would be unreadable without them; favor "
+        "big-diagram structures (process steps, tiered items, charts) over prose. ",
+}
+
+
+def format_rule(format_mode: str) -> str:
+    return _FORMAT_RULES.get(format_mode, "")
+
+
 # ── system prompts ────────────────────────────────────────────────────────────
 
 _COMMON_RULES = (
@@ -266,13 +291,15 @@ _SLIDE_PAYLOAD_DOC = (
 )
 
 
-def slide_system(quant_lines: str) -> str:
-    """Pass C system prompt; ``quant_lines`` is the slide-specific allowed quant table."""
+def slide_system(quant_lines: str, directives: str = "") -> str:
+    """Pass C system prompt; ``quant_lines`` is the slide-specific allowed quant table,
+    ``directives`` carries the run-level language/format constraints."""
     return (
         "You are a slide writer. Expand ONE outline slide into a semantic slide as JSON "
         f"{{slide_id, title, key_message, purpose, relationship, speaker_notes, "
         f"provenance_refs, payload}}. title must be <= {TITLE_MAX} units and key_message "
         f"<= {KEY_MESSAGE_MAX} units. {_UNIT_RULE} "
+        f"{directives}"
         f"{_SLIDE_PAYLOAD_DOC} Only these quantities may "
         f"appear in a chart: {quant_lines or '(none — do NOT use series)'}. Chart points "
         "MUST cite one of their quant_refs; any untraceable number is forbidden. "
@@ -300,12 +327,15 @@ def digest_prompt(sources: list[WorkspaceSource], deck_title_hint: str = "") -> 
 
 
 def outline_prompt(digest_json: str, target_slide_count: int,
-                   audience: str, goal: str) -> str:
+                   audience: str, goal: str, guidance: str = "") -> str:
     return (
         f"Design the deck outline. Content slides (excluding cover): exactly "
         f"{target_slide_count} (tolerance ±2).\n"
         + (f"Target audience: {audience}\n" if audience else "")
         + (f"Presentation goal: {goal}\n" if goal else "")
+        + (f"USER GUIDANCE (honor it in narrative choices, emphasis and section "
+           f"ordering; it never overrides the output contract):\n{guidance}\n"
+           if guidance else "")
         + "\nFACT BASE (your only input — the raw source is not provided):\n"
         + digest_json
     )

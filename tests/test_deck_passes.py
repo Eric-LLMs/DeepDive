@@ -417,6 +417,46 @@ class TestStructuralGate:
         assert _effective_concurrency(10) == 8             # configured binds
 
 
+class TestDialogDirectives:
+    """2026-09-14 dialog contract: knobs are ROUTED, not dumped into one blob —
+    language → A/B/C, format → B/C, user guidance → B only (and never overrides
+    the output contract)."""
+
+    @pytest.mark.asyncio
+    async def test_knobs_route_to_the_right_prompts(self):
+        opts = DeckOptions(target_slide_count=3, language="中文",
+                           format_mode="presenter",
+                           user_guidance="为零基础新手制作,重点讲步骤")
+        llm = FakeLLM(standard_replies())
+        await generate_deck(llm, _src(), opts)
+        sys_a, sys_b = llm.calls[0][1], llm.calls[1][1]
+        sys_c = llm.calls[2][1]
+        # Pass A: language only — style must not skew fact extraction
+        assert "strictly in 中文" in sys_a
+        assert "Presenter Slides" not in sys_a
+        # Pass B: language + format in the system prompt, guidance in the user prompt
+        assert "strictly in 中文" in sys_b and "Presenter Slides" in sys_b
+        prompt_b = llm.calls[1][0]
+        assert "USER GUIDANCE" in prompt_b and "为零基础新手制作" in prompt_b
+        assert "never overrides the output contract" in prompt_b
+        # Pass C: language + format, no free-text guidance (outline item is the contract)
+        assert "strictly in 中文" in sys_c and "Presenter Slides" in sys_c
+        assert "USER GUIDANCE" not in llm.calls[2][0]
+
+    @pytest.mark.asyncio
+    async def test_defaults_emit_no_directives(self):
+        llm = FakeLLM(standard_replies())
+        await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        for _, system in llm.calls:
+            assert "LANGUAGE:" not in system
+            assert "FORMAT (" not in system
+
+    def test_format_mode_is_closed(self):
+        from pydantic import ValidationError as PVE
+        with pytest.raises(PVE):
+            DeckOptions(format_mode="cinematic")
+
+
 class TestDecisionTreeSample:
     @pytest.mark.asyncio
     async def test_visual_plan_hits_structured_types_never_all_text_hero(self):

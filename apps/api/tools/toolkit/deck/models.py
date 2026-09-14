@@ -388,6 +388,12 @@ class DeckOptions(BaseModel):
     target_audience: str = ""
     presentation_goal: str = ""
     target_slide_count: int = 8
+    # output-language directive ("English", "中文", …); "" = follow the source language
+    language: str = ""
+    # text-density style: "detailed" = document-deck, "presenter" = visual-first slides
+    format_mode: Literal["detailed", "presenter"] = "detailed"
+    # free-form user intent from the dialog's Describe box (injected into Pass B)
+    user_guidance: str = ""
 
     @field_validator("target_slide_count")
     @classmethod

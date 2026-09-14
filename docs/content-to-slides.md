@@ -317,6 +317,23 @@ source can never reach the chart renderer.
 - **Phase timings** (A/B/C/total) are logged at INFO (`deck timing`) for offline
   P50/P95 harvesting; the 20K–30K-token document target is P50 < 90s.
 
+### 3.4 Dialog contract — intent knobs, routed not dumped (frozen 2026-09-14)
+
+The slides dialog exposes business intent only; the JSON schema, vocabularies and
+budgets never surface to the user. Controls are **routed per pass**, not concatenated
+into one blob:
+
+| Control | Backend route | Enters the Prompt? | Effect |
+| --- | --- | --- | --- |
+| Sources (multi-select popover) | cloud-file mode `file_ids[]` | no — raw context | grouped by stem (doc + subtitle sibling); all members feed Pass A ingestion |
+| Length `Short` / `Default` | `count` param (6 / 8) | half — numeric bound | injected into Pass B as the ±2 slide budget AND enforced by `check_outline` |
+| Format `Detailed Deck` / `Presenter Slides` | `format_mode` | yes — Pass B/C only | `detailed` is the baseline (no directive); `presenter` appends a LOW-text-density FORMAT rule. Pass A never sees it — style must not skew fact extraction |
+| Choose language | `language` | yes — Pass A/B/C | LANGUAGE rule: all titles/messages/labels/notes strictly in the chosen language; proper nouns stay original |
+| Describe… (free text) | `prompt` → `DeckOptions.user_guidance` | yes — Pass B user prompt only | rendered as `USER GUIDANCE (…never overrides the output contract)`; Pass C stays outline-bound |
+
+`Generate later` closes the dialog without submitting; `Generate now` posts
+`{tool, file_ids, prompt, count, language, format_mode}`.
+
 ---
 
 ## 4. Visual Grammar — deterministic mapping

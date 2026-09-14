@@ -165,6 +165,8 @@ async def generate_toolkit(
                 "count": body.count,
                 "audience": body.audience,
                 "goal": body.goal,
+                "language": body.language,
+                "format_mode": body.format_mode,
             },
             user_id=user.user_id,
         )
@@ -206,6 +208,8 @@ async def generate_toolkit(
                 "count": body.count,
                 "audience": body.audience,
                 "goal": body.goal,
+                "language": body.language,
+                "format_mode": body.format_mode,
             },
             user_id=user.user_id,
         )
@@ -235,6 +239,8 @@ async def generate_toolkit(
             "count": body.count,
             "audience": body.audience,
             "goal": body.goal,
+            "language": body.language,
+            "format_mode": body.format_mode,
         },
         user_id=user.user_id,
     )

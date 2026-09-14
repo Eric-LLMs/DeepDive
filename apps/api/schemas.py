@@ -149,6 +149,8 @@ class ToolkitGenerateRequest(BaseModel):
     count: int | None = None             # target number of CONTENT slides (clamped 3..20)
     audience: str | None = None          # target audience line (cover + Pass B)
     goal: str | None = None              # presentation goal line (cover + Pass B)
+    language: str | None = None          # output language directive, e.g. "English" / "中文" (Pass A/B/C)
+    format_mode: Literal["detailed", "presenter"] | None = None  # text-density style (Pass B/C)
 
 
 class ConfigUpdateRequest(BaseModel):
