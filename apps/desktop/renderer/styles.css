@@ -469,6 +469,14 @@ body {
   font-size: 12px;
 }
 .tools-menu button:hover { background: var(--bg-soft-2); }
+/* Busy-locked generation items must LOOK locked (see viewer.js refreshDocGenBusy). */
+.tools-menu button.busy,
+.tools-menu button:disabled {
+  color: var(--fg-dim, #8a8a8a);
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.tools-menu button:disabled:hover { background: transparent; }
 
 .viewer-body {
   flex: 1;

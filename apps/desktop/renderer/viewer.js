@@ -367,8 +367,10 @@ const Viewer = (() => {
           document.addEventListener("click", () => genMenu.classList.add("hidden"));
           function genItem(label, tool) {
             const b = document.createElement("button");
+            b.dataset.label = label;
             b.textContent = label;
             b.onclick = () => {
+              if (b.disabled) return;
               genMenu.classList.add("hidden");
               acts.generate(tool);
             };
@@ -380,11 +382,16 @@ const Viewer = (() => {
           genItem("Slides", "slides");
           genItem("Summary", "summary");
           // The clicked item locks while ITS background job runs; re-evaluated on every open.
+          // Locking must be VISIBLE (grey + ⏳): a disabled button that looks normal reads
+          // as "the click was ignored", which is worse than a locked-but-labelled one.
           function refreshDocGenBusy() {
             for (const tool of Object.keys(genItems)) {
               const busy = docGenerateBusy ? docGenerateBusy(tool) : false;
-              genItems[tool].disabled = busy;
-              genItems[tool].title = busy ? "A generation for this is already running in the background." : "";
+              const b = genItems[tool];
+              b.disabled = busy;
+              b.classList.toggle("busy", busy);
+              b.textContent = busy ? `${b.dataset.label} ⏳` : b.dataset.label;
+              b.title = busy ? "A generation for this is already running in the background." : "";
             }
           }
           genWrap.append(genBtn, genMenu);

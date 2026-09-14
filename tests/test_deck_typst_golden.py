@@ -92,3 +92,31 @@ class TestCompile:
         res = shutil.os.system(f'typst compile "{typ}" "{pdf}"')
         assert res == 0
         assert pdf.read_bytes()[:5] == b"%PDF-"
+
+    def test_visual_types_really_paint_geometry_in_pdf(self, tmp_path):
+        # Case-C guard (real-model replay 2026-09-14): a VisualPlan saying CARDS/
+        # ARCHITECTURE is worthless if the Typst template silently degrades to text.
+        # Compile the all-types deck through the CANONICAL render path and count the
+        # vector drawings each visual page paints (boxes/arrows/tiers/axes).
+        import pymupdf
+
+        from apps.api.tools.toolkit.deck.render import render_deck_pdf
+
+        res = render_deck_pdf(all_types_deck(), tmp_path)
+        assert res.pdf and res.report.ok
+        doc = pymupdf.open(stream=res.pdf, filetype="pdf")
+        try:
+            # page order: cover, hero, CARDS, FLOWCHART, TIMELINE, COMPARISON, ARCH, CHART
+            floors = {2: ("TEXT_HERO", 1), 3: ("CARDS", 4), 4: ("FLOWCHART", 5),
+                      5: ("TIMELINE", 4), 6: ("COMPARISON", 3),
+                      7: ("ARCHITECTURE", 3), 8: ("CHART", 3)}
+            for pno, (vt, floor) in floors.items():
+                n = len(doc[pno - 1].get_drawings())
+                if vt == "TEXT_HERO":
+                    assert n <= 2, f"TEXT_HERO page {pno} drew {n} paths — should be header rule only"
+                else:
+                    assert n >= floor, (
+                        f"{vt} page {pno}: only {n} drawings (floor {floor}) — "
+                        "renderer degraded to text")
+        finally:
+            doc.close()
