@@ -5039,6 +5039,61 @@
     optsRow.append(langField, lenField, srcField);
     body.append(optsRow);
 
+    // Output path (kept from the classic dialog): Cloud Drive folder + optional name
+    const outRow = document.createElement("div");
+    outRow.className = "deck-row";
+    const dirField = document.createElement("div");
+    dirField.className = "deck-field";
+    dirField.append(section("Output folder"));
+    const dirVal = document.createElement("span");
+    dirVal.className = "cd-gen-dir-val";
+    const dirBtn = document.createElement("button");
+    dirBtn.type = "button";
+    dirBtn.className = "cd-gen-add";
+    dirBtn.textContent = "Choose folder…";
+    dirField.append(dirVal, dirBtn);
+    const nameField = document.createElement("div");
+    nameField.className = "deck-field deck-name-field";
+    nameField.append(section("File name (optional)"));
+    const nameInput = document.createElement("input");
+    nameInput.className = "cd-gen-name";
+    nameInput.type = "text";
+    nameInput.spellcheck = false;
+    const nameHint = document.createElement("div");
+    nameHint.className = "cd-gen-name-hint";
+    nameField.append(nameInput, nameHint);
+    outRow.append(dirField, nameField);
+    body.append(outRow);
+
+    let folderPath = null;
+    const sanitizeLike = (t) => {
+      const s = (t || "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, " ").trim();
+      if (!s) return "source";
+      return s.length > 80 ? s.slice(0, 80) : s;
+    };
+    const stemOfAsset = (nm) => {
+      const i = (nm || "").lastIndexOf(".");
+      return i > 0 ? nm.slice(0, i) : (nm || "source");
+    };
+    const refreshOutput = () => {
+      dirVal.textContent = folderPath
+        ? `☁️ My Drive / ${folderPath.split("/").join(" / ")}`
+        : "☁️ Cloud Drive (root)";
+      const typed = nameInput.value.trim();
+      const base = sanitizeLike(typed || stemOfAsset(asset.name));
+      nameHint.textContent = (typed ? "Will create: " : "Default: ")
+        + [`${base}_slides.pdf`, "_slides.md / .pptx / deck.json"].join(" + ");
+      nameInput.placeholder = `${stemOfAsset(asset.name)}_slides`;
+    };
+    dirBtn.addEventListener("click", async () => {
+      const picked = await window.pickDriveFolderModal("Choose output folder", { prompt: false, okLabel: "Select" });
+      if (picked === undefined) return;
+      folderPath = picked.folderPath || null;
+      refreshOutput();
+    });
+    nameInput.addEventListener("input", refreshOutput);
+    refreshOutput();
+
     // Describe (free-text user intent → Pass B USER GUIDANCE)
     body.append(section("Describe the slide deck you want to create"));
     const descEl = document.createElement("textarea");
@@ -5122,7 +5177,7 @@
       Viewer.toast("Generating slides…");
       (async () => {
         try {
-          const jobId = await submitCloudFilesJob("slides", ids, guidance, null, null, {
+          const jobId = await submitCloudFilesJob("slides", ids, guidance, folderPath, nameInput.value.trim() || null, {
             count: state.length === "short" ? 6 : 8,
             language: state.language,
             format_mode: state.format,

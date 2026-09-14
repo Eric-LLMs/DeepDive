@@ -2492,6 +2492,9 @@ body.resizing-ew { cursor: ew-resize; }
 }
 .deck-seg button.cd-active { background: #eef0fb; font-weight: 600; }
 .deck-src-wrap { position: relative; }
+.deck-name-field { flex: 1; min-width: 200px; }
+.deck-field .cd-gen-dir-val { font-size: 12px; color: var(--accent); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.deck-field .cd-gen-add { width: max-content; }
 .deck-src-btn {
   border: 1px solid var(--border); background: var(--bg); color: var(--fg);
   border-radius: 999px; padding: 7px 16px; font-size: 13px; font-family: inherit; cursor: pointer;
