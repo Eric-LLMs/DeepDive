@@ -104,6 +104,22 @@ class TestBudgets:
         errs = rules.budget_violations(s, plan_of(s), make_digest())
         assert any("FLOWCHART needs 3..6" in e for e in errs)
 
+    def test_flow_step_detail_cap_blocks_layout_overflow(self):
+        # The real-model smoke produced a 30-unit step detail that only blew up at the
+        # micro tier inside layout. step_detail=18 is calibrated to the 6-node worst
+        # case, so Pass C's corrective loop — not layout — must catch it (errata #4).
+        from apps.api.tools.toolkit.deck.models import Step
+        long = flow_slide(4).model_copy(update={
+            "payload": slide_payload(steps=[
+                Step(label=f"步骤{i}", detail="维" * (19 if i == 1 else 8))
+                for i in range(1, 5)])})
+        errs = rules.budget_violations(long, plan_of(long), make_digest())
+        assert any(e.endswith("step 1 detail is 19 units, budget <= 18") for e in errs), errs
+        ok = flow_slide(4).model_copy(update={
+            "payload": slide_payload(steps=[
+                Step(label=f"步骤{i}", detail="维" * 16) for i in range(1, 5)])})
+        assert rules.budget_violations(ok, plan_of(ok), make_digest()) == []
+
     def test_hero_rejects_payload_shape(self):
         s = hero_slide().model_copy(update={
             "payload": slide_payload(items=[{"label": "extra"}])})

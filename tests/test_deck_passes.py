@@ -95,6 +95,28 @@ def standard_replies():
     return [_digest_json(), _outline_json(), _c_reply, _c_reply, _c_reply]
 
 
+def test_digest_schema_matches_model_null_optionals():
+    # Real-model smoke (deepseek) sent "superseded_by": null and "page": null — legal for
+    # the Pydantic models (str|None / int|None); the JSON schema must agree, or the
+    # corrective-retry loop fails the pass for a shape the contract actually allows.
+    from apps.api.tools.toolkit import outputs
+
+    d = _digest_json()
+    d["facts"][0]["superseded_by"] = None
+    d["facts"][0]["provenance"][0]["page"] = None
+    d["facts"][0]["provenance"][0]["t_ms"] = None
+    assert outputs.validate(P.DIGEST_SCHEMA, d) == []
+
+
+def test_digest_schema_still_rejects_invented_keys():
+    from apps.api.tools.toolkit import outputs
+
+    d = _digest_json()
+    d["facts"][0]["provenance"][0]["locator"] = "3-5"
+    errs = outputs.validate(P.DIGEST_SCHEMA, d)
+    assert errs and any("locator" in e for e in errs)
+
+
 class TestGenerateDeck:
     @pytest.mark.asyncio
     async def test_happy_path_three_llm_calls(self):

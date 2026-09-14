@@ -29,11 +29,13 @@ _PROVENANCE_SCHEMA = {
     "properties": {
         "source_id": {"type": "string"},
         "kind": {"enum": ["session", "document", "book", "subtitles"]},
-        "message_id": {"type": "string"},
-        "page": {"type": "integer", "minimum": 1},
-        "lines": {"type": "string"},          # "start" or "start-end"
-        "t_ms": {"type": "integer", "minimum": 0},
-        "quote": {"type": "string"},
+        # The location fields are optional and may be sent as null (a real model writes
+        # "page": null for a line-located fact); ProvenanceRef accepts None for each.
+        "message_id": {"type": ["string", "null"]},
+        "page": {"type": ["integer", "null"], "minimum": 1},
+        "lines": {"type": ["string", "null"]},   # "start" or "start-end"
+        "t_ms": {"type": ["integer", "null"], "minimum": 0},
+        "quote": {"type": ["string", "null"]},
     },
 }
 
@@ -56,11 +58,13 @@ DIGEST_SCHEMA = {
                     "statement": {"type": "string"},
                     "provenance": {"type": "array", "minItems": 1,
                                    "items": _PROVENANCE_SCHEMA},
-                    "superseded_by": {"type": "string"},
+                    "superseded_by": {"type": ["string", "null"]},
                 },
             },
         },
-        "concepts": {"type": "array", "maxItems": 20, "items": {"type": "string"}},
+        # Informational only (no downstream consumer gates on it) — the cap is a
+        # sanity bound against bloat, matching the facts cap; Pydantic itself is uncapped.
+        "concepts": {"type": "array", "maxItems": 60, "items": {"type": "string"}},
         "quantities": {
             "type": "array", "maxItems": 30,
             "items": {
@@ -211,9 +215,12 @@ SCHEMAS = {"digest": DIGEST_SCHEMA, "outline": OUTLINE_SCHEMA, "slide": SLIDE_SC
 # ── system prompts ────────────────────────────────────────────────────────────
 
 _COMMON_RULES = (
-    "Every factual claim must carry provenance: one ref with a locator (lines \"start-end\" "
-    "for documents, page for books, message_id for sessions, or t_ms for subtitles). "
-    "Never invent facts, numbers, or locators — if the source has no numbers, no quantities. "
+    "Every factual claim must carry provenance. A provenance ref is an object with "
+    "source_id plus EXACTLY ONE location field: lines (\"start\" or \"start-end\") for "
+    "documents, page for books, t_ms for subtitles, or message_id for sessions. Use "
+    "ONLY those key names — never a \"locator\" key, never extra keys, and omit the "
+    "unused location fields (or set them to null). "
+    "Never invent facts, numbers, or locations — if the source has no numbers, no quantities. "
     "If a statement is later corrected in a session transcript, keep the corrected fact and "
     "mark the old one with superseded_by. Reply with JSON only."
 )
@@ -221,16 +228,23 @@ _COMMON_RULES = (
 DIGEST_SYSTEM = (
     "You are a grounding-first analyst building a fact base from raw source text. Output "
     "JSON {title, facts:[{fact_id: \"f1\"..., statement, provenance:[...], superseded_by}], "
-    "concepts:[...], quantities:[{quant_id: \"q1\"..., metric, value, unit, provenance:[...]}]}. "
+    "concepts:[\"short bare string\", ...] — plain strings, NEVER {name, description} "
+    "objects, quantities:[{quant_id: \"q1\"..., metric, value, unit, provenance:[...]}]}. "
     f"Facts are atomic, checkable statements grounded in the source text below. {_COMMON_RULES}"
+)
+
+_UNIT_RULE = (
+    "Budget units are counted as: 1 per CJK character, 1 per Latin/digit word; spaces "
+    "and punctuation are free (so a 12-unit Chinese title is at most 12 hanzi)."
 )
 
 OUTLINE_SYSTEM = (
     "You are a presentation architect. From a FACT BASE (never raw text), design the deck "
     "narrative as JSON {title, narrative_strategy, sections:[{title, purpose, slides:[...]}]}. "
-    f"Each slide: slide_id \"s1\"..., title (<= {TITLE_MAX} words), purpose in "
+    f"Each slide: slide_id \"s1\"..., title (<= {TITLE_MAX} units), purpose in "
     f"{PURPOSES}, relationship in {RELATIONSHIPS}, key_message (exactly one takeaway, "
     f"<= {KEY_MESSAGE_MAX} units), fact_refs = the fact ids this slide stands on (>= 1). "
+    f"{_UNIT_RULE} "
     "Choose NO visual formats — layout is decided downstream. The LAST slide must have "
     "purpose SUMMARY. Reply with JSON only."
 )
@@ -250,7 +264,9 @@ def slide_system(quant_lines: str) -> str:
     return (
         "You are a slide writer. Expand ONE outline slide into a semantic slide as JSON "
         f"{{slide_id, title, key_message, purpose, relationship, speaker_notes, "
-        f"provenance_refs, payload}}. {_SLIDE_PAYLOAD_DOC} Only these quantities may "
+        f"provenance_refs, payload}}. title must be <= {TITLE_MAX} units and key_message "
+        f"<= {KEY_MESSAGE_MAX} units. {_UNIT_RULE} "
+        f"{_SLIDE_PAYLOAD_DOC} Only these quantities may "
         f"appear in a chart: {quant_lines or '(none — do NOT use series)'}. Chart points "
         "MUST cite one of their quant_refs; any untraceable number is forbidden. "
         f"{_COMMON_RULES}"

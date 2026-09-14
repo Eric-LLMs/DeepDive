@@ -27,7 +27,9 @@ from .models import (
 BUDGETS: dict[VisualType, dict[str, int]] = {
     "TEXT_HERO":   {"key_message": 60},
     "CARDS":       {"card_label": 6, "card_detail": 25, "cards_min": 2, "cards_max": 4},
-    "FLOWCHART":   {"steps_min": 3, "steps_max": 6, "step_label": 8},
+    # step_detail is calibrated to the worst-case flow node (6 steps → node_w ≈ 43mm,
+    # micro 10pt ⇒ ≈10 CJK chars per line, 2 lines in the 12mm detail slot).
+    "FLOWCHART":   {"steps_min": 3, "steps_max": 6, "step_label": 8, "step_detail": 18},
     "TIMELINE":    {"steps_min": 3, "steps_max": 6, "step_label": 6, "step_note": 15},
     "COMPARISON":  {"columns_max": 4, "rows_max": 6, "cell": 10},
     "ARCHITECTURE": {"tiers_max": 3, "nodes_per_tier_max": 5, "node_label": 4},
@@ -164,8 +166,8 @@ def budget_violations(slide: Slide, plan: VisualPlan, digest: ContentDigest) -> 
                         f"steps, got {len(steps)}")
         for i, st in enumerate(steps, 1):
             over(f"step {i} label", text_units(st.label), b["step_label"], slide.slide_id)
-            if vt == "TIMELINE":
-                over(f"step {i} note", text_units(st.detail), b["step_note"], slide.slide_id)
+            over(f"step {i} detail", text_units(st.detail),
+                 b["step_detail" if vt == "FLOWCHART" else "step_note"], slide.slide_id)
     elif vt == "COMPARISON":
         cols = p.columns
         if not 2 <= len(cols) <= b["columns_max"]:

@@ -334,7 +334,7 @@ corrective feedback — rules never patch the slide themselves.
 |---|---|
 | TEXT_HERO | key_message 10–30 EN words / ≤60 CJK chars; no payload items |
 | CARDS | 2–4 cards; card label ≤6 words, detail ≤25 words |
-| FLOWCHART | 3–6 steps; step ≤8 words; single lane (no branching in MVP) |
+| FLOWCHART | 3–6 steps; step label ≤8 units, detail ≤18 units (calibrated to the 6-node worst case at the micro tier so layout can never legitimately overflow); single lane (no branching in MVP) |
 | TIMELINE | 3–6 events; label ≤6 words; note ≤15 words |
 | COMPARISON | ≤4 columns × ≤5 rows; cell ≤10 words |
 | ARCHITECTURE | ≤3 tiers × ≤5 nodes; node label ≤4 words |
