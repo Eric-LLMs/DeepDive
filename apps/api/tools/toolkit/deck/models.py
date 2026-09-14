@@ -83,6 +83,18 @@ class ProvenanceRef(BaseModel):
     t_ms: int | None = None       # subtitle cue start
     quote: str | None = None
 
+    @field_validator("lines", mode="before")
+    @classmethod
+    def _lines_coerce(cls, v):
+        # Real models emit {"start": N, "end": M} for ranges; normalize to the
+        # "start-end" string convention deterministically (schema accepts both).
+        if isinstance(v, dict):
+            start, end = v.get("start"), v.get("end")
+            if not isinstance(start, int) or (end is not None and not isinstance(end, int)):
+                raise ValueError(f"lines object needs integer start/end, got {v!r}")
+            return str(start) if end is None or end == start else f"{start}-{end}"
+        return v
+
     @field_validator("lines")
     @classmethod
     def _lines_shape(cls, v: str | None) -> str | None:

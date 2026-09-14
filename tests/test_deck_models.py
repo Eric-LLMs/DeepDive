@@ -55,6 +55,15 @@ class TestProvenance:
         assert ref(lines="10-12").lines == "10-12"
         assert ref(lines="7").lines == "7"
 
+    def test_lines_object_form_is_coerced(self):
+        # Real models emit {"start":N,"end":M}; the wire accepts it and the model
+        # normalizes it to the "start-end" convention (2026-09-14 Pass A failures).
+        assert ref(lines={"start": 4, "end": 12}).lines == "4-12"
+        assert ref(lines={"start": 7}).lines == "7"
+        assert ref(lines={"start": 7, "end": 7}).lines == "7"
+        with pytest.raises(ValidationError):
+            ref(lines={"start": "x", "end": 2})
+
 
 class TestClosedVocabularies:
     def test_extra_field_forbidden(self):

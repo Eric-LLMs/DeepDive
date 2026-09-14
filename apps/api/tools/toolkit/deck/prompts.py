@@ -33,7 +33,18 @@ _PROVENANCE_SCHEMA = {
         # "page": null for a line-located fact); ProvenanceRef accepts None for each.
         "message_id": {"type": ["string", "null"]},
         "page": {"type": ["integer", "null"], "minimum": 1},
-        "lines": {"type": ["string", "null"]},   # "start" or "start-end"
+        # "start" or "start-end"; real models also naturally emit {"start":N,"end":M}
+        # and refuse to unlearn it under correction, so the wire accepts both and the
+        # ProvenanceRef model normalizes the object form to the string convention.
+        "lines": {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "null"},
+                {"type": "object", "required": ["start"], "additionalProperties": False,
+                 "properties": {"start": {"type": "integer", "minimum": 1},
+                                "end": {"type": "integer", "minimum": 1}}},
+            ],
+        },
         "t_ms": {"type": ["integer", "null"], "minimum": 0},
         "quote": {"type": ["string", "null"]},
     },
