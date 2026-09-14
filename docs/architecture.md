@@ -664,15 +664,41 @@ The sibling **toolkit pipeline** (`apps/api/tools/toolkit/`) powers the workbenc
 **Generate Mind Map / Generate Slides / Summarize** — `POST /toolkit/generate` → worker
 `toolkit_generate`. Every tool (`summary` / `mindmap` / `slides`) runs the same five stages:
 **validate** (workspace-confined sources, existence, per-file size cap) → **ingest** (text
-extraction + token-budget map-reduce: a single over-budget file is split into line-tracked
-chunks, digest calls run under a concurrency cap of 4, and the chunk bound — 64 chunks ×
-12000 chars per file — fails loudly instead of burning the worker timeout on serial LLM calls)
-→ **generate** (structured JSON via JSON mode, jsonschema-validated, one corrective retry that
-carries the concrete schema errors back into the prompt) → **render** (JSON → Mermaid `.mmd` /
-Marp `.md` / summary Markdown / `.pptx`, never raw model-written markup) → **persist** (atomic,
-collision-proof names). The endpoint accepts three modes, plus two per-run options — `name`
-(output-stem override) and `prompt` (a per-task custom prompt **appended to** — never replacing
-— the tool's default system prompt in stage 3, so the JSON/schema constraints stay intact):
+extraction + token-budget single-pass rule: sources totalling ≤ `toolkit_max_input_tokens`
+(40K) go to the model RAW; only over-budget sources are split into line-tracked chunks
+(64 × 12000 chars/file, digest calls capped at concurrency 4) and map-reduced, failing
+loudly at the chunk bound instead of burning the worker timeout) → **generate** → **render**
+(JSON → Mermaid `.mmd` / summary Markdown; `slides` → the deck engine below, never raw
+model-written markup) → **persist** (atomic, collision-proof names).
+
+`summary` / `mindmap` **generate** is the single structured call (JSON mode,
+jsonschema-validated, one corrective retry that carries the concrete — condensed, ≤240-char —
+schema errors back into the prompt). `slides` **generate** runs the dedicated
+**content-to-slides deck engine** (`toolkit/deck/`, full spec
+[docs/content-to-slides.md](content-to-slides.md)): three semantic LLM passes —
+**A understand** (grounded fact base: atomic facts + quantities, every claim carries a
+provenance ref; caps facts≤60 / quantities≤30) → **B outline** (narrative + per-slide
+purpose/relationship/key message, reads ONLY the digest, never the raw source) → **C
+expansion** (per slide, concurrent with `min(configured, provider, worker, slide_count)`
+semaphores, a per-attempt `deck_slide_timeout_s` deadline, and a structural gate: a slide
+whose purpose promises a graphic — PROCESS/TIMELINE→steps, ARCHITECTURE/hierarchical→tiered
+items, COMPARISON/comparative→columns — fails validation and retries that one slide alone
+when its payload is empty or mismatched) — plus a deterministic, zero-LLM **D visual-plan**
+pass (`rules.py` fallback chain) feeding budgets-checked Typst rendering. Canonical artifact
+is the compiled 16:9 **`<name>_slides.pdf`**, alongside `.md` / `.pptx` / `deck.json` exports
+of the same `DeckSpec`; **no silent trimming anywhere** — a slide still violating budgets
+after its corrective re-run fails the job loudly. Per-pass timings log at INFO
+(`deck timing`) for offline P50/P95 harvesting.
+
+Dialog knobs are **routed per pass, not concatenated**: the slides "Customize Slide Deck"
+dialog submits `{file_ids, prompt, count, language, format_mode}`; `count` bounds Pass B's
+outline (±2, validator-enforced), `language` appends a LANGUAGE rule to Passes A/B/C,
+`format_mode=presenter` appends a low-text-density FORMAT rule to Passes B/C (`detailed` is
+the silent baseline), and the free-text `prompt` becomes Pass B's `USER GUIDANCE` — which can
+never override the output contract (Pass C stays outline-bound). The other tools keep the
+two per-run options — `name` (output-stem override) and `prompt` (a per-task custom prompt
+**appended to** — never replacing — the tool's default system prompt in stage 3, so the
+JSON/schema constraints stay intact):
 
 ```
 ┌─ Electron workbench ──────────────┐        ┌─ FastAPI gateway ────────────┐
@@ -852,6 +878,11 @@ job is **never transient**. The desktop client reflects that: the generate dialo
 Generate button disabled and polls `GET /jobs/{id}` every 2 s **until a terminal state** — it
 imposes no client-side deadline — so a job that outlives the dialog keeps running and reports its
 result when the user reopens the dialog or when the poll completes in the background.
+The poller is **fail-terminated, never stuck**: each poll fetch is bounded by a 10 s
+`AbortController` timeout (a wedged connection can't freeze the pool), 30 consecutive poll
+failures give the entry up loudly, a 45-minute watchdog marks it failed if the backend never
+finalizes, and error toasts carry a 200-char brief — so a dead or slow job can never leave
+Generate permanently locked.
 
 [↑ Back to top](#table-of-contents)
 
@@ -1245,6 +1276,7 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Attach document images to RAG chunks | page/para markers → chunk `meta.pages` / `meta.image_ids` (union across pages, state machine covers unmarked blocks) |
 | Route the vision tool to a model | `tools.vision.model` → catalog model → route → credential (`_resolve_vision_channel`) |
 | Compile a publication PDF from the finalized manuscript | `ArtifactCompileService.compile_project_pdf` (`plugins/artifact/`): zero-LLM deterministic projection (`project_manuscript_to_ast`, inv. 11) → Typst CLI → drive binary + `outputs/<task name>_v{N}.pdf` mirror; **default-ON** sibling branch of the PUBLISH node (opt out with `pdf_report: false`; a PDF fault still publishes and writes `pipeline.publish.pdf_error`) — see §21 |
+| Generate a 16:9 slide deck from documents / subtitles / sessions | deck engine `toolkit/deck/`: Pass A grounded fact base → Pass B outline (digest-only input) → Pass C per-slide concurrent expansion with timeout isolation + structural payload gate → pure Pass D visual plan → Typst PDF; canonical `<name>_slides.pdf` + `.md`/`.pptx`/`deck.json`; no silent trimming, loud fail on residual budget violations; dialog knobs (count / language / format / guidance) routed per pass — see [docs/content-to-slides.md](content-to-slides.md) |
 
 [↑ Back to top](#table-of-contents)
 
@@ -2001,8 +2033,16 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     collapses the chat into a floating restore icon; a **Generate** toolbar above the input
     exposes the same three entries as one-click buttons.
 
-    Every generation entry opens the **generate dialog** (see §6): pick the source — **this
-    conversation** or **Cloud Drive files** (a checkbox-tree picker, `pickCloudFiles`, that greys
+    Every generation entry opens a dialog (see §6). **Slides** open the dedicated
+    **Customize Slide Deck** dialog — business intent only, no schema exposure: two Format
+    cards (**Detailed Deck** = document-deck default / **Presenter Slides** = visual-first),
+    a **language** select (English / 中文), a **Short / Default** length pill (6 / 8 content
+    slides), a **Sources** multi-select popover (drive files grouped by stem — a doc and its
+    subtitle sibling share one row with a `· N sources` count; Show all / Only sources with
+    new content / Recent filters; the launching file pre-checked), a free-text **Describe the
+    slide deck** box, and an AI-usage estimate bar with **Generate later / Generate now**.
+    **Mind map / summary** keep the classic dialog: pick the source — **this conversation**
+    or **Cloud Drive files** (a checkbox-tree picker, `pickCloudFiles`, that greys
     out files over the `/toolkit/config` per-file cap or in an unsupported format) — then the
     output folder, an optional custom prompt, and an optional file name. Submit enqueues
     `POST /toolkit/generate` in session or cloud-file mode. While the job runs the dialog's
