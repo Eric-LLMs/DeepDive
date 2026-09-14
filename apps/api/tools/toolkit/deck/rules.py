@@ -37,6 +37,46 @@ BUDGETS: dict[VisualType, dict[str, int]] = {
 }
 
 
+# ── Pass C structural gate (pure; used as an extra_check during expansion) ────
+#
+# A slide whose SEMANTICS promise a graphic (purpose/relationship below) must arrive
+# from Pass C with the matching structured payload. Before this gate such a slide
+# silently degraded down the fallback chain (rule3/rule4 → CARDS/TEXT_HERO) — the
+# "all-bullets" visual regression. The gate turns it into a LOUD per-slide validation
+# failure so ONLY that slide retries. Purity law holds: this reports, never mutates.
+# Text stays legal where the semantics themselves are textual (singular_takeaway
+# heroes, PROBLEM/SUMMARY/DEFINITION pages, and quantitative pages with no real
+# numbers — anti-fabrication must not be forced into a drawing).
+
+_STEPS = "ordered steps [{label, detail}] — 3..6 of them, one per stage"
+_TIERS = "tiered items [{label, detail, group}] — set group to the layer/tier name"
+_COLS = "comparison columns [{header, cells}] — 2..4 columns with equal cell counts"
+
+REQUIRED_SHAPE: dict[str, tuple[str, str]] = {
+    "PROCESS": ("steps", _STEPS),
+    "TIMELINE": ("steps", _STEPS + ", and a `when` label per event"),
+    "ARCHITECTURE": ("items-grouped", _TIERS),
+    "COMPARISON": ("columns", _COLS),
+    "sequential": ("steps", _STEPS),
+    "hierarchical": ("items-grouped", _TIERS),
+    "comparative": ("columns", _COLS),
+}
+
+
+def payload_shape_violations(slide: Slide) -> list[str]:
+    """[] = the structured promise carried by purpose/relationship is honoured by the payload."""
+    want = REQUIRED_SHAPE.get(slide.purpose) or REQUIRED_SHAPE.get(slide.relationship)
+    if want is None:
+        return []
+    shape, remedy = want
+    if slide.payload.shape() != shape:
+        return [f"slide {slide.slide_id}: purpose={slide.purpose} "
+                f"relationship={slide.relationship} requires {remedy}; got shape "
+                f"{slide.payload.shape()!r}. Do NOT answer with text only — populate "
+                "the structured payload; the visual type is derived from it."]
+    return []
+
+
 # ── the pure chain ────────────────────────────────────────────────────────────
 
 def derive_visual_plan(slide: Slide, digest: ContentDigest) -> VisualPlan:

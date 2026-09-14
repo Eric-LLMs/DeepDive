@@ -67,9 +67,19 @@ class Settings(BaseSettings):
     # ── Toolkit content generation (workspace files → slides / mindmap / summary) ──
     # Output root (relative to the workspace) and input guardrails: text above the token
     # budget triggers map-reduce; files over the byte cap are refused outright.
+    # 40K ≈ the current model's safe single-pass input (64K window minus generation
+    # headroom): small/medium documents go to the generator RAW — the map-reduce
+    # pre-pass is only for genuinely over-budget sources.
     toolkit_output_dir: Path = Path(".output")
-    toolkit_max_input_tokens: int = 12000
+    toolkit_max_input_tokens: int = 40000
     toolkit_max_file_bytes: int = 20 * 1024 * 1024
+
+    # Deck (content-to-slides) Pass C throughput knobs. Effective fan-out per deck =
+    # min(configured, provider per-key cap, worker in-job cap, slide_count).
+    deck_pass_c_concurrency: int = 8      # configured ceiling for parallel slide calls
+    deck_provider_concurrency: int = 6    # conservative DeepSeek per-key concurrent-call cap
+    deck_worker_concurrency: int = 8      # LLM calls one worker job may keep in flight
+    deck_slide_timeout_s: float = 180.0   # per-attempt deadline; a timed-out page retries alone
 
     # ── Web search (agent web_search tool) ──
     # provider is free text: aggregate/keyless (no key) | duckduckgo (no key) | tavily |

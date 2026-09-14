@@ -258,7 +258,11 @@ _SLIDE_PAYLOAD_DOC = (
     "steps [{label, detail, when}] (sequential; when only for timelines), "
     "columns [{header, cells}] (comparative — equal cell counts), "
     "series [{name, points:[{x, y, quant_ref}]}] (quantitative). A singular_takeaway "
-    "slide has an empty payload."
+    "slide has an empty payload. "
+    "MANDATORY shapes (an empty or mismatched payload is REJECTED and you will be asked "
+    "to redo THIS slide): purpose/relationship PROCESS or sequential -> steps (3..6); "
+    "TIMELINE -> steps with `when`; ARCHITECTURE or hierarchical -> items with group "
+    "tiers; COMPARISON or comparative -> columns."
 )
 
 

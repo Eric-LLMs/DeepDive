@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 
+from core.config import settings
 from pydantic import ValidationError
 
 from ..errors import GenerationError
@@ -32,16 +34,16 @@ from .models import (
     DeckSpec,
     Outline,
     Slide,
+    SlideOutlineItem,
     SourceDoc,
     VisualPlan,
     check_outline,
 )
-from .rules import budget_violations, derive_visual_plan
+from .rules import budget_violations, derive_visual_plan, payload_shape_violations
 
 logger = logging.getLogger(__name__)
 
 _RETRIES = 2            # corrective retries per pass
-_PASS_C_CONCURRENCY = 4   # parallel slide expansion calls (order-preserving collect)
 
 
 def _source_docs(sources: list[WorkspaceSource]) -> list[SourceDoc]:
@@ -95,13 +97,28 @@ def _condense_errors(errors: list[str]) -> list[str]:
 
 
 async def _structured(llm, *, prompt: str, system: str, schema: dict,
-                      extra_check=None, label: str) -> tuple[object, dict]:
+                      extra_check=None, label: str,
+                      timeout: float | None = None) -> tuple[object, dict]:
     """One LLM pass with corrective retries. ``extra_check(data) -> (errors, loaded)``
-    runs after schema validation; returns the loaded object."""
+    runs after schema validation; returns the loaded object. ``timeout`` bounds a
+    SINGLE attempt: a timed-out attempt is fed back as a corrective error so the same
+    call is retried in isolation — one slow page never stalls or redoes the deck."""
     current = prompt
     last_errs: list[str] = []
     for attempt in range(_RETRIES + 1):
-        data = await _complete_json(llm, current, system)
+        try:
+            if timeout:
+                data = await asyncio.wait_for(_complete_json(llm, current, system), timeout)
+            else:
+                data = await _complete_json(llm, current, system)
+        except asyncio.TimeoutError:
+            errors = _condense_errors(
+                [f"model response timed out after {timeout:.0f}s — produce the complete "
+                 "JSON now, staying inside every stated budget"])
+            last_errs = errors
+            logger.info("%s pass attempt %d timed out", label, attempt + 1)
+            current = P.corrective_retry_prompt(errors, prompt)
+            continue
         errors = validate(schema, data)
         loaded = None
         if not errors and extra_check is not None:
@@ -156,22 +173,44 @@ def _fact_subset(digest: ContentDigest, fact_refs: list[str]) -> dict:
     return {"facts": facts, "quantities": quants}
 
 
+def _c_check(item: SlideOutlineItem):
+    """Pass C extra_check for one outline item.
+
+    purpose/relationship are FORCED from the validated outline (the model fills content,
+    it does not re-decide the slide's cognitive task), and the structural gate rejects
+    slides that promise a graphic but deliver an empty/other payload — that failure
+    retries ONLY this slide, closing the silent TEXT_HERO-degradation hole.
+    """
+    def check(d: dict) -> tuple[list[str], object | None]:
+        d = dict(d)
+        d.setdefault("slide_id", item.slide_id)   # the id is fixed by the outline
+        d["purpose"] = item.purpose               # never model-reassignable
+        d["relationship"] = item.relationship
+        errs, slide = _check(d, Slide)
+        if errs:
+            return errs, None
+        return payload_shape_violations(slide), slide
+    return check
+
+
 async def _pass_c_one(llm, item, section: str, subset: dict) -> Slide:
     quant_lines = "; ".join(
         f"{q['quant_id']}={q['value']}{q.get('unit', '')}"
         for q in subset["quantities"]) or ""
     prompt = P.slide_prompt(P.dumps(item.model_dump(mode="json")),
                             P.dumps(subset), section)
-
-    def check(d: dict) -> tuple[list[str], object | None]:
-        d = dict(d)
-        d.setdefault("slide_id", item.slide_id)   # the id is fixed by the outline
-        return _check(d, Slide)
-
     slide, _raw = await _structured(
         llm, prompt=prompt, system=P.slide_system(quant_lines),
-        schema=P.SLIDE_SCHEMA, extra_check=check, label=f"C/{item.slide_id}")
+        schema=P.SLIDE_SCHEMA, extra_check=_c_check(item), label=f"C/{item.slide_id}",
+        timeout=settings.deck_slide_timeout_s)
     return slide
+
+
+def _effective_concurrency(n_slides: int) -> int:
+    """min(configured, provider, worker, slide_count) — directive §3.1."""
+    caps = (settings.deck_pass_c_concurrency, settings.deck_provider_concurrency,
+            settings.deck_worker_concurrency, max(1, n_slides))
+    return max(1, min(caps))
 
 
 async def pass_c_expand(llm, outline: Outline, digest: ContentDigest) -> list[Slide]:
@@ -179,7 +218,7 @@ async def pass_c_expand(llm, outline: Outline, digest: ContentDigest) -> list[Sl
     for sec in outline.sections:
         for item in sec.slides:
             jobs.append((item, sec.title, _fact_subset(digest, item.fact_refs)))
-    sem = asyncio.Semaphore(_PASS_C_CONCURRENCY)
+    sem = asyncio.Semaphore(_effective_concurrency(len(jobs)))
 
     async def one(item, section, subset):
         async with sem:
@@ -211,29 +250,28 @@ async def plan_with_repair(llm, slides: list[Slide], outline: Outline,
         return slides, plans
 
     items = {i.slide_id: (i, sec.title) for sec in outline.sections for i in sec.slides}
-    sem = asyncio.Semaphore(_PASS_C_CONCURRENCY)
+    sem = asyncio.Semaphore(_effective_concurrency(len(bad)))
 
     async def fix(slide: Slide, plan: VisualPlan) -> Slide:
         errs = budget_violations(slide, plan, digest)
-        subset = _fact_subset(digest, items[slide.slide_id][0].fact_refs)
+        item = items[slide.slide_id][0]
+        subset = _fact_subset(digest, item.fact_refs)
         quant_lines = "; ".join(
             f"{q['quant_id']}={q['value']}{q.get('unit', '')}"
             for q in subset["quantities"]) or ""
         prompt = P.corrective_retry_prompt(
             errs,
-            P.slide_prompt(P.dumps(items[slide.slide_id][0].model_dump(mode="json")),
+            P.slide_prompt(P.dumps(item.model_dump(mode="json")),
                            P.dumps(subset), items[slide.slide_id][1])
             + "\n\nYOUR REJECTED SLIDE (fix the violations above, keep the meaning):\n"
             + P.dumps(slide.model_dump(mode="json", exclude_none=True)))
         async with sem:
             slide, _ = await _structured(
                 llm, prompt=prompt, system=P.slide_system(quant_lines),
-                schema=P.SLIDE_SCHEMA, extra_check=_check_slide,
-                label=f"C-repair/{slide.slide_id}")
+                schema=P.SLIDE_SCHEMA, extra_check=_c_check(item),
+                label=f"C-repair/{slide.slide_id}",
+                timeout=settings.deck_slide_timeout_s)
             return slide
-
-    def _check_slide(d: dict) -> tuple[list[str], object | None]:
-        return _check(d, Slide)
 
     fixed = await asyncio.gather(*(fix(s, p) for s, p in bad), return_exceptions=True)
     repl: dict[str, Slide] = {}
@@ -264,12 +302,23 @@ def _check(d: dict, model_cls):
 async def generate_deck(llm, sources: list[WorkspaceSource],
                         options: DeckOptions | None = None, *,
                         deck_id: str = "deck", hint: str = "") -> DeckSpec:
-    """Run Pass A → B → C → D and assemble the DeckSpec (the single source of truth)."""
+    """Run Pass A → B → C → D and assemble the DeckSpec (the single source of truth).
+
+    Phase timings are logged at INFO so P50/P95 can be harvested offline from worker
+    logs without a separate metrics pipeline.
+    """
     options = options or DeckOptions()
+    t0 = time.perf_counter()
     digest = await pass_a_understand(llm, sources, hint)
+    t1 = time.perf_counter()
     outline = await pass_b_outline(llm, digest, options)
+    t2 = time.perf_counter()
     slides = await pass_c_expand(llm, outline, digest)
     slides, plans = await plan_with_repair(llm, slides, outline, digest)
+    t3 = time.perf_counter()
+    logger.info(
+        "deck timing %s: A=%.1fs B=%.1fs C=%.1fs (slides=%d) total=%.1fs",
+        deck_id, t1 - t0, t2 - t1, t3 - t2, len(slides), t3 - t0)
     return DeckSpec(
         deck_id=deck_id,
         title=outline.title or digest.title,

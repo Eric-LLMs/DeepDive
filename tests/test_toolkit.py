@@ -185,6 +185,20 @@ async def test_budget_plan_unchanged_under_budget():
     assert planned == [src]
 
 
+async def test_budget_plan_single_pass_at_40k_default():
+    # 2026-09-14 directive: a mid-size source (~30K tokens, inside the 40K default)
+    # must reach Pass A verbatim — no map-reduce round-trips, zero extra LLM calls.
+    assert settings.toolkit_max_input_tokens == 40000
+    text = "lorem ipsum dolor sit amet " * 5400          # ~30K tokens
+    src = sources.WorkspaceSource(name="doc.md", path="doc.md", text=text,
+                                  char_count=len(text), line_count=text.count("\n") + 1)
+    assert 20_000 <= sources.token_count(text) <= settings.toolkit_max_input_tokens
+    llm = _FakeLLM()
+    planned = await sources.budget_plan([src], llm)
+    assert planned == [src]
+    assert not llm.complete_calls
+
+
 # ── pipeline stages ──
 
 async def test_path_traversal_rejected(tmp_path):

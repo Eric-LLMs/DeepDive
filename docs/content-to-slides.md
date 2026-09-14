@@ -294,6 +294,29 @@ CHART anti-fabrication: `Series.points[].quant_ref` must reference a
 COMPARISON table) when `digest.quantities` is empty. Numbers that don't exist in the
 source can never reach the chart renderer.
 
+### 3.3 Throughput decisions (frozen 2026-09-14)
+
+- **Single-pass ingestion.** `toolkit_max_input_tokens` is the model's safe single-call
+  input (default 40K). Sources at or below it go to Pass A RAW — map-reduce exists only
+  for over-budget sources. (The old 12K value made every medium document pay a
+  multi-call digest pre-pass.)
+- **Pass A + Pass B stay separate (merge evaluated, rejected).** A combined
+  planner call must return digest+outline in one JSON — strictly larger and more
+  failure-prone than the today-observed Pass A oversized-output failures, and it
+  would break errata #2 (exactly 3 semantic LLM passes) and the "Pass B reads the
+  digest only" contract. Two calls, each independently validated, converge faster.
+- **Pass C is per-slide concurrent** with `effective_concurrency = min(configured,
+  provider, worker, slide_count)` (settings `deck_pass_c_concurrency`,
+  `deck_provider_concurrency`, `deck_worker_concurrency`), a per-attempt deadline
+  (`deck_slide_timeout_s`), and a structural gate: a slide whose purpose/relationship
+  promises a graphic (PROCESS/TIMELINE/sequential → steps, ARCHITECTURE/hierarchical →
+  tiered items, COMPARISON/comparative → columns) FAILS validation and retries — only
+  that one slide — when the payload is empty or of another shape. Silent degradation
+  of a structured promise to TEXT_HERO is thereby impossible; TEXT_HERO remains legal
+  only where the semantics are genuinely textual.
+- **Phase timings** (A/B/C/total) are logged at INFO (`deck timing`) for offline
+  P50/P95 harvesting; the 20K–30K-token document target is P50 < 90s.
+
 ---
 
 ## 4. Visual Grammar — deterministic mapping

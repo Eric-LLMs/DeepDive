@@ -6,6 +6,7 @@ anti-fabrication repair loop.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 
@@ -36,6 +37,8 @@ class FakeLLM:
         r = self.replies.pop(0)
         if callable(r):
             r = r(prompt)
+            if asyncio.iscoroutine(r):          # async callables can script delays
+                r = await r
         if isinstance(r, Exception):
             raise r
         return json.loads(json.dumps(r))     # deep copy
@@ -209,7 +212,9 @@ class TestGenerateDeck:
             "provenance_refs": [{"source_id": "doc.md", "kind": "document", "lines": "9"}],
         }
 
-        # queue: digest, outline, s1, s2(bad), s3, then repair for s2 (fixed)
+        # queue: digest, outline, s1, s2(bad), s3, then repair for s2 (fixed).
+        # Pass C forces purpose/relationship from the outline item, so the outline —
+        # not the model reply — declares DATA_INSIGHT for s2.
         def c(prompt):
             if '"s1"' in prompt:
                 return _slide_json("s1")
@@ -218,7 +223,11 @@ class TestGenerateDeck:
             if '"s2"' in prompt and "REJECTED SLIDE" not in prompt:
                 return bad_s2
             return _slide_json("s2")          # repair re-run returns the clean steps slide
-        llm = FakeLLM([_digest_json(), _outline_json(), c, c, c, c])
+        o = _outline_json()
+        o["sections"][0]["slides"][1] = {**o["sections"][0]["slides"][1],
+                                         "purpose": "DATA_INSIGHT",
+                                         "relationship": "quantitative"}
+        llm = FakeLLM([_digest_json(), o, c, c, c, c])
         deck = await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
         assert deck.slides[1].payload.steps      # repaired
         assert deck.visual_plan[1].visual_type == "FLOWCHART"
@@ -274,3 +283,173 @@ class TestRenderPdf:
 def _deck_slides():
     from tests._deck_fixtures import cards_slide, flow_slide, hero_slide
     return [hero_slide(), cards_slide(4), flow_slide(4)]
+
+
+# ── throughput + structural-gate contracts (2026-09-14 directive) ─────────────
+
+def _decision_tree_outline_json() -> dict:
+    """A decision-tree shaped outline: tiers, traversal process, strategy comparison, close."""
+    return {
+        "title": "决策树详解", "narrative_strategy": "top_down",
+        "sections": [{"title": "主体", "purpose": "main", "slides": [
+            {"slide_id": "s1", "title": "三层结构", "purpose": "ARCHITECTURE",
+             "relationship": "hierarchical", "key_message": "根/内部/叶节点分层",
+             "fact_refs": ["f1"]},
+            {"slide_id": "s2", "title": "建树流程", "purpose": "PROCESS",
+             "relationship": "sequential", "key_message": "四步递归分裂",
+             "fact_refs": ["f2"]},
+            {"slide_id": "s3", "title": "基尼 vs 信息增益", "purpose": "COMPARISON",
+             "relationship": "comparative", "key_message": "两种分裂准则",
+             "fact_refs": ["f3"]},
+            {"slide_id": "s4", "title": "小结", "purpose": "SUMMARY",
+             "relationship": "singular_takeaway", "key_message": "剪枝防过拟合",
+             "fact_refs": ["f3"]},
+        ]}],
+    }
+
+
+def _dt_c_reply(prompt: str) -> dict:
+    prov = [{"source_id": "doc.md", "kind": "document", "lines": "1-3"}]
+    if '"s1"' in prompt:
+        return {"slide_id": "s1", "title": "三层结构", "key_message": "根/内部/叶节点分层",
+                "purpose": "ARCHITECTURE", "relationship": "hierarchical",
+                "speaker_notes": "", "provenance_refs": prov,
+                "payload": {"items": [
+                    {"label": "根节点", "detail": "全量样本", "group": "顶层"},
+                    {"label": "内部节点", "detail": "特征分裂", "group": "中层"},
+                    {"label": "叶节点", "detail": "类别输出", "group": "底层"}]}}
+    if '"s2"' in prompt:
+        return {"slide_id": "s2", "title": "建树流程", "key_message": "四步递归分裂",
+                "purpose": "PROCESS", "relationship": "sequential",
+                "speaker_notes": "", "provenance_refs": prov,
+                "payload": {"steps": [{"label": "选择特征", "detail": "信息增益最大"},
+                                      {"label": "分裂节点", "detail": "按阈值二分"},
+                                      {"label": "递归", "detail": "子集继续"},
+                                      {"label": "停止", "detail": "纯度达标"}]}}
+    if '"s3"' in prompt:
+        return {"slide_id": "s3", "title": "基尼 vs 信息增益",
+                "key_message": "两种分裂准则", "purpose": "COMPARISON",
+                "relationship": "comparative", "speaker_notes": "",
+                "provenance_refs": prov,
+                "payload": {"columns": [
+                    {"header": "基尼", "cells": ["CART", "计算快"]},
+                    {"header": "信息增益", "cells": ["ID3", "偏向多值"]}]}}
+    return {"slide_id": "s4", "title": "小结", "key_message": "剪枝防过拟合",
+            "purpose": "SUMMARY", "relationship": "singular_takeaway",
+            "speaker_notes": "", "provenance_refs": prov, "payload": {}}
+
+
+class TestStructuralGate:
+    @pytest.mark.asyncio
+    async def test_process_slide_without_steps_retries_only_that_slide(self):
+        # Directive 3.2: an empty payload on a PROCESS/sequential slide is a LOUD
+        # per-slide validation failure — never a silent TEXT_HERO degradation.
+        calls = {"s2": 0}
+
+        def c(prompt):
+            if '"s1"' in prompt:
+                return _slide_json("s1")
+            if '"s3"' in prompt:
+                return _slide_json("s3")
+            calls["s2"] += 1
+            if calls["s2"] == 1:
+                bad = json.loads(json.dumps(_slide_json("s2")))
+                bad["payload"] = {}                        # structured promise broken
+                return bad
+            return _slide_json("s2")
+
+        llm = FakeLLM([_digest_json(), _outline_json(), c, c, c, c])
+        deck = await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        assert calls["s2"] == 2                            # only s2 retried
+        assert sum(1 for p in llm.prompts[2:] if '"s1"' in p) == 1   # s1 untouched
+        assert deck.slides[1].payload.steps
+        assert any("requires ordered steps" in p for p in llm.prompts)
+
+    @pytest.mark.asyncio
+    async def test_purpose_and_relationship_forced_from_outline(self):
+        # The model must not re-decide the slide's cognitive task to dodge the gate.
+        def c(prompt):
+            if '"s2"' in prompt:
+                dodgy = json.loads(json.dumps(_slide_json("s2")))
+                dodgy["purpose"] = "PROBLEM"
+                dodgy["relationship"] = "singular_takeaway"
+                return dodgy
+            return _slide_json("s1" if '"s1"' in prompt else "s3")
+
+        llm = FakeLLM([_digest_json(), _outline_json(), c, c, c])
+        deck = await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        s2 = deck.slides[1]
+        assert s2.purpose == "PROCESS" and s2.relationship == "sequential"
+        assert deck.visual_plan[1].visual_type == "FLOWCHART"   # no degradation
+
+    @pytest.mark.asyncio
+    async def test_slide_timeout_retries_only_that_slide(self, monkeypatch):
+        from core.config import settings
+        monkeypatch.setattr(settings, "deck_slide_timeout_s", 0.05)
+        seen = {"s2": 0}
+
+        async def slow_s2(prompt):
+            seen["s2"] += 1
+            if seen["s2"] == 1:
+                await asyncio.sleep(1.0)                   # blows the 0.05s deadline
+            return _slide_json("s2")
+
+        def c(prompt):
+            if '"s2"' in prompt:
+                return slow_s2(prompt)                     # coroutine → FakeLLM awaits it
+            return _slide_json("s1" if '"s1"' in prompt else "s3")
+
+        llm = FakeLLM([_digest_json(), _outline_json(), c, c, c, c])
+        deck = await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        assert seen["s2"] == 2                             # timed out once, retried once
+        assert deck.slides[1].payload.steps
+
+    def test_effective_concurrency_is_min_of_caps(self, monkeypatch):
+        from core.config import settings
+        from apps.api.tools.toolkit.deck.passes import _effective_concurrency
+        monkeypatch.setattr(settings, "deck_pass_c_concurrency", 8)
+        monkeypatch.setattr(settings, "deck_provider_concurrency", 6)
+        monkeypatch.setattr(settings, "deck_worker_concurrency", 8)
+        assert _effective_concurrency(10) == 6             # provider binds
+        assert _effective_concurrency(2) == 2              # slide_count binds
+        monkeypatch.setattr(settings, "deck_provider_concurrency", 16)
+        monkeypatch.setattr(settings, "deck_worker_concurrency", 16)
+        assert _effective_concurrency(10) == 8             # configured binds
+
+
+class TestDecisionTreeSample:
+    @pytest.mark.asyncio
+    async def test_visual_plan_hits_structured_types_never_all_text_hero(self):
+        llm = FakeLLM([_digest_json(), _decision_tree_outline_json(),
+                       _dt_c_reply, _dt_c_reply, _dt_c_reply, _dt_c_reply])
+        deck = await generate_deck(llm, _src(), DeckOptions(target_slide_count=4))
+        types = [p.visual_type for p in deck.visual_plan]
+        assert set(types) >= {"ARCHITECTURE", "FLOWCHART", "COMPARISON"}
+        assert types != ["TEXT_HERO"] * len(types)
+        # structured pages were chosen by payload shape (rule1/2), never the rule4 fallback
+        for p in deck.visual_plan:
+            if p.visual_type in ("ARCHITECTURE", "FLOWCHART", "COMPARISON"):
+                assert not p.rationale.startswith("rule4")
+
+    @pytest.mark.skipif(shutil.which("typst") is None,
+                        reason="typst binary only present in the worker container")
+    def test_decision_tree_pdf_contains_vector_geometry(self, tmp_path):
+        # page order: cover, ARCHITECTURE, FLOWCHART, COMPARISON, TEXT_HERO
+        deck = make_deck(_dt_slides())
+        r = render_deck_pdf(deck, tmp_path)
+        assert r.report.ok, r.report.model_dump()
+        import pymupdf
+        doc = pymupdf.open(stream=r.pdf, filetype="pdf")
+        try:
+            counts = [len(doc[i].get_drawings()) for i in range(doc.page_count)]
+        finally:
+            doc.close()
+        assert counts[1] >= 3 and counts[2] >= 5 and counts[3] >= 3   # real shapes
+        assert counts[4] <= 2                                          # hero: text only
+
+
+def _dt_slides():
+    from tests._deck_fixtures import arch_slide, compare_slide, flow_slide, hero_slide
+    arch = arch_slide().model_copy(update={"purpose": "ARCHITECTURE"})
+    comp = compare_slide().model_copy(update={"purpose": "COMPARISON"})
+    return [arch, flow_slide(4), comp, hero_slide()]
