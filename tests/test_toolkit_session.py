@@ -67,6 +67,20 @@ def test_build_transcript_without_title_skips_heading():
     assert "**User:** Hi" in out
 
 
+def test_build_transcript_emits_message_id_markers():
+    # The deck engine's Pass A grounds corrections via message_id locators, so each kept
+    # message carries its ``<!-- msg:ID -->`` marker on the line above it.
+    out = build_transcript("T", [
+        {"id": "u1", "role": "user", "content": "对,改成 0.565 USD"},
+        {"id": "a2", "role": "assistant", "content": "Done."},
+        {"role": "user", "content": "no id here"},
+    ])
+    assert "<!-- msg:u1 -->\n**User:** 对,改成 0.565 USD" in out
+    assert "<!-- msg:a2 -->\n**Assistant:** Done." in out
+    assert out.count("<!-- msg:") == 2  # the id-less message gets no marker
+    assert "**User:** no id here" in out
+
+
 def test_build_transcript_empty_raises():
     with pytest.raises(ValueError, match="no messages"):
         build_transcript("T", [{"role": "tool", "content": "x"}, {"role": "system", "content": "y"}])
@@ -78,12 +92,14 @@ def test_artifact_plan_maps_extensions_to_names():
     summ = artifact_plan("summary", "My Session")
     assert summ == {".md": ("My Session_summary.md", "text/markdown")}
     slides = artifact_plan("slides", "My Session")
-    assert set(slides) == {".md", ".pptx"}
+    assert set(slides) == {".pdf", ".md", ".pptx", ".json"}
+    assert slides[".pdf"] == ("My Session_slides.pdf", "application/pdf")
     assert slides[".md"] == ("My Session_slides.md", "text/markdown")
     assert slides[".pptx"] == (
         "My Session_slides.pptx",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     )
+    assert slides[".json"] == ("My Session_slides.json", "application/json")
 
 
 def test_artifact_plan_sanitizes_title():
@@ -278,11 +294,13 @@ class _FakePipeline:
     def __init__(self, workspace):
         self.workspace = workspace
         self.called_with = None
+        self.last_params = None
 
     async def run(self, paths, output_dir=None, **params):
         self.called_with = list(paths)
+        self.last_params = params
         outs = []
-        for ext in (".md", ".pptx", ".mmd"):
+        for ext in (".pdf", ".md", ".pptx", ".json", ".mmd"):
             p = self.workspace / f"artifact{len(outs)}{ext}"
             p.write_bytes(f"{ext} bytes".encode())
             outs.append(str(p))
@@ -331,14 +349,25 @@ async def test_worker_session_branch_generates_and_saves(monkeypatch, tmp_path):
     job_id = uuid.uuid4()
     ctx = {"job_store": _FakeJobStore(_FakeJobRow(owner)), "llm": None}
     result = await worker_tasks._generate_from_session(
-        ctx, str(job_id), {"tool": "slides", "session_id": str(session_id), "folder_path": "notes"}
+        ctx, str(job_id),
+        {
+            "tool": "slides",
+            "session_id": str(session_id),
+            "folder_path": "notes",
+            "count": 6, "audience": "execs", "goal": "decide",
+        },
     )
 
     assert result["tool"] == "slides"
-    # Only the extensions in the slides plan (.md + .pptx) are saved; .mmd is filtered out.
-    assert len(result["assets"]) == 2
+    # Only the extensions in the slides plan (.pdf/.md/.pptx/.json) are saved; .mmd is filtered out.
+    assert len(result["assets"]) == 4
     names = {a["name"] for a in result["assets"]}
-    assert names == {"My Session_slides.md", "My Session_slides.pptx"}
+    assert names == {
+        "My Session_slides.pdf",
+        "My Session_slides.md",
+        "My Session_slides.pptx",
+        "My Session_slides.json",
+    }
     assert all(a["folder_path"] == "notes" for a in result["assets"])
     assert result["summary"] == "done"
 
@@ -346,8 +375,12 @@ async def test_worker_session_branch_generates_and_saves(monkeypatch, tmp_path):
     assert pipeline.called_with and Path(pipeline.called_with[0]).is_relative_to(
         tmp_path / SESSION_SRC_DIR
     )
+    # Deck options ride the payload into the pipeline params.
+    assert pipeline.last_params["count"] == 6
+    assert pipeline.last_params["audience"] == "execs"
+    assert pipeline.last_params["goal"] == "decide"
     # Every save went to the job owner with the mapped mime + real bytes.
-    assert len(drive.saved) == 2
+    assert len(drive.saved) == 4
     assert all(s[0] == owner for s in drive.saved)
     # The temp transcript was removed afterwards.
     src_dir = tmp_path / SESSION_SRC_DIR

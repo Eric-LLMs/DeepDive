@@ -26,15 +26,16 @@ _DESCRIPTIONS = {
         "converging on a single central topic."
     ),
     "slides": (
-        "Generate a slide deck (Marp Markdown + .pptx) from one or more workspace files: "
-        "one core idea per slide, three support points, and speaker notes."
+        "Generate a slide deck from one or more workspace files: canonical 16:9 PDF "
+        "(Typst-compiled) plus Marp Markdown and .pptx compat exports and the deck.json "
+        "model; one core idea per slide with grounded citations."
     ),
 }
 
 _PLUGIN_DESCRIPTIONS = {
     "summary": "Grounded summary generator (toolkit_summary).",
     "mindmap": "Mermaid mind map generator (toolkit_mindmap).",
-    "slides": "Slide deck generator, Marp + .pptx (toolkit_slides).",
+    "slides": "Slide deck generator, PDF + Marp + .pptx (toolkit_slides).",
 }
 
 

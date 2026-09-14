@@ -1,0 +1,214 @@
+"""Pass orchestration tests with a scripted fake LLM — no network, fully deterministic.
+
+Verifies the frozen contracts end to end: 3 LLM calls + 1 pure Pass D, the Pass B/C
+digest-subset input rule (raw source NEVER re-enters), corrective retries, and the
+anti-fabrication repair loop.
+"""
+from __future__ import annotations
+
+import json
+import shutil
+
+import pytest
+
+from apps.api.tools.toolkit.deck import prompts as P
+from apps.api.tools.toolkit.deck.errors import DeckLayoutError  # noqa: F401
+from apps.api.tools.toolkit.deck.models import DeckOptions, DeckSpec
+from apps.api.tools.toolkit.deck.passes import generate_deck
+from apps.api.tools.toolkit.deck.render import deck_to_marp, deck_to_pptx_slides, render_deck_pdf
+from tests._deck_fixtures import make_digest, make_deck
+
+RAW_MARKER = "RAW-SOURCE-MARKER-9f3c"
+SRC_TEXT = f"{RAW_MARKER} RAG 结合检索与生成,向量库按谓词隔离,成本 0.565 USD。"
+
+
+class FakeLLM:
+    """Queue-based scripted LLM: records every prompt/system pair it sees."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)         # each entry: dict | callable(prompt)->dict | Exception
+        self.calls: list[tuple[str, str]] = []
+
+    async def complete_json(self, prompt: str, system: str) -> dict:
+        self.calls.append((prompt, system))
+        if not self.replies:
+            raise AssertionError("FakeLLM queue exhausted")
+        r = self.replies.pop(0)
+        if callable(r):
+            r = r(prompt)
+        if isinstance(r, Exception):
+            raise r
+        return json.loads(json.dumps(r))     # deep copy
+
+    async def complete(self, prompt: str, system: str) -> str:
+        return json.dumps(await self.complete_json(prompt, system))
+
+    @property
+    def prompts(self):
+        return [p for p, _ in self.calls]
+
+
+def _src():
+    from apps.api.tools.toolkit.sources import WorkspaceSource
+    return [WorkspaceSource(name="doc.md", path="/ws/doc.md", text=SRC_TEXT,
+                            char_count=len(SRC_TEXT), line_count=3)]
+
+
+def _digest_json() -> dict:
+    return make_digest().model_dump(mode="json", exclude_none=True)
+
+
+def _outline_json(n=3) -> dict:
+    from tests._deck_fixtures import make_outline
+    return make_outline(n).model_dump(mode="json", exclude_none=True)
+
+
+def _slide_json(slide_id: str) -> dict:
+    if slide_id == "s2":
+        return {
+            "slide_id": "s2", "title": "处理流程", "key_message": "三步完成检索增强",
+            "purpose": "PROCESS", "relationship": "sequential",
+            "speaker_notes": "notes",
+            "payload": {"steps": [{"label": "索引", "detail": "chunk 入向量库"},
+                                  {"label": "检索", "detail": "top-k 召回"},
+                                  {"label": "生成", "detail": "拼接上下文"}]},
+            "provenance_refs": [{"source_id": "doc.md", "kind": "document",
+                                 "lines": "1-3"}],
+        }
+    return {
+        "slide_id": slide_id, "title": "单页结论", "key_message": "少做 re-verify 多复用",
+        "purpose": "PROBLEM" if slide_id == "s1" else "SUMMARY",
+        "relationship": "singular_takeaway", "speaker_notes": "",
+        "provenance_refs": [{"source_id": "doc.md", "kind": "document", "lines": "1-2"}],
+        "payload": {},
+    }
+
+
+def _c_reply(prompt: str) -> dict:
+    for sid in ("s1", "s2", "s3"):
+        if f'"{sid}"' in prompt:
+            return _slide_json(sid)
+    raise AssertionError("no slide id found in Pass C prompt")
+
+
+def standard_replies():
+    return [_digest_json(), _outline_json(), _c_reply, _c_reply, _c_reply]
+
+
+class TestGenerateDeck:
+    @pytest.mark.asyncio
+    async def test_happy_path_three_llm_calls(self):
+        llm = FakeLLM(standard_replies())
+        deck = await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        assert isinstance(deck, DeckSpec)
+        assert [p.slide_id for p in deck.visual_plan] == \
+               [s.slide_id for s in deck.slides] == ["s1", "s2", "s3"]
+        assert [p.visual_type for p in deck.visual_plan] == \
+               ["TEXT_HERO", "FLOWCHART", "TEXT_HERO"]
+        assert len(llm.calls) == 5          # 1 digest + 1 outline + 3 slides — nothing else
+
+    @pytest.mark.asyncio
+    async def test_raw_source_never_enters_pass_b_c(self):
+        # errata #1: Pass B/C must work from the digest only
+        llm = FakeLLM(standard_replies())
+        await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        assert RAW_MARKER in llm.prompts[0]                 # Pass A sees raw text
+        for p in llm.prompts[1:]:
+            assert RAW_MARKER not in p                      # B and every C call
+
+    @pytest.mark.asyncio
+    async def test_pass_c_gets_only_referenced_facts(self):
+        llm = FakeLLM(standard_replies())
+        await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        # outline fixtures reference f1/f2/f3 one per slide — each prompt holds exactly one
+        for p in llm.prompts[2:]:
+            cited = [f for f in ("f1", "f2", "f3") if f'"fact_id": "{f}"' in p
+                     or f'"fact_id":"{f}"' in p]
+            assert len(cited) == 1, p[:200]
+
+    @pytest.mark.asyncio
+    async def test_corrective_retry_on_bad_digest(self):
+        bad = {"facts": [{"fact_id": "f1"}]}                # missing statement/provenance
+        llm = FakeLLM([bad, *_digest_bad_retry()])
+        deck = await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        assert deck.slides
+        assert "failed validation" in llm.prompts[1]
+
+    @pytest.mark.asyncio
+    async def test_fabricated_chart_triggers_repair_rerun(self):
+        # s2 comes back as a DATA_INSIGHT citing an unknown quant → Pass D budget violation
+        # → ONE corrective re-run with the violation text → fixed to steps
+        bad_s2 = {
+            "slide_id": "s2", "title": "成本洞察", "key_message": "成本 0.565 USD",
+            "purpose": "DATA_INSIGHT", "relationship": "quantitative",
+            "payload": {"series": [{"name": "cost", "points": [
+                {"x": "2024", "y": 1.0, "quant_ref": "q99"},
+                {"x": "2025", "y": 2.0, "quant_ref": "q99"}]}]},
+            "provenance_refs": [{"source_id": "doc.md", "kind": "document", "lines": "9"}],
+        }
+
+        # queue: digest, outline, s1, s2(bad), s3, then repair for s2 (fixed)
+        def c(prompt):
+            if '"s1"' in prompt:
+                return _slide_json("s1")
+            if '"s3"' in prompt:
+                return _slide_json("s3")
+            if '"s2"' in prompt and "REJECTED SLIDE" not in prompt:
+                return bad_s2
+            return _slide_json("s2")          # repair re-run returns the clean steps slide
+        llm = FakeLLM([_digest_json(), _outline_json(), c, c, c, c])
+        deck = await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        assert deck.slides[1].payload.steps      # repaired
+        assert deck.visual_plan[1].visual_type == "FLOWCHART"
+        repair_prompt = next(p for p in llm.prompts if "REJECTED SLIDE" in p)
+        assert "fabricated" in repair_prompt or "needs" in repair_prompt
+
+    @pytest.mark.asyncio
+    async def test_outline_budget_fail_raises_after_retries(self):
+        # 3 attempts for Pass B (1 + _RETRIES) — all bad → GenerationError
+        llm = FakeLLM([_digest_json()] + [{"title": "x"}] * 3)
+        from apps.api.tools.toolkit.errors import GenerationError
+        with pytest.raises(GenerationError):
+            await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+
+
+def _digest_bad_retry():
+    return [_digest_json(), _outline_json(), _c_reply, _c_reply, _c_reply]
+
+
+class TestCompatExports:
+    def test_marp_and_pptx_from_deck_spec(self):
+        deck = make_deck([*_deck_slides()])
+        md = deck_to_marp(deck)
+        assert md.startswith("---") and "marp: true" in md
+        assert deck.title in md
+        tuples = deck_to_pptx_slides(deck)
+        assert len(tuples) == len(deck.slides)
+        assert all(h for h, _ in tuples)
+
+    def test_speaker_notes_not_in_pdf_source(self):
+        # errata #7: notes live in the model, never on the page
+        deck = make_deck([*_deck_slides()])
+        llm_deck = deck.model_copy(update={"slides": [
+            s.model_copy(update={"speaker_notes": "SECRET-NOTES"}) for s in deck.slides]})
+        from apps.api.tools.toolkit.deck.typst_deck import compile_deck_typst
+        from apps.api.tools.toolkit.deck.layout import layout_deck
+        src = compile_deck_typst(llm_deck, layout_deck(llm_deck))
+        assert "SECRET-NOTES" not in src
+
+
+class TestRenderPdf:
+    @pytest.mark.skipif(shutil.which("typst") is None,
+                        reason="typst binary only present in the worker container")
+    def test_render_report_ok(self, tmp_path):
+        deck = make_deck([*_deck_slides()])
+        r = render_deck_pdf(deck, tmp_path)
+        assert r.report.compiled, r.report.typst_warnings
+        assert r.report.ok, r.report.model_dump()
+        assert r.pdf and r.pdf[:5] == b"%PDF-"
+        assert r.report.pages_expected == deck.pages_expected() == 1 + len(deck.slides)
+
+
+def _deck_slides():
+    from tests._deck_fixtures import cards_slide, flow_slide, hero_slide
+    return [hero_slide(), cards_slide(4), flow_slide(4)]

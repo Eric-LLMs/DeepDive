@@ -162,6 +162,9 @@ async def generate_toolkit(
                 "folder_path": _confined_folder_path(body.folder_path),
                 "name": body.name,
                 "prompt": body.prompt,
+                "count": body.count,
+                "audience": body.audience,
+                "goal": body.goal,
             },
             user_id=user.user_id,
         )
@@ -200,6 +203,9 @@ async def generate_toolkit(
                 "folder_path": _confined_folder_path(body.folder_path),
                 "name": body.name,
                 "prompt": body.prompt,
+                "count": body.count,
+                "audience": body.audience,
+                "goal": body.goal,
             },
             user_id=user.user_id,
         )
@@ -226,6 +232,9 @@ async def generate_toolkit(
             "output_dir": output_dir,
             "name": body.name,
             "prompt": body.prompt,
+            "count": body.count,
+            "audience": body.audience,
+            "goal": body.goal,
         },
         user_id=user.user_id,
     )

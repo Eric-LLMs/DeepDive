@@ -16,6 +16,8 @@ _PPTX_MIME = (
 )
 _MD_MIME = "text/markdown"
 _MMD_MIME = "text/plain"
+_PDF_MIME = "application/pdf"
+_JSON_MIME = "application/json"
 
 # Directory (under the workspace) that holds one transcript per in-flight session job.
 SESSION_SRC_DIR = ".toolkit_session_src"
@@ -36,9 +38,11 @@ def build_transcript(title: str | None, messages: list[dict]) -> str:
 
     Only ``user`` / ``assistant`` messages are included — tool/system messages (large raw
     tool outputs, error noise) are filtered out so the token budget is spent on the Q&A.
-    Every kept message becomes ``**<Role>:** <content>`` under a ``# <title>`` heading, which
-    is what the pipeline extracts, token-counts, and maps over. Raises ``ValueError`` when
-    the session carries no usable message content (a title alone is not source material).
+    Every kept message becomes an optional ``<!-- msg:UUID -->`` marker line (the deck
+    engine's Pass A grounds corrections via ``message_id`` locators) followed by
+    ``**<Role>:** <content>`` under a ``# <title>`` heading, which is what the pipeline
+    extracts, token-counts, and maps over. Raises ``ValueError`` when the session carries
+    no usable message content (a title alone is not source material).
     """
     body: list[str] = []
     for msg in messages:
@@ -48,12 +52,17 @@ def build_transcript(title: str | None, messages: list[dict]) -> str:
         content = (msg.get("content") or "").strip()
         if not content:
             continue
-        body.append(f"**{role.capitalize()}:** {content}")
+        entry = f"**{role.capitalize()}:** {content}"
+        mid = str(msg.get("id") or "").strip()
+        if mid:
+            entry = f"<!-- msg:{mid} -->\n{entry}"   # marker stays attached to its message
+        body.append(entry)
     if not body:
         raise ValueError("session has no messages to generate from")
+    joined = "\n\n".join(body)
     if title and title.strip():
-        return f"# {title.strip()}\n\n" + "\n\n".join(body) + "\n"
-    return "\n\n".join(body) + "\n"
+        return f"# {title.strip()}\n\n" + joined + "\n"
+    return joined + "\n"
 
 
 def cleanup_stale_sources(workspace: Path, *, max_age_s: int = 24 * 3600) -> int:
@@ -84,7 +93,8 @@ def cleanup_stale_sources(workspace: Path, *, max_age_s: int = 24 * 3600) -> int
 def artifact_plan(tool: str, title: str) -> dict[str, tuple[str, str]]:
     """Map an output file extension -> ``(drive asset name, mime)`` for ``tool``.
 
-    Slides produce two artifacts (Marp Markdown + .pptx); mindmap and summary produce one.
+    Slides produce the canonical PDF plus compat Markdown/.pptx and the DeckSpec JSON
+    (speaker notes live in deck.json); mindmap and summary produce one artifact each.
     The names follow the user's choice: ``<session title>_<tool>.<ext>``.
     """
     safe = sanitize_name(title)
@@ -93,6 +103,8 @@ def artifact_plan(tool: str, title: str) -> dict[str, tuple[str, str]]:
     if tool == "summary":
         return {".md": (f"{safe}_summary.md", _MD_MIME)}
     return {
+        ".pdf": (f"{safe}_slides.pdf", _PDF_MIME),
         ".md": (f"{safe}_slides.md", _MD_MIME),
         ".pptx": (f"{safe}_slides.pptx", _PPTX_MIME),
+        ".json": (f"{safe}_slides.json", _JSON_MIME),
     }

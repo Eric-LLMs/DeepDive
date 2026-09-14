@@ -333,7 +333,9 @@ async def _generate_from_session(ctx, job_id: str, payload: dict) -> dict:
     try:
         tmp_source.write_text(transcript, encoding="utf-8")
         result = await pipeline_for(payload["tool"], ctx["llm"]).run(
-            [str(tmp_source)], prompt=payload.get("prompt")
+            [str(tmp_source)], prompt=payload.get("prompt"),
+            count=payload.get("count"), audience=payload.get("audience"),
+            goal=payload.get("goal"),
         )
         plan = artifact_plan(payload["tool"], title)
         drive = DriveService(SessionLocal)
@@ -417,6 +419,8 @@ async def _generate_from_files(ctx, job_id: str, payload: dict) -> dict:
             sources,
             output_dir=payload.get("output_dir"),
             prompt=payload.get("prompt"),
+            count=payload.get("count"), audience=payload.get("audience"),
+            goal=payload.get("goal"),
         )
         if not drive_mode:
             return {"files": result.files, "summary": result.summary}

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -45,6 +46,22 @@ logger = logging.getLogger(__name__)
 
 HOOK_PREFIX = "toolkit"
 TOOLS = ("summary", "mindmap", "slides")
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Binary twin of ``fs_tools._atomic_write`` (temp file + os.replace, no torn file)."""
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 @dataclass
@@ -116,7 +133,7 @@ class ToolKitPipeline:
         await self._observe("after-generate", data)
 
         await self._hook("before-render", data)
-        rendered = self.stage_render(data)
+        rendered = await self.stage_render(data)
         await self._observe("after-render", rendered)
 
         await self._hook("before-persist", rendered)
@@ -156,13 +173,33 @@ class ToolKitPipeline:
 
     # ── stage 3: generate ──
     async def stage_generate(self, sources: list[WorkspaceSource], params: dict) -> dict:
-        """Structured JSON generation with schema validation and one corrective retry.
+        """Structured generation with schema validation and corrective retries.
+
+        ``slides`` runs the dedicated deck engine (docs/content-to-slides.md): three LLM
+        passes (understand → outline → expansion, each on its own validated input contract)
+        plus the deterministic visual-planning pass, producing a :class:`DeckSpec` —
+        the single source of truth every renderer consumes. Other tools keep the single
+        schema-validated call.
 
         A per-task custom prompt (``params["prompt"]``, from the generation dialog) is
         appended to the tool's default system prompt, never replacing it — the default
         carries the JSON/schema constraints that keep the pipeline working, and the user's
         own requirements layer on top. An empty/missing prompt uses the default alone.
         """
+        if self.tool == "slides":
+            from .deck.models import DeckOptions
+            from .deck.passes import generate_deck
+
+            options = DeckOptions(
+                target_audience=str(params.get("audience") or ""),
+                presentation_goal=str(params.get("goal") or ""),
+                target_slide_count=int(params["count"]) if params.get("count") else 8,
+            )
+            hint = (params.get("prompt") or "").strip()
+            deck = await generate_deck(self.llm, sources, options,
+                                       deck_id=secrets.token_hex(4), hint=hint)
+            return {"deck": deck.model_dump(mode="json")}
+
         system = SYSTEM_PROMPTS[self.tool]
         custom = (params.get("prompt") or "").strip()
         if custom:
@@ -199,8 +236,36 @@ class ToolKitPipeline:
         return data
 
     # ── stage 4: render ──
-    def stage_render(self, data: dict) -> dict[str, object]:
-        """Structured JSON → final display formats (never raw model-written markup)."""
+    async def stage_render(self, data: dict) -> dict[str, object]:
+        """Structured JSON → final display formats (never raw model-written markup).
+
+        Slides render from the DeckSpec: the canonical ``deck.pdf`` (deterministic Typst
+        emit + compile, validated by the RenderReport) plus compat exports derived from
+        the same model — Marp Markdown, .pptx inputs, and ``deck.json`` (which carries the
+        speaker notes; the PDF does not).
+        """
+        if self.tool == "slides":
+            import json as _json
+            import tempfile
+            from pathlib import Path as _P
+
+            from .deck.models import DeckSpec
+            from .deck.render import deck_to_marp, deck_to_pptx_slides, render_deck_pdf
+
+            deck = DeckSpec.model_validate(data["deck"])
+            with tempfile.TemporaryDirectory(prefix="deck_") as td:
+                res = await asyncio.to_thread(render_deck_pdf, deck, _P(td))
+            if not res.report.ok:
+                raise GenerationError(
+                    "deck PDF render failed: "
+                    + f"pages {res.report.pages_actual}/{res.report.pages_expected}; "
+                    + "; ".join(res.report.typst_warnings[:3]))
+            return {
+                "deck.pdf": res.pdf,
+                "deck.json": _json.dumps(deck.model_dump(mode="json"), ensure_ascii=False),
+                "deck.md": deck_to_marp(deck),
+                "deck.pptx": deck_to_pptx_slides(deck),
+            }
         return outputs.render(self.tool, data)
 
     # ── stage 5: persist ──
@@ -222,6 +287,8 @@ class ToolKitPipeline:
             try:
                 if ext == "pptx":
                     await asyncio.to_thread(media_lib.build_text_pptx, content, path, title=stem)
+                elif isinstance(content, (bytes, bytearray)):
+                    await asyncio.to_thread(_atomic_write_bytes, path, bytes(content))
                 else:
                     await asyncio.to_thread(_atomic_write, path, content)
             except (OSError, ValueError) as exc:  # write error or a broken .pptx

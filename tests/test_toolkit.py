@@ -269,17 +269,48 @@ async def test_summary_writes_md(tmp_path):
     assert "# Deep Dive" in out.read_text(encoding="utf-8")
 
 
-async def test_slides_writes_marp_and_pptx(tmp_path):
-    _doc(tmp_path, text="# Title\n\n" + "Body.\n" * 20)
-    pipe = ToolKitPipeline(_FakeLLM([SLIDES_DATA]), "slides", workspace=tmp_path)
-    result = await pipe.run(["doc.md"])
-    assert len(result.files) == 2
-    md = next(f for f in result.files if f.endswith(".md"))
-    pptx = next(f for f in result.files if f.endswith(".pptx"))
-    assert Path(md).is_file()
-    assert Path(md).read_text(encoding="utf-8").startswith("---\nmarp: true")
-    assert Path(pptx).is_file()
-    assert Path(pptx).read_bytes().startswith(b"PK")  # a real zip/pptx
+async def test_slides_deck_engine_writes_all_artifacts(tmp_path):
+    # slides now runs the deck engine: 3 LLM passes → DeckSpec → canonical deck.pdf +
+    # deck.json + compat deck.md/deck.pptx from the same model
+    import json as _json
+    import shutil as _shutil
+
+    from tests.test_deck_passes import (
+        SRC_TEXT,
+        FakeLLM,
+        _c_reply,
+        _digest_json,
+        _outline_json,
+    )
+
+    if _shutil.which("typst") is None:
+        import pytest
+        pytest.skip("typst binary required for deck.pdf render")
+    _doc(tmp_path, text="# Title\n\n" + SRC_TEXT)
+    llm = FakeLLM([_digest_json(), _outline_json(3), _c_reply, _c_reply, _c_reply])
+    pipe = ToolKitPipeline(llm, "slides", workspace=tmp_path)
+    result = await pipe.run(["doc.md"], count=3)  # match the scripted 3-slide outline
+    exts = {Path(f).suffix for f in result.files}
+    assert exts == {".pdf", ".json", ".md", ".pptx"}
+    pdf = next(Path(f) for f in result.files if f.endswith(".pdf"))
+    assert pdf.read_bytes()[:5] == b"%PDF-"
+    # 1 cover + 3 content slides (pages_expected formula, errata #5)
+    assert _pdf_page_count(pdf) == 4
+    md = next(Path(f) for f in result.files if f.endswith(".md"))
+    assert md.read_text(encoding="utf-8").startswith("---\nmarp: true")
+    deck = _json.loads(
+        next(Path(f) for f in result.files if f.endswith(".json")).read_text(encoding="utf-8"))
+    assert len(deck["slides"]) == 3 and len(deck["visual_plan"]) == 3
+    assert deck["digest"]["facts"], "deck.json carries the full model"
+
+
+def _pdf_page_count(pdf: Path) -> int:
+    import pymupdf
+    doc = pymupdf.open(pdf)
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
 
 
 async def test_mindmap_writes_mmd(tmp_path):
@@ -328,16 +359,18 @@ async def test_after_persist_observer_runs(tmp_path):
 # ── plugin wiring ──
 
 async def test_plugin_tool_executes_via_runtime(tmp_path):
+    # generic plugin→runtime wiring, tool-agnostic: use summary (the deck engine for
+    # slides is covered end-to-end by test_slides_deck_engine_writes_all_artifacts)
     _doc(tmp_path)
-    llm = _FakeLLM([SLIDES_DATA])
-    plugin = build_toolkit_plugin("slides", llm, workspace=tmp_path)
+    llm = _FakeLLM([SUMMARY_DATA])
+    plugin = build_toolkit_plugin("summary", llm, workspace=tmp_path)
     runtime = ToolRuntime()
     runtime.register(plugin.tools[0])
 
-    res = await runtime.execute(ToolExecution("t1", "slides_gen", {"paths": ["doc.md"]}))
+    res = await runtime.execute(ToolExecution("t1", "summary_gen", {"paths": ["doc.md"]}))
     assert res.is_error is False
     rendered = str(res.value)
-    assert "slides" in rendered and ".pptx" in rendered
+    assert "summary" in rendered and ".md" in rendered
 
 
 async def test_plugin_manager_mounts_toolkit_plugins(tmp_path):
@@ -350,6 +383,88 @@ async def test_plugin_manager_mounts_toolkit_plugins(tmp_path):
     assert manager.runtime.get("summary_gen") is not None
     assert manager.runtime.get("mindmap_gen") is not None
     assert manager.runtime.get("slides_gen") is not None
+
+
+# ── worker file-branch E2E (real pipeline + deck engine + drive save) ──
+
+async def test_worker_files_branch_e2e_srt_deck_to_drive(monkeypatch, tmp_path):
+    # In-process E2E of the worker's cloud-file drive mode: a .srt subtitle is downloaded,
+    # run through the real ToolKitPipeline + deck engine (scripted LLM, real Typst compile),
+    # and every artifact named by ``artifact_plan`` is saved back into the Drive.
+    import shutil as _shutil
+    import uuid as _uuid
+    from types import SimpleNamespace
+
+    from apps.api.tools.toolkit.pipeline import ToolKitPipeline
+    from apps.worker import tasks as worker_tasks
+    from tests.test_deck_passes import (
+        SRC_TEXT,
+        FakeLLM,
+        _c_reply,
+        _digest_json,
+        _outline_json,
+    )
+
+    if _shutil.which("typst") is None:
+        pytest.skip("typst binary required for deck.pdf render")
+
+    srt = (
+        "1\n00:00:01,000 --> 00:00:05,000\n" + SRC_TEXT + "\n\n"
+        "2\n00:00:06,000 --> 00:00:10,000\n"
+        "Vector stores isolate data with app-level predicates.\n"
+    )
+    owner, fid = _uuid.uuid4(), _uuid.uuid4()
+
+    class _Drive:
+        def __init__(self):
+            self.saved: list[tuple[str, str, bytes]] = []
+
+        async def download(self, user_id, file_id):
+            assert user_id == owner and file_id == fid
+            return "application/x-subrip", "lecture.srt", srt.encode("utf-8")
+
+        async def save_artifact(self, user_id, name, mime, content, *, folder_path=None, workspace_id=None):
+            assert user_id == owner and folder_path == "gen"
+            self.saved.append((name, mime, content))
+            return SimpleNamespace(id=_uuid.uuid4(), name=name, folder_path=folder_path)
+
+    class _JobStore:
+        async def get(self, job_id):
+            return SimpleNamespace(user_id=owner)
+
+    llm = FakeLLM([_digest_json(), _outline_json(3), _c_reply, _c_reply, _c_reply])
+    monkeypatch.setattr("apps.api.tools.toolkit.pipeline_for",
+                        lambda tool, _llm: ToolKitPipeline(llm, tool, workspace=tmp_path))
+    monkeypatch.setattr(settings, "workspace_dir", tmp_path)
+    drive = _Drive()
+    monkeypatch.setattr("apps.worker.tasks.DriveService", lambda _sf: drive)
+
+    result = await worker_tasks._generate_from_files(
+        {"job_store": _JobStore(), "llm": llm}, str(_uuid.uuid4()),
+        {"tool": "slides", "file_ids": [str(fid)], "name": "Lecture",
+         "folder_path": "gen", "count": 3},
+    )
+
+    assert result["tool"] == "slides"
+    assert {a["name"] for a in result["assets"]} == {
+        "Lecture_slides.pdf", "Lecture_slides.md", "Lecture_slides.pptx", "Lecture_slides.json"}
+    mimes = {name: mime for name, mime, _ in drive.saved}
+    assert mimes["Lecture_slides.pdf"] == "application/pdf"
+    assert mimes["Lecture_slides.json"] == "application/json"
+    pdf_bytes = next(c for name, _, c in drive.saved if name.endswith(".pdf"))
+    assert pdf_bytes[:5] == b"%PDF-"
+    import pymupdf
+
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        assert doc.page_count == 4  # 1 cover + 3 scripted content slides
+    finally:
+        doc.close()
+    # The downloaded temp subtitle is cleaned up after the run.
+    from apps.api.tools.toolkit.session_source import SESSION_SRC_DIR
+
+    src_dir = tmp_path / SESSION_SRC_DIR
+    assert not list(src_dir.glob("lecture*.srt"))
 
 
 # ── HTTP endpoint path confinement ──

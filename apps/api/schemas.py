@@ -145,6 +145,10 @@ class ToolkitGenerateRequest(BaseModel):
     folder_path: str | None = None       # Cloud Drive target folder (session/cloud mode; None = drive root)
     name: str | None = None              # output file name stem; None = auto-named from the session title / first file
     prompt: str | None = None            # per-task custom prompt appended to the default system prompt
+    # deck options (slides tool; ignored by the other tools) — see DeckOptions in the deck engine
+    count: int | None = None             # target number of CONTENT slides (clamped 3..20)
+    audience: str | None = None          # target audience line (cover + Pass B)
+    goal: str | None = None              # presentation goal line (cover + Pass B)
 
 
 class ConfigUpdateRequest(BaseModel):
