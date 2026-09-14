@@ -5,7 +5,7 @@ import pytest
 
 from apps.api.tools.toolkit.deck import layout as L
 from apps.api.tools.toolkit.deck.errors import DeckLayoutError
-from apps.api.tools.toolkit.deck.rules import derive_visual_plan
+from apps.api.tools.toolkit.deck.rules import budget_violations, derive_visual_plan
 from tests._deck_fixtures import (
     arch_slide,
     cards_slide,
@@ -115,6 +115,32 @@ class TestNoTrimming:
         src = s.key_message
         assert set(src.replace(" ", "").replace(",", "")) <= set(
             joined.replace(" ", "").replace(",", ""))
+
+
+class TestFitViolations:
+    """Geometry dry-run: catches what unit budgets can't see (production job ef08eb70 —
+    a 7-word Latin detail passed the 18-unit step budget yet overflowed a 6-node
+    flowchart slot at the micro tier, killing the job at render time)."""
+
+    def test_clean_slide_reports_no_violation(self):
+        s = flow_slide(6)
+        plan = derive_visual_plan(s, make_digest())
+        assert L.fit_violations(s, plan) == []
+
+    def test_long_latin_detail_flagged_despite_unit_budget(self):
+        # the exact string that overflowed in production
+        long_detail = "Choose b; int8 symmetric range is taken"
+        s = flow_slide(6)
+        s = s.model_copy(update={"payload": slide_payload(
+            steps=[Step(label=f"步骤{i}", detail=long_detail) for i in range(1, 7)])})
+        digest = make_digest()
+        plan = derive_visual_plan(s, digest)
+        # unit budgets are satisfied — only the geometry check can see this
+        assert budget_violations(s, plan, digest) == []
+        errs = L.fit_violations(s, plan)
+        assert len(errs) == 1
+        assert "does not fit even at micro" in errs[0]
+        assert s.slide_id in errs[0]
 
 
 class TestDeckLevel:

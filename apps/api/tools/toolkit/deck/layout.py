@@ -171,7 +171,9 @@ def layout_slide(slide: Slide, plan: VisualPlan) -> SlideLayout:
     elif vt in ("FLOWCHART", "TIMELINE"):
         n = len(p.steps)
         gap = 10.0 if vt == "FLOWCHART" else 6.0
-        node_w = (CONTENT_W_MM - gap * max(0, n - 1)) / n
+        # max(1, n): budget checks flag empty/degenerate payloads — this dry-run must
+        # report geometry, not crash on a zero-width division.
+        node_w = (CONTENT_W_MM - gap * max(0, n - 1)) / max(1, n)
         node_h = 30.0 if vt == "FLOWCHART" else 0.0
         steps = []
         for st in p.steps:
@@ -192,7 +194,7 @@ def layout_slide(slide: Slide, plan: VisualPlan) -> SlideLayout:
         cols = p.columns
         n = len(cols)
         gap = 6.0
-        col_w = (CONTENT_W_MM - gap * (n - 1)) / n
+        col_w = (CONTENT_W_MM - gap * max(0, n - 1)) / max(1, n)   # see FLOWCHART guard
         out = []
         for c in cols:
             hpt, hlines = _fit(c.header, col_w - 6, 10.0, ("body", "caption", "micro"))
@@ -266,3 +268,20 @@ def _is_ordered(payload) -> bool:
 def layout_deck(deck) -> list[SlideLayout]:
     plans = {pl.slide_id: pl for pl in deck.visual_plan}
     return [layout_slide(s, plans[s.slide_id]) for s in deck.slides]
+
+
+def fit_violations(slide: Slide, plan: VisualPlan) -> list[str]:
+    """Dry-run the geometry for one slide: the SAME conservative measurement the
+    renderer uses, reported as corrective-retry error strings instead of raised.
+
+    Unit budgets (rules.py) can pass while a long-worded Latin string still wraps past
+    a narrow slot — this closes the "budget OK, layout dead" gap deterministically.
+    """
+    try:
+        layout_slide(slide, plan)
+        return []
+    except DeckLayoutError as exc:
+        msg = str(exc)
+        return [f"slide {slide.slide_id}: {msg} — shorten the offending label/detail "
+                "so it fits the slot at the micro tier (keep each line short: fewer, "
+                "smaller words; do not drop the meaning)"]

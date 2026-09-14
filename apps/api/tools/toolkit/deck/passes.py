@@ -39,6 +39,7 @@ from .models import (
     VisualPlan,
     check_outline,
 )
+from .layout import fit_violations
 from .rules import budget_violations, derive_visual_plan, payload_shape_violations
 
 logger = logging.getLogger(__name__)
@@ -256,10 +257,13 @@ async def plan_with_repair(llm, slides: list[Slide], outline: Outline,
                            digest: ContentDigest,
                            options: DeckOptions | None = None
                            ) -> tuple[list[Slide], list[VisualPlan]]:
-    """Slides whose Pass D budget check reports violations get ONE corrective re-run
-    with the violation strings; a still-violating slide fails the job (no silent fix)."""
+    """Slides whose Pass D budget OR geometry check reports violations get ONE
+    corrective re-run with the violation strings; a still-violating slide fails the
+    job (no silent fix)."""
     plans = pass_d_plan(slides, digest)
-    bad = [(s, p) for s, p in zip(slides, plans) if budget_violations(s, p, digest)]
+    violations = [budget_violations(s, p, digest) + fit_violations(s, p)
+                  for s, p in zip(slides, plans)]
+    bad = [(s, p) for (s, p), errs in zip(zip(slides, plans), violations) if errs]
     if not bad:
         return slides, plans
 
@@ -268,7 +272,7 @@ async def plan_with_repair(llm, slides: list[Slide], outline: Outline,
     sem = asyncio.Semaphore(_effective_concurrency(len(bad)))
 
     async def fix(slide: Slide, plan: VisualPlan) -> Slide:
-        errs = budget_violations(slide, plan, digest)
+        errs = budget_violations(slide, plan, digest) + fit_violations(slide, plan)
         item = items[slide.slide_id][0]
         subset = _fact_subset(digest, item.fact_refs)
         quant_lines = "; ".join(
@@ -296,8 +300,9 @@ async def plan_with_repair(llm, slides: list[Slide], outline: Outline,
         repl[b[0].slide_id] = f
     slides = [repl.get(s.slide_id, s) for s in slides]
     plans = pass_d_plan(slides, digest)
-    leftover = [(s.slide_id, budget_violations(s, p, digest))
-                for s, p in zip(slides, plans) if budget_violations(s, p, digest)]
+    leftover = [(s.slide_id, budget_violations(s, p, digest) + fit_violations(s, p))
+                for s, p in zip(slides, plans)
+                if budget_violations(s, p, digest) or fit_violations(s, p)]
     if leftover:
         raise GenerationError("budget violations survive corrective retry (job fails "
                               "loudly, layout never trims): " + str(leftover[:3]))
