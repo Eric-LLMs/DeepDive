@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import time
+from contextvars import Token
 from pathlib import Path
 from uuid import UUID
 
@@ -53,6 +54,8 @@ from core.infrastructure.repositories import (
     SqlSentenceRepository,
 )
 from core.infrastructure.request_context import (
+    get_request_llm_channel,
+    reset_request_llm_channel,
     set_request_llm_channel,
     set_request_user,
 )
@@ -91,6 +94,50 @@ def _record_dead_letter(job_id, attempt: int, error: str) -> None:
         logger.warning("job_dead_letter_write_failed job_id=%s", job_id)
 
 
+async def _pin_owner_channel(ctx, uid: UUID):
+    """Resolve the job owner's LLM channel AT JOB START and pin it into the request context.
+
+    The single gateway entry for every worker job (dispatch-golden rule: no one-off key
+    SQL, no payload-supplied credentials, no global-key fallback):
+    ``resolve_channel_for_owner`` → ContextVar → shell client (:class:`OpenAILLM` with
+    ``require_channel=True``). The plaintext key lives only in this process's context for
+    the job's lifetime — never in the payload, a log line, or the DB.
+
+    Semantics are strict, with NO privileged bypass:
+    - owner with an active channel → pinned; the returned token must be reset in ``finally``;
+    - owner without one (banned / inactive role / no role binding) → NOT pinned, and the
+      job is not failed here: the first LLM call raises ``NoActiveChannelError`` and lands
+      in ``job.error`` via the normal failure path — a job that never calls the LLM is
+      unaffected;
+    - no owner (``user_id is None``) → same: pin nothing. A system job that genuinely needs
+      an LLM must carry a dedicated ``system`` role and go through this same gateway.
+
+    Revocation granularity is JOB-level (Fail-Fast at Job start): a running job keeps the
+    channel bound at its start; admin unbinds block new submissions immediately.
+    """
+    from core.infrastructure.llm_routing import resolve_channel_for_owner
+
+    try:
+        job = await ctx["job_store"].get(uid)
+    except Exception:
+        logger.warning("job %s: could not read job row for channel pinning", uid, exc_info=True)
+        return None
+    user_id = getattr(job, "user_id", None)
+    if user_id is None:
+        return None
+    base_url, api_key, model, _business, _credential_id = await resolve_channel_for_owner(
+        ctx["session_factory"], user_id
+    )
+    if not (base_url and api_key):
+        # No active channel for the owner: pin NOTHING (Fail-Fast at first LLM call).
+        logger.warning(
+            "job %s: owner %s has no active LLM channel; LLM calls will fail fast",
+            uid, user_id,
+        )
+        return None
+    return set_request_llm_channel((model or None, base_url, api_key))
+
+
 async def _run(ctx, job_id: str, work) -> dict:
     """Mark the job running, execute ``work``, and record the terminal state.
 
@@ -98,6 +145,10 @@ async def _run(ctx, job_id: str, work) -> dict:
     non-terminal failure flips the job back to RUNNING with a "retrying" note so PG never
     shows a false FAILED while arq is still retrying. The dead-letter marker is recorded on
     terminal failure.
+
+    Every job's LLM channel is gateway-resolved at this point (job start) and the pin is
+    unconditionally reset in ``finally`` — no job can ever observe another job's credentials,
+    even if the event loop reuses the task context.
     """
     store: JobStore = ctx["job_store"]
     uid = UUID(job_id)
@@ -109,7 +160,11 @@ async def _run(ctx, job_id: str, work) -> dict:
     # so the ContextVar set here never bleeds across jobs; the reset keeps the tag from
     # surviving if the task is ever reused (tests, nested arq).
     log_tokens = set_log_context(request_id=f"job:{job_id}")
+    chan_token: Token | None = None
     try:
+        # Pin INSIDE the try: a gateway DB error must fold into the normal failure
+        # accounting below, never strand the row in RUNNING.
+        chan_token = await _pin_owner_channel(ctx, uid)
         try:
             result = await work
         except asyncio.CancelledError:
@@ -132,6 +187,8 @@ async def _run(ctx, job_id: str, work) -> dict:
         await store.mark_succeeded(uid, result)
         return result
     finally:
+        if chan_token is not None:
+            reset_request_llm_channel(chan_token)
         reset_log_context(log_tokens)
 
 
@@ -1024,8 +1081,10 @@ async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
     worker. The answer lands in the session like a normal chat message and
     ``session_finalize`` is deferred exactly as in the interactive path.
 
-    Payload: ``user_id``, ``session_id``, ``message`` (+ optional ``model`` / ``base_url`` /
-    ``api_key`` to pin an LLM channel, mirroring the chat endpoint).
+    Payload: ``user_id``, ``session_id``, ``message``. The LLM channel is NOT part of the
+    payload anymore — :func:`_run` resolves the owner's effective channel through the
+    dispatch gateway at job start and pins it into the request context (a payload-borne
+    key/base_url would be a plaintext-credential and SSRF bypass of that gateway).
     """
     async def work() -> dict:
         user_id = UUID(payload["user_id"])
@@ -1034,10 +1093,9 @@ async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
         log_tokens = set_log_context(
             user_id=str(user_id), session_id=str(session_id), request_id=f"job:{job_id}"
         )
-        # Scope RAG / memory recall + context-free LLM sub-calls (rag_search rewrite) to this
-        # turn's owner and its enqueued channel, mirroring the interactive chat path.
+        # Scope RAG / memory recall to this turn's owner; the LLM channel is already pinned
+        # by _run (gateway-resolved at job start), mirroring the interactive chat path.
         set_request_user(user_id)
-        set_request_llm_channel((payload.get("model"), payload.get("base_url"), payload.get("api_key")))
         try:
             session_memory = SessionMemoryStore(
                 ctx["session_factory"], ctx["embedder"], ctx["llm"], session_id, user_id
@@ -1047,14 +1105,12 @@ async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
                 message,
                 history,
                 session_memory=session_memory,
-                model=payload.get("model"),
-                base_url=payload.get("base_url"),
-                api_key=payload.get("api_key"),
             )
             # run() already closed session_memory (flushed events); defer the expensive
             # embed + summary work to session_finalize, like the interactive chat path.
+            # The owner rides along so _run pins finalize's summarizer channel via the gateway.
             await TaskQueue(ctx["redis"], ctx["job_store"]).enqueue(
-                SESSION_FINALIZE, {"session_id": str(session_id)}
+                SESSION_FINALIZE, {"session_id": str(session_id)}, user_id=user_id
             )
             return {
                 "final_answer": result.final_answer,
@@ -1084,8 +1140,9 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
     (hard-asserted in tests/test_pipeline_worker_wiring.py). The Chat path
     (:func:`run_agent_turn`) keeps the kernel untouched.
 
-    Payload: ``user_id``, ``task_id``, ``run_id``, ``turn_index`` (+ optional ``session_id``
-    and ``model`` / ``base_url`` / ``api_key`` pinning the interactive run's LLM channel).
+    Payload: ``user_id``, ``task_id``, ``run_id``, ``turn_index`` (+ optional ``session_id``).
+    LLM channel is resolved by the dispatch gateway at this job's start (see
+    :func:`_pin_owner_channel`) — the payload never carries model/base_url/api_key.
     Never raises for a graded stop (finish / blocked / stalled / cancelled / drop): those are
     honest outcomes recorded in the driver state. Only an unexpected bug escapes (after the
     slot is released) so the job row fails truthfully.
@@ -1097,13 +1154,6 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
             set_request_approval,
         )
 
-        # Reuse the web main-chat channel resolver (``_resolve_chat_route`` via the shared
-        # ``resolve_channel_for_owner`` helper) — never write one-off key SQL here. The task
-        # ownership is enforced by the driver claim below (projects are owner-scoped), and the
-        # resolver checks account/role active + only picks an active role channel the user is
-        # not banned from. This is what kills the worker's llm-gateway 401: rag_search's LLM
-        # sub-calls ride this owner channel, not the unconfigured global default.
-        from apps.api.routers._shared import resolve_channel_for_owner
         from plugins.research.driver import ResearchRunDriver, RunTurnResult
         from plugins.research.plugin import ResearchService
 
@@ -1113,30 +1163,22 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
         turn_index = int(payload["turn_index"])
         session_id = payload.get("session_id")
 
-        # Runtime dynamic injection: resolve the owner's effective LLM channel from the DB on
-        # every spawn (the "拉起任务时" point). Prefer the fresh DB route; fall back to the
-        # channel pinned on the originating login (the enqueued payload) only when no active
-        # DB channel resolves, so a run outlives an admin clearing the role binding mid-run.
-        db_base_url, db_api_key, db_model, _business, _credential_id = (
-            await resolve_channel_for_owner(ctx["session_factory"], user_id)
-        )
-        if db_base_url and db_api_key:
-            model, base_url, api_key = db_model or None, db_base_url, db_api_key
-        else:
-            model, base_url, api_key = payload.get("model"), payload.get("base_url"), payload.get("api_key")
-
-        # Scope RAG / memory recall to this run's owner, and pin this job's LLM channel so
-        # every context-free sub-call (rag_search query rewrite / CRAG judge) uses the same
-        # key/model as the conversation — the "执行 rag_search 时" injection point.
+        # The owner's LLM channel was gateway-resolved and pinned by _run at JOB START
+        # (resolve_channel_for_owner — the same funnel as the web chat: role-binding ∧
+        # credential active ∧ user ban ∧ catalog route). Handlers read it from the context;
+        # payload-carried model/base_url/api_key are NOT consulted (no plaintext credentials,
+        # no payload base_url override in the execution path). If the owner had no active
+        # channel the pin is empty and the first LLM call fails fast with NoActiveChannelError.
         set_request_user(user_id)
-        set_request_llm_channel((model, base_url, api_key))
+        _pinned = get_request_llm_channel()
+        model = _pinned[0] if _pinned else None
         # A4: inject the catalog price pair (the single pricing source of truth — the
         # Admin-Console-managed model catalog) for turns created in this job. Only a plain
         # numeric pair flows downstream (telemetry/AgentTurn never see a session); a model
         # with no priced catalog row yields None = PRICING_UNKNOWN, never a silent $0.
         if model:
-            from core.infrastructure.billing import get_model_prices
             from agent.engine.telemetry import set_current_pricing
+            from core.infrastructure.billing import get_model_prices
 
             try:
                 async with ctx["session_factory"]() as _price_session:
@@ -1197,7 +1239,9 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
         # constructed nor invoked on this path anymore — the batch-3 hard assertion
         # (tests/test_pipeline_worker_wiring.py) pins that to zero. The Chat path
         # (``run_agent_turn`` above) keeps the kernel untouched.
-        from plugins.research import handlers as _research_handlers  # noqa: F401 — side effect: registers all 10 nodes
+        from plugins.research import (
+            handlers as _research_handlers,  # noqa: F401 — side effect: registers all 10 nodes
+        )
         from plugins.research import pipeline
 
         def _rag_channel_factory():
@@ -1213,7 +1257,7 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
                 try:
                     retriever = get_agent_kernel().ctx.resolve("retrieval")
                     hits = await retriever.retrieve(query, 5, {"user_id": user_id})
-                except Exception as exc:  # noqa: BLE001 — degrade, never kill the node
+                except Exception as exc:
                     raise RuntimeError(f"retrieval unavailable: {exc}") from exc
                 items: list[dict] = []
                 for h in hits or []:
@@ -1296,7 +1340,6 @@ async def research_drive(ctx, job_id: str, payload: dict) -> dict:
                 task_id=task_id,
                 session_id=session_id,
                 outcome=outcome,
-                channel=(model, base_url, api_key),
             )
         finally:
             set_request_approval(None)
@@ -1314,11 +1357,12 @@ async def _settle_research_outcome(
     task_id: str,
     session_id: str | None,
     outcome,
-    channel: tuple[str | None, str | None, str | None],
 ) -> dict:
     """Act on a driver outcome: mirror, schedule the next turn, publish the wake-up event.
 
     Kept as a plain helper so the mirror/enqueue/publish ordering is testable without arq.
+    The continuation job carries NO LLM credentials: each turn's channel is resolved fresh
+    by the gateway at ITS OWN job start (Fail-Fast at Job start granularity).
     """
     from core.infrastructure.jobs import RESEARCH_DRIVE
 
@@ -1345,7 +1389,6 @@ async def _settle_research_outcome(
         with contextlib.suppress(Exception):
             await service.emit_gate_notes(ctx["session_factory"], owner_id, task_id, session_id)
 
-    model, base_url, api_key = channel
     if outcome.action == "continue":
         try:
             await TaskQueue(ctx["redis"], ctx["job_store"]).enqueue(
@@ -1356,9 +1399,6 @@ async def _settle_research_outcome(
                     "run_id": outcome.run_id,
                     "session_id": session_id,
                     "turn_index": outcome.next_turn_index,
-                    "model": model,
-                    "base_url": base_url,
-                    "api_key": api_key,
                 },
                 user_id=owner_id,
             )

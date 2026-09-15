@@ -154,7 +154,11 @@ async def rag_reindex(
         ).scalars().all()
     task_queue = get_task_queue(request)
     for asset in ready:
-        await task_queue.enqueue("asset_ingest", {"asset_id": str(asset.id)})
+        # The owner rides along so the worker pins each asset's channel through the
+        # dispatch gateway at job start (ingest has LLM stages; no owner = no pin).
+        await task_queue.enqueue(
+            "asset_ingest", {"asset_id": str(asset.id)}, user_id=asset.user_id
+        )
     # Reindex changes the whole corpus: bump the version so the Redis query cache stops
     # serving pre-reindex hits immediately (the key embeds the corpus version).
     redis = getattr(request.app.state, "redis", None)

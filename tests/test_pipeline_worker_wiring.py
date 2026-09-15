@@ -65,13 +65,9 @@ def env(tmp_path, monkeypatch):
     # Pin every worker surface the job touches EXCEPT the pipeline run itself.
     monkeypatch.setattr(tasks, "get_drive_service", lambda: drive)
     monkeypatch.setattr(tasks.settings, "research_scratch_dir", tmp_path / "scratch")
-    # DB channel resolution: no DB route -> the pinned payload channel is used.
-    from apps.api.routers import _shared
-
-    async def _no_channel(session_factory, user_id):
-        return (None, None, None, None, None)
-
-    monkeypatch.setattr(_shared, "resolve_channel_for_owner", _no_channel)
+    # LLM channel: the fake ctx has no usable job row / session factory, so _run's
+    # gateway pin resolves nothing and pins nothing — the pipeline nodes use their own
+    # stubbed LLM seams below, exactly as before the dispatch-gateway refactor.
     # Approvals: offline in-memory broker.
     import agent.security.approvals as approvals
 

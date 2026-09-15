@@ -57,15 +57,20 @@ DEFAULT_TASK = "2cbb0ca0-bea0-4aa5-bbf3-a161fd62b09e"  # "如何炒西红柿" (b
 
 
 async def resolve_owner_channel(owner_id: uuid.UUID):
-    """The owner's effective LLM channel from the DB, or ``None`` when none is usable."""
-    from apps.api.routers._shared import resolve_channel_for_owner
+    """Preflight: the owner's effective LLM channel via the dispatch gateway, or ``None``.
+
+    Used ONLY to refuse launching a run that would fail-fast at job start. The channel is
+    NOT put in the payload — the worker re-resolves it through the same gateway at each
+    turn's job start (plaintext keys never enter job payloads/DB).
+    """
+    from core.infrastructure.llm_routing import resolve_channel_for_owner
 
     base_url, api_key, model, _business, _credential = await resolve_channel_for_owner(
         SessionLocal, owner_id
     )
     if not (base_url and api_key):
         return None
-    return model, base_url, api_key
+    return model, base_url, None
 
 
 async def main() -> int:
@@ -95,7 +100,7 @@ async def main() -> int:
     if channel is None:
         print("owner has no usable LLM channel in the DB — the run would 401-loop; aborting.")
         return 2
-    model, base_url, api_key = channel
+    model, base_url, _api_key = channel
 
     session_id = args.session or project.get("session_id")
     print("── E2E run plan ──────────────────────────────────────")
@@ -150,9 +155,6 @@ async def main() -> int:
                 "run_id": run_id,
                 "session_id": session_id,
                 "turn_index": 1,
-                "model": model,
-                "base_url": base_url,
-                "api_key": api_key,
             },
             user_id=args.owner,
         )

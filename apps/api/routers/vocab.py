@@ -350,12 +350,22 @@ async def list_sentences_for_term(
 
 
 @router.post("/terms/definition")
-async def generate_definition(body: GenerateDefinitionRequest, queue: TaskQueue = Depends(get_task_queue)):
-    job_id = await queue.enqueue(GENERATE_DEFINITION, {"term": body.term})
+async def generate_definition(
+    body: GenerateDefinitionRequest,
+    user: AuthUser = Depends(require_user),
+    queue: TaskQueue = Depends(get_task_queue),
+):
+    # Auth required (was optional): the worker's definition LLM stage rides the dispatch
+    # gateway, so the job must carry an owner or it would fail-fast at job start.
+    job_id = await queue.enqueue(GENERATE_DEFINITION, {"term": body.term}, user_id=user.user_id)
     return {"job_id": str(job_id)}
 
 
 @router.post("/sentences/analyze")
-async def analyze_syntax(body: SyntaxAnalysisRequest, queue: TaskQueue = Depends(get_task_queue)):
-    job_id = await queue.enqueue(ANALYZE_SYNTAX, {"sentence": body.sentence})
+async def analyze_syntax(
+    body: SyntaxAnalysisRequest,
+    user: AuthUser = Depends(require_user),
+    queue: TaskQueue = Depends(get_task_queue),
+):
+    job_id = await queue.enqueue(ANALYZE_SYNTAX, {"sentence": body.sentence}, user_id=user.user_id)
     return {"job_id": str(job_id)}

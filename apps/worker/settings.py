@@ -2,6 +2,13 @@
 
 The worker never loads models in-process; llm/tts/embedder are HTTP clients to the model
 containers, images is the scraper, and session_factory/job_store talk to PostgreSQL.
+
+**LLM channel doctrine (dispatch gateway):** the worker's ``ctx["llm"]`` is a *shell*
+(``require_channel=True``) — it holds NO commercial credential in memory. Every job's
+channel is resolved live from the DB by the gateway at job start (see
+:func:`core.infrastructure.llm_routing.resolve_channel_for_owner` pinned in
+``tasks._run``); a job whose owner has no active channel fails fast instead of silently
+riding a stale or global key.
 """
 import logging
 from typing import ClassVar
@@ -25,61 +32,6 @@ from apps.api.tools.toolkit.session_source import cleanup_stale_sources
 from apps.worker import tasks
 
 
-async def _active_llm_channel() -> tuple[str | None, str | None, str | None]:
-    """Resolve the admin-configured LLM channel from the DB as ``(base_url, api_key, model)``.
-
-    Mirrors the API chat path (``_channel_route``): pick an active credential, then the model
-    it routes to (preferred active ``credential_models`` route, else the first active catalog
-    model). The model is the provider's real id (``provider_model_name``). When the catalog has
-    no active channel the worker falls back to the legacy settings (the litellm gateway), so a
-    fresh deploy still boots.
-    """
-    from core.infrastructure.db import (
-        CredentialModelModel,
-        LLMCredentialModel,
-        LLMModelModel,
-    )
-    from sqlalchemy import select
-
-    async with SessionLocal() as session:
-        credential = (
-            await session.execute(
-                select(LLMCredentialModel)
-                .where(LLMCredentialModel.is_active.is_(True))
-                .order_by(LLMCredentialModel.created_at)
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        model = None
-        if credential is not None:
-            model_id = (
-                await session.execute(
-                    select(CredentialModelModel.model_id)
-                    .where(
-                        CredentialModelModel.credential_id == credential.id,
-                        CredentialModelModel.is_active.is_(True),
-                    )
-                    .order_by(CredentialModelModel.priority)
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if model_id is not None:
-                model = await session.get(LLMModelModel, model_id)
-        if model is None:
-            model = (
-                await session.execute(
-                    select(LLMModelModel)
-                    .where(LLMModelModel.is_active.is_(True))
-                    .order_by(LLMModelModel.created_at)
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-        if credential is None:
-            return None, None, None
-        model_name = (model.provider_model_name or model.name) if model is not None else None
-        return credential.base_url, credential.api_key, model_name
-
-
 async def startup(ctx) -> None:
     # Route worker loggers to logs/worker.log (rotating) before any job logs. arq runs jobs in
     # a fresh task per invocation, so set_log_context inside each job is concurrency-safe.
@@ -93,26 +45,25 @@ async def startup(ctx) -> None:
     # the research monitor's wake-up bus both publish on the shared Redis client arq hands us.
     configure_approval_broker(ctx["redis"])
     set_bus(ctx["redis"])
-    base_url, api_key, model = await _active_llm_channel()
-    ctx["llm"] = OpenAILLM(api_key=api_key, base_url=base_url, model=model)
-    # Give the shared agent-kernel LLM (api.agent_factory's module singleton — the channel
-    # rag_search's query-rewrite / CRAG and context-free tool calls ride) the SAME default the
-    # API host gives it at startup. The host applies the stored admin provider via
-    # routers/config._bootstrap_config; this worker never runs that router, so without the
-    # mirror its singleton would stay on the env-seeded llm-gateway vars whose upstream is
-    # still a placeholder -> gateway 401. Reuse the identical bootstrap so host and worker
-    # defaults agree and the gateway placeholder is never a live default. (Per-owner turns
-    # override this at job time via the request LLM channel — see research_drive.)
+    # Shell client: no key, no endpoint baked in. ``tasks._run`` pins the gateway-resolved
+    # owner channel into the request context at every job start; without it any LLM call
+    # raises NoActiveChannelError (loud fail-fast) — the old one-off ``_active_llm_channel``
+    # startup snapshot (role-blind, freeze-after-boot) is gone by design.
+    ctx["llm"] = OpenAILLM(require_channel=True)
+    # The shared agent-kernel LLM (api.agent_factory's module singleton — what context-free
+    # sub-calls construct against) still gets the API-host default via the SAME bootstrap so
+    # host and worker pricing/catalog defaults agree. NOTE: since the gateway work this is
+    # NOT an LLM channel source anymore — product calls ride the per-job pinned channel;
+    # ``_bootstrap_config`` only seeds settings/catalog (pricing) concerns here.
     try:
         from apps.api.routers.config import _bootstrap_config
 
         async with SessionLocal() as session:
             await _bootstrap_config(session)
     except Exception:
-        # The mirror is a best-effort default; a failure here must never take the worker down
-        # (per-owner turns do not depend on it — they resolve the owner's channel from the DB
-        # at job time via resolve_channel_for_owner).
-        logger.warning("worker default LLM channel mirror failed; per-owner resolution still applies", exc_info=True)
+        # Best-effort catalog/pricing mirror; a failure here must never take the worker down
+        # (per-owner channels resolve from the DB at job time via the gateway).
+        logger.warning("worker config mirror failed; per-owner channel resolution still applies", exc_info=True)
     ctx["tts"] = TTSClient()
     ctx["images"] = ImageScraper()
     # Batch embed (session finalize / sentence indexing / RAG ingest) can exceed the

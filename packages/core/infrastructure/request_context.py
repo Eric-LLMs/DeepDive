@@ -18,7 +18,7 @@ configured global client is used unchanged.
 from __future__ import annotations
 
 import uuid
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 
 request_user: ContextVar[uuid.UUID | None] = ContextVar("request_user", default=None)
 request_llm_channel: ContextVar[tuple[str | None, str | None, str | None] | None] = ContextVar(
@@ -42,7 +42,17 @@ def get_request_llm_channel() -> tuple[str | None, str | None, str | None] | Non
 
 def set_request_llm_channel(
     channel: tuple[str | None, str | None, str | None] | None,
-) -> None:
+) -> Token:
     """Pin the current request's LLM channel so context-free sub-calls (rag rewrite / CRAG)
-    use the same key/model as the conversation instead of the process-global default."""
-    request_llm_channel.set(channel)
+    use the same key/model as the conversation instead of the process-global default.
+
+    Returns the ContextVar token so scoped callers (the worker's per-job pin) can
+    ``reset_request_llm_channel(token)`` in a ``finally`` — a pinned channel must never
+    outlive the request/job that resolved it.
+    """
+    return request_llm_channel.set(channel)
+
+
+def reset_request_llm_channel(token: Token) -> None:
+    """Undo a :func:`set_request_llm_channel` pin (restore the previous context value)."""
+    request_llm_channel.reset(token)

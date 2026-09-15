@@ -216,8 +216,23 @@ class _FakeQueue:
         return uuid.uuid4()
 
 
+def _patch_gate(monkeypatch):
+    """Neutralize the enqueue-time LLM gate (quota + dispatch gateway) — the gate's own
+    semantics are pinned in tests/test_llm_channel_enforcement.py; here we test routing."""
+
+    async def _ok(session, uid, role):
+        return "free"
+
+    async def _channel(session, **kw):
+        return ("http://gw", "sk-test", "model-x", "biz", uuid.uuid4())
+
+    monkeypatch.setattr("apps.api.routers.jobs.authorize_usage", _ok)
+    monkeypatch.setattr("apps.api.routers.jobs.resolve_effective_channel", _channel)
+
+
 async def test_toolkit_generate_session_mode_enqueues(monkeypatch):
     owner = uuid.uuid4()
+    _patch_gate(monkeypatch)
     monkeypatch.setattr(
         "apps.api.routers.jobs.SessionLocal",
         _FakeSessionLocal(_FakeSessionRow(owner)),
@@ -226,7 +241,9 @@ async def test_toolkit_generate_session_mode_enqueues(monkeypatch):
     body = ToolkitGenerateRequest(
         tool="mindmap", session_id=uuid.uuid4(), folder_path="notes"
     )
-    res = await generate_toolkit(body, queue=queue, user=SimpleNamespace(user_id=owner))
+    res = await generate_toolkit(
+        body, queue=queue, user=SimpleNamespace(user_id=owner, role=SimpleNamespace(role_id="pro"))
+    )
     assert "job_id" in res
 
     (type_, payload, uid) = queue.enqueued[0]
@@ -235,17 +252,20 @@ async def test_toolkit_generate_session_mode_enqueues(monkeypatch):
     assert payload["session_id"] == str(body.session_id)
     assert payload["folder_path"] == "notes"
     assert uid == owner
+    # attribution-only audit; the payload never carries a plaintext key
+    assert "api_key" not in payload and "llm_audit" in payload
 
 
 async def test_toolkit_generate_session_mode_ownership_404(monkeypatch):
     owner = uuid.uuid4()
+    _patch_gate(monkeypatch)
     monkeypatch.setattr(
         "apps.api.routers.jobs.SessionLocal",
         _FakeSessionLocal(_FakeSessionRow(owner)),
     )
     queue = _FakeQueue()
     body = ToolkitGenerateRequest(tool="slides", session_id=uuid.uuid4())
-    user = SimpleNamespace(user_id=uuid.uuid4())  # not the session owner
+    user = SimpleNamespace(user_id=uuid.uuid4(), role=SimpleNamespace(role_id="pro"))  # not the session owner
     with pytest.raises(HTTPException) as exc:
         await generate_toolkit(body, queue=queue, user=user)
     assert exc.value.status_code == 404
@@ -253,22 +273,30 @@ async def test_toolkit_generate_session_mode_ownership_404(monkeypatch):
 
 
 async def test_toolkit_generate_session_mode_missing_session_404(monkeypatch):
+    _patch_gate(monkeypatch)
     monkeypatch.setattr(
         "apps.api.routers.jobs.SessionLocal", _FakeSessionLocal(None)
     )
     queue = _FakeQueue()
     body = ToolkitGenerateRequest(tool="summary", session_id=uuid.uuid4())
     with pytest.raises(HTTPException) as exc:
-        await generate_toolkit(body, queue=queue, user=SimpleNamespace(user_id=uuid.uuid4()))
+        await generate_toolkit(
+            body, queue=queue,
+            user=SimpleNamespace(user_id=uuid.uuid4(), role=SimpleNamespace(role_id="pro")),
+        )
     assert exc.value.status_code == 404
     assert queue.enqueued == []
 
 
-async def test_toolkit_generate_rejects_mixed_modes():
+async def test_toolkit_generate_rejects_mixed_modes(monkeypatch):
+    _patch_gate(monkeypatch)
     queue = _FakeQueue()
     body = ToolkitGenerateRequest(tool="mindmap", paths=["doc.md"], session_id=uuid.uuid4())
     with pytest.raises(HTTPException) as exc:
-        await generate_toolkit(body, queue=queue, user=SimpleNamespace(user_id=uuid.uuid4()))
+        await generate_toolkit(
+            body, queue=queue,
+            user=SimpleNamespace(user_id=uuid.uuid4(), role=SimpleNamespace(role_id="pro")),
+        )
     assert exc.value.status_code == 400
     assert queue.enqueued == []
 

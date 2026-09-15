@@ -10,12 +10,27 @@ Every ``Retrieve`` is gated by :class:`AuthGuard` before reaching the pipeline:
   tenant. The guard therefore **requires** a non-empty ``user_id`` (or an explicit
   ``guest=1`` marker) and rejects anything else with ``PERMISSION_DENIED``. A guest
   resolves to ``user_id=None``, which the recall nodes treat as public-link assets only.
+
+The pipeline's LLM stages (query rewrite / CRAG judge) ride the SAME dispatch gateway as
+chat/worker: each request resolves the tenant's channel from the DB (guest → the
+``anonymous`` role) and pins it for the call's duration. The client is a keyless shell, so
+without a channel those stages degrade to the raw query — recall never depends on an LLM.
 """
 import json
 import time
+from contextvars import Token
+from uuid import UUID
 
 import grpc
+from core.infrastructure.llm_routing import (
+    resolve_channel_for_owner,
+    resolve_effective_channel,
+)
 from core.infrastructure.proto import retrieval_pb2, retrieval_pb2_grpc
+from core.infrastructure.request_context import (
+    reset_request_llm_channel,
+    set_request_llm_channel,
+)
 
 
 class TokenBucketLimiter:
@@ -95,16 +110,43 @@ class AuthGuard:
 
 
 class RetrievalService(retrieval_pb2_grpc.RetrievalServiceServicer):
-    def __init__(self, pipeline, auth: AuthGuard | None = None) -> None:
+    def __init__(self, pipeline, auth: AuthGuard | None = None, session_factory=None) -> None:
         self.pipeline = pipeline
         self.auth = auth or AuthGuard()
+        self.session_factory = session_factory
+
+    async def _pin_llm_channel(self, filters: dict) -> Token | None:
+        """Resolve the tenant's LLM channel through the dispatch gateway and pin it.
+
+        Owner → :func:`resolve_channel_for_owner`; guest (``user_id is None`` after
+        binding) → the ``anonymous`` role through the same funnel. No channel → pin
+        nothing: the shell client makes the LLM stages fail soft (raw query), and no
+        request can smuggle its own base_url/key — only DB-authorized routes are used.
+        """
+        if self.session_factory is None:
+            return None
+        uid = filters.get("user_id")
+        if uid:
+            route = await resolve_channel_for_owner(self.session_factory, UUID(str(uid)))
+        else:
+            async with self.session_factory() as session:
+                route = await resolve_effective_channel(session, role_id="anonymous")
+        base_url, api_key, model, _business, _credential_id = route
+        if not (base_url and api_key):
+            return None
+        return set_request_llm_channel((model or None, base_url, api_key))
 
     async def Retrieve(self, request, context):
         await self.auth.require_token(context)
         await self.auth.rate_limit(context)
         filters = await self.auth.bind_tenant(request, context)
         top_k = request.top_k if request.top_k > 0 else 5
-        hits = await self.pipeline.retrieve(request.query, top_k, filters)
+        pin = await self._pin_llm_channel(filters)
+        try:
+            hits = await self.pipeline.retrieve(request.query, top_k, filters)
+        finally:
+            if pin is not None:
+                reset_request_llm_channel(pin)
         return retrieval_pb2.RetrieveResponse(
             hits=[
                 retrieval_pb2.SearchHit(

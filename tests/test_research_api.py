@@ -548,7 +548,7 @@ class TestInteractiveTurnRelease:
 
         result = await _maybe_continue_research(
             service, _FakeQueue(), user_id=USER, task_id=task_id,
-            run_id=rid, session_id="s", channel=(None, None, None),
+            run_id=rid, session_id="s",
         )
 
         assert result is False

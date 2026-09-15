@@ -181,7 +181,6 @@ async def _maybe_continue_research(
     task_id: str,
     run_id: str,
     session_id: str | None,
-    channel: tuple[str | None, str | None, str | None],
 ) -> bool:
     """Hand an interactive research turn's run to the worker chain, or release it.
 
@@ -192,7 +191,8 @@ async def _maybe_continue_research(
     the continuation could not be scheduled — the slot is never stranded).
 
     The interactive turn is the "free" turn 0: the driver's no-progress / caps / cost grading
-    starts with auto-turn 1. ``channel`` pins the same LLM channel the interactive turn used.
+    starts with auto-turn 1. The payload carries NO LLM credentials — each worker turn
+    resolves the owner's channel through the dispatch gateway at its own job start.
     """
     from plugins.research.driver import ResearchRunDriver, iso_now
 
@@ -257,7 +257,6 @@ async def _maybe_continue_research(
         )
         return False
 
-    model, base_url, api_key = channel
     try:
         await queue.enqueue(
             RESEARCH_DRIVE,
@@ -267,9 +266,6 @@ async def _maybe_continue_research(
                 "run_id": run_id,
                 "session_id": session_id,
                 "turn_index": 1,
-                "model": model,
-                "base_url": base_url,
-                "api_key": api_key,
             },
             user_id=user_id,
         )
@@ -587,7 +583,6 @@ async def chat(
                         task_id=bound_task_id,
                         run_id=run_id,
                         session_id=str(session_id),
-                        channel=(model, base_url or None, api_key or None),
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("research continuation decision failed: %s", exc)
@@ -597,7 +592,9 @@ async def chat(
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("research end_run failed: %s", exc)
     # close() (inside run) already flushed events; defer the expensive embed+summary work.
-    await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
+    # user_id rides along so the worker pins this session's owner through the dispatch
+    # gateway at job start (finalize's summarizer is an LLM call — no owner = no channel).
+    await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)}, user_id=user_id)
     if log_user is not None:
         await _log_usage(
             log_user, business_name, "chat", result.usage,
@@ -863,7 +860,7 @@ async def chat_stream(
             ``session_history.json`` mirror. The DB SessionModel stays the authoritative chat
             record; the mirror is a task-local projection and failures only log."""
             nonlocal notice
-            await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)})
+            await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)}, user_id=user_id)
             if log_user is not None:
                 await _log_usage(
                     log_user, business_name, "chat_stream",
@@ -952,7 +949,6 @@ async def chat_stream(
                                 task_id=bound_task_id,
                                 run_id=run_id,
                                 session_id=str(session_id),
-                                channel=(model, base_url or None, api_key or None),
                             )
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("research continuation decision failed: %s", exc)

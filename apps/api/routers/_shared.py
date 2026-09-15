@@ -1,13 +1,15 @@
 """Cross-router helpers shared by auth / admin / chat / config routes.
 
-Each helper keeps its own module logger. The chat routing ladder (``_resolve_chat_route``
-and friends) resolves which LLM channel serves a request; ``_usage_report`` / ``_log_usage`` /
-``_guest_quota`` back the billing and quota paths; ``_masked_model`` is the catalog view.
+Each helper keeps its own module logger. The LLM channel ladder now lives in
+:mod:`core.infrastructure.llm_routing` (the platform-wide dispatch gateway); this
+module re-exports it under the historic private names so existing router imports
+keep working. No routing logic lives here anymore.
+``_usage_report`` / ``_log_usage`` / ``_guest_quota`` back the billing and quota
+paths; ``_masked_model`` is the catalog view.
 """
 from __future__ import annotations
 
 import logging
-import random
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -21,19 +23,40 @@ from core.infrastructure.billing import (
     list_transactions,
 )
 from core.infrastructure.db import (
-    AccessTokenModel,
-    CredentialModelModel,
     LLMCredentialModel,
     LLMModelModel,
-    LoginTokenModel,
-    RoleCredentialModel,
     SessionLocal,
     UserModel,
     UserUsageCounterModel,
     UserUsageLogModel,
 )
+
+# Re-exports of the dispatch gateway under the historic router names; the per-line
+# F401 suppressions exist because ruff cannot see the sibling-router imports.
+from core.infrastructure.llm_routing import (
+    channel_route as _channel_route,  # noqa: F401
+)
+from core.infrastructure.llm_routing import (
+    fallback_model as _fallback_model,  # noqa: F401
+)
+from core.infrastructure.llm_routing import (
+    pick_credential as _pick_credential,  # noqa: F401
+)
+from core.infrastructure.llm_routing import (
+    provider_model_name as _provider_model_name,  # noqa: F401
+)
+from core.infrastructure.llm_routing import (
+    resolve_channel_for_owner,  # noqa: F401
+    resolve_effective_channel,  # noqa: F401
+)
+from core.infrastructure.llm_routing import (
+    resolve_chat_route as _resolve_chat_route,  # noqa: F401
+)
+from core.infrastructure.llm_routing import (
+    user_banned_from as _user_banned_from,  # noqa: F401
+)
 from core.infrastructure.memory import ensure_user
-from core.infrastructure.security import get_role, verify_password
+from core.infrastructure.security import verify_password
 from fastapi import HTTPException, Request
 from sqlalchemy import func, select
 
@@ -84,231 +107,6 @@ async def _auth_rate_limit(request: Request, redis, kind: str) -> None:
     key = f"ratelimit:auth:{kind}:{client_ip}"
     if not await check_rate_limit(redis, key, limit, settings.auth_rate_limit_window):
         raise HTTPException(status_code=429, detail="请求过于频繁,请稍后再试。")
-
-
-async def _pick_credential(
-    session, role_id: str, user_id: UUID | None = None
-) -> UUID | None:
-    """Randomly pick one active LLM channel bound to a role (None if none is usable).
-
-    Only bindings whose own ``is_active`` flag and the channel's ``is_active`` are both set
-    qualify, so the admin can disable a channel either via its credential row or via the
-    per-role binding without touching the other.
-
-    When ``user_id`` is given, channels the user has a *disabled ``access_tokens`` grant* for
-    are excluded — the Tokens page bans a user from a specific LLM key by flipping that grant's
-    ``is_active``, and the ban must be sticky (a re-login must not revive it).
-    """
-    rows = (
-        await session.execute(
-            select(RoleCredentialModel.credential_id)
-            .join(
-                LLMCredentialModel,
-                LLMCredentialModel.id == RoleCredentialModel.credential_id,
-            )
-            .where(
-                RoleCredentialModel.role_id == role_id,
-                RoleCredentialModel.is_active.is_(True),
-                LLMCredentialModel.is_active.is_(True),
-            )
-        )
-    ).scalars().all()
-    candidates = list(rows)
-    if user_id is not None and candidates:
-        banned = set(
-            (
-                await session.execute(
-                    select(AccessTokenModel.credential_id)
-                    .where(
-                        AccessTokenModel.user_id == user_id,
-                        AccessTokenModel.credential_id.is_not(None),
-                        AccessTokenModel.is_active.is_(False),
-                    )
-                )
-            ).scalars().all()
-        )
-        if banned:
-            candidates = [c for c in candidates if c not in banned]
-    if not candidates:
-        return None
-    return random.choice(candidates)
-
-
-async def _user_banned_from(session, user_id: UUID | None, credential_id: UUID) -> bool:
-    """True if the user has a disabled ``access_tokens`` grant for this channel (a Tokens ban)."""
-    if user_id is None:
-        return False
-    row = (
-        await session.execute(
-            select(AccessTokenModel.id)
-            .where(
-                AccessTokenModel.user_id == user_id,
-                AccessTokenModel.credential_id == credential_id,
-                AccessTokenModel.is_active.is_(False),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    return row is not None
-
-
-async def _resolve_chat_route(
-    session, token: LoginTokenModel | None, role_id: str
-) -> tuple[str, str, str, str, UUID | None]:
-    """Resolve ``(base_url, api_key, provider_model, business_name, credential_id)``.
-
-    ``token`` carries the channel pinned at login when present; ``role_id`` is the effective
-    role (the user's role, or ``anonymous`` for guests). ``provider_model`` is the real model
-    id sent upstream; ``business_name`` is the catalog display name used for billing/usage;
-    ``credential_id`` is the serving channel (None when no channel resolved — recorded on the
-    usage log so the admin can aggregate cost per channel).
-
-    - A pinned channel that is still active and not banned for the user is used directly;
-      the model is the role's ``default_model``, else the channel's preferred active route,
-      else the first active catalog model.
-    - A pinned channel that was disabled (credential-level, or a user-level Tokens ban on
-      that key) fails over to another active channel of the same role the user is not banned
-      from.
-    - No pinned channel (guest, or admin/legacy token) picks fresh from the role; if the role
-      has none, empty strings signal "use the configured global client".
-    """
-    user_id = token.user_id if token is not None else None
-    credential_id = token.credential_id if token is not None else None
-    if credential_id is not None:
-        if not await _user_banned_from(session, user_id, credential_id):
-            credential = await session.get(LLMCredentialModel, credential_id)
-            if credential is not None and credential.is_active:
-                return await _channel_route(session, credential, role_id)
-        alt = await _pick_credential(session, role_id, user_id)
-        if alt is not None and alt != credential_id:
-            credential = await session.get(LLMCredentialModel, alt)
-            if credential is not None:
-                return await _channel_route(session, credential, role_id)
-        business = await _fallback_model(session, role_id)
-        provider = await _provider_model_name(session, business) if business else ""
-        return "", "", provider, business, None
-    picked = await _pick_credential(session, role_id, user_id)
-    if picked is not None:
-        credential = await session.get(LLMCredentialModel, picked)
-        if credential is not None:
-            return await _channel_route(session, credential, role_id)
-    return "", "", "", "", None
-
-
-async def resolve_channel_for_owner(
-    session_factory, user_id: UUID
-) -> tuple[str, str, str, str, UUID | None]:
-    """Resolve a background turn's LLM channel with the SAME ladder as the web main chat.
-
-    Headless twin of :func:`_resolve_chat_route` for the worker (research_drive / scheduled
-    turns), where there is no request login token to carry a pinned channel. It loads the
-    owner account and applies the identical checks a ``/chat`` request for that user would:
-
-    - the account must exist and be active (``users.is_active``);
-    - the user's effective role must be active;
-    - the channel comes from :func:`_resolve_chat_route` itself, so role-binding /
-      credential ``is_active`` / user-level Tokens-ban validation is byte-identical to the
-      web path — no key logic is reimplemented here.
-
-    Returns ``(base_url, api_key, provider_model, business_name, credential_id)``, empty
-    strings when no active channel resolves (the caller then uses the configured global
-    client, exactly like the web chat's empty-channel fallback).
-    """
-    async with session_factory() as session:
-        user = await session.get(UserModel, user_id)
-        if user is None or not user.is_active:
-            return "", "", "", "", None
-        role = await get_role(session, user.role_id)
-        if role is None or not role.is_active:
-            return "", "", "", "", None
-        return await _resolve_chat_route(session, None, user.role_id)
-
-
-async def _provider_model_name(session, display_name: str) -> str:
-    """Map a catalog display name (or raw id) to the provider's real model id.
-
-    Prefers an exact display-name match, then falls back to the provider id, so a
-    ``default_model`` that is already a raw provider id round-trips unchanged and a
-    provider id shared by several catalog entries stays unambiguous. Unknown strings
-    pass through as-is (backwards compatibility with the legacy config).
-    """
-    if not display_name:
-        return ""
-    m = (
-        await session.execute(
-            select(LLMModelModel).where(LLMModelModel.name == display_name)
-        )
-    ).scalar_one_or_none()
-    if m is None:
-        m = (
-            await session.execute(
-                select(LLMModelModel).where(LLMModelModel.provider_model_name == display_name)
-            )
-        ).scalar_one_or_none()
-    if m is None or not m.provider_model_name:
-        return display_name
-    return m.provider_model_name
-
-
-async def _fallback_model(session, role_id: str | None = None) -> str:
-    """Catalog display name used as the global default when no channel route resolves.
-
-    Prefers the role's ``default_model`` (a catalog display name or raw provider id),
-    else the first active catalog model (created earliest wins, so the default never
-    depends on row order). Returns ``""`` when the catalog has no active model.
-    """
-    if role_id:
-        role = await get_role(session, role_id)
-        if role is not None and role.default_model:
-            return role.default_model
-    m = (
-        await session.execute(
-            select(LLMModelModel)
-            .where(LLMModelModel.is_active.is_(True))
-            .order_by(LLMModelModel.created_at)
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    return m.name if m is not None else ""
-
-
-async def _channel_route(
-    session, credential: LLMCredentialModel, role_id: str | None
-) -> tuple[str, str, str, str, UUID | None]:
-    """Return ``(base_url, api_key, provider_model, business_name, credential_id)``.
-
-    The model is resolved to the role's ``default_model`` (a catalog display name) when set,
-    else the credential's preferred active route's catalog entry, else the first active
-    catalog model. ``provider_model`` is that display name mapped to the provider's real id —
-    the name sent upstream; ``business_name`` is the catalog display name, used for billing
-    and usage stats. ``credential_id`` is the serving channel (recorded on the usage log).
-    A route's ``note`` is a purpose label only.
-    """
-    business = ""
-    if role_id:
-        role = await get_role(session, role_id)
-        if role is not None and role.default_model:
-            business = role.default_model
-    if not business:
-        model_id = (
-            await session.execute(
-                select(CredentialModelModel.model_id)
-                .where(
-                    CredentialModelModel.credential_id == credential.id,
-                    CredentialModelModel.is_active.is_(True),
-                )
-                .order_by(CredentialModelModel.priority)
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if model_id is not None:
-            catalog = await session.get(LLMModelModel, model_id)
-            if catalog is not None:
-                business = catalog.name
-    if not business:
-        business = await _fallback_model(session, role_id)
-    provider = await _provider_model_name(session, business)
-    return credential.base_url, credential.api_key, provider or business, business, credential.id
 
 
 def _login_expiry() -> datetime:

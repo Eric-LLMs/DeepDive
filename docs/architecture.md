@@ -53,6 +53,7 @@
   - [12.3 Implemented auth, RBAC & billing schema](#123-implemented-auth-rbac--billing-schema)
   - [12.4 Business logic — per-user LLM-key assignment & the disable (Tokens module)](#124-business-logic--per-user-llm-key-assignment--the-disable-tokens-module)
   - [12.5 Session & message deletion](#125-session--message-deletion)
+  - [12.6 LLM Dispatch Gateway — one funnel, shell workers, Job-level fail-fast](#126-llm-dispatch-gateway--one-funnel-shell-workers-job-level-fail-fast)
 - [13. Multi-Tenancy and Deployment Strategy](#13-multi-tenancy-and-deployment-strategy)
 - [14. Cloud Drive Module](#14-cloud-drive-module)
   - [14.1 Database](#141-database)
@@ -1637,6 +1638,74 @@ rows sharing one blob cost nothing extra), so clearing `chat/temp/` can't remove
 image; deleting the chat afterwards still removes the `chat/temp/` copy while the stable
 `RAG/images/` copy — a separate asset row referenced by the chunk `meta.image_ids` — survives.
 See [§18.2](#182-chat-screenshot-pipeline).
+
+### 12.6 LLM Dispatch Gateway — one funnel, shell workers, Job-level fail-fast
+
+Every commercial LLM call on the platform — chat, research, toolkit, worker jobs, the
+retrieval service's query-rewrite — is decided by **one function**
+(`packages/core/infrastructure/llm_routing.py`), so no path can drift from the policy:
+
+```
+resolve_effective_channel(session, *, user_id?, role_id?, token?)
+  = (base_url, api_key, provider_model, business_name, credential_id) | None
+
+AND-funnel (all gates must pass):
+  1. role_credentials.is_active ∧ llm_credentials.is_active   # role binding ∧ physical master switch
+  2. user not banned                                          # disabled access_tokens row (guest: no row = pass)
+  3. model ladder: role.default_model → channel's active route (priority) → first active catalog model
+  4. nothing selectable → None
+Caller obligation: API route → 503 (never enqueue); worker job → fail-fast. NEVER a global-key fallback.
+```
+
+The two entry points used across the codebase are **thin adapters** over the funnel — they differ
+only in where the identity comes from: `resolve_chat_route(session, token, role_id)` (interactive
+request, login-pinned `credential_id`) and `resolve_channel_for_owner(session_factory, user_id)`
+(headless job / retrieval request; additionally checks the user and role rows are active).
+`apps/api/routers/_shared.py` re-exports both plus the ladder helpers under their historic names,
+so login/admin/config imports are unchanged; the ladder logic itself no longer lives behind a
+FastAPI import — core owns it, api/worker/plugins consume the same code.
+
+**Shell workers — no resident commercial credentials.** `apps/worker/settings.py` builds
+`ctx["llm"] = OpenAILLM(require_channel=True)`: the process holds no key and no endpoint. At job
+start `_run` calls `_pin_owner_channel`, which resolves the job row's `user_id` through the gateway
+and pins the result into a `ContextVar` (`request_llm_channel`); the `finally` resets it, so a
+reused coroutine can never leak one job's channel into the next. A job **without** an owner pins
+nothing — the first LLM call raises `NoActiveChannelError` into `job.error` (a privileged system
+task would be exposed there, not silently allowed); a genuine system-level LLM need would get a
+`system` role credential through the same gateway. Consequently every LLM-bearing job type
+(`asset_ingest`, `learning_import`, `session_finalize`, `chat_import`, `explain`,
+`generate_definition`, `analyze_syntax`, `toolkit_generate`, `research_drive`, agent turns) enqueues
+with `user_id`. The `_bootstrap_config` mirror kept in worker settings serves pricing/catalog
+lookups only — it is **not** a channel source anymore.
+
+**Credential-flow boundary (SSRF + plaintext hard constraints).** The plaintext `api_key` produced
+by the funnel travels only through the in-process execution stack (gateway → ContextVar →
+AsyncOpenAI) and is never persisted: not in job payloads, not in the DB, not in logs or traces.
+The worker's `base_url` comes **purely** from DB-adjudicated credential/route rows — payloads
+neither carry nor may override `base_url`/`api_key` (the old `research_drive` payload-borne-key and
+DB-empty→payload fallback branches were deleted; `run_agent_turn` no longer reads a channel from
+its payload). The toolkit enqueue gate instead attaches an attribution-only `llm_audit` dict
+(`credential_id` / `provider_model` / `base_url` / 12-hex `key_fp`) so a job row can be reconciled
+against the gateway decision without exposing the secret.
+
+**Revocation semantics — 生效粒度为 Job 级(Fail-Fast at Job start).** An admin unbind / deactivate
+takes effect for every new submission or next batch of jobs at 100%; a job already running keeps
+the channel bound at its start (no mid-execution re-adjudication). This replaces the old worker
+behaviour — a startup snapshot held in memory across restarts — whose stale-key window was
+unbounded; the new window is exactly one job.
+
+**Guests ride the same funnel.** The chat anonymous tier resolves the `anonymous` role through
+`resolve_effective_channel` (no channel → 503, no global key). The gRPC retrieval service is also a
+shell (`require_channel=True`): each `Retrieve` pins the requester's channel per-request — the
+tenant's owner via `resolve_channel_for_owner`, a guest call via the `anonymous` role — and when no
+channel exists the LLM stages (query rewrite / CRAG judge) degrade to the raw query, so recall
+never depends on a commercial key.
+
+**Anti-regression guard.** A static whitelist test greps every `OpenAILLM(` construction site:
+core business clients (chat / research / toolkit / worker / retrieval) must pass
+`require_channel=True` explicitly; only a small allowlist of local test/diagnostic entries may
+stay `False`, and a construction outside it fails CI — reintroducing a resident-key client is a
+test failure, not a review miss.
 
 [↑ Back to top](#table-of-contents)
 

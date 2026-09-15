@@ -8,6 +8,7 @@ server files.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from uuid import UUID
@@ -32,11 +33,44 @@ from core.infrastructure.jobs import (
     TTS,
     TaskQueue,
 )
+from core.infrastructure.llm_routing import resolve_effective_channel
+from core.infrastructure.security import authorize_usage
 from core.infrastructure.tts import TTSClient
 from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
 router = APIRouter(tags=["jobs"])
+
+
+async def _toolkit_llm_gate(user: AuthUser) -> dict:
+    """Pre-enqueue LLM authorization for toolkit jobs — the SAME gates a /chat turn passes.
+
+    Quota first (``authorize_usage``: daily/monthly limits, wallet overflow gate), then the
+    dispatch gateway (``resolve_effective_channel``: role binding ∧ credential active ∧
+    user ban ∧ catalog route). No channel → ``503`` and the job is NEVER enqueued.
+
+    Returns an ``llm_audit`` attribution dict — credential_id / provider_model / base_url /
+    a 12-hex fingerprint of the key — for traceability ONLY. The plaintext key must never
+    enter the payload, the DB, or logs; the worker re-resolves its channel live at job
+    start and ignores this dict as a credential source.
+    """
+    async with SessionLocal() as session:
+        await authorize_usage(session, user.user_id, user.role)
+        base_url, api_key, provider_model, _business, credential_id = (
+            await resolve_effective_channel(
+                session, user_id=user.user_id, role_id=user.role.role_id
+            )
+        )
+    if not (base_url and api_key):
+        raise HTTPException(
+            status_code=503, detail="当前没有可用的 LLM 渠道,请联系管理员"
+        )
+    return {
+        "credential_id": str(credential_id) if credential_id else None,
+        "provider_model": provider_model,
+        "base_url": base_url,
+        "key_fp": hashlib.sha256(api_key.encode()).hexdigest()[:12],
+    }
 
 
 def _confined_folder_path(path: str | None) -> str | None:
@@ -144,7 +178,13 @@ async def generate_toolkit(
     - **cloud-file mode** (``file_ids``): generate from the caller's Cloud Drive files; every
       id is ownership-checked here so a caller cannot name another user's file. Artifacts are
       saved back into the caller's Cloud Drive (``folder_path`` or the drive root).
+
+    Both gates run BEFORE enqueueing (same chain as /chat): role quota and the LLM dispatch
+    gateway — with no active channel the request fails 503 and no job row is created. The
+    payload carries only the ``llm_audit`` attribution (no plaintext key, no base_url
+    override for the worker — its channel is re-resolved from the DB at job start).
     """
+    llm_audit = await _toolkit_llm_gate(user)
     if body.session_id is not None:
         if body.paths or body.file_ids:
             raise HTTPException(
@@ -167,6 +207,7 @@ async def generate_toolkit(
                 "goal": body.goal,
                 "language": body.language,
                 "format_mode": body.format_mode,
+                "llm_audit": llm_audit,
             },
             user_id=user.user_id,
         )
@@ -210,6 +251,7 @@ async def generate_toolkit(
                 "goal": body.goal,
                 "language": body.language,
                 "format_mode": body.format_mode,
+                "llm_audit": llm_audit,
             },
             user_id=user.user_id,
         )
@@ -241,6 +283,7 @@ async def generate_toolkit(
             "goal": body.goal,
             "language": body.language,
             "format_mode": body.format_mode,
+            "llm_audit": llm_audit,
         },
         user_id=user.user_id,
     )

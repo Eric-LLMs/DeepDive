@@ -1,6 +1,10 @@
 """LLM client for a chat-completions HTTP API, with real streaming.
 
-The endpoint, key, and model are read from configuration.
+The endpoint, key, and model are read from configuration — unless the client was built
+as a *shell* (``require_channel=True``, the worker posture): then it holds no key at all
+and every call must carry (or find in the request context) a channel resolved by the
+LLM dispatch gateway (:mod:`core.infrastructure.llm_routing`), else it raises
+:class:`NoActiveChannelError`. Global-key fallback is forbidden by platform doctrine.
 """
 import json
 from collections.abc import AsyncIterator
@@ -9,10 +13,20 @@ from agent.llm.llm_errors import raise_classified
 from openai import AsyncOpenAI
 
 from core.config import settings
+from core.infrastructure.request_context import get_request_llm_channel
 
 # The OpenAI SDK refuses to build a client without credentials, but the real key is loaded
 # from the DB (admin panel) at startup. Use a placeholder until ``configure`` supplies it.
 _PLACEHOLDER_KEY = "sk-placeholder"
+
+
+class NoActiveChannelError(RuntimeError):
+    """A shell client (``require_channel=True``) was called with no gateway-resolved channel.
+
+    Fail-Fast by design: the worker holds no resident commercial key, so this means the
+    dispatch gateway found no active channel for the job's owner at job start. The caller
+    must surface it as the job's error — never retry with a global key.
+    """
 
 
 def _wire_tool_call(tc: dict) -> dict:
@@ -57,7 +71,11 @@ class OpenAILLM:
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
+        require_channel: bool = False,
     ) -> None:
+        # ``require_channel=True`` = shell posture (worker / retrieval): NO usable key is
+        # stored on the client; every call must carry a gateway-resolved channel.
+        self.require_channel = require_channel
         self.client = AsyncOpenAI(
             base_url=base_url or settings.llm_base_url,
             api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
@@ -75,6 +93,45 @@ class OpenAILLM:
         if model:
             self.model = model
 
+    def _call_channel(
+        self,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        *,
+        timeout: float | None = None,
+        max_retries: int | None = None,
+    ) -> tuple[AsyncOpenAI, str]:
+        """Resolve the client + model for ONE call: explicit args > request contextvar > self.
+
+        Priority per field, so a caller that only overrides the model still rides the turn's
+        pinned channel. A shell client (``require_channel``) raises
+        :class:`NoActiveChannelError` unless BOTH base_url and api_key come from the
+        explicit args or the gateway-pinned contextvar — the embedded/global config is
+        never consulted, which is what "worker holds no resident key" means in code.
+        """
+        ch = get_request_llm_channel()
+        if ch is not None:
+            c_model, c_base, c_key = ch
+            model = model or c_model
+            base_url = base_url or c_base
+            api_key = api_key or c_key
+        if self.require_channel and not (base_url and api_key):
+            raise NoActiveChannelError(
+                "no gateway-resolved LLM channel for this call — the shell client holds no "
+                "key and global-key fallback is forbidden (Fail-Fast at call site)"
+            )
+        if base_url or api_key or timeout is not None or max_retries is not None:
+            kwargs: dict = {
+                "base_url": base_url or settings.llm_base_url,
+                "api_key": api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+                "timeout": timeout if timeout is not None else settings.llm_timeout_seconds,
+            }
+            if max_retries is not None:
+                kwargs["max_retries"] = max_retries
+            return AsyncOpenAI(**kwargs), model or self.model
+        return self.client, model or self.model
+
     @staticmethod
     def _messages(prompt: str, system_prompt: str) -> list[dict]:
         return [
@@ -90,15 +147,9 @@ class OpenAILLM:
         base_url: str | None = None,
         api_key: str | None = None,
     ) -> str:
-        client = self.client
-        if base_url or api_key:
-            client = AsyncOpenAI(
-                base_url=base_url or settings.llm_base_url,
-                api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
-                timeout=settings.llm_timeout_seconds,
-            )
+        client, mdl = self._call_channel(model, base_url, api_key)
         resp = await client.chat.completions.create(
-            model=model or self.model,
+            model=mdl,
             messages=self._messages(prompt, system_prompt),
             temperature=0.3,
         )
@@ -119,16 +170,10 @@ class OpenAILLM:
         JSON object. A provider that rejects JSON mode raises (the caller can fall back to
         ``complete`` + a tolerant JSON parse).
         """
-        client = self.client
-        if base_url or api_key:
-            client = AsyncOpenAI(
-                base_url=base_url or settings.llm_base_url,
-                api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
-                timeout=settings.llm_timeout_seconds,
-            )
+        client, mdl = self._call_channel(model, base_url, api_key)
         try:
             resp = await client.chat.completions.create(
-                model=model or self.model,
+                model=mdl,
                 messages=self._messages(prompt, system_prompt),
                 response_format={"type": "json_object"},
                 temperature=0.3,
@@ -154,18 +199,9 @@ class OpenAILLM:
     ) -> AsyncIterator[str]:
         # Per-call timeout/max_retries overrides force a fresh client (the shared
         # self.client carries process-wide settings); otherwise reuse it.
-        client = self.client
-        if base_url or api_key or timeout is not None or max_retries is not None:
-            kwargs: dict = {
-                "base_url": base_url or settings.llm_base_url,
-                "api_key": api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
-                "timeout": timeout if timeout is not None else settings.llm_timeout_seconds,
-            }
-            if max_retries is not None:
-                kwargs["max_retries"] = max_retries
-            client = AsyncOpenAI(**kwargs)
+        client, mdl = self._call_channel(model, base_url, api_key, timeout=timeout, max_retries=max_retries)
         stream = await client.chat.completions.create(
-            model=model or self.model,
+            model=mdl,
             messages=self._messages(prompt, system_prompt),
             temperature=0.3,
             stream=True,
@@ -196,15 +232,9 @@ class OpenAILLM:
         ``base_url`` / ``api_key`` optionally route this call through a specific LLM
         channel without mutating the shared client.
         """
-        client = self.client
-        if base_url or api_key:
-            client = AsyncOpenAI(
-                base_url=base_url or settings.llm_base_url,
-                api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
-                timeout=settings.llm_timeout_seconds,
-            )
+        client, mdl = self._call_channel(model, base_url, api_key)
         kwargs = {
-            "model": model or self.model,
+            "model": mdl,
             "messages": _wire_messages(messages),
             "temperature": 0.3,
             "stream": True,
@@ -292,9 +322,10 @@ class OpenAILLM:
             "- 'explanation': The explanation of the term."
         )
         user_prompt = f"Target Term: {term}\nContext Sentence: {context}"
+        client, mdl = self._call_channel()
         try:
-            resp = await self.client.chat.completions.create(
-                model=self.model,
+            resp = await client.chat.completions.create(
+                model=mdl,
                 messages=self._messages(user_prompt, system_prompt),
                 response_format={"type": "json_object"},
                 temperature=0.3,
@@ -320,14 +351,8 @@ class OpenAILLM:
         Returns ``{content, tool_calls, usage}`` where ``usage`` is the token counts from the
         provider (``prompt_tokens``/``completion_tokens``/``total_tokens``, all 0 if absent).
         """
-        client = self.client
-        if base_url or api_key:
-            client = AsyncOpenAI(
-                base_url=base_url or settings.llm_base_url,
-                api_key=api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
-                timeout=settings.llm_timeout_seconds,
-            )
-        kwargs = {"model": model or self.model, "messages": _wire_messages(messages), "temperature": 0.3}
+        client, mdl = self._call_channel(model, base_url, api_key)
+        kwargs = {"model": mdl, "messages": _wire_messages(messages), "temperature": 0.3}
         if tools:
             kwargs["tools"] = tools
         resp = await client.chat.completions.create(**kwargs)

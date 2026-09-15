@@ -28,7 +28,10 @@ def _build_pipeline() -> RAGPipeline:
         embedder=TEIEmbedder(),
         vector_store=PgVectorStore(SessionLocal),
         session_factory=SessionLocal,
-        llm=OpenAILLM(),
+        # Shell client: the service holds NO commercial key. Each Retrieve pins the
+        # requester's gateway-resolved channel (see apps.retrieval.server); with no
+        # channel the query-rewrite node degrades to the raw query, recall is unaffected.
+        llm=OpenAILLM(require_channel=True),
         settings=settings,
     )
 
@@ -49,6 +52,7 @@ async def serve() -> None:
         RetrievalService(
             _build_pipeline(),
             auth=AuthGuard(settings.retrieval_grpc_token, settings.retrieval_grpc_rate_limit),
+            session_factory=SessionLocal,
         ),
         server,
     )
