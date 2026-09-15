@@ -101,14 +101,14 @@ flowchart TB
 
     subgraph trackB["Track B · session memory — PostgreSQL, system-written · agent read-only"]
         MSGS[(messages<br/>text · pgvector · tsvector · created_at)]
-        SESS[(sessions<br/>title · summary · closed_at · type<br/>0=chat 1=research, hidden from sidebar)]
+        SESS[(sessions<br/>title · summary · closed_at · type · compaction JSONB<br/>0=chat 1=research, hidden from sidebar)]
         EVTS[(session_events<br/>audit log · JSONB payload<br/>compaction summaries persist here)]
         KW[tsvector keyword recall<br/>to_tsvector english<br/>fts_config swappable for CJK]
         VEC[pgvector semantic recall]
         RRF[RRF fusion + recency decay<br/>30-day half-life · 1.0× recent<br/>0.68× at 30d · 0.55× at 90d]
-        COMPACT[compact_history · hierarchical recap<br/>over 40 msgs → keep latest 20<br/>L2 prior-window summaries coarse<br/>L1 current summary · failure still truncates]
-        FINAL[worker finalize<br/>backfill embeddings · summary · auto-title<br/>failure-robust · cosmetic failures never block]
-        SWEEP[retention cron · scheduled daily<br/>purge session_events > 30d<br/>audit log only · L2 recap fades · messages kept]
+        COMPACT[apply_compaction · dual persistence barrier<br/>over 40 msgs → one fold of raw SQL rows<br/>5-section summary · inclusive watermark CAS<br/>failure defers · never trims]
+        FINAL[worker finalize<br/>backfill embeddings · first-time summary/title only<br/>never re-summarizes · cosmetic failures never block]
+        SWEEP[retention cron · scheduled daily<br/>purge session_events > 30d<br/>audit log only · messages + checkpoints kept]
         MSGS --> KW
         MSGS --> VEC
         KW --> RRF
@@ -137,8 +137,10 @@ flowchart TB
 > degrades to tsvector-only (never a silent empty); superseding marks a memory `superseded` and
 > keeps the file as an audit trail — it is never deleted; the recall gate skips only the deep
 > recall on non-memory-seeking turns (the Lane-1 brief always injects); cosmetic failures
-> (summary / title / compaction) never block the main flow.
-> Design: [architecture.md §5.4 — Memory, skills, sessions](architecture.md#54-memory-skills-sessions).
+> (summary / title) never block the main flow; the session context rides the client's Live State,
+> so a normal turn reads no SQL and a deferrable compaction never trims.
+> Design: [architecture.md §5.4 — Memory, skills, sessions](architecture.md#54-memory-skills-sessions)
+> and [§22 — Chat Session Memory v2](architecture.md#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns).
 
 **Prompt — cache-boundary assembly, compression, and deferred tool stubs** (architecture, design
 features, and per-step process logic):
@@ -161,7 +163,7 @@ flowchart TB
 
     subgraph input["Input"]
         HIST["chat history + new user message"]
-        AUTO["compact_history · token-aware char budget<br/>over prompt_max_chars → keep latest 20<br/>inject L1 current + L2 coarse recap"]
+        AUTO["apply_compaction · /chat boundary<br/>over 40 msgs or char budget → fold raw rows<br/>inject one 5-section leading summary<br/>dual barrier · failure defers, never trims"]
         HIST --> AUTO
     end
 

@@ -91,6 +91,14 @@
   - [20.2 Architectural Decisions](#202-architectural-decisions)
   - [20.3 Architectural Benefits](#203-architectural-benefits)
   - [20.4 Summary](#204-summary)
+- [22. Chat Session Memory v2 — Client Live State Authority + Zero-Read Turns](#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns)
+  - [22.1 Model & invariants](#221-model--invariants)
+  - [22.2 Wire contract](#222-wire-contract)
+  - [22.3 Turn assembly & the dual persistence barrier](#223-turn-assembly--the-dual-persistence-barrier)
+  - [22.4 Compaction: one full re-fold; failure never trims](#224-compaction-one-full-re-fold-failure-never-trims)
+  - [22.5 Checkpoint CAS & the per-session write queue](#225-checkpoint-cas--the-per-session-write-queue)
+  - [22.6 Recovery, reconcile & the worker path](#226-recovery-reconcile--the-worker-path)
+  - [22.7 Trade-off & configuration](#227-trade-off--configuration)
 
 [↑ Back to top](#table-of-contents)
 
@@ -107,7 +115,7 @@
 | Query repository | unified multi-source corpus: cloud-drive files (`source_type='file'`) + Learning-Platform sentences/articles (`'learning'`) + chat Q&A pairs / LLM-grouped whole-session imports (`'chat'`); `chunks.asset_id` nullable + `source_type`/`source_id`, source-aware recall (both recallers `LEFT JOIN assets`); PDF tool chain (body text + tables rendered to PNG → vision LLM, per-table skip on failure); admin RAG → **Repository** tab lists non-file chunks with delete |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
 | Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the shared `AgentKernel` composition (`apps/api/agent_factory.py`) for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output; session / cloud-file modes → caller's Cloud Drive, with a custom `prompt` + `name`) |
-| Session memory | PG-backed `sessions` / `messages` / `session_events` + deferred embed+summary finalize + trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + hierarchical history compaction (L2 coarse recap + L1 summary at `/chat`) + 30-day audit-event retention |
+| Session memory | PG-backed `sessions` / `messages` / `session_events`; **client Live State (summary + tail) is the normal-turn context source — zero SQL reads on hot turns**; threshold compaction folds raw rows into one 5-section structured summary behind a dual persistence barrier (`sessions.compaction` JSONB = durable checkpoint, revision CAS); per-session async write queue (one batch INSERT/turn); deferred finalize = incremental embed + first-time-only sidebar summary/title; trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + 30-day audit-event retention — see [§22](#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns) |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
 | Chat | agent loop with tool use, SSE streaming |
 | Research OS (chat-driven) | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module) |
@@ -349,8 +357,10 @@ disconnect) the `finally` block still closes the session memory, so nothing leak
 
 The API's `POST /chat/stream` (SSE, `EventSourceResponse`) consumes `run_stream` through the
 **same auth / quota / session / history path as `/chat`** — anonymous guest fallback and quota
-checks, session creation (`create_session`), `compact_history`, deferred `session_finalize`
+checks, session creation (`create_session`), zero-read v2 history assembly with threshold
+compaction (`_assemble_turn_history` → `apply_compaction`, §22), deferred `session_finalize`
 enqueue, and usage logging. It also resolves the turn's `user_message_id` / `assistant_message_id`
+(from the write queue's batch-INSERT `RETURNING` ids, not a text scan)
 so the client can act on a single message, and it emits a `notice` event when a user with no
 usable LLM key is degraded to the anonymous tier. Reasoning (`thinking`) is streamed but **never
 persisted**, keeping the recall corpus clean.
@@ -413,9 +423,10 @@ prompt byte-identical to the no-context case.
 
 The **compression pipeline** bounds the prompt at two levels: per-message **snip** — the loop caps
 each message's content to `settings.prompt_message_max_chars` when building the LLM request (the
-persistence copy stays raw); and **token-aware autocompact** — `compact_history` also fires on a
-total-window character budget (`settings.prompt_max_chars`), so a few oversized messages trigger
-compaction even below the message-count threshold.
+persistence copy stays raw); and **session compaction at the `/chat` boundary** — `apply_compaction`
+fires on a message-count threshold (`settings.history_max_messages`) or a total-window character
+budget (`settings.prompt_max_chars`) above `history_keep_messages`, folding the overflow into one
+structured summary behind a dual persistence barrier (§22).
 
 The README's *Prompt* diagram ([mermaid source](../README.md)) visualizes the same contract end to
 end — input compaction, the three cache-boundary zones feeding a stable head, `render_prompt`
@@ -469,19 +480,14 @@ visible-tool stubs).
   meta-tool set) are denied, with the reason fed back to the model.
 - **Sessions** — `SessionLog` is an append-only event stream
   (`session-start` / `session-end` / `llm-call` / `tool-call` / `tool-result`), serializable to
-  JSONL for audit. Long conversations are **compacted** at the `/chat` boundary: histories over
-  `HISTORY_MAX_MESSAGES` are truncated to the recent `HISTORY_KEEP_MESSAGES`, the dropped prefix
-  is folded into a conversation summary (reusing the session summary when one exists, otherwise a
-  synchronous LLM summary via the same prompt as `finalize_session`), injected as a leading
-  system message, and recorded as a `compaction` session event whose payload **persists the
-  summary**. The injected recap is **hierarchical**: coarse summaries of prior compaction windows
-  (each truncated, up to the latest 5) render as `## Earlier conversation (coarse)` ahead of the
-  current window's `## Conversation summary` — L0 raw messages are never deleted, L1 is the
-  latest window, L2 is the coarse prior-window recap, and L3 is the cross-session file memory —
-  so distant turns are remembered in broad strokes while the token window stays flat. If the
-  summary call fails the overflow is still dropped — a bounded window is preferred to an
-  unbounded request. A fresh session is also **auto-titled** at creation from the first user
-  message
+  JSONL for audit. Conversation context runs on **client Live State** (§22): a normal turn
+  assembles its prompt from the client-uploaded `context_state.summary` + `tail` with zero SQL
+  reads; when the window crosses the threshold, `apply_compaction` folds the range's raw SQL rows
+  into **one** 5-section structured summary (never a summary-of-summary), advances the
+  `sessions.compaction` watermark under revision CAS, and ships the new summary in the done frame;
+  any failure **defers without trimming** (`compaction_deferred` reason on the done frame), and
+  each successful fold is audited as a `compaction` session event. A fresh session is also
+  **auto-titled** at creation from the first user message
   (`create_session`, `sessions.title`, 40-char cap). `GET /sessions?q=` filters a user's sessions
   by **content** — a case-insensitive `ILIKE` over title, summary, and message text
   (`list_sessions` outer-joins `messages` and de-dups) — and each result carries a `snippet`
@@ -842,11 +848,16 @@ Enrichment endpoints (`/tts`, `/image-fetch`, `/explain`, `/terms/definition`,
 immediately; the frontend polls `GET /jobs/{id}` until the worker marks the job
 `succeeded`/`failed`. The PostgreSQL `jobs` table is the single source of truth for job state
 (`queued → running → succeeded | failed`); Redis only carries the work to the worker (arq).
-Chat sessions finalize the same way: the gateway flushes session events synchronously on
-`close()`, then enqueues `session_finalize` to backfill message embeddings and write the summary.
-Finalize is **failure-robust**: the summary and auto-title are cosmetic — if either LLM call
-fails, finalize still closes the session and persists embeddings (a `logger.warning` is the only
-signal), so a dead provider can never strand a session in an open/unsaved state.
+Chat sessions finalize the same way: `close()` drains the per-session write queue (turn messages
+were already batch-INSERTed during the turn, §22.5) and flushes session events, then enqueues
+`session_finalize` to backfill embeddings for rows still missing them and — only for a session
+never yet compacted or summarized — write the first sidebar summary / title. A compacted
+session's sidebar summary is copied from the checkpoint at fold time; finalize **never
+re-summarizes a whole transcript**. Finalize is **failure-robust**: the first-time summary and
+auto-title are cosmetic — if either LLM call fails, finalize still closes the session and persists
+embeddings (a `logger.warning` is the only signal), so a dead provider can never strand a session
+in an open/unsaved state. Archival embed/summary corpora carry user/assistant rows only — `system`
+gate notes and `tool` bookkeeping rows never reach a model.
 A daily retention cron (`prune_session_events`, registered in `WorkerSettings.cron_jobs`) sweeps
 `session_events` older than `SESSION_EVENTS_RETENTION_DAYS` (30); only the audit log is purged —
 `messages` (the recall corpus) and `sessions` (summaries) are deliberately kept.
@@ -855,10 +866,12 @@ A daily retention cron (`prune_session_events`, registered in `WorkerSettings.cr
 turn for a user/session in the worker. It **reuses the shared `AgentKernel` composition** built by
 `apps/api/agent_factory.py` (the worker never touches FastAPI's `deps.py`), so a scheduled turn
 gets exactly the same prompt assembly, recall, approvals, telemetry, and budget guard as an
-interactive one — no second, drift-prone kernel construction in the worker. The answer
+interactive one — no second, drift-prone kernel construction in the worker. With no client
+attached it assembles history in **recovery mode** (`assemble_recovery_history`: checkpoint +
+bounded SQL load + the same `apply_compaction` threshold fold, §22.6). The answer
 lands in the session like a normal chat message and `session_finalize` is deferred exactly as in the
-interactive path (payload: `user_id` / `session_id` / `message`, plus optional `model` / `base_url` /
-`api_key` to pin an LLM channel).
+interactive path (payload: `user_id` / `session_id` / `message` — the LLM channel is pinned at job
+start by the dispatch gateway, §12.6; the payload never carries keys).
 
 **Job lifecycle under retries** — `WorkerSettings.max_tries` (arq's retry budget) is mirrored to PG by
 the `_run` wrapper (`apps/worker/tasks.py`): a job is marked `running` first, and **FAILED is written
@@ -1273,7 +1286,7 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Stable prompt head for prefix cache | `CacheBoundaryAssembler` zones (internal `CACHE_BOUNDARY` separator, never rendered) + `snapshot_key()` |
 | Load a tool schema on demand | `tool_search` meta-tool → `ToolGateway.mount(name)` (defer_loading stub) + `schema_of(name)` in the result |
 | Inject project conventions | `read_project_context` → `PromptZone.PROJECT_CONTEXT` (DEEPDIVE.md, capped) |
-| Bound the prompt window | per-message snip (`prompt_message_max_chars`) + char-budget autocompact (`prompt_max_chars`) |
+| Bound the prompt window | per-message snip (`prompt_message_max_chars`) + in-run window guard (`prompt_max_chars`) + client-Live-State session compaction at the `/chat` boundary (§22) |
 | Scope tool visibility per request | `ToolVisibilityPolicy` `allow` / `deny` / `present_as` (disposers) |
 | Gate a tool by session permission | `Sandbox.guard()` + `ToolPermission` (`classify_permissions`) |
 | Recall / write memory as a tool | `memory_search` / `memory_save` (guardrailed, READ-classified; importance + supersede) |
@@ -1325,7 +1338,10 @@ The core learning + chat tables that run today (`migrations/0001_init.sql`):
   `source_type` (`'file'` default | `'learning'` | `'chat'`, indexed) + `source_id`, and the new
   `articles` table (user / domain / title / content / created_at) for Learning-Platform study material.
 - **sessions** — `id`, `user_id` (FK → `users`), `title`, `created_at`, `closed_at`, `summary`,
-  `type`. `type` (`0017_sessions_type.sql`, default `0`) distinguishes the session kind:
+  `type`, `compaction` (JSONB, `0018_sessions_compaction.sql`) — the durable compaction checkpoint
+  `{revision, through_message_id, through_created_at, summary, summary_chars, last_compaction_at,
+  fold_count}`; read only by recovery / compaction / reconcile, never by a normal turn (§22).
+  `type` (`0017_sessions_type.sql`, default `0`) distinguishes the session kind:
   `0` = ordinary chat, `1` = research task session — `GET /sessions` hides type 1 from the chat
   sidebar and deleting a research task cascades to its type-1 sessions (§17).
   `title` (`0009_session_title.sql`) is auto-set at creation from the first user message —
@@ -2221,19 +2237,22 @@ and feeds the value into the kernel, so project rules reach the model on every t
 
 ### 16.5 Compression pipeline
 
-The prompt window is bounded at two levels:
+The prompt window is bounded at three levels:
 
 - **Per-message snip** — the loop (`_snip` / `_snip_messages`) caps each message's content at
   `settings.prompt_message_max_chars` when building the LLM request. It trims **only the request
   snapshot** (a shallow copy); the `messages` list the persistence layer keeps stays raw.
-- **Token-aware autocompact** — `compact_history` fires when the message count exceeds
-  `settings.history_max_messages`, **or** when it sits between `history_keep_messages` and the max
-  while the total character budget `settings.prompt_max_chars` is exceeded. It keeps the latest
-  `history_keep_messages` and folds the overflow into a hierarchical recap (L2 prior-window coarse
-  summaries + L1 current summary, injected as a leading system message). Histories at or below
-  `history_keep_messages` always pass through — nothing to drop, and oversized singles are handled
-  by the snip. If the summary call fails the overflow is still dropped (bounded window beats an
-  unbounded request).
+- **In-run window guard** — `ReactLoopAgent._enforce_window` trims the working message list to
+  the `settings.prompt_max_chars` budget (oldest dropped first) between steps, so a long
+  tool-heavy run cannot grow the request without bound.
+- **Session compaction** — `apply_compaction` fires at the `/chat` boundary when the assembled
+  window exceeds `settings.history_max_messages` messages, **or** sits above
+  `history_keep_messages` while the total budget `settings.prompt_max_chars` is exceeded. It
+  folds the overflow range's raw SQL rows into one 5-section leading-system summary (one LLM
+  call) and advances the checkpoint watermark — strictly behind the dual persistence barrier,
+  and a failed fold **defers with nothing trimmed** (§22). Histories at or below
+  `history_keep_messages` always pass through — nothing to drop, and oversized singles are
+  handled by the snip.
 
 ### 16.6 Deferred tool loading (defer_loading stubs)
 
@@ -2254,7 +2273,8 @@ permission guard (a READ-only session cannot gain write tools by mounting them).
    `assembler.begin_session()` (clearing prior `inject()` content) and `gateway.reset_session()`
    (clearing the mounted tool set).
 2. **Assemble** — the three zones render; the static/project head is cached once.
-3. **Compact** — `compact_history` bounds the history window by count and character budget.
+3. **Compact** — `_enforce_window` bounds the in-run message window by character budget (the
+   session-level window fold happens before the loop starts, at the `/chat` boundary — §22).
 4. **Snip** — the request snapshot is built as `system + snipped messages`; persistence keeps full text.
 5. **Call** — the LLM sees `render_prompt(assembly)` plus the visible tools (full core schemas +
    stubs); a tool result may trigger `tool_search` → mount → richer visible set next step.
@@ -2266,8 +2286,9 @@ permission guard (a READ-only session cannot gain write tools by mounting them).
 
 | setting | default | role |
 |---|---|---|
-| `prompt_max_chars` | `120_000` | total-window character budget for token-aware autocompact |
+| `prompt_max_chars` | `120_000` | total-window character budget (in-run window guard + compaction trigger) |
 | `prompt_message_max_chars` | `8_000` | per-message snip cap on the request snapshot |
+| `compaction_summary_max_chars` | `2_500` | cap on the folded 5-section session summary (§22.4) |
 | `project_context_files` | `["DEEPDIVE.md"]` | convention files tried in order |
 | `project_context_max_chars` | `8_000` | cap on the project-context zone, with truncation marker |
 
@@ -3633,5 +3654,156 @@ preflight/typst faults with zero drive writes, owner-scoped `status`, the **defa
 `pipeline.publish.pdf_error` (plus the ledger line), the gate-not-bypassed case, the
 `_pdf_name` versioning / 64-char-stem / CJK / skill-fallback naming contract, and multi-H1 /
 duplicate-title manuscripts (unique section ids + per-parent orders end-to-end).
+
+[↑ Back to top](#table-of-contents)
+
+## 22. Chat Session Memory v2 — Client Live State Authority + Zero-Read Turns
+
+The chat context model rests on one rule: **the client's Live State (summary + active tail) is the
+only context source of a normal chat turn.** The server's `sessions.compaction` checkpoint is a
+durable backup serving recovery, compaction, and reconciliation only — a normal turn reads no SQL.
+Compaction is a **rare, audited event**: below the threshold it costs zero extra LLM calls; above
+it the server folds the range's raw messages into one single-layer structured summary — never a
+summary-of-summary. Mechanism owner: `packages/core/infrastructure/memory.py` + the two
+`/chat` / `/chat/stream` entries in `apps/api/routers/chat.py`.
+
+### 22.1 Model & invariants
+
+- **Zero-read hot path.** A v2 turn issues no `SELECT` against `messages` or `sessions`: the
+  prompt is `[leading system block from the client summary] + client tail verbatim + new user
+  message`. This holds on the turn immediately after a compaction (Turn N+1) — the state rides
+  entirely on Live State (test-pinned).
+- **Inclusive watermark.** `through_message_id` is the **last message fully covered by the
+  summary** (closed interval); the first message after it is the tail's start. No seq columns
+  anywhere: identity is `message_id`, ordering is `(created_at, id)`.
+- **No silent fallback.** A request carrying `context_state` with an illegal empty tail (summary
+  or watermark present) is a 422 parameter error — the hot path never quietly re-loads SQL. An
+  empty tail is legal only for a fresh session (summary and watermark both null). A request
+  *without* `context_state` is a legacy/recovery client and takes the bounded SQL load.
+- **The UI summary is not context.** `sessions.summary` serves the sidebar list and history
+  search only; it is copied from the checkpoint at fold time (first 400 chars) and never read
+  into a prompt.
+- **Raw rows are permanent.** Compaction never deletes a message row; the full transcript stays in
+  SQL and can be losslessly re-folded at any time.
+
+### 22.2 Wire contract
+
+```
+ChatRequest { session_id, message,
+  context_state: { summary?, through_message_id?, has_pending_mutations } | None,  # None = legacy
+  tail: [ { message_id?, role ∈ {user, assistant}, content } ] }
+```
+
+Server-side validation uses **no SQL reads**: session-level ownership (auth), role whitelist, tail
+count ≤ `2 × history_max_messages`, total content ≤ `prompt_max_chars`. On a normal turn the
+`message_id` is an **opaque identifier** — the client legitimately owns its context text, and
+session ownership is pinned by auth; id-truth checks are deferred to the paths that read SQL
+anyway (compaction boundary, reconcile).
+
+The done frame (both sync and SSE) gains:
+- `compaction: {revision, through_message_id, through_created_at, summary, …}` on a successful
+  fold — the client updates Live State = new summary + returned kept tail (its own ids);
+- `compaction_deferred: <reason>` when a threshold breach was deferred (§22.3/§22.4) — the client
+  keeps its state and retries next turn (UI shows a retry hint);
+- `persist_failed: true` when the turn's write queue exhausted its retries — display and Live
+  State are unaffected; the rows converge via reconcile.
+
+### 22.3 Turn assembly & the dual persistence barrier
+
+`chat._assemble_turn_history` is shared by both entries:
+
+1. **Legacy** (`context_state` absent) → `assemble_recovery_history`: checkpoint load + bounded
+   `load_session_messages(after = watermark)` + the same compaction pass. The worker's
+   `run_agent_turn` uses this entry point (no client attached).
+2. **v2 normal** → assemble from client state; `needs_compaction` gates on the assembled window
+   (summary counts as one message): `> history_max_messages` messages, or above
+   `history_keep_messages` **and** over `prompt_max_chars` characters. Below threshold: zero SQL,
+   zero extra compaction LLM calls.
+3. **Over threshold** → `apply_compaction` first passes **both barrier halves, in this order**:
+   (a) the client declares `has_pending_mutations == false` (no undelivered local Edit/Delete);
+   (b) the server's own per-session write queue fully flushes (`flush_session_writes`). Any
+   failure defers **before any fold read** (`client_pending_mutations` /
+   `persist_barrier_failed`); the over-budget tail is used as-is for this turn (temporary
+   overshoot is acceptable) and retried next turn. A stale SQL snapshot can therefore never feed
+   a summary. After both halves pass, the fold range is authoritative *as of SQL now*; the
+   residual multi-device concurrency window is last-writer-wins and converges via reconcile.
+
+### 22.4 Compaction: one full re-fold; failure never trims
+
+- Fold input = **all raw user/assistant rows** of the range `[session head, boundary]` from SQL
+  (each `_snip`ped), never a previous summary — the old summary is discarded and rebuilt. Exactly
+  **one** LLM call, through the channel pinned to the turn/job request context.
+- Output = a single-layer **5-section structured summary** (Primary intent / Decisions &
+  conclusions / Key facts & entities / Files & assets touched / Open tasks & questions, with
+  verbatim user constraints preserved), capped at `compaction_summary_max_chars` (2 500).
+- **Deterministic budget packing:** rows are packed oldest-first until `prompt_max_chars` is
+  reached; the watermark advances to the **last covered row** (inclusive); uncovered middle rows
+  stay at the top of the tail shipped back to the client (it may exceed `history_keep_messages` —
+  monotonic convergence, zero silent loss).
+- **Every failure defers without changing anything** — no trim, no watermark move, no checkpoint
+  write, client state intact — and names its `compaction_deferred` reason: `fold_failed`,
+  `cas_conflict` (concurrent fold; the loser reloads next turn), `no_boundary_id` (overflow rows
+  not persisted yet), `stale_boundary` (watermark row missing from SQL), plus the §22.3 barrier
+  reasons. In-run `_enforce_window` + snip still bound the worst-case request.
+- Success: checkpoint + sidebar copy land in **one** CAS'd `UPDATE sessions` (§22.5), a
+  `compaction` `session_events` row audits the fold, and the done frame carries the payload.
+
+### 22.5 Checkpoint CAS & the per-session write queue
+
+- `sessions.compaction` JSONB holds `{revision, through_message_id, through_created_at, summary,
+  summary_chars, last_compaction_at, fold_count}`. `save_compaction` updates summary and
+  watermark **atomically** under revision CAS — `WHERE id = :sid AND
+  (compaction->>'revision')::int = :expected` (first fold: `compaction IS NULL`) — so there is no
+  partial state, and a concurrent second fold loses the CAS and defers.
+- `SessionMemoryStore.append_message` **only enqueues** (the hot path performs no SQL).
+  `flush_writes` executes **one batch `INSERT INTO messages … RETURNING id, created_at, role`**
+  (first try + 2 retries; the queue is kept on final failure and `persist_failed` is set — never
+  raised into the turn). The done frame awaits this short flush to obtain the turn's
+  `user_message_id` / `assistant_message_id` — no content scan. A connection-drop retry can
+  duplicate a row; that is the accepted last-writer residual, and reconcile converges it.
+- Queue state lives inside `memory.py` (`_SessionWriteQueue`, keyed per session) so the store that
+  enqueues and the barrier that flushes share one owner.
+
+### 22.6 Recovery, reconcile & the worker path
+
+- **Restart / reconnect:** `GET /sessions/{id}` inlines the checkpoint (`compaction`) alongside
+  the messages; the client rebuilds `[summary] + [tail after watermark]` and the next turn is
+  zero-read again. History search (`GET /sessions?q=`) and pgvector recall are unchanged — they
+  are retrieval paths, separate from the context path.
+- **Reconcile** (`POST /sessions/{id}/reconcile`, reconnect only): body = client Live State; the
+  server aligns SQL rows after the watermark **with the client as authority** — client-missing →
+  delete, SQL-missing / forged foreign id → insert fresh (foreign ids are never honored as-is),
+  content mismatch → client text wins and `embedding` is reset to NULL for re-embed. This is the
+  one path that checks `message_id` ownership; it answers `{deleted, inserted, updated}`.
+- **Worker:** `run_agent_turn` assembles via `assemble_recovery_history` and records
+  `compaction` audit events exactly like the API; `session_finalize` is deferred identically.
+- **Finalize** no longer re-summarizes per turn: incremental embedding backfill + a first-time
+  sidebar summary/title only, skipped once the session has a checkpoint (the sidebar column is
+  then owned by the fold-time copy).
+
+### 22.7 Trade-off & configuration
+
+> Full re-fold — every fold rebuilds the summary from raw messages, rejecting
+> summary-of-summary — carries an **O(total session length) token cost per compaction event**,
+> linear in the fold range. This is the deliberate architectural choice that **completely removes
+> generational memory decay**: the cost is paid only on rare compaction events, while a normal
+> turn always makes zero extra compaction LLM calls. Raw messages remain in SQL forever, so the
+> summary can be re-derived losslessly at any time. — Also recorded in the `memory.py` module
+> docstring and `apply_compaction`'s docstring.
+
+| setting | default | role |
+|---|---|---|
+| `history_max_messages` | `40` | compaction trigger on assembled-window message count |
+| `history_keep_messages` | `20` | floor below which the char-budget never triggers; fold keeps this many tail rows |
+| `prompt_max_chars` | `120_000` | character budget for the assembled window + fold packing |
+| `compaction_summary_max_chars` | `2_500` | cap on the folded 5-section summary |
+
+**Test doctrine** (`tests/test_compaction.py` + `tests/test_chat_memory_v2.py`, hand-rolled
+SQL-shaped fakes — no real DB): zero reads on both tables for normal turns *and* Turn N+1 after a
+fold; client-edited content wins over stale SQL; 422 on illegal empty tails; both barrier halves
+defer before any fold read; exactly one LLM call from raw rows with an inclusive watermark; the
+second fold contains no first-summary text; every failure defers without trimming; CAS conflict;
+budget-packing residue stays at the tail top; reconcile delete/insert/update with `embedding =
+NULL`; legacy + worker recovery loads.
 
 [↑ Back to top](#table-of-contents)
