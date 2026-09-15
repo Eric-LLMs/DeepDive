@@ -25,8 +25,8 @@ POST /toolkit/generate            apps/api/routers/jobs.py:129
       ├ paths/file_ids → drive.download / workspace file
       └ ToolKitPipeline.run()                apps/api/tools/toolkit/pipeline.py:96
             1 validate  path jail + size gate                     :128
-            2 ingest    extract_document_text + budget_plan       packages/core/infrastructure/ingest.py:163
-                        (map-reduce digest over 12k tokens)       apps/api/tools/toolkit/sources.py:127
+            2 ingest    extract_document_text; FULL raw text always   packages/core/infrastructure/ingest.py:163
+                        (no digest; capacity check in generate)      apps/api/tools/toolkit/sources.py
             3 generate  SYSTEM_PROMPTS[tool] → llm.complete_json  :158
                         jsonschema validate + 1 corrective retry  apps/api/tools/toolkit/outputs.py:120
             4 render    deterministic renderers (model never writes markup)  :202
@@ -83,7 +83,7 @@ assistant claim and unresolved questions are dropped.
 | Session reader | `session_source.build_transcript`, `load_session_detail` | **Extend** | Add `[msg:<id>]` line markers for provenance; transcript shape otherwise unchanged |
 | File/drive source | `_generate_from_files` + `drive.download` | **Reuse** | Already stages cloud files with extension preserved |
 | Text extraction | `ingest.extract_document_text`, `pdf.py`, `media.parse_subtitles` | **Reuse** | All five input formats already parse |
-| Token budget / map-reduce | `sources.budget_plan` (`sources.py:127`) | **Reuse** | Books/long docs already digest with citation-preserving `[file:start-end]` |
+| Capacity check / big-doc flow | `sources.plan_big_document` (removed `budget_plan`, 2026-09-15) | **Replaced** | Over one-shot capacity: explicit raw-grounded Pass A per batch + deterministic fact-base merge (ids renumbered, lines shifted absolute) — never a digest as sole input |
 | LLM client & routing | `ctx["llm"] = OpenAILLM` (`worker/settings.py:162+`), `complete_json` | **Reuse** | All deck passes call the same worker LLM |
 | JSON validation + repair retry | `pipeline._complete_json` + `outputs.validate` (Draft7, errors fed back) | **Extend** | Extract the validate→retry→fail block into a shared helper (`generate_structured`), used by every deck pass — same pattern, not a re-implementation |
 | 5-stage lifecycle engine | `ToolKitPipeline` (`pipeline.py:59`) | **Extend** | Slides dispatches to the deck engine **inside stage_generate**; hook pairs (`toolkit/before-*`) untouched |
@@ -117,7 +117,7 @@ flowchart TB
         API["POST /toolkit/generate\n(tool='slides', deck_options)"] --> JOB["TaskQueue → toolkit_generate (arq)"]
     end
     JOB --> V["1 validate (existing)"]
-    V --> I["2 ingest (existing)\nsession transcript / drive file / book PDF / subtitles\n→ SourceDoc {kind, text, locators}\nover-budget → budget_plan map-reduce (existing)"]
+    V --> I["2 ingest (existing)\nsession transcript / drive file / book PDF / subtitles\n→ SourceDoc {kind, text, locators}\nfull raw text always — capacity check defers to the\nexplicit big-document flow in generate"]
     I --> G["3 generate — DECK ENGINE (extends stage_generate)"]
 
     subgraph Deck["Deck engine — 3 LLM passes (A/B/C) + 1 deterministic pass (D)"]
@@ -296,9 +296,13 @@ source can never reach the chart renderer.
 
 ### 3.3 Throughput decisions (frozen 2026-09-14)
 
-- **Single-pass ingestion.** `toolkit_max_input_tokens` is the model's safe single-call
-  input (default 40K). Sources at or below it go to Pass A RAW — map-reduce exists only
-  for over-budget sources. (The old 12K value made every medium document pay a
+- **One-shot full text; explicit flow over capacity.** `toolkit_max_input_tokens` (default
+  100K since 2026-09-15) is a pure capacity check of the COMPLETE raw input. At or below it
+  Pass A receives the full text in one RAW call. Above it the pipeline enters the EXPLICIT
+  big-document multi-call flow: one raw-grounded Pass A per line-tracked batch, fact bases
+  merged deterministically. The old map-reduce digest pre-pass (summary as sole input) was
+  removed by directive — the map stage was a silent compression that lost provenance detail
+  and timed out; nothing replaces it. (The old 12K value made every medium document pay a
   multi-call digest pre-pass.)
 - **Pass A + Pass B stay separate (merge evaluated, rejected).** A combined
   planner call must return digest+outline in one JSON — strictly larger and more
@@ -549,8 +553,9 @@ full semantic pipeline → 16:9 PDF. Source[] stays a model-level capability onl
 3. **E2E via existing job** (three inputs, one at a time):
    a) a real chat session with at least one user *correction* → verify the digest drops
    the superseded claim and slide `provenance_refs` carry `message_id`s;
-   b) a PDF book → verify `[[PAGE:n]]` page locators in provenance and map-reduce
-   digest path over the 12k-token budget;
+   b) a PDF book over the one-shot capacity → verify `[[PAGE:n]]` / line locators stay
+   absolute and that the explicit big-document flow ran (per-batch raw Pass A calls, merged
+   fact base with unique ids);
    c) an `.srt` → verify cue `t_ms` locators.
    Each: `POST /toolkit/generate` → poll `GET /jobs/{id}` → `GET /files/{id}/download`
    the PDF; open in the desktop viewer (zero UI work needed).

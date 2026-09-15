@@ -13,9 +13,13 @@ other plugins can intercept or observe a stage by registering on the shared :cla
 Stage order and responsibilities:
 
 1. **validate** — path safety (workspace escape rejected), existence, per-file size cap.
-2. **ingest**   — text extraction + token budget / map-reduce (see :mod:`sources`).
+2. **ingest**   — text extraction; the FULL raw text always goes downstream (never a
+   digest). ``toolkit_max_input_tokens`` is a capacity check only.
 3. **generate** — structured JSON via JSON mode, jsonschema-validated, one retry that
-   carries the concrete schema errors back into the prompt.
+   carries the concrete schema errors back into the prompt. When the complete input
+   exceeds the one-shot capacity, the EXPLICIT big-document multi-call flow runs instead:
+   one raw-grounded call per batch (:mod:`sources.plan_big_document`) + deterministic
+   merge — never a summary as sole input.
 4. **render**   — structured JSON → Mermaid / Marp / summary Markdown / .pptx (never raw
    model-written diagram markup).
 5. **persist**  — atomic write into the workspace output dir with collision-proof names.
@@ -40,7 +44,13 @@ from core.infrastructure import media as media_lib
 from . import outputs
 from .errors import GenerationError, PersistError, SourceError, ToolKitError
 from .prompts import SYSTEM_PROMPTS, build_user_prompt
-from .sources import WorkspaceSource, load_sources
+from .sources import (
+    WorkspaceSource,
+    load_sources,
+    plan_big_document,
+    remap_citations,
+    total_input_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +138,18 @@ class ToolKitPipeline:
         sources = await self.stage_ingest(resolved)
         await self._observe("after-ingest", sources)
 
+        # One-shot capacity check (never a compression trigger — see sources.py).
+        batches = plan_big_document(sources)
+        if batches:
+            logger.warning(
+                "toolkit %s: input of %d tokens exceeds the %d-token one-shot capacity — "
+                "entering the EXPLICIT big-document multi-call flow: %d raw-grounded "
+                "call(s), structurally merged; the document is never replaced by a summary",
+                self.tool, total_input_tokens(sources),
+                settings.toolkit_max_input_tokens, len(batches))
+
         await self._hook("before-generate", sources)
-        data = await self.stage_generate(sources, params)
+        data = await self.stage_generate(sources, params, batches=batches)
         await self._observe("after-generate", data)
 
         await self._hook("before-render", data)
@@ -137,7 +157,9 @@ class ToolKitPipeline:
         await self._observe("after-render", rendered)
 
         await self._hook("before-persist", rendered)
-        result = await self.stage_persist(rendered, out_dir, stem=resolved[0].stem if resolved else "artifact")
+        result = await self.stage_persist(
+            rendered, out_dir, stem=resolved[0].stem if resolved else "artifact",
+            bigdoc_calls=len(batches) if batches else None)
         await self._observe("after-persist", result)
         return result
 
@@ -168,12 +190,21 @@ class ToolKitPipeline:
 
     # ── stage 2: ingest ──
     async def stage_ingest(self, resolved: list[Path]) -> list[WorkspaceSource]:
-        """Extract text and apply the token budget / map-reduce."""
+        """Extract text; the FULL text goes to generation verbatim (no digest/trimming)."""
         return await load_sources(self.workspace, resolved, self.llm)
 
     # ── stage 3: generate ──
-    async def stage_generate(self, sources: list[WorkspaceSource], params: dict) -> dict:
+    async def stage_generate(
+        self, sources: list[WorkspaceSource], params: dict, *,
+        batches: list[list[WorkspaceSource]] | None = None,
+    ) -> dict:
         """Structured generation with schema validation and corrective retries.
+
+        ``batches`` (from :func:`sources.plan_big_document`) engages the EXPLICIT
+        big-document multi-call flow: one grounding call per batch, each on that batch's
+        RAW text, plus a deterministic structural merge. Below capacity (``batches`` None)
+        the complete raw text goes to the generator in one call — always verbatim, never
+        digested.
 
         ``slides`` runs the dedicated deck engine (docs/content-to-slides.md): three LLM
         passes (understand → outline → expansion, each on its own validated input contract)
@@ -200,14 +231,33 @@ class ToolKitPipeline:
             options.user_guidance = (params.get("prompt") or "").strip()
             hint = (params.get("prompt") or "").strip()
             deck = await generate_deck(self.llm, sources, options,
-                                       deck_id=secrets.token_hex(4), hint=hint)
+                                       deck_id=secrets.token_hex(4), hint=hint,
+                                       batches=batches)
             return {"deck": deck.model_dump(mode="json")}
 
         system = SYSTEM_PROMPTS[self.tool]
         custom = (params.get("prompt") or "").strip()
         if custom:
             system = f"{system}\n\n{custom}"
-        prompt = build_user_prompt(self.tool, sources, params)
+        if not batches:
+            prompt = build_user_prompt(self.tool, sources, params)
+            return await self._generate_validated(prompt, system)
+
+        partials: list[dict] = []
+        n = len(batches)
+        for i, batch in enumerate(batches, 1):
+            prompt = (
+                f"(Big-document batch {i} of {n}: generate this part of the {self.tool} "
+                f"strictly from the sources below.)\n\n"
+                + build_user_prompt(self.tool, batch, params)
+            )
+            data = await self._generate_validated(prompt, system)
+            # Batch-relative [name:line] citations → absolute original lines before merge.
+            partials.append(remap_citations(data, {s.name: s.line_offset for s in batch}))
+        return outputs.merge_tool_outputs(self.tool, partials)
+
+    async def _generate_validated(self, prompt: str, system: str) -> dict:
+        """One JSON generation + schema validation + single corrective retry."""
         data = await self._complete_json(prompt, system)
 
         errors = outputs.validate(outputs.SCHEMAS[self.tool], data)
@@ -225,14 +275,19 @@ class ToolKitPipeline:
         return data
 
     async def _complete_json(self, prompt: str, system: str) -> dict:
-        """JSON mode when the client supports it; else a tolerant ``complete`` + parse."""
+        """JSON mode when the client supports it; else a tolerant ``complete`` + parse.
+
+        Toolkit calls run on (near-)full-context inputs: the global per-call timeout is
+        too tight for them, so ``toolkit_llm_timeout_s`` bounds each attempt instead.
+        """
+        timeout = settings.toolkit_llm_timeout_s
         fn = getattr(self.llm, "complete_json", None)
         if fn is not None:
             try:
-                return await fn(prompt, system)
+                return await fn(prompt, system, timeout=timeout)
             except Exception as exc:  # noqa: BLE001 - JSON mode is best-effort; fall back
                 logger.info("complete_json unavailable (%s); falling back to tolerant parse", exc)
-        raw = await self.llm.complete(prompt, system)
+        raw = await self.llm.complete(prompt, system, timeout=timeout)
         data = outputs.extract_json(raw)
         if data is None:
             raise GenerationError("model response was not valid JSON")
@@ -273,9 +328,14 @@ class ToolKitPipeline:
 
     # ── stage 5: persist ──
     async def stage_persist(
-        self, rendered: dict[str, object], out_dir: Path, *, stem: str
+        self, rendered: dict[str, object], out_dir: Path, *, stem: str,
+        bigdoc_calls: int | None = None,
     ) -> ToolKitResult:
-        """Write every rendered artifact atomically; collision-proof names, workspace-confined."""
+        """Write every rendered artifact atomically; collision-proof names, workspace-confined.
+
+        ``bigdoc_calls`` (set when the explicit big-document multi-call flow ran) is
+        surfaced in the one-line summary so the job record states the flow used.
+        """
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -298,8 +358,13 @@ class ToolKitPipeline:
                 raise PersistError(f"failed to write {filename}: {exc}") from exc
             files.append(str(path))
 
+        note = (
+            f" Large input: {bigdoc_calls} raw grounding calls "
+            "(explicit big-document flow)."
+            if bigdoc_calls else ""
+        )
         return ToolKitResult(
             tool=self.tool,
             files=files,
-            summary=f"Generated {self.tool} output ({len(files)} file{'s' if len(files) != 1 else ''}).",
+            summary=f"Generated {self.tool} output ({len(files)} file{'s' if len(files) != 1 else ''}).{note}",
         )

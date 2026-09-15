@@ -146,8 +146,11 @@ class OpenAILLM:
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        timeout: float | None = None,
     ) -> str:
-        client, mdl = self._call_channel(model, base_url, api_key)
+        # A per-call ``timeout`` (e.g. toolkit full-context generation) forces a fresh
+        # client; without it the shared client's global wall time applies.
+        client, mdl = self._call_channel(model, base_url, api_key, timeout=timeout)
         resp = await client.chat.completions.create(
             model=mdl,
             messages=self._messages(prompt, system_prompt),
@@ -162,15 +165,17 @@ class OpenAILLM:
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        timeout: float | None = None,
     ) -> dict:
         """Structured completion: ask the provider for a JSON object.
 
         Uses JSON mode (``response_format={"type": "json_object"}``) — the prompt must
         contain the word "json" for some providers to honour the mode. Returns the parsed
         JSON object. A provider that rejects JSON mode raises (the caller can fall back to
-        ``complete`` + a tolerant JSON parse).
+        ``complete`` + a tolerant JSON parse). A per-call ``timeout`` bounds long
+        full-context generations (toolkit) without touching the global default.
         """
-        client, mdl = self._call_channel(model, base_url, api_key)
+        client, mdl = self._call_channel(model, base_url, api_key, timeout=timeout)
         try:
             resp = await client.chat.completions.create(
                 model=mdl,

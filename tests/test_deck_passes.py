@@ -30,7 +30,8 @@ class FakeLLM:
         self.replies = list(replies)         # each entry: dict | callable(prompt)->dict | Exception
         self.calls: list[tuple[str, str]] = []
 
-    async def complete_json(self, prompt: str, system: str) -> dict:
+    async def complete_json(self, prompt: str, system: str,
+                            timeout: float | None = None) -> dict:
         self.calls.append((prompt, system))
         if not self.replies:
             raise AssertionError("FakeLLM queue exhausted")
@@ -43,7 +44,8 @@ class FakeLLM:
             raise r
         return json.loads(json.dumps(r))     # deep copy
 
-    async def complete(self, prompt: str, system: str) -> str:
+    async def complete(self, prompt: str, system: str,
+                       timeout: float | None = None) -> str:
         return json.dumps(await self.complete_json(prompt, system))
 
     @property
@@ -96,6 +98,71 @@ def _c_reply(prompt: str) -> dict:
 
 def standard_replies():
     return [_digest_json(), _outline_json(), _c_reply, _c_reply, _c_reply]
+
+
+def _batch_digest_json(prefix: str) -> dict:
+    """A schema-valid Pass A reply; provenance anchored to ``doc.md`` batch-relative lines."""
+    return {
+        "title": "检索增强",
+        "facts": [
+            {"fact_id": f"f{k}", "statement": f"{prefix} 事实 {k}",
+             "provenance": [{"source_id": "doc.md", "kind": "document", "lines": "1-2"}]}
+            for k in (1, 2, 3)
+        ],
+        "concepts": [f"c-{prefix}"],
+        "quantities": [],
+    }
+
+
+class TestBigDocumentFlow:
+    """EXPLICIT big-document multi-call flow: raw grounding per batch + deterministic merge.
+
+    Directive 2026-09-15: over the one-shot capacity the deck engine runs Pass A once per
+    batch (each call sees its batch's RAW text) and merges the fact bases structurally —
+    ids renumbered globally, line locators shifted to absolute source lines. No digest of
+    a digest, no LLM merge call.
+    """
+
+    @staticmethod
+    def _src(text: str, offset: int):
+        from apps.api.tools.toolkit.sources import WorkspaceSource
+        return WorkspaceSource(name="doc.md", path="/ws/doc.md", text=text,
+                               char_count=len(text), line_count=text.count("\n") + 1,
+                               line_offset=offset)
+
+    @pytest.mark.asyncio
+    async def test_generate_deck_batches_ground_raw_and_merge(self):
+        batches = [
+            [self._src("BATCH-ONE line A\nline B\n", 1)],
+            [self._src("BATCH-TWO line C\nline D\n", 3)],
+        ]
+        full = [self._src("BATCH-ONE line A\nline B\nBATCH-TWO line C\nline D\n", 1)]
+        llm = FakeLLM([_batch_digest_json("A"), _batch_digest_json("B"),
+                       _outline_json(3), _c_reply, _c_reply, _c_reply])
+        deck = await generate_deck(llm, full, DeckOptions(target_slide_count=3),
+                                   batches=batches)
+        prompts = llm.prompts
+        # Pass A: one RAW-grounded call per batch, each seeing only its own text.
+        assert "BATCH-ONE" in prompts[0] and "BATCH-TWO" not in prompts[0]
+        assert "BATCH-TWO" in prompts[1] and "BATCH-ONE" not in prompts[1]
+        assert prompts[0].count("BIG DOCUMENT (1/2)") == 1
+        assert prompts[1].count("BIG DOCUMENT (2/2)") == 1
+        # Merged fact base: globally unique ids; batch-2 lines shifted 1-2 → 3-4.
+        assert [f.fact_id for f in deck.digest.facts] == [f"f{i}" for i in range(1, 7)]
+        shifted = [f for f in deck.digest.facts if f.statement.startswith("B 事实")]
+        assert {r.lines for f in shifted for r in f.provenance} == {"3-4"}
+        assert deck.digest.concepts == ["c-A", "c-B"]
+        # Pass B still never sees the raw source (contract holds under the flow).
+        assert "BATCH-" not in prompts[2]
+
+    @pytest.mark.asyncio
+    async def test_generate_deck_without_batches_is_single_raw_call(self):
+        llm = FakeLLM(standard_replies())
+        deck = await generate_deck(llm, _src(), DeckOptions(target_slide_count=3))
+        # one Pass A call carrying the complete raw text, verbatim
+        assert RAW_MARKER in llm.prompts[0]
+        assert all(RAW_MARKER not in p for p in llm.prompts[1:])
+        assert isinstance(deck, DeckSpec)
 
 
 def test_digest_schema_matches_model_null_optionals():

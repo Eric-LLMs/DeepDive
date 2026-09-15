@@ -665,12 +665,22 @@ The sibling **toolkit pipeline** (`apps/api/tools/toolkit/`) powers the workbenc
 **Generate Mind Map / Generate Slides / Summarize** — `POST /toolkit/generate` → worker
 `toolkit_generate`. Every tool (`summary` / `mindmap` / `slides`) runs the same five stages:
 **validate** (workspace-confined sources, existence, per-file size cap) → **ingest** (text
-extraction + token-budget single-pass rule: sources totalling ≤ `toolkit_max_input_tokens`
-(40K) go to the model RAW; only over-budget sources are split into line-tracked chunks
-(64 × 12000 chars/file, digest calls capped at concurrency 4) and map-reduced, failing
-loudly at the chunk bound instead of burning the worker timeout) → **generate** → **render**
-(JSON → Mermaid `.mmd` / summary Markdown; `slides` → the deck engine below, never raw
+extraction; the FULL raw text always goes downstream — never a digest) → **generate** →
+**render** (JSON → Mermaid `.mmd` / summary Markdown; `slides` → the deck engine below, never raw
 model-written markup) → **persist** (atomic, collision-proof names).
+
+The generate stage applies the 2026-09-15 input doctrine: `toolkit_max_input_tokens`
+(100K) is a pure **capacity check** of the complete input, never a compression trigger.
+At or below it the generator receives the complete raw text in **one call**. Above it the
+pipeline enters the **explicit big-document multi-call flow** (`sources.plan_big_document`):
+the raw text is split into line-tracked batches (original names kept, per-batch line
+offsets), each grounding call sees only its batch's RAW text (for `slides` this is Pass A
+per batch; the fact bases merge deterministically — ids renumbered globally, line locators
+shifted to absolute source lines), and `summary`/`mindmap` partial outputs are joined
+structurally (bullets/sections/branches concatenated, batch citations remapped). No partial
+ever becomes a re-summarization input, nothing runs silently — the switch is a WARN in the
+worker log and a note in the job's one-line summary. Every toolkit generation call runs
+under `toolkit_llm_timeout_s` (300 s) instead of the global 90 s wall time.
 
 `summary` / `mindmap` **generate** is the single structured call (JSON mode,
 jsonschema-validated, one corrective retry that carries the concrete — condensed, ≤240-char —
@@ -873,8 +883,9 @@ sentence over SSE: each `segment` event carries a **cached WAV URL** (synthesize
 the localhost Kokoro container), so the client plays sentence 1 while the later ones are still
 generating; `error` / `done` frames terminate the stream.
 
-**Toolkit generation jobs** — `toolkit_generate` legitimately runs many minutes (a large PDF's
-map-reduce, then JSON generation) and is bounded by `WORKER_JOB_TIMEOUT` (1 h), so a generation
+**Toolkit generation jobs** — `toolkit_generate` legitimately runs many minutes (the explicit
+big-document flow makes one raw-grounded call per batch, then the deck passes) and is bounded
+by `WORKER_JOB_TIMEOUT` (1 h), so a generation
 job is **never transient**. The desktop client reflects that: the generate dialog keeps its
 Generate button disabled and polls `GET /jobs/{id}` every 2 s **until a terminal state** — it
 imposes no client-side deadline — so a job that outlives the dialog keeps running and reports its

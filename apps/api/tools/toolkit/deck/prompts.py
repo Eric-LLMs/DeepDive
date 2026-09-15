@@ -328,10 +328,12 @@ def build_source_block(sources: list[WorkspaceSource]) -> str:
     return "\n\n".join(parts)
 
 
-def digest_prompt(sources: list[WorkspaceSource], deck_title_hint: str = "") -> str:
+def digest_prompt(sources: list[WorkspaceSource], deck_title_hint: str = "",
+                  note: str = "") -> str:
     hint = f"\nDeck subject hint: {deck_title_hint}\n" if deck_title_hint else "\n"
+    batch = f"{note}\n" if note else ""
     return (
-        "Extract the grounded fact base from the sources below." + hint
+        "Extract the grounded fact base from the sources below." + hint + batch
         + "Use the exact source_id shown in each header for provenance refs.\n\n"
         + build_source_block(sources)
     )

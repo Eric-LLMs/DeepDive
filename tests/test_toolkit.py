@@ -63,17 +63,19 @@ class _FakeLLM:
     def __init__(self, responses=None) -> None:
         self._responses = list(responses or [])
         self.complete_calls: list[tuple[str, str]] = []
+        self.complete_timeouts: list[float | None] = []
         self.complete_json_calls: list[tuple[str, str]] = []
 
-    async def complete(self, text: str, system: str) -> str:
+    async def complete(self, text: str, system: str, timeout: float | None = None) -> str:
         self.complete_calls.append((text, system))
+        self.complete_timeouts.append(timeout)
         if "excerpt summarizer" in system:
             return "Digest fact [doc.md:1-1]"
         if "digest merger" in system:
             return "Merged digest [doc.md:1-1]"
         return ""
 
-    async def complete_json(self, text: str, system: str) -> dict:
+    async def complete_json(self, text: str, system: str, timeout: float | None = None) -> dict:
         self.complete_json_calls.append((text, system))
         if not self._responses:
             raise ValueError("no JSON response queued")
@@ -148,7 +150,7 @@ def test_slides_for_pptx():
     assert outputs.slides_for_pptx(SLIDES_DATA) == [("Intro", "A\nB\nC")]
 
 
-# ── token budget / map-reduce ──
+# ── one-shot capacity check + explicit big-document multi-call flow ──
 
 def test_token_count_heuristic_fallback(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "tiktoken", None)  # force offline fallback
@@ -157,46 +159,115 @@ def test_token_count_heuristic_fallback(monkeypatch):
     assert sources.token_count("") >= 1
 
 
-def test_split_with_lines_preserves_ranges():
-    text = "\n".join(f"line {i}" for i in range(60))
-    chunks = sources._split_with_lines(text, 200)
-    assert "".join(c[0] for c in chunks) == text
-    for piece, start, end in chunks:
-        assert end - start + 1 == piece.count("\n") + 1
-
-
-async def test_budget_plan_map_reduces_when_over_budget(monkeypatch):
-    monkeypatch.setattr(settings, "toolkit_max_input_tokens", 10)
-    src = sources.WorkspaceSource(
-        name="doc.md", path="doc.md", text="# Title\n\n" + "para\n" * 40,
-        char_count=1, line_count=1,
+def _src(text: str, name: str = "doc.md", offset: int = 1) -> sources.WorkspaceSource:
+    return sources.WorkspaceSource(
+        name=name, path=name, text=text, char_count=len(text),
+        line_count=text.count("\n") + 1, line_offset=offset,
     )
-    llm = _FakeLLM()
-    planned = await sources.budget_plan([src], llm)
-    assert len(planned) == 1
-    assert planned[0].name == "merged"
-    assert "Digest fact" in planned[0].text
-    assert any("excerpt summarizer" in sys for _, sys in llm.complete_calls)
 
 
-async def test_budget_plan_unchanged_under_budget():
-    src = sources.WorkspaceSource(name="doc.md", path="doc.md", text="short", char_count=5, line_count=1)
-    planned = await sources.budget_plan([src], _FakeLLM())
-    assert planned == [src]
+def test_plan_big_document_none_within_capacity(monkeypatch):
+    # Directive 2026-09-15: at or below capacity the COMPLETE raw text goes in ONE call.
+    monkeypatch.setattr(sources.settings, "toolkit_max_input_tokens", 1000)
+    assert sources.plan_big_document([_src("short raw text\n")]) is None
 
 
-async def test_budget_plan_single_pass_at_40k_default():
-    # 2026-09-14 directive: a mid-size source (~30K tokens, inside the 40K default)
-    # must reach Pass A verbatim — no map-reduce round-trips, zero extra LLM calls.
-    assert settings.toolkit_max_input_tokens == 40000
-    text = "lorem ipsum dolor sit amet " * 5400          # ~30K tokens
-    src = sources.WorkspaceSource(name="doc.md", path="doc.md", text=text,
-                                  char_count=len(text), line_count=text.count("\n") + 1)
-    assert 20_000 <= sources.token_count(text) <= settings.toolkit_max_input_tokens
-    llm = _FakeLLM()
-    planned = await sources.budget_plan([src], llm)
-    assert planned == [src]
-    assert not llm.complete_calls
+async def test_load_sources_over_capacity_returns_full_raw_text(tmp_path, monkeypatch):
+    # load_sources NEVER fails or compresses on size — planning is the pipeline's job.
+    monkeypatch.setattr(sources.settings, "toolkit_max_input_tokens", 10)
+    _doc(tmp_path, text="# T\n\n" + "raw body line\n" * 30)
+    loaded = await sources.load_sources(tmp_path, [tmp_path / "doc.md"], _FakeLLM())
+    assert len(loaded) == 1
+    assert loaded[0].text.count("raw body line") == 30  # full raw text, nothing dropped
+
+
+def test_plan_big_document_splits_raw_preserving_text_and_offsets(monkeypatch):
+    monkeypatch.setattr(sources, "token_count", lambda t: max(1, len(t) // 4))
+    monkeypatch.setattr(sources.settings, "toolkit_max_input_tokens", 40)
+    text = "\n".join(f"L{i:02d} " + "x" * 20 for i in range(8))
+    batches = sources.plan_big_document([_src(text + "\n")])
+    assert batches and len(batches) == 2
+    assert "".join(b[0].text for b in batches) == text + "\n"  # raw, exact, complete
+    assert batches[0][0].line_offset == 1
+    assert batches[1][0].line_offset == 1 + sum(
+        1 for _ in batches[0][0].text.rstrip("\n").split("\n"))
+    for b in batches:
+        assert sources.total_input_tokens(b) <= 40
+    assert all(s.name == "doc.md" for b in batches for s in b)  # original names kept
+
+
+def test_plan_big_document_batches_guardrail(monkeypatch):
+    monkeypatch.setattr(sources, "token_count", lambda t: max(1, len(t) // 4))
+    monkeypatch.setattr(sources.settings, "toolkit_max_input_tokens", 8)
+    text = "".join("y" * 24 + "\n" for _ in range(200))  # 600 tokens → 75 > 64 batches
+    with pytest.raises(SourceError, match="big-document calls"):
+        sources.plan_big_document([_src(text)])
+
+
+def test_remap_citations_shifts_batch_relative_lines():
+    data = {
+        "key_points": [{"point": "p", "citations": ["[doc.md:3]", "[doc.md:1-2]"]}],
+        "note": "see [doc.md:5] and [file.md:2]",
+    }
+    out = sources.remap_citations(data, {"doc.md": 21})
+    assert out["key_points"][0]["citations"] == ["[doc.md:23]", "[doc.md:21-22]"]
+    assert "[doc.md:25]" in out["note"]      # offset applied
+    assert "[file.md:2]" in out["note"]      # unlisted names untouched
+
+
+def test_merge_summary_and_mindmap_join_structurally():
+    a = {**SUMMARY_DATA, "title": "T", "executive_summary": "part one"}
+    b = {**SUMMARY_DATA, "title": "", "executive_summary": "part two"}
+    merged = outputs.merge_summary([a, b])
+    assert merged["title"] == "T"
+    assert merged["executive_summary"] == "part one\n\npart two"
+    assert len(merged["key_points"]) == 2 and len(merged["sections"]) == 2
+    mm_a = {**MINDMAP_DATA, "topic": "Big Topic"}
+    mm = outputs.merge_mindmap([mm_a, MINDMAP_DATA])
+    assert mm["topic"] == "Big Topic" and len(mm["branches"]) == 2
+
+
+# ── pipeline E2E over capacity: explicit flow, raw grounding, merged result ──
+
+async def test_summary_over_capacity_uses_raw_multi_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(sources, "token_count", lambda t: max(1, len(t) // 4))
+    monkeypatch.setattr(sources.settings, "toolkit_max_input_tokens", 40)
+    text = "\n".join(f"L{i:02d} " + "x" * 20 for i in range(8)) + "\n"
+    _doc(tmp_path, text=text)
+    llm = _FakeLLM([SUMMARY_DATA, SUMMARY_DATA])
+    pipe = ToolKitPipeline(llm, "summary", workspace=tmp_path)
+    result = await pipe.run(["doc.md"])
+    # 2 batches → 2 grounding calls, EACH on raw text, and no digest-input call anywhere.
+    prompts = [p for p, _ in llm.complete_json_calls]
+    assert len(prompts) == 2
+    seen = "".join(prompts)
+    assert all(f"L{i:02d}" in seen for i in range(8))       # full raw coverage
+    assert prompts[0] != prompts[1]                          # per-batch windows
+    assert all("Big-document batch" in p for p in prompts)   # announced, explicit
+    out = Path(result.files[0]).read_text(encoding="utf-8")
+    assert out.count("- RRF blends scores.") == 2            # structurally merged
+    # batch-2 lines shifted by its offset (6 raw lines precede it → +6): [doc.md:1]→[doc.md:7]
+    assert "[doc.md:7]" in out and "[doc.md:8]" in out
+    assert "big-document" in result.summary                  # visible in the job record
+
+
+async def test_mindmap_over_capacity_joins_branches(tmp_path, monkeypatch):
+    monkeypatch.setattr(sources, "token_count", lambda t: max(1, len(t) // 4))
+    monkeypatch.setattr(sources.settings, "toolkit_max_input_tokens", 40)
+    text = "\n".join(f"L{i:02d} " + "x" * 20 for i in range(8)) + "\n"
+    _doc(tmp_path, text=text)
+    llm = _FakeLLM([MINDMAP_DATA, MINDMAP_DATA])
+    pipe = ToolKitPipeline(llm, "mindmap", workspace=tmp_path)
+    result = await pipe.run(["doc.md"])
+    assert len(llm.complete_json_calls) == 2
+    mmd = Path(result.files[0]).read_text(encoding="utf-8")
+    assert mmd.count("RRF") == 2  # both batches' branches kept
+
+
+async def test_slides_under_capacity_still_single_raw_call(tmp_path, monkeypatch):
+    # capacity check must NOT touch the one-shot path: a small doc stays ONE Pass A call.
+    monkeypatch.setattr(sources.settings, "toolkit_max_input_tokens", 1_000_000)
+    assert sources.plan_big_document([_src("# T\n\nsmall body\n")]) is None
 
 
 # ── pipeline stages ──

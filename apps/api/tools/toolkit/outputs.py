@@ -240,6 +240,43 @@ def slides_for_pptx(data: dict) -> list[tuple[str, str]]:
     return slides
 
 
+# ── Big-document merge (explicit multi-call flow; deterministic, no LLM call) ─
+#
+# Each partial was produced by a grounding call on the RAW text of one batch (see
+# ``sources.plan_big_document``). Merging joins the structured results — bullets,
+# sections, branches — it never asks the model to re-summarize the document, so no
+# partial output ever becomes another call's input. (``slides`` merges inside the deck
+# engine, where the per-batch Pass A fact bases get renumbered and line-shifted.)
+
+def merge_summary(partials: list[dict]) -> dict:
+    """Join per-batch summaries: concatenation, with the first non-empty title kept."""
+    return {
+        "title": next((p.get("title", "") for p in partials if p.get("title")), ""),
+        "executive_summary": "\n\n".join(
+            p.get("executive_summary", "").strip()
+            for p in partials if p.get("executive_summary", "").strip()),
+        "key_points": [kp for p in partials for kp in p.get("key_points", [])],
+        "sections": [sec for p in partials for sec in p.get("sections", [])],
+        "qa": [qa for p in partials for qa in p.get("qa", [])],
+    }
+
+
+def merge_mindmap(partials: list[dict]) -> dict:
+    """One root topic + every batch's branches, kept at their validated depth."""
+    topic = next((p.get("topic", "") for p in partials if p.get("topic")), "Mind Map")
+    return {"topic": topic, "branches": [b for p in partials for b in p.get("branches", [])]}
+
+
+def merge_tool_outputs(tool: str, partials: list[dict]) -> dict:
+    if len(partials) == 1:
+        return partials[0]
+    if tool == "summary":
+        return merge_summary(partials)
+    if tool == "mindmap":
+        return merge_mindmap(partials)
+    raise ValueError(f"no big-document merge for tool {tool!r}")
+
+
 def render(tool: str, data: dict) -> dict[str, object]:
     """Dispatch to the tool's renderer(s); returns ``{logical_name: content}``."""
     if tool == "summary":

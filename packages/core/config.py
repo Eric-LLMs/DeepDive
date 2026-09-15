@@ -65,14 +65,20 @@ class Settings(BaseSettings):
     media_output_dir: Path = Path("data/media_output")
 
     # ── Toolkit content generation (workspace files → slides / mindmap / summary) ──
-    # Output root (relative to the workspace) and input guardrails: text above the token
-    # budget triggers map-reduce; files over the byte cap are refused outright.
-    # 40K ≈ the current model's safe single-pass input (64K window minus generation
-    # headroom): small/medium documents go to the generator RAW — the map-reduce
-    # pre-pass is only for genuinely over-budget sources.
+    # Output root (relative to the workspace) + input guardrails. Since 2026-09-15 the
+    # three tools generate from the FULL raw text: ``toolkit_max_input_tokens`` is a pure
+    # one-shot capacity CHECK — at or below it the complete text goes to the generator in
+    # ONE call; above it the pipeline enters the EXPLICIT big-document multi-call flow
+    # (raw-grounded call per line-tracked batch + deterministic merge; the old map-reduce
+    # digest pre-pass that fed a summary as sole input is removed for good).
+    # 100K ≈ current channel's 128K window minus generation headroom;
+    # ``compact_history`` on the chat path is a separate mechanism and unaffected.
+    # ``toolkit_llm_timeout_s`` bounds each toolkit generation call (a full-context
+    # Pass A / one-shot summary needs far more than the global 90s wall time).
     toolkit_output_dir: Path = Path(".output")
-    toolkit_max_input_tokens: int = 40000
+    toolkit_max_input_tokens: int = 100000
     toolkit_max_file_bytes: int = 20 * 1024 * 1024
+    toolkit_llm_timeout_s: float = 300.0
 
     # Deck (content-to-slides) Pass C throughput knobs. Effective fan-out per deck =
     # min(configured, provider per-key cap, worker in-job cap, slide_count).

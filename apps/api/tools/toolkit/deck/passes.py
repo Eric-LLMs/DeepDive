@@ -1,7 +1,9 @@
 """The three LLM passes + the deterministic Pass D, orchestrated into a DeckSpec.
 
 Contract (docs §3, errata #1/#2):
-  Pass A UNDERSTAND  raw source text (post budget_plan)        → ContentDigest
+  Pass A UNDERSTAND  raw source text — one call when the input fits the one-shot context
+                     capacity, else one RAW-grounded call per batch of the explicit
+                     big-document flow, merged deterministically (see pass_a_batched)
   Pass B OUTLINE     the digest JSON — NEVER the raw source    → Outline
   Pass C EXPANSION   per slide: outline item + the digest fact subset → Slide
   Pass D VISUAL PLAN pure :mod:`.rules` (no LLM)               → list[VisualPlan]
@@ -55,15 +57,20 @@ def _source_docs(sources: list[WorkspaceSource]) -> list[SourceDoc]:
     return out
 
 
-async def _complete_json(llm, prompt: str, system: str) -> dict:
-    """JSON mode when available, tolerant parse otherwise (mirrors pipeline._complete_json)."""
+async def _complete_json(llm, prompt: str, system: str,
+                         timeout: float | None = None) -> dict:
+    """JSON mode when available, tolerant parse otherwise (mirrors pipeline._complete_json).
+
+    ``timeout`` is a per-call wall clock handed to the transport (toolkit generation on a
+    full-context input routinely exceeds the global ``llm_timeout_seconds``).
+    """
     fn = getattr(llm, "complete_json", None)
     if fn is not None:
         try:
-            return await fn(prompt, system)
+            return await fn(prompt, system, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - best-effort, fall back
             logger.info("complete_json unavailable (%s); falling back to parse", exc)
-    raw = await llm.complete(prompt, system)
+    raw = await llm.complete(prompt, system, timeout=timeout)
     data = extract_json(raw)
     if data is None:
         raise GenerationError("model response was not valid JSON")
@@ -105,19 +112,22 @@ def _condense_errors(errors: list[str]) -> list[str]:
 
 async def _structured(llm, *, prompt: str, system: str, schema: dict,
                       extra_check=None, label: str,
-                      timeout: float | None = None) -> tuple[object, dict]:
+                      timeout: float | None = None,
+                      call_timeout: float | None = None) -> tuple[object, dict]:
     """One LLM pass with corrective retries. ``extra_check(data) -> (errors, loaded)``
     runs after schema validation; returns the loaded object. ``timeout`` bounds a
     SINGLE attempt: a timed-out attempt is fed back as a corrective error so the same
-    call is retried in isolation — one slow page never stalls or redoes the deck."""
+    call is retried in isolation — one slow page never stalls or redoes the deck.
+    ``call_timeout`` is the per-call transport wall clock handed to ``_complete_json``."""
     current = prompt
     last_errs: list[str] = []
     for attempt in range(_RETRIES + 1):
         try:
+            coro = _complete_json(llm, current, system, timeout=call_timeout)
             if timeout:
-                data = await asyncio.wait_for(_complete_json(llm, current, system), timeout)
+                data = await asyncio.wait_for(coro, timeout)
             else:
-                data = await _complete_json(llm, current, system)
+                data = await coro
         except asyncio.TimeoutError:
             errors = _condense_errors(
                 [f"model response timed out after {timeout:.0f}s — produce the complete "
@@ -143,16 +153,78 @@ async def _structured(llm, *, prompt: str, system: str, schema: dict,
 # ── the three passes ──────────────────────────────────────────────────────────
 
 async def pass_a_understand(llm, sources: list[WorkspaceSource],
-                            hint: str = "", language: str = "") -> ContentDigest:
-    prompt = P.digest_prompt(sources, hint)
+                            hint: str = "", language: str = "", note: str = "",
+                            call_timeout: float | None = None) -> ContentDigest:
+    prompt = P.digest_prompt(sources, hint, note=note)
     digest, _raw = await _structured(
         llm, prompt=prompt, system=P.DIGEST_SYSTEM + P.language_rule(language),
         schema=P.DIGEST_SCHEMA,
-        extra_check=lambda d: _check(d, ContentDigest), label="A/understand")
+        extra_check=lambda d: _check(d, ContentDigest), label="A/understand",
+        call_timeout=call_timeout)
     return digest
 
 
-async def pass_b_outline(llm, digest: ContentDigest, options: DeckOptions) -> Outline:
+_LINE_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
+
+
+def _remap_digest_lines(digest: ContentDigest, offsets: dict[str, int]) -> None:
+    """Shift line locators from batch-relative to absolute source lines (in place)."""
+    for obj in list(digest.facts) + list(digest.quantities):
+        for ref in obj.provenance:
+            off = offsets.get(ref.source_id, 1) - 1
+            if off <= 0 or not ref.lines:
+                continue
+            m = _LINE_RANGE_RE.match(ref.lines)
+            if not m:
+                continue
+            a = int(m.group(1)) + off
+            b = int(m.group(2)) + off if m.group(2) else None
+            ref.lines = str(a) if b is None or b == a else f"{a}-{b}"
+
+
+async def pass_a_batched(llm, batches: list[list[WorkspaceSource]], *,
+                         hint: str = "", language: str = "") -> ContentDigest:
+    """The EXPLICIT big-document flow's grounding stage — one Pass A per batch.
+
+    Every call is grounded in the RAW text of its own batch (never a digest), and the
+    merge is deterministic: facts/quantities get globally unique ids, line locators are
+    shifted to absolute source lines, concepts are order-preserving deduplicated. No LLM
+    merge call — the per-batch fact bases ARE the fact base for Pass B/C.
+    """
+    n = len(batches)
+    facts, quantities, concepts = [], [], []
+    title = ""
+    for i, batch in enumerate(batches, 1):
+        logger.info("deck Pass A big-document flow: raw grounding call %d/%d", i, n)
+        digest = await pass_a_understand(
+            llm, batch, hint, language=language,
+            note=(f"BIG DOCUMENT ({i}/{n}): the input is one batch of a large document; "
+                  "extract facts ONLY from the text below. " if n > 1 else ""),
+            call_timeout=settings.toolkit_llm_timeout_s)
+        _remap_digest_lines(digest, {s.name: s.line_offset for s in batch})
+        if not title:
+            title = digest.title
+        id_map: dict[str, str] = {}
+        for f in digest.facts:
+            new_id = f"f{len(facts) + 1}"
+            id_map[f.fact_id] = new_id
+            f.fact_id = new_id
+            facts.append(f)
+        for f in digest.facts:
+            if f.superseded_by:
+                f.superseded_by = id_map.get(f.superseded_by, f.superseded_by)
+        for q in digest.quantities:
+            q.quant_id = f"q{len(quantities) + 1}"
+            quantities.append(q)
+        for c in digest.concepts:
+            if c not in concepts:
+                concepts.append(c)
+    return ContentDigest(title=title, facts=facts, concepts=concepts,
+                         quantities=quantities)
+
+
+async def pass_b_outline(llm, digest: ContentDigest, options: DeckOptions,
+                         call_timeout: float | None = None) -> Outline:
     digest_json = P.dumps(digest.model_dump(mode="json", exclude_none=True))
     prompt = P.outline_prompt(digest_json, options.target_slide_count,
                               options.target_audience, options.presentation_goal,
@@ -167,7 +239,7 @@ async def pass_b_outline(llm, digest: ContentDigest, options: DeckOptions) -> Ou
     outline, _raw = await _structured(
         llm, prompt=prompt, system=P.OUTLINE_SYSTEM + _bc_directives(options),
         schema=P.OUTLINE_SCHEMA,
-        extra_check=check, label="B/outline")
+        extra_check=check, label="B/outline", call_timeout=call_timeout)
     return outline
 
 
@@ -321,17 +393,29 @@ def _check(d: dict, model_cls):
 
 async def generate_deck(llm, sources: list[WorkspaceSource],
                         options: DeckOptions | None = None, *,
-                        deck_id: str = "deck", hint: str = "") -> DeckSpec:
+                        deck_id: str = "deck", hint: str = "",
+                        batches: list[list[WorkspaceSource]] | None = None) -> DeckSpec:
     """Run Pass A → B → C → D and assemble the DeckSpec (the single source of truth).
+
+    ``batches`` (from :func:`..sources.plan_big_document`) engages the EXPLICIT
+    big-document multi-call flow: Pass A runs raw-grounded once per batch and the fact
+    bases merge deterministically; Passes B/C/D are unchanged because they never saw raw
+    text anyway. Without batches, Pass A is the single one-shot raw call.
 
     Phase timings are logged at INFO so P50/P95 can be harvested offline from worker
     logs without a separate metrics pipeline.
     """
     options = options or DeckOptions()
     t0 = time.perf_counter()
-    digest = await pass_a_understand(llm, sources, hint, language=options.language)
+    if batches:
+        digest = await pass_a_batched(llm, batches, hint=hint, language=options.language)
+    else:
+        digest = await pass_a_understand(llm, sources, hint,
+                                         language=options.language,
+                                         call_timeout=settings.toolkit_llm_timeout_s)
     t1 = time.perf_counter()
-    outline = await pass_b_outline(llm, digest, options)
+    outline = await pass_b_outline(llm, digest, options,
+                                   call_timeout=settings.toolkit_llm_timeout_s)
     t2 = time.perf_counter()
     slides = await pass_c_expand(llm, outline, digest, options)
     slides, plans = await plan_with_repair(llm, slides, outline, digest, options)
