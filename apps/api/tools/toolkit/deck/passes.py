@@ -146,8 +146,9 @@ def _repair_provenance(obj):
                 p["lines"] = str(start)
 
 
-def _repair_wire_slips(data: dict) -> dict:
-    """In-place deterministic repair of model wire slips; semantics are never altered."""
+def _repair_wire_slips(data: dict, metric_of: dict[str, str] | None = None) -> dict:
+    """In-place deterministic repair of model wire slips; semantics are never altered.
+    ``metric_of`` (quant_id -> metric, Pass C only) names a merged comparison series."""
     if not isinstance(data, dict):
         return data
     for key in ("facts", "quantities"):
@@ -206,6 +207,30 @@ def _repair_wire_slips(data: dict) -> dict:
                             p.pop("quant_ref", None)
                         if isinstance(p, dict) and "y" in p:
                             p["y"] = _as_number(p["y"])
+            # N entities each as a 1-point series is THE recurring model shape here and
+            # the corrective retry never converges (the model re-emits it verbatim).
+            # The pipeline doctrine already says what the chart is: comparing N entities
+            # on ONE metric is ONE series with N points (x = entity name) — perform that
+            # merge deterministically. Only when EVERY series is one-point (and the
+            # result fits 2..8 points); otherwise leave it for validation to report.
+            if (len(series) >= 2 and all(isinstance(s, dict)
+                                         and isinstance(s.get("points"), list)
+                                         and len(s["points"]) == 1 for s in series)
+                    and 2 <= len(series) <= 8):
+                merged = []
+                for s in series:
+                    p = dict(s["points"][0])
+                    if not str(p.get("x") or "").strip():
+                        p["x"] = str(s.get("name") or "").strip() or f"entity{len(merged) + 1}"
+                    merged.append(p)
+                refs = {p.get("quant_ref") for p in merged}
+                name = ""
+                if len(refs) == 1 and metric_of:
+                    name = metric_of.get(next(iter(refs)), "")
+                name = name or str(series[0].get("name") or "").strip() or "Comparison"
+                logger.info("deck repair: merged %d one-point series into one %d-point "
+                            "series '%s'", len(series), len(merged), name)
+                payload["series"] = [{"name": name, "points": merged}]
     return data
 
 
@@ -249,7 +274,8 @@ def _condense_errors(errors: list[str]) -> list[str]:
 async def _structured(llm, *, prompt: str, system: str, schema: dict,
                       extra_check=None, label: str,
                       timeout: float | None = None,
-                      call_timeout: float | None = None) -> tuple[object, dict]:
+                      call_timeout: float | None = None,
+                      metric_of: dict[str, str] | None = None) -> tuple[object, dict]:
     """One LLM pass with corrective retries. ``extra_check(data) -> (errors, loaded)``
     runs after schema validation; returns the loaded object. ``timeout`` bounds a
     SINGLE attempt: a timed-out attempt is fed back as a corrective error so the same
@@ -272,7 +298,7 @@ async def _structured(llm, *, prompt: str, system: str, schema: dict,
             logger.info("%s pass attempt %d timed out", label, attempt + 1)
             current = P.corrective_retry_prompt(errors, prompt)
             continue
-        data = _repair_wire_slips(data)
+        data = _repair_wire_slips(data, metric_of)
         errors = validate(schema, data)
         loaded = None
         if not errors and extra_check is not None:
@@ -417,12 +443,14 @@ async def _pass_c_one(llm, item, section: str, subset: dict,
     quant_lines = "; ".join(
         f"{q['quant_id']}={q['value']}{q.get('unit', '')}"
         for q in subset["quantities"]) or ""
+    metric_of = {q["quant_id"]: str(q.get("metric") or "")
+                 for q in subset["quantities"]}
     prompt = P.slide_prompt(P.dumps(item.model_dump(mode="json")),
                             P.dumps(subset), section)
     slide, _raw = await _structured(
         llm, prompt=prompt, system=P.slide_system(quant_lines, directives),
         schema=P.SLIDE_SCHEMA, extra_check=_c_check(item), label=f"C/{item.slide_id}",
-        timeout=settings.deck_slide_timeout_s)
+        timeout=settings.deck_slide_timeout_s, metric_of=metric_of)
     return slide
 
 

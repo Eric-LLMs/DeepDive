@@ -627,6 +627,31 @@ class TestNumberStringCoercion:
         out = _condense_errors(["quantities->1->value: '13.7' is not of type 'number'"])
         assert "bare JSON number" in out[0] and "never force a number" in out[0]
 
+    def test_one_point_series_merged_into_one_entity_series(self):
+        """The model re-emits N entities as N one-point series every retry; the repair
+        performs the pipeline's own doctrine: one series, x = entity name."""
+        from apps.api.tools.toolkit.deck.passes import _repair_wire_slips
+        out = _repair_wire_slips({"payload": {"series": [
+            {"name": "Claude", "points": [{"x": "", "y": "4.8", "quant_ref": "q2"}]},
+            {"name": "GPT", "points": [{"x": "GPT", "y": 4.1, "quant_ref": "q2"}]},
+        ]}}, metric_of={"q2": "harness score"})
+        ser = out["payload"]["series"]
+        assert len(ser) == 1 and ser[0]["name"] == "harness score"
+        assert [p["x"] for p in ser[0]["points"]] == ["Claude", "GPT"]
+        assert [p["y"] for p in ser[0]["points"]] == [4.8, 4.1]
+
+    def test_one_point_merge_skipped_when_mixed_or_unmergeable(self):
+        from apps.api.tools.toolkit.deck.passes import _repair_wire_slips
+        mixed = _repair_wire_slips({"payload": {"series": [
+            {"name": "A", "points": [{"x": "a", "y": 1, "quant_ref": "q1"}]},
+            {"name": "B", "points": [{"x": "b1", "y": 2, "quant_ref": "q1"},
+                                     {"x": "b2", "y": 3, "quant_ref": "q1"}]},
+        ]}})
+        assert len(mixed["payload"]["series"]) == 2  # untouched — validation reports
+        single = _repair_wire_slips({"payload": {"series": [
+            {"name": "A", "points": [{"x": "a", "y": 1, "quant_ref": "q1"}]}]}})
+        assert len(single["payload"]["series"]) == 1 and len(single["payload"]["series"][0]["points"]) == 1
+
 
 def test_payload_array_cap_guidance_names_the_number():
     """jsonschema says only 'too long'; the corrective message must carry the actual cap,
