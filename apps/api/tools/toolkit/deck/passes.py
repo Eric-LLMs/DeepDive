@@ -100,9 +100,20 @@ def _condense_errors(errors: list[str]) -> list[str]:
     for e in errors:
         m = _TOO_LONG_RE.match(e)
         if m:
-            out.append(f"{m.group('path')}: array is too long — keep ONLY the most "
-                       "decision-relevant items; drop the least important ones until "
-                       "the array fits within the allowed maximum.")
+            if m.group("path") == "payload->series":
+                # The generic "drop items" advice is WRONG guidance here: the usual shape
+                # is N single-value entities emitted as N one-point series, and dropping
+                # series loses facts. The fix is merging into one series, not trimming.
+                out.append("payload->series: too many series — comparing N entities on "
+                           "ONE metric belongs in ONE series with one point per entity "
+                           "(x = entity name); keep at most 2 series (one per metric).")
+            else:
+                out.append(f"{m.group('path')}: array is too long — keep ONLY the most "
+                           "decision-relevant items; drop the least important ones until "
+                           "the array fits within the allowed maximum.")
+        elif re.match(r"^payload->series(?:->\d+)?->points: \[.*\] is too short$", e, re.DOTALL):
+            out.append("each series needs 2..8 points — merge the single values into one "
+                       "series across entities (x = entity name); never emit 1-point series.")
         elif len(e) > 240:
             out.append(e[:240] + "… (truncated)")
         else:
