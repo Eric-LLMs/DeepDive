@@ -560,3 +560,34 @@ def _dt_slides():
     arch = arch_slide().model_copy(update={"purpose": "ARCHITECTURE"})
     comp = compare_slide().model_copy(update={"purpose": "COMPARISON"})
     return [arch, flow_slide(4), comp, hero_slide()]
+
+
+class TestNumberStringCoercion:
+    """2026-09-15: with thinking off the model quotes plain numbers ("13.7"). Clean
+    numeric strings are repaired deterministically; ranges/multipliers stay errors."""
+
+    def test_quoted_plain_numbers_coerced_ranges_and_multipliers_untouched(self):
+        from apps.api.tools.toolkit.deck.passes import _coerce_number_strings
+        data = {
+            "quantities": [
+                {"quant_id": "q1", "value": "13.7", "unit": "%"},
+                {"quant_id": "q2", "value": " 84 "},
+                {"quant_id": "q3", "value": "10x"},
+                {"quant_id": "q4", "value": "15-35"},
+            ],
+            "payload": {"series": [{"name": "s", "points": [
+                {"x": "a", "y": "76.4", "quant_ref": "q1"},
+                {"x": "b", "y": 10.0, "quant_ref": "q2"},
+            ]}]},
+        }
+        out = _coerce_number_strings(data)
+        vals = [q["value"] for q in out["quantities"]]
+        assert vals[0] == 13.7 and vals[1] == 84
+        assert vals[2] == "10x" and vals[3] == "15-35"  # never force a number
+        pts = out["payload"]["series"][0]["points"]
+        assert pts[0]["y"] == 76.4 and pts[1]["y"] == 10.0
+
+    def test_number_type_error_carries_actionable_guidance(self):
+        from apps.api.tools.toolkit.deck.passes import _condense_errors
+        out = _condense_errors(["quantities->1->value: '13.7' is not of type 'number'"])
+        assert "bare JSON number" in out[0] and "never force a number" in out[0]

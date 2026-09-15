@@ -95,6 +95,43 @@ def _bc_directives(options: DeckOptions) -> str:
 _TOO_LONG_RE = re.compile(r"^(?P<path>[^:]+): \[.*\] is too long$", re.S)
 
 
+# With thinking off the model frequently quotes plain numbers in JSON ("13.7"). That is a
+# wire-format slip, not a semantic change, so repair it deterministically before schema
+# validation — ONLY clean numeric strings, never ranges or multipliers ("15-35", "10x"),
+# which stay errors so the model must resolve them honestly (omit or split), never coerce.
+_NUMERIC_STR_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _as_number(v):
+    if isinstance(v, str):
+        s = v.strip()
+        if _NUMERIC_STR_RE.match(s):
+            return float(s) if "." in s else int(s)
+    return v
+
+
+def _coerce_number_strings(data: dict) -> dict:
+    """In-place repair of the two numeric fields the deck schema declares ``number``:
+    ``quantities[*].value`` and ``payload.series[*].points[*].y``."""
+    if not isinstance(data, dict):
+        return data
+    qs = data.get("quantities")
+    if isinstance(qs, list):
+        for q in qs:
+            if isinstance(q, dict) and "value" in q:
+                q["value"] = _as_number(q["value"])
+    payload = data.get("payload")
+    series = payload.get("series") if isinstance(payload, dict) else None
+    if isinstance(series, list):
+        for s in series:
+            pts = s.get("points") if isinstance(s, dict) else None
+            if isinstance(pts, list):
+                for p in pts:
+                    if isinstance(p, dict) and "y" in p:
+                        p["y"] = _as_number(p["y"])
+    return data
+
+
 def _condense_errors(errors: list[str]) -> list[str]:
     out = []
     for e in errors:
@@ -114,6 +151,10 @@ def _condense_errors(errors: list[str]) -> list[str]:
         elif re.match(r"^payload->series(?:->\d+)?->points: \[.*\] is too short$", e, re.DOTALL):
             out.append("each series needs 2..8 points — merge the single values into one "
                        "series across entities (x = entity name); never emit 1-point series.")
+        elif "is not of type 'number'" in e:
+            out.append(e + " — emit a bare JSON number with no quotes (13.7, not \"13.7\"); "
+                       "if the source gives a range or approximation, record one quantity "
+                       "per endpoint or omit it — never force a number.")
         elif len(e) > 240:
             out.append(e[:240] + "… (truncated)")
         else:
@@ -147,6 +188,7 @@ async def _structured(llm, *, prompt: str, system: str, schema: dict,
             logger.info("%s pass attempt %d timed out", label, attempt + 1)
             current = P.corrective_retry_prompt(errors, prompt)
             continue
+        data = _coerce_number_strings(data)
         errors = validate(schema, data)
         loaded = None
         if not errors and extra_check is not None:
