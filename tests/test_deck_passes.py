@@ -591,3 +591,15 @@ class TestNumberStringCoercion:
         from apps.api.tools.toolkit.deck.passes import _condense_errors
         out = _condense_errors(["quantities->1->value: '13.7' is not of type 'number'"])
         assert "bare JSON number" in out[0] and "never force a number" in out[0]
+
+
+def test_payload_array_cap_guidance_names_the_number():
+    """jsonschema says only 'too long'; the corrective message must carry the actual cap,
+    and the cap table must not drift from the schema."""
+    from apps.api.tools.toolkit.deck import prompts as P
+    from apps.api.tools.toolkit.deck.passes import _PAYLOAD_ARRAY_CAPS, _condense_errors
+    props = P.SLIDE_SCHEMA["properties"]["payload"]["properties"]
+    for path, cap in _PAYLOAD_ARRAY_CAPS.items():
+        assert props[path.split("->")[1]]["maxItems"] == cap
+    out = _condense_errors(["payload->items: [1,2,3] is too long"])
+    assert "HARD maximum 6" in out[0]

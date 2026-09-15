@@ -94,6 +94,9 @@ def _bc_directives(options: DeckOptions) -> str:
 # Replace it with a short, actionable instruction; cap anything else that is huge.
 _TOO_LONG_RE = re.compile(r"^(?P<path>[^:]+): \[.*\] is too long$", re.S)
 
+# Schema maxItems for the Pass C payload arrays (keep in sync with prompts.SLIDE_SCHEMA).
+_PAYLOAD_ARRAY_CAPS = {"payload->items": 6, "payload->steps": 8, "payload->columns": 4}
+
 
 # With thinking off the model frequently quotes plain numbers in JSON ("13.7"). That is a
 # wire-format slip, not a semantic change, so repair it deterministically before schema
@@ -137,15 +140,22 @@ def _condense_errors(errors: list[str]) -> list[str]:
     for e in errors:
         m = _TOO_LONG_RE.match(e)
         if m:
-            if m.group("path") == "payload->series":
+            path = m.group("path")
+            if path == "payload->series":
                 # The generic "drop items" advice is WRONG guidance here: the usual shape
                 # is N single-value entities emitted as N one-point series, and dropping
                 # series loses facts. The fix is merging into one series, not trimming.
                 out.append("payload->series: too many series — comparing N entities on "
                            "ONE metric belongs in ONE series with one point per entity "
                            "(x = entity name); keep at most 2 series (one per metric).")
+            elif path in _PAYLOAD_ARRAY_CAPS:
+                # jsonschema never prints the limit; "array is too long" alone leaves the
+                # model guessing how many to cut, and it overshoots again every retry.
+                cap = _PAYLOAD_ARRAY_CAPS[path]
+                out.append(f"{path}: more than {cap} entries — merge related ones and "
+                           f"keep the {cap} most decision-relevant (HARD maximum {cap}).")
             else:
-                out.append(f"{m.group('path')}: array is too long — keep ONLY the most "
+                out.append(f"{path}: array is too long — keep ONLY the most "
                            "decision-relevant items; drop the least important ones until "
                            "the array fits within the allowed maximum.")
         elif re.match(r"^payload->series(?:->\d+)?->points: \[.*\] is too short$", e, re.DOTALL):

@@ -290,9 +290,9 @@ OUTLINE_SYSTEM = (
 
 _SLIDE_PAYLOAD_DOC = (
     "payload carries AT MOST ONE shape, matching the slide's relationship: items "
-    "[{label, detail, group?}] (categorical/hierarchical — set group for tiers), "
-    "steps [{label, detail, when}] (sequential; when only for timelines), "
-    "columns [{header, cells}] (comparative — equal cell counts), "
+    "[{label, detail, group?}] max 6 (categorical/hierarchical — set group for tiers), "
+    "steps [{label, detail, when}] 3..8 (sequential; when only for timelines), "
+    "columns [{header, cells}] 2..4 (comparative — equal cell counts), "
     "series [{name, points:[{x, y, quant_ref}]}] (quantitative — at most 2 series, each "
     "with 2..8 points; comparing N entities on ONE metric is ONE series with N points, "
     "x = entity name; a 1-point series is REJECTED). A singular_takeaway "
