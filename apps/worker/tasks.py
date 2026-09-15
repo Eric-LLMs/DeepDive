@@ -46,6 +46,7 @@ from core.infrastructure.ingest import (
 from core.infrastructure.jobs import SESSION_FINALIZE, JobStore, TaskQueue
 from core.infrastructure.memory import (
     SessionMemoryStore,
+    assemble_recovery_history,
     finalize_session,
     load_session_detail,
 )
@@ -1100,7 +1101,15 @@ async def run_agent_turn(ctx, job_id: str, payload: dict) -> dict:
             session_memory = SessionMemoryStore(
                 ctx["session_factory"], ctx["embedder"], ctx["llm"], session_id, user_id
             )
-            history = await session_memory.load_messages()
+            # Client-less recovery mode (session-memory v2): bounded load after the
+            # checkpoint watermark + compaction when the threshold is crossed — the
+            # worker previously loaded the full table and NEVER compacted (unbounded
+            # prompt growth). No client Live State exists here, so SQL is the source.
+            history, _compaction, _deferred, compaction_audit = await assemble_recovery_history(
+                ctx["session_factory"], session_id, ctx["llm"], message
+            )
+            if compaction_audit:
+                session_memory.record_event("compaction", compaction_audit)
             result = await get_agent_kernel().run(
                 message,
                 history,

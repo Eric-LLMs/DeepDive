@@ -49,9 +49,12 @@ from core.infrastructure.jobs import (
 )
 from core.infrastructure.memory import (
     SessionMemoryStore,
-    compact_history,
+    apply_compaction,
+    assemble_recovery_history,
     create_session,
+    needs_compaction,
     set_session_type,
+    summary_block,
 )
 from core.infrastructure.request_context import (
     set_request_llm_channel,
@@ -423,6 +426,83 @@ async def chat_imported_status(
     }
 
 
+def _last_written_id(rows: list[dict], role: str) -> str | None:
+    """Id of the LAST written row with ``role`` (this turn's message), or None."""
+    for r in reversed(rows):
+        if r["role"] == role:
+            return r["message_id"]
+    return None
+
+
+def _turn_tail(items) -> list[dict]:
+    """Schema tail entries → the internal tail shape ``{message_id, role, content}``."""
+    return [
+        {
+            "message_id": str(t.message_id) if t.message_id else None,
+            "role": t.role,
+            "content": t.content,
+        }
+        for t in items
+    ]
+
+
+async def _assemble_turn_history(
+    body: ChatRequest,
+    session_memory: SessionMemoryStore,
+    session_id,
+    user_text: str,
+    *,
+    model: str | None,
+    base_url: str | None,
+    api_key: str | None,
+) -> tuple[list[dict], dict | None, str | None]:
+    """Build the turn's history under session-memory v2. Returns
+    ``(history, compaction_payload, compaction_deferred)``.
+
+    - **v2 client** (``context_state`` present): ZERO SQL reads on a normal turn —
+      history = client summary + client tail, assembled in memory. Only when the
+      threshold is crossed does ``apply_compaction`` read SQL (behind its dual
+      persistence barrier). A deferred compaction changes nothing: the full (over
+      budget) tail is used as-is for this turn and the next turn retries.
+    - **Legacy client** (no ``context_state``): client-less recovery mode — bounded
+      SQL load after the checkpoint watermark + the same compaction path
+      (:func:`assemble_recovery_history`); correct but not zero-read, kept so P1
+      ships without a client update. §8.3: a v2 request whose watermark implies
+      history but whose tail is empty is a 422 at schema level — the v2 path has no
+      silent SQL fallback.
+    """
+    if body.context_state is None:
+        history, compaction, deferred, audit = await assemble_recovery_history(
+            SessionLocal, session_id, llm, user_text,
+            model=model, base_url=base_url, api_key=api_key,
+        )
+        if audit:
+            session_memory.record_event("compaction", audit)
+        return history, compaction, deferred
+
+    summary = body.context_state.summary
+    tail = _turn_tail(body.tail)
+    history = summary_block(summary) + [
+        {"role": m["role"], "content": m["content"]} for m in tail
+    ]
+    if not needs_compaction(summary=summary, tail=tail, new_message=user_text):
+        return history, None, None
+    outcome = await apply_compaction(
+        session_factory=SessionLocal,
+        session_id=session_id,
+        llm=llm,
+        tail=tail,
+        has_pending_mutations=body.context_state.has_pending_mutations,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    if outcome.status == "compacted":
+        session_memory.record_event("compaction", outcome.audit or {})
+        return outcome.context, outcome.compaction, None
+    return history, None, outcome.deferred_reason
+
+
 @router.post("/chat")
 async def chat(
     body: ChatRequest,
@@ -543,16 +623,9 @@ async def chat(
         SessionLocal, _embedder(), llm, session_id, user_id,
         attach_asset_id=owned_asset_id,
     )
-    history = body.history or await session_memory.load_messages()
-    history = await compact_history(
-        history,
-        session_factory=SessionLocal,
-        session_id=session_id,
-        session_memory=session_memory,
-        llm=llm,
-        model=model,
-        base_url=base_url or None,
-        api_key=api_key or None,
+    history, compaction_payload, compaction_deferred = await _assemble_turn_history(
+        body, session_memory, session_id, user_text,
+        model=model, base_url=base_url or None, api_key=api_key or None,
     )
     research_continuing = False
     try:
@@ -600,23 +673,14 @@ async def chat(
             log_user, business_name, "chat", result.usage,
             credential_id=credential_id, paid=(tier == "paid"),
         )
-    # Resolve this turn's user-message / assistant-answer ids so the client can delete a
-    # single message. Scan ascending for the last row matching each text (texts may repeat,
-    # but this turn's rows are always the newest).
-    user_message_id = assistant_message_id = None
-    async with SessionLocal() as session:
-        rows = (
-            await session.execute(
-                select(MessageModel.id, MessageModel.role, MessageModel.text)
-                .where(MessageModel.session_id == session_id)
-                .order_by(MessageModel.created_at)
-            )
-        ).all()
-        for m_id, role, text in rows:
-            if role == "user" and text == user_text:
-                user_message_id = str(m_id)
-            elif role == "assistant" and text == result.final_answer:
-                assistant_message_id = str(m_id)
+    # This turn's user/assistant message ids come from the write queue's RETURNING rows
+    # (drained here; run()'s close() already flushed them into the buffer) — the old
+    # full-table text scan is gone. On persistence failure the ids are simply null and
+    # ``persist_failed`` tells the client its Live State still owns the transcript.
+    await session_memory.flush_writes()
+    written = session_memory.take_written()
+    user_message_id = _last_written_id(written, "user")
+    assistant_message_id = _last_written_id(written, "assistant")
     # Mirror this turn into the bound task's session_history.json (best-effort; the DB
     # SessionModel is the authority — a write failure only logs, it never fails the turn).
     if research_service is not None and bound_task_id is not None:
@@ -637,6 +701,12 @@ async def chat(
         "user_message_id": user_message_id,
         "assistant_message_id": assistant_message_id,
     }
+    if compaction_payload:
+        resp["compaction"] = compaction_payload
+    if compaction_deferred:
+        resp["compaction_deferred"] = compaction_deferred
+    if session_memory.persist_failed:
+        resp["persist_failed"] = True
     if guest_token:
         resp["guest_token"] = guest_token
     if research_continuing:
@@ -773,16 +843,9 @@ async def chat_stream(
         SessionLocal, _embedder(), llm, session_id, user_id,
         attach_asset_id=owned_asset_id,
     )
-    history = body.history or await session_memory.load_messages()
-    history = await compact_history(
-        history,
-        session_factory=SessionLocal,
-        session_id=session_id,
-        session_memory=session_memory,
-        llm=llm,
-        model=model,
-        base_url=base_url or None,
-        api_key=api_key or None,
+    history, compaction_payload, compaction_deferred = await _assemble_turn_history(
+        body, session_memory, session_id, user_text,
+        model=model, base_url=base_url or None, api_key=api_key or None,
     )
 
     async def gen():
@@ -867,23 +930,13 @@ async def chat_stream(
                     final_payload["usage"] if final_payload else None,
                     credential_id=credential_id, paid=(tier == "paid"),
                 )
-            # Resolve this turn's user/assistant message ids (same scan as /chat: ascending,
-            # last row matching each text) so the client can delete a single message.
+            # Resolve this turn's message ids from the write queue's RETURNING rows
+            # (same mechanism as /chat — the full-table text scan is gone).
             answer = (final_payload or {}).get("answer", "")
-            user_message_id = assistant_message_id = None
-            async with SessionLocal() as session:
-                rows = (
-                    await session.execute(
-                        select(MessageModel.id, MessageModel.role, MessageModel.text)
-                        .where(MessageModel.session_id == session_id)
-                        .order_by(MessageModel.created_at)
-                    )
-                ).all()
-                for m_id, role, text in rows:
-                    if role == "user" and text == user_text:
-                        user_message_id = str(m_id)
-                    elif role == "assistant" and answer and text == answer:
-                        assistant_message_id = str(m_id)
+            await session_memory.flush_writes()
+            written = session_memory.take_written()
+            user_message_id = _last_written_id(written, "user")
+            assistant_message_id = _last_written_id(written, "assistant")
             if research_service is not None and bound_task_id is not None:
                 try:
                     await research_service.append_session_turn(user_id, session_id, "user", body.message)
@@ -898,6 +951,12 @@ async def chat_stream(
                 "user_message_id": user_message_id,
                 "assistant_message_id": assistant_message_id,
             }
+            if compaction_payload:
+                done["compaction"] = compaction_payload
+            if compaction_deferred:
+                done["compaction_deferred"] = compaction_deferred
+            if session_memory.persist_failed:
+                done["persist_failed"] = True
             if guest_token:
                 done["guest_token"] = guest_token
             if research_notice:

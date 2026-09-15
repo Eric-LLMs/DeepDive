@@ -10,10 +10,10 @@ from agent.security.approvals import get_approval_bridge
 from agent.tools.checkpoints import CheckpointError
 from api.auth import AuthUser, require_user
 from api.deps import get_agent, get_drive_service
-from api.schemas import ApprovalResolveRequest, SessionRenameRequest
+from api.schemas import ApprovalResolveRequest, ReconcileRequest, SessionRenameRequest
 from core.application.drive_service import DriveError, DriveService
 from core.infrastructure.db import ChunkModel, MessageModel, SessionLocal, SessionModel
-from core.infrastructure.memory import list_sessions, load_session_detail
+from core.infrastructure.memory import list_sessions, load_session_detail, reconcile_messages
 from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import select, update
 
@@ -110,7 +110,15 @@ async def get_session_messages(session_id: UUID, user: AuthUser = Depends(requir
     # Recover pre-flag imported state onto the message rows so the response below carries it.
     await _backfill_imported_rag(SessionLocal, user.user_id, session_id)
     detail = await load_session_detail(SessionLocal, session_id)
-    return {"session_id": str(session_id), "title": detail["title"], "messages": detail["messages"]}
+    # ``compaction`` is the durable checkpoint inlined for Live-State RECOVERY: a client
+    # that lost its in-memory state rebuilds [summary]+[tail] from here, then returns to
+    # zero-read turns. Recovery is its only purpose — normal chat never reads it.
+    return {
+        "session_id": str(session_id),
+        "title": detail["title"],
+        "compaction": detail["compaction"],
+        "messages": detail["messages"],
+    }
 
 
 @router.patch("/sessions/{session_id}")
@@ -211,6 +219,39 @@ async def delete_session_message(
         except DriveError:
             pass
     return Response(status_code=204)
+
+
+@router.post("/sessions/{session_id}/reconcile")
+async def reconcile_session(
+    session_id: UUID,
+    body: ReconcileRequest,
+    user: AuthUser = Depends(require_user),
+):
+    """Align SQL to the client's authoritative Live State (RECONNECT/RECOVERY ONLY).
+
+    Compensation for failed async Edit/Delete syncs and writes that never landed while
+    the client was offline — not part of any normal turn. Rows after the checkpoint
+    boundary (INCLUSIVE watermark) are diffed against the uploaded tail: client-missing
+    → delete; SQL-missing (incl. foreign/forged ids — rejected as ids, inserted under
+    fresh ones) → insert; text mismatch → client's text wins, ``embedding`` cleared for
+    re-embed. Message-id ownership is enforced here (this path reads SQL anyway).
+    """
+    async with SessionLocal() as session:
+        sess = (
+            await session.execute(select(SessionModel).where(SessionModel.id == session_id))
+        ).scalar_one_or_none()
+        if sess is None or sess.user_id != user.user_id:
+            raise HTTPException(status_code=404, detail="session not found")
+    tail = [
+        {
+            "message_id": str(t.message_id) if t.message_id else None,
+            "role": t.role,
+            "content": t.content,
+        }
+        for t in body.tail
+    ]
+    counts = await reconcile_messages(SessionLocal, user.user_id, session_id, tail)
+    return {"ok": True, **counts}
 
 
 @router.post("/approvals/{approval_id}")

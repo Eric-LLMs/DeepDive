@@ -60,18 +60,25 @@ def _mem(store):
     )
 
 
-async def test_append_message_writes_text_only():
-    store = _Store()
-    mem = _mem(store)
+async def test_append_message_enqueues_then_batch_inserts_on_flush():
+    """Hot path = enqueue only (no SQL); flush = ONE batch INSERT, text rows, no embedding."""
+    from core.infrastructure.memory import _get_write_queue
 
+    from tests._memory_v2_fakes import Db, factory
+
+    sid = uuid.uuid4()
+    db = Db(insert_n=1, insert_roles=["user"])
+    mem = SessionMemoryStore(
+        factory(db), embedder=None, llm=None, session_id=sid, user_id=uuid.uuid4()
+    )
     await mem.append_message("user", "hello world")
+    assert db.inserts == []                      # nothing hit SQL during the turn
+    assert _get_write_queue(sid).pending
 
-    assert len(store.added) == 1
-    msg = store.added[0]
-    assert isinstance(msg, MessageModel)
-    assert msg.role == "user"
-    assert msg.text == "hello world"
-    assert msg.embedding is None  # embedding is backfilled by session_finalize, not here
+    rows = await mem.flush_writes()
+    assert db.inserts == [1]                     # one batched INSERT (RETURNING ids)
+    assert [r["role"] for r in rows] == ["user"]
+    assert mem.take_written() == rows
 
 
 async def test_close_flushes_events_and_clears():
@@ -139,7 +146,7 @@ class _DetailSession:
 
 async def test_load_session_detail_carries_imported_rag_flag():
     mid1, mid2 = uuid.uuid4(), uuid.uuid4()
-    sess = SimpleNamespace(title="Chat", imported_rag=None)  # title read only
+    sess = SimpleNamespace(title="Chat", imported_rag=None, compaction={"revision": 1})
     # (message, asset) rows: the join resolves the attachment asset; messages without an
     # attach_asset_id come back with a NULL asset.
     msgs = [
@@ -165,6 +172,8 @@ async def test_load_session_detail_carries_imported_rag_flag():
     assert detail["messages"][0]["id"] == str(mid1)
 
     assert detail["messages"][0]["attach"] is None  # no attachment on these messages
+    # checkpoint is inlined for Live-State recovery (client rebuilds [summary]+[tail]).
+    assert detail["compaction"] == {"revision": 1}
 
 
 # ── gate ``system`` note path ─────────────────────────────────────────────────
@@ -248,7 +257,7 @@ def _msg(role, text):
 async def test_finalize_excludes_system_and_tool_from_embed_and_summary(monkeypatch):
     """Only user/assistant rows enter the embedding corpus and the summary transcript."""
     monkeypatch.setattr(settings, "session_summary_enabled", True)
-    sess = SimpleNamespace(title="Existing", summary=None, closed_at=None)
+    sess = SimpleNamespace(title="Existing", summary=None, closed_at=None, compaction=None)
     # Order matches created_at: a real conversation with a gate ``system`` note + a tool row.
     msgs = [
         _msg("user", "user Q"),

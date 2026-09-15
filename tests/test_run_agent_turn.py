@@ -14,13 +14,20 @@ from apps.worker import tasks
 class _FakeSessionMemory:
     def __init__(self, *args):
         self.args = args
-        self.history = [{"role": "user", "content": "prior turn"}]
+        self.events = []
 
-    async def load_messages(self):
-        return self.history
+    def record_event(self, type_, payload):
+        self.events.append((type_, payload))
 
     async def close(self):
         pass
+
+
+async def _fake_assemble(session_factory, session_id, llm, new_message, **kw):
+    """Client-less recovery stub: the real path (SQL + fold) is exercised by
+    tests/test_chat_memory_v2.py; these tests care about kernel composition + finalize
+    deferral + channel-ignoring, so they pin the loaded history here."""
+    return [{"role": "user", "content": "prior turn"}], None, None, None
 
 
 class _FakeKernel:
@@ -82,6 +89,7 @@ async def test_run_agent_turn_runs_kernel_and_defers_finalize(monkeypatch):
     kernel = _FakeKernel()
     monkeypatch.setattr(tasks, "get_agent_kernel", lambda: kernel)
     monkeypatch.setattr(tasks, "SessionMemoryStore", _FakeSessionMemory)
+    monkeypatch.setattr(tasks, "assemble_recovery_history", _fake_assemble)
     ctx = _ctx()
 
     result = await tasks.run_agent_turn(
@@ -132,6 +140,7 @@ async def test_run_agent_turn_ignores_payload_channel_fields(monkeypatch):
     kernel = _FakeKernel()
     monkeypatch.setattr(tasks, "get_agent_kernel", lambda: kernel)
     monkeypatch.setattr(tasks, "SessionMemoryStore", _FakeSessionMemory)
+    monkeypatch.setattr(tasks, "assemble_recovery_history", _fake_assemble)
     ctx = _ctx()
 
     await tasks.run_agent_turn(

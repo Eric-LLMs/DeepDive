@@ -3,7 +3,8 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel
+from core.config import settings
+from pydantic import BaseModel, model_validator
 
 
 class DomainCreate(BaseModel):
@@ -106,9 +107,42 @@ class ExplainRequest(BaseModel):
     context: str
 
 
+class ChatTurnMessage(BaseModel):
+    """One client-held tail entry (session-memory v2).
+
+    ``message_id`` is the id the server handed back when the row was persisted
+    (done frame / detail / reconcile). On NORMAL turns it is an OPAQUE label — the
+    client already controls what text its own context contains, session ownership is
+    pinned by auth, and id authenticity is checked on the compaction/reconcile
+    paths where SQL is read anyway. ``null`` = a local-only row never persisted.
+    """
+
+    message_id: UUID | None = None
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatContextState(BaseModel):
+    """The client's Live State watermark (session-memory v2).
+
+    ``summary`` is the structured compaction summary the client holds; it covers
+    every model-facing message from the session head through ``through_message_id``
+    INCLUSIVE. Presence of this object marks a v2 client: the server then assembles
+    the prompt ZERO-READ from ``summary + tail + message`` and never loads history
+    from SQL (§8.3: with context_state present an invalid empty tail is a 422,
+    never a silent SQL fallback). ``has_pending_mutations`` = the client still has
+    unsent Edit/Delete backlog — compaction is deferred while it is true.
+    """
+
+    summary: str | None = None
+    through_message_id: UUID | None = None
+    has_pending_mutations: bool = False
+
+
 class ChatRequest(BaseModel):
     message: str
-    history: list[dict] = []
+    context_state: ChatContextState | None = None  # None = legacy client → recovery-mode
+    tail: list[ChatTurnMessage] = []               #   bounded SQL load (kept compatible)
     user_id: UUID | None = None      # deprecated: ignored for anonymous requests — the
     guest_token: str | None = None   #   server resolves a guest's identity from the signed
                                      #   gt_ token (api.auth.sign_guest_token), never from a
@@ -123,6 +157,32 @@ class ChatRequest(BaseModel):
                                      #   mode: "research_resume" }). Formatted into a
                                      #   structured instruction prefix AND sunk into the
                                      #   turn context so tools read it at runtime.
+
+    @model_validator(mode="after")
+    def _guard_v2_payload(self) -> "ChatRequest":
+        if self.context_state is None:
+            return self  # legacy client: the router loads SQL in recovery mode
+        # §8.3: a v2 client with a real watermark may NOT send an empty tail —
+        # that would silently drop the conversation. Only a fresh session
+        # (no summary, no watermark) legitimately rides an empty tail.
+        if not self.tail and (self.context_state.summary or self.context_state.through_message_id):
+            raise ValueError(
+                "context_state carries a summary/watermark but tail is empty; "
+                "reload the session via GET /sessions/{id} (recovery) instead"
+            )
+        if len(self.tail) > 2 * settings.history_max_messages:
+            raise ValueError("tail exceeds the per-request message cap")
+        cap = settings.prompt_max_chars
+        if cap and sum(len(t.content) for t in self.tail) > cap:
+            raise ValueError("tail exceeds the per-request character budget")
+        return self
+
+
+class ReconcileRequest(BaseModel):
+    """Reconnect/recovery alignment: the client Live State is authoritative."""
+
+    context_state: ChatContextState
+    tail: list[ChatTurnMessage] = []
 
 
 class ApprovalResolveRequest(BaseModel):

@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     # (raw-grounded call per line-tracked batch + deterministic merge; the old map-reduce
     # digest pre-pass that fed a summary as sole input is removed for good).
     # 100K ≈ current channel's 128K window minus generation headroom;
-    # ``compact_history`` on the chat path is a separate mechanism and unaffected.
+    # chat-history compaction (``apply_compaction``) is a separate mechanism and unaffected.
     # ``toolkit_llm_timeout_s`` bounds each toolkit generation call (a full-context
     # Pass A / one-shot summary needs far more than the global 90s wall time).
     toolkit_output_dir: Path = Path(".output")
@@ -186,6 +186,11 @@ class Settings(BaseSettings):
     history_keep_messages: int = 20            # most-recent messages kept after compaction
     prompt_max_chars: int = 120_000            # total window char budget that triggers compaction (~30k tokens)
     prompt_message_max_chars: int = 8000       # per-message content cap when building the LLM request (snip)
+    # Char cap on the 5-section structured summary produced by one fold. The fold input is
+    # rebuilt from RAW messages every time (no summary-of-summary) — its token cost grows
+    # linearly with the fold range; this is the deliberate trade-off for zero generational
+    # memory decay, paid only at low-frequency compaction events (never in normal turns).
+    compaction_summary_max_chars: int = 2500
 
     # Project context (DEEPDIVE.md conventions injected into the prompt's PROJECT_CONTEXT zone).
     project_context_files: list[str] = ["DEEPDIVE.md"]

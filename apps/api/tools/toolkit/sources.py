@@ -16,7 +16,7 @@ compression trigger:
   deterministically (facts / bullets / branches). A document summary is never fed back as
   the sole input; the switch is announced in the job log — nothing is compressed silently.
 
-Chat-history compaction (``compact_history`` in the chat router) is a separate mechanism
+Chat-history compaction (``apply_compaction`` in the memory layer) is a separate mechanism
 for conversation context and shares no code with this module. RAG import
 (``core.infrastructure.ingest`` + asset_ingest) indexes its own vector chunks and never
 passes through here.

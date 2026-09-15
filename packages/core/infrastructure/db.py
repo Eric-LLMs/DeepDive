@@ -723,6 +723,14 @@ class SessionModel(Base):
     # 0 = ordinary chat, 1 = research task session: type 1 is hidden from the chat sidebar
     # and cascade-deleted with its task (migration 0017). Old rows default to 0.
     type: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # Durable compaction checkpoint (migration 0018):
+    # { revision, through_message_id, through_created_at, summary, summary_chars,
+    #   last_compaction_at, fold_count }. ``summary`` fully covers every model-facing
+    # message up to ``through_message_id`` (INCLUSIVE). Normal chat turns do not read
+    # this column — the client's live state carries the summary; the server reads it
+    # only for recovery / compaction / reconcile. See ``CompactionState`` in
+    # ``core.infrastructure.memory``.
+    compaction: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class MessageModel(Base):
