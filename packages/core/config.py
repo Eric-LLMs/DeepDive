@@ -80,6 +80,14 @@ class Settings(BaseSettings):
     toolkit_max_file_bytes: int = 20 * 1024 * 1024
     toolkit_llm_timeout_s: float = 300.0
 
+    # Batch generation (``complete``/``complete_json``) streams the response and
+    # accumulates it, so the provider's ~300s non-stream gateway cutoff can never kill a
+    # legitimate full-context generation; ``toolkit_llm_timeout_s`` becomes an
+    # idle-between-chunks deadline. ``llm_disable_thinking`` sends the Qwen-compatible
+    # ``enable_thinking: false`` flag on those calls — reasoning tokens are pure latency
+    # for schema-validated JSON output. Interactive chat (``chat_stream``) keeps thinking.
+    llm_disable_thinking: bool = True
+
     # Deck (content-to-slides) Pass C throughput knobs. Effective fan-out per deck =
     # min(configured, provider per-key cap, worker in-job cap, slide_count).
     deck_pass_c_concurrency: int = 8      # configured ceiling for parallel slide calls

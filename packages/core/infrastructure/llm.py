@@ -139,6 +139,32 @@ class OpenAILLM:
             {"role": "user", "content": prompt},
         ]
 
+    async def _stream_accumulate(
+        self, client: AsyncOpenAI, mdl: str, messages: list[dict],
+        response_format: dict | None = None,
+    ) -> str:
+        """One streamed completion, accumulated to the full text.
+
+        Batch generation never needs a whole-response wall time: providers such as
+        dashscope enforce a ~300s cutoff on NON-streaming requests, so a full-context
+        Pass A that legitimately needs 4-5 minutes dies at the gateway while the model
+        is still generating. Streaming moves the per-call timeout to an idle-between-
+        chunks deadline, and ``enable_thinking: false`` (Qwen-compatible flag,
+        ``llm_disable_thinking``) removes reasoning tokens — pure latency for
+        schema-validated JSON output. Interactive chat paths are untouched.
+        """
+        kwargs: dict = {"model": mdl, "messages": messages, "temperature": 0.3, "stream": True}
+        if response_format:
+            kwargs["response_format"] = response_format
+        if settings.llm_disable_thinking:
+            kwargs["extra_body"] = {"enable_thinking": False}
+        stream = await client.chat.completions.create(**kwargs)
+        parts: list[str] = []
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                parts.append(chunk.choices[0].delta.content)
+        return "".join(parts).strip()
+
     async def complete(
         self,
         prompt: str,
@@ -149,14 +175,11 @@ class OpenAILLM:
         timeout: float | None = None,
     ) -> str:
         # A per-call ``timeout`` (e.g. toolkit full-context generation) forces a fresh
-        # client; without it the shared client's global wall time applies.
+        # client; without it the shared client's global wall time applies. Under the
+        # streaming wire this bounds IDLE time between chunks, not total generation.
         client, mdl = self._call_channel(model, base_url, api_key, timeout=timeout)
-        resp = await client.chat.completions.create(
-            model=mdl,
-            messages=self._messages(prompt, system_prompt),
-            temperature=0.3,
-        )
-        return (resp.choices[0].message.content or "").strip()
+        return await self._stream_accumulate(
+            client, mdl, self._messages(prompt, system_prompt))
 
     async def complete_json(
         self,
@@ -173,19 +196,17 @@ class OpenAILLM:
         contain the word "json" for some providers to honour the mode. Returns the parsed
         JSON object. A provider that rejects JSON mode raises (the caller can fall back to
         ``complete`` + a tolerant JSON parse). A per-call ``timeout`` bounds long
-        full-context generations (toolkit) without touching the global default.
+        full-context generations (toolkit); under the streaming wire it is an idle-between-
+        chunks deadline, not a total-generation cutoff.
         """
         client, mdl = self._call_channel(model, base_url, api_key, timeout=timeout)
         try:
-            resp = await client.chat.completions.create(
-                model=mdl,
-                messages=self._messages(prompt, system_prompt),
+            content = await self._stream_accumulate(
+                client, mdl, self._messages(prompt, system_prompt),
                 response_format={"type": "json_object"},
-                temperature=0.3,
             )
         except Exception as exc:
             raise raise_classified(exc) from exc
-        content = resp.choices[0].message.content
         try:
             return json.loads(content)
         except (TypeError, json.JSONDecodeError) as exc:

@@ -29,7 +29,8 @@ Environment variables and their defaults. Model inference never runs inside the 
 | `DRIVE_MAX_FILE_SIZE` | `0` (unlimited) | per-file size limit for the cloud drive (bytes; `0` = no limit) |
 | `INGEST_CHUNK_CHARS` / `INGEST_CHUNK_OVERLAP` | `1200` / `150` | text chunking window / overlap used when a cloud-drive file is ingested for RAG |
 | `TOOLKIT_MAX_INPUT_TOKENS` / `TOOLKIT_MAX_FILE_BYTES` | `100000` / `20MB` | toolkit generation (mind map / slides / summary): one-shot **capacity check** of the complete raw input — at or below it the full text goes to the model in ONE call; above it the pipeline enters the explicit big-document multi-call flow (raw-grounded call per line-tracked batch + deterministic merge; never a silent digest) / per-file size cap — files over the cap are refused and greyed out in the picker |
-| `TOOLKIT_LLM_TIMEOUT_S` | `300` | per-call wall time for toolkit generation calls (a full-context Pass A / one-shot summary exceeds the global `LLM_TIMEOUT_SECONDS=90`) |
+| `TOOLKIT_LLM_TIMEOUT_S` | `300` | per-call deadline for toolkit generation calls; since 2026-09-15 these calls stream and accumulate, so it bounds IDLE time between chunks, not total generation time (the provider's ~300s non-stream gateway cutoff no longer kills a legitimate full-context Pass A) |
+| `LLM_DISABLE_THINKING` | `true` | batch generation (`complete`/`complete_json`) sends the Qwen-compatible `enable_thinking: false` flag — reasoning tokens are pure latency for schema-validated JSON output; interactive chat (`chat_stream`) always keeps thinking |
 | `EMBED_BATCH_SIZE` | `16` | embedding batch size for indexing cloud-drive files into pgvector |
 
 See [docs/architecture.md](architecture.md) for the full topology.
