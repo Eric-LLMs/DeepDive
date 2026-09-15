@@ -336,6 +336,7 @@ async def test_publish_opt_out_skips_pdf_entirely(env, monkeypatch):
     assert out.ledger == []
 
 
+@requires_typst
 async def test_publish_pdf_failure_still_publishes_with_visible_reason(
     env, monkeypatch,
 ):
