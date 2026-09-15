@@ -95,7 +95,12 @@ def plan_big_document(sources: list[WorkspaceSource]) -> list[list[WorkspaceSour
 
 
 def _units_within_capacity(src: WorkspaceSource, limit: int):
-    """Yield ``src`` itself when it fits, else its line-aligned raw chunks (never digests)."""
+    """Yield ``src`` itself when it fits, else its line-aligned raw chunks (never digests).
+
+    A single line longer than the whole budget (typical of some PDF extractions) is
+    hard-split by characters at an estimated token boundary — the chunk keeps the line's
+    original offset, so every citation in it still names the correct source line.
+    """
     if token_count(src.text) <= limit:
         yield src
         return
@@ -104,6 +109,18 @@ def _units_within_capacity(src: WorkspaceSource, limit: int):
     offset = src.line_offset
     for ln in src.text.splitlines(keepends=True):
         t = token_count(ln)
+        if t > limit:  # one oversized line: flush, then hard-split it
+            if cur:
+                piece = "".join(cur)
+                yield _chunk(src, piece, offset)
+                offset += piece.count("\n")
+                cur, cur_tokens = [], 0
+            chars_per = max(1, len(ln) // t)  # this line's own chars-per-token estimate
+            step = max(1, int(limit * 0.9) * chars_per)
+            for i in range(0, len(ln), step):
+                yield _chunk(src, ln[i : i + step], offset)
+            offset += 1 if ln.endswith("\n") else 0
+            continue
         if cur and cur_tokens + t > limit:
             piece = "".join(cur)
             yield _chunk(src, piece, offset)

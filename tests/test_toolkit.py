@@ -196,6 +196,20 @@ def test_plan_big_document_splits_raw_preserving_text_and_offsets(monkeypatch):
     assert all(s.name == "doc.md" for b in batches for s in b)  # original names kept
 
 
+def test_plan_big_document_hard_splits_single_oversized_line(monkeypatch):
+    # PDF-extracted text can be ONE line with no newlines — line-granular splitting must
+    # degrade to a char-level hard split, and every sub-chunk keeps the line's offset.
+    monkeypatch.setattr(sources, "token_count", lambda t: max(1, len(t) // 4))
+    monkeypatch.setattr(sources.settings, "toolkit_max_input_tokens", 40)
+    line = "z" * 400  # 100 tokens on one line
+    batches = sources.plan_big_document([_src(line)])
+    assert batches and len(batches) >= 3
+    assert "".join(s.text for b in batches for s in b) == line  # raw, complete
+    for b in batches:
+        assert b[0].line_offset == 1  # all of one original line
+        assert sources.total_input_tokens(b) <= 40
+
+
 def test_plan_big_document_batches_guardrail(monkeypatch):
     monkeypatch.setattr(sources, "token_count", lambda t: max(1, len(t) // 4))
     monkeypatch.setattr(sources.settings, "toolkit_max_input_tokens", 8)
