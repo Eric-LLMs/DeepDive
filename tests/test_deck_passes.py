@@ -563,29 +563,64 @@ def _dt_slides():
 
 
 class TestNumberStringCoercion:
-    """2026-09-15: with thinking off the model quotes plain numbers ("13.7"). Clean
-    numeric strings are repaired deterministically; ranges/multipliers stay errors."""
+    """2026-09-15: with thinking off the model quotes plain numbers ("13.7") and decorates
+    approximations ("10x", "170+", "<90") — and repeats the slip on every corrective retry.
+    Plain and operator-decorated numbers are repaired deterministically; ranges are dropped
+    as quantities, never forced into a single number."""
 
-    def test_quoted_plain_numbers_coerced_ranges_and_multipliers_untouched(self):
-        from apps.api.tools.toolkit.deck.passes import _coerce_number_strings
+    def test_quoted_plain_numbers_coerced_range_dropped_never_forced(self):
+        from apps.api.tools.toolkit.deck.passes import _repair_wire_slips
         data = {
             "quantities": [
                 {"quant_id": "q1", "value": "13.7", "unit": "%"},
                 {"quant_id": "q2", "value": " 84 "},
-                {"quant_id": "q3", "value": "10x"},
-                {"quant_id": "q4", "value": "15-35"},
+                {"quant_id": "q3", "value": "15-35"},
             ],
             "payload": {"series": [{"name": "s", "points": [
                 {"x": "a", "y": "76.4", "quant_ref": "q1"},
-                {"x": "b", "y": 10.0, "quant_ref": "q2"},
+                {"x": "b", "y": 10.0, "quant_ref": None},
             ]}]},
         }
-        out = _coerce_number_strings(data)
+        out = _repair_wire_slips(data)
         vals = [q["value"] for q in out["quantities"]]
-        assert vals[0] == 13.7 and vals[1] == 84
-        assert vals[2] == "10x" and vals[3] == "15-35"  # never force a number
+        assert vals == [13.7, 84]                     # range q dropped, not faked
         pts = out["payload"]["series"][0]["points"]
         assert pts[0]["y"] == 76.4 and pts[1]["y"] == 10.0
+        assert "quant_ref" not in pts[1]              # null → absent → clear required error
+
+    def test_decorated_numbers_move_the_operator_into_unit(self):
+        from apps.api.tools.toolkit.deck.passes import _repair_wire_slips
+        out = _repair_wire_slips({"quantities": [
+            {"quant_id": "q1", "value": "10x"},
+            {"quant_id": "q2", "value": "170+", "unit": "repos"},
+            {"quant_id": "q3", "value": "<90", "unit": ""},
+        ]})
+        assert out["quantities"][0]["value"] == 10
+        assert out["quantities"][0]["unit"] == "x"
+        assert out["quantities"][1]["value"] == 170 and out["quantities"][1]["unit"] == "+ repos"
+        assert out["quantities"][2]["value"] == 90 and out["quantities"][2]["unit"] == "<"
+
+    def test_provenance_typo_and_start_end_shape_repaired(self):
+        from apps.api.tools.toolkit.deck.passes import _repair_wire_slips
+        out = _repair_wire_slips({"facts": [
+            {"fact_id": "f1", "provisionance": [
+                {"source_id": "doc.md", "kind": "document", "start": 12, "end": 15}]},
+            {"fact_id": "f2", "provenance": [
+                {"source_id": "doc.md", "kind": "document", "start": 7, "end": 7, "lines": ""}]},
+        ]})
+        assert "provisionance" not in out["facts"][0]
+        p1 = out["facts"][0]["provenance"][0]
+        assert p1["lines"] == "12-15" and "start" not in p1 and "end" not in p1
+        assert out["facts"][1]["provenance"][0]["lines"] == "7"
+
+    def test_optional_string_nulls_stripped_from_payload_entries(self):
+        from apps.api.tools.toolkit.deck.passes import _repair_wire_slips
+        out = _repair_wire_slips({"payload": {
+            "steps": [{"label": "a", "detail": None, "when": None},
+                      {"label": "b", "detail": "d", "when": "2024"}],
+        }})
+        assert out["payload"]["steps"][0] == {"label": "a"}
+        assert out["payload"]["steps"][1] == {"label": "b", "detail": "d", "when": "2024"}
 
     def test_number_type_error_carries_actionable_guidance(self):
         from apps.api.tools.toolkit.deck.passes import _condense_errors

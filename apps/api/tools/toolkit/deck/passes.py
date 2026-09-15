@@ -98,40 +98,114 @@ _TOO_LONG_RE = re.compile(r"^(?P<path>[^:]+): \[.*\] is too long$", re.S)
 _PAYLOAD_ARRAY_CAPS = {"payload->items": 6, "payload->steps": 8, "payload->columns": 4}
 
 
-# With thinking off the model frequently quotes plain numbers in JSON ("13.7"). That is a
-# wire-format slip, not a semantic change, so repair it deterministically before schema
-# validation — ONLY clean numeric strings, never ranges or multipliers ("15-35", "10x"),
-# which stay errors so the model must resolve them honestly (omit or split), never coerce.
+# With thinking off the model emits recurring wire-level slips that corrective retries
+# do NOT fix (it re-produces the same slip every attempt): numbers quoted as strings,
+# qualifier decorations ("10x", "170+", "<90"), the typo "provisionance", provenance
+# written as {start,end} instead of the "lines" string, and nulls for optional strings.
+# None of these change meaning, so repair them deterministically before validation.
+# What we NEVER do: invent a number the source does not state — ranges ("15-35") are
+# dropped as quantities (the fact line still carries them), and a chart y with a
+# qualifier stays an error so the model must route it through quant_ref + unit.
 _NUMERIC_STR_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_NUM_SLIP_RE = re.compile(
+    r"^(?P<pre>[<>≤≥]=?)?\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<post>[x×+%+~≈]|左右)?$")
+_RANGE_RE = re.compile(r"^\d+(?:\.\d+)?\s*[-–—~]\s*\d+(?:\.\d+)?$")
+
+# optional string fields a slide payload declares; null is a slip, absent is valid
+_OPT_STR_FIELDS = ("detail", "group", "when")
 
 
-def _as_number(v):
+def _as_number(v, keep_slip=False):
+    """Plain numeric strings always convert. With ``keep_slip`` also convert decorated
+    numbers to (value, qualifier); returns the unchanged value when not parseable."""
     if isinstance(v, str):
-        s = v.strip()
+        s = v.strip().replace(",", "")
         if _NUMERIC_STR_RE.match(s):
             return float(s) if "." in s else int(s)
+        if keep_slip:
+            m = _NUM_SLIP_RE.match(s)
+            if m:
+                num = float(m.group("num")) if "." in m.group("num") else int(m.group("num"))
+                qual = (m.group("pre") or "") + (m.group("post") or "")
+                return num, qual
     return v
 
 
-def _coerce_number_strings(data: dict) -> dict:
-    """In-place repair of the two numeric fields the deck schema declares ``number``:
-    ``quantities[*].value`` and ``payload.series[*].points[*].y``."""
+def _repair_provenance(obj):
+    prov = obj.get("provenance")
+    if not isinstance(prov, list):
+        return
+    for p in prov:
+        if not isinstance(p, dict):
+            continue
+        start, end = p.pop("start", None), p.pop("end", None)
+        if not p.get("lines"):
+            if start is not None and end is not None and str(start) != str(end):
+                p["lines"] = f"{start}-{end}"
+            elif start is not None:
+                p["lines"] = str(start)
+
+
+def _repair_wire_slips(data: dict) -> dict:
+    """In-place deterministic repair of model wire slips; semantics are never altered."""
     if not isinstance(data, dict):
         return data
+    for key in ("facts", "quantities"):
+        lst = data.get(key)
+        if isinstance(lst, list):
+            for o in lst:
+                if not isinstance(o, dict):
+                    continue
+                if "provisionance" in o and "provenance" not in o:
+                    o["provenance"] = o.pop("provisionance")
+                _repair_provenance(o)
     qs = data.get("quantities")
     if isinstance(qs, list):
+        keep = []
         for q in qs:
-            if isinstance(q, dict) and "value" in q:
-                q["value"] = _as_number(q["value"])
+            v = q.get("value") if isinstance(q, dict) else None
+            parsed = _as_number(v, keep_slip=True) if isinstance(v, str) else v
+            if isinstance(parsed, tuple):        # "10x"/"170+"/"<90" → number + unit note
+                q["value"] = parsed[0]
+                if parsed[1]:
+                    q["unit"] = (parsed[1] + " " + str(q.get("unit") or "")).strip()
+                keep.append(q)
+            elif isinstance(parsed, (int, float)):
+                q["value"] = parsed
+                keep.append(q)
+            elif isinstance(v, str) and _RANGE_RE.match(v.strip()):
+                logger.info("deck repair: dropped range quantity %r ('%s') — a single "
+                            "chart number would misrepresent it; the fact still carries it",
+                            q.get("quant_id"), v)
+                continue
+            else:
+                keep.append(q)                  # untouched — validation reports it
+        data["quantities"] = keep
     payload = data.get("payload")
-    series = payload.get("series") if isinstance(payload, dict) else None
-    if isinstance(series, list):
-        for s in series:
-            pts = s.get("points") if isinstance(s, dict) else None
-            if isinstance(pts, list):
-                for p in pts:
-                    if isinstance(p, dict) and "y" in p:
-                        p["y"] = _as_number(p["y"])
+    if isinstance(payload, dict):
+        for arr in payload.values():
+            if not isinstance(arr, list):
+                continue
+            for entry in arr:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("quant_ref") is None:
+                    entry.pop("quant_ref", None)
+                for f in _OPT_STR_FIELDS:
+                    if entry.get(f) is None:
+                        entry.pop(f, None)
+                if entry.get("y") is not None:
+                    entry["y"] = _as_number(entry.get("y"))
+        series = payload.get("series")
+        if isinstance(series, list):
+            for s in series:
+                pts = s.get("points") if isinstance(s, dict) else None
+                if isinstance(pts, list):
+                    for p in pts:
+                        if isinstance(p, dict) and p.get("quant_ref") is None:
+                            p.pop("quant_ref", None)
+                        if isinstance(p, dict) and "y" in p:
+                            p["y"] = _as_number(p["y"])
     return data
 
 
@@ -198,7 +272,7 @@ async def _structured(llm, *, prompt: str, system: str, schema: dict,
             logger.info("%s pass attempt %d timed out", label, attempt + 1)
             current = P.corrective_retry_prompt(errors, prompt)
             continue
-        data = _coerce_number_strings(data)
+        data = _repair_wire_slips(data)
         errors = validate(schema, data)
         loaded = None
         if not errors and extra_check is not None:
