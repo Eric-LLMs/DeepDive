@@ -966,6 +966,11 @@
     if (!pane) return;
     syncRunFromDetail(detail);
     recordResearchSession(detail);
+    // The rebuild below detaches and re-appends the preview column; Chromium resets the
+    // scroll offset of any scroller that was detached, so capture every scrolled element
+    // inside it first and restore the offsets after re-attach. Without this, each live-
+    // monitor refresh throws a half-read document back to the top as if freshly opened.
+    const scrollMemo = capturePreviewScroll();
     pane.innerHTML = "";
 
     // Card header: title + status/stage badges + actions up top, working-directory meta as
@@ -1071,8 +1076,30 @@
     workbench.appendChild(top);
     workbench.appendChild(ensureActivity(detail.task_id));
     pane.appendChild(workbench);
+    restorePreviewScroll(scrollMemo);
     reconcilePreview(detail); // live-refresh the open file when the agent rewrote it
     syncRunCtl(); // reflect any run state on the freshly rendered Run / Delete controls
+  }
+
+  // Preview-column scroll preservation across renderMainDetail rebuilds. The column node
+  // itself is reused (ensurePreviewCol), but detach+reattach zeroes scrollTop on every
+  // scroller inside it — the markdown body (.rtv-preview-body) and, for mounted PDFs,
+  // the inner .pdf-container. Capture before the wipe, restore next frame after the
+  // re-attach (layout must settle before the offsets stick).
+  function capturePreviewScroll() {
+    const memo = [];
+    if (!previewColEl || !previewColEl.isConnected) return memo;
+    for (const n of [previewColEl, ...previewColEl.querySelectorAll("*")]) {
+      if (n.scrollTop > 0) memo.push([n, n.scrollTop]);
+    }
+    return memo;
+  }
+
+  function restorePreviewScroll(memo) {
+    if (!memo.length) return;
+    requestAnimationFrame(() => {
+      for (const [n, top] of memo) if (n.isConnected) n.scrollTop = top;
+    });
   }
 
   // The task folder as a standard VS Code / Explorer-style vertical tree — the left column of
