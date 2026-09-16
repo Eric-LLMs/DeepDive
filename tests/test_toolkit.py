@@ -385,7 +385,7 @@ async def test_summary_writes_md(tmp_path):
 async def test_slides_brief_engine_writes_all_artifacts(tmp_path):
     # slides now runs the grounded visual presentation engine: multimodal ingest (text
     # channel here — a Markdown source) → A/C/D brief workflow → PresentationBrief →
-    # canonical deck.pdf (via the render bridge) + deck.json (the brief) + compat exports
+    # canonical deck.pdf (via the Visual Compiler) + deck.json (the brief) + compat exports
     import json as _json
     import shutil as _shutil
 

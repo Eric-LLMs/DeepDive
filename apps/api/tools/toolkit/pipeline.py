@@ -251,6 +251,9 @@ class ToolKitPipeline:
                 "document_title": doc_rep.document_title,
                 "presentation_goal": controls.presentation_goal,
                 "source_names": [s.name for s in sources],
+                # the render stage re-embeds referenced slices by asset id (§9.3)
+                "visual_assets": [a.model_dump(mode="json")
+                                  for a in doc_rep.visual_assets],
             }
 
         system = SYSTEM_PROMPTS[self.tool]
@@ -315,30 +318,33 @@ class ToolKitPipeline:
     async def stage_render(self, data: dict) -> dict[str, object]:
         """Structured JSON → final display formats (never raw model-written markup).
 
-        Slides render from the canonical :class:`~.deck.schema.PresentationBrief`:
-        ``deck.json`` is the brief itself; the canonical ``deck.pdf`` and the compat
-        exports (Marp Markdown, .pptx inputs) are derived through the transient
-        deterministic bridge :mod:`.deck.bridge` until the M1 Visual Compiler
-        replaces it. The RenderReport gate stays loud — nothing silently degrades.
+        Slides render from the canonical :class:`~.deck.schema.PresentationBrief`
+        through the Visual Compiler (:mod:`.deck.compiler`): the brief + the sliced
+        assets re-emit ``deck.pdf`` with zero LLM calls (§1.2.6), and the compat
+        exports (Marp Markdown, .pptx inputs) derive from the same brief.
+        ``deck.json`` is the brief itself. The RenderReport gate stays loud —
+        nothing silently degrades; template fallbacks surface as ``layout_warnings``.
         """
         if self.tool == "slides":
             import json as _json
             import tempfile
             from pathlib import Path as _P
 
-            from .deck.bridge import brief_to_deckspec
-            from .deck.render import deck_to_marp, deck_to_pptx_slides, render_deck_pdf
-            from .deck.schema import PresentationBrief
+            from .deck.render import (
+                brief_to_marp,
+                brief_to_pptx_slides,
+                render_brief_pdf,
+            )
+            from .deck.schema import PresentationBrief, VisualAsset
 
             brief = PresentationBrief.model_validate(data["brief"])
-            deck = brief_to_deckspec(
-                brief,
-                document_title=data.get("document_title", ""),
-                source_names=list(data.get("source_names") or []),
-                presentation_goal=data.get("presentation_goal", ""),
-            )
+            assets = [VisualAsset.model_validate(a)
+                      for a in data.get("visual_assets") or []]
             with tempfile.TemporaryDirectory(prefix="deck_") as td:
-                res = await asyncio.to_thread(render_deck_pdf, deck, _P(td))
+                res = await asyncio.to_thread(
+                    render_brief_pdf, brief, assets, _P(td),
+                    document_title=data.get("document_title", ""),
+                    source_names=list(data.get("source_names") or []))
             if not res.report.ok:
                 raise GenerationError(
                     "deck PDF render failed: "
@@ -348,8 +354,9 @@ class ToolKitPipeline:
                 "deck.pdf": res.pdf,
                 "deck.json": _json.dumps(brief.model_dump(mode="json"),
                                          ensure_ascii=False),
-                "deck.md": deck_to_marp(deck),
-                "deck.pptx": deck_to_pptx_slides(deck),
+                "deck.md": brief_to_marp(
+                    brief, document_title=data.get("document_title", "")),
+                "deck.pptx": brief_to_pptx_slides(brief),
             }
         return outputs.render(self.tool, data)
 

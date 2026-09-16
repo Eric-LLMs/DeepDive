@@ -4,6 +4,10 @@
 // calls them. Golden-snapshot tests pin compiled output — bump
 // SLIDES_TEMPLATE_VERSION whenever this file changes.
 //
+// v2 (plan §M1.7 — Visual Compiler): adds the brief-native templates
+// thesisSlide / figureSlide / funnelSlide / loopSlide / tableSlide. All v1
+// functions are untouched, so legacy DeckSpec emits keep compiling identically.
+//
 // Contract with the emitter:
 //   * every text field arrives ALREADY WRAPPED as an array of lines — the template
 //     never re-wraps, so measurement and rendering can never disagree;
@@ -11,7 +15,7 @@
 //   * the layout engine guarantees fit upstream — no trimming here or there.
 // Page constants below MUST mirror deck/layout.py.
 
-#let SLIDES_TEMPLATE_VERSION = 1
+#let SLIDES_TEMPLATE_VERSION = 2
 
 // ── geometry (mirror of layout.py) ───────────────────────────────────────────
 #let CONTENT-W = 306.67          // PAGE-W 338.67 - 2 * MARGIN-X 16
@@ -352,6 +356,161 @@
         #v(4pt)
         #align(center)[#{ legend.join() }]
       ]
+    ]
+  ]
+}
+
+// ── v2: brief-native templates (Visual Compiler, plan §M1.7) ────────────────
+
+// CENTERED_THESIS — one big statement + optional chip row of card labels.
+#let thesisSlide(d) = {
+  let chip(s) = box(radius: 12pt, fill: deck-band, inset: (x: 9pt, y: 3pt))[
+    #set text(size: 10pt, fill: deck-muted)
+    #s
+  ]
+  slide(d)[
+    #align(center + horizon)[
+      #textLines(d.message_lines, d.message_pt, fill: deck-primary,
+                 weight: "bold", at: center + horizon)
+      #if d.chips.len() > 0 [
+        #v(7mm)
+        #align(center)[#stack(dir: ltr, spacing: 4mm, ..d.chips.map(s => chip(s)))]
+      ]
+    ]
+  ]
+}
+
+// DATA_DASHBOARD (source slice) — contained figure + caption + optional notes.
+// b.name is a workdir-relative file copied in by render.render_brief_pdf.
+#let figureSlide(d) = {
+  let b = d.body
+  let notes = b.notes.cards.map(c => box(
+    width: 100%,
+    radius: 4pt,
+    fill: deck-card,
+    stroke: 0.7pt + deck-line,
+    inset: 6pt,
+  )[
+    #textLines(c.label_lines, c.label_pt, fill: deck-primary, weight: "bold",
+               at: top + left)
+    #v(3pt)
+    #textLines(c.detail_lines, c.detail_pt, fill: deck-ink, at: top + left)
+  ])
+  let figure = [
+    #align(center)[
+      // w/h are already contain-fit computed upstream — exact box, no stretch
+      #image(b.name, width: b.w_mm * 1mm, height: b.h_mm * 1mm)
+    ]
+    #if b.caption_lines.len() > 0 [
+      #v(2pt)
+      #align(center)[
+        #textLines(b.caption_lines, b.caption_pt, fill: deck-faint,
+                   at: center + top)
+      ]
+    ]
+  ]
+  slide(d)[
+    #if notes.len() > 0 {
+      grid(
+        columns: (b.img_col_fr * 1fr, 1fr),
+        gutter: b.gap_mm * 1mm,
+        align(horizon)[#figure],
+        grid(columns: 1, rows: notes.len(), gutter: 2mm, ..notes),
+      )
+    } else {
+      align(center + horizon)[#figure]
+    }
+  ]
+}
+
+// HORIZONTAL_FLOW (funnel variant) — decreasing-width levels, python tints.
+#let funnelSlide(d) = {
+  let b = d.body
+  let levels = b.levels.map(l => align(center)[
+    #box(
+      width: l.w_mm * 1mm,
+      height: b.level_h_mm * 1mm,
+      radius: 3pt,
+      fill: rgb(l.fill),
+      inset: 4pt,
+    )[
+      #textLines(l.label_lines, l.label_pt, fill: rgb(l.text), weight: "bold",
+                 at: center + horizon)
+      #textLines(l.detail_lines, l.detail_pt, fill: rgb(l.text),
+                 at: center + horizon)
+    ]
+  ])
+  slide(d)[
+    #align(center + horizon)[
+      #stack(dir: ttb, spacing: b.gap_mm * 1mm, ..levels)
+    ]
+  ]
+}
+
+// HORIZONTAL_FLOW (loop variant) — flow row + dashed feedback return beneath.
+#let loopSlide(d) = {
+  let b = d.body
+  let items = ()
+  for i in range(b.steps.len()) {
+    let st = b.steps.at(i)
+    items.push(box(
+      width: b.node_w_mm * 1mm,
+      height: b.node_h_mm * 1mm,
+      radius: 4pt,
+      fill: deck-card,
+      stroke: 0.8pt + deck-primary,
+      inset: 4pt,
+    )[
+      #textLines(st.label_lines, st.label_pt, fill: deck-primary, weight: "bold")
+      #v(2pt)
+      #textLines(st.detail_lines, st.detail_pt, fill: deck-muted)
+    ])
+    if i < b.n - 1 {
+      items.push(connector(b.gap_mm, b.node_h_mm))
+    }
+  }
+  let lineLen = CONTENT-W - b.gap_mm * 2
+  slide(d)[
+    #align(center + horizon)[
+      #box(width: CONTENT-W * 1mm, height: (b.node_h_mm + 14) * 1mm)[
+        #place(top + center)[#stack(dir: ltr, spacing: 0mm, ..items)]
+        #place(top + left, dx: b.gap_mm * 1mm, dy: (b.node_h_mm + 8) * 1mm)[
+          #line(length: lineLen * 1mm,
+                stroke: (dash: "dashed", thickness: 0.9pt, paint: deck-accent))
+        ]
+        #place(top + left, dx: (b.gap_mm - 0.5) * 1mm,
+               dy: (b.node_h_mm + 4.5) * 1mm)[
+          #polygon((6pt, 0pt), (0pt, 3.5pt), (6pt, 7pt), fill: deck-accent)
+        ]
+        #place(top + right, dx: -b.gap_mm * 1mm, dy: (b.node_h_mm + 9.5) * 1mm)[
+          #set text(size: 8pt, fill: deck-accent)
+          #b.loop_label
+        ]
+      ]
+    ]
+  ]
+}
+
+// NATIVE_TABLE — two-column label | detail rows from content cards.
+#let tableSlide(d) = {
+  let b = d.body
+  let cells = ()
+  for r in b.rows {
+    cells.push(textLines(r.label_lines, r.label_pt, fill: deck-primary,
+                         weight: "bold"))
+    cells.push(textLines(r.detail_lines, r.detail_pt, fill: deck-ink))
+  }
+  slide(d)[
+    #align(center + horizon)[
+      #table(
+        columns: (b.left_fr * 1fr, 1fr),
+        inset: 6pt,
+        stroke: 0.5pt + deck-line,
+        fill: (x, y) => {
+          if calc.even(y) { white } else { rgb("#FAFBFC") }
+        },
+        ..cells,
+      )
     ]
   ]
 }

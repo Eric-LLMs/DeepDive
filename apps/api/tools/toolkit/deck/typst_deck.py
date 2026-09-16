@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .layout import CONTENT_W_MM, SlideLayout, wrap_lines
 from .models import DeckSpec, ProvenanceRef
+from .schema import PresentationBrief
 
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "slides.typ"
 
@@ -120,8 +121,7 @@ def compile_deck_typst(deck: DeckSpec, layouts: list[SlideLayout],
         raise ValueError("layouts must cover every slide, in order")
     tpl = template if template is not None else load_template()
 
-    body: list[str] = ["", "// ── emitted body (deterministic — do not edit by hand) "
-                           "──────"]
+    body: list[str] = ["", _BODY_BANNER]
     body.append(f"#deckCover({_val(_cover_dict(deck))})")
     for slide, lay in zip(deck.slides, layouts):
         fn = SLIDE_FN.get(lay.visual_type)
@@ -129,4 +129,50 @@ def compile_deck_typst(deck: DeckSpec, layouts: list[SlideLayout],
             raise ValueError(f"no template function for visual type {lay.visual_type}")
         body.append("#pagebreak()")
         body.append(f"#{fn}({_val(_slide_dict(slide, lay))})")
+    return tpl.rstrip() + "\n" + "\n".join(body) + "\n"
+
+
+# ── brief-native emit (Visual Compiler M1) ────────────────────────────────────
+# The layout dicts come from deck.compiler.layout_engine (BriefSlideLayout);
+# thesisSlide reads its body FLATTENED onto the slide dict (mirrors heroSlide).
+
+BRIEF_FLAT_FN = frozenset({"thesisSlide"})
+
+_BODY_BANNER = "// ── emitted body (deterministic — do not edit by hand) ──────"
+
+
+def _brief_cover_dict(brief: PresentationBrief, document_title: str,
+                      source_names: list[str]) -> dict:
+    subtitle = " · ".join(x for x in (brief.target_audience, brief.presentation_style)
+                          if x)
+    names = list(source_names) or [brief.deck_id]
+    return {
+        "title_lines": wrap_lines(document_title or brief.deck_id,
+                                  CONTENT_W_MM * 0.85, 34),
+        "subtitle_lines": wrap_lines(subtitle, CONTENT_W_MM * 0.85, 15) if subtitle else [],
+        "sources_label": "Sources",
+        "sources": names,
+    }
+
+
+def compile_brief_typst(brief: PresentationBrief,
+                        layouts: list, *, document_title: str = "",
+                        source_names: list[str] | None = None,
+                        template: str | None = None) -> str:
+    """Template + deterministic call body straight from the brief's layouts."""
+    if len(layouts) != len(brief.slides):
+        raise ValueError("layouts must cover every slide, in order")
+    tpl = template if template is not None else load_template()
+
+    body: list[str] = ["", _BODY_BANNER]
+    body.append(f"#deckCover({_val(_brief_cover_dict(brief, document_title, source_names or []))})")
+    for lay in layouts:
+        d = dict(lay.header)
+        if lay.fn in BRIEF_FLAT_FN:
+            d.update(lay.body)
+        else:
+            d["body"] = lay.body
+        d["citations"] = lay.citations
+        body.append("#pagebreak()")
+        body.append(f"#{lay.fn}({_val(d)})")
     return tpl.rstrip() + "\n" + "\n".join(body) + "\n"
