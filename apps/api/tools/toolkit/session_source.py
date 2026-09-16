@@ -93,8 +93,8 @@ def cleanup_stale_sources(workspace: Path, *, max_age_s: int = 24 * 3600) -> int
 def artifact_plan(tool: str, title: str) -> dict[str, tuple[str, str]]:
     """Map an output file extension -> ``(drive asset name, mime)`` for ``tool``.
 
-    Slides produce the canonical PDF plus compat Markdown/.pptx and the DeckSpec JSON
-    (speaker notes live in deck.json); mindmap and summary produce one artifact each.
+    Slides produce the canonical PDF plus compat Markdown/.pptx and the PresentationBrief
+    JSON (speaker notes live in deck.json); mindmap and summary produce one artifact each.
     The names follow the user's choice: ``<session title>_<tool>.<ext>``.
     """
     safe = sanitize_name(title)

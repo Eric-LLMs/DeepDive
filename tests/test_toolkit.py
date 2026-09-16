@@ -88,6 +88,20 @@ def _doc(workspace: Path, name: str = "doc.md", text: str = "# Title\n\nBody tex
     return path
 
 
+def _brief_reply(prompt: str) -> dict:
+    """Scripted Pass D reply: echo the run's dynamic deck_id from the task header."""
+    import re
+
+    from tests.test_deck_workflow import brief_payload
+    deck_id = re.search(r"DECK_ID: (\S+)", prompt).group(1)
+    payload = brief_payload(deck_id, ["sec_1"], with_fig=False)
+    payload["slides"] += [
+        {**payload["slides"][0], "slide_index": 2},
+        {**payload["slides"][0], "slide_index": 3},
+    ]
+    return payload
+
+
 # ── output parsing / rendering ──
 
 @pytest.mark.parametrize(
@@ -368,27 +382,22 @@ async def test_summary_writes_md(tmp_path):
     assert "# Deep Dive" in out.read_text(encoding="utf-8")
 
 
-async def test_slides_deck_engine_writes_all_artifacts(tmp_path):
-    # slides now runs the deck engine: 3 LLM passes → DeckSpec → canonical deck.pdf +
-    # deck.json + compat deck.md/deck.pptx from the same model
+async def test_slides_brief_engine_writes_all_artifacts(tmp_path):
+    # slides now runs the grounded visual presentation engine: multimodal ingest (text
+    # channel here — a Markdown source) → A/C/D brief workflow → PresentationBrief →
+    # canonical deck.pdf (via the render bridge) + deck.json (the brief) + compat exports
     import json as _json
     import shutil as _shutil
 
-    from tests.test_deck_passes import (
-        SRC_TEXT,
-        FakeLLM,
-        _c_reply,
-        _digest_json,
-        _outline_json,
-    )
+    from tests.test_deck_workflow import FakeLLM, global_payload, section_payload
 
     if _shutil.which("typst") is None:
         import pytest
         pytest.skip("typst binary required for deck.pdf render")
-    _doc(tmp_path, text="# Title\n\n" + SRC_TEXT)
-    llm = FakeLLM([_digest_json(), _outline_json(3), _c_reply, _c_reply, _c_reply])
+    _doc(tmp_path, text="# Title\n\n" + "Retrieval anchors generation. " * 6)
+    llm = FakeLLM([section_payload(), global_payload(["sec_1"]), _brief_reply])
     pipe = ToolKitPipeline(llm, "slides", workspace=tmp_path)
-    result = await pipe.run(["doc.md"], count=3)  # match the scripted 3-slide outline
+    result = await pipe.run(["doc.md"], count=3)  # the scripted brief carries 3 slides
     exts = {Path(f).suffix for f in result.files}
     assert exts == {".pdf", ".json", ".md", ".pptx"}
     pdf = next(Path(f) for f in result.files if f.endswith(".pdf"))
@@ -397,10 +406,12 @@ async def test_slides_deck_engine_writes_all_artifacts(tmp_path):
     assert _pdf_page_count(pdf) == 4
     md = next(Path(f) for f in result.files if f.endswith(".md"))
     assert md.read_text(encoding="utf-8").startswith("---\nmarp: true")
-    deck = _json.loads(
+    brief = _json.loads(
         next(Path(f) for f in result.files if f.endswith(".json")).read_text(encoding="utf-8"))
-    assert len(deck["slides"]) == 3 and len(deck["visual_plan"]) == 3
-    assert deck["digest"]["facts"], "deck.json carries the full model"
+    assert len(brief["slides"]) == 3
+    assert brief["traceability_graph"], "deck.json is now the canonical brief"
+    # per-stage stats ride the same mechanism as before
+    assert {"A/text_1", "C/reduce", "D/synthesize"} <= set(result.stats)
 
 
 def _pdf_page_count(pdf: Path) -> int:
@@ -458,8 +469,8 @@ async def test_after_persist_observer_runs(tmp_path):
 # ── plugin wiring ──
 
 async def test_plugin_tool_executes_via_runtime(tmp_path):
-    # generic plugin→runtime wiring, tool-agnostic: use summary (the deck engine for
-    # slides is covered end-to-end by test_slides_deck_engine_writes_all_artifacts)
+    # generic plugin→runtime wiring, tool-agnostic: use summary (the brief engine for
+    # slides is covered end-to-end by test_slides_brief_engine_writes_all_artifacts)
     _doc(tmp_path)
     llm = _FakeLLM([SUMMARY_DATA])
     plugin = build_toolkit_plugin("summary", llm, workspace=tmp_path)
@@ -488,21 +499,16 @@ async def test_plugin_manager_mounts_toolkit_plugins(tmp_path):
 
 async def test_worker_files_branch_e2e_srt_deck_to_drive(monkeypatch, tmp_path):
     # In-process E2E of the worker's cloud-file drive mode: a .srt subtitle is downloaded,
-    # run through the real ToolKitPipeline + deck engine (scripted LLM, real Typst compile),
-    # and every artifact named by ``artifact_plan`` is saved back into the Drive.
+    # run through the real ToolKitPipeline + brief workflow (scripted LLM, real Typst
+    # compile), and every artifact named by ``artifact_plan`` is saved back into the Drive.
     import shutil as _shutil
     import uuid as _uuid
     from types import SimpleNamespace
 
     from apps.api.tools.toolkit.pipeline import ToolKitPipeline
     from apps.worker import tasks as worker_tasks
-    from tests.test_deck_passes import (
-        SRC_TEXT,
-        FakeLLM,
-        _c_reply,
-        _digest_json,
-        _outline_json,
-    )
+    from tests.test_deck_passes import SRC_TEXT
+    from tests.test_deck_workflow import FakeLLM, global_payload, section_payload
 
     if _shutil.which("typst") is None:
         pytest.skip("typst binary required for deck.pdf render")
@@ -531,7 +537,7 @@ async def test_worker_files_branch_e2e_srt_deck_to_drive(monkeypatch, tmp_path):
         async def get(self, job_id):
             return SimpleNamespace(user_id=owner)
 
-    llm = FakeLLM([_digest_json(), _outline_json(3), _c_reply, _c_reply, _c_reply])
+    llm = FakeLLM([section_payload(), global_payload(["sec_1"]), _brief_reply])
     monkeypatch.setattr("apps.api.tools.toolkit.pipeline_for",
                         lambda tool, _llm: ToolKitPipeline(llm, tool, workspace=tmp_path))
     monkeypatch.setattr(settings, "workspace_dir", tmp_path)
@@ -550,6 +556,10 @@ async def test_worker_files_branch_e2e_srt_deck_to_drive(monkeypatch, tmp_path):
     mimes = {name: mime for name, mime, _ in drive.saved}
     assert mimes["Lecture_slides.pdf"] == "application/pdf"
     assert mimes["Lecture_slides.json"] == "application/json"
+    import json as _json
+
+    brief = _json.loads(next(c for name, _, c in drive.saved if name.endswith(".json")))
+    assert brief["deck_id"] and len(brief["slides"]) == 3   # deck.json IS the brief
     pdf_bytes = next(c for name, _, c in drive.saved if name.endswith(".pdf"))
     assert pdf_bytes[:5] == b"%PDF-"
     import pymupdf

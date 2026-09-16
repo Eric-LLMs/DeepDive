@@ -212,10 +212,11 @@ class ToolKitPipeline:
         the complete raw text goes to the generator in one call — always verbatim, never
         digested.
 
-        ``slides`` runs the dedicated deck engine (docs/content-to-slides.md): three LLM
-        passes (understand → outline → expansion, each on its own validated input contract)
-        plus the deterministic visual-planning pass, producing a :class:`DeckSpec` —
-        the single source of truth every renderer consumes. Other tools keep the single
+        ``slides`` runs the grounded visual presentation engine: multimodal ingest
+        (:mod:`.deck.ingest`, zero LLM) → the presentation-brief workflow
+        (TEXT → VISUAL → REDUCE → SYNTHESIZE over the generic core,
+        :mod:`.deck.workflow_driver`) producing the canonical
+        :class:`~.deck.schema.PresentationBrief`. Other tools keep the single
         schema-validated call.
 
         A per-task custom prompt (``params["prompt"]``, from the generation dialog) is
@@ -224,24 +225,33 @@ class ToolKitPipeline:
         own requirements layer on top. An empty/missing prompt uses the default alone.
         """
         if self.tool == "slides":
-            from .deck.models import DeckOptions
-            from .deck.passes import generate_deck
+            from .deck.ingest import build_document_representation
+            from .deck.schema import PresentationControls
+            from .deck.workflow_driver import run_presentation_workflow
 
-            options = DeckOptions(
+            controls = PresentationControls(
                 target_audience=str(params.get("audience") or ""),
                 presentation_goal=str(params.get("goal") or ""),
                 target_slide_count=int(params["count"]) if params.get("count") else 8,
                 language=str(params.get("language") or ""),
                 format_mode=str(params.get("format_mode") or "detailed"),
+                user_guidance=(params.get("prompt") or "").strip(),
             )
-            options.user_guidance = (params.get("prompt") or "").strip()
-            hint = (params.get("prompt") or "").strip()
+            deck_id = secrets.token_hex(4)
+            doc_rep = await build_document_representation(
+                sources, workspace=self.workspace, deck_id=deck_id)
             deck_stats: dict = {}
-            deck = await generate_deck(self.llm, sources, options,
-                                       deck_id=secrets.token_hex(4), hint=hint,
-                                       batches=batches, stats=deck_stats)
+            # The brief chain chunks and grounds internally (per-block Pass A calls on
+            # RAW text), so the batch plan is not consumed here.
+            brief = await run_presentation_workflow(
+                self.llm, doc_rep, controls, deck_id=deck_id, stats_out=deck_stats)
             self._deck_stats = deck_stats
-            return {"deck": deck.model_dump(mode="json")}
+            return {
+                "brief": brief.model_dump(mode="json"),
+                "document_title": doc_rep.document_title,
+                "presentation_goal": controls.presentation_goal,
+                "source_names": [s.name for s in sources],
+            }
 
         system = SYSTEM_PROMPTS[self.tool]
         custom = (params.get("prompt") or "").strip()
@@ -305,20 +315,28 @@ class ToolKitPipeline:
     async def stage_render(self, data: dict) -> dict[str, object]:
         """Structured JSON → final display formats (never raw model-written markup).
 
-        Slides render from the DeckSpec: the canonical ``deck.pdf`` (deterministic Typst
-        emit + compile, validated by the RenderReport) plus compat exports derived from
-        the same model — Marp Markdown, .pptx inputs, and ``deck.json`` (which carries the
-        speaker notes; the PDF does not).
+        Slides render from the canonical :class:`~.deck.schema.PresentationBrief`:
+        ``deck.json`` is the brief itself; the canonical ``deck.pdf`` and the compat
+        exports (Marp Markdown, .pptx inputs) are derived through the transient
+        deterministic bridge :mod:`.deck.bridge` until the M1 Visual Compiler
+        replaces it. The RenderReport gate stays loud — nothing silently degrades.
         """
         if self.tool == "slides":
             import json as _json
             import tempfile
             from pathlib import Path as _P
 
-            from .deck.models import DeckSpec
+            from .deck.bridge import brief_to_deckspec
             from .deck.render import deck_to_marp, deck_to_pptx_slides, render_deck_pdf
+            from .deck.schema import PresentationBrief
 
-            deck = DeckSpec.model_validate(data["deck"])
+            brief = PresentationBrief.model_validate(data["brief"])
+            deck = brief_to_deckspec(
+                brief,
+                document_title=data.get("document_title", ""),
+                source_names=list(data.get("source_names") or []),
+                presentation_goal=data.get("presentation_goal", ""),
+            )
             with tempfile.TemporaryDirectory(prefix="deck_") as td:
                 res = await asyncio.to_thread(render_deck_pdf, deck, _P(td))
             if not res.report.ok:
@@ -328,7 +346,8 @@ class ToolKitPipeline:
                     + "; ".join(res.report.typst_warnings[:3]))
             return {
                 "deck.pdf": res.pdf,
-                "deck.json": _json.dumps(deck.model_dump(mode="json"), ensure_ascii=False),
+                "deck.json": _json.dumps(brief.model_dump(mode="json"),
+                                         ensure_ascii=False),
                 "deck.md": deck_to_marp(deck),
                 "deck.pptx": deck_to_pptx_slides(deck),
             }
