@@ -5,8 +5,10 @@
 // SLIDES_TEMPLATE_VERSION whenever this file changes.
 //
 // v2 (plan §M1.7 — Visual Compiler): adds the brief-native templates
-// thesisSlide / figureSlide / funnelSlide / loopSlide / tableSlide. All v1
-// functions are untouched, so legacy DeckSpec emits keep compiling identically.
+// thesisSlide / figureSlide / funnelSlide / loopSlide / tableSlide; the brief
+// layouts reuse the v1 functions where the grammar matches (cards / flow /
+// timeline / arch / compare / chart). The DeckSpec-era emitter is retired —
+// every slide now compiles from a PresentationBrief layout.
 //
 // Contract with the emitter:
 //   * every text field arrives ALREADY WRAPPED as an array of lines — the template

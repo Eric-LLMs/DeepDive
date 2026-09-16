@@ -1,11 +1,10 @@
 """Generic structured-LLM engine for the Presentation Brief workflow.
 
-Additive sibling of :mod:`.passes`: same hard-won contract (stream accumulate →
-deterministic wire-slip repair → jsonschema → Pydantic + semantic extra_check →
-condensed corrective retry → loud fail after attempts), re-pointed at the new
-IR (schema.py) and extended with multimodal input (``images=``) for the visual
-understanding pass. The legacy DeckSpec engine keeps its own copy untouched
-until every consumer migrates (refactor-boundary doctrine).
+The hard-won contract, carried over from the retired DeckSpec passes (stream
+accumulate → deterministic wire-slip repair → jsonschema → Pydantic + semantic
+extra_check → condensed corrective retry → loud fail after attempts), pointed at
+the canonical IR (:mod:`.schema`) and extended with multimodal input
+(``images=``) for the visual understanding pass.
 
 Every wire-slip repaired here is *mechanical* (quoting/typo/null/enum-head);
 semantics are never altered and numbers are never invented.
@@ -17,11 +16,11 @@ import json
 import logging
 import re
 import time
-from typing import Any, Callable, Optional
-
-from pydantic import ValidationError
+from collections.abc import Callable
+from typing import Any
 
 from core.config import settings
+from pydantic import ValidationError
 
 from ..errors import GenerationError
 from ..outputs import extract_json, validate
@@ -150,7 +149,7 @@ def _enum_table() -> dict[str, list[str]]:
 _ENUM_TABLE: dict[str, list[str]] = {}
 
 
-def _norm_enum(v, allowed: list[str]) -> Optional[str]:
+def _norm_enum(v, allowed: list[str]) -> str | None:
     """Unique enum member v denotes; None when ambiguous/unknown (leave to validation)."""
     if not isinstance(v, str):
         return None
@@ -280,7 +279,7 @@ ExtraCheck = Callable[[dict], tuple[list[str], Any]]
 
 
 async def structured_call(llm, *, prompt: str, system: str, schema: dict,
-                          extra_check: Optional[ExtraCheck] = None,
+                          extra_check: ExtraCheck | None = None,
                           label: str,
                           timeout: float | None = None,
                           call_timeout: float | None = None,
@@ -303,8 +302,8 @@ async def structured_call(llm, *, prompt: str, system: str, schema: dict,
             data = await (asyncio.wait_for(coro, timeout) if timeout else coro)
         except TimeoutError:
             errors = condense_errors(
-                [f"model response timed out after {timeout:.0f}s — produce the complete "
-                 "JSON now, staying inside every stated budget"])
+                [(f"model response timed out after {timeout:.0f}s — produce the complete "
+                  "JSON now, staying inside every stated budget")])
             last_errs = errors
             logger.info("%s attempt %d timed out", label, attempt + 1)
             record_attempt(stats, label, t0, usage, rejected=True)

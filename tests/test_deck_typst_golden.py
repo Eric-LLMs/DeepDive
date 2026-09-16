@@ -1,122 +1,110 @@
-"""Golden-snapshot tests for the pure Typst emitter (deterministic, no LLM)."""
+"""Golden-snapshot tests for the brief-native Typst emitter (zero LLM, §1.2.6).
+
+Same brief + same assets ⇒ byte-identical Typst source: the golden file is the
+drift tripwire for emitter or template changes. The all-templates deck exercises
+every Typst function the Visual Compiler can emit, in the happy (non-degraded)
+configuration — degradations are pinned with their own reasons in
+``tests/test_deck_compiler.py``.
+"""
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
 import pytest
 
-from apps.api.tools.toolkit.deck import layout as L
 from apps.api.tools.toolkit.deck import typst_deck as T
-from apps.api.tools.toolkit.deck.rules import derive_visual_plan
-from tests._deck_fixtures import (
-    arch_slide,
-    cards_slide,
-    chart_slide,
-    compare_slide,
-    flow_slide,
-    hero_slide,
-    make_deck,
-    make_digest,
-)
+from apps.api.tools.toolkit.deck.compiler import layout_engine as LE
+from tests.test_deck_compiler import brief_from, chart_gen, figure_asset, slide
 
-GOLDEN = Path(__file__).parent / "goldens" / "deck_all_types.typ"
+GOLDEN = Path(__file__).parent / "goldens" / "deck_brief_all_types.typ"
 
 
-def all_types_deck():
-    tl = flow_slide(4, with_when=True).model_copy(update={"purpose": "TIMELINE",
-                                                          "relationship": "sequential"})
-    return make_deck([hero_slide(), cards_slide(4), flow_slide(5), tl,
-                      compare_slide(), arch_slide(), chart_slide()])
+def all_templates_brief(tmp_path):
+    slides = [
+        slide(1, "TEXTUAL_THESIS", n_cards=0),
+        slide(2, "STRUCTURED_CARDS", n_cards=4),
+        slide(3, "PIPELINE_FLOW", n_cards=3),
+        slide(4, "TIMELINE", n_cards=3),
+        slide(5, "CIRCULAR_LOOP", n_cards=3),
+        slide(6, "INVERTED_PYRAMID", n_cards=3),
+        slide(7, "COMPARISON", n_cards=3),
+        slide(8, "SYSTEM_BLUEPRINT", n_cards=3),
+        slide(9, "QUADRANT_MATRIX", n_cards=4),
+        slide(10, "TABLE", n_cards=3),
+        slide(11, "DATA_CHART", n_cards=0, policy="QUANTITATIVE_CODE",
+              gen=chart_gen()),
+        slide(12, "SOURCE_FIGURE_REUSE", n_cards=2, policy="SOURCE_FIDELITY",
+              reuse="fig_1"),
+    ]
+    brief = brief_from(slides)
+    asset = figure_asset(tmp_path)
+    layouts, warns = LE.build_deck_layouts(brief, {asset.asset_id: asset})
+    assert warns == []                      # happy path: no silent degradation
+    return brief, layouts, asset
 
 
-def compiled(deck) -> str:
-    digest = make_digest()
-    plans = [derive_visual_plan(s, digest) for s in deck.slides]
-    decks = deck.model_copy(update={"visual_plan": plans})
-    lays = L.layout_deck(decks)
-    return T.compile_deck_typst(decks, lays)
+def compiled(tmp_path) -> str:
+    brief, layouts, _ = all_templates_brief(tmp_path)
+    return T.compile_brief_typst(brief, layouts, document_title="RAG Survey",
+                                 source_names=["doc1.pdf"])
 
 
 class TestEmitter:
-    def test_deterministic(self):
-        deck = all_types_deck()
-        assert compiled(deck) == compiled(deck)
+    def test_template_carries_version_2(self):
+        assert "#let SLIDES_TEMPLATE_VERSION = 2" in T.load_template()
 
-    def test_covers_every_slide_fn(self):
-        src = compiled(all_types_deck())
-        for fn in T.SLIDE_FN.values():
-            assert f"#{fn}(" in src
-        assert "#deckCover(" in src
-        assert src.count("#pagebreak()") == len(all_types_deck().slides)
+    def test_deterministic(self, tmp_path):
+        assert compiled(tmp_path) == compiled(tmp_path)
 
-    def test_citations_emitted(self):
-        src = compiled(all_types_deck())
-        assert "[src1:1-3]" in src
+    def test_covers_every_template_fn(self, tmp_path):
+        src = compiled(tmp_path)
+        for _, fn in LE.HAPPY.values():
+            assert f"#{fn}(" in src, fn
+        assert src.count("#deckCover(") == 1
+        assert src.count("#pagebreak()") == 12      # cover + one per slide
 
-    def test_golden_snapshot(self):
-        src = compiled(all_types_deck())
-        assert GOLDEN.exists(), "golden missing — regenerate via scripts or first run"
-        assert src == GOLDEN.read_text(encoding="utf-8")
+    def test_citations_emitted(self, tmp_path):
+        src = compiled(tmp_path)
+        assert "[doc1:3]" in src                     # t1's page+start_line locator
 
-    def test_strings_escaped(self):
-        deck = all_types_deck()
-        s0 = deck.slides[0].model_copy(update={"key_message": 'he said "hi" \\ done'})
-        deck = deck.model_copy(update={"slides": [s0] + list(deck.slides[1:])})
-        src = compiled(deck)
+    def test_flattened_vs_nested_bodies(self, tmp_path):
+        # thesisSlide reads its body FLATTENED; everything else nests under body
+        src = compiled(tmp_path)
+        assert 'message_lines: ("Message number 1.",)' in src   # 1-tuple trailing comma
+        assert 'body: (cols:' in src
+
+    def test_strings_escaped(self, tmp_path):
+        brief, _layouts, _asset = all_templates_brief(tmp_path)
+        s0 = brief.slides[0].model_copy(
+            update={"central_message": 'he said "hi" \\ done'})
+        brief = brief.model_copy(update={"slides": [s0] + list(brief.slides[1:])})
+        src = T.compile_brief_typst(brief, LE.build_deck_layouts(
+            brief, {})[0], document_title="t")
         assert '"he said \\"hi\\" \\\\ done"' in src
 
-    def test_layout_dict_keys_match_template_contract(self):
-        # spot-check the keys the template actually reads
-        deck = all_types_deck()
-        digest = make_digest()
-        for s in deck.slides:
-            plan = derive_visual_plan(s, digest)
-            lay = L.layout_slide(s, plan)
-            assert {"title_lines", "title_pt", "kicker_lines", "kicker_pt"} <= set(lay.header)
-            if lay.visual_type == "TEXT_HERO":
-                assert {"message_lines", "message_pt", "emphasis"} <= set(lay.body)
-            if lay.visual_type == "CHART":
-                for ser in lay.body["series"]:
-                    assert "name" in ser and "points" in ser
+    def test_golden_snapshot(self, tmp_path):
+        src = compiled(tmp_path)
+        if os.environ.get("DECK_GOLDEN_UPDATE") == "1":
+            GOLDEN.write_text(src, encoding="utf-8")
+            pytest.skip("golden regenerated")
+        assert GOLDEN.exists(), "golden missing — run with DECK_GOLDEN_UPDATE=1"
+        assert src == GOLDEN.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(shutil.which("typst") is None,
                     reason="typst binary only present in the worker container")
 class TestCompile:
-    def test_fixture_deck_compiles_to_pdf(self, tmp_path):
-        src = compiled(all_types_deck())
+    def test_golden_source_compiles_to_pdf(self, tmp_path):
+        brief, layouts, _asset = all_templates_brief(tmp_path)
+        src = T.compile_brief_typst(brief, layouts, document_title="RAG Survey",
+                                    source_names=["doc1.pdf"])
+        for lay in layouts:                           # what render.render_brief_pdf does
+            if lay.figure_src:
+                shutil.copyfile(lay.figure_src, tmp_path / lay.body["name"])
         typ = tmp_path / "deck.typ"
         typ.write_text(src, encoding="utf-8")
         pdf = tmp_path / "deck.pdf"
-        res = shutil.os.system(f'typst compile "{typ}" "{pdf}"')
-        assert res == 0
+        assert shutil.os.system(f'typst compile "{typ}" "{pdf}"') == 0
         assert pdf.read_bytes()[:5] == b"%PDF-"
-
-    def test_visual_types_really_paint_geometry_in_pdf(self, tmp_path):
-        # Case-C guard (real-model replay 2026-09-14): a VisualPlan saying CARDS/
-        # ARCHITECTURE is worthless if the Typst template silently degrades to text.
-        # Compile the all-types deck through the CANONICAL render path and count the
-        # vector drawings each visual page paints (boxes/arrows/tiers/axes).
-        import pymupdf
-
-        from apps.api.tools.toolkit.deck.render import render_deck_pdf
-
-        res = render_deck_pdf(all_types_deck(), tmp_path)
-        assert res.pdf and res.report.ok
-        doc = pymupdf.open(stream=res.pdf, filetype="pdf")
-        try:
-            # page order: cover, hero, CARDS, FLOWCHART, TIMELINE, COMPARISON, ARCH, CHART
-            floors = {2: ("TEXT_HERO", 1), 3: ("CARDS", 4), 4: ("FLOWCHART", 5),
-                      5: ("TIMELINE", 4), 6: ("COMPARISON", 3),
-                      7: ("ARCHITECTURE", 3), 8: ("CHART", 3)}
-            for pno, (vt, floor) in floors.items():
-                n = len(doc[pno - 1].get_drawings())
-                if vt == "TEXT_HERO":
-                    assert n <= 2, f"TEXT_HERO page {pno} drew {n} paths — should be header rule only"
-                else:
-                    assert n >= floor, (
-                        f"{vt} page {pno}: only {n} drawings (floor {floor}) — "
-                        "renderer degraded to text")
-        finally:
-            doc.close()

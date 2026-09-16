@@ -507,14 +507,15 @@ async def test_worker_files_branch_e2e_srt_deck_to_drive(monkeypatch, tmp_path):
 
     from apps.api.tools.toolkit.pipeline import ToolKitPipeline
     from apps.worker import tasks as worker_tasks
-    from tests.test_deck_passes import SRC_TEXT
     from tests.test_deck_workflow import FakeLLM, global_payload, section_payload
 
     if _shutil.which("typst") is None:
         pytest.skip("typst binary required for deck.pdf render")
 
+    src_text = ("RAW-SOURCE-MARKER-9f3c RAG 结合检索与生成,向量库按谓词隔离,"
+                "成本 0.565 USD。")
     srt = (
-        "1\n00:00:01,000 --> 00:00:05,000\n" + SRC_TEXT + "\n\n"
+        "1\n00:00:01,000 --> 00:00:05,000\n" + src_text + "\n\n"
         "2\n00:00:06,000 --> 00:00:10,000\n"
         "Vector stores isolate data with app-level predicates.\n"
     )

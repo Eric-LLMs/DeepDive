@@ -1,16 +1,13 @@
-"""Render stage for the deck engine: DeckSpec/PresentationBrief → deck.pdf (+ exports).
+"""Render stage for the Visual Compiler path: PresentationBrief → deck.pdf (+ exports).
 
-Two entry points share one compile/inspect pipeline:
-
-* :func:`render_deck_pdf` — legacy DeckSpec path (retires with DeckSpec);
-* :func:`render_brief_pdf` — Visual Compiler path (M1): brief → compiler layouts →
-  brief-native Typst emit. The ``RenderReport`` gate stays loud — a failing report
-  makes the pipeline raise; nothing downstream silently degrades, and the compiler's
-  explicit template fallbacks surface in ``layout_warnings`` (§9.4).
+Brief-native render (M1): brief → compiler layouts → brief-native Typst emit.
+The ``RenderReport`` gate stays loud — a failing report makes the pipeline
+raise; nothing downstream silently degrades, and the compiler's explicit
+template fallbacks surface in ``layout_warnings`` (§9.4).
 
 Compat exports (errata #7): Marp ``.md`` and the pptx ``(heading, bullets)`` list are
-derived from the SAME model so all formats agree; the canonical artifact stays deck.pdf.
-Speaker notes are NOT rendered into the PDF (they live in deck.json only).
+derived from the SAME brief so all formats agree; the canonical artifact stays deck.pdf.
+Speaker notes are NOT rendered into the PDF (they live in the brief JSON only).
 """
 from __future__ import annotations
 
@@ -23,22 +20,14 @@ from pathlib import Path
 from artifact_compiler.typst_compiler import run_typst_compile
 
 from . import schema as S
-from .layout import PAGE_H_MM, PAGE_W_MM, layout_deck
-from .models import DeckSpec, RenderReport
-from .typst_deck import compile_brief_typst, compile_deck_typst
+from .layout import PAGE_H_MM, PAGE_W_MM
+from .typst_deck import compile_brief_typst
 
 _ASPECT = PAGE_W_MM / PAGE_H_MM          # 16:9
 _WARN_LINE = re.compile(r"^(warn|error): (.*)$", re.MULTILINE)
 
 
-@dataclass
-class DeckRender:
-    typst_source: str
-    pdf: bytes | None
-    report: RenderReport
-
-
-def _inspect_pdf(pdf_path: Path, report: RenderReport) -> None:
+def _inspect_pdf(pdf_path: Path, report: S.RenderReport) -> None:
     import pymupdf  # lazy: keep module import cheap for pure-export consumers
 
     doc = pymupdf.open(pdf_path)
@@ -52,20 +41,9 @@ def _inspect_pdf(pdf_path: Path, report: RenderReport) -> None:
         doc.close()
 
 
-def render_deck_pdf(deck: DeckSpec, workdir: Path, *,
-                    template: str | None = None,
-                    typst_bin: str = "typst") -> DeckRender:
-    """Compile the deck to ``workdir/deck.pdf`` and validate against RenderReport."""
-    layouts = layout_deck(deck)
-    source = compile_deck_typst(deck, layouts, template)
-    report = RenderReport(pages_expected=deck.pages_expected())
-    pdf_bytes = _compile_and_inspect(source, workdir, report, typst_bin=typst_bin)
-    return DeckRender(typst_source=source, pdf=pdf_bytes, report=report)
-
-
 def _compile_and_inspect(source: str, workdir: Path, report, *,
                          typst_bin: str) -> bytes | None:
-    """Shared compile → PDF inspection for both render paths (report duck-typed)."""
+    """Compile → PDF inspection; fills the RenderReport in place."""
     out_pdf = Path(workdir) / "deck.pdf"
     ok, stderr = run_typst_compile(source, workdir, out_pdf, typst_bin=typst_bin)
     report.compiled = ok
@@ -105,53 +83,6 @@ def _page_overflows(pdf_path: Path, page_index: int) -> bool:
         return False
     finally:
         doc.close()
-
-
-# ── compat exports from the SAME DeckSpec (errata #7) ─────────────────────────
-
-def deck_to_marp(deck: DeckSpec) -> str:
-    """Marp Markdown: the legacy slides.md output, now derived from the deck model."""
-    out: list[str] = ["---", "marp: true", "theme: default", "paginate: true", "---", ""]
-    out += [f"# {deck.title}", ""]
-    for s in deck.slides:
-        out += ["---", "", f"## {s.title}", "", f"**Core idea:** {s.key_message}", ""]
-        for line in _support_points(s):
-            out.append(f"- {line}")
-        cites = " ".join(_cite_strings(s))
-        if cites:
-            out += ["", f"*Sources: {cites}*"]
-        if s.speaker_notes:
-            out += ["", f"<!-- Speaker notes: {s.speaker_notes} -->"]
-        out.append("")
-    return "\n".join(out).rstrip() + "\n"
-
-
-def deck_to_pptx_slides(deck: DeckSpec) -> list[tuple[str, str]]:
-    """``(heading, bullets)`` tuples for media.build_text_pptx."""
-    return [(s.title, "\n".join(_support_points(s))) for s in deck.slides]
-
-
-def _support_points(slide) -> list[str]:
-    p = slide.payload
-    if p.items:
-        return [f"{i.label}: {i.detail}".strip(": ").strip() for i in p.items]
-    if p.steps:
-        return [f"{st.when + ' — ' if st.when else ''}{st.label}: {st.detail}".strip(": ")
-                for st in p.steps]
-    if p.columns:
-        rows = max((len(c.cells) for c in p.columns), default=0)
-        return [" | ".join([c.header for c in p.columns])] + [
-            " | ".join(c.cells[r] if r < len(c.cells) else "" for c in p.columns)
-            for r in range(rows)]
-    if p.series:
-        return [f"{s.name}: " + ", ".join(f"{pt.x}={pt.y}" for pt in s.points)
-                for s in p.series]
-    return []
-
-
-def _cite_strings(slide) -> list[str]:
-    from .typst_deck import _cite
-    return [_cite(r) for r in slide.provenance_refs]
 
 
 # ── Visual Compiler path: PresentationBrief → PDF (+ brief-derived exports) ───
