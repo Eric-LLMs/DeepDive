@@ -5,8 +5,9 @@ The ``RenderReport`` gate stays loud — a failing report makes the pipeline
 raise; nothing downstream silently degrades, and the compiler's explicit
 template fallbacks surface in ``layout_warnings`` (§9.4).
 
-Compat exports (errata #7): Marp ``.md`` and the pptx ``(heading, bullets)`` list are
-derived from the SAME brief so all formats agree; the canonical artifact stays deck.pdf.
+Compat exports (errata #7): Marp ``.md`` and the native PPTX (M2,
+:func:`brief_to_pptx`) are derived from the SAME brief so all formats agree;
+the canonical artifact stays deck.pdf.
 Speaker notes are NOT rendered into the PDF (they live in the brief JSON only).
 """
 from __future__ import annotations
@@ -146,13 +147,23 @@ def brief_to_marp(brief: S.PresentationBrief, *, document_title: str = "") -> st
     return "\n".join(out).rstrip() + "\n"
 
 
-def brief_to_pptx_slides(brief: S.PresentationBrief) -> list[tuple[str, str]]:
-    """``(heading, bullets)`` tuples for media.build_text_pptx, from the brief."""
-    from .compiler.layout_engine import card_detail
+def brief_to_pptx(brief: S.PresentationBrief, assets: list[S.VisualAsset], *,
+                  document_title: str = "",
+                  source_names: list[str] | None = None) -> bytes:
+    """Native PptxCompiler (M2): the brief + layouts → real .pptx bytes.
 
-    out: list[tuple[str, str]] = []
-    for s in brief.slides:
-        bullets = "\n".join(f"{c.label}: {card_detail(c)}".rstrip(": ")
-                            for c in s.cards)
-        out.append((s.title, bullets or s.central_message))
-    return out
+    Layouts are rebuilt here (deterministic, zero LLM — §1.2.6); the template
+    degradations were already surfaced through ``RenderReport.layout_warnings``
+    on the PDF path, so they are not re-reported. Charts embed the shared
+    materializer PNGs; figure slides embed the sliced asset files verbatim.
+    """
+    from .compiler.layout_engine import build_deck_layouts
+    from .compiler.pptx_builder import build_brief_pptx
+    from .compiler.theme import theme_for
+
+    amap = {a.asset_id: a for a in assets}
+    theme = theme_for(brief.presentation_style)
+    layouts, _warns = build_deck_layouts(brief, amap, theme)
+    return build_brief_pptx(brief, layouts, amap, theme=theme,
+                            document_title=document_title,
+                            source_names=list(source_names or []))

@@ -22,7 +22,7 @@ from apps.api.tools.toolkit.deck.compiler.theme import ACADEMIC_LIGHT, theme_for
 from apps.api.tools.toolkit.deck.errors import DeckLayoutError
 from apps.api.tools.toolkit.deck.render import (
     brief_to_marp,
-    brief_to_pptx_slides,
+    brief_to_pptx,
     render_brief_pdf,
 )
 from apps.api.tools.toolkit.deck.typst_deck import compile_brief_typst
@@ -357,5 +357,5 @@ def test_brief_exports_derive_from_the_brief_alone():
     assert "# RAG Survey" in md and "## Title 1" in md
     assert "- L1: takeaway 1" in md and f"*Sources: [{DOC_ID}:3]*" in md
     assert "<!-- Speaker notes: notes -->" in md
-    pptx = brief_to_pptx_slides(brief)
-    assert pptx == [("Title 1", "L1: takeaway 1\nL2: takeaway 2")]
+    pptx = brief_to_pptx(brief, [])
+    assert pptx[:2] == b"PK"                       # a real OOXML package, not tuples

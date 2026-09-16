@@ -406,6 +406,14 @@ async def test_slides_brief_engine_writes_all_artifacts(tmp_path):
     assert _pdf_page_count(pdf) == 4
     md = next(Path(f) for f in result.files if f.endswith(".md"))
     assert md.read_text(encoding="utf-8").startswith("---\nmarp: true")
+    # M2: deck.pptx is a real OOXML package (cover + one slide per plan)
+    pptx = next(Path(f) for f in result.files if f.endswith(".pptx"))
+    assert pptx.read_bytes()[:2] == b"PK"
+    from io import BytesIO
+
+    from pptx import Presentation
+    prs = Presentation(BytesIO(pptx.read_bytes()))
+    assert len(list(prs.slides)) == 4
     brief = _json.loads(
         next(Path(f) for f in result.files if f.endswith(".json")).read_text(encoding="utf-8"))
     assert len(brief["slides"]) == 3

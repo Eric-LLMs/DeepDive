@@ -330,11 +330,7 @@ class ToolKitPipeline:
             import tempfile
             from pathlib import Path as _P
 
-            from .deck.render import (
-                brief_to_marp,
-                brief_to_pptx_slides,
-                render_brief_pdf,
-            )
+            from .deck.render import brief_to_marp, brief_to_pptx, render_brief_pdf
             from .deck.schema import PresentationBrief, VisualAsset
 
             brief = PresentationBrief.model_validate(data["brief"])
@@ -356,7 +352,10 @@ class ToolKitPipeline:
                                          ensure_ascii=False),
                 "deck.md": brief_to_marp(
                     brief, document_title=data.get("document_title", "")),
-                "deck.pptx": brief_to_pptx_slides(brief),
+                "deck.pptx": brief_to_pptx(
+                    brief, assets,
+                    document_title=data.get("document_title", ""),
+                    source_names=list(data.get("source_names") or [])),
             }
         return outputs.render(self.tool, data)
 
@@ -382,10 +381,11 @@ class ToolKitPipeline:
             filename = f"{stem}_{stamp}.{ext}"
             path = out_dir / filename
             try:
-                if ext == "pptx":
-                    await asyncio.to_thread(media_lib.build_text_pptx, content, path, title=stem)
-                elif isinstance(content, (bytes, bytearray)):
+                if isinstance(content, (bytes, bytearray)):
                     await asyncio.to_thread(_atomic_write_bytes, path, bytes(content))
+                elif ext == "pptx":
+                    # legacy tuple-input path (doc_slides); deck.pptx is real bytes now
+                    await asyncio.to_thread(media_lib.build_text_pptx, content, path, title=stem)
                 else:
                     await asyncio.to_thread(_atomic_write, path, content)
             except (OSError, ValueError) as exc:  # write error or a broken .pptx
