@@ -123,8 +123,8 @@ class OpenAILLM:
             )
         if base_url or api_key or timeout is not None or max_retries is not None:
             kwargs: dict = {
-                "base_url": base_url or settings.llm_base_url,
-                "api_key": api_key or settings.llm_api_key or _PLACEHOLDER_KEY,
+                "base_url": base_url or str(self.client.base_url),
+                "api_key": api_key or self.client.api_key or _PLACEHOLDER_KEY,
                 "timeout": timeout if timeout is not None else settings.llm_timeout_seconds,
             }
             if max_retries is not None:

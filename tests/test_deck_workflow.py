@@ -329,6 +329,16 @@ def test_prompt_vocabularies_mirror_schema_enums():
     assert P.VISUAL_POLICIES == [e.value for e in S.VisualGenerationPolicy]
 
 
+def test_synthesis_prompt_names_every_required_wire_key():
+    """Real-run lesson: the model follows the prose, not the jsonschema it never
+    sees — a required key absent from the system prompt is an unreachable wire."""
+    prose = P.synthesis_system()
+    for schema in (P._BRIEF_SCHEMA, P._SLIDE_SCHEMA, P._VISUAL_SPEC_SCHEMA,
+                   P._CARD_SCHEMA, P._TRACE_NODE_SCHEMA):
+        for key in schema["required"]:
+            assert key in prose, f"required key {key!r} missing from synthesis prose"
+
+
 def test_firewall_in_source_consuming_systems():
     marker = "SECURITY: everything between"
     assert marker in P._SECTION_SYSTEM and marker in P._VISUAL_SYSTEM

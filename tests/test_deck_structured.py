@@ -62,6 +62,48 @@ def test_provisionance_typo_and_locator_range_object_repaired():
     assert sum("locator lines" in e for e in ev) == 2
 
 
+def test_string_locators_rebuilt_into_objects():
+    # the [doc:line] citation convention leaking back into the wire (real-run slip)
+    data = {"metrics": [{"name": "latency", "value": 320, "locator": "slides.md:16"},
+                        {"name": "coverage", "value": 91, "locator": "doc1:8-10"},
+                        {"name": "pagebound", "value": 5, "locator": "pdf1:p3"}]}
+    ev: list[str] = []
+    out = ST.repair_wire_slips(data, ev)
+    m = out["metrics"]
+    assert m[0]["locator"] == {"doc_id": "slides.md", "start_line": 16}
+    assert m[1]["locator"] == {"doc_id": "doc1", "start_line": 8, "end_line": 10}
+    assert m[2]["locator"] == {"doc_id": "pdf1", "page": 3}
+    assert sum("string locator" in e for e in ev) == 3
+
+
+def test_ingest_digest_arrays_truncated_to_wire_cap():
+    assert ST._INGEST_CAPS["metrics"] == 10          # single source: prompts wire schema
+    data = {"metrics": [{"name": f"m{i}", "value": i} for i in range(14)]}
+    ev: list[str] = []
+    out = ST.repair_wire_slips(data, ev)
+    assert len(out["metrics"]) == 10
+    assert out["metrics"][0]["name"] == "m0"         # model order = stated importance
+    assert "metrics truncated 14->10" in ev
+
+
+def test_synthesis_arrays_never_truncated():
+    cards = [{"label": f"L{i}", "takeaway": f"t{i}", "epistemic_type": "FACT",
+              "trace_id": "t1"} for i in range(6)]
+    data = {"slides": [{"cards": cards}]}
+    ev: list[str] = []
+    out = ST.repair_wire_slips(data, ev)
+    assert len(out["slides"][0]["cards"]) == 6       # cards fail loud, never cut
+    assert ev == []
+
+
+def test_unparseable_string_locator_left_for_validation():
+    data = {"locator": "somewhere around the intro"}
+    ev: list[str] = []
+    out = ST.repair_wire_slips(data, ev)
+    assert out["locator"] == "somewhere around the intro"
+    assert ev == []
+
+
 def test_null_optional_fields_stripped():
     data = {"cards": [{"label": "A", "takeaway": "t", "metric_highlight": None,
                        "trace_id": "t1", "epistemic_type": "FACT"},

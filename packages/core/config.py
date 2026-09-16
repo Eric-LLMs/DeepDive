@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     # ── LLM (via LiteLLM gateway; the gateway routes the virtual model name) ──
     llm_api_key: str = ""
-    llm_base_url: str = "http://localhost:4000/v1"
+    llm_base_url: str = "http://localhost:14000/v1"
     llm_model: str = "deepdive-chat"
 
     # ── TTS (Kokoro-FastAPI service, OpenAI-compatible /v1/audio/speech) ──

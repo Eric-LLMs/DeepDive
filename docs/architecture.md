@@ -867,7 +867,7 @@ Switching modes never touches the tool code — it only changes what `ctx.provid
   loads in-process via `sentence-transformers` when `reranker_model` is set (disabled by default).
 - **Pinned LLM channels call their provider directly** — a session's chat request builds a
   per-request OpenAI client from the channel's `base_url`/`api_key` (the shared client is never
-  mutated). The LiteLLM gateway (`llm_base_url`, default `:4000`) is used only for roles with no
+  mutated). The LiteLLM gateway (`llm_base_url`, default `:14000`) is used only for roles with no
   bound channel and for the legacy `/config` route / enrichment summaries.
 - **DB is accessed directly** (SQLAlchemy + asyncpg) by the gateway, worker, and retrieval
   service; no DB proxy service. Production scaling adds pgBouncer + read replicas.

@@ -8,7 +8,7 @@
 #   - embedding   TEI serving BAAI/bge-m3            -> POST /embed   (port 18080)
 #   - reranker    TEI serving BAAI/bge-reranker-v2-m3 -> POST /rerank (port 18081)
 #   - tts         Kokoro-FastAPI (OpenAI-compatible)  -> /v1/audio/speech (port 18880)
-#   - llm-gateway LiteLLM proxy (unified LLM routing / keys / cost)   (port 4000)
+#   - llm-gateway LiteLLM proxy (unified LLM routing / keys / cost)   (port 14000)
 
 services:
   # ── Data ──────────────────────────────────────────────────────────────
@@ -114,7 +114,8 @@ services:
     container_name: deepdive-litellm
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     ports:
-      - "4000:4000"
+      # 4000 sits inside a Windows Hyper-V excluded port range (3984-4083) on this host; use 14000.
+      - "14000:4000"
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local-gateway}
       LLM_UPSTREAM_MODEL: ${LLM_UPSTREAM_MODEL:-openai/gpt-4o-mini}

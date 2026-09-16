@@ -34,6 +34,25 @@ RETRIES = 2               # corrective retries per call (3 attempts total)
 _RANGE_KEYS = ("lines",)
 
 
+def _ingest_caps() -> dict[str, int]:
+    """Array maxItems of the INGEST wire schemas (digest caches, not slide content).
+
+    Truncating an over-long digest array is bounded information loss and is made
+    loud through a repair event; synthesis arrays (cards/messages) are NEVER
+    touched here — those must converge or the call fails.
+    """
+    caps: dict[str, int] = {}
+    for schema in (P._SECTION_SCHEMA, P._VISUAL_UNDERSTANDING_SCHEMA,
+                   P._GLOBAL_MODEL_SCHEMA):
+        for name, prop in schema["properties"].items():
+            if prop.get("type") == "array" and "maxItems" in prop:
+                caps[name] = prop["maxItems"]
+    return caps
+
+
+_INGEST_CAPS = _ingest_caps()
+
+
 # ── LLM call (mirrors passes._complete_json, plus images) ─────────────────────
 
 async def complete_json(llm, prompt: str, system: str,
@@ -190,7 +209,8 @@ def repair_wire_slips(data: Any, events: list[str] | None = None) -> Any:
 
     Repairs (all mechanical): typo ``provisionance``→``provenance``; enum head
     normalization against the closed lists in schema.py; ``{"start":N,"end":M}``
-    locator objects → ``start_line``/``end_line`` ints; quoted numbers → numbers;
+    locator objects → ``start_line``/``end_line`` ints; string locators
+    ``"doc:8[-10]"``/``"doc:p3"`` → locator objects; quoted numbers → numbers;
     nulls on optional fields dropped; bare int ``value`` lists in generation_spec
     left alone (validated downstream).
     """
@@ -224,6 +244,27 @@ def repair_wire_slips(data: Any, events: list[str] | None = None) -> Any:
                     node.pop(key)
                     if events is not None:
                         events.append(f"locator {key}{{start,end}} -> start_line/end_line")
+        # string locator "doc:8" / "doc:8-10" / "doc:p3" → locator object: the shipped
+        # [doc:line] citation convention leaks back into the wire as a bare string
+        loc = node.get("locator")
+        if isinstance(loc, str):
+            head, sep, tail = loc.strip().rpartition(":")
+            obj: dict[str, int | str] | None = None
+            if sep and head:
+                if tail.isdigit():
+                    obj = {"doc_id": head, "start_line": int(tail)}
+                elif "-" in tail:
+                    a, _, b = tail.partition("-")
+                    if a.isdigit() and b.isdigit():
+                        obj = {"doc_id": head, "start_line": int(a)}
+                        if int(b) != int(a):
+                            obj["end_line"] = int(b)
+                elif tail[:1] == "p" and tail[1:].isdigit():
+                    obj = {"doc_id": head, "page": int(tail[1:])}
+            if obj is not None:
+                node["locator"] = obj
+                if events is not None:
+                    events.append(f"string locator {loc.strip()[:40]!r} -> object")
         for f in _NULLABLE_DROP:
             if f in node and node[f] is None:
                 node.pop(f)
@@ -240,6 +281,14 @@ def repair_wire_slips(data: Any, events: list[str] | None = None) -> Any:
         bbox = node.get("bbox")
         if isinstance(bbox, list):
             node["bbox"] = [float(x) if isinstance(x, (int, float)) else x for x in bbox]
+        # ingest-digest arrays over the wire cap → keep the model's first N
+        # (enumeration order = stated importance) and record the loss loudly.
+        for key, cap in _INGEST_CAPS.items():
+            v = node.get(key)
+            if isinstance(v, list) and len(v) > cap:
+                if events is not None:
+                    events.append(f"{key} truncated {len(v)}->{cap}")
+                node[key] = v[:cap]
 
     _walk(data, fix)
     return data

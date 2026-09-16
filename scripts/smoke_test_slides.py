@@ -72,14 +72,17 @@ DEFAULT_SOURCE = """# RAG 工作流解析
 
 
 async def build_llm(args: argparse.Namespace) -> tuple[OpenAILLM, str]:
-    """Worker-style channel resolution: admin credential from DB, else env gateway."""
+    """Worker-style channel resolution: admin DB channel (dispatch gateway), else env gateway."""
     base_url = api_key = model = None
     source = "env settings"
     if not args.no_db:
         try:
-            from apps.worker.settings import _active_llm_channel
+            from core.infrastructure.db import SessionLocal
+            from core.infrastructure.llm_routing import resolve_effective_channel
 
-            base_url, api_key, model = await _active_llm_channel()
+            async with SessionLocal() as session:
+                base_url, api_key, model, _business, _cred = \
+                    await resolve_effective_channel(session, role_id="admin")
             if api_key:
                 source = "admin DB channel"
             else:
@@ -128,12 +131,12 @@ async def main() -> int:
     ap.add_argument("--out", default="logs/smoke_slides", help="copy destination root")
     args = ap.parse_args()
 
-    if not args.yes and sys.stdin.isatty():
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("[smoke] non-interactive runs require --yes", file=sys.stderr)
+            return 2
         if input("[smoke] This calls the REAL LLM. Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
             return 1
-    if not args.yes and not sys.stdin.isatty():
-        print("[smoke] non-interactive runs require --yes", file=sys.stderr)
-        return 2
     if shutil.which("typst") is None:
         print("[smoke] FAIL: typst binary not on PATH", file=sys.stderr)
         return 2
@@ -184,6 +187,6 @@ if __name__ == "__main__":
         raise SystemExit(asyncio.run(main()))
     except SystemExit:
         raise
-    except Exception:
+    except Exception:  # noqa: BLE001 - last-resort CLI handler: print, exit 1
         traceback.print_exc()
         raise SystemExit(1)
