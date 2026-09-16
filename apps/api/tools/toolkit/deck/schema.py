@@ -504,6 +504,10 @@ class PresentationWorkflowConfig(BaseModel):
     cluster_tolerance_pt: float = 25.0        # drawing-rect merge padding
     high_density_drawings: int = 30           # page-fallback trigger thresholds
     high_density_images: int = 2
+    section_chunk_max_chars: int = 8000      # conceptual-block packing budget (Pass A)
+    pass_concurrency: int = 4                # in-stage LLM call concurrency (A/B)
+    brief_max_turns: int = 8                  # cap VALUES: declared dims live in workflow_spec
+    brief_max_no_progress: int = 2
     default_presentation_style: str = "Technical Masterclass"
     default_target_audience: str = "System Architects & Engineers"
 

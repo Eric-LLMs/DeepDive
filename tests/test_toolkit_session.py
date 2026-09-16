@@ -332,7 +332,7 @@ class _FakePipeline:
             p = self.workspace / f"artifact{len(outs)}{ext}"
             p.write_bytes(f"{ext} bytes".encode())
             outs.append(str(p))
-        return SimpleNamespace(files=outs, summary="done")
+        return SimpleNamespace(files=outs, summary="done", stats={})
 
 
 class _FakeDrive:
