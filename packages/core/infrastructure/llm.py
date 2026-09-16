@@ -133,7 +133,17 @@ class OpenAILLM:
         return self.client, model or self.model
 
     @staticmethod
-    def _messages(prompt: str, system_prompt: str) -> list[dict]:
+    def _messages(prompt: str, system_prompt: str,
+                  images: list[str] | None = None) -> list[dict]:
+        if images:
+            # Multimodal wire (same content-part shape as pdf.py table OCR and
+            # vision_tool): user content = text first, then image_url data URLs.
+            content: list[dict] = [{"type": "text", "text": prompt}]
+            content += [{"type": "image_url", "image_url": {"url": u}} for u in images]
+            return [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ]
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
@@ -201,6 +211,7 @@ class OpenAILLM:
         api_key: str | None = None,
         timeout: float | None = None,
         usage_out: dict | None = None,
+        images: list[str] | None = None,
     ) -> dict:
         """Structured completion: ask the provider for a JSON object.
 
@@ -209,12 +220,13 @@ class OpenAILLM:
         JSON object. A provider that rejects JSON mode raises (the caller can fall back to
         ``complete`` + a tolerant JSON parse). A per-call ``timeout`` bounds long
         full-context generations (toolkit); under the streaming wire it is an idle-between-
-        chunks deadline, not a total-generation cutoff.
+        chunks deadline, not a total-generation cutoff. ``images`` (data-URL list) makes
+        the user turn multimodal — used by the deck visual-understanding pass.
         """
         client, mdl = self._call_channel(model, base_url, api_key, timeout=timeout)
         try:
             content = await self._stream_accumulate(
-                client, mdl, self._messages(prompt, system_prompt),
+                client, mdl, self._messages(prompt, system_prompt, images=images),
                 response_format={"type": "json_object"},
                 usage_out=usage_out,
             )
