@@ -24,6 +24,7 @@ from workflow.ports import TaskRequest, TaskResult
 
 from ..errors import GenerationError
 from . import prompts as P
+from . import qa as QA
 from . import schema as S
 from . import structured as ST
 
@@ -268,22 +269,7 @@ class ReduceExecutor:
 # ── stage D: synthesis into the canonical PresentationBrief ───────────────────
 
 def _brief_check(deck_id: str, valid_sections: set[str], known_assets: set[str]):
-    def check(data: dict) -> tuple[list[str], Any]:
-        errs, model = ST.check_model(data, S.PresentationBrief)
-        if model is not None:
-            if model.deck_id != deck_id:
-                errs.append(f"deck_id must echo {deck_id!r}")
-            unknown = sorted({sid for s in model.slides
-                              for sid in s.source_section_ids if sid not in valid_sections})
-            if unknown:
-                errs.append(f"source_section_ids not in the mental model: {unknown}")
-            misplaced = sorted({s.visual_spec.reuse_asset_id for s in model.slides
-                                if s.visual_spec.reuse_asset_id
-                                and s.visual_spec.reuse_asset_id not in known_assets})
-            if misplaced:
-                errs.append(f"reuse_asset_id not a figure of this document: {misplaced}")
-        return errs, model
-    return check
+    return QA.make_brief_check(deck_id, valid_sections, known_assets)
 
 
 class SynthesizeExecutor:
@@ -306,15 +292,16 @@ class SynthesizeExecutor:
              "caption": a.semantic_hint or a.nearby_text or ""}
             for a in ctx.doc_rep.visual_assets if a.asset_id not in decor
         ]
+        prompt = P.synthesis_prompt(ctx.deck_id, _dump(model_json),
+                                    _dump(visuals_json), _dump(assets_json),
+                                    ctx.controls)
         checker = _brief_check(
             ctx.deck_id, set(ctx.model.section_map()),
             {a.asset_id for a in ctx.doc_rep.visual_assets},
         )
         brief, _ = await ST.structured_call(
             ctx.llm,
-            prompt=P.synthesis_prompt(ctx.deck_id, _dump(model_json),
-                                       _dump(visuals_json), _dump(assets_json),
-                                       ctx.controls),
+            prompt=prompt,
             system=P.synthesis_system(),
             schema=P.BRIEF_SCHEMAS["brief"],
             extra_check=checker,
@@ -322,5 +309,11 @@ class SynthesizeExecutor:
             call_timeout=ST.default_call_timeout(),
             stats=ctx.stats,
         )
-        ctx.brief = brief
-        return TaskResult(value=f"slides={len(brief.slides)}", spend=None)
+        # Layer-1 gates ride INSIDE the synthesize stage: "finished" on the
+        # business-facts probe means "gate-clean brief", so a deck with
+        # untraceable numbers never grades SUCCEEDED (§8.5).
+        ctx.brief = await QA.ensure_brief_clean(
+            llm=ctx.llm, deck_id=ctx.deck_id, brief=brief, controls=ctx.controls,
+            model=ctx.model, doc_rep=ctx.doc_rep, stats=ctx.stats,
+            synth_prompt=prompt, synth_system=P.synthesis_system())
+        return TaskResult(value=f"slides={len(ctx.brief.slides)}", spend=None)

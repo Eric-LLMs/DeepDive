@@ -781,3 +781,43 @@ def synthesis_prompt(brief_id: str, model_json: str, visuals_json: str,
         + "\n\nREUSABLE FIGURE ASSETS (id/page/type/caption; SOURCE_FIGURE_REUSE may "
         "reference these ids only):\n" + assets_json
     )
+
+
+# ── QA repair prompts (Layer-1 gate → bounded repairs, §8.5/§9.5) ────────────
+
+def _issues_block(issues: list[str]) -> str:
+    return "PROBLEMS FOUND BY THE CODE GATE:\n" + "\n".join(
+        f"- {x}" for x in issues) + "\n\n"
+
+
+def repair_slide_prompt(brief_json: str, slide_index: int, issues: list[str],
+                        controls) -> str:
+    return (
+        f"QA gate rejected this deck. Fix slide {slide_index} — and only that "
+        "slide.\n" + _controls_block(controls) + _issues_block(issues)
+        + "Rewrite that ONE slide so every problem is solved: reword within the "
+        "budgets, re-anchor numbers on traceability statements, add FACT nodes whose "
+        "locators are copied from the model when the slide legitimately needs a "
+        "number, or switch the visual_spec to a grammar the slide can honestly "
+        "support. HARD LOCK: return the COMPLETE brief JSON with deck_id, thesis, "
+        "target_audience, target_slide_count, style, arc and ALL other slides "
+        "byte-identical; existing traceability_graph nodes unchanged (adding new ids "
+        "is allowed). Reply with the single brief JSON only.\n\nBRIEF:\n"
+        + brief_json
+    )
+
+
+def repair_notes_prompt(brief_json: str, slide_index: int, issues: list[str],
+                        controls) -> str:
+    return (
+        f"QA gate rejected this deck's speaker notes. Rewrite ONLY the "
+        f"speaker_notes of slide {slide_index}: remove every number the gate names, "
+        "or phrase the note so its numbers match the slide's own grounded "
+        "statements. Keep the notes useful for the presenter (transitions, emphasis, "
+        "citations as [doc:line] tokens).\n" + _controls_block(controls)
+        + _issues_block(issues)
+        + "HARD LOCK: return the COMPLETE brief JSON where every other field of "
+        "every slide — including all slide content, the whole traceability_graph, "
+        "deck_id, thesis, counts, style and arc — is byte-identical to the input. "
+        "Reply with the single brief JSON only.\n\nBRIEF:\n" + brief_json
+    )
