@@ -1,0 +1,200 @@
+{
+  "job_id": "db28aaaf-112c-4520-8c76-fd654a0abee2",
+  "status": "succeeded",
+  "elapsed_s": 340.29482769966125,
+  "result": {
+    "tool": "slides",
+    "assets": [
+      {
+        "name": "Agent Harness Engineering A Survey_slides.pdf",
+        "asset_id": "8b70c4a4-246d-46bd-b1b2-914b7363a807",
+        "folder_path": "tools_test"
+      },
+      {
+        "name": "Agent Harness Engineering A Survey_slides.json",
+        "asset_id": "49f75d0a-ae17-44df-9e30-b8a50633afdf",
+        "folder_path": "tools_test"
+      },
+      {
+        "name": "Agent Harness Engineering A Survey_slides.md",
+        "asset_id": "b1b527e8-a8eb-4cab-ae97-e63a8c56703f",
+        "folder_path": "tools_test"
+      },
+      {
+        "name": "Agent Harness Engineering A Survey_slides.pptx",
+        "asset_id": "d015d383-3538-4d2e-8322-21d2cda50908",
+        "folder_path": "tools_test"
+      }
+    ],
+    "summary": "Generated slides output (4 files).",
+    "deck_stats": {
+      "C/s1": {
+        "calls": 1,
+        "repairs": [],
+        "rejected": 0,
+        "llm_seconds": 8.8,
+        "prompt_tokens": 3596,
+        "completion_tokens": 274
+      },
+      "C/s2": {
+        "calls": 1,
+        "repairs": [],
+        "rejected": 0,
+        "llm_seconds": 9.1,
+        "prompt_tokens": 3448,
+        "completion_tokens": 352
+      },
+      "C/s3": {
+        "calls": 2,
+        "repairs": [],
+        "rejected": 1,
+        "llm_seconds": 21.0,
+        "prompt_tokens": 6976,
+        "completion_tokens": 897
+      },
+      "C/s4": {
+        "calls": 1,
+        "repairs": [],
+        "rejected": 0,
+        "llm_seconds": 9.7,
+        "prompt_tokens": 3515,
+        "completion_tokens": 381
+      },
+      "C/s5": {
+        "calls": 2,
+        "repairs": [],
+        "rejected": 1,
+        "llm_seconds": 22.4,
+        "prompt_tokens": 9628,
+        "completion_tokens": 978
+      },
+      "C/s6": {
+        "calls": 1,
+        "repairs": [],
+        "rejected": 0,
+        "llm_seconds": 11.7,
+        "prompt_tokens": 4489,
+        "completion_tokens": 509
+      },
+      "C/s7": {
+        "calls": 1,
+        "repairs": [],
+        "rejected": 0,
+        "llm_seconds": 9.1,
+        "prompt_tokens": 4102,
+        "completion_tokens": 554
+      },
+      "C/s8": {
+        "calls": 1,
+        "repairs": [],
+        "rejected": 0,
+        "llm_seconds": 8.4,
+        "prompt_tokens": 3913,
+        "completion_tokens": 443
+      },
+      "B/outline": {
+        "calls": 1,
+        "repairs": [
+          "enum narrative_strategy: 'Problem-Solution-Architecture-Impact' -> problem_solution"
+        ],
+        "rejected": 0,
+        "llm_seconds": 20.0,
+        "prompt_tokens": 7823,
+        "completion_tokens": 1136
+      },
+      "C-repair/s5": {
+        "calls": 2,
+        "repairs": [],
+        "rejected": 1,
+        "llm_seconds": 19.9,
+        "prompt_tokens": 10722,
+        "completion_tokens": 928
+      },
+      "C-repair/s6": {
+        "calls": 1,
+        "repairs": [],
+        "rejected": 0,
+        "llm_seconds": 6.5,
+        "prompt_tokens": 5059,
+        "completion_tokens": 474
+      },
+      "C-repair/s7": {
+        "calls": 1,
+        "repairs": [],
+        "rejected": 0,
+        "llm_seconds": 7.1,
+        "prompt_tokens": 4730,
+        "completion_tokens": 546
+      },
+      "A/understand": {
+        "calls": 2,
+        "repairs": [
+          "number '10x'->10 unit 'x multiplier'",
+          "quoted number '13.7'->13.7",
+          "quoted number '76.4'->76.4",
+          "quoted number '1000000'->1000000",
+          "quoted number '84'->84",
+          "range quantity dropped (15-35)",
+          "number '<30'->30 unit '< %'",
+          "quoted number '14.5'->14.5",
+          "number '>30'->30 unit '> %'",
+          "quoted number '0.30'->0.3",
+          "quoted number '3.00'->3.0",
+          "quoted number '14000000'->14000000",
+          "quoted number '41000'->41000",
+          "quoted number '26'->26",
+          "quoted number '90'->90",
+          "range quantity dropped (1000-2000)",
+          "quoted number '79'->79",
+          "quoted number '98'->98",
+          "range quantity dropped (31-42)",
+          "quoted number '2.86'->2.86",
+          "quoted number '6'->6",
+          "quoted number '14'->14",
+          "quoted number '26'->26",
+          "range quantity dropped (64-88)",
+          "quoted number '38'->38",
+          "quoted number '89'->89",
+          "quoted number '52.4'->52.4",
+          "quoted number '21.7'->21.7",
+          "quoted number '17'->17",
+          "quoted number 10.0->10.0",
+          "quoted number 13.7->13.7",
+          "quoted number 76.4->76.4",
+          "quoted number 1000000.0->1000000.0",
+          "quoted number 84.0->84.0",
+          "quoted number 15.0->15.0",
+          "quoted number 35.0->35.0",
+          "quoted number 30.0->30.0",
+          "quoted number 14.5->14.5",
+          "quoted number 30.0->30.0",
+          "quoted number 0.3->0.3",
+          "quoted number 3.0->3.0",
+          "quoted number 26.0->26.0",
+          "quoted number 90.0->90.0",
+          "quoted number 1000.0->1000.0",
+          "quoted number 2000.0->2000.0",
+          "quoted number 98.0->98.0",
+          "quoted number 31.0->31.0",
+          "quoted number 42.0->42.0",
+          "quoted number 2860000.0->2860000.0",
+          "quoted number 6.0->6.0",
+          "quoted number 200.0->200.0",
+          "quoted number 125.0->125.0",
+          "quoted number 14.0->14.0",
+          "quoted number 26.0->26.0",
+          "quoted number 64.0->64.0",
+          "quoted number 88.0->88.0",
+          "quoted number 38.0->38.0",
+          "quoted number 89.0->89.0",
+          "quoted number 52.4->52.4"
+        ],
+        "rejected": 1,
+        "llm_seconds": 230.7,
+        "prompt_tokens": 146340,
+        "completion_tokens": 19433
+      }
+    }
+  },
+  "error": null
+}
