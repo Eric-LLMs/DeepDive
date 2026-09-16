@@ -19,6 +19,7 @@ the only non-determinism is the LLM itself, which the contract confines to these
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -30,6 +31,7 @@ from ..errors import GenerationError
 from ..outputs import extract_json, validate
 from ..sources import WorkspaceSource
 from . import prompts as P
+from .layout import fit_violations
 from .models import (
     ContentDigest,
     DeckOptions,
@@ -41,7 +43,6 @@ from .models import (
     VisualPlan,
     check_outline,
 )
-from .layout import fit_violations
 from .rules import budget_violations, derive_visual_plan, payload_shape_violations
 
 logger = logging.getLogger(__name__)
@@ -58,15 +59,20 @@ def _source_docs(sources: list[WorkspaceSource]) -> list[SourceDoc]:
 
 
 async def _complete_json(llm, prompt: str, system: str,
-                         timeout: float | None = None) -> dict:
+                         timeout: float | None = None,
+                         usage_out: dict | None = None) -> dict:
     """JSON mode when available, tolerant parse otherwise (mirrors pipeline._complete_json).
 
     ``timeout`` is a per-call wall clock handed to the transport (toolkit generation on a
     full-context input routinely exceeds the global ``llm_timeout_seconds``).
+    ``usage_out`` (when the transport supports it) receives the provider's REAL token
+    counts — instrumentation reads the usage chunk, never an estimate.
     """
     fn = getattr(llm, "complete_json", None)
     if fn is not None:
         try:
+            return await fn(prompt, system, timeout=timeout, usage_out=usage_out)
+        except TypeError:
             return await fn(prompt, system, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - best-effort, fall back
             logger.info("complete_json unavailable (%s); falling back to parse", exc)
@@ -92,7 +98,7 @@ def _bc_directives(options: DeckOptions) -> str:
 # too long". That payload dump pollutes the corrective retry prompt (tens of KB fed
 # back to the model), bloats the persisted job error, and teaches the model nothing.
 # Replace it with a short, actionable instruction; cap anything else that is huge.
-_TOO_LONG_RE = re.compile(r"^(?P<path>[^:]+): \[.*\] is too long$", re.S)
+_TOO_LONG_RE = re.compile(r"^(?P<path>[^:]+): \[.*\] is too long$", re.DOTALL)
 
 # Schema maxItems for the Pass C payload arrays (keep in sync with prompts.SLIDE_SCHEMA).
 _PAYLOAD_ARRAY_CAPS = {"payload->items": 6, "payload->steps": 8, "payload->columns": 4}
@@ -146,11 +152,57 @@ def _repair_provenance(obj):
                 p["lines"] = str(start)
 
 
-def _repair_wire_slips(data: dict, metric_of: dict[str, str] | None = None) -> dict:
+# Enum slips (Pass B/C): the model writes a descriptive sentence into an enum field
+# ("Problem-Solution-Evidence: Establish the harness ...") or a plausible near-miss
+# ("causal") and repeats it verbatim on every retry. Normalizing the HEAD of the string
+# against the schema's own enum list keeps the model's chosen value — never a guess:
+# we only rewrite when exactly one enum member matches; otherwise leave it for validation.
+_ENUM_FIELDS: dict[str, list[str]] = {}
+_REL_ALIASES = {"causal": "sequential"}   # a causal chain renders as an ordered flow
+
+
+def _norm_enum(v, allowed: list[str]) -> str | None:
+    """Return the unique enum member v denotes, or None when ambiguous/unknown."""
+    if not isinstance(v, str):
+        return None
+    head = re.split(r"[:：]", v, maxsplit=1)[0].strip().lower()
+    head = re.sub(r"[\s-]+", "_", head)
+    if head in _REL_ALIASES:
+        return _REL_ALIASES[head]
+    cands = [a for a in allowed if head == a or head.startswith(a)]
+    return cands[0] if len(cands) == 1 else None
+
+
+def _repair_enums(data, events: list[str] | None) -> None:
+    if not _ENUM_FIELDS:   # populate from the schemas once (no drift vs prompts.py)
+        _ENUM_FIELDS["narrative_strategy"] = P.NARRATIVES
+        _ENUM_FIELDS["relationship"] = P.RELATIONSHIPS
+
+    def walk(node):
+        if isinstance(node, dict):
+            for field, allowed in _ENUM_FIELDS.items():
+                if field in node:
+                    fixed = _norm_enum(node[field], allowed)
+                    if fixed is not None and fixed != node[field]:
+                        if events is not None:
+                            events.append(f"enum {field}: {node[field][:40]!r} -> {fixed}")
+                        node[field] = fixed
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    walk(data)
+
+
+def _repair_wire_slips(data: dict, metric_of: dict[str, str] | None = None,
+                       events: list[str] | None = None) -> dict:
     """In-place deterministic repair of model wire slips; semantics are never altered.
-    ``metric_of`` (quant_id -> metric, Pass C only) names a merged comparison series."""
+    ``metric_of`` (quant_id -> metric, Pass C only) names a merged comparison series;
+    ``events`` collects short descriptions of every repair made (for pass stats)."""
     if not isinstance(data, dict):
         return data
+    _repair_enums(data, events)
     for key in ("facts", "quantities"):
         lst = data.get(key)
         if isinstance(lst, list):
@@ -159,6 +211,8 @@ def _repair_wire_slips(data: dict, metric_of: dict[str, str] | None = None) -> d
                     continue
                 if "provisionance" in o and "provenance" not in o:
                     o["provenance"] = o.pop("provisionance")
+                    if events is not None:
+                        events.append("typo provisionance->provenance")
                 _repair_provenance(o)
     qs = data.get("quantities")
     if isinstance(qs, list):
@@ -170,14 +224,20 @@ def _repair_wire_slips(data: dict, metric_of: dict[str, str] | None = None) -> d
                 q["value"] = parsed[0]
                 if parsed[1]:
                     q["unit"] = (parsed[1] + " " + str(q.get("unit") or "")).strip()
+                if events is not None:
+                    events.append(f"number {v!r}->{parsed[0]} unit {q['unit']!r}")
                 keep.append(q)
             elif isinstance(parsed, (int, float)):
                 q["value"] = parsed
+                if events is not None:
+                    events.append(f"quoted number {v!r}->{parsed}")
                 keep.append(q)
             elif isinstance(v, str) and _RANGE_RE.match(v.strip()):
                 logger.info("deck repair: dropped range quantity %r ('%s') — a single "
                             "chart number would misrepresent it; the fact still carries it",
                             q.get("quant_id"), v)
+                if events is not None:
+                    events.append(f"range quantity dropped ({v})")
                 continue
             else:
                 keep.append(q)                  # untouched — validation reports it
@@ -230,6 +290,8 @@ def _repair_wire_slips(data: dict, metric_of: dict[str, str] | None = None) -> d
                 name = name or str(series[0].get("name") or "").strip() or "Comparison"
                 logger.info("deck repair: merged %d one-point series into one %d-point "
                             "series '%s'", len(series), len(merged), name)
+                if events is not None:
+                    events.append(f"merged {len(series)} one-point series into 1x{len(merged)}")
                 payload["series"] = [{"name": name, "points": merged}]
     return data
 
@@ -271,43 +333,88 @@ def _condense_errors(errors: list[str]) -> list[str]:
     return out
 
 
+def _stat(stats: dict | None, label: str) -> dict | None:
+    if stats is None:
+        return None
+    return stats.setdefault(label, {"calls": 0, "rejected": 0, "llm_seconds": 0.0,
+                                    "prompt_tokens": 0, "completion_tokens": 0,
+                                    "repairs": []})
+
+
+def _record_attempt(stats, label, t0, usage, *, rejected: bool) -> None:
+    st = _stat(stats, label)
+    if st is None:
+        return
+    st["calls"] += 1
+    st["rejected"] += 1 if rejected else 0
+    st["llm_seconds"] = round(st["llm_seconds"] + (time.perf_counter() - t0), 1)
+    st["prompt_tokens"] += usage.get("prompt_tokens", 0) or 0
+    st["completion_tokens"] += usage.get("completion_tokens", 0) or 0
+
+
+def _bump_rejected(stats, label) -> None:
+    st = _stat(stats, label)
+    if st is not None:
+        st["rejected"] += 1
+
+
+def _record_repairs(stats, label, repairs: list[str]) -> None:
+    st = _stat(stats, label)
+    if st is not None:
+        st["repairs"].extend(repairs)
+
+
 async def _structured(llm, *, prompt: str, system: str, schema: dict,
                       extra_check=None, label: str,
                       timeout: float | None = None,
                       call_timeout: float | None = None,
-                      metric_of: dict[str, str] | None = None) -> tuple[object, dict]:
+                      metric_of: dict[str, str] | None = None,
+                      stats: dict | None = None) -> tuple[object, dict]:
     """One LLM pass with corrective retries. ``extra_check(data) -> (errors, loaded)``
     runs after schema validation; returns the loaded object. ``timeout`` bounds a
     SINGLE attempt: a timed-out attempt is fed back as a corrective error so the same
     call is retried in isolation — one slow page never stalls or redoes the deck.
-    ``call_timeout`` is the per-call transport wall clock handed to ``_complete_json``."""
+    ``call_timeout`` is the per-call transport wall clock handed to ``_complete_json``.
+    ``stats`` (when given) accumulates per-label instrumentation: real LLM call count,
+    provider token totals, LLM wall seconds, rejected attempts and repair events."""
     current = prompt
     last_errs: list[str] = []
     for attempt in range(_RETRIES + 1):
+        t0 = time.perf_counter()
+        usage: dict = {}
         try:
-            coro = _complete_json(llm, current, system, timeout=call_timeout)
+            coro = _complete_json(llm, current, system, timeout=call_timeout,
+                                  usage_out=usage)
             if timeout:
                 data = await asyncio.wait_for(coro, timeout)
             else:
                 data = await coro
-        except asyncio.TimeoutError:
+        except TimeoutError:
             errors = _condense_errors(
                 [f"model response timed out after {timeout:.0f}s — produce the complete "
                  "JSON now, staying inside every stated budget"])
             last_errs = errors
             logger.info("%s pass attempt %d timed out", label, attempt + 1)
+            _record_attempt(stats, label, t0, usage, rejected=True)
             current = P.corrective_retry_prompt(errors, prompt)
             continue
-        data = _repair_wire_slips(data, metric_of)
+        repairs: list[str] = []
+        data = _repair_wire_slips(data, metric_of, repairs)
+        _record_attempt(stats, label, t0, usage, rejected=False)
         errors = validate(schema, data)
         loaded = None
         if not errors and extra_check is not None:
             errors, loaded = extra_check(data)
         if not errors:
+            if repairs and stats is not None:
+                _record_repairs(stats, label, repairs)
             return (loaded if loaded is not None else data), data
         errors = _condense_errors(errors)
         last_errs = errors
         logger.info("%s pass attempt %d rejected: %s", label, attempt + 1, errors[:3])
+        _bump_rejected(stats, label)
+        if repairs and stats is not None:
+            _record_repairs(stats, label, repairs)
         current = P.corrective_retry_prompt(errors, prompt)
     raise GenerationError(f"{label} pass failed after {_RETRIES + 1} attempts: "
                           + "; ".join(last_errs[:6]))
@@ -317,13 +424,14 @@ async def _structured(llm, *, prompt: str, system: str, schema: dict,
 
 async def pass_a_understand(llm, sources: list[WorkspaceSource],
                             hint: str = "", language: str = "", note: str = "",
-                            call_timeout: float | None = None) -> ContentDigest:
+                            call_timeout: float | None = None,
+                            stats: dict | None = None) -> ContentDigest:
     prompt = P.digest_prompt(sources, hint, note=note)
     digest, _raw = await _structured(
         llm, prompt=prompt, system=P.DIGEST_SYSTEM + P.language_rule(language),
         schema=P.DIGEST_SCHEMA,
         extra_check=lambda d: _check(d, ContentDigest), label="A/understand",
-        call_timeout=call_timeout)
+        call_timeout=call_timeout, stats=stats)
     return digest
 
 
@@ -346,7 +454,8 @@ def _remap_digest_lines(digest: ContentDigest, offsets: dict[str, int]) -> None:
 
 
 async def pass_a_batched(llm, batches: list[list[WorkspaceSource]], *,
-                         hint: str = "", language: str = "") -> ContentDigest:
+                         hint: str = "", language: str = "",
+                         stats: dict | None = None) -> ContentDigest:
     """The EXPLICIT big-document flow's grounding stage — one Pass A per batch.
 
     Every call is grounded in the RAW text of its own batch (never a digest), and the
@@ -363,7 +472,7 @@ async def pass_a_batched(llm, batches: list[list[WorkspaceSource]], *,
             llm, batch, hint, language=language,
             note=(f"BIG DOCUMENT ({i}/{n}): the input is one batch of a large document; "
                   "extract facts ONLY from the text below. " if n > 1 else ""),
-            call_timeout=settings.toolkit_llm_timeout_s)
+            call_timeout=settings.toolkit_llm_timeout_s, stats=stats)
         _remap_digest_lines(digest, {s.name: s.line_offset for s in batch})
         if not title:
             title = digest.title
@@ -387,7 +496,8 @@ async def pass_a_batched(llm, batches: list[list[WorkspaceSource]], *,
 
 
 async def pass_b_outline(llm, digest: ContentDigest, options: DeckOptions,
-                         call_timeout: float | None = None) -> Outline:
+                         call_timeout: float | None = None,
+                         stats: dict | None = None) -> Outline:
     digest_json = P.dumps(digest.model_dump(mode="json", exclude_none=True))
     prompt = P.outline_prompt(digest_json, options.target_slide_count,
                               options.target_audience, options.presentation_goal,
@@ -402,7 +512,7 @@ async def pass_b_outline(llm, digest: ContentDigest, options: DeckOptions,
     outline, _raw = await _structured(
         llm, prompt=prompt, system=P.OUTLINE_SYSTEM + _bc_directives(options),
         schema=P.OUTLINE_SCHEMA,
-        extra_check=check, label="B/outline", call_timeout=call_timeout)
+        extra_check=check, label="B/outline", call_timeout=call_timeout, stats=stats)
     return outline
 
 
@@ -439,7 +549,7 @@ def _c_check(item: SlideOutlineItem):
 
 
 async def _pass_c_one(llm, item, section: str, subset: dict,
-                      directives: str) -> Slide:
+                      directives: str, stats: dict | None = None) -> Slide:
     quant_lines = "; ".join(
         f"{q['quant_id']}={q['value']}{q.get('unit', '')}"
         for q in subset["quantities"]) or ""
@@ -450,7 +560,7 @@ async def _pass_c_one(llm, item, section: str, subset: dict,
     slide, _raw = await _structured(
         llm, prompt=prompt, system=P.slide_system(quant_lines, directives),
         schema=P.SLIDE_SCHEMA, extra_check=_c_check(item), label=f"C/{item.slide_id}",
-        timeout=settings.deck_slide_timeout_s, metric_of=metric_of)
+        timeout=settings.deck_slide_timeout_s, metric_of=metric_of, stats=stats)
     return slide
 
 
@@ -462,7 +572,8 @@ def _effective_concurrency(n_slides: int) -> int:
 
 
 async def pass_c_expand(llm, outline: Outline, digest: ContentDigest,
-                        options: DeckOptions | None = None) -> list[Slide]:
+                        options: DeckOptions | None = None,
+                        stats: dict | None = None) -> list[Slide]:
     directives = _bc_directives(options) if options else ""
     jobs = []
     for sec in outline.sections:
@@ -472,7 +583,7 @@ async def pass_c_expand(llm, outline: Outline, digest: ContentDigest,
 
     async def one(item, section, subset):
         async with sem:
-            return await _pass_c_one(llm, item, section, subset, directives)
+            return await _pass_c_one(llm, item, section, subset, directives, stats)
 
     results = await asyncio.gather(*(one(i, s, f) for i, s, f in jobs),
                                    return_exceptions=True)
@@ -492,7 +603,8 @@ def pass_d_plan(slides: list[Slide], digest: ContentDigest) -> list[VisualPlan]:
 
 async def plan_with_repair(llm, slides: list[Slide], outline: Outline,
                            digest: ContentDigest,
-                           options: DeckOptions | None = None
+                           options: DeckOptions | None = None,
+                           stats: dict | None = None
                            ) -> tuple[list[Slide], list[VisualPlan]]:
     """Slides whose Pass D budget OR geometry check reports violations get ONE
     corrective re-run with the violation strings; a still-violating slide fails the
@@ -526,7 +638,7 @@ async def plan_with_repair(llm, slides: list[Slide], outline: Outline,
                 llm, prompt=prompt, system=P.slide_system(quant_lines, directives),
                 schema=P.SLIDE_SCHEMA, extra_check=_c_check(item),
                 label=f"C-repair/{slide.slide_id}",
-                timeout=settings.deck_slide_timeout_s)
+                timeout=settings.deck_slide_timeout_s, stats=stats)
             return slide
 
     fixed = await asyncio.gather(*(fix(s, p) for s, p in bad), return_exceptions=True)
@@ -559,7 +671,8 @@ def _check(d: dict, model_cls):
 async def generate_deck(llm, sources: list[WorkspaceSource],
                         options: DeckOptions | None = None, *,
                         deck_id: str = "deck", hint: str = "",
-                        batches: list[list[WorkspaceSource]] | None = None) -> DeckSpec:
+                        batches: list[list[WorkspaceSource]] | None = None,
+                        stats: dict | None = None) -> DeckSpec:
     """Run Pass A → B → C → D and assemble the DeckSpec (the single source of truth).
 
     ``batches`` (from :func:`..sources.plan_big_document`) engages the EXPLICIT
@@ -573,21 +686,33 @@ async def generate_deck(llm, sources: list[WorkspaceSource],
     options = options or DeckOptions()
     t0 = time.perf_counter()
     if batches:
-        digest = await pass_a_batched(llm, batches, hint=hint, language=options.language)
+        digest = await pass_a_batched(llm, batches, hint=hint, language=options.language,
+                                 stats=stats)
     else:
         digest = await pass_a_understand(llm, sources, hint,
                                          language=options.language,
-                                         call_timeout=settings.toolkit_llm_timeout_s)
+                                         call_timeout=settings.toolkit_llm_timeout_s,
+                                         stats=stats)
     t1 = time.perf_counter()
     outline = await pass_b_outline(llm, digest, options,
-                                   call_timeout=settings.toolkit_llm_timeout_s)
+                                   call_timeout=settings.toolkit_llm_timeout_s,
+                                   stats=stats)
     t2 = time.perf_counter()
-    slides = await pass_c_expand(llm, outline, digest, options)
-    slides, plans = await plan_with_repair(llm, slides, outline, digest, options)
+    slides = await pass_c_expand(llm, outline, digest, options, stats=stats)
+    slides, plans = await plan_with_repair(llm, slides, outline, digest, options,
+                                     stats=stats)
     t3 = time.perf_counter()
     logger.info(
         "deck timing %s: A=%.1fs B=%.1fs C=%.1fs (slides=%d) total=%.1fs",
         deck_id, t1 - t0, t2 - t1, t3 - t2, len(slides), t3 - t0)
+    if stats is not None:
+        tot_c = sum(v["calls"] for v in stats.values())
+        tot_in = sum(v["prompt_tokens"] for v in stats.values())
+        tot_out = sum(v["completion_tokens"] for v in stats.values())
+        logger.info("DECK STATS %s total: llm_calls=%d prompt_tokens=%d "
+                    "completion_tokens=%d generate_wall=%.1fs",
+                    deck_id, tot_c, tot_in, tot_out, t3 - t0)
+        logger.info("DECK STATS %s detail: %s", deck_id, json.dumps(stats, ensure_ascii=False))
     return DeckSpec(
         deck_id=deck_id,
         title=outline.title or digest.title,

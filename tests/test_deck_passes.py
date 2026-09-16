@@ -17,7 +17,7 @@ from apps.api.tools.toolkit.deck.errors import DeckLayoutError  # noqa: F401
 from apps.api.tools.toolkit.deck.models import DeckOptions, DeckSpec
 from apps.api.tools.toolkit.deck.passes import generate_deck
 from apps.api.tools.toolkit.deck.render import deck_to_marp, deck_to_pptx_slides, render_deck_pdf
-from tests._deck_fixtures import make_digest, make_deck
+from tests._deck_fixtures import make_deck, make_digest
 
 RAW_MARKER = "RAW-SOURCE-MARKER-9f3c"
 SRC_TEXT = f"{RAW_MARKER} RAG 结合检索与生成,向量库按谓词隔离,成本 0.565 USD。"
@@ -329,8 +329,8 @@ class TestCompatExports:
         deck = make_deck([*_deck_slides()])
         llm_deck = deck.model_copy(update={"slides": [
             s.model_copy(update={"speaker_notes": "SECRET-NOTES"}) for s in deck.slides]})
-        from apps.api.tools.toolkit.deck.typst_deck import compile_deck_typst
         from apps.api.tools.toolkit.deck.layout import layout_deck
+        from apps.api.tools.toolkit.deck.typst_deck import compile_deck_typst
         src = compile_deck_typst(llm_deck, layout_deck(llm_deck))
         assert "SECRET-NOTES" not in src
 
@@ -473,6 +473,7 @@ class TestStructuralGate:
 
     def test_effective_concurrency_is_min_of_caps(self, monkeypatch):
         from core.config import settings
+
         from apps.api.tools.toolkit.deck.passes import _effective_concurrency
         monkeypatch.setattr(settings, "deck_pass_c_concurrency", 8)
         monkeypatch.setattr(settings, "deck_provider_concurrency", 6)
@@ -651,6 +652,54 @@ class TestNumberStringCoercion:
         single = _repair_wire_slips({"payload": {"series": [
             {"name": "A", "points": [{"x": "a", "y": 1, "quant_ref": "q1"}]}]}})
         assert len(single["payload"]["series"]) == 1 and len(single["payload"]["series"][0]["points"]) == 1
+
+    def test_enum_sentence_normalized_to_unique_prefix(self):
+        """Pass B wrote a whole sentence into narrative_strategy 3/3 attempts (00b92338)."""
+        from apps.api.tools.toolkit.deck.passes import _repair_wire_slips
+        ev: list[str] = []
+        out = _repair_wire_slips({"title": "t", "narrative_strategy":
+            "Problem-Solution-Evidence: Establish the harness as a critical layer, ...",
+            "sections": [{"title": "s", "slides": [
+                {"slide_id": "s1", "relationship": "causal"}]}]}, events=ev)
+        assert out["narrative_strategy"] == "problem_solution"
+        assert out["sections"][0]["slides"][0]["relationship"] == "sequential"
+        assert any("enum narrative_strategy" in e for e in ev)
+        assert any("enum relationship" in e for e in ev)
+
+    def test_enum_ambiguous_or_unknown_left_for_validation(self):
+        from apps.api.tools.toolkit.deck.passes import _repair_wire_slips
+        out = _repair_wire_slips({"narrative_strategy": "A journey through ideas",
+                                  "sections": []})
+        assert out["narrative_strategy"] == "A journey through ideas"
+
+    async def test_structured_stats_accumulates_real_usage(self):
+        from apps.api.tools.toolkit.deck import prompts as P
+        from apps.api.tools.toolkit.deck.passes import _structured
+
+        class UsageLLM:
+            def __init__(self):
+                self.n = 0
+
+            async def complete_json(self, prompt, system, timeout=None, usage_out=None):
+                self.n += 1
+                if usage_out is not None:
+                    usage_out.update({"prompt_tokens": 1234, "completion_tokens": 56})
+                return _digest_json()
+
+        stats: dict = {}
+        await _structured(UsageLLM(), prompt="p", system="s", schema=P.DIGEST_SCHEMA,
+                          extra_check=lambda d: _check_digest(d),
+                          label="A/understand", stats=stats)
+        st = stats["A/understand"]
+        assert st["calls"] == 1 and st["rejected"] == 0
+        assert st["prompt_tokens"] == 1234 and st["completion_tokens"] == 56
+        assert st["llm_seconds"] >= 0.0
+
+
+def _check_digest(d):
+    from apps.api.tools.toolkit.deck.models import ContentDigest
+    from apps.api.tools.toolkit.deck.passes import _check
+    return _check(d, ContentDigest)
 
 
 def test_payload_array_cap_guidance_names_the_number():

@@ -418,7 +418,8 @@ async def _generate_from_session(ctx, job_id: str, payload: dict) -> dict:
                     "folder_path": asset.folder_path,
                 }
             )
-        return {"tool": payload["tool"], "assets": assets, "summary": result.summary}
+        return {"tool": payload["tool"], "assets": assets, "summary": result.summary,
+                "deck_stats": result.stats}
     finally:
         try:
             tmp_source.unlink()
@@ -483,7 +484,8 @@ async def _generate_from_files(ctx, job_id: str, payload: dict) -> dict:
             format_mode=payload.get("format_mode"),
         )
         if not drive_mode:
-            return {"files": result.files, "summary": result.summary}
+            return {"files": result.files, "summary": result.summary,
+                    "deck_stats": result.stats}
         plan = artifact_plan(payload["tool"], payload.get("name") or first_name or "files")
         assets = []
         for path in result.files:
@@ -505,7 +507,8 @@ async def _generate_from_files(ctx, job_id: str, payload: dict) -> dict:
                     "folder_path": asset.folder_path,
                 }
             )
-        return {"tool": payload["tool"], "assets": assets, "summary": result.summary}
+        return {"tool": payload["tool"], "assets": assets, "summary": result.summary,
+                "deck_stats": result.stats}
     finally:
         for path in tmp_files:
             try:

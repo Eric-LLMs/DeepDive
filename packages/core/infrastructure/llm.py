@@ -142,6 +142,7 @@ class OpenAILLM:
     async def _stream_accumulate(
         self, client: AsyncOpenAI, mdl: str, messages: list[dict],
         response_format: dict | None = None,
+        usage_out: dict | None = None,
     ) -> str:
         """One streamed completion, accumulated to the full text.
 
@@ -152,15 +153,25 @@ class OpenAILLM:
         chunks deadline, and ``enable_thinking: false`` (Qwen-compatible flag,
         ``llm_disable_thinking``) removes reasoning tokens — pure latency for
         schema-validated JSON output. Interactive chat paths are untouched.
+
+        When ``usage_out`` is given, the provider's real token counts are merged into
+        it (``stream_options.include_usage``): the usage chunk arrives last, with no
+        choices — reading it off the stream keeps instrumentation honest (no estimates).
         """
         kwargs: dict = {"model": mdl, "messages": messages, "temperature": 0.3, "stream": True}
         if response_format:
             kwargs["response_format"] = response_format
+        if usage_out is not None:
+            kwargs["stream_options"] = {"include_usage": True}
         if settings.llm_disable_thinking:
             kwargs["extra_body"] = {"enable_thinking": False}
         stream = await client.chat.completions.create(**kwargs)
         parts: list[str] = []
         async for chunk in stream:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                usage_out["prompt_tokens"] = getattr(usage, "prompt_tokens", 0) or 0
+                usage_out["completion_tokens"] = getattr(usage, "completion_tokens", 0) or 0
             if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                 parts.append(chunk.choices[0].delta.content)
         return "".join(parts).strip()
@@ -189,6 +200,7 @@ class OpenAILLM:
         base_url: str | None = None,
         api_key: str | None = None,
         timeout: float | None = None,
+        usage_out: dict | None = None,
     ) -> dict:
         """Structured completion: ask the provider for a JSON object.
 
@@ -204,6 +216,7 @@ class OpenAILLM:
             content = await self._stream_accumulate(
                 client, mdl, self._messages(prompt, system_prompt),
                 response_format={"type": "json_object"},
+                usage_out=usage_out,
             )
         except Exception as exc:
             raise raise_classified(exc) from exc

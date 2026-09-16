@@ -81,6 +81,7 @@ class ToolKitResult:
     tool: str
     files: list[str] = field(default_factory=list)   # absolute paths of written artifacts
     summary: str = ""                                 # one-line human summary
+    stats: dict = field(default_factory=dict)         # deck per-stage instrumentation
 
 
 class ToolKitPipeline:
@@ -131,6 +132,7 @@ class ToolKitPipeline:
 
     async def _run(self, paths: list[str], output_dir: str | None, params: dict) -> ToolKitResult:
         await self._hook("before-validate", paths)
+        self._deck_stats = {}
         resolved, out_dir = await self.stage_validate(paths, output_dir)
         await self._observe("after-validate", {"paths": [str(p) for p in resolved], "output_dir": str(out_dir)})
 
@@ -161,6 +163,10 @@ class ToolKitPipeline:
             rendered, out_dir, stem=resolved[0].stem if resolved else "artifact",
             bigdoc_calls=len(batches) if batches else None)
         await self._observe("after-persist", result)
+        # Per-stage instrumentation (deck only): real LLM calls, provider token counts,
+        # seconds and repair events per pass — carried on the result for the job record.
+        if getattr(self, "_deck_stats", None) and isinstance(result, ToolKitResult):
+            result.stats = self._deck_stats
         return result
 
     # ── stage 1: validate ──
@@ -230,9 +236,11 @@ class ToolKitPipeline:
             )
             options.user_guidance = (params.get("prompt") or "").strip()
             hint = (params.get("prompt") or "").strip()
+            deck_stats: dict = {}
             deck = await generate_deck(self.llm, sources, options,
                                        deck_id=secrets.token_hex(4), hint=hint,
-                                       batches=batches)
+                                       batches=batches, stats=deck_stats)
+            self._deck_stats = deck_stats
             return {"deck": deck.model_dump(mode="json")}
 
         system = SYSTEM_PROMPTS[self.tool]
