@@ -193,15 +193,27 @@ _NULLABLE_DROP = (
 # numeric-looking string slips: model quotes numbers (Metric.value, axis values)
 _NUMBER_FIELDS = ("value", "y", "x0", "y0", "x1", "y1")
 
+# heads that are locator field names, never document ids ("start_line: 826")
+_LOCATOR_FIELD_WORDS = {"page", "start_line", "end_line", "line", "bbox"}
 
-def _walk(node, fix):
+# prose fields the model sometimes wraps in an object ({"description": "…"} or
+# {"problem": "…", "evidence_refs": […]}); the string parts join into the one
+# sentence the slot wants — non-string parts (nested locators/lists) duplicate
+# first-class fields and are dropped. Text itself is never rewritten.
+_STRING_FIELDS = ("problem_motivation", "solution_approach",
+                  "visual_potential", "internal_topology")
+
+
+def _walk(node, fix, prune=None):
     if isinstance(node, dict):
         fix(node)
         for v in node.values():
-            _walk(v, fix)
+            _walk(v, fix, prune)
     elif isinstance(node, list):
+        if prune is not None:
+            node[:] = [v for v in node if not prune(v)]
         for v in node:
-            _walk(v, fix)
+            _walk(v, fix, prune)
 
 
 def repair_wire_slips(data: Any, events: list[str] | None = None) -> Any:
@@ -211,14 +223,31 @@ def repair_wire_slips(data: Any, events: list[str] | None = None) -> Any:
     normalization against the closed lists in schema.py; ``{"start":N,"end":M}``
     locator objects → ``start_line``/``end_line`` ints; string locators
     ``"doc:8[-10]"``/``"doc:p3"`` → locator objects; quoted numbers → numbers;
-    nulls on optional fields dropped; bare int ``value`` lists in generation_spec
-    left alone (validated downstream).
+    prose fields wrapped in a one-key object unwrapped to the string; locator
+    objects in the citation-string slot ``supporting_refs`` rendered back to
+    ``"doc:line[-line]"``/``"doc:pN"``; nulls on optional fields dropped;
+    relationship edges with an invented relation label pruned (ingest digest,
+    loud event; head-normalizable ones rescued); bare int ``value`` lists in
+    generation_spec left alone (validated downstream).
     """
     if not isinstance(data, dict):
         return data
     global _ENUM_TABLE
     if not _ENUM_TABLE:
         _ENUM_TABLE = _enum_table()
+
+    # doc_id backfill context: a locator string like "page: null, start_line: 2530"
+    # (the schema shape echoed as text) carries no doc_id. Use the one doc id the
+    # payload itself already states — only when it is unambiguous.
+    _docs: set[str] = set()
+
+    def _collect(node: dict) -> None:
+        d = node.get("doc_id")
+        if isinstance(d, str) and d:
+            _docs.add(d)
+
+    _walk(data, _collect)
+    default_doc = _docs.pop() if len(_docs) == 1 else None
 
     def fix(node: dict) -> None:
         if "provisionance" in node and "provenance" not in node:
@@ -250,7 +279,7 @@ def repair_wire_slips(data: Any, events: list[str] | None = None) -> Any:
         if isinstance(loc, str):
             head, sep, tail = loc.strip().rpartition(":")
             obj: dict[str, int | str] | None = None
-            if sep and head:
+            if sep and head and head not in _LOCATOR_FIELD_WORDS:
                 if tail.isdigit():
                     obj = {"doc_id": head, "start_line": int(tail)}
                 elif "-" in tail:
@@ -261,6 +290,19 @@ def repair_wire_slips(data: Any, events: list[str] | None = None) -> Any:
                             obj["end_line"] = int(b)
                 elif tail[:1] == "p" and tail[1:].isdigit():
                     obj = {"doc_id": head, "page": int(tail[1:])}
+            if obj is None and default_doc and re.search(r"page|line", loc, re.I):
+                # field-name echo: "page: null, start_line: 2530" / "page 15, line 826"
+                pg = re.search(r"page:?\s*(\d+)", loc)
+                s = re.search(r"(?:start_line|line):?\s*(\d+)", loc)
+                e = re.search(r"(?:end_line|line)\s*:?\s*(\d+)\s*[-–]\s*(\d+)", loc)
+                if pg or s:
+                    obj = {"doc_id": default_doc}
+                    if pg:
+                        obj["page"] = int(pg.group(1))
+                    if s:
+                        obj["start_line"] = int(s.group(1))
+                    if e and int(e.group(2)) != int(e.group(1)):
+                        obj["end_line"] = int(e.group(2))
             if obj is not None:
                 node["locator"] = obj
                 if events is not None:
@@ -268,6 +310,14 @@ def repair_wire_slips(data: Any, events: list[str] | None = None) -> Any:
         for f in _NULLABLE_DROP:
             if f in node and node[f] is None:
                 node.pop(f)
+        for f in _STRING_FIELDS:
+            v = node.get(f)
+            if isinstance(v, dict):
+                parts = [x for x in v.values() if isinstance(x, str)]
+                if parts:
+                    node[f] = "; ".join(parts)
+                    if events is not None:
+                        events.append(f"{f} wrapped in object -> string")
         for f in _NUMBER_FIELDS:
             v = node.get(f)
             if f == "value" and (
@@ -289,9 +339,55 @@ def repair_wire_slips(data: Any, events: list[str] | None = None) -> Any:
                 if events is not None:
                     events.append(f"{key} truncated {len(v)}->{cap}")
                 node[key] = v[:cap]
+        # supporting_refs is the wire's CITATION-STRING slot: locator objects that
+        # leak in there are rendered back to the shipped "doc:line[-line]"/"doc:pN"
+        # convention (content preserved; the inverse of the string-locator repair).
+        refs = node.get("supporting_refs")
+        if isinstance(refs, list):
+            for i, r in enumerate(refs):
+                if isinstance(r, dict):
+                    s = _locator_ref_str(r)
+                    if s is not None:
+                        refs[i] = s
+                        if events is not None:
+                            events.append(f"locator object in supporting_refs -> {s[:40]!r}")
 
-    _walk(data, fix)
+    def prune(item) -> bool:
+        """Drop an untrusted INGEST-digest relationship edge whose invented relation
+        label is outside the closed six (head-normalization tried first). Same
+        bounded-loss class as the cap truncation — made loud via the event; slide
+        content is never pruned."""
+        if not (isinstance(item, dict) and "relation" in item
+                and "source" in item and "target" in item):
+            return False
+        r = item["relation"]
+        if not isinstance(r, str) or r in P._RELATIONS:
+            return False
+        fixed = _norm_enum(r, P._RELATIONS)
+        if fixed is not None:
+            if events is not None:
+                events.append(f"enum relation: {r[:40]!r} -> {fixed}")
+            item["relation"] = fixed
+            return False
+        if events is not None:
+            events.append(f"relationship dropped: relation {r[:40]!r} outside closed set")
+        return True
+
+    _walk(data, fix, prune)
     return data
+
+
+def _locator_ref_str(r: dict) -> str | None:
+    doc = r.get("doc_id")
+    if not isinstance(doc, str) or not doc:
+        return None
+    s, e = r.get("start_line"), r.get("end_line")
+    if isinstance(s, int):
+        return doc + f":{s}" if e in (None, s) else doc + f":{s}-{e}"
+    p = r.get("page")
+    if isinstance(p, int):
+        return doc + f":p{p}"
+    return None
 
 
 _NUMERIC_SAFE = re.compile(r"^-?\d+(?:\.\d+)?$")
@@ -315,6 +411,16 @@ def condense_errors(errors: list[str]) -> list[str]:
             out.append(e + " — emit a bare JSON number with no quotes (13.7, not \"13.7\"); "
                        "if the source gives a range or approximation, record one metric "
                        "per endpoint or omit it — never force a number.")
+        elif "is not one of" in e:
+            out.append(e + " — pick ONLY a value from the listed set; never invent a label.")
+        elif "must carry a locator" in e:
+            out.append(e + ' — add ONLY a "locator" key to that node: {"doc_id": '
+                       '"<doc>", "page": N} or {"doc_id": "<doc>", "start_line": N'
+                       '[, "end_line": M]} copied VERBATIM from that section\'s '
+                       "metrics/evidence_refs in the provided model; if the source "
+                       "carries no locator for it, relabel the node CLAIM (explicit "
+                       "author argument) or GROUNDED_SYNTHESIS with supporting_facts "
+                       "— never invent a locator, never touch the other nodes.")
         elif len(e) > 240:
             out.append(e[:240] + "… (truncated)")
         else:

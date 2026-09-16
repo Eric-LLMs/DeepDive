@@ -241,11 +241,13 @@ class ToolKitPipeline:
             doc_rep = await build_document_representation(
                 sources, workspace=self.workspace, deck_id=deck_id)
             deck_stats: dict = {}
+            # Attach BEFORE the await: the engine fills this dict in place, so a
+            # mid-run failure still leaves the partial per-node stats observable.
+            self._deck_stats = deck_stats
             # The brief chain chunks and grounds internally (per-block Pass A calls on
             # RAW text), so the batch plan is not consumed here.
             brief = await run_presentation_workflow(
                 self.llm, doc_rep, controls, deck_id=deck_id, stats_out=deck_stats)
-            self._deck_stats = deck_stats
             return {
                 "brief": brief.model_dump(mode="json"),
                 "document_title": doc_rep.document_title,

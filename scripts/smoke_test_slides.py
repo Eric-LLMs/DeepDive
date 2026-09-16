@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import shutil
 import sys
 import time
@@ -98,6 +99,37 @@ async def build_llm(args: argparse.Namespace) -> tuple[OpenAILLM, str]:
     return llm, f"{source} (model={llm.model}, base_url={llm.client.base_url})"
 
 
+def _report_stats(stats: dict, wall_s: float, stage_s: dict | None = None) -> None:
+    """Per-node instrumentation table: LLM calls / tokens / seconds per label.
+
+    Labels follow the engine's stage convention (A/text_i, B/visual_*, C/reduce*,
+    D/synthesize, D-repair/*); rejected counts retries the corrective loop ate.
+    ``stage_s`` carries the 5-stage wall-clock split (validate/ingest/generate/…).
+    """
+    if stage_s:
+        print(f"\n[smoke] {'stage':<28} {'wall_s':>7}")
+        for name, secs in stage_s.items():
+            print(f"[smoke] {name:<28} {secs:>7.1f}")
+    if not stats:
+        print("[smoke] no LLM stats recorded")
+        return
+    print(f"\n[smoke] {'node':<28} {'calls':>5} {'rej':>4} "
+          f"{'in_tok':>8} {'out_tok':>8} {'llm_s':>7}  repairs")
+    tot = {"calls": 0, "rejected": 0, "prompt_tokens": 0,
+           "completion_tokens": 0, "llm_seconds": 0.0}
+    for label in sorted(stats):
+        st = stats[label]
+        for k in tot:
+            tot[k] += st.get(k, 0) or 0
+        print(f"[smoke] {label:<28} {st['calls']:>5} {st['rejected']:>4} "
+              f"{st['prompt_tokens']:>8} {st['completion_tokens']:>8} "
+              f"{st['llm_seconds']:>7.1f}  {len(st.get('repairs', []))}")
+    print(f"[smoke] {'TOTAL':<28} {tot['calls']:>5} {tot['rejected']:>4} "
+          f"{tot['prompt_tokens']:>8} {tot['completion_tokens']:>8} "
+          f"{tot['llm_seconds']:>7.1f}")
+    print(f"[smoke] wall (incl. ingest/render): {wall_s:.1f}s")
+
+
 def _verify_pdf(pdf: Path) -> None:
     import pymupdf
 
@@ -115,6 +147,31 @@ def _verify_pdf(pdf: Path) -> None:
         raise SystemExit(f"[smoke] FAIL: only {n} page(s)")
 
 
+def _instrument_stages(pipeline, stage_s: dict) -> None:
+    """Wrap the 5 lifecycle stages so each run records its wall-clock seconds.
+
+    LLM-call accounting already lives in the engine (``_deck_stats``); this adds the
+    non-LLM split (PDF ingest, Typst render, persist) the operator asked to see.
+    """
+    import functools
+
+    for name in ("stage_validate", "stage_ingest", "stage_generate",
+                 "stage_render", "stage_persist"):
+        orig = getattr(pipeline, name)
+
+        @functools.wraps(orig)
+        async def timed(*args, _orig=orig, _name=name, **kwargs):
+            t = time.perf_counter()
+            try:
+                return await _orig(*args, **kwargs)
+            finally:
+                stage_s[_name.replace("stage_", "")] = \
+                    round(stage_s.get(_name.replace("stage_", ""), 0.0)
+                          + time.perf_counter() - t, 1)
+
+        setattr(pipeline, name, timed)
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--yes", action="store_true", help="confirm spending real LLM tokens")
@@ -129,6 +186,9 @@ async def main() -> int:
     ap.add_argument("--base-url")
     ap.add_argument("--model")
     ap.add_argument("--out", default="logs/smoke_slides", help="copy destination root")
+    ap.add_argument("--output-dir",
+                    help="pipeline output dir (workspace-relative); "
+                         "default: settings.toolkit_output_dir/slides")
     args = ap.parse_args()
 
     if not args.yes:
@@ -145,7 +205,8 @@ async def main() -> int:
     print(f"[smoke] LLM channel: {channel}")
 
     workspace = Path(settings.workspace_dir)
-    src_path = Path(args.source) if args.source else workspace / "slides_smoke_src.md"
+    src_path = (Path(args.source) if args.source and Path(args.source).is_absolute()
+                else workspace / args.source) if args.source else workspace / "slides_smoke_src.md"
     if not args.source:
         src_path.write_text(DEFAULT_SOURCE, encoding="utf-8")
     print(f"[smoke] source: {src_path} ({src_path.stat().st_size} bytes)")
@@ -153,17 +214,40 @@ async def main() -> int:
     from apps.api.tools.toolkit import pipeline_for
 
     pipeline = pipeline_for("slides", llm)
-    t0 = time.perf_counter()
-    result = await pipeline.run(
-        [str(src_path)],
-        count=args.count, audience=args.audience, goal=args.goal, prompt=args.prompt,
-    )
-    elapsed = time.perf_counter() - t0
-    print(f"[smoke] pipeline OK in {elapsed:.1f}s — {result.summary}")
-
+    stage_s: dict = {}
+    _instrument_stages(pipeline, stage_s)
     stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
     out_dir = Path(args.out) / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.perf_counter()
+    try:
+        result = await pipeline.run(
+            [str(src_path)], output_dir=args.output_dir,
+            count=args.count, audience=args.audience, goal=args.goal, prompt=args.prompt,
+        )
+    except BaseException as exc:
+        # even a failed run must show how far it got, what it spent, and the error
+        elapsed = time.perf_counter() - t0
+        stats = getattr(pipeline, "_deck_stats", {})
+        _report_stats(stats, elapsed, stage_s)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "smoke_stats.json").write_text(json.dumps({
+            "status": "failed", "error": f"{exc.__class__.__name__}: {exc}",
+            "traceback": traceback.format_exc(), "stage_wall_s": stage_s,
+            "stats": stats, "wall_s": round(elapsed, 1),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[smoke] FAIL stats+traceback → {out_dir / 'smoke_stats.json'}",
+              file=sys.stderr)
+        raise
+    elapsed = time.perf_counter() - t0
+    print(f"[smoke] pipeline OK in {elapsed:.1f}s — {result.summary}")
+    stats = result.stats or getattr(pipeline, "_deck_stats", {})
+    _report_stats(stats, elapsed, stage_s)
+
+    (out_dir / "smoke_stats.json").write_text(
+        json.dumps({"status": "ok", "stage_wall_s": stage_s, "wall_s": round(elapsed, 1),
+                    "stats": stats}, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[smoke]   stats → {out_dir / 'smoke_stats.json'}")
     pdf: Path | None = None
     for f in result.files:
         p = Path(f)

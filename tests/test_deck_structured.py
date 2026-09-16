@@ -76,6 +76,53 @@ def test_string_locators_rebuilt_into_objects():
     assert sum("string locator" in e for e in ev) == 3
 
 
+def test_locator_field_echo_string_backfilled_with_unique_doc():
+    # A/text_36 survey slip: the locator schema echoed as a string
+    # ("page: null, start_line: 2530"); the payload states exactly one doc id,
+    # so backfilling it is unambiguous and mechanical.
+    ev: list[str] = []
+    data = {"evidence_refs": [{"doc_id": "survey.pdf", "start_line": 2520}],
+            "metrics": [{"name": "stars", "value": 41000,
+                         "locator": "page: null, start_line: 2530"},
+                        {"name": "dl", "value": 14000000,
+                         "locator": "start_line: 826"},
+                        {"name": "p", "value": 2,
+                         "locator": "page 15, line 826"}]}
+    out = ST.repair_wire_slips(data, ev)
+    m = out["metrics"]
+    assert m[0]["locator"] == {"doc_id": "survey.pdf", "start_line": 2530}
+    assert m[1]["locator"] == {"doc_id": "survey.pdf", "start_line": 826}
+    assert m[2]["locator"] == {"doc_id": "survey.pdf", "page": 15, "start_line": 826}
+    assert sum("string locator" in e for e in ev) == 3
+
+
+def test_locator_field_echo_ambiguous_doc_not_backfilled():
+    # two docs in the payload → whose line is it? refuse to guess.
+    data = {"evidence_refs": [{"doc_id": "a.pdf", "start_line": 1},
+                              {"doc_id": "b.pdf", "start_line": 2}],
+            "metrics": [{"name": "x", "value": 1, "locator": "start_line: 826"}]}
+    out = ST.repair_wire_slips(copy.deepcopy(data))
+    assert out["metrics"][0]["locator"] == "start_line: 826"
+
+
+def test_locator_objects_in_supporting_refs_stringified():
+    # the citation-string slot got full locator objects (real survey-run slip);
+    # rendering them back to "doc:8-10"/"doc:p3" preserves the content.
+    ev: list[str] = []
+    data = {"relationships": [
+        {"source": "a", "target": "b", "supporting_refs": [
+            {"doc_id": "survey.pdf", "start_line": 528, "end_line": 530},
+            {"doc_id": "survey.pdf", "start_line": 7},
+            {"doc_id": "survey.pdf", "page": 4},
+            {"doc_id": "survey.pdf", "bbox": [0, 0, 1, 1]}]},   # unrenderable → untouched
+    ]}
+    out = ST.repair_wire_slips(data, ev)
+    assert out["relationships"][0]["supporting_refs"] == [
+        "survey.pdf:528-530", "survey.pdf:7", "survey.pdf:p4",
+        {"doc_id": "survey.pdf", "bbox": [0.0, 0.0, 1.0, 1.0]}]
+    assert sum("supporting_refs" in e for e in ev) == 3
+
+
 def test_ingest_digest_arrays_truncated_to_wire_cap():
     assert ST._INGEST_CAPS["metrics"] == 10          # single source: prompts wire schema
     data = {"metrics": [{"name": f"m{i}", "value": i} for i in range(14)]}
@@ -145,6 +192,62 @@ def test_enum_ambiguous_or_unknown_left_for_validation():
     assert ST._norm_enum("data", ["DATA_DASHBOARD", "DATA_CHART"]) is None
 
 
+def test_prose_field_wrapped_in_object_unwrapped():
+    # real-run slip: solution_approach arrived as {"description": "..."}
+    ev: list[str] = []
+    data = {"solution_approach": {"description": "single coder + audit protocol"},
+            "problem_motivation": {"a": 1, "b": 2}}   # not a one-key string dict
+    out = ST.repair_wire_slips(data, ev)
+    assert out["solution_approach"] == "single coder + audit protocol"
+    assert out["problem_motivation"] == {"a": 1, "b": 2}  # ambiguous → validation decides
+    assert ev == ["solution_approach wrapped in object -> string"]
+
+
+def test_prose_field_multi_key_string_object_joined():
+    # Agent-Harness survey run slip: problem_motivation arrived as a two-part
+    # {"problem": "...", "motivation": "..."}; all-string values join, mechanically.
+    ev: list[str] = []
+    data = {"problem_motivation": {"problem": "P sentence", "motivation": "M sentence"}}
+    out = ST.repair_wire_slips(data, ev)
+    assert out["problem_motivation"] == "P sentence; M sentence"
+    assert ev == ["problem_motivation wrapped in object -> string"]
+
+
+def test_prose_field_object_with_nested_parts_keeps_strings():
+    # Agent-Harness survey run slip (2nd shape): the wrap mixes prose with nested
+    # structure the block already carries in first-class fields — strings join,
+    # the non-string parts drop.
+    ev: list[str] = []
+    data = {"solution_approach": {
+        "approach": "one-sentence approach",
+        "key_steps": ["step a", "step b"],
+        "evidence_refs": [{"doc_id": "d", "start_line": 3}]}}
+    out = ST.repair_wire_slips(data, ev)
+    assert out["solution_approach"] == "one-sentence approach"
+    assert ev == ["solution_approach wrapped in object -> string"]
+
+
+def test_invented_relation_pruned_head_rescued_closed_untouched():
+    # survey-run slip: the model invents relation labels ('supports', 'addresses');
+    # the closed six are the contract — rescuable heads normalize, the rest of the
+    # untrusted edge is dropped (INGEST digest, loud event).
+    ev: list[str] = []
+    data = {"relationships": [
+        {"source": "a", "relation": "causes", "target": "b"},          # legal → untouched
+        {"source": "c", "relation": "DEPENDS_ON", "target": "e"},      # head-rescued
+        {"source": "f", "relation": "supports", "target": "g"},        # dropped
+        {"source": "h", "relation": "addresses", "target": "i"},       # dropped
+    ]}
+    out = ST.repair_wire_slips(data, ev)
+    assert out["relationships"] == [
+        {"source": "a", "relation": "causes", "target": "b"},
+        {"source": "c", "relation": "depends_on", "target": "e"}]
+    assert any("enum relation" in e for e in ev)
+    assert sum("relationship dropped" in e for e in ev) == 2
+    # non-relationship dicts are never pruned by shape
+    assert ST.repair_wire_slips({"x": {"relation": "supports"}})["x"] == {"relation": "supports"}
+
+
 def test_bbox_members_become_floats():
     out = ST.repair_wire_slips({"bbox": [1, 2.5, "3", 4]})
     assert out["bbox"] == [1.0, 2.5, "3", 4.0]   # numeric members normalized; noise untouched
@@ -157,12 +260,22 @@ def test_condense_names_the_real_caps_and_rules():
         "slides->0->cards: [{...giant dump...}] is too long",
         "sections->2->key_elements: [1,2,3] is too long",
         "critical_metrics->1->value: '13.7' is not of type 'number'",
+        "relationships->3->relation: 'supports' is not one of ['causes', 'contains']",
         "x" * 300,
     ])
     assert "HARD maximum 4" in out[0] and "merge related" in out[0]
     assert "array is too long" in out[1] and "drop the least important" in out[1]
     assert "bare JSON number" in out[2] and "never force a number" in out[2]
-    assert out[3].endswith("(truncated)") and len(out[3]) < 260
+    assert "never invent a label" in out[3]
+    assert out[4].endswith("(truncated)") and len(out[4]) < 260
+    # Agent-Harness survey D/synthesize slip: FACT nodes missing a locator got a
+    # bare pydantic "Value error" back — retries never converged. The advice must
+    # state the locator shape, its verbatim source, and the honest fallback.
+    loc = ST.condense_errors(
+        ["traceability_graph->t_harness_def: Value error, FACT traceability "
+         "node must carry a locator"])[0]
+    assert '"doc_id"' in loc and "start_line" in loc and "page" in loc
+    assert "copied VERBATIM" in loc and "never invent a locator" in loc
 
 
 # ── the retry loop: repair → validate → corrective retry → loud fail ──────────

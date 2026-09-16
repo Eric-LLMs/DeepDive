@@ -5039,7 +5039,8 @@
     optsRow.append(langField, lenField, srcField);
     body.append(optsRow);
 
-    // Output path (kept from the classic dialog): Cloud Drive folder + optional name
+    // Output path (kept from the classic dialog): the folder rides the top of the
+    // dialog as its own full-width row; the file name keeps the two-column row.
     const outRow = document.createElement("div");
     outRow.className = "deck-row";
     const dirField = document.createElement("div");
@@ -5062,8 +5063,12 @@
     const nameHint = document.createElement("div");
     nameHint.className = "cd-gen-name-hint";
     nameField.append(nameInput, nameHint);
-    outRow.append(dirField, nameField);
+    const dirRow = document.createElement("div");
+    dirRow.className = "deck-row";
+    dirRow.append(dirField);
+    outRow.append(nameField);
     body.append(outRow);
+    body.prepend(dirRow);  // Output folder — first thing in the dialog, full-width row
 
     let folderPath = null;
     const sanitizeLike = (t) => {

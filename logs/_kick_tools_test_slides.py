@@ -36,8 +36,12 @@ async def main() -> int:
         job_id = await queue.enqueue(
             TOOLKIT_GENERATE,
             {"tool": "slides", "file_ids": FILE_IDS, "folder_path": FOLDER_PATH,
-             "name": None, "prompt": None, "count": None, "audience": None,
-             "goal": None},
+             "name": "Agent Harness Engineering A Survey",
+             "prompt": "幻灯片正文用中文,专业术语保留英文原文",
+             "count": 10,
+             "audience": "工程团队内部技术评审",
+             "goal": "讲清 Agent Harness Engineering 的定义、核心组件、研究版图与工程取舍",
+             "language": "zh", "format_mode": "detailed"},
             user_id=OWNER,
         )
         jid = str(job_id)
