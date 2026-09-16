@@ -685,8 +685,18 @@ per batch; the fact bases merge deterministically — ids renumbered globally, l
 shifted to absolute source lines), and `summary`/`mindmap` partial outputs are joined
 structurally (bullets/sections/branches concatenated, batch citations remapped). No partial
 ever becomes a re-summarization input, nothing runs silently — the switch is a WARN in the
-worker log and a note in the job's one-line summary. Every toolkit generation call runs
-under `toolkit_llm_timeout_s` (300 s) instead of the global 90 s wall time.
+worker log and a note in the job's one-line summary.
+
+**Streaming batch wire.** Every batch generation call (`complete` / `complete_json` on the core
+LLM client — toolkit, deck passes, summary/mindmap, all worker-side structured calls) rides
+`stream=True` and accumulates chunks, so the provider's ~300 s non-stream gateway cutoff can
+never kill a legitimate full-context generation: `toolkit_llm_timeout_s` (300 s) bounds only the
+*idle time between chunks*, not total wall time. `llm_disable_thinking` (default **on**) adds the
+Qwen-compatible `enable_thinking: false` flag on these calls — reasoning tokens are pure latency
+for schema-validated JSON output. Interactive chat (`chat_stream`) keeps thinking and is untouched.
+When the caller passes a `usage_out` dict the stream requests `stream_options.include_usage` and
+reads the provider's real usage chunk, so instrumentation records actual token counts — never
+estimates.
 
 `summary` / `mindmap` **generate** is the single structured call (JSON mode,
 jsonschema-validated, one corrective retry that carries the concrete — condensed, ≤240-char —
@@ -704,8 +714,31 @@ when its payload is empty or mismatched) — plus a deterministic, zero-LLM **D 
 pass (`rules.py` fallback chain) feeding budgets-checked Typst rendering. Canonical artifact
 is the compiled 16:9 **`<name>_slides.pdf`**, alongside `.md` / `.pptx` / `deck.json` exports
 of the same `DeckSpec`; **no silent trimming anywhere** — a slide still violating budgets
-after its corrective re-run fails the job loudly. Per-pass timings log at INFO
-(`deck timing`) for offline P50/P95 harvesting.
+after its corrective re-run fails the job loudly.
+
+**Deterministic wire-slip repair before validation.** The model reproduces the same *format*
+slips on every corrective retry, so a pure retry loop cannot converge on them; the engine
+therefore repairs transport slips mechanically (`passes.py`) without touching semantics:
+quoted plain numbers are coerced to JSON numbers (`"13.7"` → `13.7`); decorated numerics move
+their qualifier into the unit (`10x`, `<90`); range quantities (`15-35`) are **dropped as
+chart quantities** — a single chart number would misrepresent them, the fact text still
+carries the range; `{start,end}` provenance objects and the `provisionance` typo are fixed;
+nulls on optional string fields are stripped; **N one-point chart series are merged into one
+entity series** (the pipeline's own doctrine — one series, x = entity name — applied only when
+every series is exactly one point and the result fits 2..8 points); and out-of-enum values are
+normalized (`narrative_strategy` "Problem-Solution-…" head-splits to `problem_solution`,
+`relationship` aliases map to their unique matching enum). Ambiguous or unknown values stay
+hard errors, mixed/oversized chart shapes stay validation errors — repair never trims.
+Corrective error messages name the numeric cap ("HARD maximum 6") so retries stop overshooting
+array bounds.
+
+**Per-pass LLM instrumentation (honest stats).** Every labeled call — `A/understand`,
+`B/outline`, `C/sN`, `C-repair/sN` — records real provider usage (via the streaming wire's
+usage chunk): `calls` / `rejected` / `llm_seconds` / `prompt_tokens` / `completion_tokens` /
+deterministic `repairs` applied. The stats log at INFO as `DECK STATS` + `deck timing` lines
+and ride `ToolKitResult.stats` into the job result as `deck_stats`, so per-stage token spend,
+latency, retry counts, and repair events are queryable per run for offline P50/P95
+harvesting.
 
 Dialog knobs are **routed per pass, not concatenated**: the slides "Customize Slide Deck"
 dialog submits `{file_ids, prompt, count, language, format_mode}`; `count` bounds Pass B's
@@ -1301,7 +1334,7 @@ implemented (with tests); a rating UI that calls it is not wired up yet.
 | Attach document images to RAG chunks | page/para markers → chunk `meta.pages` / `meta.image_ids` (union across pages, state machine covers unmarked blocks) |
 | Route the vision tool to a model | `tools.vision.model` → catalog model → route → credential (`_resolve_vision_channel`) |
 | Compile a publication PDF from the finalized manuscript | `ArtifactCompileService.compile_project_pdf` (`plugins/artifact/`): zero-LLM deterministic projection (`project_manuscript_to_ast`, inv. 11) → Typst CLI → drive binary + `outputs/<task name>_v{N}.pdf` mirror; **default-ON** sibling branch of the PUBLISH node (opt out with `pdf_report: false`; a PDF fault still publishes and writes `pipeline.publish.pdf_error`) — see §21 |
-| Generate a 16:9 slide deck from documents / subtitles / sessions | deck engine `toolkit/deck/`: Pass A grounded fact base → Pass B outline (digest-only input) → Pass C per-slide concurrent expansion with timeout isolation + structural payload gate → pure Pass D visual plan → Typst PDF; canonical `<name>_slides.pdf` + `.md`/`.pptx`/`deck.json`; no silent trimming, loud fail on residual budget violations; dialog knobs (count / language / format / guidance) routed per pass — see [docs/content-to-slides.md](content-to-slides.md) |
+| Generate a 16:9 slide deck from documents / subtitles / sessions | deck engine `toolkit/deck/`: Pass A grounded fact base → Pass B outline (digest-only input) → Pass C per-slide concurrent expansion with timeout isolation + structural payload gate → pure Pass D visual plan → Typst PDF; deterministic wire-slip repair before validation (number coercion, one-point-series merge, enum normalization — never trimming); canonical `<name>_slides.pdf` + `.md`/`.pptx`/`deck.json`; no silent trimming, loud fail on residual budget violations; per-pass real-usage stats (`DECK STATS` log + `deck_stats` on the job result); dialog knobs (count / language / format / guidance) routed per pass — see [docs/content-to-slides.md](content-to-slides.md) |
 
 [↑ Back to top](#table-of-contents)
 
