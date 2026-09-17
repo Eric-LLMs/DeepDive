@@ -143,6 +143,31 @@ def test_synthesis_arrays_never_truncated():
     assert ev == []
 
 
+async def test_complete_json_rejects_non_object_reply():
+    class ListLLM:
+        async def complete_json(self, prompt, system, **kw):
+            return ["not", "an", "object"]
+
+    with pytest.raises(ST.GenerationError, match="JSON object"):
+        await ST.complete_json(ListLLM(), "p", "s")
+
+
+def test_plural_locator_slip_collapses_to_singular():
+    # survey-run wire: nodes wrote "locators" — one element collapses to the
+    # singular slot; two elements are ambiguous and must stay a hard error.
+    ev: list[str] = []
+    data = {"t1": {"statement": "x", "locators": [
+                       {"doc_id": "a.pdf", "start_line": 4}]},
+            "t2": {"statement": "y", "locators": [
+                       {"doc_id": "a.pdf", "start_line": 4},
+                       {"doc_id": "a.pdf", "start_line": 9}]}}
+    out = ST.repair_wire_slips(data, ev)
+    assert out["t1"]["locator"] == {"doc_id": "a.pdf", "start_line": 4}
+    assert "locators" not in out["t1"]
+    assert "locators" in out["t2"] and "locator" not in out["t2"]
+    assert any("plural locators" in e for e in ev)
+
+
 def test_unparseable_string_locator_left_for_validation():
     data = {"locator": "somewhere around the intro"}
     ev: list[str] = []

@@ -227,7 +227,7 @@ class ToolKitPipeline:
         """
         if self.tool == "slides":
             from .deck.generator import run_direct_generation
-            from .deck.ingest import build_document_representation
+            from .deck.ingest import build_document_representation, clean_source_name
             from .deck.schema import PresentationControls
             from .deck.workflow_driver import run_presentation_workflow
 
@@ -263,7 +263,7 @@ class ToolKitPipeline:
                 "brief": brief.model_dump(mode="json"),
                 "document_title": doc_rep.document_title,
                 "presentation_goal": controls.presentation_goal,
-                "source_names": [s.name for s in sources],
+                "source_names": [clean_source_name(s.name) for s in sources],
                 # the render stage re-embeds referenced slices by asset id (§9.3)
                 "visual_assets": [a.model_dump(mode="json")
                                   for a in doc_rep.visual_assets],
@@ -354,6 +354,20 @@ class ToolKitPipeline:
                     render_brief_pdf, brief, assets, _P(td),
                     document_title=data.get("document_title", ""),
                     source_names=list(data.get("source_names") or []))
+            # Render instrumentation (zero LLM): the page contract stated with the
+            # cover counted separately from the content slides, and the compiler's
+            # explicit degradations — on success they had no home before, which
+            # made "a grammar that never landed" invisible in the job record.
+            if getattr(self, "_deck_stats", None):
+                self._deck_stats["E/render"] = {
+                    "calls": 0, "llm_seconds": 0.0,
+                    "local_seconds": None,
+                    "pages_expected": res.report.pages_expected,
+                    "pages_actual": res.report.pages_actual,
+                    "cover_pages": 1,
+                    "content_slides": len(brief.slides),
+                    "layout_warnings": list(res.report.layout_warnings),
+                }
             if not res.report.ok:
                 raise GenerationError(
                     "deck PDF render failed: "

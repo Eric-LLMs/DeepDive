@@ -450,6 +450,15 @@ async def test_slides_direct_default_writes_all_artifacts(tmp_path):
     assert len(brief["slides"]) == 3
     pdf = next(Path(f) for f in result.files if f.endswith(".pdf"))
     assert _pdf_page_count(pdf) == 4           # 1 cover + 3 content slides
+    # render instrumentation: the page contract states cover vs content apart,
+    # and the compiler's explicit degradations are visible in the job record
+    er = result.stats["E/render"]
+    assert er["pages_expected"] == er["pages_actual"] == 4
+    assert er["cover_pages"] == 1 and er["content_slides"] == 3
+    assert er["calls"] == 0
+    # the scripted brief's 1-card flow slides degrade at render — the point of
+    # this stat entry is that such degradations are now VISIBLE in the record
+    assert all("fell back" in w for w in er["layout_warnings"])
 
 
 def _pdf_page_count(pdf: Path) -> int:

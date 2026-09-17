@@ -179,6 +179,14 @@ def run_qa_suite(brief: S.PresentationBrief, *,
             elif not Path(assets[rid].path).is_file():
                 warn("plan", f"asset {rid!r} file is missing; the renderer will fall "
                              "back to cards loudly", s.slide_index)
+        if rid and s.visual_spec.grammar not in (
+                S.VisualGrammar.SOURCE_FIGURE_REUSE, S.VisualGrammar.ANNOTATED_FIGURE):
+            # the schema bans this combination; the gate keeps the ban visible as a
+            # slide-level error (patchable), never a silent drop at render time
+            err("plan", f"reuse_asset_id {rid!r} paired with structural grammar "
+                        f"{s.visual_spec.grammar.value}: figure reuse is legal only "
+                        "on SOURCE_FIGURE_REUSE/ANNOTATED_FIGURE — promote the slide "
+                        "to a figure slide or drop the asset", s.slide_index)
     # 3. number traceability
     grounded = _grounded_forms(brief)
     for s in brief.slides:

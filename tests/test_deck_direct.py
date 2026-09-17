@@ -1,8 +1,9 @@
 """Direct engine tests: the one-semantic-call generator + local compiler + SLIDE_PATCH.
 
 Deterministic throughout (scripted FakeLLM, tmp_path figure, zero network). Pins:
-the five-node stats vocabulary, both loud local rescues, reroll ≤2 with condensed
-feedback, honest exhaustion, single-slide patching with sibling zero-drift, and the
+the five-node stats vocabulary, the three loud local rescues, reroll ≤2 with condensed
+feedback, honest exhaustion, single-slide patching with sibling zero-drift, the
+figure-pairing contract (schema ban + promotion to a real rendered figure), and the
 direct prompt's enum mirrors (same no-drift contract as the legacy prompt pins in
 test_deck_workflow.py).
 """
@@ -22,6 +23,7 @@ from apps.api.tools.toolkit.deck.generator import (
     STATS_TEXT,
     STATS_VISUAL,
     pack_sections_local,
+    rescue_figure_pairing,
     rescue_policy_from_grammar,
     run_direct_generation,
 )
@@ -182,6 +184,93 @@ def test_rescue_never_touches_legal_policy():
     events: list[str] = []
     rescue_policy_from_grammar(good, events)
     assert events == []
+
+
+# ── figure pairing: reuse_asset_id may only live on a figure grammar ──────────
+
+def _spec(**over) -> dict:
+    base = {"visual_spec_id": "v1", "grammar": "TIMELINE",
+            "policy": "EXPLANATORY_DIAGRAM", "semantic_intent": "x"}
+    base.update(over)
+    return base
+
+
+def test_schema_bans_rid_on_structural_grammar():
+    with pytest.raises(Exception, match="only legal on SOURCE_FIGURE_REUSE"):
+        S.VisualSpec.model_validate(_spec(
+            policy="SOURCE_FIDELITY", reuse_asset_id="fig_1"))
+
+
+def test_schema_still_allows_the_canonical_figure_pair():
+    spec = S.VisualSpec.model_validate(_spec(
+        grammar="SOURCE_FIGURE_REUSE", policy="SOURCE_FIDELITY",
+        reuse_asset_id="fig_1"))
+    assert spec.reuse_asset_id == "fig_1"
+
+
+def test_pairing_rescue_promotes_figure_slide(tmp_path):
+    doc_rep = make_doc_rep(tmp_path)
+    data = {"slides": [{"visual_spec": _spec(
+        policy="SOURCE_FIDELITY", reuse_asset_id="fig_1")}]}
+    events: list[str] = []
+    rescue_figure_pairing(data, events, doc_rep.asset_map())
+    spec = data["slides"][0]["visual_spec"]
+    assert spec["grammar"] == "SOURCE_FIGURE_REUSE"
+    assert spec["policy"] == "SOURCE_FIDELITY" and spec["reuse_asset_id"] == "fig_1"
+    assert events and "promoted" in events[0]
+    # the promoted spec now validates — the figure will reach a real slot
+    S.VisualSpec.model_validate({k: v for k, v in spec.items()
+                                 if k != "_pairing_events"})
+
+
+def test_pairing_rescue_drops_missing_asset_never_fakes(tmp_path):
+    doc_rep = make_doc_rep(tmp_path)
+    data = {"slides": [{"visual_spec": _spec(
+        policy="SOURCE_FIDELITY", reuse_asset_id="ghost")}]}
+    events: list[str] = []
+    rescue_figure_pairing(data, events, doc_rep.asset_map())
+    spec = data["slides"][0]["visual_spec"]
+    assert spec["grammar"] == "TIMELINE"
+    assert spec["policy"] == "EXPLANATORY_DIAGRAM"
+    assert spec["reuse_asset_id"] is None
+    assert events and "never faked" in events[0]
+
+
+def test_pairing_rescue_leaves_legal_specs_alone(tmp_path):
+    doc_rep = make_doc_rep(tmp_path)
+    data = {"slides": [{"visual_spec": _spec()}, {"visual_spec": {
+        "visual_spec_id": "v2", "grammar": "SOURCE_FIGURE_REUSE",
+        "policy": "SOURCE_FIDELITY", "semantic_intent": "x",
+        "reuse_asset_id": "fig_1"}}]}
+    events: list[str] = []
+    rescue_figure_pairing(data, events, doc_rep.asset_map())
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_direct_wires_the_slip_into_a_rendered_figure(tmp_path):
+    """The observed survey-deck slip: policy=SOURCE_FIDELITY + reuse_asset_id on
+    a TIMELINE. It must NOT reroll and must NOT drop the figure — the slide is
+    promoted so the asset lands in a template with a real figure slot."""
+    doc_rep = make_doc_rep(tmp_path)
+    slipped = copy.deepcopy(brief_payload())
+    slipped["slides"][1]["visual_spec"] = {
+        "visual_spec_id": "v2", "grammar": "TIMELINE",
+        "policy": "SOURCE_FIDELITY", "semantic_intent": "the survey figure",
+        "reuse_asset_id": "fig_1"}
+    llm = ScriptedLLM([slipped])
+    stats: dict = {}
+    brief = await _run(llm, doc_rep, stats)
+    assert len(llm.prompts) == 1                       # no reroll burned
+    assert brief.slides[1].visual_spec.grammar == S.VisualGrammar.SOURCE_FIGURE_REUSE
+    rep = stats[STATS_REDUCE]["repairs"]
+    assert any("promoted to SOURCE_FIGURE_REUSE" in e for e in rep)
+    # and the layout compiler carries the asset file to the renderer
+    from apps.api.tools.toolkit.deck.compiler.layout_engine import build_slide_layout
+    lay = build_slide_layout(brief.slides[1], brief.traceability_graph,
+                             doc_rep.asset_map())
+    assert lay.fn == "figureSlide" and lay.figure_src
+    assert lay.fallback_reason is None
 
 
 # ── reroll ≤2 with condensed feedback, honest exhaustion ─────────────────────

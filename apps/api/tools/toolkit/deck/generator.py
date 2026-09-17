@@ -16,7 +16,8 @@ engines):
 * ``D/synthesize``     SYNTHESIZE — the single semantic generation; failures
   reroll at most :data:`MAX_REROLLS` times with condensed error feedback.
 * ``C/reduce_local``   REDUCE — pure local canonicalization: mechanical
-  wire-slip repair + two loud enum rescues + schema/echo validation.
+  wire-slip repair + three loud rescues (policy-from-grammar, figure pairing,
+  chart-degrade) + schema/echo validation.
 * ``D/patch_{i}``      SLIDE_PATCH — single-slide diff repair (new node,
   :mod:`.repair`); siblings never enter the model context.
 
@@ -28,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from . import prompts as P
@@ -149,6 +151,56 @@ def rescue_policy_from_grammar(data: dict, events: list[str]) -> None:
                           "-> EXPLANATORY_DIAGRAM (no fabricated chart data)")
 
 
+# The two grammars that legitimately own a reuse_asset_id (schema pairing rule).
+_FIGURE_GRAMMARS = {"SOURCE_FIGURE_REUSE", "ANNOTATED_FIGURE"}
+
+
+def _pair_one_spec(spec: dict, known_assets: dict[str, Any], label: str) -> None:
+    """Canonize one visual_spec's figure pairing; appends a loud event when it
+    touches anything. Shared by the REDUCE loop and SLIDE_PATCH merge."""
+    rid = spec.get("reuse_asset_id")
+    grammar = spec.get("grammar")
+    if grammar in _FIGURE_GRAMMARS or not rid:
+        return
+    events = spec.setdefault("_pairing_events", [])
+    asset = known_assets.get(rid)
+    if asset is not None and Path(asset.path).is_file():
+        events.append(f"{label}: reuse_asset_id {rid!r} on structural grammar "
+                      f"{grammar!r} -> promoted to SOURCE_FIGURE_REUSE "
+                      "(figure renders; cards become side notes)")
+        spec["grammar"] = "SOURCE_FIGURE_REUSE"
+        spec["policy"] = "SOURCE_FIDELITY"
+    else:
+        events.append(f"{label}: reuse_asset_id {rid!r} on structural grammar "
+                      f"{grammar!r} names no on-disk asset -> rid dropped, "
+                      "policy demoted to EXPLANATORY_DIAGRAM (never faked)")
+        spec["reuse_asset_id"] = None
+        if spec.get("policy") == "SOURCE_FIDELITY":
+            spec["policy"] = "EXPLANATORY_DIAGRAM"
+
+
+def rescue_figure_pairing(data: dict, events: list[str],
+                          known_assets: dict[str, Any]) -> None:
+    """Loud rescue for the observed wire slip: the model expresses figure reuse
+    as ``policy=SOURCE_FIDELITY`` + ``reuse_asset_id`` on a STRUCTURAL grammar
+    (e.g. TIMELINE over Figure 1). The schema bans the combination because no
+    structural template has a slot for a figure — left alone it would reroll the
+    whole deck or, worse, be silently dropped. Instead we canonize the intent:
+
+    (1) asset exists on disk  → promote the slide to SOURCE_FIGURE_REUSE (its
+        cards become the figure's side notes — the figure really renders);
+    (2) asset unknown or gone → drop the rid and demote SOURCE_FIDELITY to
+        EXPLANATORY_DIAGRAM (a missing source figure is never faked).
+
+    Only touches specs that the schema would reject anyway. Never silent."""
+    for i, slide in enumerate(data.get("slides") or [], 1):
+        spec = slide.get("visual_spec") if isinstance(slide, dict) else None
+        if not isinstance(spec, dict):
+            continue
+        _pair_one_spec(spec, known_assets, f"slide {i}")
+        events.extend(spec.pop("_pairing_events", []))
+
+
 # ── the engine ────────────────────────────────────────────────────────────────
 
 async def run_direct_generation(
@@ -219,6 +271,7 @@ async def run_direct_generation(
         events: list[str] = []
         ST.repair_wire_slips(data, events)
         rescue_policy_from_grammar(data, events)
+        rescue_figure_pairing(data, events, doc_rep.asset_map())
         errs = validate(P.BRIEF_SCHEMAS["brief"], data)
         model: S.PresentationBrief | None = None
         if not errs:
@@ -261,7 +314,8 @@ async def run_direct_generation(
         logger.info("direct %s slide %d patched for %d gate issue(s)",
                     deck_id, idx, len(by_slide[idx]))
         brief = await REPAIR.patch_slide(
-            llm, brief, idx, by_slide[idx], sections, controls, stats=stats)
+            llm, brief, idx, by_slide[idx], sections, controls, stats=stats,
+            asset_map=doc_rep.asset_map())
         report = QA.run_qa_suite(brief, assets=doc_rep.asset_map(),
                                  valid_sections=valid_sections)
     if report.errors:

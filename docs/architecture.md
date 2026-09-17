@@ -732,10 +732,10 @@ generate stage — direct engine (inside the 5-stage toolkit pipeline)
 │                                    list re-fed into the prompt        │
 │ REDUCE             C/reduce_local   0 LLM — post-generation           │
 │                                    canonicalization: mechanical       │
-│                                    wire-slip repair + loud            │
-│                                    policy-from-grammar rescues +      │
-│                                    jsonschema + deck-id echo +        │
-│                                    closed-world checks                │
+│                                    wire-slip repair + loud rescues    │
+│                                    (policy-from-grammar, figure       │
+│                                    pairing) + jsonschema + deck-id    │
+│                                    echo + closed-world checks         │
 │ SLIDE_PATCH      D/patch_{slide}    slide-level QA defects re-prompt  │
 │                                    ONLY the offending slide + its     │
 │                                    cited trace nodes + the source     │
@@ -777,13 +777,28 @@ have their string parts joined back into the one sentence the slot wants (nested
 duplicate first-class fields are dropped; the text itself is never rewritten); nulls on
 optional fields are stripped; invented relation labels on edges are pruned loudly.
 Ambiguous or unknown values stay hard errors — repair never trims or invents.
-The direct engine's REDUCE adds two further loud local rescues, applied only to an
-already-invalid `policy`: a grammar value slipped into the policy field is re-derived from
-the slide's grammar (figure reuse → `SOURCE_FIDELITY`, a `DATA_CHART` carrying a real
-`generation_spec` → `QUANTITATIVE_CODE`, otherwise `EXPLANATORY_DIAGRAM`), and a derived
-`QUANTITATIVE_CODE` without a `generation_spec` downgrades the drawing medium to
-`EXPLANATORY_DIAGRAM` — fabricating chart data is forbidden. Both land in the stats'
-`repairs` list, never silent.
+The direct engine's REDUCE adds further loud local rescues. The policy-from-grammar
+rescue applies only to an already-invalid `policy`: a grammar value slipped into the
+policy field is re-derived from the slide's grammar (figure reuse → `SOURCE_FIDELITY`, a
+`DATA_CHART` carrying a real `generation_spec` → `QUANTITATIVE_CODE`, otherwise
+`EXPLANATORY_DIAGRAM`), and a derived `QUANTITATIVE_CODE` without a `generation_spec`
+downgrades the drawing medium to `EXPLANATORY_DIAGRAM` — fabricating chart data is
+forbidden. The figure-pairing rescue canonizes the observed slip of expressing figure
+reuse as `policy=SOURCE_FIDELITY` + `reuse_asset_id` on a **structural** grammar (a
+timeline "over Figure 1"): `VisualSpec` pairs the field in both directions —
+`reuse_asset_id` is legal only on `SOURCE_FIGURE_REUSE` / `ANNOTATED_FIGURE` — so the
+combination is schema-invalid; with the named asset on disk the slide is promoted to a
+figure slide (its cards become the figure's side notes, so the original figure really
+renders), and with the asset missing the id is dropped and the policy demoted to
+`EXPLANATORY_DIAGRAM` — a missing source figure is never faked. The same rescue runs on
+SLIDE_PATCH replies. All rescues land in the stats' `repairs` list, never silent, and the
+QA suite repeats the pairing ban as a slide-level gate for consumers that bypass the
+direct REDUCE. The pairing rule lives in exactly one place — the `VisualSpec` validator
+in `deck/schema.py` — which makes a silently-dropped asset structurally impossible: the
+layout dispatch reads the field only on the two figure grammars (the only templates with
+a figure slot), so a named asset either renders or fails the gates loudly; the QA
+dry-run surfaces a missing on-disk asset as a visible cards fallback and the PPTX
+builder raises outright for a vanished figure.
 
 **Actionable corrective retries.** Condensed schema errors are rewritten into instructions,
 not just echoed: a missing FACT locator becomes an exact-shape directive — add **only** a
@@ -801,13 +816,23 @@ provider usage (via the streaming wire's usage chunk): `calls` / `rejected` / `l
 `prompt_tokens` / `completion_tokens` / deterministic `repairs` applied. Direct's three
 local nodes ship in the same vocabulary with `calls: 0` plus a measured `local_seconds`
 (`A/text_local`, `B/visual_skipped`, `C/reduce_local`), so one stats shape covers both
-engines. The stats log at
+engines. The zero-LLM render leg reports its own `E/render` entry: the page contract
+stated with the cover counted apart from the content slides (`cover_pages` /
+`content_slides` / `pages_expected = 1 + content_slides` / `pages_actual`) plus the
+compiler's `layout_warnings`, so a grammar that degraded during rendering is visible in
+the job record instead of only in the PDF. The stats log at
 INFO as `BRIEF STATS` lines and ride `ToolKitResult.stats` into the job result as
 `deck_stats`; the stats dict is attached to the pipeline **before** the workflow awaits, so
 even a failed run exposes how far it got and what it spent. Offline harvesters (e.g.
 `scripts/smoke_test_slides.py`) instrument the five lifecycle stages with wall-clock timers
 and archive the full stats + traceback on failure, so per-node token spend, latency, retry
 counts, and repair events are queryable per run for P50/P95 analysis.
+
+**Presentation-facing source names.** Workspace sources arrive with per-run staging
+tails (the temp-file tag both generation paths append; a transcript name may also carry
+a duplicated extension). Ingest cleans them once (`ingest.clean_source_name`) so the
+cover title, the `Sources:` line and every `[name:line]` citation show the human
+document name, never an internal handle.
 
 Dialog knobs are **routed per pass, not concatenated**: the slides "Customize Slide Deck"
 dialog submits `{file_ids, prompt, count, language, format_mode}`; `count` clamps to

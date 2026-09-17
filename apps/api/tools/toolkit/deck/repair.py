@@ -85,10 +85,13 @@ def _merge(brief: S.PresentationBrief, patch: dict,
 async def patch_slide(llm: Any, brief: S.PresentationBrief, target: int,
                       issues: list[str], sections: list[dict],
                       controls: S.PresentationControls, *,
-                      stats: dict | None = None) -> S.PresentationBrief:
+                      stats: dict | None = None,
+                      asset_map: dict[str, Any] | None = None) -> S.PresentationBrief:
     """Repair one slide with ≤ MAX_SLIDE_PATCHES model calls; returns the merged
     brief or raises. The reply contract is the slide diff — the rest of the deck
-    is never sent and never rewritten."""
+    is never sent and never rewritten. ``asset_map`` enables the same loud
+    figure-pairing rescue the REDUCE leg runs (the patch reply may reintroduce
+    the slip)."""
     slide = brief.slide_map().get(target)
     if slide is None:
         raise GenerationError(f"SLIDE_PATCH: slide {target} not in the brief")
@@ -113,8 +116,16 @@ async def patch_slide(llm: Any, brief: S.PresentationBrief, target: int,
             raise GenerationError(f"SLIDE_PATCH slide {target}: LLM call failed: {exc}") \
                 from exc
         events: list[str] = []
-        ST.repair_wire_slips(data, events)
         ST.record_attempt(stats, label, t0, usage, rejected=False)
+        ST.repair_wire_slips(data, events)
+        spec = data.get("slide", {}).get("visual_spec") \
+            if isinstance(data.get("slide"), dict) else None
+        if isinstance(spec, dict) and asset_map is not None:
+            # same loud pairing rescue as REDUCE — the patch reply may reintroduce
+            # the structural-grammar-with-asset slip
+            from .generator import _pair_one_spec
+            _pair_one_spec(spec, asset_map, f"patch slide {target}")
+            events.extend(spec.pop("_pairing_events", []))
         if events and stats is not None:
             ST.record_repairs(stats, label, events)
         errs = validate(P.BRIEF_SCHEMAS["slide_patch"], data)

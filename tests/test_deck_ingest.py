@@ -101,6 +101,43 @@ def test_guess_document_title_prefers_h1():
     assert IG.guess_document_title("no heading here", "fallback") == "fallback"
 
 
+# ── staging-tag hygiene: no internal temp names on covers or citations ────────
+
+@pytest.mark.parametrize("raw, clean", [
+    # worker shape: sanitize_name(full filename) keeps ".pdf", plus _{job8hex}
+    ("Agent Harness Engineering A Survey.pdf_ab12cd34.pdf",
+     "Agent Harness Engineering A Survey"),
+    # session-transcript shape: stem + _{job8hex}, no duplicated extension
+    ("Weekly sync_ab12cd34.md", "Weekly sync"),
+    # bare tag, extension already absent
+    ("Big Doc_deadbeef", "Big Doc"),
+    # ordinary names survive untouched
+    ("paper.pdf", "paper"),
+    ("report", "report"),
+    ("Big Doc", "Big Doc"),
+    ("Notes 2026", "Notes 2026"),
+])
+def test_clean_source_name_strips_staging_artifacts(raw, clean):
+    assert IG.clean_source_name(raw) == clean
+
+
+def test_clean_source_name_is_idempotent():
+    once = IG.clean_source_name("Big Doc.pdf_deadbeef.pdf")
+    assert once == "Big Doc"
+    assert IG.clean_source_name(once) == once
+
+
+async def test_pdf_staging_name_never_reaches_doc_id(tmp_path):
+    pdf = tmp_path / "Survey.pdf_ab12cd34.pdf"
+    _make_pdf(pdf)
+    src = _src("body line one\nline two\n", name=pdf.name, path=pdf)
+    rep = await IG.build_document_representation(
+        [src], workspace=tmp_path, deck_id="d9")
+    assert rep.doc_id == "Survey"
+    assert all(b.locator.doc_id == "Survey" for b in rep.text_blocks)
+    assert "ab12cd34" not in rep.document_title
+
+
 # ── visual channel (PDF physics) ─────────────────────────────────────────────
 
 async def test_pdf_ingest_three_channels_with_provenance(tmp_path):
@@ -142,7 +179,7 @@ async def test_non_pdf_source_is_text_only(tmp_path):
         [_src("# My Doc\n\nsome transcript content\n")], workspace=tmp_path, deck_id="d2")
     assert rep.visual_assets == []
     assert rep.document_title == "My Doc"
-    assert rep.doc_id == "doc.md" and rep.page_count == 1
+    assert rep.doc_id == "doc" and rep.page_count == 1   # staging-cleaned name
     assert not (tmp_path / IG.ASSET_DIR / "d2").exists()   # nothing to write, nothing made
 
 

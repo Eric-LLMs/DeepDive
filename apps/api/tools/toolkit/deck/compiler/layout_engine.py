@@ -401,6 +401,10 @@ def build_slide_layout(plan: S.SlidePlan, traceability: dict[str, S.Traceability
                        theme: ThemeTokens = ACADEMIC_LIGHT) -> BriefSlideLayout:
     spec = plan.visual_spec
     g = spec.grammar
+    # schema pairing rule: reuse_asset_id exists only on the two figure
+    # grammars — every asset the brief names therefore reaches a template with a
+    # real figure slot (or the QA/patch legs made it fail loudly upstream);
+    # there is no structural path that can drop an asset on the floor.
     asset = assets.get(spec.reuse_asset_id or "")
     asset_ok = bool(asset) and Path(asset.path).is_file()
     frame = chart_frame(spec.generation_spec) \

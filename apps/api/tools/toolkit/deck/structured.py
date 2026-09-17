@@ -67,20 +67,35 @@ async def complete_json(llm, prompt: str, system: str,
     """
     fn = getattr(llm, "complete_json", None)
     if fn is not None:
+        sentinel = object()
+        data = sentinel
         try:
-            return await fn(prompt, system, timeout=timeout, usage_out=usage_out,
+            data = await fn(prompt, system, timeout=timeout, usage_out=usage_out,
                             images=images)
         except TypeError:
             try:
-                return await fn(prompt, system, timeout=timeout, usage_out=usage_out)
+                data = await fn(prompt, system, timeout=timeout, usage_out=usage_out)
             except TypeError:
-                return await fn(prompt, system, timeout=timeout)
+                data = await fn(prompt, system, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - best-effort, fall back
             logger.info("complete_json unavailable (%s); falling back to parse", exc)
+        if data is not sentinel:
+            return _require_object(data)
     raw = await llm.complete(prompt, system, timeout=timeout)
     data = extract_json(raw)
     if data is None:
         raise GenerationError("model response was not valid JSON")
+    return _require_object(data)
+
+
+def _require_object(data: Any) -> dict:
+    """The wire contract is a JSON OBJECT. A model that replies with an array or
+    a bare scalar used to crash the first ``.get`` downstream with a bare
+    AttributeError ("'list' object has no attribute 'get'") — honest but
+    useless. Fail as a clear GenerationError instead."""
+    if not isinstance(data, dict):
+        raise GenerationError(
+            f"model reply must be a JSON object, got {type(data).__name__}")
     return data
 
 
@@ -254,6 +269,21 @@ def repair_wire_slips(data: Any, events: list[str] | None = None) -> Any:
             node["provenance"] = node.pop("provisionance")
             if events is not None:
                 events.append("typo provisionance->provenance")
+        # plural-slip: a node writing "locators" (the survey-run wire) is the
+        # singular locator slot; a single-element list collapses, more than one
+        # is ambiguous and stays a loud schema error.
+        if "locators" in node and "locator" not in node:
+            lks = node["locators"]
+            if isinstance(lks, list) and len(lks) == 1:
+                node["locator"] = lks[0]
+                node.pop("locators")
+                if events is not None:
+                    events.append("plural locators[1] -> locator")
+            elif isinstance(lks, dict):
+                node["locator"] = lks
+                node.pop("locators")
+                if events is not None:
+                    events.append("plural locators -> locator")
         for field, allowed in _ENUM_TABLE.items():
             if field in node:
                 fixed = _norm_enum(node[field], allowed)

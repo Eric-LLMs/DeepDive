@@ -358,6 +358,13 @@ class VisualSpec(BaseModel):
                 raise ValueError(f"{self.grammar.value} requires SOURCE_FIDELITY policy")
             if not self.reuse_asset_id:
                 raise ValueError(f"{self.grammar.value} requires reuse_asset_id")
+        elif self.reuse_asset_id:
+            # pairing runs both ways: a rid on a structural grammar would be a
+            # figure the template has no slot for — the renderer must never be
+            # asked to silently drop an asset, so the combination is illegal.
+            raise ValueError(
+                f"reuse_asset_id is only legal on SOURCE_FIGURE_REUSE/"
+                f"ANNOTATED_FIGURE grammars, not on {self.grammar.value}")
         if self.policy == VisualGenerationPolicy.QUANTITATIVE_CODE and not self.generation_spec:
             raise ValueError("QUANTITATIVE_CODE needs a generation_spec (labels/values/points)")
         return self

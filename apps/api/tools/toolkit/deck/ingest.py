@@ -40,6 +40,27 @@ _MSG_MARKER_RE = re.compile(r"^<!--\s*msg:(\S+)\s*-->\s*$")
 _CAPTION_RE = re.compile(
     r"(?im)^\s*((?:figure|fig\.|table|chart)\s\S[^\n]{0,160}|[图表]\s*\d[^\n]{0,80})"
 )
+# staging artifacts on a workspace source name, stripped tail-first, repeatedly:
+# a trailing extension (".pdf"/".md") and the per-run hex tag both call sites
+# append ("Title.pdf_ab12cd34.pdf", "Title_ab12cd34.md", "Title_it40fe.pdf").
+_STAGING_TAIL_RE = re.compile(
+    r"(?:\.[A-Za-z][A-Za-z0-9]{1,5}|_[0-9a-f]{4,12})$")
+
+
+def clean_source_name(name: str) -> str:
+    """Presentation-facing source name: strip staging tags and a duplicated
+    extension so covers and ``[name:line]`` citations show the human document
+    name, never an internal temp-file handle. Only a pure-lowercase-hex tail
+    counts as a tag (``report_v2`` stays intact); ordinary names are untouched
+    except the one trailing extension."""
+    cur = name.strip()
+    while True:
+        nxt = _STAGING_TAIL_RE.sub("", cur, count=1)
+        if not nxt.strip():                    # refuse to clean a name away
+            return name
+        if nxt == cur:
+            return cur.strip()
+        cur = nxt
 
 
 # ── text channel (deterministic, shared by every source kind) ────────────────
@@ -243,18 +264,25 @@ async def build_document_representation(
     page_count = 1
     title = ""
     for si, src in enumerate(sources, 1):
-        blocks.extend(blocks_from_text(src.text, src.name, first_id=len(blocks) + 1))
+        # one presentation-facing name per source: text-block doc_ids, PDF
+        # citations and the title fallback all agree, and none of them can show
+        # a staging tag (the temp names both call sites append would otherwise).
+        display_name = clean_source_name(src.name)
+        blocks.extend(blocks_from_text(src.text, display_name,
+                                       first_id=len(blocks) + 1))
         path = Path(src.path)
         if path.suffix.lower() == ".pdf":
             pc, pdf_title, new_assets = await asyncio.to_thread(
-                _ingest_pdf_sync, path, src.name, si, assets_dir, cfg)
+                _ingest_pdf_sync, path, display_name, si, assets_dir, cfg)
             page_count = pc
             visuals.extend(new_assets)
             title = title or pdf_title
     if not title:
-        title = guess_document_title(sources[0].text, Path(sources[0].name).stem)
+        title = guess_document_title(sources[0].text,
+                                     Path(clean_source_name(sources[0].name)).stem)
     return S.DocumentRepresentation(
-        doc_id=sources[0].name, document_title=title, page_count=page_count,
+        doc_id=clean_source_name(sources[0].name), document_title=title,
+        page_count=page_count,
         text_blocks=blocks, visual_assets=visuals,
     )
 
