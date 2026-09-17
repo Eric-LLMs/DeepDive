@@ -680,10 +680,12 @@ The generate stage applies the 2026-09-15 input doctrine: `toolkit_max_input_tok
 At or below it the generator receives the complete raw text in **one call**. Above it the
 pipeline enters the **explicit big-document multi-call flow** (`sources.plan_big_document`):
 the raw text is split into line-tracked batches (original names kept, per-batch line
-offsets), each grounding call sees only its batch's RAW text (for `slides` this is Pass A
-per batch; the fact bases merge deterministically — ids renumbered globally, line locators
-shifted to absolute source lines), and `summary`/`mindmap` partial outputs are joined
-structurally (bullets/sections/branches concatenated, batch citations remapped). No partial
+offsets), each grounding call sees only its batch's RAW text, and `summary`/`mindmap`
+partial outputs are joined structurally (bullets/sections/branches concatenated, batch
+citations remapped). The `slides` engine does not consume the batch plan — **direct**
+(default) carries the complete raw text to its one semantic call (an input beyond model
+context fails loudly there, never digested), and **legacy** grounds per chunk internally.
+No partial
 ever becomes a re-summarization input, nothing runs silently — the switch is a WARN in the
 worker log and a note in the job's one-line summary.
 
@@ -702,21 +704,62 @@ estimates.
 jsonschema-validated, one corrective retry that carries the concrete — condensed, ≤240-char —
 schema errors back into the prompt). `slides` **generate** runs the dedicated
 **content-to-slides deck engine** (`toolkit/deck/`, full spec
-[docs/content-to-slides.md](content-to-slides.md)) — the **brief chain**, the single
-generation path. Four LLM passes fan out per logical node:
-**A section-understanding** (`A/text_i` — one grounded call per concept batch; every fact
-carries a doc/page/line locator) → **B visual-understanding** (`B/visual_<asset_id>` — one
-multimodal call per extracted figure) → **C hierarchical reduce** (`C/reduce_gN` group calls
-when sections exceed `reduce_group_threshold` (15), then a final `C/reduce` merge —
-VERBATIM section-echo is contract-enforced) → **D synthesize** (`D/synthesize` — one call
-emitting the canonical `PresentationBrief`), followed by **bounded QA repair** inside the
-synthesize stage: gate violations re-prompt only the defective slide
-(`D-repair/<slide>`), speaker notes (`D-repair/notes_*`), or, for graph/global defects, one
-full re-synthesis (`D-repair/resynth`). The brief drives deterministic, zero-LLM layout
-compilation (Pillow self-drawn visuals + native editable `.pptx` / Typst PDF renderers).
-Canonical artifact is the compiled 16:9 **`<name>_slides.pdf`**, alongside `.md` / `.pptx` /
-`deck.json` exports of the same brief; **no silent trimming anywhere** — a slide still
-violating its gates after its corrective re-run fails the job loudly.
+[docs/content-to-slides.md](content-to-slides.md)). The engine is selected by
+`settings.slides_generation_mode` (default **`direct`**; a request may override per job via
+`generation_mode`). **direct** makes exactly **one semantic LLM call** —
+the model performs the whole understand-and-design step, treating the deck as **visual
+storytelling** across eight narrative dimensions (overview, process, key concepts,
+relationships, evidence, examples, visual decisions, takeaway) — while every other step is
+deterministic local code, inside five generate-internal nodes:
+
+```
+generate stage — direct engine (inside the 5-stage toolkit pipeline)
+┌───────────────────────────────────────────────────────────────────────┐
+│ TEXT_UNDERSTAND    A/text_local     0 LLM — sec_i packing of the text │
+│                                    blocks with real line locators:    │
+│                                    the address system the brief's     │
+│                                    source_section_ids / traceability  │
+│                                    graph must cite                    │
+│ VISUAL_UNDERSTAND  B/visual_skipped 0 LLM — the extracted-figure menu │
+│                                    rides the prompt as reuse          │
+│                                    candidates; unchosen figures are   │
+│                                    simply never mounted (nothing is  │
+│                                    deleted)                           │
+│ SYNTHESIZE         D/synthesize     ONE call → canonical              │
+│                  (+ D/reroll_i)     PresentationBrief; a reply that   │
+│                                    fails REDUCE rerolls at most 2     │
+│                                    times with the condensed error     │
+│                                    list re-fed into the prompt        │
+│ REDUCE             C/reduce_local   0 LLM — post-generation           │
+│                                    canonicalization: mechanical       │
+│                                    wire-slip repair + loud            │
+│                                    policy-from-grammar rescues +      │
+│                                    jsonschema + deck-id echo +        │
+│                                    closed-world checks                │
+│ SLIDE_PATCH      D/patch_{slide}    slide-level QA defects re-prompt  │
+│                                    ONLY the offending slide + its     │
+│                                    cited trace nodes + the source     │
+│                                    excerpt (≤2 calls/slide); the      │
+│                                    server merges the reply, so        │
+│                                    siblings are zero-drift by         │
+│                                    construction                       │
+└──────────────────────────────┬────────────────────────────────────────┘
+                               ▼ shared tail (both engines)
+                bounded QA gates → render → persist
+```
+
+The brief drives deterministic, zero-LLM layout compilation (Pillow self-drawn visuals +
+native editable `.pptx` / Typst PDF renderers) — the local renderer only realizes the
+content and visual intent the model decided; it never decides *what to say*. Canonical
+artifact is the compiled 16:9 **`<name>_slides.pdf`**, alongside `.md` / `.pptx` /
+`deck.json` exports of the same brief; **no silent trimming anywhere** — reroll or patch
+exhaustion fails the job loudly, partial stats included. **legacy**
+(`generation_mode="legacy"`) keeps the four-pass brief chain whole as the
+config-switchable fallback: **A section-understanding** (`A/text_i` — one grounded call per
+concept batch) → **B visual-understanding** (`B/visual_<asset_id>` — one multimodal call
+per extracted figure) → **C hierarchical reduce** (`C/reduce_gN` group calls above
+`reduce_group_threshold` (15), then `C/reduce` merge) → **D synthesize** (`D/synthesize`)
+plus the bounded `D-repair/*` matrix (per-slide, per-notes, and full-resynth rewrites).
 
 **Deterministic wire-slip repair before validation.** The model reproduces the same *format*
 slips on every corrective retry, so a pure retry loop cannot converge on them; the engine
@@ -734,18 +777,31 @@ have their string parts joined back into the one sentence the slot wants (nested
 duplicate first-class fields are dropped; the text itself is never rewritten); nulls on
 optional fields are stripped; invented relation labels on edges are pruned loudly.
 Ambiguous or unknown values stay hard errors — repair never trims or invents.
+The direct engine's REDUCE adds two further loud local rescues, applied only to an
+already-invalid `policy`: a grammar value slipped into the policy field is re-derived from
+the slide's grammar (figure reuse → `SOURCE_FIDELITY`, a `DATA_CHART` carrying a real
+`generation_spec` → `QUANTITATIVE_CODE`, otherwise `EXPLANATORY_DIAGRAM`), and a derived
+`QUANTITATIVE_CODE` without a `generation_spec` downgrades the drawing medium to
+`EXPLANATORY_DIAGRAM` — fabricating chart data is forbidden. Both land in the stats'
+`repairs` list, never silent.
 
 **Actionable corrective retries.** Condensed schema errors are rewritten into instructions,
 not just echoed: a missing FACT locator becomes an exact-shape directive — add **only** a
 `locator` key copied verbatim from that section's metrics/evidence_refs, or relabel the node
 CLAIM / GROUNDED_SYNTHESIS with supporting facts, never invent a locator, never touch the
-other nodes; numeric-cap violations name the bound ("HARD maximum 6"). Each label gets
-`RETRIES=2` attempts (3 total) of repair → validate → corrective retry.
+other nodes; numeric-cap violations name the bound ("HARD maximum 6"). Legacy repair labels
+get `RETRIES=2` attempts (3 total) of repair → validate → corrective retry; in direct the
+same condense + corrective-retry wire drives the SYNTHESIZE reroll (≤2) and each slide's
+SLIDE_PATCH budget (≤2).
 
-**Per-node LLM instrumentation (honest stats).** Every labeled call — `A/text_i`,
+**Per-node LLM instrumentation (honest stats).** Every labeled call — direct's
+`D/synthesize` / `D/reroll_i` / `D/patch_{slide}` and legacy's `A/text_i`,
 `B/visual_*`, `C/reduce_gN`, `C/reduce`, `D/synthesize`, `D-repair/*` — records real
 provider usage (via the streaming wire's usage chunk): `calls` / `rejected` / `llm_seconds` /
-`prompt_tokens` / `completion_tokens` / deterministic `repairs` applied. The stats log at
+`prompt_tokens` / `completion_tokens` / deterministic `repairs` applied. Direct's three
+local nodes ship in the same vocabulary with `calls: 0` plus a measured `local_seconds`
+(`A/text_local`, `B/visual_skipped`, `C/reduce_local`), so one stats shape covers both
+engines. The stats log at
 INFO as `BRIEF STATS` lines and ride `ToolKitResult.stats` into the job result as
 `deck_stats`; the stats dict is attached to the pipeline **before** the workflow awaits, so
 even a failed run exposes how far it got and what it spent. Offline harvesters (e.g.

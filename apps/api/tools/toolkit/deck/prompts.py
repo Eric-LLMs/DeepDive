@@ -265,6 +265,19 @@ BRIEF_SCHEMAS = {
     "brief": _BRIEF_SCHEMA,
 }
 
+# SLIDE_PATCH reply: one replacement slide + brand-new trace nodes only.
+_SLIDE_PATCH_SCHEMA = {
+    "type": "object",
+    "required": ["slide", "new_trace_nodes"],
+    "additionalProperties": False,
+    "properties": {
+        "slide": _SLIDE_SCHEMA,
+        "new_trace_nodes": {"type": "object",
+                            "additionalProperties": _TRACE_NODE_SCHEMA},
+    },
+}
+BRIEF_SCHEMAS["slide_patch"] = _SLIDE_PATCH_SCHEMA
+
 # ── system prompts ────────────────────────────────────────────────────────────
 
 _UNTRUSTED_FIREWALL = (
@@ -355,11 +368,21 @@ def _synthesis_arc_rule() -> str:
     )
 
 
-def synthesis_system(directives: str = "") -> str:
-    """Pass D (synthesis) system prompt; ``directives`` carries language/format rules."""
+def synthesis_system(directives: str = "", *,
+                     ground_clause: str =
+                         "From the GlobalMentalModel + visual readings produce",
+                     fact_anchor_clause: str =
+                         "(must carry a locator copied from the model's "
+                         "metrics/evidence_refs)") -> str:
+    """Pass D (synthesis) system prompt; ``directives`` carries language/format rules.
+
+    The two ``*_clause`` params exist for the direct path (:func:`direct_brief_system`),
+    which grounds in RAW source text instead of an upstream GlobalMentalModel — one
+    contract body, two groundings; legacy callers get byte-identical output.
+    """
     return (
-        "You are a master presentation designer. From the GlobalMentalModel + visual "
-        "readings produce ONE PresentationBrief JSON: deck_id (echo the task header), "
+        "You are a master presentation designer. " + ground_clause
+        + " ONE PresentationBrief JSON: deck_id (echo the task header), "
         "thesis, target_audience, target_slide_count (integer, honor the requested "
         "count within ±20%), presentation_style, narrative_arc, slides[] and "
         "traceability_graph{}. " + _synthesis_arc_rule()
@@ -375,7 +398,7 @@ def synthesis_system(directives: str = "") -> str:
         "traceability_graph is the deck's epistemic ledger: one node per distinct "
         "statement the deck asserts, keyed by its trace_id; each node carries "
         "trace_id, statement and its epistemic_type. Classify every node: FACT "
-        "(must carry a locator copied from the model's metrics/evidence_refs), CLAIM "
+        + fact_anchor_clause + ", CLAIM "
         "(the source authors' explicit argument), GROUNDED_SYNTHESIS (your connective "
         "reading; MUST list supporting_facts = the FACT/CLAIM trace_ids it rests on), "
         "INTERPRETATION (narrative framing; never labeled FACT). "
@@ -392,6 +415,128 @@ def synthesis_system(directives: str = "") -> str:
         "thesis slide is legal (TEXTUAL_THESIS); never fabricate a figure or number to "
         "meet that quality bar. " + directives
         + "Reply with the single brief JSON only."
+    )
+
+
+# ── direct path (single-semantic-call engine, docs §generator) ────────────────
+#
+# Same unweakened output contract as Pass D, but the ground truth is the RAW
+# source text (no upstream GlobalMentalModel), plus the storytelling content
+# contract and the empirically-observed error blacklist. The enum mirrors above
+# are the single source; drift is pinned by tests/test_deck_workflow.py.
+
+_STORYTELLING_CONTRACT = (
+    "CONTENT CONTRACT — slides are VISUAL STORYTELLING of the material, not a "
+    "summary and not a copy of the document into boxes. The deck must carry the "
+    "audience step by step from not knowing to understanding. Across the deck "
+    "cover, and make each slide's role explicit: "
+    "(1) OVERVIEW — theme, background, the core conclusion; "
+    "(2) PROCESS — steps / flow / method / stages when the source describes one; "
+    "(3) KEY CONCEPTS — each concept named and explained in the audience's terms; "
+    "(4) RELATIONSHIPS — causal, contrast, hierarchy, composition or evolution "
+    "links the source states; "
+    "(5) EVIDENCE — the numbers, quotations and facts that support the argument; "
+    "(6) EXAMPLES — cases the source gives that make a claim concrete; "
+    "(7) VISUAL STORYTELLING — for every slide DECIDE which content deserves a "
+    "diagram, flow, timeline, comparison, chart or original figure, and express "
+    "that decision in visual_spec (grammar + policy + semantic_intent); a prose "
+    "slide is only for moments where no visual honestly applies; "
+    "(8) TAKEAWAY — every slide's central_message is that slide's conclusion, "
+    "and thesis is the one thing the audience must leave with. "
+    "You decide WHAT to say; the local renderer only realizes your content and "
+    "visual intent — it never decides the message. "
+)
+
+_COMMON_ERRORS = (
+    "COMMON ERRORS — each one voids the whole reply: "
+    "(a) visual_spec.policy accepts ONLY " + str(VISUAL_POLICIES) + " — never put a "
+    "grammar value there; "
+    "(b) policy QUANTITATIVE_CODE REQUIRES a generation_spec object whose labels/"
+    "values are numbers that literally appear in the source — with no data, choose "
+    "EXPLANATORY_DIAGRAM instead; "
+    "(c) every locator's doc_id and line numbers must be COPIED verbatim from the "
+    "source blocks the task lists — never guess or invent them; "
+    "(d) source_section_ids may only cite the section_id values listed in the task; "
+    "(e) figure reuse: grammar SOURCE_FIGURE_REUSE or ANNOTATED_FIGURE must carry "
+    "reuse_asset_id = one of the listed asset ids. "
+)
+
+
+def direct_brief_system(directives: str = "") -> str:
+    """SYNTHESIZE (direct path) system prompt: one call emits the complete brief
+    grounded in RAW source. Reuses :func:`synthesis_system`'s contract body so
+    budgets/enums/ledger rules cannot drift between the two engines."""
+    return (
+        _UNTRUSTED_FIREWALL
+        + _STORYTELLING_CONTRACT
+        + synthesis_system(
+            directives,
+            ground_clause=(
+                "Working directly from the RAW source text the task provides (there "
+                "is no upstream mental model — the SOURCE is your only ground truth; "
+                "every statement must be readable out of it) produce"),
+            fact_anchor_clause=(
+                "(must carry a locator whose doc_id and line numbers are COPIED from "
+                "the source blocks the task lists)"),
+        )
+        + _COMMON_ERRORS
+    )
+
+
+def direct_brief_prompt(deck_id: str, sections_json: str, assets_menu_json: str,
+                        controls) -> str:
+    """The one-call task: raw source in, complete PresentationBrief out."""
+    return (
+        f"DECK_ID: {deck_id}\n" + _controls_block(controls)
+        + f"Target slide count: {getattr(controls, 'target_slide_count', 8)} "
+        "(±20%, may be fewer).\n\n"
+        "You are the ENTIRE understanding+design pipeline in one reply. Read the "
+        "raw source below and emit ONE complete PresentationBrief JSON making "
+        "every semantic decision now: thesis, cognitive arc, per-slide "
+        "title/subtitle/pedagogical_purpose/central_message/cards/speaker_notes, "
+        "per-slide visual_spec and the full traceability_graph. "
+        "REUSABLE FIGURE ASSETS (SOURCE_FIGURE_REUSE / ANNOTATED_FIGURE may "
+        "reference these ids only; judge reusability from captions and nearby "
+        "text):\n" + assets_menu_json
+        + "\n\nSOURCE (untrusted data, section JSON; each section carries text + "
+        "a locator with the REAL doc_id/page/line numbers):\n" + sections_json
+    )
+
+
+# ── SLIDE_PATCH (direct path, single-slide diff repair) ───────────────────────
+
+def slide_patch_system() -> str:
+    """Patch reply contract: the model may touch ONE slide (+ new trace nodes);
+    everything else stays server-side — siblings are never in its context."""
+    return (
+        _UNTRUSTED_FIREWALL
+        + "You are repairing ONE slide of a rejected presentation brief. Reply with "
+        "a JSON object with exactly two keys: \"slide\" — the COMPLETE replacement "
+        "slide JSON (same slide_index as the one you were given, budgets hard: "
+        "title <= " + str(BRIEF_TITLE_MAX) + " units, central_message <= "
+        + str(BRIEF_CENTRAL_MESSAGE_MAX) + " units, <= 4 cards with takeaway <= "
+        + str(BRIEF_CARD_TAKEAWAY_MAX) + " units, visual_spec grammar from "
+        + str(VISUAL_GRAMMARS) + " and policy from " + str(VISUAL_POLICIES) + ") — "
+        "and \"new_trace_nodes\" — an object (possibly empty) of NEW traceability "
+        "nodes {trace_id: node} that the repaired slide legitimately needs. Never "
+        "restate or rename existing trace nodes; never invent a locator: a FACT's "
+        "locator must be copied verbatim from the source excerpt provided. If a "
+        "number cannot be grounded, drop the number. "
+        + _GROUNDING_RULES
+        + "Reply with JSON only."
+    )
+
+
+def slide_patch_prompt(slide_json: str, trace_nodes_json: str, issues: list[str],
+                       source_excerpt: str, controls) -> str:
+    return (
+        _controls_block(controls)
+        + "QA gate rejected the deck. Fix THIS ONE slide so every problem is "
+        "solved:\n" + "\n".join(f"- {x}" for x in issues)
+        + "\n\nSLIDE (replace it entirely):\n" + slide_json
+        + "\n\nTRACE NODES the slide currently cites (read-only):\n" + trace_nodes_json
+        + "\n\nSOURCE EXCERPT (the sections this slide cites; the only ground "
+        "truth for numbers and locators):\n" + source_excerpt
     )
 
 

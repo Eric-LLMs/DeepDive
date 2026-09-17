@@ -213,11 +213,12 @@ class ToolKitPipeline:
         digested.
 
         ``slides`` runs the grounded visual presentation engine: multimodal ingest
-        (:mod:`.deck.ingest`, zero LLM) → the presentation-brief workflow
-        (TEXT → VISUAL → REDUCE → SYNTHESIZE over the generic core,
-        :mod:`.deck.workflow_driver`) producing the canonical
-        :class:`~.deck.schema.PresentationBrief`. Other tools keep the single
-        schema-validated call.
+        (:mod:`.deck.ingest`, zero LLM) → the generation engine selected by
+        ``generation_mode`` (default ``slides_generation_mode``): ``direct`` =
+        :mod:`.deck.generator` (one semantic call + local compiler), ``legacy`` =
+        the presentation-brief workflow (:mod:`.deck.workflow_driver`). Both emit
+        the canonical :class:`~.deck.schema.PresentationBrief`. Other tools keep
+        the single schema-validated call.
 
         A per-task custom prompt (``params["prompt"]``, from the generation dialog) is
         appended to the tool's default system prompt, never replacing it — the default
@@ -225,6 +226,7 @@ class ToolKitPipeline:
         own requirements layer on top. An empty/missing prompt uses the default alone.
         """
         if self.tool == "slides":
+            from .deck.generator import run_direct_generation
             from .deck.ingest import build_document_representation
             from .deck.schema import PresentationControls
             from .deck.workflow_driver import run_presentation_workflow
@@ -244,10 +246,19 @@ class ToolKitPipeline:
             # Attach BEFORE the await: the engine fills this dict in place, so a
             # mid-run failure still leaves the partial per-node stats observable.
             self._deck_stats = deck_stats
-            # The brief chain chunks and grounds internally (per-block Pass A calls on
-            # RAW text), so the batch plan is not consumed here.
-            brief = await run_presentation_workflow(
-                self.llm, doc_rep, controls, deck_id=deck_id, stats_out=deck_stats)
+            # Engine switch (2026-09-17): "direct" = one semantic LLM call + the local
+            # compiler (default); "legacy" = the Brief chain (TEXT→VISUAL→REDUCE→
+            # SYNTHESIZE) over the generic workflow core, kept whole as fallback.
+            mode = str(params.get("generation_mode")
+                       or settings.slides_generation_mode or "direct").lower()
+            if mode == "legacy":
+                # The brief chain chunks and grounds internally (per-block Pass A calls
+                # on RAW text), so the batch plan is not consumed here.
+                brief = await run_presentation_workflow(
+                    self.llm, doc_rep, controls, deck_id=deck_id, stats_out=deck_stats)
+            else:
+                brief = await run_direct_generation(
+                    self.llm, doc_rep, controls, deck_id=deck_id, stats_out=deck_stats)
             return {
                 "brief": brief.model_dump(mode="json"),
                 "document_title": doc_rep.document_title,

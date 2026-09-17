@@ -383,9 +383,10 @@ async def test_summary_writes_md(tmp_path):
 
 
 async def test_slides_brief_engine_writes_all_artifacts(tmp_path):
-    # slides now runs the grounded visual presentation engine: multimodal ingest (text
-    # channel here — a Markdown source) → A/C/D brief workflow → PresentationBrief →
-    # canonical deck.pdf (via the Visual Compiler) + deck.json (the brief) + compat exports
+    # LEGACY-mode coverage (the Brief chain stays the config-switchable fallback):
+    # multimodal ingest → A/C/D brief workflow → PresentationBrief → deck.pdf
+    # (Visual Compiler) + deck.json + compat exports. Direct mode is the default
+    # and has its own E2E below.
     import json as _json
     import shutil as _shutil
 
@@ -397,7 +398,8 @@ async def test_slides_brief_engine_writes_all_artifacts(tmp_path):
     _doc(tmp_path, text="# Title\n\n" + "Retrieval anchors generation. " * 6)
     llm = FakeLLM([section_payload(), global_payload(["sec_1"]), _brief_reply])
     pipe = ToolKitPipeline(llm, "slides", workspace=tmp_path)
-    result = await pipe.run(["doc.md"], count=3)  # the scripted brief carries 3 slides
+    result = await pipe.run(["doc.md"], count=3,  # scripted brief carries 3 slides
+                            generation_mode="legacy")
     exts = {Path(f).suffix for f in result.files}
     assert exts == {".pdf", ".json", ".md", ".pptx"}
     pdf = next(Path(f) for f in result.files if f.endswith(".pdf"))
@@ -420,6 +422,34 @@ async def test_slides_brief_engine_writes_all_artifacts(tmp_path):
     assert brief["traceability_graph"], "deck.json is now the canonical brief"
     # per-stage stats ride the same mechanism as before
     assert {"A/text_1", "C/reduce", "D/synthesize"} <= set(result.stats)
+
+
+async def test_slides_direct_default_writes_all_artifacts(tmp_path):
+    # DIRECT is the default engine now: ONE scripted semantic call produces the whole
+    # brief; packing/reduce/QA/render/persist are all local code. Artifacts and the
+    # 4-suffix contract are identical to legacy — the swap is engine-internal.
+    import json as _json
+    import shutil as _shutil
+
+    from tests.test_deck_workflow import FakeLLM
+
+    if _shutil.which("typst") is None:
+        import pytest
+        pytest.skip("typst binary required for deck.pdf render")
+    _doc(tmp_path, text="# Title\n\n" + "Retrieval anchors generation. " * 6)
+    llm = FakeLLM([_brief_reply])
+    pipe = ToolKitPipeline(llm, "slides", workspace=tmp_path)
+    result = await pipe.run(["doc.md"], count=3)
+    exts = {Path(f).suffix for f in result.files}
+    assert exts == {".pdf", ".json", ".md", ".pptx"}
+    assert result.stats["D/synthesize"]["calls"] == 1
+    assert {"A/text_local", "B/visual_skipped", "C/reduce_local"} <= set(result.stats)
+    assert "A/text_1" not in result.stats and "C/reduce" not in result.stats
+    brief = _json.loads(
+        next(Path(f) for f in result.files if f.endswith(".json")).read_text(encoding="utf-8"))
+    assert len(brief["slides"]) == 3
+    pdf = next(Path(f) for f in result.files if f.endswith(".pdf"))
+    assert _pdf_page_count(pdf) == 4           # 1 cover + 3 content slides
 
 
 def _pdf_page_count(pdf: Path) -> int:
@@ -556,7 +586,7 @@ async def test_worker_files_branch_e2e_srt_deck_to_drive(monkeypatch, tmp_path):
     result = await worker_tasks._generate_from_files(
         {"job_store": _JobStore(), "llm": llm}, str(_uuid.uuid4()),
         {"tool": "slides", "file_ids": [str(fid)], "name": "Lecture",
-         "folder_path": "gen", "count": 3},
+         "folder_path": "gen", "count": 3, "generation_mode": "legacy"},
     )
 
     assert result["tool"] == "slides"

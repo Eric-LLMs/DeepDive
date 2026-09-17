@@ -211,6 +211,9 @@ class ToolkitGenerateRequest(BaseModel):
     goal: str | None = None              # presentation goal line (cover + Pass B)
     language: str | None = None          # output language directive, e.g. "English" / "中文" (Pass A/B/C)
     format_mode: Literal["detailed", "presenter"] | None = None  # text-density style (Pass B/C)
+    # slides engine override: "direct" = one semantic call + local compiler (default
+    # via settings.slides_generation_mode); "legacy" = the Brief-chain fallback.
+    generation_mode: Literal["direct", "legacy"] | None = None
 
 
 class ConfigUpdateRequest(BaseModel):

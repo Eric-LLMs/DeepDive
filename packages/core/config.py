@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     toolkit_max_input_tokens: int = 100000
     toolkit_max_file_bytes: int = 20 * 1024 * 1024
     toolkit_llm_timeout_s: float = 300.0
+    # Slides engine switch (2026-09-17): "direct" = one semantic LLM call + the local
+    # deterministic compiler (apps.api.tools.toolkit.deck.generator); "legacy" = the
+    # Brief chain (TEXT→VISUAL→REDUCE→SYNTHESIZE) kept whole as the escape hatch.
+    # Overridable per request via the ``generation_mode`` job parameter.
+    slides_generation_mode: str = "direct"
 
     # Batch generation (``complete``/``complete_json``) streams the response and
     # accumulates it, so the provider's ~300s non-stream gateway cutoff can never kill a
