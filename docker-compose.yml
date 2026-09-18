@@ -227,8 +227,9 @@ services:
     restart: unless-stopped
 
   # ── Edge gateway (Traefik) ───────────────────────────────────────────
-  # Routes edge HTTP (/api -> FastAPI) and internal gRPC (retrieval service). Skeleton only:
-  # the FastAPI app still runs on the host during development.
+  # Single entrypoint on the machine's LAN IP (by IP for now, no DNS/TLS): :80 serves the
+  # web console + ``/api/*`` → host-run FastAPI (host.docker.internal:8300); :15052 carries
+  # retrieval gRPC. The FastAPI app still runs on the host during development.
   traefik:
     image: traefik:v3.0
     container_name: deepdive-traefik

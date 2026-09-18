@@ -1,24 +1,33 @@
 # Traefik dynamic configuration (routers/services).
 #
-# Skeleton wiring:
-#   - HTTP:  `/api/*` -> api:8000 (FastAPI)
+# Route table:
+#   - HTTP:  `/api/*` -> host-run FastAPI on host.docker.internal:8300 (prefix stripped —
+#            the API mounts its routers without an ``/api`` prefix; clients add it).
 #   - gRPC:  retrieval path -> retrieval:50051 (h2c, plaintext HTTP/2)
 http:
   routers:
     deepdive-api:
       entryPoints: ["web"]
       rule: "PathPrefix(`/api`)"
+      middlewares: ["strip-api"]
       service: deepdive-api
     deepdive-retrieval:
       entryPoints: ["grpc"]
       rule: "PathPrefix(`/retrieval.v1.RetrievalService/`)"
       service: deepdive-retrieval
 
+  middlewares:
+    strip-api:
+      stripPrefix:
+        prefixes: ["/api"]
+
   services:
     deepdive-api:
       loadBalancer:
         servers:
-          - url: "http://api:8000"
+          # Explicit IPv4: host.docker.internal also yields a ULA IPv6 that the host-run
+          # API (bound 0.0.0.0) never answers — Go's dialer would hang on it.
+          - url: "http://192.168.65.254:8300"  # = host.docker.internal (Docker Desktop host gateway)
     deepdive-retrieval:
       loadBalancer:
         servers:
