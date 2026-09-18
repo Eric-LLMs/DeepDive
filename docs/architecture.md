@@ -143,17 +143,24 @@ Dropped as non-goals (deliberate decisions, not gaps): recurring-billing **subsc
 
 ## 1. Product Positioning
 
-DeepDive is an AI-native learning and research workspace — a self-hosted environment for
-reading, watching, understanding, researching, and creating with your own materials, designed
-to keep your data and AI workloads within your own infrastructure and under your control. It
-combines a document and media workspace with AI chat, memory, RAG, agents, research workflows,
-and persistent knowledge, so your materials become an active part of the AI interaction rather
-than just file attachments.
+DeepDive is a self-hosted AI workspace for learning and research, built around your own
+knowledge.
 
-DeepDive supports PDFs, Office documents, video, audio, and images directly in the workspace,
-with integrated file management and personal cloud storage. Select a passage, page, or video
-moment and ask in context — then research beyond your materials, save durable insights, and turn
-conversations into reusable knowledge and artifacts.
+Read, watch, understand, research, and create with AI — directly alongside your own documents,
+media, and research materials. Select a passage, page, or moment and interact with AI in context,
+explore beyond your materials, and turn your work into reusable outputs.
+
+At the same time, DeepDive helps you build a persistent knowledge base from the materials you
+work with, the insights you discover, the research you conduct, and the outputs you create. Your
+knowledge stays with you instead of being trapped in individual files or conversations.
+
+This creates a continuous loop: AI helps you learn and research → your work produces knowledge →
+that knowledge becomes part of your personal knowledge base → the accumulated knowledge provides
+richer context for future AI-assisted work.
+
+DeepDive brings contextual AI interaction, RAG, persistent memory, agents, research workflows,
+and artifact creation together to support this loop — while keeping your data, knowledge, and AI
+workloads under your control.
 
 [↑ Back to top](#table-of-contents)
 
