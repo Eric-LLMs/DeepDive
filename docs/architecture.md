@@ -3,18 +3,11 @@
 > This document is the single source of truth (SSOT) for DeepDive. Every technical decision,
 > module boundary, and deployment topology is governed here.
 
-> **Implementation status:** this document is the SSOT, but not every part is implemented yet.
-> The status tables below mark what runs today versus what is designed-only, so it is clear what
-> to fill in when extending the business.
->
-> **Going forward:** [Evolution Roadmap](evolution-roadmap.md) is the 3–5 year scaling path
-> (modular → service extraction, multi-tenancy hardening, async HA, observability/evals).
-
 ## Table of Contents
 
 - [Implementation Status](#implementation-status)
   - [Implemented (runs today)](#implemented-runs-today)
-  - [Designed, not yet implemented](#designed-not-yet-implemented)
+  - [Not implemented](#not-implemented)
 - [1. Product Positioning](#1-product-positioning)
 - [2. Tech Stack](#2-tech-stack)
 - [3. Repository Structure (Monorepo)](#3-repository-structure-monorepo)
@@ -103,6 +96,10 @@
 [↑ Back to top](#table-of-contents)
 
 ## Implementation Status
+
+> The tables mark what runs today versus designed-only. The 3–5 year scaling path
+> (modular → service extraction, multi-tenancy hardening, async HA, observability/evals)
+> is its own document: [Evolution Roadmap](evolution-roadmap.md).
 
 ### Implemented (runs today)
 
