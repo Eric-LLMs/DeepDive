@@ -187,6 +187,13 @@
             </div>
           </form>
         </section>
+
+        <!-- Hands-free call overlay: shown while 🌊 is active — live waveform + phase + hang up. -->
+        <div id="call-overlay" class="call-overlay hidden">
+          <canvas id="call-wave" width="260" height="64"></canvas>
+          <div id="call-phase" class="call-phase">Listening…</div>
+          <button id="call-hangup" type="button" class="call-hangup" title="Hang up (or click 🌊 again)">Hang up</button>
+        </div>
       </main>
 
       <!-- Floating mini-icon shown while the chat is hidden; clicking it restores the chat. -->

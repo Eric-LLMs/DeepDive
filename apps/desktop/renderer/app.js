@@ -4325,6 +4325,12 @@
   let callCollecting = false;
   let callStartIdx = 0;    // slice index where the current utterance began (0 = session start)
   let callSpeechFrames = 0, callSilenceMs = 0, callBargeFrames = 0;
+  let callSpeakTimer = null;   // stuck-read watchdog (see callOnAnswer)
+  let callRaf = 0;             // overlay waveform animation frame
+  let callFreq = null;         // reusable frequency buffer for the painter
+  const callOverlay = document.getElementById("call-overlay");
+  const callPhaseEl = document.getElementById("call-phase");
+  const callCanvas = document.getElementById("call-wave");
 
   function callSetPhase(p) {
     callPhase = p;
@@ -4335,6 +4341,34 @@
       thinking: "In call — thinking…",
       speaking: "In call — speaking; talk to interrupt (click to hang up)",
     }[p] || CALL_IDLE_TITLE;
+    if (callPhaseEl) {
+      callPhaseEl.textContent = {
+        listening: "🎙️ Listening — just speak",
+        transcribing: "📝 Transcribing…",
+        thinking: "🤔 Thinking…",
+        speaking: "🔊 Speaking — talk to interrupt",
+      }[p] || "In call";
+    }
+  }
+
+  // ChatGPT-style call overlay: mirror-spectrum bars from the live analyser, colored by phase.
+  function callPaint() {
+    callRaf = 0;
+    if (!callActive || !callAnalyser || !callCanvas || callOverlay.classList.contains("hidden")) return;
+    if (!callFreq) callFreq = new Uint8Array(callAnalyser.frequencyBinCount);
+    callAnalyser.getByteFrequencyData(callFreq);
+    const g = callCanvas.getContext("2d");
+    const W = callCanvas.width, H = callCanvas.height;
+    g.clearRect(0, 0, W, H);
+    const colors = { listening: "#2f9e63", transcribing: "#d9a514", thinking: "#d9a514", speaking: "#6ea8fe" };
+    g.fillStyle = colors[callPhase] || "#2f9e63";
+    const bars = 26, bw = W / bars, usable = Math.floor(callFreq.length * 0.35);
+    for (let i = 0; i < bars; i++) {
+      const v = callFreq[Math.floor((i * usable) / bars)] / 255;
+      const h = Math.max(4, Math.pow(v, 0.85) * (H - 8));
+      g.fillRect(i * bw + bw * 0.2, (H - h) / 2, bw * 0.6, h);
+    }
+    callRaf = requestAnimationFrame(callPaint);
   }
 
   function callRms() {
@@ -4412,6 +4446,7 @@
 
   function callResumeListening() {
     if (!callActive) return;
+    if (callSpeakTimer) { clearTimeout(callSpeakTimer); callSpeakTimer = null; }
     callCollecting = false; callStartIdx = 0; callAll = [];
     callSpeechFrames = 0; callSilenceMs = 0; callBargeFrames = 0;
     callSetPhase("listening");
@@ -4422,6 +4457,16 @@
     console.log(`[call] answer → speak, ${text.length} chars`);
     callSetPhase("speaking");
     callBargeFrames = 0;
+    // Stuck-read watchdog: a dead/hung TTS sidecar must not strand the call in "speaking"
+    // (that was the observed mid-call dropout when the Docker VM took Kokoro down with it).
+    callSpeakTimer = setTimeout(() => {
+      callSpeakTimer = null;
+      if (callActive && callPhase === "speaking" && !voiceCurrent && !voiceQueue.length) {
+        console.warn("[call] read-aloud stalled — resuming listening");
+        Viewer.toast("Read-aloud stalled (TTS unreachable?) — back to listening.");
+        voiceStop(); callResumeListening();
+      }
+    }, 30000);
     // Fast path: if the stream produced nothing playable, speakMessage's catch stops the
     // queue and resolves — resume listening right away instead of waiting for the idle hook.
     speakMessage(text, null).finally(() => {
@@ -4433,6 +4478,9 @@
     if (note) appendMsg("error", `Call ended: ${note}`);
     callActive = false;
     callCollecting = false;
+    if (callSpeakTimer) { clearTimeout(callSpeakTimer); callSpeakTimer = null; }
+    if (callRaf) { cancelAnimationFrame(callRaf); callRaf = 0; }
+    if (callOverlay) callOverlay.classList.add("hidden");
     clearInterval(callTimer); callTimer = null;
     if (callRecorder && callRecorder.state !== "inactive") callRecorder.stop();
     callRecorder = null; callAll = []; callStartIdx = 0;
@@ -4478,9 +4526,14 @@
     callActive = true;
     chatSpeak.classList.add("calling");
     callResumeListening();
+    if (callOverlay) callOverlay.classList.remove("hidden");
+    callRaf = requestAnimationFrame(callPaint);
     Viewer.toast("Call started — just speak. Click 🌊 again to hang up.");
     callTimer = setInterval(callTick, CALL_VAD.frameMs);
   });
+
+  const callHangup = document.getElementById("call-hangup");
+  if (callHangup) callHangup.addEventListener("click", () => callStop());
 
   // Push-to-talk mic input: one recorder at a time. Click 1 records (red pulse), click 2 stops and
   // uploads the clip to the local FunASR/SenseVoice sidecar via /api/stt; the transcript
