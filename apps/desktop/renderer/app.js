@@ -1254,12 +1254,16 @@
     const next = () => {
       if (voiceCurrent !== a) return;
       voiceCurrent = null;
-      if (!voiceQueue.length) setVoiceBtn(null);
+      if (!voiceQueue.length) {
+        setVoiceBtn(null);
+        // Playback fully finished → a live call resumes listening.
+        if (callActive && callPhase === "speaking") callResumeListening();
+      }
       voicePlay();
     };
     a.onended = next;
     a.onerror = next;
-    a.play().catch(next);
+    a.play().catch((e) => { console.warn("[voice] play() rejected:", e && (e.name + " " + e.message)); next(); });
   }
 
   // Read a message aloud via the streaming server-side Kokoro TTS (POST /tts/stream → SSE
@@ -1313,6 +1317,7 @@
       if (!gotDone) Viewer.toast("TTS stream ended early.");
     } catch (err) {
       if (err.name === "AbortError") return; // intentional stop, not a failure
+      console.warn("[voice] speakMessage failed:", err && err.message);
       if (voiceGen === gen) { voiceStop(); Viewer.toast(`TTS failed: ${err.message}`); }
     }
   }
@@ -1661,7 +1666,12 @@
             streamMsg = appendStreamingAssistant();
             streamMsg.add(evt.data.answer);
           }
-          if (evt.data.answer && speakEnabled) speak(evt.data.answer);
+          // Call mode: hands-free loop — read this answer aloud (Kokoro, same chain as the
+          // bubble 🔊 Read); listening resumes when playback ends or the user barges in.
+          if (callActive) {
+            const spoken = evt.data.answer || (streamMsg ? streamMsg.el.textContent.trim() : "");
+            if (spoken) callOnAnswer(spoken); else callResumeListening();
+          }
           // Fresh session: show a provisional title (first words) until the worker's async
           // LLM title lands; then refresh the list so the auto-named session shows up.
           if (!hadSession) {
@@ -4288,26 +4298,191 @@
     chatResize.addEventListener("pointercancel", onUp);
   });
 
-  // ── Voice: speak replies (Web Speech synth) + mic input (MediaRecorder → /api/stt) ──
-  let speakEnabled = false;
+  // ── Voice: hands-free call mode (🌊 button) + push-to-talk mic input (🎤 → /api/stt) ──
   const chatSpeak = document.getElementById("chat-speak");
   const chatMic = document.getElementById("chat-mic");
 
-  function speak(text) {
-    if (!("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    // Match the server-side Kokoro routing: Chinese text → zh, otherwise English.
-    u.lang = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(text) ? "zh-CN" : "en-US";
-    window.speechSynthesis.speak(u);
+  // Call mode: a Doubao-style hands-free loop. One click enters the call; then
+  //   listening → (energy-VAD end-of-speech) → /api/stt → auto sendChat → Kokoro reads
+  //   the answer aloud → listening again. The mic stays open during read-aloud: sustained
+  //   loud speech past a stricter gate is a barge-in — TTS stops and the new speech becomes
+  //   the next utterance. A second click hangs up. VAD is a WebAudio RMS gate over the live
+  //   mic stream (no extra model); getUserMedia echo-cancellation suppresses speaker bleed.
+  const CALL_VAD = {
+    frameMs: 30,         // VAD tick interval
+    startFrames: 7,      // consecutive active frames (≈210ms) before an utterance begins
+    silenceMs: 900,      // trailing quiet time that closes an utterance
+    thresh: 0.015,       // RMS gate for starting/continuing normal speech
+    threshBarge: 0.030,  // stricter gate while TTS plays (guards against speaker echo)
+    bargeFrames: 10,     // consecutive barge-gate frames → interrupt the read-aloud
+  };
+  const CALL_IDLE_TITLE = "Voice call (hands-free chat, like a phone call)";
+  let callActive = false;
+  let callPhase = "idle"; // idle | listening | transcribing | thinking | speaking
+  let callStream = null, callCtx = null, callAnalyser = null, callBuf = null, callTimer = null;
+  let callRecorder = null, callMime = "";
+  let callAll = [];        // every dataavailable slice of the call's single recorder session
+  let callCollecting = false;
+  let callStartIdx = 0;    // slice index where the current utterance began (0 = session start)
+  let callSpeechFrames = 0, callSilenceMs = 0, callBargeFrames = 0;
+
+  function callSetPhase(p) {
+    callPhase = p;
+    if (!callActive) { chatSpeak.title = CALL_IDLE_TITLE; return; }
+    chatSpeak.title = {
+      listening: "In call — listening… (click to hang up)",
+      transcribing: "In call — transcribing…",
+      thinking: "In call — thinking…",
+      speaking: "In call — speaking; talk to interrupt (click to hang up)",
+    }[p] || CALL_IDLE_TITLE;
   }
 
-  chatSpeak.addEventListener("click", () => {
-    speakEnabled = !speakEnabled;
-    chatSpeak.classList.toggle("active", speakEnabled);
+  function callRms() {
+    callAnalyser.getFloatTimeDomainData(callBuf);
+    let sum = 0;
+    for (let i = 0; i < callBuf.length; i++) sum += callBuf[i] * callBuf[i];
+    return Math.sqrt(sum / callBuf.length);
+  }
+
+  function callBeginUtterance() {
+    callCollecting = true;
+    // Roll back ~3 slices (≈0.75s) so the words that triggered detection aren't clipped;
+    // slice [0] (the webm/opus header) is always re-prepended when building the blob.
+    callStartIdx = Math.max(0, callAll.length - 3);
+    callSilenceMs = 0; callSpeechFrames = 0; callBargeFrames = 0;
+    callSetPhase("listening");
+  }
+
+  function callTick() {
+    if (!callActive || !callAnalyser) return;
+    // Bound memory during long silences: drop old mid-stream slices, keep the header.
+    if (callAll.length > 480 && !callCollecting) {
+      callAll.splice(1, 160);
+      callStartIdx = Math.max(0, callStartIdx - 160);
+    }
+    const rms = callRms();
+    if (callPhase === "listening" && !callCollecting) {
+      callSpeechFrames = rms >= CALL_VAD.thresh ? callSpeechFrames + 1 : 0;
+      if (callSpeechFrames >= CALL_VAD.startFrames) callBeginUtterance();
+    } else if (callCollecting) {
+      if (rms < CALL_VAD.thresh) {
+        callSilenceMs += CALL_VAD.frameMs;
+        if (callSilenceMs >= CALL_VAD.silenceMs) callEndUtterance();
+      } else callSilenceMs = 0;
+    } else if (callPhase === "speaking") {
+      callBargeFrames = rms >= CALL_VAD.threshBarge ? callBargeFrames + 1 : 0;
+      if (callBargeFrames >= CALL_VAD.bargeFrames) { console.log(`[call] barge-in (rms=${rms.toFixed(3)})`); voiceStop(); callBeginUtterance(); }
+    }
+  }
+
+  function callEndUtterance() {
+    callCollecting = false;
+    callSetPhase("transcribing");
+    const parts = callStartIdx === 0 ? callAll.slice() : [callAll[0], ...callAll.slice(callStartIdx)];
+    const blob = new Blob(parts, { type: (callRecorder && callRecorder.mimeType) || callMime || "audio/webm" });
+    if (!blob.size) { callResumeListening(); return; }
+    callTranscribe(blob);
+  }
+
+  async function callTranscribe(blob) {
+    try {
+      const fd = new FormData();
+      fd.append("file", blob, `call-${Date.now()}.${suffixForMime(callMime)}`);
+      const headers = state.token ? { Authorization: `Bearer ${state.token}` } : {};
+      const res = await fetch("/api/stt", { method: "POST", headers, body: fd });
+      if (res.status === 401) { openAccount(); callStop("Session expired — sign in again."); return; }
+      if (!res.ok) {
+        let detail = res.statusText;
+        try { detail = (await res.json()).detail || detail; } catch { /* keep statusText */ }
+        throw new Error(detail);
+      }
+      const { text } = await res.json();
+      if (!callActive) return;
+      if (!text) { Viewer.toast("No speech detected."); callResumeListening(); return; }
+      callSetPhase("thinking");
+      // Live-call turns ride without reasoning tokens — time-to-first-sentence matters.
+      sendChat(text, { disable_thinking: true }).finally(() => {
+        // Stream errored before any answer → don't strand the call in "thinking".
+        if (callActive && callPhase === "thinking") callResumeListening();
+      });
+    } catch (err) {
+      if (callActive) { appendMsg("error", `Call: transcription failed: ${err.message}`); callResumeListening(); }
+    }
+  }
+
+  function callResumeListening() {
+    if (!callActive) return;
+    callCollecting = false; callStartIdx = 0; callAll = [];
+    callSpeechFrames = 0; callSilenceMs = 0; callBargeFrames = 0;
+    callSetPhase("listening");
+  }
+
+  function callOnAnswer(text) {
+    if (!callActive) return;
+    console.log(`[call] answer → speak, ${text.length} chars`);
+    callSetPhase("speaking");
+    callBargeFrames = 0;
+    // Fast path: if the stream produced nothing playable, speakMessage's catch stops the
+    // queue and resolves — resume listening right away instead of waiting for the idle hook.
+    speakMessage(text, null).finally(() => {
+      if (callActive && callPhase === "speaking" && !voiceQueue.length && !voiceCurrent) callResumeListening();
+    });
+  }
+
+  function callStop(note) {
+    if (note) appendMsg("error", `Call ended: ${note}`);
+    callActive = false;
+    callCollecting = false;
+    clearInterval(callTimer); callTimer = null;
+    if (callRecorder && callRecorder.state !== "inactive") callRecorder.stop();
+    callRecorder = null; callAll = []; callStartIdx = 0;
+    if (callStream) { callStream.getTracks().forEach((t) => t.stop()); callStream = null; }
+    if (callCtx) { callCtx.close().catch(() => { /* already closed */ }); callCtx = null; callAnalyser = null; }
+    voiceStop();
+    callPhase = "idle";
+    chatSpeak.classList.remove("calling");
+    chatSpeak.title = CALL_IDLE_TITLE;
+  }
+
+  chatSpeak.addEventListener("click", async () => {
+    if (callActive) { callStop(); return; }
+    if (micRecorder && micRecorder.state !== "inactive") { Viewer.toast("Finish the voice-input clip first."); return; }
+    if (!navigator.mediaDevices || typeof MediaRecorder === "undefined" || typeof AudioContext === "undefined") {
+      appendMsg("error", "Voice call is not available in this environment.");
+      return;
+    }
+    try {
+      callStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (err) {
+      callStream = null;
+      appendMsg("error", `Microphone unavailable (${err && err.name ? err.name : "unknown error"}) — check the OS microphone permissions for DeepDive.`);
+      return;
+    }
+    try {
+      callCtx = new AudioContext();
+      callCtx.createMediaStreamSource(callStream).connect(
+        (callAnalyser = callCtx.createAnalyser()), // analyser only — never routed to output (no feedback)
+      );
+      callAnalyser.fftSize = 1024;
+      callBuf = new Float32Array(callAnalyser.fftSize);
+      callMime = pickAudioMime();
+      callRecorder = callMime ? new MediaRecorder(callStream, { mimeType: callMime }) : new MediaRecorder(callStream);
+      callRecorder.ondataavailable = (ev) => { if (ev.data && ev.data.size > 0) callAll.push(ev.data); };
+      callRecorder.start(250);
+    } catch (err) {
+      callStop(err.message);
+      return;
+    }
+    callActive = true;
+    chatSpeak.classList.add("calling");
+    callResumeListening();
+    Viewer.toast("Call started — just speak. Click 🌊 again to hang up.");
+    callTimer = setInterval(callTick, CALL_VAD.frameMs);
   });
 
-  // Mic input: one recorder at a time. Click 1 records (red pulse), click 2 stops and
+  // Push-to-talk mic input: one recorder at a time. Click 1 records (red pulse), click 2 stops and
   // uploads the clip to the local FunASR/SenseVoice sidecar via /api/stt; the transcript
   // lands in the input box for review — never auto-sent.
   const VOICE_IDLE_TITLE = "Voice input (talk to the assistant)";
@@ -4356,7 +4531,11 @@
     try {
       const fd = new FormData();
       fd.append("file", blob, `voice-${Date.now()}.${suffixForMime(mime)}`);
-      const res = await fetch("/api/stt", { method: "POST", body: fd });
+      // FormData owns the multipart boundary, so only the Bearer header is added here
+      // (authHeaders() would force a JSON Content-Type and break the upload).
+      const headers = state.token ? { Authorization: `Bearer ${state.token}` } : {};
+      const res = await fetch("/api/stt", { method: "POST", headers, body: fd });
+      if (res.status === 401) { openAccount(); throw new Error("Session expired — sign in again."); }
       if (!res.ok) {
         let detail = res.statusText;
         try { detail = (await res.json()).detail || detail; } catch { /* keep statusText */ }
@@ -4380,6 +4559,7 @@
 
   chatMic.addEventListener("click", async () => {
     if (micTranscribing) return; // one upload at a time; ignore clicks while pending
+    if (callActive) { Viewer.toast("In a call already — just speak, 🎤 isn't needed."); return; }
     if (micRecorder && micRecorder.state !== "inactive") {
       micRecorder.stop(); // onstop performs the upload and resets the button
       return;
@@ -4392,9 +4572,9 @@
       micStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true },
       });
-    } catch {
+    } catch (err) {
       micStream = null;
-      appendMsg("error", "Microphone unavailable — check the OS microphone permissions for DeepDive.");
+      appendMsg("error", `Microphone unavailable (${err && err.name ? err.name : "unknown error"}) — check the OS microphone permissions for DeepDive.`);
       return;
     }
     const mime = pickAudioMime();

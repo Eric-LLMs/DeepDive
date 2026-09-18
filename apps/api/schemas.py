@@ -148,6 +148,8 @@ class ChatRequest(BaseModel):
                                      #   gt_ token (api.auth.sign_guest_token), never from a
                                      #   client-supplied user_id.
     session_id: UUID | None = None   # optional: resume an existing session
+    disable_thinking: bool = False   # live voice-call turns: suppress reasoning tokens for
+                                     #   this turn's model calls (faster time-to-first-sentence)
     attach: dict | None = None       # optional: { kind: "asset", asset_id, name } — a cloud
                                      #   file the user wants the agent to troubleshoot; its
                                      #   name + asset_id are prefixed to the message context.

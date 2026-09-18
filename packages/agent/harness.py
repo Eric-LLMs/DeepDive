@@ -31,6 +31,7 @@ class FakeLLM:
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        disable_thinking: bool = False,
     ):
         """Yield scripted events: one response per call, decomposed into thinking/content/tool_calls/usage."""
         self.calls.append((list(messages), tools))

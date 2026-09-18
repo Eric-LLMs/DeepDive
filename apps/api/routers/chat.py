@@ -888,6 +888,7 @@ async def chat_stream(
                     api_key=api_key or None,
                     context={"handoff": effective_handoff} if effective_handoff else None,
                     progress_sink=lambda evt: frames.put_nowait(("agent", evt)),
+                    disable_thinking=body.disable_thinking,
                 ):
                     frames.put_nowait(("agent", evt))
             finally:

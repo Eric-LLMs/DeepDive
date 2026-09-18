@@ -76,13 +76,15 @@ class AgentLLMPort(Protocol):
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        disable_thinking: bool = False,
     ) -> AsyncIterator[dict]:
         """Optional streaming variant of :meth:`chat`.
 
         Yields event dicts ``{"type": "thinking"|"content", "data": <delta>}`` per chunk,
         then a final ``{"type": "tool_calls", "data": [...]}`` event. The agent loop's
         :meth:`ReactLoopAgent.run_stream` consumes these; a port that only implements
-        ``chat`` still works for the non-streaming :meth:`run`.
+        ``chat`` still works for the non-streaming :meth:`run`. ``disable_thinking``
+        requests no reasoning tokens for this turn's calls (the live voice-call path).
         """
         ...
 
@@ -374,7 +376,8 @@ class ReactLoopAgent:
                 t0 = time.monotonic()
                 try:
                     async for evt in self.llm.chat_stream(
-                        request, tools=visible_tools, model=model, base_url=base_url, api_key=api_key
+                        request, tools=visible_tools, model=model, base_url=base_url, api_key=api_key,
+                        disable_thinking=turn.disable_thinking,
                     ):
                         kind = evt.get("type")
                         if kind == "thinking" and evt.get("data"):

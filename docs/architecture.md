@@ -113,7 +113,7 @@
 | Agent runtime | `AgentKernel` composition root: cache-boundary `CacheBoundaryAssembler` (3 zones + `snapshot_key`) + deferred-tool `ToolGateway` + dual-track `MemoryService` (PG tsvector/pgvector RRF) + skill catalog + READ-only `Sandbox`, over `ReactLoopAgent` step loop + plugin `ToolRuntime`; `ReliableLLM` timeout/retry (error taxonomy + cancellation) + per-turn cost budget; HITL approvals (memory / Redis pub-sub broker); `run_subagent` (bounded child turns); `plan` meta-tool; shadow-git checkpoints (`revert_to_checkpoint`); Docker `BashSandbox` backend |
 | Retrieval | config-driven node pipeline (query rewrite → recall → RRF → rerank, plus optional parent-expand / CRAG nodes; CJK + contextual + parent-child indexing); `in_process` default, gRPC service available (`AuthGuard` token gate / per-peer rate limit / tenant binding); admin RAG console + golden-set eval (Recall@k / Precision@k / MRR); Redis **query cache** (keyed by query/filters/top_k + config + corpus version); `POST /rag/feedback` golden-dataset recorder |
 | Query repository | unified multi-source corpus: cloud-drive files (`source_type='file'`) + Learning-Platform sentences/articles (`'learning'`) + chat Q&A pairs / LLM-grouped whole-session imports (`'chat'`); `chunks.asset_id` nullable + `source_type`/`source_id`, source-aware recall (both recallers `LEFT JOIN assets`); PDF tool chain (body text + tables rendered to PNG → vision LLM, per-table skip on failure); admin RAG → **Repository** tab lists non-file chunks with delete |
-| Model services | TEI embedding (BGE-M3), Kokoro TTS, LiteLLM gateway (all Docker) |
+| Model services | TEI embedding (BGE-M3), Kokoro TTS, FunASR SenseVoice STT, LiteLLM gateway (all Docker) |
 | Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the shared `AgentKernel` composition (`apps/api/agent_factory.py`) for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output; session / cloud-file modes → caller's Cloud Drive, with a custom `prompt` + `name`) |
 | Session memory | PG-backed `sessions` / `messages` / `session_events`; **client Live State (summary + tail) is the normal-turn context source — zero SQL reads on hot turns**; threshold compaction folds raw rows into one 5-section structured summary behind a dual persistence barrier (`sessions.compaction` JSONB = durable checkpoint, revision CAS); per-session async write queue (one batch INSERT/turn); deferred finalize = incremental embed + first-time-only sidebar summary/title; trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + 30-day audit-event retention — see [§22](#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns) |
 | Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
@@ -172,7 +172,7 @@ DeepDive is an "AI learning workbench" unified by a single abstraction:
 | Retrieval (RAG) | config-driven node pipeline: query rewrite → pgvector + tsvector recall → RRF fusion → rerank, plus optional parent-expand / CRAG nodes | hybrid keyword + semantic search; CJK queries segmented with jieba; topology + params editable live in the admin console |
 | Agent | `AgentKernel` (cache-boundary prompt + deferred tool loading + dual-track memory + sandbox) over `ReactLoopAgent` + plugin `ToolRuntime` | controllable, testable, plugin-based |
 | MCP | FastMCP | optional external exposure of the tool runtime (`core/infrastructure/mcp.py`) |
-| Speech | STT: faster-whisper / Whisper API; TTS: local Kokoro-82M | |
+| Speech | STT: local FunASR SenseVoiceSmall sidecar (OpenAI-compatible `/v1/audio/transcriptions`, CPU, zh/en); TTS: local Kokoro-82M | both Docker sidecars reached over the host loopback (`:18881` / `:18880`) — the gateway itself runs on the host |
 
 **Language boundary**: backend in Python (AI deps), frontend in TypeScript. The boundary is
 API-only: REST/SSE at the edge, gRPC between internal services, HTTP to model services.
@@ -949,6 +949,7 @@ Switching modes never touches the tool code — it only changes what `ctx.provid
                                     │    HTTP (OpenAI-compatible) to model services:
                                     ├───────────────▶ TEI embedding  (POST /embed)
                                     ├───────────────▶ Kokoro TTS     (/v1/audio/speech)
+                                    ├───────────────▶ FunASR SenseVoice (/v1/audio/transcriptions)
                                     └───────────────▶ LiteLLM gateway (/v1)
                                     │
                                     │    DB direct (no service in front); jobs table = job state
@@ -956,7 +957,7 @@ Switching modes never touches the tool code — it only changes what `ctx.provid
                             PostgreSQL (pgvector + tsvector + jobs) via SQLAlchemy+asyncpg
 ```
 
-- **Model inference never runs in the API/retrieval/worker process** — embedding/TTS are separate
+- **Model inference never runs in the API/retrieval/worker process** — embedding/TTS/STT are separate
   containers; model updates don't restart the app. Reranking is the exception: the cross-encoder
   loads in-process via `sentence-transformers` when `reranker_model` is set (disabled by default).
 - **Pinned LLM channels call their provider directly** — a session's chat request builds a
@@ -1022,6 +1023,13 @@ failed job marks the asset `FAILED` so the UI never shows a stuck badge (cancell
 sentence over SSE: each `segment` event carries a **cached WAV URL** (synthesized in-process against
 the localhost Kokoro container), so the client plays sentence 1 while the later ones are still
 generating; `error` / `done` frames terminate the stream.
+
+**Speech transcription** — `POST /stt` is a **synchronous** enrichment (deliberately not a job:
+clients wait on the transcript as part of an interactive turn). The upload is MIME-guarded
+(clearly non-audio → 415; empty/unknown type falls back to `application/octet-stream`) and
+size-bounded by `stt_max_bytes` (bounded read, 413 past the cap), then relayed through
+`STTClient` to the localhost FunASR SenseVoice sidecar over the OpenAI-compatible
+`/v1/audio/transcriptions` route, returning `{text}`; sidecar connect/timeout faults → 502.
 
 **Toolkit generation jobs** — `toolkit_generate` legitimately runs many minutes (the explicit
 big-document flow makes one raw-grounded call per batch, then the deck passes) and is bounded
@@ -2255,6 +2263,20 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     **Generate Mind Map / Generate Slides / Summarize & Save Notes**) and a **hide** toggle that
     collapses the chat into a floating restore icon; a **Generate** toolbar above the input
     exposes the same three entries as one-click buttons.
+
+    The 🎤 / 🔊 input-box buttons drive the **local** speech sidecars (no cloud APIs):
+    **🎤 push-to-talk** — click records via `MediaRecorder` (red pulse), click again uploads the
+    clip to `POST /stt` (FunASR/SenseVoice), and the transcript lands in the input box for
+    review, never auto-sent. **🔊 hands-free call** — one click opens a loop of
+    *listen → end-of-speech auto-detected by an RMS energy VAD (WebAudio `AnalyserNode`, ~0.9 s
+    trailing silence) → auto-transcribe → send through the same `/chat/stream` with
+    `disable_thinking` (reasoning tokens suppressed for call turns; typed chat keeps them) →
+    the answer is read aloud through the same Kokoro `POST /tts/stream` chain as the bubble
+    Read → listening resumes when playback ends*; the mic stays open during read-aloud so
+    sustained loud speech **barges in** (TTS aborts, the new speech becomes the next
+    utterance), and a second click hangs up (stream / recorder / AudioContext released).
+    `main.js` grants the `media` permission to the app's own `webContents` via the session
+    permission handlers.
 
     Every generation entry opens a dialog (see §6). **Slides** open the dedicated
     **Customize Slide Deck** dialog — business intent only, no schema exposure: two Format
@@ -3818,6 +3840,7 @@ summary-of-summary. Mechanism owner: `packages/core/infrastructure/memory.py` + 
 ```
 ChatRequest { session_id, message,
   context_state: { summary?, through_message_id?, has_pending_mutations } | None,  # None = legacy
+  disable_thinking: bool = false,  # voice-call turns suppress reasoning tokens for this turn
   tail: [ { message_id?, role ∈ {user, assistant}, content } ] }
 ```
 

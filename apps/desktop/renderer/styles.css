@@ -1090,6 +1090,17 @@ pre.text-viewer {
   50% { box-shadow: 0 0 0 6px rgba(229, 72, 77, 0); }
 }
 
+/* Call mode: green + pulse while the hands-free voice call is live. */
+.chat-input-btn.calling {
+  background: #2f9e63;
+  color: #fff;
+  animation: chat-call-pulse 1.6s ease-in-out infinite;
+}
+@keyframes chat-call-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(47, 158, 99, 0.55); }
+  50% { box-shadow: 0 0 0 6px rgba(47, 158, 99, 0); }
+}
+
 #chat-send {
   flex: none;
   margin-left: auto;   /* keep Send anchored to the right edge of the actions row */

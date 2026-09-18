@@ -269,6 +269,7 @@ class OpenAILLM:
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        disable_thinking: bool = False,
     ) -> AsyncIterator[dict]:
         """Stream a chat completion, yielding per-chunk event dicts.
 
@@ -281,7 +282,10 @@ class OpenAILLM:
           total_tokens}`` (all 0 when the provider omits them).
 
         ``base_url`` / ``api_key`` optionally route this call through a specific LLM
-        channel without mutating the shared client.
+        channel without mutating the shared client. ``disable_thinking`` sends the
+        Qwen-compatible ``enable_thinking: false`` flag — the live voice-call path uses
+        it because reasoning tokens are pure time-to-first-sentence there; interactive
+        typed chat keeps thinking on.
         """
         client, mdl = self._call_channel(model, base_url, api_key)
         kwargs = {
@@ -293,6 +297,8 @@ class OpenAILLM:
         }
         if tools:
             kwargs["tools"] = tools
+        if disable_thinking:
+            kwargs["extra_body"] = {"enable_thinking": False}
         stream = await client.chat.completions.create(**kwargs)
 
         # Tool-call arguments/name arrive as fragmented deltas keyed by index; accumulate

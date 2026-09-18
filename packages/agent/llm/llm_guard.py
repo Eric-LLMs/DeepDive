@@ -84,6 +84,7 @@ class ReliableLLM:
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        disable_thinking: bool = False,
     ) -> AsyncIterator[dict]:
         # The stream generator is returned through the retry wrapper and kept only in the
         # local frame of this coroutine — never stored on the instance. Two overlapping
@@ -91,7 +92,8 @@ class ReliableLLM:
         # other's deltas (the old ``self._gen`` instance slot was the cross-talk bug).
         async def open_stream() -> tuple[dict, AsyncIterator[dict]]:
             gen = self._inner.chat_stream(
-                messages, tools=tools, model=model, base_url=base_url, api_key=api_key
+                messages, tools=tools, model=model, base_url=base_url, api_key=api_key,
+                disable_thinking=disable_thinking,
             )
             try:
                 first = await asyncio.wait_for(anext(gen), timeout=self.timeout_s)

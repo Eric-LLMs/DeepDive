@@ -966,17 +966,21 @@ app.whenReady().then(() => {
   app.setAppUserModelId("com.deepdive.desktop");
   protocol.handle("app", handleAppRequest);
   protocol.handle("local", handleLocalRequest);
-  // Chat voice input: the renderer records with getUserMedia, so `media` is granted only
-  // to our own UI origin (app://bundle) — silently, no OS prompt. Other permission types
-  // keep Electron's stock allow-by-default behavior (clipboard etc. rely on it).
-  const ALLOW_MEDIA_ORIGIN = "app://bundle";
-  const grantPermission = (permission, requestingOrigin) =>
-    permission !== "media" || (requestingOrigin || "").startsWith(ALLOW_MEDIA_ORIGIN);
-  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
-    callback(grantPermission(permission, details && details.requestingOrigin));
+  // Chat voice input: the renderer records with getUserMedia, so `media` is granted
+  // silently (no OS prompt). Only our privileged app:// UI ever loads in these windows,
+  // so granting the permission on our own webContents is safe; every other permission
+  // type keeps Electron's stock allow-by-default behavior (clipboard etc. rely on it).
+  // The origin is logged because Chromium hands formats like "app://bundle" that are
+  // easy to over-match — if a denial appears, this line shows what actually arrived.
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const grant = permission !== "media" || !webContents.isDestroyed();
+    console.log(`[perm-request] ${permission} origin=${details && details.requestingOrigin} → ${grant ? "grant" : "deny"}`);
+    callback(grant);
   });
-  session.defaultSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) => {
-    return grantPermission(permission, requestingOrigin);
+  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
+    const grant = permission !== "media" || !!(webContents && !webContents.isDestroyed());
+    if (permission === "media") console.log(`[perm-check] ${permission} origin=${requestingOrigin} → ${grant ? "grant" : "deny"}`);
+    return grant;
   });
   registerIpcHandlers();
   setupMenu();

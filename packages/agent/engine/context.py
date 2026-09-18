@@ -57,6 +57,9 @@ class AgentTurn:
     model: str | None = None
     base_url: str | None = None
     api_key: str | None = None
+    # Per-turn LLM knob: the live voice-call path sets it to suppress reasoning tokens
+    # (time-to-first-sentence); typed chat and worker runs leave it False.
+    disable_thinking: bool = False
     turn_id: str = field(default_factory=lambda: str(uuid4()))
 
     # ── structured handoff / context (sunk, not just prompt text) ──

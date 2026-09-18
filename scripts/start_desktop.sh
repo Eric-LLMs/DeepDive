@@ -38,7 +38,7 @@ export PLUGINS_DIR="$REPO_ROOT/plugins"
 WEB_LOG="$LOG_DIR/web.log"
 PID_FILE="$LOG_DIR/uvicorn.pid"
 WEB_PORT=5273
-COMPOSE_SERVICES="postgres redis embedding tts llm-gateway worker"
+COMPOSE_SERVICES="postgres redis embedding tts stt llm-gateway worker"
 
 # Make the Docker CLI resolvable even before the system PATH refreshes after install.
 DOCKER_BIN="/c/Program Files/Docker/Docker/resources/bin"
