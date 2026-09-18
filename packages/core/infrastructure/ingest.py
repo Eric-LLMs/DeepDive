@@ -102,6 +102,85 @@ def extract_text(content: bytes, name: str, *, para_markers: bool = False) -> st
     return "\n".join(c.text for c in cues if c.text)
 
 
+def parse_subtitle_cues(content: bytes, name: str) -> list[media.SubtitleCue] | None:
+    """Parse subtitle bytes into cues, or None when ``name`` isn't a subtitle file.
+
+    Shared by the flat-text path (``extract_text``) and the timestamped ingest path
+    (:func:`build_subtitle_chunks`).
+    """
+    ext = Path(name).suffix.lower()
+    if ext not in _SUBTITLE_EXTS:
+        return None
+    text = _decode(content)
+    if ext == ".vtt":
+        return media.parse_vtt_text(text)
+    if ext == ".lrc":
+        return media.parse_lrc_text(text)
+    return media.parse_srt_text(text)
+
+
+def format_ts(ms: int) -> str:
+    """Milliseconds → ``H:MM:SS`` citation stamp (e.g. 754000 → ``0:12:34``)."""
+    s = ms // 1000
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def build_subtitle_chunks(
+    cues: list[media.SubtitleCue], chunk_chars: int, *, video_name: str
+) -> list[Chunk]:
+    """Group consecutive subtitle cues into timestamped leaf chunks.
+
+    Each chunk covers cues whose joined text fits ``chunk_chars`` and carries
+    ``meta = {kind:"subtitle", video, start_ms, end_ms, start_ts, end_ts}`` — the
+    retrieval layer forwards ``meta`` verbatim, so the agent can cite
+    ``<video> @ H:MM:SS`` for any hit. Clean cue boundaries beat sliding overlap, so
+    no overlap is applied; a single oversized cue is windowed via ``_split_fixed``
+    (all windows then share the one cue's time span).
+    """
+    cues = [c for c in cues if c.text.strip()]
+    chunks: list[Chunk] = []
+
+    def emit(lines: list[str], group: list[media.SubtitleCue]) -> None:
+        if not lines:
+            return
+        start, end = group[0].start_ms, group[-1].end_ms
+        chunks.append(Chunk(
+            content_en="\n".join(lines),
+            chunk_kind="leaf",
+            meta={
+                "kind": "subtitle", "video": video_name,
+                "start_ms": start, "end_ms": end,
+                "start_ts": format_ts(start), "end_ts": format_ts(end),
+            },
+        ))
+
+    lines: list[str] = []
+    group: list[media.SubtitleCue] = []
+    for cue in cues:
+        if len(cue.text) > chunk_chars:
+            emit(lines, group)
+            lines, group = [], []
+            for window in _split_fixed(cue.text, chunk_chars, 0):
+                chunks.append(Chunk(
+                    content_en=window,
+                    chunk_kind="leaf",
+                    meta={
+                        "kind": "subtitle", "video": video_name,
+                        "start_ms": cue.start_ms, "end_ms": cue.end_ms,
+                        "start_ts": format_ts(cue.start_ms), "end_ts": format_ts(cue.end_ms),
+                    },
+                ))
+            continue
+        candidate = len("\n".join(lines + [cue.text]))
+        if lines and candidate > chunk_chars:
+            emit(lines, group)
+            lines, group = [], []
+        lines.append(cue.text)
+        group.append(cue)
+    emit(lines, group)
+    return chunks
+
+
 def _extract_docx(content: bytes, *, para_markers: bool = False) -> str:
     """Extract paragraphs + table cells from a .docx (``python-docx``).
 
@@ -354,6 +433,27 @@ async def build_chunks(
         on_split(chunks)
     if config.contextual:
         chunks = await contextualize_chunks(chunks, doc_title, llm)
+    if config.cjk:
+        for c in chunks:
+            if not c.content_search:
+                c.content_search = segment(c.content_en)
+    return chunks
+
+
+async def build_subtitle_chunks_async(
+    cues: list[media.SubtitleCue], config, *, video_name: str, llm
+) -> list[Chunk]:
+    """Subtitle path of the ingest pipeline: cue-grouped timestamped chunks + enrichments.
+
+    Mirrors :func:`build_chunks` (contextual prefixes + CJK ``content_search``) but skips
+    the strategy split and parent/child hierarchy — cue boundaries are the semantic unit,
+    and every leaf already cites its time span via ``meta``.
+    """
+    from rag.query.cjk import segment  # lazy: rag is a sibling package
+
+    chunks = build_subtitle_chunks(cues, config.chunking.chunk_chars, video_name=video_name)
+    if config.contextual:
+        chunks = await contextualize_chunks(chunks, video_name, llm)
     if config.cjk:
         for c in chunks:
             if not c.content_search:

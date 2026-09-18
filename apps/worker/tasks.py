@@ -40,7 +40,9 @@ from core.infrastructure.drive_repositories import (
 from core.infrastructure.ingest import (
     Chunk,
     build_chunks,
+    build_subtitle_chunks_async,
     extract_document_text,
+    parse_subtitle_cues,
     write_query_repo_chunks,
 )
 from core.infrastructure.jobs import SESSION_FINALIZE, JobStore, TaskQueue
@@ -554,6 +556,78 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
         # carries the image_ids of the pages it covers — the agent then sees those ids in
         # ``rag_search`` results and reads them with the ``vision`` tool.
         await assets.set_status(asset_id, rag_status="CHUNKING")
+
+        async def _embed_and_index(chunks: list[Chunk]) -> dict:
+            """Shared tail for every chunking path: embed leaves + insert (incrementally)."""
+            await assets.set_status(asset_id, rag_status="EMBEDDING")
+            # Drop previous chunks up front, then embed + insert incrementally per batch so a
+            # worker timeout preserves whatever already committed — a re-run re-does only the
+            # remainder instead of losing the whole document.
+            chunks_repo = SqlChunkRepository(ctx["session_factory"])
+            await chunks_repo.delete_by_asset(asset_id)
+
+            # Parents are context only: recall searches leaf chunks (``chunk_kind='leaf'``) and
+            # parent_expand fetches parents by ID, so parent embeddings are never queried. Skipping
+            # them removes the ingest bottleneck — 3600-char parents pushed a 16-row batch to
+            # ~14k tokens, which TEI (max-batch-tokens 2048) took ~70s to embed, blowing the
+            # embedder timeout. Parents get a zero-vector sentinel to satisfy the NOT NULL column.
+            zero = [0.0] * settings.embedding_dim
+            parent_rows = [
+                {
+                    "id": c.id,
+                    "content_en": c.content_en,
+                    "content_cn": c.content_cn,
+                    "meta": {**c.meta, "asset_id": str(asset_id)},
+                    "embedding": zero,
+                    "chunk_kind": c.chunk_kind,
+                    "parent_chunk_id": c.parent_chunk_id,
+                    "content_search": c.content_search,
+                }
+                for c in chunks
+                if c.chunk_kind == "parent"
+            ]
+            if parent_rows:
+                await chunks_repo.bulk_insert(
+                    asset_id, asset.user_id, asset.workspace_id, parent_rows
+                )
+
+            # Leaf chunks embed + insert in batches; parents were inserted first so every
+            # ``parent_chunk_id`` reference is already satisfied.
+            inserted = len(parent_rows)
+            leaves = [c for c in chunks if c.chunk_kind != "parent"]
+            for i in range(0, len(leaves), settings.embed_batch_size):
+                batch = leaves[i : i + settings.embed_batch_size]
+                embeddings = await ctx["embedder"].embed([c.content_en for c in batch])
+                rows = [
+                    {
+                        "id": c.id,
+                        "content_en": c.content_en,
+                        "content_cn": c.content_cn,
+                        "meta": {**c.meta, "asset_id": str(asset_id)},
+                        "embedding": emb,
+                        "chunk_kind": c.chunk_kind,
+                        "parent_chunk_id": c.parent_chunk_id,
+                        "content_search": c.content_search,
+                    }
+                    for c, emb in zip(batch, embeddings)
+                ]
+                await chunks_repo.bulk_insert(asset_id, asset.user_id, asset.workspace_id, rows)
+                inserted += len(batch)
+            await assets.set_status(asset_id, rag_status="INDEXED")
+            # The corpus changed → invalidate the Redis query cache (best-effort).
+            await bump_corpus_version(ctx["redis"])
+            return {"chunks": inserted}
+
+        # Subtitle assets (srt/vtt/lrc) take the timestamped path: consecutive cues are
+        # grouped into chunks whose ``meta`` carries {video, start_ms/end_ms, start_ts/
+        # end_ts}, so every retrieval result can cite ``<video> @ H:MM:SS`` — the video is
+        # addressed by the subtitle file's stem, matching the local naming convention.
+        sub_cues = parse_subtitle_cues(data, asset.name)
+        if sub_cues:
+            chunks = await build_subtitle_chunks_async(
+                sub_cues, cfg, video_name=Path(asset.name).stem, llm=ctx["llm"]
+            )
+            return await _embed_and_index(chunks)
         scans = await asyncio.to_thread(scan_embedded_images, data, asset.name)
         if scans:
             drive = DriveService(ctx["session_factory"])
@@ -601,64 +675,7 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
             text = await extract_document_text(data, asset.name, ctx["llm"])
             chunks = await build_chunks(text, cfg, doc_title=asset.name, llm=ctx["llm"])
 
-        await assets.set_status(asset_id, rag_status="EMBEDDING")
-        # Drop previous chunks up front, then embed + insert incrementally per batch so a
-        # worker timeout preserves whatever already committed — a re-run re-does only the
-        # remainder instead of losing the whole document.
-        chunks_repo = SqlChunkRepository(ctx["session_factory"])
-        await chunks_repo.delete_by_asset(asset_id)
-
-        # Parents are context only: recall searches leaf chunks (``chunk_kind='leaf'``) and
-        # parent_expand fetches parents by ID, so parent embeddings are never queried. Skipping
-        # them removes the ingest bottleneck — 3600-char parents pushed a 16-row batch to
-        # ~14k tokens, which TEI (max-batch-tokens 2048) took ~70s to embed, blowing the
-        # embedder timeout. Parents get a zero-vector sentinel to satisfy the NOT NULL column.
-        zero = [0.0] * settings.embedding_dim
-        parent_rows = [
-            {
-                "id": c.id,
-                "content_en": c.content_en,
-                "content_cn": c.content_cn,
-                "meta": {**c.meta, "asset_id": str(asset_id)},
-                "embedding": zero,
-                "chunk_kind": c.chunk_kind,
-                "parent_chunk_id": c.parent_chunk_id,
-                "content_search": c.content_search,
-            }
-            for c in chunks
-            if c.chunk_kind == "parent"
-        ]
-        if parent_rows:
-            await chunks_repo.bulk_insert(
-                asset_id, asset.user_id, asset.workspace_id, parent_rows
-            )
-
-        # Leaf chunks embed + insert in batches; parents were inserted first so every
-        # ``parent_chunk_id`` reference is already satisfied.
-        inserted = len(parent_rows)
-        leaves = [c for c in chunks if c.chunk_kind != "parent"]
-        for i in range(0, len(leaves), settings.embed_batch_size):
-            batch = leaves[i : i + settings.embed_batch_size]
-            embeddings = await ctx["embedder"].embed([c.content_en for c in batch])
-            rows = [
-                {
-                    "id": c.id,
-                    "content_en": c.content_en,
-                    "content_cn": c.content_cn,
-                    "meta": {**c.meta, "asset_id": str(asset_id)},
-                    "embedding": emb,
-                    "chunk_kind": c.chunk_kind,
-                    "parent_chunk_id": c.parent_chunk_id,
-                    "content_search": c.content_search,
-                }
-                for c, emb in zip(batch, embeddings)
-            ]
-            await chunks_repo.bulk_insert(asset_id, asset.user_id, asset.workspace_id, rows)
-            inserted += len(batch)
-        await assets.set_status(asset_id, rag_status="INDEXED")
-        # The corpus changed → invalidate the Redis query cache (best-effort).
-        await bump_corpus_version(ctx["redis"])
-        return {"chunks": inserted}
+        return await _embed_and_index(chunks)
 
     # Serialize per asset (see _asset_ingest_lock): without this, concurrent jobs for the
     # same asset interleave their delete-by-asset + incremental insert and can delete each
