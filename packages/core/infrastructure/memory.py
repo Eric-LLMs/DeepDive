@@ -62,7 +62,7 @@ from core.infrastructure.db import (
 from core.infrastructure.vector import TEIEmbedder
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Compaction checkpoint (sessions.compaction JSONB, migration 0018)
+# Compaction checkpoint (sessions.compaction JSONB, canonical schema)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass

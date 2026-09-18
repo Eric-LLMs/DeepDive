@@ -23,7 +23,7 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
         # assets (owner / workspace / ACL). A guest (None) sees public-link assets only.
         filters = {"user_id": get_request_user_id()}
         # Optional domain scoping (P1): when the model/console pins a domain id, retrieval
-        # narrows to assets of that domain (assets.domain_id, migration 0010).
+        # narrows to assets of that domain (assets.domain_id).
         if args.get("domain"):
             filters["domain_id"] = str(args["domain"])
         try:

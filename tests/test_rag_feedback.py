@@ -27,11 +27,11 @@ def test_feedback_columns_and_types():
     assert isinstance(cols["filters"].type, JSONB)
 
 
-def test_feedback_migration_matches():
+def test_feedback_schema_matches_canonical_init():
     root = Path(__file__).resolve().parents[1]
-    sql = (root / "migrations" / "0012_rag_feedback.sql").read_text(encoding="utf-8")
-    assert "CREATE TABLE IF NOT EXISTS rag_feedback" in sql
-    # The migration's columns mirror the model (id, query, rating, reason, hits, filters).
-    for col in ("user_id UUID NULL", "query TEXT NOT NULL", "rating BOOLEAN NOT NULL",
-                "reason TEXT NULL", "hits JSONB", "filters JSONB"):
+    sql = (root / "migrations" / "0001_init.sql").read_text(encoding="utf-8")
+    assert "CREATE TABLE public.rag_feedback (" in sql
+    # The canonical schema's columns mirror the model (id, query, rating, reason, hits, filters).
+    for col in ("user_id uuid", "query text NOT NULL", "rating boolean NOT NULL",
+                "reason text", "hits jsonb", "filters jsonb"):
         assert col in sql

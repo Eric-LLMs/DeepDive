@@ -1,8 +1,8 @@
 """Retrieval-feedback loop contracts (DB-free).
 
 ``_extract_retrieval`` is a pure function over the turn's message list, so it gets
-direct unit tests; the persistence side (``messages.meta`` JSONB + migration 0016)
-is verified the same contract way as test_rag_feedback.py.
+direct unit tests; the persistence side (``messages.meta`` JSONB in the canonical
+``migrations/0001_init.sql``) is verified the same contract way as test_rag_feedback.py.
 """
 import json
 from pathlib import Path
@@ -125,7 +125,8 @@ def test_message_model_has_meta_jsonb():
     assert cols["meta"].nullable
 
 
-def test_migration_0016_matches():
+def test_meta_column_in_canonical_init():
     root = Path(__file__).resolve().parents[1]
-    sql = (root / "migrations" / "0016_messages_meta.sql").read_text(encoding="utf-8")
-    assert "ALTER TABLE messages ADD COLUMN IF NOT EXISTS meta JSONB" in sql
+    sql = (root / "migrations" / "0001_init.sql").read_text(encoding="utf-8")
+    ddl = sql[sql.index("CREATE TABLE public.messages ("):sql.index(");", sql.index("CREATE TABLE public.messages ("))]
+    assert "meta jsonb" in ddl

@@ -1,15 +1,21 @@
 # Traefik dynamic configuration (routers/services).
 #
 # Route table:
-#   - HTTP:  `/api/*` -> host-run FastAPI on host.docker.internal:8300 (prefix stripped —
+#   - HTTP:  `/api/*` -> host-run FastAPI on :8300 (prefix stripped —
 #            the API mounts its routers without an ``/api`` prefix; clients add it).
-#   - gRPC:  retrieval path -> retrieval:50051 (h2c, plaintext HTTP/2)
+#   - HTTP:  `/admin` + `/audio` `/images` `/avatars` -> same API, paths as-is
+#            (the web console SPA and its media mounts served by FastAPI itself).
+#   - gRPC:  retrieval path -> retrieval:50051 (h2c, plaintext HTTP/2), own entryPoint
 http:
   routers:
     deepdive-api:
       entryPoints: ["web"]
       rule: "PathPrefix(`/api`)"
       middlewares: ["strip-api"]
+      service: deepdive-api
+    deepdive-console:
+      entryPoints: ["web"]
+      rule: "Path(`/admin`) || PathPrefix(`/admin/`) || PathPrefix(`/audio/`) || PathPrefix(`/images/`) || PathPrefix(`/avatars/`)"
       service: deepdive-api
     deepdive-retrieval:
       entryPoints: ["grpc"]

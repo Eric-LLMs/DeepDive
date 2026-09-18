@@ -1,466 +1,1673 @@
--- 0001_init.sql: DeepDive full schema (consolidated).
+-- DeepDive canonical database initialization -- the single install script.
 --
--- Single shipped script for end users: the squash of the original 0001_init.sql through
--- 0008_login_tokens.sql applied in order (a fresh install produces the exact same schema
--- as running all eight). Versioned per-change migrations are a development concern; the
--- release schema is always this one consolidated file.
+-- Fresh installs: the asyncpg runner (packages/core/infrastructure/db.py) applies
+-- this file once inside a transaction and records "0001_init" in schema_migrations.
+-- The development-time incremental migrations 0002-0019 were deliberately squashed
+-- into this final schema; existing databases that already applied them carry the
+-- "0001_init" version and skip re-application. Do not add dev-history deltas here
+-- as new numbered files -- extend this schema instead.
 --
--- Idempotent: statements are IF NOT EXISTS / guarded, so re-running is safe.
+-- Generated from the live PostgreSQL 16 schema (pg_dump --schema-only), plus the
+-- curated reference seeds at the bottom.
 
-
--- 0001_init: initial schema.
 --
--- Extensions first, then core tables. Idempotent (IF NOT EXISTS) so it is safe to re-run
--- against a database that was already created by the previous Alembic migration.
-
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
-CREATE TABLE IF NOT EXISTS domains (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name        TEXT NOT NULL UNIQUE,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS materials (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    type        TEXT NOT NULL,               -- 'domain' | 'video' | 'document'
-    title       TEXT NOT NULL,
-    source_url  TEXT,
-    meta        JSONB NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS users (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS terms (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    domain_id   UUID NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
-    word        TEXT NOT NULL,
-    definition  TEXT,
-    frequency   INTEGER NOT NULL,
-    star_level  INTEGER NOT NULL,
-    audio_hash  TEXT,
-    image_paths JSONB NOT NULL,
-    is_active   BOOLEAN NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS sentences (
-    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    domain_id      UUID NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
-    origin_source  TEXT,
-    content_en     TEXT NOT NULL UNIQUE,
-    content_cn     TEXT,
-    audio_hash     TEXT,
-    cn_explanation TEXT,
-    embedding      vector(1024)
-);
-
-CREATE TABLE IF NOT EXISTS chunks (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    material_id UUID NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
-    seq         INTEGER NOT NULL,
-    content_en  TEXT NOT NULL,
-    content_cn  TEXT,
-    meta        JSONB NOT NULL,
-    embedding   vector(1024) NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    closed_at   TIMESTAMPTZ,
-    summary     TEXT
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    session_id  UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    role        TEXT NOT NULL,               -- 'user' | 'assistant' | 'tool'
-    text        TEXT NOT NULL,
-    embedding   vector(1024),
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS session_events (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    session_id  UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    seq         INTEGER NOT NULL,
-    type        TEXT NOT NULL,
-    timestamp   DOUBLE PRECISION NOT NULL,
-    payload     JSONB NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS matches (
-    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    term_id        UUID NOT NULL REFERENCES terms(id) ON DELETE CASCADE,
-    sentence_id    UUID NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
-    cn_explanation TEXT
-);
-
-CREATE TABLE IF NOT EXISTS jobs (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    type         TEXT NOT NULL,
-    status       TEXT NOT NULL,
-    payload      JSONB NOT NULL,
-    result       JSONB,
-    error        TEXT,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    started_at   TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ
-);
-
-
--- 0002_auth: multi-user auth + server-managed settings.
+-- PostgreSQL database dump
 --
--- Adds login columns to the users table and a key/value settings table that the admin
--- console reads/writes (LLM provider config, admin credential, user tiers). Idempotent
--- so it is safe to re-run against an existing database.
-
-ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS username      TEXT,
-    ADD COLUMN IF NOT EXISTS password_hash TEXT,
-    ADD COLUMN IF NOT EXISTS display_name  TEXT,
-    ADD COLUMN IF NOT EXISTS is_active     BOOLEAN NOT NULL DEFAULT true,
-    ADD COLUMN IF NOT EXISTS tier          TEXT NOT NULL DEFAULT 'regular';
-
--- Unique on non-null usernames; legacy anonymous rows (NULL username) are unaffected.
-CREATE UNIQUE INDEX IF NOT EXISTS users_username_idx
-    ON users (username) WHERE username IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS app_settings (
-    key        TEXT PRIMARY KEY,
-    value      JSONB NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 
 
--- 0003_rbac: role-based access control + opaque API tokens + usage accounting.
+-- Dumped from database version 16.14 (Debian 16.14-1.pgdg12+1)
+-- Dumped by pg_dump version 16.14 (Debian 16.14-1.pgdg12+1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
 --
--- Replaces the flat ``users.tier`` column with a proper roles table, adds opaque access
--- tokens (server-side, revocable, multi-token), and per-user usage counters plus an
--- append-only usage log for audit. Idempotent (IF NOT EXISTS / DO NOTHING / guarded DDL).
+-- Name: pg_trgm; Type: EXTENSION; Schema: -; Owner: -
+--
 
--- ── 1. Roles (quota + model + feature permissions live on the role) ──
-CREATE TABLE IF NOT EXISTS user_roles (
-    role_id               TEXT PRIMARY KEY,
-    role_name             TEXT NOT NULL,
-    daily_request_limit   INT NOT NULL DEFAULT 50,      -- -1 = unlimited
-    monthly_request_limit INT NOT NULL DEFAULT 1500,    -- -1 = unlimited
-    daily_token_limit     BIGINT DEFAULT -1,            -- -1 = unlimited
-    rpm_limit             INT DEFAULT -1,               -- -1 = unlimited
-    monthly_cost_limit    NUMERIC(12,6) DEFAULT -1,     -- -1 = unlimited
-    default_model         TEXT DEFAULT '',              -- empty = use active provider model
-    models                TEXT[] DEFAULT '{}',          -- allowed model ids (empty = all)
-    features              JSONB NOT NULL DEFAULT '{}'::jsonb,  -- e.g. {"chat": true}
-    is_active             BOOLEAN NOT NULL DEFAULT true,
-    created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pg_trgm; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
+
+
+--
+-- Name: vector; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION vector; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: access_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.access_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    credential_id uuid
 );
 
-INSERT INTO user_roles
+
+--
+-- Name: app_settings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app_settings (
+    key text NOT NULL,
+    value jsonb NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: articles; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.articles (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    domain_id uuid,
+    title text NOT NULL,
+    content text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: asset_acl; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.asset_acl (
+    asset_id uuid NOT NULL,
+    grantee_user_id uuid,
+    permission text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    id uuid DEFAULT gen_random_uuid() NOT NULL
+);
+
+
+--
+-- Name: assets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.assets (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    workspace_id uuid,
+    object_sha256 text,
+    name text NOT NULL,
+    folder_path text,
+    mime_type text,
+    size bigint,
+    file_status text DEFAULT 'uploading'::text NOT NULL,
+    rag_status text DEFAULT 'pending'::text NOT NULL,
+    meta jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    deleted_at timestamp with time zone,
+    domain_id uuid,
+    source_asset_id uuid
+);
+
+
+--
+-- Name: chunks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.chunks (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    asset_id uuid,
+    user_id uuid,
+    workspace_id uuid,
+    seq integer NOT NULL,
+    content_en text NOT NULL,
+    content_cn text,
+    meta jsonb DEFAULT '{}'::jsonb NOT NULL,
+    embedding public.vector(1024) NOT NULL,
+    parent_chunk_id uuid,
+    chunk_kind text DEFAULT 'leaf'::text NOT NULL,
+    content_search text,
+    source_type text DEFAULT 'file'::text NOT NULL,
+    source_id text
+);
+
+
+--
+-- Name: credential_models; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credential_models (
+    credential_id uuid NOT NULL,
+    model_id uuid NOT NULL,
+    note text,
+    priority integer DEFAULT 0 NOT NULL,
+    weight integer DEFAULT 1 NOT NULL,
+    prompt_price_per_1k numeric(12,6),
+    completion_price_per_1k numeric(12,6),
+    is_active boolean DEFAULT true NOT NULL
+);
+
+
+--
+-- Name: domains; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.domains (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    user_id uuid
+);
+
+
+--
+-- Name: folders; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.folders (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    workspace_id uuid,
+    path text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: global_objects; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.global_objects (
+    sha256 text NOT NULL,
+    size bigint NOT NULL,
+    storage_key text NOT NULL,
+    mime_type text,
+    ref_count bigint DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: jobs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.jobs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    type text NOT NULL,
+    status text NOT NULL,
+    payload jsonb NOT NULL,
+    result jsonb,
+    error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    started_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    user_id uuid
+);
+
+
+--
+-- Name: llm_credentials; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.llm_credentials (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    base_url text NOT NULL,
+    api_key text NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone
+);
+
+
+--
+-- Name: llm_models; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.llm_models (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    description text,
+    prompt_price_per_1k numeric(12,6) DEFAULT 0 NOT NULL,
+    completion_price_per_1k numeric(12,6) DEFAULT 0 NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    provider_model_name text
+);
+
+
+--
+-- Name: login_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.login_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid,
+    name text NOT NULL,
+    token_hash text NOT NULL,
+    role text DEFAULT 'user'::text NOT NULL,
+    role_id text,
+    credential_id uuid,
+    expires_at timestamp with time zone,
+    last_used_at timestamp with time zone,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: matches; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.matches (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    term_id uuid NOT NULL,
+    sentence_id uuid NOT NULL,
+    cn_explanation text
+);
+
+
+--
+-- Name: messages; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.messages (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    session_id uuid NOT NULL,
+    role text NOT NULL,
+    text text NOT NULL,
+    embedding public.vector(1024),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    imported_rag boolean DEFAULT false NOT NULL,
+    attach_asset_id uuid,
+    meta jsonb
+);
+
+
+--
+-- Name: rag_feedback; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.rag_feedback (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid,
+    query text NOT NULL,
+    rating boolean NOT NULL,
+    reason text,
+    hits jsonb DEFAULT '[]'::jsonb NOT NULL,
+    filters jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: role_credentials; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.role_credentials (
+    role_id text NOT NULL,
+    credential_id uuid NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: sentences; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sentences (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    domain_id uuid NOT NULL,
+    origin_source text,
+    content_en text NOT NULL,
+    content_cn text,
+    audio_hash text,
+    cn_explanation text,
+    embedding public.vector(1024),
+    user_id uuid
+);
+
+
+--
+-- Name: session_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.session_events (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    session_id uuid NOT NULL,
+    seq integer NOT NULL,
+    type text NOT NULL,
+    "timestamp" double precision NOT NULL,
+    payload jsonb NOT NULL
+);
+
+
+--
+-- Name: sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sessions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    closed_at timestamp with time zone,
+    summary text,
+    title text,
+    type integer DEFAULT 0 NOT NULL,
+    compaction jsonb
+);
+
+
+--
+-- Name: terms; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.terms (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    domain_id uuid NOT NULL,
+    word text NOT NULL,
+    definition text,
+    frequency integer NOT NULL,
+    star_level integer NOT NULL,
+    audio_hash text,
+    image_paths jsonb NOT NULL,
+    is_active boolean NOT NULL,
+    user_id uuid
+);
+
+
+--
+-- Name: upload_sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.upload_sessions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    asset_id uuid NOT NULL,
+    sha256 text NOT NULL,
+    size bigint NOT NULL,
+    chunk_size integer NOT NULL,
+    num_chunks integer NOT NULL,
+    received_chunks jsonb DEFAULT '[]'::jsonb NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: user_roles; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_roles (
+    role_id text NOT NULL,
+    role_name text NOT NULL,
+    daily_request_limit integer DEFAULT 50 NOT NULL,
+    monthly_request_limit integer DEFAULT 1500 NOT NULL,
+    daily_token_limit bigint DEFAULT '-1'::integer,
+    rpm_limit integer DEFAULT '-1'::integer,
+    monthly_cost_limit numeric(12,6) DEFAULT '-1'::integer,
+    default_model text DEFAULT ''::text,
+    models text[] DEFAULT '{}'::text[],
+    features jsonb DEFAULT '{}'::jsonb NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: user_usage_counters; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_usage_counters (
+    user_id uuid NOT NULL,
+    period_type text NOT NULL,
+    period_start date NOT NULL,
+    request_count bigint DEFAULT 0 NOT NULL,
+    token_count bigint DEFAULT 0 NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: user_usage_logs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_usage_logs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid,
+    token_id uuid,
+    role_id text,
+    model_name text,
+    tool text,
+    prompt_tokens integer DEFAULT 0 NOT NULL,
+    completion_tokens integer DEFAULT 0 NOT NULL,
+    total_tokens integer DEFAULT 0 NOT NULL,
+    cost_usd numeric(12,6) DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    credential_id uuid
+);
+
+
+--
+-- Name: user_wallets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_wallets (
+    user_id uuid NOT NULL,
+    balance numeric(14,6) DEFAULT 0 NOT NULL,
+    currency text DEFAULT 'USD'::text NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: users; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.users (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    username text,
+    password_hash text,
+    display_name text,
+    is_active boolean DEFAULT true NOT NULL,
+    role_id text DEFAULT 'regular'::text NOT NULL,
+    meta jsonb DEFAULT '{}'::jsonb NOT NULL,
+    updated_at timestamp with time zone,
+    email text,
+    phone text,
+    avatar text,
+    email_verified boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: verification_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.verification_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    kind text NOT NULL,
+    token_hash text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    used_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: wallet_transactions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.wallet_transactions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    type text NOT NULL,
+    amount numeric(14,6) NOT NULL,
+    balance_after numeric(14,6) NOT NULL,
+    description text,
+    meta jsonb DEFAULT '{}'::jsonb NOT NULL,
+    idempotency_key text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: workspace_activity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workspace_activity (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid,
+    actor_user_id uuid,
+    actor_username text,
+    action text NOT NULL,
+    target_type text NOT NULL,
+    target_id text,
+    target_name text,
+    detail text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: workspace_members; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workspace_members (
+    workspace_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    role text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: workspaces; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workspaces (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_id uuid NOT NULL,
+    name text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: access_tokens access_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.access_tokens
+    ADD CONSTRAINT access_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: app_settings app_settings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_settings
+    ADD CONSTRAINT app_settings_pkey PRIMARY KEY (key);
+
+
+--
+-- Name: articles articles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.articles
+    ADD CONSTRAINT articles_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: asset_acl asset_acl_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.asset_acl
+    ADD CONSTRAINT asset_acl_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: assets assets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: chunks chunks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.chunks
+    ADD CONSTRAINT chunks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credential_models credential_models_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credential_models
+    ADD CONSTRAINT credential_models_pkey PRIMARY KEY (credential_id, model_id);
+
+
+--
+-- Name: domains domains_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.domains
+    ADD CONSTRAINT domains_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: folders folders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folders
+    ADD CONSTRAINT folders_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: global_objects global_objects_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.global_objects
+    ADD CONSTRAINT global_objects_pkey PRIMARY KEY (sha256);
+
+
+--
+-- Name: jobs jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.jobs
+    ADD CONSTRAINT jobs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: llm_credentials llm_credentials_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.llm_credentials
+    ADD CONSTRAINT llm_credentials_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: llm_models llm_models_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.llm_models
+    ADD CONSTRAINT llm_models_name_key UNIQUE (name);
+
+
+--
+-- Name: llm_models llm_models_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.llm_models
+    ADD CONSTRAINT llm_models_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: login_tokens login_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.login_tokens
+    ADD CONSTRAINT login_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: login_tokens login_tokens_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.login_tokens
+    ADD CONSTRAINT login_tokens_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: matches matches_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.matches
+    ADD CONSTRAINT matches_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: messages messages_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.messages
+    ADD CONSTRAINT messages_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: rag_feedback rag_feedback_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_feedback
+    ADD CONSTRAINT rag_feedback_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: role_credentials role_credentials_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role_credentials
+    ADD CONSTRAINT role_credentials_pkey PRIMARY KEY (role_id, credential_id);
+
+
+--
+-- Name: sentences sentences_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sentences
+    ADD CONSTRAINT sentences_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: session_events session_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_events
+    ADD CONSTRAINT session_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: sessions sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sessions
+    ADD CONSTRAINT sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: terms terms_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.terms
+    ADD CONSTRAINT terms_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: upload_sessions upload_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.upload_sessions
+    ADD CONSTRAINT upload_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_roles user_roles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_roles
+    ADD CONSTRAINT user_roles_pkey PRIMARY KEY (role_id);
+
+
+--
+-- Name: user_usage_counters user_usage_counters_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_usage_counters
+    ADD CONSTRAINT user_usage_counters_pkey PRIMARY KEY (user_id, period_type, period_start);
+
+
+--
+-- Name: user_usage_logs user_usage_logs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_usage_logs
+    ADD CONSTRAINT user_usage_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_wallets user_wallets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_wallets
+    ADD CONSTRAINT user_wallets_pkey PRIMARY KEY (user_id);
+
+
+--
+-- Name: users users_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: verification_tokens verification_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.verification_tokens
+    ADD CONSTRAINT verification_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: verification_tokens verification_tokens_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.verification_tokens
+    ADD CONSTRAINT verification_tokens_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: wallet_transactions wallet_transactions_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wallet_transactions
+    ADD CONSTRAINT wallet_transactions_idempotency_key_key UNIQUE (idempotency_key);
+
+
+--
+-- Name: wallet_transactions wallet_transactions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wallet_transactions
+    ADD CONSTRAINT wallet_transactions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: workspace_activity workspace_activity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workspace_activity
+    ADD CONSTRAINT workspace_activity_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: workspace_members workspace_members_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workspace_members
+    ADD CONSTRAINT workspace_members_pkey PRIMARY KEY (workspace_id, user_id);
+
+
+--
+-- Name: workspaces workspaces_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workspaces
+    ADD CONSTRAINT workspaces_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: access_tokens_credential_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX access_tokens_credential_id_idx ON public.access_tokens USING btree (credential_id);
+
+
+--
+-- Name: access_tokens_user_credential_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX access_tokens_user_credential_uniq ON public.access_tokens USING btree (user_id, credential_id) WHERE ((user_id IS NOT NULL) AND (credential_id IS NOT NULL));
+
+
+--
+-- Name: access_tokens_user_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX access_tokens_user_id_idx ON public.access_tokens USING btree (user_id);
+
+
+--
+-- Name: asset_acl_grantee_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX asset_acl_grantee_uniq ON public.asset_acl USING btree (asset_id, grantee_user_id) WHERE (grantee_user_id IS NOT NULL);
+
+
+--
+-- Name: asset_acl_public_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX asset_acl_public_uniq ON public.asset_acl USING btree (asset_id) WHERE (grantee_user_id IS NULL);
+
+
+--
+-- Name: assets_domain_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX assets_domain_idx ON public.assets USING btree (domain_id);
+
+
+--
+-- Name: assets_folder_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX assets_folder_idx ON public.assets USING btree (folder_path);
+
+
+--
+-- Name: assets_name_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX assets_name_idx ON public.assets USING btree (lower(name));
+
+
+--
+-- Name: assets_object_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX assets_object_idx ON public.assets USING btree (object_sha256);
+
+
+--
+-- Name: assets_user_deleted_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX assets_user_deleted_idx ON public.assets USING btree (user_id, deleted_at);
+
+
+--
+-- Name: assets_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX assets_user_idx ON public.assets USING btree (user_id);
+
+
+--
+-- Name: assets_workspace_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX assets_workspace_idx ON public.assets USING btree (workspace_id);
+
+
+--
+-- Name: chunks_asset_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX chunks_asset_idx ON public.chunks USING btree (asset_id);
+
+
+--
+-- Name: chunks_content_search_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX chunks_content_search_idx ON public.chunks USING gin (to_tsvector('simple'::regconfig, COALESCE(content_search, ''::text)));
+
+
+--
+-- Name: chunks_embedding_hnsw; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX chunks_embedding_hnsw ON public.chunks USING hnsw (embedding public.vector_cosine_ops) WITH (m='16', ef_construction='64');
+
+
+--
+-- Name: chunks_parent_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX chunks_parent_idx ON public.chunks USING btree (parent_chunk_id);
+
+
+--
+-- Name: chunks_source_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX chunks_source_idx ON public.chunks USING btree (source_type);
+
+
+--
+-- Name: chunks_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX chunks_user_idx ON public.chunks USING btree (user_id);
+
+
+--
+-- Name: chunks_workspace_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX chunks_workspace_idx ON public.chunks USING btree (workspace_id);
+
+
+--
+-- Name: domains_name_private_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX domains_name_private_uniq ON public.domains USING btree (user_id, name) WHERE (user_id IS NOT NULL);
+
+
+--
+-- Name: domains_name_public_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX domains_name_public_uniq ON public.domains USING btree (name) WHERE (user_id IS NULL);
+
+
+--
+-- Name: domains_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX domains_user_idx ON public.domains USING btree (user_id);
+
+
+--
+-- Name: folders_unique_personal; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX folders_unique_personal ON public.folders USING btree (path) WHERE (workspace_id IS NULL);
+
+
+--
+-- Name: folders_unique_ws; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX folders_unique_ws ON public.folders USING btree (workspace_id, path) WHERE (workspace_id IS NOT NULL);
+
+
+--
+-- Name: folders_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX folders_user_idx ON public.folders USING btree (user_id);
+
+
+--
+-- Name: idx_assets_source_asset; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_assets_source_asset ON public.assets USING btree (source_asset_id);
+
+
+--
+-- Name: idx_assets_source_content; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_assets_source_content ON public.assets USING btree (source_asset_id, object_sha256);
+
+
+--
+-- Name: idx_messages_attach_asset; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_messages_attach_asset ON public.messages USING btree (attach_asset_id);
+
+
+--
+-- Name: idx_session_events_timestamp; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_session_events_timestamp ON public.session_events USING btree ("timestamp");
+
+
+--
+-- Name: jobs_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX jobs_user_idx ON public.jobs USING btree (user_id);
+
+
+--
+-- Name: login_tokens_credential_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX login_tokens_credential_id_idx ON public.login_tokens USING btree (credential_id);
+
+
+--
+-- Name: login_tokens_user_credential_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX login_tokens_user_credential_uniq ON public.login_tokens USING btree (user_id, credential_id) WHERE ((user_id IS NOT NULL) AND (credential_id IS NOT NULL));
+
+
+--
+-- Name: login_tokens_user_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX login_tokens_user_id_idx ON public.login_tokens USING btree (user_id);
+
+
+--
+-- Name: login_tokens_user_no_cred_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX login_tokens_user_no_cred_uniq ON public.login_tokens USING btree (user_id) WHERE ((user_id IS NOT NULL) AND (credential_id IS NULL));
+
+
+--
+-- Name: rag_feedback_rating_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_feedback_rating_idx ON public.rag_feedback USING btree (rating);
+
+
+--
+-- Name: rag_feedback_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_feedback_user_idx ON public.rag_feedback USING btree (user_id);
+
+
+--
+-- Name: role_credentials_credential_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX role_credentials_credential_idx ON public.role_credentials USING btree (credential_id);
+
+
+--
+-- Name: sentences_content_en_private_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX sentences_content_en_private_uniq ON public.sentences USING btree (user_id, content_en) WHERE (user_id IS NOT NULL);
+
+
+--
+-- Name: sentences_content_en_public_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX sentences_content_en_public_uniq ON public.sentences USING btree (content_en) WHERE (user_id IS NULL);
+
+
+--
+-- Name: sentences_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX sentences_user_idx ON public.sentences USING btree (user_id);
+
+
+--
+-- Name: terms_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX terms_user_idx ON public.terms USING btree (user_id);
+
+
+--
+-- Name: upload_sessions_asset_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX upload_sessions_asset_idx ON public.upload_sessions USING btree (asset_id);
+
+
+--
+-- Name: upload_sessions_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX upload_sessions_user_idx ON public.upload_sessions USING btree (user_id);
+
+
+--
+-- Name: user_usage_logs_cred_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX user_usage_logs_cred_idx ON public.user_usage_logs USING btree (credential_id);
+
+
+--
+-- Name: user_usage_logs_token_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX user_usage_logs_token_id_idx ON public.user_usage_logs USING btree (token_id, created_at);
+
+
+--
+-- Name: user_usage_logs_user_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX user_usage_logs_user_id_idx ON public.user_usage_logs USING btree (user_id, created_at);
+
+
+--
+-- Name: users_email_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX users_email_idx ON public.users USING btree (email) WHERE (email IS NOT NULL);
+
+
+--
+-- Name: users_username_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX users_username_idx ON public.users USING btree (username) WHERE (username IS NOT NULL);
+
+
+--
+-- Name: wallet_transactions_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX wallet_transactions_user_idx ON public.wallet_transactions USING btree (user_id, created_at);
+
+
+--
+-- Name: workspace_members_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX workspace_members_user_idx ON public.workspace_members USING btree (user_id);
+
+
+--
+-- Name: workspaces_owner_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX workspaces_owner_idx ON public.workspaces USING btree (owner_id);
+
+
+--
+-- Name: ws_activity_actor_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ws_activity_actor_idx ON public.workspace_activity USING btree (actor_username);
+
+
+--
+-- Name: ws_activity_target_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ws_activity_target_idx ON public.workspace_activity USING btree (target_name);
+
+
+--
+-- Name: ws_activity_ws_created_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ws_activity_ws_created_idx ON public.workspace_activity USING btree (workspace_id, created_at DESC);
+
+
+--
+-- Name: access_tokens access_tokens_credential_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.access_tokens
+    ADD CONSTRAINT access_tokens_credential_id_fkey FOREIGN KEY (credential_id) REFERENCES public.llm_credentials(id) ON DELETE SET NULL;
+
+
+--
+-- Name: access_tokens access_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.access_tokens
+    ADD CONSTRAINT access_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: articles articles_domain_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.articles
+    ADD CONSTRAINT articles_domain_id_fkey FOREIGN KEY (domain_id) REFERENCES public.domains(id) ON DELETE SET NULL;
+
+
+--
+-- Name: articles articles_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.articles
+    ADD CONSTRAINT articles_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: asset_acl asset_acl_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.asset_acl
+    ADD CONSTRAINT asset_acl_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: asset_acl asset_acl_grantee_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.asset_acl
+    ADD CONSTRAINT asset_acl_grantee_user_id_fkey FOREIGN KEY (grantee_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: assets assets_domain_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_domain_id_fkey FOREIGN KEY (domain_id) REFERENCES public.domains(id) ON DELETE SET NULL;
+
+
+--
+-- Name: assets assets_object_sha256_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_object_sha256_fkey FOREIGN KEY (object_sha256) REFERENCES public.global_objects(sha256);
+
+
+--
+-- Name: assets assets_source_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_source_asset_id_fkey FOREIGN KEY (source_asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: assets assets_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: assets assets_workspace_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id);
+
+
+--
+-- Name: chunks chunks_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.chunks
+    ADD CONSTRAINT chunks_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: chunks chunks_parent_chunk_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.chunks
+    ADD CONSTRAINT chunks_parent_chunk_id_fkey FOREIGN KEY (parent_chunk_id) REFERENCES public.chunks(id) ON DELETE SET NULL;
+
+
+--
+-- Name: credential_models credential_models_credential_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credential_models
+    ADD CONSTRAINT credential_models_credential_id_fkey FOREIGN KEY (credential_id) REFERENCES public.llm_credentials(id) ON DELETE CASCADE;
+
+
+--
+-- Name: credential_models credential_models_model_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credential_models
+    ADD CONSTRAINT credential_models_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.llm_models(id) ON DELETE CASCADE;
+
+
+--
+-- Name: domains domains_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.domains
+    ADD CONSTRAINT domains_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: folders folders_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folders
+    ADD CONSTRAINT folders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: folders folders_workspace_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folders
+    ADD CONSTRAINT folders_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+
+--
+-- Name: jobs jobs_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.jobs
+    ADD CONSTRAINT jobs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: login_tokens login_tokens_credential_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.login_tokens
+    ADD CONSTRAINT login_tokens_credential_id_fkey FOREIGN KEY (credential_id) REFERENCES public.llm_credentials(id) ON DELETE SET NULL;
+
+
+--
+-- Name: login_tokens login_tokens_role_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.login_tokens
+    ADD CONSTRAINT login_tokens_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.user_roles(role_id) ON DELETE SET NULL;
+
+
+--
+-- Name: login_tokens login_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.login_tokens
+    ADD CONSTRAINT login_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: matches matches_sentence_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.matches
+    ADD CONSTRAINT matches_sentence_id_fkey FOREIGN KEY (sentence_id) REFERENCES public.sentences(id) ON DELETE CASCADE;
+
+
+--
+-- Name: matches matches_term_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.matches
+    ADD CONSTRAINT matches_term_id_fkey FOREIGN KEY (term_id) REFERENCES public.terms(id) ON DELETE CASCADE;
+
+
+--
+-- Name: messages messages_attach_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.messages
+    ADD CONSTRAINT messages_attach_asset_id_fkey FOREIGN KEY (attach_asset_id) REFERENCES public.assets(id) ON DELETE SET NULL;
+
+
+--
+-- Name: messages messages_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.messages
+    ADD CONSTRAINT messages_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.sessions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: messages messages_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.messages
+    ADD CONSTRAINT messages_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: rag_feedback rag_feedback_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_feedback
+    ADD CONSTRAINT rag_feedback_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: role_credentials role_credentials_credential_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role_credentials
+    ADD CONSTRAINT role_credentials_credential_id_fkey FOREIGN KEY (credential_id) REFERENCES public.llm_credentials(id) ON DELETE CASCADE;
+
+
+--
+-- Name: role_credentials role_credentials_role_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role_credentials
+    ADD CONSTRAINT role_credentials_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.user_roles(role_id) ON DELETE CASCADE;
+
+
+--
+-- Name: sentences sentences_domain_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sentences
+    ADD CONSTRAINT sentences_domain_id_fkey FOREIGN KEY (domain_id) REFERENCES public.domains(id) ON DELETE CASCADE;
+
+
+--
+-- Name: sentences sentences_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sentences
+    ADD CONSTRAINT sentences_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: session_events session_events_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_events
+    ADD CONSTRAINT session_events_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.sessions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: sessions sessions_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sessions
+    ADD CONSTRAINT sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: terms terms_domain_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.terms
+    ADD CONSTRAINT terms_domain_id_fkey FOREIGN KEY (domain_id) REFERENCES public.domains(id) ON DELETE CASCADE;
+
+
+--
+-- Name: terms terms_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.terms
+    ADD CONSTRAINT terms_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: upload_sessions upload_sessions_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.upload_sessions
+    ADD CONSTRAINT upload_sessions_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: upload_sessions upload_sessions_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.upload_sessions
+    ADD CONSTRAINT upload_sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: user_usage_counters user_usage_counters_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_usage_counters
+    ADD CONSTRAINT user_usage_counters_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: user_usage_logs user_usage_logs_credential_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_usage_logs
+    ADD CONSTRAINT user_usage_logs_credential_id_fkey FOREIGN KEY (credential_id) REFERENCES public.llm_credentials(id) ON DELETE SET NULL;
+
+
+--
+-- Name: user_usage_logs user_usage_logs_token_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_usage_logs
+    ADD CONSTRAINT user_usage_logs_token_id_fkey FOREIGN KEY (token_id) REFERENCES public.login_tokens(id) ON DELETE SET NULL;
+
+
+--
+-- Name: user_usage_logs user_usage_logs_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_usage_logs
+    ADD CONSTRAINT user_usage_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: user_wallets user_wallets_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_wallets
+    ADD CONSTRAINT user_wallets_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: users users_role_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT users_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.user_roles(role_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: verification_tokens verification_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.verification_tokens
+    ADD CONSTRAINT verification_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: wallet_transactions wallet_transactions_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wallet_transactions
+    ADD CONSTRAINT wallet_transactions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workspace_members workspace_members_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workspace_members
+    ADD CONSTRAINT workspace_members_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workspace_members workspace_members_workspace_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workspace_members
+    ADD CONSTRAINT workspace_members_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workspaces workspaces_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workspaces
+    ADD CONSTRAINT workspaces_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+
+
+-- ── Reference seeds ─────────────────────────────────────────────────────────
+-- Role catalog (quotas in requests/tokens; -1 = unlimited). Guests route
+-- through the anonymous role's LLM channels with a per-day limit.
+
+INSERT INTO public.user_roles
     (role_id, role_name, daily_request_limit, monthly_request_limit, daily_token_limit,
      rpm_limit, monthly_cost_limit, default_model, models, features)
 VALUES
-    ('regular', '普通用户', 50,  1500,  -1, -1, -1, '', '{}', '{"chat": true}'::jsonb),
-    ('pro',     '专业版',   500, 15000, -1, -1, -1, '', '{}', '{"chat": true}'::jsonb),
-    ('vip',     'VIP',      -1,  -1,    -1, -1, -1, '', '{}', '{"chat": true}'::jsonb),
-    ('admin',   '管理员',    -1,  -1,    -1, -1, -1, '', '{}', '{"chat": true}'::jsonb)
+    ('regular',   '普通用户', 50,  1500,  -1, -1, -1, '', '{}', '{"chat": true}'::jsonb),
+    ('pro',       '专业版',   500, 15000, -1, -1, -1, '', '{}', '{"chat": true}'::jsonb),
+    ('vip',       'VIP',      -1,  -1,    -1, -1, -1, '', '{}', '{"chat": true}'::jsonb),
+    ('admin',     '管理员',    -1,  -1,    -1, -1, -1, '', '{}', '{"chat": true}'::jsonb),
+    ('anonymous', '匿名用户', 20,  600,   -1, -1, -1, '', '{}', '{"chat": true}'::jsonb)
 ON CONFLICT (role_id) DO NOTHING;
-
--- ── 2. users: flat tier → role_id (backfill existing rows) ──
-ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS role_id    TEXT,
-    ADD COLUMN IF NOT EXISTS meta       JSONB NOT NULL DEFAULT '{}'::jsonb,
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
-
-UPDATE users SET role_id = tier WHERE role_id IS NULL AND tier IN ('regular', 'pro', 'vip', 'admin');
-UPDATE users SET role_id = 'regular' WHERE role_id IS NULL;
-
-ALTER TABLE users ALTER COLUMN role_id SET DEFAULT 'regular';
-ALTER TABLE users ALTER COLUMN role_id SET NOT NULL;
-
-ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_id_fkey;
-ALTER TABLE users ADD CONSTRAINT users_role_id_fkey
-    FOREIGN KEY (role_id) REFERENCES user_roles (role_id) ON DELETE RESTRICT;
-
-ALTER TABLE users DROP COLUMN IF EXISTS tier;
-
--- ── 3. Opaque access tokens (login tokens + admin-minted API tokens) ──
-CREATE TABLE IF NOT EXISTS access_tokens (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id      UUID REFERENCES users (id) ON DELETE CASCADE,   -- NULL = admin token
-    name         TEXT NOT NULL,                                  -- human label
-    token_hash   TEXT NOT NULL UNIQUE,                           -- sha256(raw token)
-    role         TEXT NOT NULL DEFAULT 'user',                   -- 'admin' | 'user'
-    role_id      TEXT REFERENCES user_roles (role_id) ON DELETE SET NULL,  -- optional role override
-    expires_at   TIMESTAMPTZ,
-    last_used_at TIMESTAMPTZ,
-    is_active    BOOLEAN NOT NULL DEFAULT true,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS access_tokens_user_id_idx ON access_tokens (user_id);
-
--- ── 4. Usage counters (O(1) atomic quota enforcement; NOT redis, NOT COUNT over logs) ──
-CREATE TABLE IF NOT EXISTS user_usage_counters (
-    user_id       UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    period_type   TEXT NOT NULL,          -- 'day' | 'month'
-    period_start  DATE NOT NULL,          -- today's date, or first-of-month
-    request_count BIGINT NOT NULL DEFAULT 0,
-    token_count   BIGINT NOT NULL DEFAULT 0,
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (user_id, period_type, period_start)
-);
-
--- ── 5. Usage log (append-only audit) ──
-CREATE TABLE IF NOT EXISTS user_usage_logs (
-    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id           UUID REFERENCES users (id) ON DELETE SET NULL,
-    token_id          UUID REFERENCES access_tokens (id) ON DELETE SET NULL,
-    role_id           TEXT,               -- role snapshot at call time
-    model_name        TEXT,
-    tool              TEXT,
-    prompt_tokens     INT NOT NULL DEFAULT 0,
-    completion_tokens INT NOT NULL DEFAULT 0,
-    total_tokens      INT NOT NULL DEFAULT 0,   -- prompt + completion; denormalized for dashboards
-    cost_usd          NUMERIC(12,6) NOT NULL DEFAULT 0,
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS user_usage_logs_user_id_idx ON user_usage_logs (user_id, created_at);
-CREATE INDEX IF NOT EXISTS user_usage_logs_token_id_idx ON user_usage_logs (token_id, created_at);
-
-
--- 0004_billing: provider normalization + per-model pricing + wallet ledger.
---
--- Complements the RBAC module (0003) with the billing side:
---   * llm_credentials / llm_models / credential_models  — provider key + model catalog + N:M routing
---   * user_wallets / wallet_transactions                — cash wallet + append-only ledger (balance_after)
---
--- Pricing on llm_models is the cost source for PAYG billing (prompt/completion price per 1k tokens);
--- credential_models may override it per credential. Idempotent.
-
--- ── 1. Provider API credentials (manually maintained) ──
-CREATE TABLE IF NOT EXISTS llm_credentials (
-    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name       TEXT NOT NULL,
-    base_url   TEXT NOT NULL,
-    api_key    TEXT NOT NULL,
-    is_active  BOOLEAN NOT NULL DEFAULT true,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ
-);
-
--- ── 2. Model catalog + pricing ──
-CREATE TABLE IF NOT EXISTS llm_models (
-    id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name                   TEXT NOT NULL UNIQUE,      -- display name (referenced by roles)
-    provider_model_name    TEXT,                      -- real model id on the provider platform
-    description            TEXT,
-    prompt_price_per_1k    NUMERIC(12,6) NOT NULL DEFAULT 0,
-    completion_price_per_1k NUMERIC(12,6) NOT NULL DEFAULT 0,
-    is_active              BOOLEAN NOT NULL DEFAULT true,
-    created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- ── 3. Credential ↔ model routing (N:M; failover priority + load weight + per-key override) ──
-CREATE TABLE IF NOT EXISTS credential_models (
-    credential_id           UUID NOT NULL REFERENCES llm_credentials (id) ON DELETE CASCADE,
-    model_id                UUID NOT NULL REFERENCES llm_models (id) ON DELETE CASCADE,
-    note                    TEXT,                       -- free-text route purpose ("what this is for")
-    priority                INT NOT NULL DEFAULT 0,     -- lower = preferred
-    weight                  INT NOT NULL DEFAULT 1,     -- load-balance weight
-    prompt_price_per_1k     NUMERIC(12,6),              -- NULL = inherit llm_models
-    completion_price_per_1k NUMERIC(12,6),
-    is_active               BOOLEAN NOT NULL DEFAULT true,
-    PRIMARY KEY (credential_id, model_id)
-);
-
--- ── 4. Cash wallets (one row per user) ──
-CREATE TABLE IF NOT EXISTS user_wallets (
-    user_id    UUID PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
-    balance    NUMERIC(14,6) NOT NULL DEFAULT 0,
-    currency   TEXT NOT NULL DEFAULT 'USD',
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- ── 5. Wallet ledger (append-only; balance_after is a snapshot, never recomputed) ──
-CREATE TABLE IF NOT EXISTS wallet_transactions (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id         UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    type            TEXT NOT NULL,                     -- 'topup' | 'llm_consume' | 'refund' | 'adjustment'
-    amount          NUMERIC(14,6) NOT NULL,            -- +credit / -debit
-    balance_after   NUMERIC(14,6) NOT NULL,
-    description     TEXT,
-    meta            JSONB NOT NULL DEFAULT '{}'::jsonb,
-    idempotency_key TEXT UNIQUE,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS wallet_transactions_user_idx ON wallet_transactions (user_id, created_at);
-
-
--- 0005_roles_credentials: role ↔ channel binding + credential pinning on tokens + anonymous role.
---
--- Complements 0003 (RBAC) and 0004 (billing):
---   * role_credentials          — N:M "which LLM channels (llm_credentials) a role may use"
---   * access_tokens.credential_id — the channel randomly picked from the role at login and pinned
---   * anonymous role            — guest tier with its own channel set and limits
---
--- One idempotent unit (final shape in a single pass, no repeated ALTERs). Applied in filename order.
-
--- ── 1. Role ↔ channel binding (N:M) ──
-CREATE TABLE IF NOT EXISTS role_credentials (
-    role_id       TEXT    NOT NULL REFERENCES user_roles (role_id)  ON DELETE CASCADE,
-    credential_id UUID    NOT NULL REFERENCES llm_credentials (id) ON DELETE CASCADE,
-    is_active     BOOLEAN NOT NULL DEFAULT true,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (role_id, credential_id)
-);
-CREATE INDEX IF NOT EXISTS role_credentials_credential_idx ON role_credentials (credential_id);
-
--- ── 2. Token credential pinning (channel chosen at login) ──
-ALTER TABLE access_tokens ADD COLUMN IF NOT EXISTS credential_id UUID
-    REFERENCES llm_credentials (id) ON DELETE SET NULL;
-CREATE INDEX IF NOT EXISTS access_tokens_credential_id_idx ON access_tokens (credential_id);
-
--- ── 3. Anonymous guest role (seeded; guests route through its channels) ──
-INSERT INTO user_roles
-    (role_id, role_name, daily_request_limit, monthly_request_limit, daily_token_limit,
-     rpm_limit, monthly_cost_limit, default_model, models, features)
-VALUES
-    ('anonymous', '匿名用户', 20, 600, -1, -1, -1, '', '{}', '{"chat": true}'::jsonb)
-ON CONFLICT (role_id) DO NOTHING;
-
-
--- 0006_unique_user_tokens: one row per (user, pinned channel); re-login updates in place.
---
--- Before this, every login minted a fresh access_tokens row, so heavy logins grew the
--- table unboundedly. Now user tokens are reused per (user, credential_id):
---   * dedupe historical rows (keep the newest per pair) before adding the guard
---   * a partial unique index on (user_id, credential_id) where both are non-null
---     prevents duplicates; admin tokens (user_id NULL) and manual user tokens
---     (credential_id NULL) stay exempt, and the login endpoint reuses those rows
---     in application code instead.
---
--- One idempotent unit (final shape in a single pass).
-
--- ── 1. Dedupe existing login tokens: keep the newest row per (user, channel) ──
-DELETE FROM access_tokens a
-USING access_tokens b
-WHERE a.user_id IS NOT NULL
-  AND a.user_id = b.user_id
-  AND a.credential_id IS NOT DISTINCT FROM b.credential_id
-  AND (a.created_at < b.created_at
-       OR (a.created_at = b.created_at AND a.id < b.id));
-
--- ── 2. Guard: at most one row per (user, pinned channel) ──
-CREATE UNIQUE INDEX IF NOT EXISTS access_tokens_user_credential_uniq
-    ON access_tokens (user_id, credential_id)
-    WHERE user_id IS NOT NULL AND credential_id IS NOT NULL;
-
-
--- 0007_console_tokens_stateless: admin console logins no longer persist a token row.
---
--- The console now returns a signed, stateless session token (HMAC, held in the browser)
--- instead of minting an access_tokens row, so every browser login no longer grows the
--- table. This migration removes the leftover console-login rows (role='admin' with no
--- user and no channel, named after the console account) and hardens the
--- (user, channel) uniqueness guarantee for the "no channel pinned" case, which the
--- 0006 partial index intentionally did not cover.
-
--- ── 1. Drop leftover console-login rows ──
--- Console logins minted rows with role='admin', no user, no channel, and the console
--- username as the token name. Tokens-page admin API tokens (user-chosen names) are kept.
-DELETE FROM access_tokens
-WHERE role = 'admin'
-  AND user_id IS NULL
-  AND credential_id IS NULL
-  AND name = (SELECT COALESCE(value->>'username', 'admin') FROM app_settings WHERE key = 'admin');
-
--- ── 2. Dedupe legacy (user, no-channel) rows: keep the newest per user ──
-DELETE FROM access_tokens a
-USING access_tokens b
-WHERE a.user_id IS NOT NULL
-  AND a.credential_id IS NULL
-  AND a.user_id = b.user_id
-  AND b.credential_id IS NULL
-  AND (a.created_at < b.created_at
-       OR (a.created_at = b.created_at AND a.id < b.id));
-
--- ── 3. Guard: at most one (user, no-channel) token per user ──
--- Complements 0006's index (which only covers pinned channels) so the uniqueness rule
--- holds for both cases: one row per (user, channel) whether the channel is pinned or not.
-CREATE UNIQUE INDEX IF NOT EXISTS access_tokens_user_no_cred_uniq
-    ON access_tokens (user_id)
-    WHERE user_id IS NOT NULL AND credential_id IS NULL;
-
-
--- 0008_login_tokens: split access_tokens into two concerns.
---
--- access_tokens was doing double duty: it was the login/API credential *and* the per-user
--- LLM-key permission record, so the single is_active column conflated "can this user sign in"
--- with "may this user use this key" — revoking an expired credential silently killed the key
--- too. This migration separates them:
---   * login_tokens  — the login/API credential (token_hash, role, expiry, the key pinned at
---     login). Its is_active is credential validity only.
---   * access_tokens — the per-user LLM-key grant matrix (user × key, is_active = key ban).
---     All login data is stripped out entirely.
---
--- Old access_tokens rows are copied into login_tokens preserving the same id, so the
--- user_usage_logs.token_id FK keeps resolving; it is then re-pointed to login_tokens.
-
--- ── 1. Login-credential table (same shape as the old access_tokens) ──
-CREATE TABLE IF NOT EXISTS login_tokens (
-    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id       UUID REFERENCES users (id) ON DELETE CASCADE,   -- NULL = admin/API token
-    name          TEXT NOT NULL,                                  -- human label
-    token_hash    TEXT NOT NULL UNIQUE,                           -- sha256(raw token)
-    role          TEXT NOT NULL DEFAULT 'user',                   -- 'admin' | 'user'
-    role_id       TEXT REFERENCES user_roles (role_id) ON DELETE SET NULL,
-    credential_id UUID REFERENCES llm_credentials (id) ON DELETE SET NULL,  -- key pinned at login
-    expires_at    TIMESTAMPTZ,
-    last_used_at  TIMESTAMPTZ,
-    is_active     BOOLEAN NOT NULL DEFAULT true,                  -- login-credential validity
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS login_tokens_user_id_idx ON login_tokens (user_id);
-CREATE INDEX IF NOT EXISTS login_tokens_credential_id_idx ON login_tokens (credential_id);
-
--- ── 2. Copy every access_tokens row (same ids) into login_tokens ──
-INSERT INTO login_tokens (id, user_id, name, token_hash, role, role_id, credential_id,
-                          expires_at, last_used_at, is_active, created_at)
-SELECT id, user_id, name, token_hash, role, role_id, credential_id,
-       expires_at, last_used_at, is_active, created_at
-FROM access_tokens;
-
--- ── 3. Re-point the usage-log FK from access_tokens → login_tokens ──
-ALTER TABLE user_usage_logs DROP CONSTRAINT IF EXISTS user_usage_logs_token_id_fkey;
-ALTER TABLE user_usage_logs ADD CONSTRAINT user_usage_logs_token_id_fkey
-    FOREIGN KEY (token_id) REFERENCES login_tokens (id) ON DELETE SET NULL;
-
--- ── 4. Strip access_tokens to the key-grant matrix ──
--- Admin tokens (user_id NULL) and no-key login rows (credential_id NULL) are pure login
--- credentials — now in login_tokens only, so drop them here.
-DELETE FROM access_tokens WHERE user_id IS NULL OR credential_id IS NULL;
-ALTER TABLE access_tokens DROP COLUMN IF EXISTS name;
-ALTER TABLE access_tokens DROP COLUMN IF EXISTS token_hash;
-ALTER TABLE access_tokens DROP COLUMN IF EXISTS role;
-ALTER TABLE access_tokens DROP COLUMN IF EXISTS role_id;
-ALTER TABLE access_tokens DROP COLUMN IF EXISTS expires_at;
-ALTER TABLE access_tokens DROP COLUMN IF EXISTS last_used_at;
-
--- ── 5. Indexes ──
--- The 0006 (user, credential) unique index now guards the grant matrix (keep it).
--- The 0007 "no channel pinned" unique index was login-only → move to login_tokens.
-CREATE UNIQUE INDEX IF NOT EXISTS login_tokens_user_credential_uniq
-    ON login_tokens (user_id, credential_id)
-    WHERE user_id IS NOT NULL AND credential_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS login_tokens_user_no_cred_uniq
-    ON login_tokens (user_id)
-    WHERE user_id IS NOT NULL AND credential_id IS NULL;
-DROP INDEX IF EXISTS access_tokens_user_no_cred_uniq;
-
-

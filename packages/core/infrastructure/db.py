@@ -721,9 +721,9 @@ class SessionModel(Base):
     # Short auto-generated title (LLM from the first user message); None until finalized.
     title: Mapped[str | None] = mapped_column(Text)
     # 0 = ordinary chat, 1 = research task session: type 1 is hidden from the chat sidebar
-    # and cascade-deleted with its task (migration 0017). Old rows default to 0.
+    # and cascade-deleted with its task (canonical schema). Old rows default to 0.
     type: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    # Durable compaction checkpoint (migration 0018):
+    # Durable compaction checkpoint (sessions.compaction JSONB):
     # { revision, through_message_id, through_created_at, summary, summary_chars,
     #   last_compaction_at, fold_count }. ``summary`` fully covers every model-facing
     # message up to ``through_message_id`` (INCLUSIVE). Normal chat turns do not read
@@ -763,7 +763,7 @@ class MessageModel(Base):
     attach_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True
     )
-    # Generic per-message metadata (migration 0016). First use: the retrieval-feedback
+    # Generic per-message metadata (JSONB). First use: the retrieval-feedback
     # snapshot ``{"retrieval": {"hits": [{id, score, text?}], "queries": [...]}}`` written
     # on an assistant turn that ran rag_search, so the client can offer a persistent
     # 👍/👎 rating recorded into ``rag_feedback``.
@@ -850,10 +850,12 @@ def _asyncpg_dsn(database_url: str) -> str:
 
 
 async def init_db() -> None:
-    """Apply pending SQL migrations in order (replaces Alembic).
+    """Apply the canonical init SQL (replaces Alembic).
 
-    Each ``migrations/NNNN_*.sql`` file runs once, inside a transaction; applied versions are
-    recorded in ``schema_migrations`` so re-runs are no-ops.
+    Fresh installs run ``migrations/0001_init.sql`` once, inside a transaction; applied
+    versions are recorded in ``schema_migrations`` so re-runs are no-ops. The
+    dev-time incremental migrations were squashed — new schema changes extend the
+    canonical file (for fresh installs); existing DBs are migrated out-of-band if needed.
     """
     import asyncpg
 

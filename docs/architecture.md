@@ -111,15 +111,16 @@
 | Vocabulary subdomain | domains / terms / sentences / matches / materials / chunks (6 tables) |
 | Hybrid search | pgvector (semantic) + tsvector (keyword) + RRF fusion |
 | Agent runtime | `AgentKernel` composition root: cache-boundary `CacheBoundaryAssembler` (3 zones + `snapshot_key`) + deferred-tool `ToolGateway` + dual-track `MemoryService` (PG tsvector/pgvector RRF) + skill catalog + READ-only `Sandbox`, over `ReactLoopAgent` step loop + plugin `ToolRuntime`; `ReliableLLM` timeout/retry (error taxonomy + cancellation) + per-turn cost budget; HITL approvals (memory / Redis pub-sub broker); `run_subagent` (bounded child turns); `plan` meta-tool; shadow-git checkpoints (`revert_to_checkpoint`); Docker `BashSandbox` backend |
-| Retrieval | config-driven node pipeline (query rewrite → recall → RRF → rerank, plus optional parent-expand / CRAG nodes; CJK + contextual + parent-child indexing); `in_process` default, gRPC service available (`AuthGuard` token gate / per-peer rate limit / tenant binding); admin RAG console + golden-set eval (Recall@k / Precision@k / MRR); Redis **query cache** (keyed by query/filters/top_k + config + corpus version); **retrieval-feedback loop** — grounded answers get a persistent per-message 👍/👎 source rating: the turn's `rag_search` hits are extracted server-side from the tool trace and snapshotted into `messages.meta.retrieval` (JSONB, migration 0016; rides the done frame + `GET /sessions/{id}`), the chat bubble's rate panel posts the `POST /rag/feedback` golden-set recorder — [§10.12](#1012-query-cache--retrieval-feedback) |
+| Retrieval | config-driven node pipeline (query rewrite → recall → RRF → rerank, plus optional parent-expand / CRAG nodes; CJK + contextual + parent-child indexing); `in_process` default, gRPC service available (`AuthGuard` token gate / per-peer rate limit / tenant binding); admin RAG console + golden-set eval (Recall@k / Precision@k / MRR); Redis **query cache** (keyed by query/filters/top_k + config + corpus version); **retrieval-feedback loop** — grounded answers get a persistent per-message 👍/👎 source rating: the turn's `rag_search` hits are extracted server-side from the tool trace and snapshotted into `messages.meta.retrieval` (JSONB in the canonical schema; rides the done frame + `GET /sessions/{id}`), the chat bubble's rate panel posts the `POST /rag/feedback` golden-set recorder — [§10.12](#1012-query-cache--retrieval-feedback) |
 | RAG node pipeline config | the whole retrieval chain is runtime-configured from admin **RAG → Nodes**: add / remove / reorder / enable / disable stages and edit params, persisted in `app_settings.rag`, applied live — no code, no restart; ingest side likewise (chunk strategy `fixed` / `paragraph` / `sentence` / `semantic` + contextual / parent-child / CJK-jieba toggles, with a Chunking preview) — [§10.6](#106-nodes), [§10.7](#107-ingest-side-runtime-configured-chunking), [§10.10](#1010-admin-console) |
 | Query repository | unified multi-source corpus: cloud-drive files (`source_type='file'`) + Learning-Platform sentences/articles (`'learning'`) + chat Q&A pairs / LLM-grouped whole-session imports (`'chat'`); `chunks.asset_id` nullable + `source_type`/`source_id`, source-aware recall (both recallers `LEFT JOIN assets`); PDF tool chain (body text + tables rendered to PNG → vision LLM, per-table skip on failure); admin RAG → **Repository** tab lists non-file chunks with delete |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, FunASR SenseVoice STT, LiteLLM gateway (all Docker) |
+| Edge gateway | **Traefik** as the single public entrypoint: `:80` strips `/api` onto the host-run FastAPI and also fronts the web console (`/admin` + `/audio` `/images` `/avatars` static mounts); retrieval gRPC rides its own entryPoint (`:15052` → `h2c://retrieval:50051`); the host API is reached by **explicit IPv4** (`192.168.65.254:8300` — `host.docker.internal` also yields a ULA IPv6 the host never answers, which hangs Go's dialer); file-provider config in `deploy/traefik/`, LAN-IP published — [§13](#13-multi-tenancy-and-deployment-strategy) |
 | Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the shared `AgentKernel` composition (`apps/api/agent_factory.py`) for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output; session / cloud-file modes → caller's Cloud Drive, with a custom `prompt` + `name`) |
 | Session memory | PG-backed `sessions` / `messages` / `session_events`; **client Live State (summary + tail) is the normal-turn context source — zero SQL reads on hot turns**; threshold compaction folds raw rows into one 5-section structured summary behind a dual persistence barrier (`sessions.compaction` JSONB = durable checkpoint, revision CAS); per-session async write queue (one batch INSERT/turn); deferred finalize = incremental embed + first-time-only sidebar summary/title; trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + 30-day audit-event retention — see [§22](#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns) |
-| Migrations | numbered SQL files (`migrations/*.sql`) + asyncpg runner (replaces Alembic) |
+| Migrations | single canonical init script `migrations/0001_init.sql` (final schema + reference seeds) applied once by the asyncpg runner (replaces Alembic); dev-time incremental migrations deliberately squashed |
 | Chat | agent loop with tool use, SSE streaming |
-| Research OS (chat-driven) | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module) |
+| Research OS | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; **deterministic execution engine** — Python owns control flow through a 10-stage contract pipeline (`DISCOVER → FRAME → EVIDENCE → DESIGN → EXECUTE → EXPLAIN → WRITE → REVIEW → REPRODUCE → PUBLISH`) with repair-once bounded attempts, per-stage declared LLM call budgets + run-level turn/cost/no-progress caps, and guard gates at the transition fence: **strict** mode (default) parks a failed gate on a PENDING human override with zero rework on resume, lenient mode records it and continues; structural violations halt terminally (`BLOCKED`); lease-based crash recovery makes interrupted runs resumable; publication finality is the `PROMOTED` record (report + compiled PDF, optional slides via toolkit); desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module), [§20](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline) |
 | Workflow core (`packages/workflow`) | domain-free run engine behind Research OS: declarative `workflow_spec` (transitions / activities / cap dimensions / hooks) + state machine with lease contest, crash recovery, retry, loop-cap grading and definition-drift detection; adapter pattern (ports + ledger/lease persistence supplied by the plugin) — [§19](#19-workflow-core-packagesworkflow) |
 | Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX embedded images → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
 | Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload). Auth endpoints are Redis **rate-limited per client IP** (login/register/recovery, fixed window, fail-open); `enforce_secure_secrets` fails fast at startup when the legacy `JWT_SECRET` default is untouched |
@@ -235,11 +236,11 @@ deepdive/
 │   └── soul.md                   # agent identity persona (STATIC_PREFIX source)
 ├── skills/                       # version-controlled `*.skill.md` (skill catalog, lazy-loaded via the `skill` tool)
 ├── plugins/                      # version-controlled `*/plugin.py` (auto-discovered at startup; e.g. `social_search`)
-├── migrations/                   # numbered SQL migrations (applied by init_db.py; replaces Alembic)
+├── migrations/                   # single canonical DB init script (applied by init_db.py; replaces Alembic)
 ├── proto/retrieval/v1/retrieval.proto   # RetrievalService contract
 ├── buf.yaml / buf.gen.yaml             # proto lint / breaking / codegen
 ├── scripts/gen_proto.sh                # grpc_tools.protoc (or buf) codegen
-├── scripts/init_db.py                  # apply migrations/*.sql (same runner as the app lifespan)
+├── scripts/init_db.py                  # apply migrations/0001_init.sql (same runner as the app lifespan)
 ├── scripts/setup.sh                    # host setup (venv / deps / proto)
 ├── scripts/start_desktop.sh            # one-click launch: infra + uvicorn (port 8300) + Electron workbench
 ├── deploy/
@@ -254,7 +255,7 @@ deepdive/
 
 > The tree is illustrative, not an exhaustive inventory: each directory shows a few
 > representative files and the rest are collapsed — `apps/desktop`, `apps/web/src`,
-> `packages/core/{domain,ports,infrastructure}`, `migrations/*.sql` and `tests/` account for
+> `packages/core/{domain,ports,infrastructure}`, `migrations/` and `tests/` account for
 > most of the omitted files. `git ls-files` is the authoritative list.
 
 > `packages/agent`, `packages/rag`, `packages/core`, `packages/workflow`, and `apps/api` are
@@ -1267,7 +1268,7 @@ The **query repository** is the unified retrieval corpus: the existing `chunks` 
 content can arrive from three entries instead of only cloud-drive files. Recall is
 **source-aware** — one query searches file, learning, and chat content together, still tenant-scoped.
 
-**Schema** (migration `0011_query_repository.sql`): `chunks.asset_id` is now nullable; two new columns
+**Schema** (canonical `migrations/0001_init.sql`): `chunks.asset_id` is now nullable; two new columns
 `source_type TEXT NOT NULL DEFAULT 'file'` (`file` / `learning` / `chat`) and `source_id TEXT NULL`
 (article id, sentence id, or chat session / Q&A id) tag non-file content, indexed by
 `chunks_source_idx`. A new `articles` table (user / domain / title / content) backs the Learning-Platform
@@ -1374,7 +1375,7 @@ console page in `apps/api/admin/index.html`. Six
 
 ### 10.11 Schema
 
-Defined in migration `0010_rag_pipeline.sql`:
+Defined in the canonical schema (`migrations/0001_init.sql`):
 
 `assets.domain_id UUID NULL REFERENCES domains(id) ON DELETE SET NULL` (+ `assets_domain_idx`);
 `chunks.parent_chunk_id` (FK → `chunks.id` ON DELETE SET NULL), `chunks.chunk_kind` (default
@@ -1407,8 +1408,7 @@ version bumps, dropping stale query-cache hits immediately.
 dataset** for future fine-tuning / eval without re-running retrieval. The loop is closed in chat:
 after a turn the server extracts this turn's `rag_search` hits from the agent tool trace
 (`_extract_retrieval` in `chat.py` — flat `tool_calls` map tool rows to queries; hits dedupe by id,
-text capped at 200 chars), persists the snapshot into `messages.meta.retrieval` (JSONB, migration
-0016, best-effort with a short retry while the assistant row is still in the session write queue),
+text capped at 200 chars), persists the snapshot into `messages.meta.retrieval` (JSONB in the canonical schema, best-effort with a short retry while the assistant row is still in the session write queue),
 and ships it in the SSE done frame / `GET /sessions/{id}` — the desktop bubble renders a 👍/👎 panel
 over exactly those hits, so a rating survives reopen without re-querying retrieval.
 
@@ -1454,20 +1454,15 @@ over exactly those hits, so a rating survives reopen without re-querying retriev
 
 ## 12. Data Model
 
-> **Migration note:** the schema is defined **only** in `migrations/*.sql` — applied in filename
-> order by `init_db()` via asyncpg and tracked in the `schema_migrations` table (no Alembic, no
-> `create_all`). This document does not repeat the DDL; the migration files are the single source
-> of truth. Table names below are the implemented ones (`sessions`, `messages`, `jobs` …), not the
-> earlier design names (`conversations`, `job_logs` …). `migrations/0001_init.sql` is the single
-> consolidated base schema (the squash of the original 0001–0008 development migrations; every
-> statement is idempotent). On top of it, the incremental migrations `0002_auth_profiles.sql` …
-> `0017_sessions_type.sql` layer later changes (self-service accounts + `verification_tokens`,
-> usage-log channel, cloud-drive objects, vocabulary isolation, folders, workspace activity,
-> memory-retention index, session title, RAG pipeline columns, the multi-source query
-> repository, RAG retrieval feedback, the public-link asset ACL, the per-message
-> `imported_rag` flag, the chat-screenshot `attach_asset_id` link, the derived-image
-> `source_asset_id` lineage, and the `sessions.type` chat/research discriminator). All are applied in
-> filename order by `init_db()`.
+> **Migration note:** the schema is defined **only** in the single canonical
+> `migrations/0001_init.sql` — applied once by `init_db()` via asyncpg inside a transaction
+> and tracked in the `schema_migrations` table (no Alembic, no `create_all`). This document
+> does not repeat the DDL; that file is the single source of truth. The development-time
+> incremental migrations (0002 … 0019) were deliberately squashed into it — a fresh install
+> runs one initialization script and gets the final schema; existing databases already record
+> `0001_init` and skip re-application. Table names below are the implemented ones
+> (`sessions`, `messages`, `jobs` …), not the earlier design names
+> (`conversations`, `job_logs` …).
 
 The core learning + chat tables that run today (`migrations/0001_init.sql`):
 
@@ -1476,22 +1471,22 @@ The core learning + chat tables that run today (`migrations/0001_init.sql`):
 - **users** — `id`, `created_at`; the auth columns are added by the consolidated schema (see §12.3).
 - **terms** — `id`, `domain_id` (FK → `domains`), `word`, `definition`, `frequency`, `star_level`, `audio_hash`, `image_paths` (JSONB), `is_active`.
 - **sentences** — `id`, `domain_id` (FK → `domains`), `origin_source`, `content_en` (unique), `content_cn`, `audio_hash`, `cn_explanation`, `embedding` (vector(1024)).
-- **chunks** — the RAG chunk table (added by `0004_drive_objects.sql`): `id`, `asset_id` (FK →
+- **chunks** — the RAG chunk table (in the canonical schema): `id`, `asset_id` (FK →
   `assets` CASCADE, **nullable since `0011`**), denormalized `user_id` / `workspace_id` for filtered
   recall, `seq`, `content_en`, `content_cn`, `meta` (JSONB), `embedding` (vector(1024), HNSW-indexed).
-  The `0010_rag_pipeline.sql` migration adds `parent_chunk_id` (FK → `chunks.id`, parent/child indexing),
+  The schema carries `parent_chunk_id` (FK → `chunks.id`, parent/child indexing),
   `chunk_kind` (`'leaf'` default | `'parent'`), and `content_search` (jieba-segmented CJK keywords,
-  GIN-indexed). The `0011_query_repository.sql` migration makes non-file content first-class:
+  GIN-indexed). Non-file content is first-class:
   `source_type` (`'file'` default | `'learning'` | `'chat'`, indexed) + `source_id`, and the new
   `articles` table (user / domain / title / content / created_at) for Learning-Platform study material.
 - **sessions** — `id`, `user_id` (FK → `users`), `title`, `created_at`, `closed_at`, `summary`,
-  `type`, `compaction` (JSONB, `0018_sessions_compaction.sql`) — the durable compaction checkpoint
+  `type`, `compaction` (JSONB) — the durable compaction checkpoint
   `{revision, through_message_id, through_created_at, summary, summary_chars, last_compaction_at,
   fold_count}`; read only by recovery / compaction / reconcile, never by a normal turn (§22).
-  `type` (`0017_sessions_type.sql`, default `0`) distinguishes the session kind:
+  `type` (default `0`) distinguishes the session kind:
   `0` = ordinary chat, `1` = research task session — `GET /sessions` hides type 1 from the chat
   sidebar and deleting a research task cascades to its type-1 sessions (§17).
-  `title` (`0009_session_title.sql`) is auto-set at creation from the first user message —
+  `title` is auto-set at creation from the first user message —
   whitespace-normalized and capped at 40 chars — so the sidebar shows a readable name while the
   deferred finalize job is still running; `PATCH /sessions/{id}` can rename it and an empty title
   resets it to `NULL` so auto-naming kicks in again.
@@ -1515,9 +1510,9 @@ Hybrid recall is computed in code over two channels:
   query is jieba-segmented (`rag/query/cjk.py`) and matched against the stored `chunks.content_search`
   column via `to_tsvector('simple', content_search) @@ plainto_tsquery('simple', <segments>)`.
 - **Semantic (pgvector)** — cosine search over the `embedding vector(1024)` columns.
-- **Indexes** — `0004_drive_objects.sql` adds an HNSW index on `chunks.embedding`;
-  `0010_rag_pipeline.sql` adds a GIN index on `to_tsvector('simple', COALESCE(content_search, ''))`
-  plus B-tree indexes on `chunks.parent_chunk_id` and `assets.domain_id`. `0008_memory_retention.sql`
+- **Indexes** — the schema carries an HNSW index on `chunks.embedding`,
+  a GIN index on `to_tsvector('simple', COALESCE(content_search, ''))`
+  plus B-tree indexes on `chunks.parent_chunk_id` and `assets.domain_id`. Memory retention
   adds a plain B-tree index on `session_events(timestamp)` so the daily audit-event sweep's range
   DELETE stays fast.
 
@@ -1544,7 +1539,7 @@ the anonymous tier for that request (guest quota + `anonymous` routing).
 ### 12.3 Implemented auth, RBAC & billing schema
 
 The multi-user + billing surface (all part of the consolidated `migrations/0001_init.sql`, with the
-self-service account tables/columns in `0002_auth_profiles.sql`): login credentials live in
+self-service account tables/columns, canonical schema): login credentials live in
 `login_tokens`, and `access_tokens` is the per-user LLM-key grant matrix.
 Fields below mirror the migration DDL exactly;
 `TEXT` columns are plain `TEXT`, money is `NUMERIC`, time is `TIMESTAMPTZ`, JSON is `JSONB`.
@@ -1554,8 +1549,8 @@ Fields below mirror the migration DDL exactly;
   `display_name` (TEXT), `is_active` (BOOLEAN, default true), `role_id` (TEXT FK → `user_roles`
   `ON DELETE RESTRICT`, default `'regular'`), `meta` (JSONB, default `{}`), `created_at`
   (TIMESTAMPTZ, default now()), `updated_at` (TIMESTAMPTZ). The flat `tier` column from the early
-  design was dropped in favour of `role_id`. Self-service profile/verification columns (from
-  `migrations/0002_auth_profiles.sql`): `email` (TEXT, unique where non-null), `phone` (TEXT),
+  design was dropped in favour of `role_id`. Self-service profile/verification columns
+  (canonical schema): `email` (TEXT, unique where non-null), `phone` (TEXT),
   `avatar` (TEXT — `/avatars/{user_id}.{ext}`, the uploaded file path served by a static mount),
   `email_verified` (BOOLEAN, default false — a non-null email blocks sign-in until verified).
 - **verification_tokens** — one-time tokens for email verification (`kind='verify'`, TTL 24h) and
@@ -1611,11 +1606,11 @@ Fields below mirror the migration DDL exactly;
   (BIGINT), `updated_at`; PK `(user_id, period_type, period_start)`.
 - **user_usage_logs** — append-only per-call audit. Columns: `id` (UUID PK), `user_id` (UUID FK SET
   NULL), `token_id` (UUID FK → `login_tokens` SET NULL), `role_id` (TEXT, snapshot at call time),
-  `model_name` (TEXT), `credential_id` (UUID FK → `llm_credentials` SET NULL, from
-  `migrations/0003_usage_channel.sql` — **the channel that served this request**; records which
+  `model_name` (TEXT), `credential_id` (UUID FK → `llm_credentials` SET NULL, canonical
+  schema — **the channel that served this request**; records which
   provider key ran the call), `tool` (TEXT), `prompt_tokens` / `completion_tokens` / `total_tokens`
   (INT, default 0; total is denormalized for dashboards), `cost_usd` (NUMERIC(12,6)), `created_at`;
-  indexes on `(user_id, created_at)` and `(token_id, created_at)` (plus `credential_id` from 0003).
+  indexes on `(user_id, created_at)` and `(token_id, created_at)` (plus `credential_id`).
   **The `cost_usd` is always the catalog `llm_models` price** for the served model; `credential_id`
   only records *which channel* served it, so the admin can aggregate cost per channel (see the
   `GET /admin/usage/by-channel` aggregation). A request with no usable channel (anonymous/legacy
@@ -1797,7 +1792,7 @@ already imported to knowledge is removed via the admin **RAG → Repository** pe
 session.
 
 **Image attachments are folder-agnostic.** A user message that created a chat screenshot carries
-`messages.attach_asset_id` (migration `0015_messages_attach.sql`) — the asset the message *owns*,
+`messages.attach_asset_id` — the asset the message *owns*,
 stored under the purely-UI `chat/temp/` folder — the **temporary** chat zone a user may empty
 at will. `DELETE /sessions/{id}` and
 `DELETE /sessions/{id}/messages/{mid}` (with `?delete_assets=1`, the default) soft-delete that
@@ -1890,7 +1885,7 @@ test failure, not a review miss.
 | B2C (multi-user) | Shared DB + app-level predicates (`user_id` scoping + `visibility` tenant predicate) |
 | B2B (enterprise) | database-per-tenant |
 | Read scaling | read replicas + pgBouncer connection pool |
-| Edge vs internal | external REST/SSE via Traefik ↔ internal gRPC. Decided shape: Traefik is the single entrypoint and is published on the machine's **LAN IP** (temporarily by IP — no DNS/TLS yet); the host-run API stays on the host and is reached through Docker Desktop's host route (`host.docker.internal:8300`), so one local IP:80 fronts web + `/api` + the retrieval gRPC port |
+| Edge vs internal | external REST/SSE via Traefik ↔ internal gRPC. Live shape: Traefik is the single entrypoint, published on the machine's **LAN IP** (temporarily by IP — no DNS/TLS yet): `:80` strips `/api` to the host-run FastAPI and also fronts the web console (`/admin` + `/audio` `/images` `/avatars` static mounts), the retrieval gRPC rides its own entryPoint (`:15052`). The host API is reached by explicit IPv4 of the Docker Desktop host gateway (`192.168.65.254:8300`) — `host.docker.internal` also resolves to a ULA IPv6 the host never answers, which hangs Go's dialer |
 | Model scaling | separate model services (TEI/Kokoro/LiteLLM), independent scale-out |
 
 ---
@@ -1905,7 +1900,7 @@ groups). A *file* is a logical **asset** that points at a physical, SHA-256-dedu
 the trash keeps soft-deleted assets for a retention window; and every mutation lands in a
 no-FK audit trail.
 
-Sources: `migrations/0004_drive_objects.sql`, `0006_folders.sql`, `0007_workspace_activity.sql`;
+Source: canonical schema `migrations/0001_init.sql`;
 `packages/core/application/drive_service.py` (service), `packages/core/infrastructure/drive_repositories.py`
 (SQL repos), `packages/core/infrastructure/visibility.py` (tenant predicate),
 `apps/api/routers/drive.py` (REST), `apps/web/src/CloudDrive.tsx` (file manager).
@@ -1918,10 +1913,10 @@ Sources: `migrations/0004_drive_objects.sql`, `0006_folders.sql`, `0007_workspac
 | `workspaces` | User-owned group (`owner_id`, `name`). Ownership is **not** a member row. |
 | `workspace_members` | `(workspace_id, user_id)` PK + `role` (`admin` / `editor` / `viewer`). Membership is the sharing mechanism. |
 | `folders` | One row per folder path inside a scope; `workspace_id` NULL = My Drive. `path` is the full `/`-separated relative path (`"English/Vocab"`), so ancestors are implicit — no parent FK. Uniqueness per scope via `folders_unique_ws` (partial) and `folders_unique_personal`. |
-| `assets` | Logical file: `user_id` (owner), nullable `workspace_id`, `object_sha256` → `global_objects`, `name`, `folder_path`, `file_status` (`uploading/processing/ready/deleted`), `rag_status` (`pending/parsing/chunking/embedding/indexed/failed`), `domain_id` (nullable → `domains`, added by `0010_rag_pipeline.sql`, drives the RAG domain filter), `meta` JSONB, `deleted_at`. |
+| `assets` | Logical file: `user_id` (owner), nullable `workspace_id`, `object_sha256` → `global_objects`, `name`, `folder_path`, `file_status` (`uploading/processing/ready/deleted`), `rag_status` (`pending/parsing/chunking/embedding/indexed/failed`), `domain_id` (nullable → `domains`, drives the RAG domain filter), `meta` JSONB, `deleted_at`. |
 | `asset_acl` | Asset-level sharing: `(asset_id, grantee_user_id)` PK; `grantee_user_id` NULL = public link (`asset_acl_public_uniq` unique partial index). `permission` = `read` / `write`. |
 | `upload_sessions` | Chunked-upload state: expected `sha256`, `size`, `chunk_size`, `num_chunks`, `received_chunks` (boolean array) → resumable uploads. |
-| `chunks` | RAG chunks rebuilt with denormalized `asset_id` / `user_id` / `workspace_id` for filtered recall; `embedding vector(1024)` with an HNSW index; `0010_rag_pipeline.sql` adds `parent_chunk_id` + `chunk_kind` (parent/child indexing, recall searches `leaf` only) and `content_search` (jieba-segmented CJK keywords, GIN-indexed). |
+| `chunks` | RAG chunks rebuilt with denormalized `asset_id` / `user_id` / `workspace_id` for filtered recall; `embedding vector(1024)` with an HNSW index; the schema carries `parent_chunk_id` + `chunk_kind` (parent/child indexing, recall searches `leaf` only) and `content_search` (jieba-segmented CJK keywords, GIN-indexed). |
 | `workspace_activity` | Audit trail: `workspace_id`, `actor_user_id` / `actor_username`, `action` (e.g. `file.create`, `member.add`), `target_type` / `target_id` / `target_name`, `detail`. **No foreign keys by design** — an entry survives the deletion of the workspace / user it references. |
 
 ### 14.2 Core logic
@@ -1996,7 +1991,7 @@ Sources: `migrations/0004_drive_objects.sql`, `0006_folders.sql`, `0007_workspac
   `workspace_id` (so the `assets` FK does not block the drop), then removes the workspace row;
   members and folders cascade. Trashed assets of a deleted workspace restore into My Drive.
 - **Derived assets & cascade lifecycle** — an asset can record `source_asset_id`
-  (migration `0016_assets_source.sql`, FK → `assets.id` `ON DELETE CASCADE`): RAG images
+  (FK → `assets.id` `ON DELETE CASCADE`): RAG images
   derived from a PDF/DOCX point back to the source document. `delete_asset` soft-deletes the
   derived images into the trash too (`list_by_source`); `_purge_asset` recurses derived-first
   so each derived `global_objects` ref-count is released exactly once; `restore_trash` restores
@@ -2664,7 +2659,7 @@ schema and skill doc alone proved insufficient to stop a retail read/verify loop
 ```
 
 **Session isolation.** Every task binds a single dedicated chat session (1:1, `bind_session`).
-The kind lives in the DB — `sessions.type` (migration `0017_sessions_type.sql`; 0 = chat,
+The kind lives in the DB — `sessions.type` (0 = chat,
 1 = research): the task's session row is created **marked `type=1`**, and when an ordinary chat's
 first message binds it to a task the chat route marks it type 1 too (`set_session_type`,
 best-effort — a marking failure never breaks the turn). `GET /sessions` filters by `type != 1`, so
@@ -3042,8 +3037,7 @@ deleting the chat.
 
 ### 18.1 Asset relationship model (save/delete backbone)
 
-Three columns carry the image semantics (migrations `0015_messages_attach.sql` +
-`0016_assets_source.sql`):
+Three columns carry the image semantics (canonical schema):
 
 - **`messages.attach_asset_id`** (UUID NULL → `assets.id`, `ON DELETE SET NULL`) — set only on a
   `user` message whose turn created a chat attachment (📷 screenshot). It answers "which cloud

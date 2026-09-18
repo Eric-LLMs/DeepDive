@@ -1,12 +1,14 @@
 # DeepDive — data + model-serving infrastructure.
 #
 # The FastAPI app itself runs on the host during development (uvicorn), and talks to
-# these containers over HTTP. Model inference (LLM / embedding / rerank / TTS / STT) never
+# these containers over HTTP. Model inference (LLM / embedding / TTS / STT) never
 # runs inside the API process, so model updates don't require an API restart.
+# (Rerank is the exception: it is an in-process cross-encoder inside the RAG pipeline,
+# enabled by RERANKER_MODEL — see the reranker service note below.)
 #
 # Model services:
 #   - embedding   TEI serving BAAI/bge-m3            -> POST /embed   (port 18080)
-#   - reranker    TEI serving BAAI/bge-reranker-v2-m3 -> POST /rerank (port 18081)
+#   - reranker    LEGACY TEI container — not wired (rerank runs in-process)   (port 18081)
 #   - tts         Kokoro-FastAPI (OpenAI-compatible)  -> /v1/audio/speech (port 18880)
 #   - stt         FunASR serving SenseVoiceSmall      -> /v1/audio/transcriptions (port 18881, loopback only)
 #   - llm-gateway LiteLLM proxy (unified LLM routing / keys / cost)   (port 14000)
@@ -209,7 +211,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://deepdive:deepdive@postgres:5432/deepdive
       EMBEDDING_BASE_URL: http://embedding:80
-      RERANKER_MODEL: ""            # cross-encoder disabled by default (runs via the TEI reranker instead)
+      RERANKER_MODEL: ""            # in-process cross-encoder rerank; "" disables reranking (the TEI reranker container is legacy, not wired)
       RAG_QUERY_REWRITE: "true"
       LLM_BASE_URL: http://llm-gateway:4000/v1
       LLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-gateway}
