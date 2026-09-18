@@ -149,7 +149,8 @@ DeepDive is an "AI learning workbench" unified by a single abstraction:
 - **Video / document learning**: media → timestamped/paginated text chunks → searchable, annotatable
 - **AI chat assistant**: interactive Q&A with tool use (RAG + vocabulary lookup + sandboxed file/network tools), voice in/out (mic transcription, text-to-speech, hands-free call mode)
 - **Cloud drive & workspaces**: every learning material is a real file — personal My Drive + shared workspaces with folders, versioned uploads, sharing/ACL, trash, in-place editing, and one-click RAG import
-- **Research OS**: chat-created research tasks run a deterministic multi-stage pipeline (evidence gathering → design → writing → review) under budgets and quality gates, ending in published artifacts — report PDF and slide decks
+- **Research OS**: chat-created research tasks run a deterministic multi-stage pipeline (evidence gathering → design → writing → review) under budgets and quality gates, ending in published artifacts
+- **Create**: discussions and research become summaries, mind maps, and slides that flow back into the searchable workspace
 - **Unifying principle: everything is a text chunk** — vocabulary, media, drive files, and research evidence all land in the same searchable corpus
 
 [↑ Back to top](#table-of-contents)
