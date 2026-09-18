@@ -1079,6 +1079,17 @@ pre.text-viewer {
 .chat-input-btn:hover { background: var(--bg-soft-2); color: var(--fg); }
 .chat-input-btn.active { background: var(--accent); color: #fff; }
 
+/* Mic recording state: red + pulse while the MediaRecorder is live. */
+.chat-input-btn.recording {
+  background: #e5484d;
+  color: #fff;
+  animation: chat-mic-pulse 1.2s ease-in-out infinite;
+}
+@keyframes chat-mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(229, 72, 77, 0.55); }
+  50% { box-shadow: 0 0 0 6px rgba(229, 72, 77, 0); }
+}
+
 #chat-send {
   flex: none;
   margin-left: auto;   /* keep Send anchored to the right edge of the actions row */

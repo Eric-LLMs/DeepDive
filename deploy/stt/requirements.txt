@@ -1,0 +1,11 @@
+# FunASR SenseVoiceSmall STT sidecar — OpenAI-compatible /v1/audio/transcriptions.
+# Every pin is exact; the torch/torchaudio CPU wheels come from the official PyTorch
+# index so the image never drags in a CUDA toolchain (device is fixed to cpu below).
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+funasr==1.4.15
+torch==2.8.0+cpu
+torchaudio==2.8.0+cpu
+fastapi==0.115.14
+uvicorn==0.34.3
+python-multipart==0.0.20

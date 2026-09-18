@@ -1,13 +1,14 @@
 # DeepDive — data + model-serving infrastructure.
 #
 # The FastAPI app itself runs on the host during development (uvicorn), and talks to
-# these containers over HTTP. Model inference (LLM / embedding / rerank / TTS) never
+# these containers over HTTP. Model inference (LLM / embedding / rerank / TTS / STT) never
 # runs inside the API process, so model updates don't require an API restart.
 #
 # Model services:
 #   - embedding   TEI serving BAAI/bge-m3            -> POST /embed   (port 18080)
 #   - reranker    TEI serving BAAI/bge-reranker-v2-m3 -> POST /rerank (port 18081)
 #   - tts         Kokoro-FastAPI (OpenAI-compatible)  -> /v1/audio/speech (port 18880)
+#   - stt         FunASR serving SenseVoiceSmall      -> /v1/audio/transcriptions (port 18881, loopback only)
 #   - llm-gateway LiteLLM proxy (unified LLM routing / keys / cost)   (port 14000)
 
 services:
@@ -104,6 +105,27 @@ services:
       retries: 5
       start_period: 60s
     # GPU variant: image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
+
+  # ── STT (FunASR serving SenseVoiceSmall, OpenAI-compatible /v1/audio/transcriptions) ──
+  # Built locally from deploy/stt/Dockerfile. Host port is bound to loopback only: the
+  # host-run API gateway reaches it at http://localhost:18881/v1 (same mechanism as TTS).
+  # start_period is generous because the first boot downloads the model + fsmn-vad into
+  # the funasr-cache volume; later restarts reuse it with no network access.
+  stt:
+    build: ./deploy/stt
+    image: deepdive-stt:latest
+    container_name: deepdive-stt
+    ports:
+      - "127.0.0.1:18881:8000"
+    volumes:
+      - funasr-cache:/root/.cache/modelscope
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
 
   # ── LLM gateway (LiteLLM proxy) ───────────────────────────────────────
   # The API calls a virtual model name (LLM_MODEL=deepdive-chat); LiteLLM routes it to
@@ -228,3 +250,4 @@ volumes:
   embedding-cache:
   reranker-cache:
   kokoro-cache:
+  funasr-cache:

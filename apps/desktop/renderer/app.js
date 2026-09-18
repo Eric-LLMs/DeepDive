@@ -4288,9 +4288,8 @@
     chatResize.addEventListener("pointercancel", onUp);
   });
 
-  // ── Voice: speak replies + mic input (Web Speech API) ──
+  // ── Voice: speak replies (Web Speech synth) + mic input (MediaRecorder → /api/stt) ──
   let speakEnabled = false;
-  let recognition = null;
   const chatSpeak = document.getElementById("chat-speak");
   const chatMic = document.getElementById("chat-mic");
 
@@ -4308,29 +4307,111 @@
     chatSpeak.classList.toggle("active", speakEnabled);
   });
 
-  chatMic.addEventListener("click", () => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
+  // Mic input: one recorder at a time. Click 1 records (red pulse), click 2 stops and
+  // uploads the clip to the local FunASR/SenseVoice sidecar via /api/stt; the transcript
+  // lands in the input box for review — never auto-sent.
+  const VOICE_IDLE_TITLE = "Voice input (talk to the assistant)";
+  const VOICE_STOP_TITLE = "Stop recording and transcribe";
+  const VOICE_WAIT_TITLE = "Transcribing…";
+  let micStream = null;
+  let micRecorder = null;
+  let micChunks = [];
+  let micTranscribing = false;
+
+  function pickAudioMime() {
+    if (typeof MediaRecorder === "undefined") return null;
+    const candidates = [
+      "audio/webm;codecs=opus", "audio/webm",
+      "audio/mp4", "audio/ogg;codecs=opus", "audio/ogg",
+    ];
+    for (const c of candidates) {
+      try { if (MediaRecorder.isTypeSupported(c)) return c; } catch { /* ignore */ }
+    }
+    return ""; // nothing matched: let the UA pick, suffix falls back below
+  }
+
+  function suffixForMime(mime) {
+    if (!mime || mime.includes("webm")) return "webm";
+    if (mime.includes("mp4")) return "m4a";
+    if (mime.includes("ogg")) return "ogg";
+    if (mime.includes("mpeg")) return "mp3";
+    if (mime.includes("wav")) return "wav";
+    return "bin";
+  }
+
+  async function onMicStopped() {
+    const mime = (micRecorder && micRecorder.mimeType) || "audio/webm";
+    if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+    micRecorder = null;
+    const blob = new Blob(micChunks, { type: mime || "application/octet-stream" });
+    micChunks = [];
+    if (!blob.size) {
+      chatMic.classList.remove("recording");
+      chatMic.title = VOICE_IDLE_TITLE;
+      return;
+    }
+    micTranscribing = true;
+    chatMic.classList.remove("recording");
+    chatMic.title = VOICE_WAIT_TITLE;
+    try {
+      const fd = new FormData();
+      fd.append("file", blob, `voice-${Date.now()}.${suffixForMime(mime)}`);
+      const res = await fetch("/api/stt", { method: "POST", body: fd });
+      if (!res.ok) {
+        let detail = res.statusText;
+        try { detail = (await res.json()).detail || detail; } catch { /* keep statusText */ }
+        throw new Error(detail);
+      }
+      const data = await res.json();
+      if (data.text) {
+        const cur = chatInput.value.trimEnd();
+        chatInput.value = (cur ? cur + " " : "") + data.text;
+        chatInput.focus();
+      } else {
+        Viewer.toast("No speech detected.");
+      }
+    } catch (err) {
+      appendMsg("error", `Voice input failed: ${err.message}`);
+    } finally {
+      micTranscribing = false;
+      chatMic.title = VOICE_IDLE_TITLE;
+    }
+  }
+
+  chatMic.addEventListener("click", async () => {
+    if (micTranscribing) return; // one upload at a time; ignore clicks while pending
+    if (micRecorder && micRecorder.state !== "inactive") {
+      micRecorder.stop(); // onstop performs the upload and resets the button
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === "undefined") {
       appendMsg("error", "Voice input is not available in this environment.");
       return;
     }
-    if (recognition) {
-      recognition.stop();
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+    } catch {
+      micStream = null;
+      appendMsg("error", "Microphone unavailable — check the OS microphone permissions for DeepDive.");
       return;
     }
-    recognition = new SR();
-    recognition.lang = "en-US";
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
-    recognition.onresult = (e) => {
-      const text = e.results[0][0].transcript;
-      chatInput.value = text;
-      chatForm.dispatchEvent(new Event("submit"));
-    };
-    recognition.onend = () => { recognition = null; chatMic.classList.remove("active"); };
-    recognition.onerror = () => { recognition = null; chatMic.classList.remove("active"); };
-    recognition.start();
-    chatMic.classList.add("active");
+    const mime = pickAudioMime();
+    micChunks = [];
+    try {
+      micRecorder = mime ? new MediaRecorder(micStream, { mimeType: mime }) : new MediaRecorder(micStream);
+    } catch (err) {
+      if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+      micRecorder = null;
+      appendMsg("error", `Could not start recording: ${err.message}`);
+      return;
+    }
+    micRecorder.ondataavailable = (ev) => { if (ev.data && ev.data.size > 0) micChunks.push(ev.data); };
+    micRecorder.onstop = () => { onMicStopped(); };
+    micRecorder.start();
+    chatMic.classList.add("recording");
+    chatMic.title = VOICE_STOP_TITLE;
   });
 
   // ── Chat attachments: attach the current file / selected text / a window screenshot ──

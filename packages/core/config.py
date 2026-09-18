@@ -58,8 +58,14 @@ class Settings(BaseSettings):
     retrieval_mode: str = "in_process"  # "in_process" (RAGPipeline) | "grpc" (retrieval service)
     retrieval_grpc_addr: str = "localhost:15051"
 
-    # ── STT ──
-    stt_model: str = "whisper-1"
+    # ── STT (FunASR SenseVoice sidecar, OpenAI-compatible /v1/audio/transcriptions) ──
+    # Runs as a docker-published sidecar reached over the host loopback, mirroring the TTS
+    # mechanism above (the API gateway itself runs on the host, not inside the compose network).
+    stt_base_url: str = "http://localhost:18881/v1"
+    stt_api_key: str = "not-needed"   # the FunASR server ignores auth; the openai SDK needs a non-empty key
+    stt_model: str = "sensevoice"     # FunASR alias → iic/SenseVoiceSmall (≈234M, zh/en friendly)
+    stt_max_bytes: int = 10 * 1024 * 1024  # upload guard for POST /stt (a few minutes of speech)
+    stt_timeout_seconds: float = 30.0      # client-side wall time per transcription request
 
     # ── Media (desktop workbench: keyframes → PPT / PDF book) ──
     media_output_dir: Path = Path("data/media_output")

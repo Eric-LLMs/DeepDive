@@ -4,7 +4,7 @@
 // protocol, proxies /api to the FastAPI backend, and gives the renderer access to
 // local files through a `local://` protocol + a small IPC surface (folder pick,
 // file tree, open-with-OS-default, text read, screenshot save).
-const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, Menu, screen } = require("electron");
+const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, Menu, screen, session } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -966,6 +966,18 @@ app.whenReady().then(() => {
   app.setAppUserModelId("com.deepdive.desktop");
   protocol.handle("app", handleAppRequest);
   protocol.handle("local", handleLocalRequest);
+  // Chat voice input: the renderer records with getUserMedia, so `media` is granted only
+  // to our own UI origin (app://bundle) — silently, no OS prompt. Other permission types
+  // keep Electron's stock allow-by-default behavior (clipboard etc. rely on it).
+  const ALLOW_MEDIA_ORIGIN = "app://bundle";
+  const grantPermission = (permission, requestingOrigin) =>
+    permission !== "media" || (requestingOrigin || "").startsWith(ALLOW_MEDIA_ORIGIN);
+  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
+    callback(grantPermission(permission, details && details.requestingOrigin));
+  });
+  session.defaultSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) => {
+    return grantPermission(permission, requestingOrigin);
+  });
   registerIpcHandlers();
   setupMenu();
   createWindow();

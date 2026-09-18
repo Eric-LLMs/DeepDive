@@ -35,8 +35,9 @@ from core.infrastructure.jobs import (
 )
 from core.infrastructure.llm_routing import resolve_effective_channel
 from core.infrastructure.security import authorize_usage
+from core.infrastructure.stt import STTClient
 from core.infrastructure.tts import TTSClient
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sse_starlette.sse import EventSourceResponse
 
 router = APIRouter(tags=["jobs"])
@@ -357,6 +358,63 @@ async def synthesize_audio_stream(
         yield {"data": json.dumps({"type": "done", "count": idx}, ensure_ascii=False)}
 
     return EventSourceResponse(gen())
+
+
+# Content-types the FunASR sidecar can decode even though they aren't ``audio/*``
+# (browser MediaRecorder variants, ogg-in-mp4). Anything else non-empty is rejected 415.
+_NONSTANDARD_AUDIO_CT = {"video/webm", "video/mp4", "application/ogg"}
+_STT_SUFFIX = {
+    "audio/webm": ".webm", "video/webm": ".webm", "audio/ogg": ".ogg",
+    "application/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+    "video/mp4": ".m4a", "audio/wav": ".wav", "audio/x-wav": ".wav",
+    "audio/flac": ".flac", "application/octet-stream": ".bin",
+}
+
+
+def _stt_validate_content_type(raw: str | None) -> str:
+    """Sanitize the upload MIME: fall back to octet-stream when missing, 415 when clearly not audio.
+
+    ``application/octet-stream`` counts as "missing" — multipart clients emit it as the
+    generic default when the sender never set a part type.
+    """
+    ct = (raw or "").split(";", 1)[0].strip().lower()
+    if not ct or ct == "application/octet-stream":
+        return "application/octet-stream"
+    if ct.startswith("audio/") or ct in _NONSTANDARD_AUDIO_CT:
+        return ct
+    raise HTTPException(status_code=415, detail=f"unsupported audio type: {raw}")
+
+
+@router.post("/stt")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    user: AuthUser = Depends(require_user),
+):
+    """Transcribe one recorded voice clip (desktop chat mic input).
+
+    Synchronous on purpose: a few-second clip transcribes in about a second against the
+    local FunASR/SenseVoice sidecar, so the client awaits the text directly instead of
+    polling a job. Guardrails: bounded read (never buffer an unbounded upload), size cap
+    (413), non-a MIME rejection (415), and any sidecar failure surfaces as 502.
+    """
+    content_type = _stt_validate_content_type(file.content_type)
+    audio = await file.read(settings.stt_max_bytes + 1)
+    if len(audio) > settings.stt_max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"audio too large (limit {settings.stt_max_bytes} bytes)",
+        )
+    suffix = _STT_SUFFIX.get(content_type, ".bin")
+    safe_name = Path(file.filename or "voice").name.replace('"', "") or "voice"
+    if not safe_name.lower().endswith(suffix):
+        safe_name += suffix
+    try:
+        text = await STTClient().transcribe(audio, safe_name, content_type)
+    except Exception as exc:  # noqa: BLE001 - connection/timeout/server faults → actionable 502
+        raise HTTPException(
+            status_code=502, detail=f"speech transcription failed: {exc}"
+        ) from exc
+    return {"text": text}
 
 
 @router.post("/explain")
