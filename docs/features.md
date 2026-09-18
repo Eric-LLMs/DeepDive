@@ -69,13 +69,15 @@
   while files keep their usual sharing / ACL rules — [design: §10.8](architecture.md#108-query-repository-multi-source-import).
 - **Import content & multiple text formats**: files get a **＋ Import to Knowledge** button and an
   "in knowledge" badge once indexed. Supported formats: plain text (`.txt` / `.md` / `.log` / `.json` /
-  `.csv`), subtitles (`.srt` / `.vtt` / `.lrc`), Word (`.docx`), and PDF (`.pdf`). PDFs extract body text
+  `.csv`), subtitles (`.srt` / `.vtt` / `.lrc` — indexed as timestamped cue-grouped chunks, so answers
+  cite `<video name> @ H:MM:SS`), Word (`.docx`), and PDF (`.pdf`). PDFs extract body text
   *and* detect tables, rendering each to an image the vision LLM transcribes (a failing table is skipped,
   never fatal). The Learning Platform lets you import saved sentences and write articles; chat lets you
   import a single reply (bound to its question) or organize a whole session — the LLM merges the same
   question's follow-up turns into one entry and splits distinct questions. Imported chat entries show a
   persistent **✓ Imported** state — [design: §10.8](architecture.md#108-query-repository-multi-source-import).
 - **Document images join the RAG flow**: importing a PDF/DOCX also extracts its embedded images (PDF pages via `pymupdf`, DOCX paragraphs via the OOXML relationship parts) and saves each to the cloud drive as a derived asset. During ingest each chunk is tagged with `meta.pages` + `meta.image_ids` (the **union** across every page/paragraph the chunk spans — no dropped images on cross-page chunks); at retrieval the agent sees those ids and reads the actual images with the `vision` tool — [design: §18.3](architecture.md#183-rag-document-image-pipeline-extraction--meta-annotation).
+- **Rate the sources behind an answer**: when a reply was grounded on `rag_search` hits, the assistant bubble shows a 👍/👎 panel over exactly those sources (with an optional reason); the verdict lands in the golden-set feedback table, and the hit snapshot persists with the message so the rating is still there when you reopen the chat.
 - **Chat screenshots imported into RAG are preserved**: a chat Q&A whose question carried a screenshot writes that asset into the chunk's `meta.image_ids` on import (single-pair and whole-session imports alike), so retrieval returns it for the `vision` tool. The import **copies** the image into `RAG/images/` while **keeping the `chat/temp/` copy** — the two rows share one content-addressed blob, so clearing `chat/temp/` can't orphan a referenced image (and the copy costs nothing extra). A screenshot is temporary and dies with its chat — deleting the session/message still removes the `chat/temp/` copy — while the `RAG/images/` copy is a separate asset row that survives deletion, so the image stays stored alongside the RAG text — [design: §18.2](architecture.md#182-chat-screenshot-pipeline).
 - **Configurable chunking**: pick a split strategy — `fixed` sliding window, `paragraph`, `sentence`, or
   `semantic` — and set chunk size / overlap. Optionally enable **contextual** enrichment (an LLM-written

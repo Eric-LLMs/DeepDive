@@ -45,7 +45,6 @@ DeepDive is a persistent AI tutor that helps you deeply understand your material
 | **Research** | • Search across your files, notes, conversations, and sources<br>• Go beyond your material — search the web and community discussions for newer research and supporting evidence<br>• Synthesize multiple sources into grounded, structured answers |
 | **Remember** | • Save durable insights and recall them in later sessions<br>• Keep long-term memory separate from conversation history<br>• Revisit bookmarks, notes, and saved spots |
 | **Create** | • Summarize sessions, notes, and documents<br>• Generate mind maps and grounded slide decks (canonical 16:9 Typst PDF + editable PPTX)<br>• Publish research reports as citation-resolved PDFs<br>• Turn conversations into reusable knowledge that flows back into search |
-| **Talk** | • 🎤 push-to-talk dictation — local FunASR/SenseVoice transcription into the input box<br>• 🌊 hands-free voice call — VAD end-of-speech auto-send, Kokoro reads the answer aloud, talking over it interrupts (barge-in), all CPU-local sidecars |
 | **Collaborate** | • Share files and knowledge in workspaces<br>• Study and discuss the same material as a team with role-based access control |
 
 ## Demo
