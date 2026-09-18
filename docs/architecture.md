@@ -143,16 +143,17 @@ Dropped as non-goals (deliberate decisions, not gaps): recurring-billing **subsc
 
 ## 1. Product Positioning
 
-DeepDive is an "AI learning workbench" unified by a single abstraction:
+DeepDive is an AI-native learning and research workspace — a self-hosted environment for
+reading, watching, understanding, researching, and creating with your own materials, designed
+to keep your data and AI workloads within your own infrastructure and under your control. It
+combines a document and media workspace with AI chat, memory, RAG, agents, research workflows,
+and persistent knowledge, so your materials become an active part of the AI interaction rather
+than just file attachments.
 
-- **Vocabulary learning**: domain vocabulary + example sentences + definitions + TTS + images + star ratings
-- **Video / document learning**: media → timestamped/paginated text chunks → searchable, annotatable
-- **AI chat assistant**: interactive Q&A with tool use (RAG + vocabulary lookup + sandboxed file/network tools), voice in/out (mic transcription, text-to-speech, hands-free call mode)
-- **Cloud drive & workspaces**: every learning material is a real file — personal My Drive + shared workspaces with folders, versioned uploads, sharing/ACL, trash, in-place editing, and one-click RAG import
-- **Research OS**: chat-created research tasks run a deterministic multi-stage pipeline (evidence gathering → design → writing → review) under budgets and quality gates, ending in published artifacts
-- **Create**: discussions and research become summaries, mind maps, and slides that flow back into the searchable workspace
-- **Remember**: conversations carry dual-track session memory, and valuable Q&A / whole sessions can be imported into the user's own RAG corpus — pick up where you left off
-- **Unifying principle: everything is a text chunk** — vocabulary, media, drive files, and research evidence all land in the same searchable corpus
+DeepDive supports PDFs, Office documents, video, audio, and images directly in the workspace,
+with integrated file management and personal cloud storage. Select a passage, page, or video
+moment and ask in context — then research beyond your materials, save durable insights, and turn
+conversations into reusable knowledge and artifacts.
 
 [↑ Back to top](#table-of-contents)
 
