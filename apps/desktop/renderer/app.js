@@ -783,6 +783,7 @@
     copy: "Copy",
     speak: "Read",
     import: "Import to Knowledge",
+    rate: "Rate sources",
     delete: "Delete",
   };
   function buildMsgActions(div, role, getText) {
@@ -806,6 +807,11 @@
       const done = state.importedByMsgId.get(div.dataset.id) === true || state.sessionImportedLegacy;
       console.log("[imported] render msg", div.dataset.id, "done", done, "legacy", state.sessionImportedLegacy);
       items.push(["import", "📥", (b) => importPair(div, b), done]);
+      // Rate-retrieval chip: only when this message's turn actually ran rag_search
+      // (hits snapshot persisted on the row / carried by the live done frame).
+      if (state.retrievalByMsg && state.retrievalByMsg[div.dataset.id]) {
+        items.push(["rate", "👍", () => openRetrievalRate(div), false]);
+      }
     }
     items.push(["delete", "🗑", () => startDeleteSelection(div)]);
     for (const [a, glyph, fn, done] of items) {
@@ -828,6 +834,90 @@
       actions.appendChild(b);
     }
     return actions;
+  }
+
+  // ── Retrieval feedback (👍/👎) ────────────────────────────────────────────────
+  // When a turn's answer was grounded on rag_search hits, the done frame carries
+  // ``retrieved`` and the assistant row persists the same snapshot (messages.meta).
+  // The 👍/👎 chip records a rating into ``rag_feedback`` (POST /rag/feedback),
+  // growing the golden dataset; query falls back to the rag_search query, then the
+  // user's own question text.
+  state.retrievalByMsg = state.retrievalByMsg || {};
+
+  async function postRagFeedback(div, retrieval, rating) {
+    const query = (retrieval.queries && retrieval.queries[0])
+      || ((div.previousElementSibling && div.previousElementSibling.__getText
+        ? div.previousElementSibling.__getText() : "") || "").slice(0, 500);
+    const reason = (div.__ratePanel && div.__ratePanel.querySelector(".rate-reason") || {}).value || "";
+    try {
+      const res = await fetch("/api/rag/feedback", {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ query, rating, reason: reason.trim(), hits: retrieval.hits }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      retrieval.rated = rating ? "up" : "down";
+      if (div.__ratePanel) renderRatePanel(div.__ratePanel, div, retrieval);
+      Viewer.toast(rating ? "Thanks — marked relevant." : "Thanks — marked off-target.");
+    } catch (e) {
+      Viewer.toast(`Feedback failed: ${e.message}`);
+    }
+  }
+
+  function renderRatePanel(panel, div, retrieval) {
+    panel.innerHTML = "";
+    if (retrieval.rated) {
+      const ok = document.createElement("span");
+      ok.className = "rate-done";
+      ok.textContent = retrieval.rated === "up" ? "👍 Rated relevant" : "👎 Rated off-target";
+      panel.appendChild(ok);
+      return;
+    }
+    const reason = document.createElement("input");
+    reason.className = "rate-reason";
+    reason.placeholder = "Why? (optional)";
+    const up = rateBtn("👍 Relevant", () => postRagFeedback(div, retrieval, true));
+    const down = rateBtn("👎 Off-target", () => postRagFeedback(div, retrieval, false));
+    panel.append(reason, up, down);
+  }
+
+  function rateBtn(label, fn) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "rate-opt";
+    b.textContent = label;
+    b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+    return b;
+  }
+
+  function openRetrievalRate(div) {
+    const retrieval = state.retrievalByMsg[div.dataset.id];
+    if (!retrieval) return;
+    if (div.__ratePanel) {
+      div.__ratePanel.classList.toggle("hidden");
+      return;
+    }
+    const panel = document.createElement("div");
+    panel.className = "msg-rate";
+    div.__ratePanel = panel;
+    renderRatePanel(panel, div, retrieval);
+    div.appendChild(panel);
+  }
+
+  // Live done-frame path: the bubble's action row was built before the message id was
+  // known, so append the 👍 chip afterwards and open the panel in one go.
+  function addRetrievalActions(div) {
+    const actions = div.querySelector(".msg-actions");
+    if (!actions || actions.querySelector('button[data-a="rate"]')) return;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.dataset.a = "rate";
+    b.innerHTML = `<span class="glyph">👍</span><span class="lbl"></span>`;
+    b.title = ACTION_LABELS.rate;
+    b.querySelector(".lbl").textContent = ACTION_LABELS.rate;
+    b.addEventListener("click", (e) => { e.stopPropagation(); openRetrievalRate(div); });
+    actions.appendChild(b);
+    openRetrievalRate(div);
   }
 
   // Update an action button's text + tooltip. The button keeps its glyph; the label
@@ -1086,19 +1176,22 @@
   // message created (a 📷 screenshot or an attached file). When present, the media is
   // rendered inside the bubble above the text — images show as an inline thumbnail, other
   // files as a chip — mirroring how Gemini/ChatGPT display sent images.
-  function appendMessage(id, role, text, attach) {
+  function appendMessage(id, role, text, attach, retrieval) {
     if (role !== "user" && role !== "assistant") return appendMsg(role, text);
     const div = document.createElement("div");
     div.className = `msg ${role}`;
     if (id) {
       div.dataset.id = id;
       state.renderedMsgIds.add(id); // tracked so live refresh never re-renders it
+      if (retrieval) (state.retrievalByMsg = state.retrievalByMsg || {})[id] = retrieval; // before buildMsgActions → 👍 chip
     }
     div.dataset.raw = text; // markdown source, kept for edit + copy of raw text
     const bubble = document.createElement("div");
     bubble.className = "msg-bubble";
-    const media = attach && attach.asset_id ? buildAttachMedia(attach) : null;
-    if (media) bubble.appendChild(media);
+    if (attach && attach.asset_id) {
+      const media = buildAttachMedia(attach);
+      if (media) bubble.appendChild(media);
+    }
     const body = document.createElement("div");
     body.innerHTML = renderMarkdown(text);
     bubble.appendChild(body);
@@ -1109,6 +1202,11 @@
     // empty and an already-imported pair never rendered as "✓ Imported" on reopen.
     chatLog.appendChild(div);
     div.appendChild(buildMsgActions(div, role, () => text));
+    div.__getText = () => text;
+    if (retrieval) {
+      div.__retrieval = retrieval; // reopen path passes the row's meta.retrieval
+      if (id) state.retrievalByMsg[id] = retrieval;
+    }
     chatLog.scrollTop = chatLog.scrollHeight;
     return div;
   }
@@ -1119,7 +1217,7 @@
   function appendMsgRow(m) {
     if (m.role === "tool") return;
     if (m.role === "system") { appendMsg("system", m.content, m.id); return; }
-    appendMessage(m.id, m.role === "assistant" ? "assistant" : "user", m.content, m.attach);
+    appendMessage(m.id, m.role === "assistant" ? "assistant" : "user", m.content, m.attach, m.retrieval);
   }
 
   // Build the inline media element for a message attachment. Images are fetched from the
@@ -1179,6 +1277,7 @@
     // so the import button can bind the preceding user question via previousElementSibling.
     chatLog.appendChild(div);
     div.appendChild(buildMsgActions(div, "assistant", () => text));
+    div.__getText = () => text; // retrieval-rate falls back to the question text
     return {
       el: div,
       add: (t) => { text += t; bubble.innerHTML = renderMarkdown(text); scroll(); },
@@ -1594,6 +1693,7 @@
     let streamMsg = null;      // { el, add, reset }
     let stepChanged = false;   // a new agent step began → restart the bubble on next content
     let gotDone = false;
+    let lastRetrieved = null;  // this turn's rag_search hits snapshot (done frame → 👍/👎 row)
     let researchContinuing = false; // done frame carried research_continuing → worker still driving
 
     const handleEvent = (evt) => {
@@ -1660,6 +1760,13 @@
           if (evt.data.assistant_message_id && streamMsg) {
             streamMsg.el.dataset.id = evt.data.assistant_message_id;
             state.renderedMsgIds.add(evt.data.assistant_message_id); // never re-render from a refresh
+          }
+          // Retrieval happened this turn → remember the hits and offer the 👍/👎 row on
+          // the assistant bubble (survives reopen via the message's persisted meta).
+          lastRetrieved = evt.data.retrieved || null;
+          if (lastRetrieved && streamMsg) {
+            state.retrievalByMsg[streamMsg.el.dataset.id] = lastRetrieved;
+            addRetrievalActions(streamMsg.el);
           }
           // Fallback when no content streamed (e.g. tool round produced only reasoning).
           if (!streamMsg && evt.data.answer) {

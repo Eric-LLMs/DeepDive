@@ -152,7 +152,7 @@ async def test_load_session_detail_carries_imported_rag_flag():
     msgs = [
         (
             SimpleNamespace(
-                id=mid1, role="user", text="Q", imported_rag=True,
+                id=mid1, role="user", text="Q", imported_rag=True, meta=None,
                 created_at=SimpleNamespace(isoformat=lambda: "2026-08-28T10:00:00+00:00"),
             ),
             None,
@@ -160,6 +160,7 @@ async def test_load_session_detail_carries_imported_rag_flag():
         (
             SimpleNamespace(
                 id=mid2, role="assistant", text="A", imported_rag=False,
+                meta={"retrieval": {"hits": [{"id": "h1", "score": 0.9, "text": "t"}], "queries": ["q"]}},
                 created_at=SimpleNamespace(isoformat=lambda: "2026-08-28T10:00:01+00:00"),
             ),
             None,
@@ -172,6 +173,10 @@ async def test_load_session_detail_carries_imported_rag_flag():
     assert detail["messages"][0]["id"] == str(mid1)
 
     assert detail["messages"][0]["attach"] is None  # no attachment on these messages
+    # ``meta.retrieval`` surfaces as a first-class ``retrieval`` field (👍/👎 feedback UI).
+    assert detail["messages"][0]["retrieval"] is None
+    assert detail["messages"][1]["retrieval"]["queries"] == ["q"]
+    assert detail["messages"][1]["retrieval"]["hits"][0]["id"] == "h1"
     # checkpoint is inlined for Live-State recovery (client rebuilds [summary]+[tail]).
     assert detail["compaction"] == {"revision": 1}
 

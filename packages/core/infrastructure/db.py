@@ -763,6 +763,11 @@ class MessageModel(Base):
     attach_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True
     )
+    # Generic per-message metadata (migration 0016). First use: the retrieval-feedback
+    # snapshot ``{"retrieval": {"hits": [{id, score, text?}], "queries": [...]}}`` written
+    # on an assistant turn that ran rag_search, so the client can offer a persistent
+    # 👍/👎 rating recorded into ``rag_feedback``.
+    meta: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

@@ -1031,6 +1031,9 @@ async def load_session_detail(session_factory, session_id: UUID) -> dict:
                         if asset is not None
                         else None
                     ),
+                    # Retrieval-feedback snapshot (assistant messages that ran rag_search):
+                    # {hits, queries} so the client re-renders the 👍/👎 row after reopen.
+                    "retrieval": (m.meta or {}).get("retrieval") if m.meta else None,
                 }
                 for m, asset in rows
             ],

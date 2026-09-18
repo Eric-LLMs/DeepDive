@@ -3323,3 +3323,11 @@ textarea.rtv-desc-edit::placeholder { color: var(--fg-dim); opacity: 0.7; }
 .research-gate-card .rga-btn.approve { border-color: #34d399; color: #34d399; }
 .research-gate-card .rga-btn.reject { border-color: #c94f4f; color: #c94f4f; }
 .research-gate-card .rga-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* ── Retrieval feedback (👍/👎) panel under assistant bubbles ── */
+.msg-rate { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+.msg-rate.hidden { display: none; }
+.msg-rate .rate-reason { flex: 1; min-width: 120px; font-size: 12px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-soft); color: var(--fg); }
+.msg-rate .rate-opt { font-size: 12px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-soft); color: var(--fg); cursor: pointer; }
+.msg-rate .rate-opt:hover { border-color: var(--accent); color: var(--accent); }
+.msg-rate .rate-done { font-size: 12px; color: var(--fg-dim); }

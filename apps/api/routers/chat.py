@@ -434,6 +434,90 @@ def _last_written_id(rows: list[dict], role: str) -> str | None:
     return None
 
 
+def _extract_retrieval(messages: list[dict] | None) -> dict | None:
+    """Snapshot this turn's rag_search hits for the retrieval-feedback loop.
+
+    Maps assistant ``tool_calls`` (flat {id, name, arguments} shape) so each tool-role row
+    is identified by name; parses every ``rag_search`` result (a JSON list of hit dicts)
+    into a compact ``{"hits": [{id, score, text<=200}], "queries": [...]}``.
+    ``_UNAVAILABLE`` / malformed payloads contribute nothing; hits dedupe by id keeping the
+    first score. Returns None when the turn ran no successful rag_search.
+    """
+    if not messages:
+        return None
+    name_by_call: dict[str, str] = {}
+    query_by_call: dict[str, str] = {}
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            tcid, name = tc.get("id"), tc.get("name")
+            if not tcid or not name:
+                continue
+            name_by_call[tcid] = name
+            if name == "rag_search":
+                try:
+                    q = (json.loads(tc.get("arguments") or "{}") or {}).get("query")
+                except Exception:  # noqa: BLE001 - malformed args just means no query tag
+                    q = None
+                if q:
+                    query_by_call[tcid] = str(q)
+    hits: dict[str, dict] = {}
+    queries: list[str] = []
+    for m in messages:
+        if m.get("role") != "tool":
+            continue
+        cid = m.get("tool_call_id")
+        if name_by_call.get(cid) != "rag_search":
+            continue
+        content = m.get("content")
+        if isinstance(content, list):  # text-block parts shape
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        try:
+            parsed = json.loads(content) if isinstance(content, str) else None
+        except Exception:  # noqa: BLE001
+            parsed = None
+        if not isinstance(parsed, list):
+            continue
+        if cid in query_by_call and query_by_call[cid] not in queries:
+            queries.append(query_by_call[cid])
+        for h in parsed:
+            if not isinstance(h, dict):
+                continue
+            hid = h.get("id") or h.get("chunk_id")
+            if hid is None or str(hid) in hits:
+                continue
+            score = h.get("score")
+            hits[str(hid)] = {
+                "id": str(hid),
+                "score": float(score) if isinstance(score, (int, float)) else None,
+                "text": str(h.get("text") or "")[:200],
+            }
+    if not hits:
+        return None
+    return {"hits": list(hits.values()), "queries": queries}
+
+
+async def _persist_retrieval_meta(message_id: str | None, retrieval: dict) -> None:
+    """Attach the retrieval snapshot to the assistant message row. Best-effort: a failure
+    only means the 👍/👎 row won't survive a reopen, never fails the turn. The row may
+    still be in-flight in the session write queue, so retry briefly on a missing row."""
+    if not message_id:
+        return
+    for attempt in range(3):
+        try:
+            async with SessionLocal() as s:
+                row = await s.get(MessageModel, UUID(message_id))
+                if row is None:
+                    raise RuntimeError("assistant row not visible yet")
+                meta = dict(row.meta or {})
+                meta["retrieval"] = retrieval
+                row.meta = meta
+                await s.commit()
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("retrieval meta persist failed (%d/3): %s", attempt + 1, exc)
+            await asyncio.sleep(0.5)
+
+
 def _turn_tail(items) -> list[dict]:
     """Schema tail entries → the internal tail shape ``{message_id, role, content}``."""
     return [
@@ -693,6 +777,11 @@ async def chat(
         except Exception as exc:  # noqa: BLE001
             logger.warning("research session_history mirror failed: %s", exc)
     reset_log_context(log_tokens)
+    # Retrieval-feedback snapshot: persist + return the turn's rag_search hits so the
+    # client renders the persistent 👍/👎 row (POST /rag/feedback records the rating).
+    retrieval = _extract_retrieval(result.messages)
+    if retrieval:
+        await _persist_retrieval_meta(assistant_message_id, retrieval)
     resp = {
         "answer": result.final_answer,
         "messages": result.messages,
@@ -701,6 +790,8 @@ async def chat(
         "user_message_id": user_message_id,
         "assistant_message_id": assistant_message_id,
     }
+    if retrieval:
+        resp["retrieved"] = retrieval
     if compaction_payload:
         resp["compaction"] = compaction_payload
     if compaction_deferred:
@@ -952,6 +1043,12 @@ async def chat_stream(
                 "user_message_id": user_message_id,
                 "assistant_message_id": assistant_message_id,
             }
+            # Retrieval-feedback snapshot (same contract as /chat): persist onto the
+            # assistant row + hand the client the hits to rate.
+            retrieval = _extract_retrieval((final_payload or {}).get("messages"))
+            if retrieval:
+                await _persist_retrieval_meta(assistant_message_id, retrieval)
+                done["retrieved"] = retrieval
             if compaction_payload:
                 done["compaction"] = compaction_payload
             if compaction_deferred:
