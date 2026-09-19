@@ -253,3 +253,35 @@ async def test_confined_path_rejects_parent_escape(monkeypatch, tmp_path):
     with pytest.raises(HTTPException) as exc:
         _confined_path(str(root / "sub" / ".." / ".." / "etc" / "passwd"), field="video_path")
     assert exc.value.status_code == 400
+
+
+# ── Password policy (the shared validator behind all five write paths) ──
+
+def test_password_policy_accepts_all_four_classes():
+    assert sec.password_policy_error("Pwd@2026x") is None
+    assert sec.password_policy_error("Pa1@x7y8") is None  # exactly 8 chars passes
+
+
+def test_password_policy_rejects_each_gap():
+    hint = sec.PASSWORD_POLICY_HINT
+    assert sec.password_policy_error(None) == hint
+    assert sec.password_policy_error("") == hint
+    assert sec.password_policy_error("P@1aBcd") == hint        # 7 chars
+    assert sec.password_policy_error("password1@") == hint     # no uppercase
+    assert sec.password_policy_error("PASSWORD1@") == hint     # no lowercase
+    assert sec.password_policy_error("Pass@word") == hint      # no digit
+    assert sec.password_policy_error("Passw0rd") == hint       # no special
+    assert sec.password_policy_error("Pwd 2026x") == hint      # space is not a special char
+
+
+def test_password_policy_special_charset_coverage():
+    # representative specials from both ends of the set
+    assert sec.password_policy_error("Pwd~2026x") is None
+    assert sec.password_policy_error("Pwd#2026x") is None
+    assert sec.password_policy_error("Pwd.2026x") is None
+
+
+def test_admin_seed_hash_roundtrip():
+    stored = sec.hash_password("pwd@Admin")
+    assert sec.verify_password("pwd@Admin", stored)
+    assert not sec.verify_password("admin", stored)

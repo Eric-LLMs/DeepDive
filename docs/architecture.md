@@ -1690,7 +1690,7 @@ Fields below mirror the migration DDL exactly;
 
 Two auth details worth knowing: **the admin credential is mirrored into `users`** — on every boot the
 startup guard (`apps/api/main.py`, `security.py`) upserts a `users` row matching
-`app_settings['admin']`, so `admin/admin` can also sign in through `/auth/login` (the desktop client),
+`app_settings['admin']`, so `admin/pwd@Admin` can also sign in through `/auth/login` (the desktop client),
 not just the stateless `/admin/login`. And **a password reset revokes every login token** for the user
 (`/auth/reset-password` flips all their `login_tokens.is_active` false), so the old password stops
 working immediately.

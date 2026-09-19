@@ -130,7 +130,11 @@ See [docs/architecture.md §Implementation Status](docs/architecture.md#implemen
 | Windows desktop | `bash scripts/start_desktop.sh` |
 | Linux server | `bash scripts/start_server.sh` |
 
-Each script installs Docker if missing, starts the data + model services, ensures the Python environment, seeds the default `admin` / `admin` account, and launches the workbench (desktop) or web UI (server).
+Each script installs Docker if missing, starts the data + model services, ensures the Python environment, seeds the default `admin` / `pwd@Admin` account, and launches the workbench (desktop) or web UI (server).
+
+### After first launch — configure model keys
+
+All LLM configuration lives in the database and is managed from the **admin console** — nothing else needs editing after install. Open the web UI, sign in with the seeded account (**admin / pwd@Admin**), and in the console's *Providers* tab register your upstream credentials (API key + base URL), then in *Models* map catalog entries onto those providers with routing priorities. The chat model, the embedding model, and the **vision model** used for screenshots, PDF tables, and document-image captions (`tools.vision.model` in the *Tools* tab) are all picked from this catalog — a provider that runs out of balance surfaces as HTTP 402 on the affected call, so keep a funded route active.
 
 ### Option B — Manual local development
 

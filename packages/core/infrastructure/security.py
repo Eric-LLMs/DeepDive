@@ -29,6 +29,34 @@ from core.infrastructure.db import (
 
 _PBKDF2_ITERATIONS = 100_000
 
+# ── Password policy (single source of truth) ──
+# Every write path (register / reset / profile change / admin create+update) validates
+# through :func:`password_policy_error`, and the UI hints (desktop profile, admin console,
+# reset page) mirror :data:`PASSWORD_POLICY_HINT` verbatim — so the rule lives exactly once.
+PASSWORD_MIN_LEN = 8
+PASSWORD_POLICY_HINT = (
+    "Password must be at least 8 characters and include uppercase, lowercase, "
+    "digit and special characters"
+)
+_POLICY_SPECIALS = set("!@#$%^&*()-_=+[]{};:,.<>/?~`\\|\"'")
+
+
+def password_policy_error(password: str | None) -> str | None:
+    """Return the policy hint if ``password`` is too weak, else ``None``.
+
+    Requires ≥ ``PASSWORD_MIN_LEN`` chars and all four classes: lowercase, uppercase,
+    digit, special.
+    """
+    pw = password or ""
+    ok = (
+        len(pw) >= PASSWORD_MIN_LEN
+        and any(c.islower() for c in pw)
+        and any(c.isupper() for c in pw)
+        and any(c.isdigit() for c in pw)
+        and any(c in _POLICY_SPECIALS for c in pw)
+    )
+    return None if ok else PASSWORD_POLICY_HINT
+
 
 # ── Passwords ──
 def hash_password(password: str) -> str:
@@ -92,13 +120,13 @@ async def set_setting(session, key: str, value: dict) -> None:
 
 
 async def ensure_default_admin(session) -> None:
-    """Seed the default admin credential (admin/admin) on first boot if none exists."""
+    """Seed the default admin credential (admin/pwd@Admin) on first boot if none exists."""
     if await get_setting(session, "admin") is not None:
         return
     await set_setting(
         session,
         "admin",
-        {"username": "admin", "password_hash": hash_password("admin")},
+        {"username": "admin", "password_hash": hash_password("pwd@Admin")},
     )
 
 

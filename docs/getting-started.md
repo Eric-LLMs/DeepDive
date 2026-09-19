@@ -135,10 +135,10 @@ First run on a fresh machine also installs Docker and the Python/Node deps autom
 
 | Environment | Script | What it does |
 |---|---|---|
-| **Windows desktop** (local PC client) | `bash scripts/start_desktop.sh` | Auto-installs Docker Desktop if missing → starts **all** dependency services (postgres, redis, embedding, tts, llm-gateway, worker) → ensures the Python venv → starts the backend (boot seeds `admin`/`admin`) → opens the Electron workbench. |
-| **Linux server** (browser access) | `bash scripts/start_server.sh` | Auto-installs Docker Engine if missing → starts **all** dependency services (postgres, redis, embedding, tts, llm-gateway, worker) → ensures the Python venv → starts the backend (boot seeds `admin`/`admin`) → builds and serves the React web UI at `http://<server-ip>:5273`. |
+| **Windows desktop** (local PC client) | `bash scripts/start_desktop.sh` | Auto-installs Docker Desktop if missing → starts **all** dependency services (postgres, redis, embedding, tts, llm-gateway, worker) → ensures the Python venv → starts the backend (boot seeds `admin`/`pwd@Admin`) → opens the Electron workbench. |
+| **Linux server** (browser access) | `bash scripts/start_server.sh` | Auto-installs Docker Engine if missing → starts **all** dependency services (postgres, redis, embedding, tts, llm-gateway, worker) → ensures the Python venv → starts the backend (boot seeds `admin`/`pwd@Admin`) → builds and serves the React web UI at `http://<server-ip>:5273`. |
 
-The default `admin` / `admin` account is seeded on first boot and ready to sign in from the start.
+The default `admin` / `pwd@Admin` account is seeded on first boot and ready to sign in from the start.
 
 ---
 
@@ -185,7 +185,7 @@ Chat, session history & search, media generation, sign-in, and the **☁️ Clou
 - **Trash**: deleting a file moves it to **Trash** — restore, purge permanently, or **Empty Trash**; entries older than 30 days purge automatically. Deleting a workspace trashes its files and moves them to My Drive trash.
 - **Query Repo column**: files are ingested for retrieval in the background — each file shows a badge (Pending → Parsing → Chunking → Embedding → Indexed) plus a **＋ Import to Knowledge** button to (re)ingest text-bearing files (PDF tables are read via vision); unsupported formats (audio/video/slides) show a disabled hint, and ingested files show a grey **In Knowledge** badge.
 
-## 🔧 Admin console (`/admin`, default `admin` / `admin`)
+## 🔧 Admin console (`/admin`, default `admin` / `pwd@Admin`)
 
 Sign in as an operator to configure the whole instance from a single SPA:
 

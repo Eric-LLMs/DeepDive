@@ -45,6 +45,7 @@ from core.infrastructure.security import (
     generate_token,
     get_role,
     hash_password,
+    password_policy_error,
     role_to_dict,
     verify_password,
 )
@@ -265,8 +266,8 @@ async def register(body: RegisterRequest, request: Request) -> dict:
     email = body.email.strip().lower()
     if not username or not email or not body.password:
         raise HTTPException(status_code=400, detail="用户名、邮箱和密码不能为空")
-    if len(body.password) < 6:
-        raise HTTPException(status_code=400, detail="密码至少 6 位")
+    if (policy_err := password_policy_error(body.password)):
+        raise HTTPException(status_code=400, detail=policy_err)
     async with SessionLocal() as session:
         dup = (
             await session.execute(
@@ -358,11 +359,12 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request) -> dict
 async def reset_password_page(token: str) -> HTMLResponse:
     """Browser landing for the reset link: a small form that POSTs JSON to /auth/reset-password."""
     body = (
-        "<h1>重置密码</h1><p>请输入新密码(至少 6 位)。</p>"
+        "<h1>重置密码</h1><p>请输入新密码 — "
+        "at least 8 characters, with uppercase, lowercase, a digit and a special character.</p>"
         '<form id="reset-form"><input type="hidden" id="reset-token" value="'
         + token
         + '">'
-        '<input type="password" id="reset-password" placeholder="新密码" minlength="6" autocomplete="new-password" required>'
+        '<input type="password" id="reset-password" placeholder="新密码" minlength="8" autocomplete="new-password" required>'
         '<input type="password" id="reset-password2" placeholder="确认新密码" required>'
         '<button type="submit">重置密码</button>'
         '<p class="err" id="reset-err"></p></form>'
@@ -386,8 +388,8 @@ async def reset_password_page(token: str) -> HTMLResponse:
 async def reset_password(body: ResetPasswordRequest, request: Request) -> dict:
     """Apply a new password from a valid reset token and revoke the user's login tokens."""
     await _auth_rate_limit(request, getattr(request.app.state, "redis", None), "recovery")
-    if len(body.password) < 6:
-        raise HTTPException(status_code=400, detail="密码至少 6 位")
+    if (policy_err := password_policy_error(body.password)):
+        raise HTTPException(status_code=400, detail=policy_err)
     async with SessionLocal() as session:
         vrow = await _consume_verification(session, body.token, "reset")
         if vrow is None:
@@ -465,8 +467,8 @@ async def update_me(
         if body.new_password:
             if not verify_password(body.current_password or "", row.password_hash):
                 raise HTTPException(status_code=400, detail="当前密码不正确")
-            if len(body.new_password) < 6:
-                raise HTTPException(status_code=400, detail="新密码至少 6 位")
+            if (policy_err := password_policy_error(body.new_password)):
+                raise HTTPException(status_code=400, detail=policy_err)
             row.password_hash = hash_password(body.new_password)
         await session.commit()
     if email_changed:

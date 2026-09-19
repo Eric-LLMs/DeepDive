@@ -53,6 +53,7 @@ from core.infrastructure.security import (
     get_role,
     hash_password,
     list_roles,
+    password_policy_error,
     role_to_dict,
 )
 from fastapi import APIRouter, Depends, HTTPException
@@ -150,6 +151,8 @@ async def list_users(_: AuthAdmin = Depends(require_admin)) -> dict:
 @router.post("/admin/users")
 async def create_user(body: UserCreateRequest, _: AuthAdmin = Depends(require_admin)) -> dict:
     """Create a user account (admin sets the initial password + role)."""
+    if (policy_err := password_policy_error(body.password)):
+        raise HTTPException(status_code=400, detail=policy_err)
     async with SessionLocal() as session:
         existing = (
             await session.execute(select(UserModel).where(UserModel.username == body.username))
@@ -191,6 +194,8 @@ async def update_user(
         if body.is_active is not None:
             row.is_active = body.is_active
         if body.password:
+            if (policy_err := password_policy_error(body.password)):
+                raise HTTPException(status_code=400, detail=policy_err)
             row.password_hash = hash_password(body.password)
         if body.email is not None:
             row.email = body.email.strip().lower() or None

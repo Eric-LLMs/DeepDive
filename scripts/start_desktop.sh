@@ -8,7 +8,7 @@
 #   [3] Docker daemon ready?            -> start Docker Desktop and wait
 #   [4] All dependency services up      -> postgres/redis/embedding/tts/litellm/worker
 #   [5] Python venv + pip deps ensured  -> create .venv, pip install -e ".[dev]"
-#   [6] Backend started + admin verified-> uvicorn boot seeds admin/admin
+#   [6] Backend started + admin verified-> uvicorn boot seeds admin/pwd@Admin
 #   [7] React web UI served             -> vite dev server at :5273 (proxies /api)
 #   [8] Electron client launched
 #
@@ -164,12 +164,12 @@ verify_admin_login() {
   local body
   body="$(curl -fsS --max-time 5 -X POST "$BACKEND_URL/admin/login" \
       -H 'Content-Type: application/json' \
-      -d '{"username":"admin","password":"admin"}' 2>/dev/null || true)"
+      -d '{"username":"admin","password":"pwd@Admin"}' 2>/dev/null || true)"
   if printf '%s' "$body" | grep -q '"access_token"'; then
-    ok "Admin login OK (admin / admin) — sign in straight from the client."
+    ok "Admin login OK (admin / pwd@Admin) — sign in straight from the client."
     return 0
   fi
-  warn "admin/admin login check failed — see $UVICORN_LOG."
+  warn "admin/pwd@Admin login check failed — see $UVICORN_LOG."
   return 1
 }
 

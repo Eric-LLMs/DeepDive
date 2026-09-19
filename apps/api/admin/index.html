@@ -2091,6 +2091,7 @@
           const isEdit = !!user;
           const username = textInput(isEdit ? user.username || "" : "", { placeholder: "Username" });
           const password = textInput("", { type: "password", placeholder: isEdit ? "Leave empty to keep" : "Initial password" });
+          const PW_POLICY = "At least 8 characters, with uppercase, lowercase, a digit and a special character";
           const display = textInput(isEdit ? user.display_name || "" : "", { placeholder: "Display name (optional)" });
           const roleSel = select(ctx.roles.map((r) => ({ value: r.role_id, label: r.role_id })), isEdit ? user.role_id : "");
           const active = switchToggle(isEdit ? user.is_active : true);
@@ -2098,7 +2099,7 @@
           const body = el("div");
           body.append(
             field("Username", username, isEdit ? "Not editable." : "Required."),
-            field("Password", password, isEdit ? "Blank keeps the current password." : "Required."),
+            field("Password", password, isEdit ? "Blank keeps the current password. " + PW_POLICY : "Required. " + PW_POLICY),
             field("Display name", display),
             field("Role", roleSel)
           );

@@ -1743,6 +1743,7 @@ body.resizing-ew { cursor: ew-resize; }
 }
 .register-debug.hidden { display: none; }
 .register-debug-label { font-size: 11px; color: var(--fg-dim); }
+.pw-hint { font-size: 11px; color: var(--fg-dim); margin: 2px 0 6px; }
 .register-debug-link { display: flex; gap: 6px; align-items: center; }
 .register-debug-link input {
   flex: 1; min-width: 0; padding: 5px 8px; font-size: 11px;

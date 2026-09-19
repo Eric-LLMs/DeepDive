@@ -8,7 +8,7 @@
 #   [3] Docker daemon ready?            -> systemctl enable --now docker, wait
 #   [4] All dependency services up      -> postgres/redis/embedding/tts/litellm/worker
 #   [5] Python venv + pip deps ensured  -> create .venv, pip install -e ".[dev]"
-#   [6] Backend started + admin verified-> uvicorn boot seeds admin/admin
+#   [6] Backend started + admin verified-> uvicorn boot seeds admin/pwd@Admin
 #   [7] React web UI built + served     -> vite preview at :5273 (proxies /api etc.)
 #
 # Designed for Linux servers — there is no Electron client here; the browser-facing
@@ -143,12 +143,12 @@ verify_admin_login() {
   local body
   body="$(curl -fsS --max-time 5 -X POST "$BACKEND_URL/admin/login" \
       -H 'Content-Type: application/json' \
-      -d '{"username":"admin","password":"admin"}' 2>/dev/null || true)"
+      -d '{"username":"admin","password":"pwd@Admin"}' 2>/dev/null || true)"
   if printf '%s' "$body" | grep -q '"access_token"'; then
-    ok "Admin login OK (admin / admin) — sign in from the web UI."
+    ok "Admin login OK (admin / pwd@Admin) — sign in from the web UI."
     return 0
   fi
-  warn "admin/admin login check failed — see $UVICORN_LOG."
+  warn "admin/pwd@Admin login check failed — see $UVICORN_LOG."
   return 1
 }
 
@@ -231,5 +231,5 @@ echo
 echo "=============================================="
 echo "  Ready."
 echo "    API / docs : http://localhost:8300/docs"
-echo "    Web UI     : http://<this-server-ip>:$WEB_PORT  (admin / admin)"
+echo "    Web UI     : http://<this-server-ip>:$WEB_PORT  (admin / pwd@Admin)"
 echo "=============================================="
