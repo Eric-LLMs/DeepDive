@@ -151,7 +151,9 @@ The LiteLLM gateway routes the virtual model `deepdive-chat` to any OpenAI-compa
 
 Full manual steps, environment variables, and the desktop/web/admin walkthrough: [docs/getting-started.md](docs/getting-started.md) · [docs/configuration.md](docs/configuration.md).
 
-### After first launch — configure model access
+---
+
+## ⚙️ Configure Model Access
 
 Sign in with the seeded account (**admin / `pwd@Admin`**), then open **Admin → Admin Console** from the bottom-left account menu to configure a model route:
 

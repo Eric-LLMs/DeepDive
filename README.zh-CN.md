@@ -166,7 +166,9 @@ LiteLLM 网关把虚拟模型 `deepdive-chat` 路由到任意 OpenAI 兼容上�
 
 完整手动步骤、环境变量与桌面 / 网页 / 管理后台走查：[docs/getting-started.md](docs/getting-started.md) · [docs/configuration.md](docs/configuration.md)。
 
-### 首次启动后 — 配置模型访问
+---
+
+## ⚙️ 配置模型访问
 
 使用预置账号 **admin / `pwd@Admin`** 登录，然后打开左下角的**账号菜单 → Admin Console（管理控制台）**，进入管理控制台配置模型路由：
 
