@@ -1242,6 +1242,33 @@ The chunking + enrichment pipeline lives in `core/infrastructure/ingest.py`. `as
 current `RagPipelineConfig` at job time, so a chunking / enrichment config
 change takes effect on the next `POST /admin/rag/reindex` (re-ingests every READY asset):
 
+**Intake timing — upload ≠ index.** An upload only creates the Cloud Drive asset
+(`rag_status=NOT_STARTED`); nothing enters the corpus until a trigger enqueues the worker's
+`asset_ingest` job. Four entries, one deliberate automation:
+
+- **＋ Import to Knowledge** on a drive file row (`POST /files/{id}/import-rag`) — the manual
+  entry, surfaced as the **Query Repo** column state (`✓ In Knowledge` / Processing with ETA /
+  import button) in the desktop and web file lists.
+- **Chat imports** — a single Q&A (`Import to Knowledge` on the bubble) or an organized whole
+  session (§10.8).
+- **Research promote** — the *only* automatic path: publishing a report sets its Markdown
+  RAG-pending, so the published report becomes retrievable in later sessions (§17).
+- **Re-import is an upsert** — re-ingesting refreshes chunks in place; derived images reuse by
+  `(source, sha256)` (§18.3/§18.4), so a refresh never doubles rows or bytes.
+
+`rag_status` walks `NOT_STARTED → PENDING → PARSING → CHUNKING → EMBEDDING → INDEXED /
+FAILED` (the middle legs are progress the file lists surface as Processing + ETA); an
+unsupported extension fails honestly (`FAILED`, extractor raises `UnsupportedFileType`)
+instead of crashing the job, and media assets land INDEXED only after their
+transcript/enrichment legs.
+
+**What becomes searchable text.** All extraction dispatches through the shared
+`extract_document_text` (§18.6 doctrine: local deterministic read, LLM only for eyes):
+per-format body text (slides / paragraphs / grids / decoded text / cue text), and
+**tables always arrive as text, never as pictures** — PDF tables are rendered and
+vision-transcribed on the way in, while `.docx` / `.xlsx` / `.pptx` grids are flattened
+locally to delimited rows. Everything then flows into the strategies below.
+
 - **Strategies** — `fixed` (sliding window), `paragraph` (blank-line groups merged), `sentence`
   (sentence-boundary merge), `semantic` (embedding breakpoints; interface reserved).
 - **Subtitles bypass the strategies** — `.srt` / `.vtt` / `.lrc` assets are grouped by cue instead
@@ -1270,6 +1297,10 @@ change takes effect on the next `POST /admin/rag/reindex` (re-ingests every READ
   extraction, and a page/para state machine annotates each chunk's `meta` with the pages it
   spans plus the deduped **union** of the images on those pages (`image_ids`) — the agent reads
   them with the `vision` tool on retrieval. Details in [§18.3](#183-rag-document-image-pipeline-extraction--meta-annotation).
+  **PPTX is a text-only ingest for now**: `scan_embedded_images` walks PDF pages and DOCX
+  relationship parts, so deck-embedded pictures are *not* extracted — a `.pptx` enters the
+  corpus as slide text + speaker notes + flattened table rows only (the same gap does not
+  affect chat `read_document`, which reads the text equally well).
 
 ### 10.8 Query Repository — multi-source import
 
