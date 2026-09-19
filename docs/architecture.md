@@ -3168,7 +3168,10 @@ read this spreadsheet" request collapsed into a parse-failure apology. The `read
   worker uses, so chat never grows a second, drift-prone parsing stack:
   **PDF** → PyMuPDF body text, plus table images transcribed by the vision LLM;
   **Word** `.docx` → python-docx; **Excel** `.xlsx`/`.xlsm`/`.xltx`/`.xltm` → openpyxl
-  read-only with the ingest sheet/row caps; **plain text** `.txt`/`.md`/`.csv`/`.json`/`.log`;
+  read-only with the ingest sheet/row caps; **PowerPoint** `.pptx`/`.potx`/`.ppsx` →
+  python-pptx per-slide text + speaker notes (templates/slide shows share the OOXML
+  layout — the main content type is normalized in memory so one reader opens all three);
+  **plain text** `.txt`/`.md`/`.csv`/`.json`/`.log`;
   **subtitles** `.srt`/`.vtt`/`.lrc` flattened to cue text.
 - **Image routing** — an image extension/MIME short-circuits to a pointer reply telling the
   agent to call the `vision` tool (§18.5) with the same `asset_id`; images are a vision
@@ -3176,9 +3179,11 @@ read this spreadsheet" request collapsed into a parse-failure apology. The `read
 - **Type-aware attach note** — `_attach_note` (`chat.py`) picks the hint by suffix: documents
   get "call `read_document`", images get "call `vision`", so the agent needs no guessing to
   reach the right reader through `tool_search`.
-- **Honest failure, bounded output** — legacy `.doc`/`.xls` are refused with a resave-as
-  hint (the shared stack rejects them too); a parsed-but-empty document reports "no
-  extractable text (scanned?)"; extraction errors surface verbatim instead of a silent
+- **Honest failure, bounded output** — legacy `.doc`/`.xls`/`.ppt` are refused with a
+  resave-as hint (the shared stack rejects them too); a refusal or a parsed-but-empty
+  document explicitly instructs the agent **never to substitute another document from
+  the conversation** (a failed read once let the model summarize the *previous* attach —
+  wrong by omission); extraction errors surface verbatim instead of a silent
   empty. The reply is capped at 20 000 chars with a `[...truncated; N chars total]` tail, so
   one huge attachment cannot flood the context window — the agent can tell the user it only
   saw the first part.
@@ -3210,11 +3215,11 @@ Consequences that keep the boundary honest:
   materials simultaneously — there is no second parser to drift.
 - **Per-type routes.** PDF → local body + conditional vision tables; `.docx` → local
   paragraphs; `.xlsx`/`.xlsm`/`.xltx`/`.xltm` → local streaming grid with caps;
+  `.pptx`/`.potx`/`.ppsx` → local per-slide text + speaker notes (content-type
+  normalization lets one reader accept deck, template and slideshow packages);
   `.txt`/`.md`/`.csv`/`.json`/`.log` → local decode; subtitles → local cue flatten; images
-  → vision; `.doc`/`.xls` → refused (resave hint); **`.pptx` → not in the extraction
-  stack** (`supported_extensions()` excludes it, so `read_document` and ingest refuse it
-  honestly) — the desktop viewer's PowerPoint *preview* is a separate, purely client-side
-  JSZip renderer and does not feed any parser.
+  → vision; `.doc`/`.xls`/`.ppt` → refused (resave hint) — the desktop viewer's Office
+  *previews* are separate, purely client-side JS renderers and do not feed any parser.
 
 [↑ Back to top](#table-of-contents)
 

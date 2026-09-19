@@ -5,8 +5,9 @@ Attachments ride on the chat payload as a drive ``asset_id``; the agent only see
 the file, so every "parse this PDF / summarize this Word doc" request fails. This tool
 closes that gap: it loads the asset bytes from storage and runs the same extractor the
 ingest worker uses — PDF (PyMuPDF body text, tables via the vision LLM), .docx
-(python-docx), Excel (.xlsx via openpyxl), plus plain text / markdown / csv / json and
-subtitles. Images are routed to the ``vision`` tool instead, and the output is capped so
+(python-docx), Excel (.xlsx via openpyxl), PowerPoint (.pptx/.potx/.ppsx slide text +
+speaker notes via python-pptx), plus plain text / markdown / csv / json and subtitles.
+Images are routed to the ``vision`` tool instead, and the output is capped so
 one huge document cannot flood the agent's context window.
 """
 from __future__ import annotations
@@ -52,11 +53,16 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
         try:
             text = await extract_document_text(data, name, llm)
         except UnsupportedFileType as exc:
-            return f"Cannot extract text from '{name}': {exc}"
+            return (
+                f"Cannot extract text from '{name}': {exc} — you must NOT substitute "
+                "another document from the conversation for this one; tell the user this "
+                "file could not be read."
+            )
         if not text.strip():
             return (
                 f"'{name}' was parsed but contains no extractable text — it may be a "
-                "scanned/image-only document."
+                "scanned/image-only document — and you must NOT summarize a different "
+                "document in its place."
             )
         if len(text) > MAX_OUTPUT_CHARS:
             total = len(text)
@@ -67,8 +73,9 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
         define_tool(
             name="read_document",
             description="Extract the text content of a document the user attached to the "
-            "chat (PDF, Word .docx, Excel .xlsx/.xlsm, txt/markdown/csv/json, subtitles). "
-            "Attachments arrive as [Attached: <filename> (asset_id <id>)]. Whenever the "
+            "chat (PDF, Word .docx, Excel .xlsx/.xlsm, PowerPoint .pptx/.potx/.ppsx, "
+            "txt/markdown/csv/json, subtitles). Attachments arrive as "
+            "[Attached: <filename> (asset_id <id>)]. Whenever the "
             "user asks about the content of an attached document, you MUST call this tool "
             "with that asset_id instead of guessing or claiming the file cannot be read. "
             "For attached images and screenshots use the `vision` tool instead.",

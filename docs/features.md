@@ -35,7 +35,7 @@
 - **RAG Retrieval**: a config-driven node pipeline — query rewrite → multi-recall (vector + keyword) → RRF fusion → rerank, extensible with CJK segmentation, contextual enrichment, parent/child indexing, and domain filtering. Full feature walk-through in **RAG & Query Repository** below.
 - **Query Repository**: one search corpus for cloud-drive files (PDF tables transcribed via vision), Learning-Platform sentences/articles, and chat Q&A.
 - **Image analysis via the `vision` tool**: the agent reads an attached screenshot or a document image by `asset_id` (saved on the cloud drive) at the model's discretion — vision and RAG retrieval are both tools, so the LLM decides which to call and in what order; chat renders a retrieved image inline in the bubble — [design: §18.5](architecture.md#185-vision-routing).
-- **Attached documents become readable content** (`read_document`): attach a **PDF / Word (.docx) / Excel (.xlsx) / txt·md·csv·json / subtitle** file in chat and the agent extracts its text through the *same* ingest extractor (PyMuPDF body + vision-transcribed tables, python-docx, openpyxl) instead of apologizing about parse failure; images are routed to `vision`, the attach note names the right tool per type, legacy `.doc`/`.xls` are refused with a resave hint, and a huge document is capped with an honest truncation tail — [design: §18.6](architecture.md#186-attached-document-extraction-read_document).
+- **Attached documents become readable content** (`read_document`): attach a **PDF / Word (.docx) / Excel (.xlsx) / PowerPoint (.pptx·.potx·.ppsx with speaker notes) / txt·md·csv·json / subtitle** file in chat and the agent extracts its text through the *same* ingest extractor (PyMuPDF body + vision-transcribed tables, python-docx, openpyxl, python-pptx) instead of apologizing about parse failure; images are routed to `vision`, the attach note names the right tool per type, legacy `.doc`/`.xls`/`.ppt` are refused with a resave hint (and a refused read explicitly forbids summarizing an earlier document in its place), and a huge document is capped with an honest truncation tail — [design: §18.6](architecture.md#186-attached-document-extraction-read_document).
 - **SSE Streaming**: Real-time token streaming to the frontend.
 
 ## 🔬 Research OS (Deep Research)
@@ -71,7 +71,8 @@
 - **Import content & multiple text formats**: files get a **＋ Import to Knowledge** button and an
   "in knowledge" badge once indexed. Supported formats: plain text (`.txt` / `.md` / `.log` / `.json` /
   `.csv`), subtitles (`.srt` / `.vtt` / `.lrc` — indexed as timestamped cue-grouped chunks, so answers
-  cite `<video name> @ H:MM:SS`), Word (`.docx`), and PDF (`.pdf`). PDFs extract body text
+  cite `<video name> @ H:MM:SS`), Word (`.docx`), PowerPoint (`.pptx` / `.potx` / `.ppsx` — per-slide
+  text plus speaker notes), and PDF (`.pdf`). PDFs extract body text
   *and* detect tables, rendering each to an image the vision LLM transcribes (a failing table is skipped,
   never fatal). The Learning Platform lets you import saved sentences and write articles; chat lets you
   import a single reply (bound to its question) or organize a whole session — the LLM merges the same

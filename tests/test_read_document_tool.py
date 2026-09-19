@@ -101,6 +101,70 @@ async def test_reads_pdf(monkeypatch, tmp_path):
     assert "pdf body text" in str(res.value)
 
 
+async def test_reads_pptx_with_notes(monkeypatch, tmp_path):
+    from pptx import Presentation
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = "DCS overview slide"
+    slide.notes_slide.notes_text_frame.text = "speaker note: fieldbus protocol"
+    buf = BytesIO()
+    prs.save(buf)
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "deck.pptx", buf.getvalue())
+    res = await _call(runtime, asset_id)
+    assert res.is_error is False
+    assert "## slide 1" in str(res.value)
+    assert "DCS overview slide" in str(res.value)
+    assert "speaker note: fieldbus protocol" in str(res.value)
+
+
+def _as_alt_package(raw: bytes, alt_main: str) -> bytes:
+    """Rewrite a .pptx package's main content type (template/slideshow), as PowerPoint saves do."""
+    import zipfile
+
+    src = zipfile.ZipFile(BytesIO(raw))
+    out = BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.namelist():
+            data = src.read(item)
+            if item == "[Content_Types].xml":
+                data = data.replace(
+                    b"application/vnd.openxmlformats-officedocument.presentationml"
+                    b".presentation.main+xml",
+                    (
+                        b"application/vnd.openxmlformats-officedocument.presentationml."
+                        + alt_main.encode()
+                        + b".main+xml"
+                    ),
+                )
+            dst.writestr(item, data)
+    return out.getvalue()
+
+
+async def test_reads_potx_template(monkeypatch, tmp_path):
+    """The reported bug: a lecture .potx attach must extract, not fail and let the model
+    summarize an earlier document."""
+    from pptx import Presentation
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = "template deck title"
+    buf = BytesIO()
+    prs.save(buf)
+    potx = _as_alt_package(buf.getvalue(), "template")
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "lecture.potx", potx)
+    res = await _call(runtime, asset_id)
+    assert res.is_error is False
+    assert "template deck title" in str(res.value)
+
+
+async def test_unsupported_message_forbids_stale_substitution(monkeypatch, tmp_path):
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "legacy.ppt", b"\xd0\xcf\x11\xe0junk")
+    res = await _call(runtime, asset_id)
+    assert "Cannot extract text" in str(res.value)
+    assert "must NOT substitute" in str(res.value)
+
+
 async def test_image_routed_to_vision_hint(monkeypatch, tmp_path):
     png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
     runtime, asset_id = await _register(monkeypatch, tmp_path, "shot.png", png)

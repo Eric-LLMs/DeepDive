@@ -26,6 +26,18 @@ from core.infrastructure import media
 _SUBTITLE_EXTS = {".srt", ".vtt", ".lrc"}
 _TEXT_EXTS = {".txt", ".md", ".markdown", ".text", ".log", ".json", ".csv"}
 _EXCEL_EXTS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+_PPT_EXTS = {".pptx", ".potx", ".ppsx"}  # deck / template / slideshow — one OOXML layout
+
+# python-pptx accepts exactly one main content type; templates (.potx) and slide shows
+# (.ppsx) share the presentation XML layout but declare a different type, so the type is
+# normalized in memory before opening (see :func:`_ppt_as_presentation`).
+_PPT_CANONICAL_MAIN = (
+    b"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+)
+_PPT_ALT_MAINS = (
+    b"application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+    b"application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml",
+)
 
 # Excel read budget: the research materials path feeds the extracted grid straight into
 # the evidence pipeline, so bound the read — read_only streaming (no formula tree, no
@@ -50,7 +62,7 @@ def supported_extensions() -> set[str]:
     Single source of truth for the clients: the toolkit config endpoint surfaces these so
     the desktop picker can grey out files a generation job would refuse.
     """
-    return _TEXT_EXTS | _SUBTITLE_EXTS | _EXCEL_EXTS | {".pdf", ".docx"}
+    return _TEXT_EXTS | _SUBTITLE_EXTS | _EXCEL_EXTS | _PPT_EXTS | {".pdf", ".docx"}
 
 
 @dataclass
@@ -86,6 +98,10 @@ def extract_text(content: bytes, name: str, *, para_markers: bool = False) -> st
         return _extract_excel(content)
     if ext == ".xls":
         raise UnsupportedFileType("legacy .xls is not supported — resave as .xlsx")
+    if ext in _PPT_EXTS:
+        return _extract_ppt(content)
+    if ext == ".ppt":
+        raise UnsupportedFileType("legacy .ppt is not supported — resave as .pptx")
     text = _decode(content)
     if ext == ".vtt":
         cues = media.parse_vtt_text(text)
@@ -237,6 +253,80 @@ def _extract_excel(content: bytes) -> str:
     finally:
         wb.close()
     return "\n".join(parts)
+
+
+def _extract_ppt(content: bytes) -> str:
+    """Extract slide text (shapes, tables, speaker notes) from a .pptx / .potx / .ppsx.
+
+    One per-slide section ``## slide N`` plus a ``## slide N (notes)`` block when the
+    speaker notes carry text — lecture decks live in the notes. Charts / SmartArt are
+    flattened to their frame text only; pictures contribute nothing (visual content stays
+    the ``vision`` tool's domain). Legacy ``.ppt`` never reaches here (rejected upstream).
+    """
+    import io
+
+    from pptx import Presentation
+
+    prs = Presentation(io.BytesIO(_ppt_as_presentation(content)))
+    parts: list[str] = []
+    for i, slide in enumerate(prs.slides, 1):
+        parts.append(f"## slide {i}")
+        parts.extend(_shape_texts(slide.shapes))
+        if slide.has_notes_slide:
+            notes = slide.notes_slide.notes_text_frame.text.strip()
+            if notes:
+                parts.append(f"## slide {i} (notes)\n{notes}")
+    return "\n".join(p for p in parts if p)
+
+
+def _shape_texts(shapes) -> list[str]:
+    """Flatten a shape tree to text lines: tables row-by-row, groups recursed, text as-is."""
+    out: list[str] = []
+    for sh in shapes:
+        if getattr(sh, "has_table", False):
+            for row in sh.table.rows:
+                cells = [c.text.strip() for c in row.cells]
+                if any(cells):
+                    out.append(" | ".join(cells))
+        elif getattr(sh, "has_text_frame", False):
+            text = sh.text_frame.text.strip()
+            if text:
+                out.append(text)
+        elif hasattr(sh, "shapes"):  # group shape — walk its children
+            out.extend(_shape_texts(sh.shapes))
+    return out
+
+
+def _ppt_as_presentation(content: bytes) -> bytes:
+    """Normalize a .potx/.ppsx package to the presentation main content type in memory.
+
+    Template and slideshow packages have the same parts layout as a .pptx but declare a
+    different main content type, which python-pptx's validator rejects; swapping that one
+    string in ``[Content_Types].xml`` lets the same reader open all three. A plain .pptx
+    (or an unrecognized package) is returned untouched — python-pptx then raises its own
+    honest error.
+    """
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(content)) as src:
+        try:
+            ctypes = src.read("[Content_Types].xml")
+        except KeyError:
+            return content
+        if _PPT_CANONICAL_MAIN in ctypes:
+            return content
+        fixed = ctypes
+        for alt in _PPT_ALT_MAINS:
+            fixed = fixed.replace(alt, _PPT_CANONICAL_MAIN)
+        if fixed == ctypes or _PPT_CANONICAL_MAIN not in fixed:
+            return content
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+            for item in src.infolist():
+                data = fixed if item.filename == "[Content_Types].xml" else src.read(item.filename)
+                dst.writestr(item, data)
+    return out.getvalue()
 
 
 async def extract_document_text(
