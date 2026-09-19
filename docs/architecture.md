@@ -3183,6 +3183,39 @@ read this spreadsheet" request collapsed into a parse-failure apology. The `read
   one huge attachment cannot flood the context window — the agent can tell the user it only
   saw the first part.
 
+**Parsing doctrine — deterministic local extraction, LLM only for eyes and reading.**
+Across every document path (chat `read_document`, the ingest worker's `asset_ingest` (§10.7),
+and Research `fetch_materials` (§17)) the same division of labor holds, and it is a hard
+boundary, not an optimization:
+
+| Leg | Where it runs | What crosses the boundary |
+|---|---|---|
+| Text/grid extraction | **local Python** (PyMuPDF / python-docx / openpyxl / decoders) — zero LLM | nothing — raw file bytes never leave the server as model input |
+| PDF **tables** | vision LLM, but only after local `page.find_tables()` locates them | the table *rendered as an image* → transcribed text back |
+| Image attachments | vision LLM (`vision` tool, §18.5) | the image as a `data:` URL → analysis text back |
+| Understanding (summarize / answer) | chat model | **plain extracted text** as the tool result / chunk content |
+
+Consequences that keep the boundary honest:
+
+- **Cost is content-shaped, not size-shaped.** A table-free PDF, any `.docx`, `.xlsx`, or
+  text file is extracted with zero model calls; LLM spend appears only for pages that
+  actually contain tables (bounded concurrency, and a table whose transcription fails is
+  skipped with a warning — never fatal) or for genuinely visual input.
+- **Extraction is reproducible.** The same bytes always yield the same text — the LLM is
+  never in the extraction loop, so parsing has no flakiness and no prompt surface to
+  attack; models only ever see Python-produced plain text.
+- **One stack for all formats.** Because every path dispatches through
+  `ingest.extract_document_text`, adding a format (or tightening a cap like Excel's
+  8-sheet / 2000-row read budget) changes behavior in chat, RAG ingest, and research
+  materials simultaneously — there is no second parser to drift.
+- **Per-type routes.** PDF → local body + conditional vision tables; `.docx` → local
+  paragraphs; `.xlsx`/`.xlsm`/`.xltx`/`.xltm` → local streaming grid with caps;
+  `.txt`/`.md`/`.csv`/`.json`/`.log` → local decode; subtitles → local cue flatten; images
+  → vision; `.doc`/`.xls` → refused (resave hint); **`.pptx` → not in the extraction
+  stack** (`supported_extensions()` excludes it, so `read_document` and ingest refuse it
+  honestly) — the desktop viewer's PowerPoint *preview* is a separate, purely client-side
+  JSZip renderer and does not feed any parser.
+
 [↑ Back to top](#table-of-contents)
 
 ## 19. Workflow Core (packages/workflow)
