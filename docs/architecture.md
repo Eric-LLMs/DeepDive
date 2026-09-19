@@ -201,6 +201,7 @@ deepdive/
 │   │   ├── admin/                # admin console SPA (single-file index.html: Providers / Roles / Users / Tokens / Tools / RAG)
 │   │   ├── agent_factory.py      # shared composition root: AgentKernel + capability singletons (used by api AND worker)
 │   │   ├── deps.py               # FastAPI DI getters (vocab / task queue / agent accessor), re-exports from agent_factory
+│   │   ├── soul.md               # agent identity persona (STATIC_PREFIX source; shipped with the code)
 │   │   ├── routers/              # functional routers: drive (files/folders/trash/users/workspaces), auth, admin, rag_admin, config, vocab, chat, sessions, jobs
 │   │   ├── tools/                # gateway tools, auto-discovered by `_tool.py` modules (rag_search / translate / web_search)
 │   │   └── schemas.py            # Pydantic request/response models
@@ -241,8 +242,6 @@ deepdive/
 │   │   └── infrastructure/memory_retrieval.py  # PG tsvector + pgvector session-recall channels
 │   ├── workflow/                 # package `workflow`: generic workflow core (definition / runner / runtime / ports / leases / ledger / policy / retry / states) — domain-free control plane driven by adapters
 │   └── shared/proto/retrieval/   # generated protobuf/gRPC stubs (import name `retrieval.v1`)
-├── data/
-│   └── soul.md                   # agent identity persona (STATIC_PREFIX source)
 ├── skills/                       # version-controlled `*.skill.md` (skill catalog, lazy-loaded via the `skill` tool)
 ├── plugins/                      # version-controlled `*/plugin.py` (auto-discovered at startup; e.g. `social_search`)
 ├── migrations/                   # single canonical DB init script (applied by init_db.py; replaces Alembic)
@@ -403,7 +402,7 @@ Sections register with an `order` plus a `zone` and merge ascending within it. T
 
 | zone | content | stability |
 |---|---|---|
-| `PromptZone.STATIC_PREFIX` | SOUL.md identity (`data/soul.md`) + complete tool catalog + full skill catalog (never truncated) | byte-identical across requests → the provider reuses its prefix cache |
+| `PromptZone.STATIC_PREFIX` | SOUL.md identity (`apps/api/soul.md`) + complete tool catalog + full skill catalog (never truncated) | byte-identical across requests → the provider reuses its prefix cache |
 | `PromptZone.PROJECT_CONTEXT` | the first existing `DEEPDIVE.md` under `settings.workspace_dir` (read by `read_project_context`, capped at `settings.project_context_max_chars`) | stable per project; empty when absent |
 | `PromptZone.DYNAMIC_SUFFIX` | per-step session memory brief + any `inject()` content | re-rendered every step |
 

@@ -118,8 +118,8 @@ def get_drive_service() -> DriveService:
 
 
 def _read_soul() -> str:
-    """Load the identity persona (``data/soul.md``), falling back to a one-line persona."""
-    soul_path = settings.memory_dir.parent / "soul.md"
+    """Load the identity persona (``apps/api/soul.md``, shipped with the code)."""
+    soul_path = Path(__file__).resolve().parent / "soul.md"
     try:
         return soul_path.read_text(encoding="utf-8")
     except OSError:
