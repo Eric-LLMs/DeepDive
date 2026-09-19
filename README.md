@@ -132,24 +132,6 @@ See [docs/architecture.md §Implementation Status](docs/architecture.md#implemen
 
 Each script installs Docker if missing, starts the data + model services, ensures the Python environment, seeds the default `admin` / `pwd@Admin` account, and launches the workbench (desktop) or web UI (server).
 
-### After first launch — configure model access
-
-Sign in with the seeded account (**admin / `pwd@Admin`**), then open **Admin → Admin Console** from the bottom-left account menu to configure a model route:
-
-1. **Providers → Credentials** — Add a provider credential with its API key and base URL.
-2. **Providers → Model Catalog** — Register the models available through that credential.
-3. **Providers → Routing & Weights** — Create a route by selecting a credential and model, then configure its priority and weight.
-4. **Roles → Channels** — Bind the available provider channels to the roles that may use them (start with the `admin` role).
-
-Once configured, the bound model routes are available to the corresponding roles.
-
-> **How the model configuration works:**
-> A **Credential** provides access to a provider. A **Model** defines which model to use. A **Route** connects a credential to a model. A **Channel** exposes one or more routes to a **Role**.
-
-All LLM configuration is stored in the database and managed through the admin console.
-
-If a provider runs out of balance, affected requests will return HTTP 402. Make sure each required channel has at least one active, funded route.
-
 ### Option B — Manual local development
 
 ```bash
@@ -168,6 +150,24 @@ uvicorn apps.api.main:app --reload     # http://localhost:8300/docs
 The LiteLLM gateway routes the virtual model `deepdive-chat` to any OpenAI-compatible upstream (`LLM_UPSTREAM_BASE`). Point it at a self-hosted server (vLLM / Ollama / …) to run the whole AI stack on your own hardware, or at an external provider — no code change.
 
 Full manual steps, environment variables, and the desktop/web/admin walkthrough: [docs/getting-started.md](docs/getting-started.md) · [docs/configuration.md](docs/configuration.md).
+
+### After first launch — configure model access
+
+Sign in with the seeded account (**admin / `pwd@Admin`**), then open **Admin → Admin Console** from the bottom-left account menu to configure a model route:
+
+1. **Providers → Credentials** — Add a provider credential with its API key and base URL.
+2. **Providers → Model Catalog** — Register the models available through that credential.
+3. **Providers → Routing & Weights** — Create a route by selecting a credential and model, then configure its priority and weight.
+4. **Roles → Channels** — Bind the available provider channels to the roles that may use them (start with the `admin` role).
+
+Once configured, the bound model routes are available to the corresponding roles.
+
+> **How the model configuration works:**
+> A **Credential** provides access to a provider. A **Model** defines which model to use. A **Route** connects a credential to a model. A **Channel** exposes one or more routes to a **Role**.
+
+All LLM configuration is stored in the database and managed through the admin console.
+
+If a provider runs out of balance, affected requests will return HTTP 402. Make sure each required channel has at least one active, funded route.
 
 ---
 
