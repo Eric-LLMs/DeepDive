@@ -364,6 +364,26 @@ fragments as they arrive, `{"type": "tool", "data"}` before each tool dispatch, 
 `{"type": "done", "data": {answer, messages, usage}}`. If the generator is abandoned (client
 disconnect) the `finally` block still closes the session memory, so nothing leaks.
 
+**Turn-scoped answer resolution.** The terminal answer is resolved *inside the turn only*.
+Before stepping, the loop pins the turn's user-message entry; the fallback scan then walks the
+message list right-to-left for the newest non-empty assistant text and **stops at the pinned
+entry** — prior turns are unreachable by construction:
+
+```
+messages = [ …history… │ turn_start(user) │ asst+tool… │ asst+tool… │ … ]
+                       ▲
+        scan ends here — a turn that never produced text has no answer, full stop
+```
+
+Two design points. (1) The boundary is held as the **object identity** of that list entry, not
+an index: `_enforce_window` prunes the oldest *tool* entries from the head between steps
+(user/assistant turns are always kept), so indices drift while the anchor reference cannot.
+(2) A step-cap expiry while the model is still calling tools means no final-answer step ever
+ran — the loop then reports **"this turn ended before a final answer was produced (step budget
+exhausted); retry"** on both paths, because the honest terminal state of an unanswered turn is
+*unanswered*; silently replaying an earlier turn's text as this turn's reply is the one failure
+mode this boundary exists to foreclose.
+
 The API's `POST /chat/stream` (SSE, `EventSourceResponse`) consumes `run_stream` through the
 **same auth / quota / session / history path as `/chat`** — anonymous guest fallback and quota
 checks, session creation (`create_session`), zero-read v2 history assembly with threshold
@@ -3323,6 +3343,18 @@ read this spreadsheet" request collapsed into a parse-failure apology. The `read
   empty. The reply is capped at 20 000 chars with a `[...truncated; N chars total]` tail, so
   one huge attachment cannot flood the context window — the agent can tell the user it only
   saw the first part.
+- **Intent-scoped sourcing (persona rule)** — extraction answers *what the file says*; it does
+  not answer *what else exists out there*. The persona (`apps/api/soul.md`, a `## Attachments`
+  section) splits an attachment request by intent: **about the attachment itself** ("what does
+  this slide cover") → the extracted content is the *only* basis, no web search to fill gaps,
+  because external material would silently blend into what is presented as the document's own
+  content; **anchored on the attachment but asking for more** ("explain it and add related
+  material") → extract first, then search, and label which claims come from the attachment vs
+  from outside. Work that turns into many independent lookups is delegated to
+  `run_subagent`, whose child turn carries its own step budget (§5.2) instead of burning the
+  conversation's. The persona ships with the code — versioned, reviewable, and part of the
+  `STATIC_PREFIX` cache identity (§5.1), so changing it is a deliberate, deployed change rather
+  than drift in an untracked runtime file.
 
 **Parsing doctrine — deterministic local extraction, LLM only for eyes and reading.**
 Across every document path (chat `read_document`, the ingest worker's `asset_ingest` (§10.7),
