@@ -53,6 +53,28 @@ class _FakeMemory:
         self.closed = True
 
 
+async def test_step_cap_exhausted_never_replays_history_answer():
+    """Regression (2026-09-19 chat bug): a turn that burns the whole step budget on
+    tool calls with no final text must NOT fall back to a previous turn's answer from
+    ``history`` — the old ``_final`` scanned through history and replayed the stale
+    image description as this turn's reply.
+    """
+    runtime = ToolRuntime()
+    runtime.register(_echo_tool())
+    llm = FakeLLM([tool_call(f"c{i}", "echo", {"x": i}) for i in range(3)])
+    agent = ReactLoopAgent(llm, runtime, SystemPrompt(), max_steps=3)
+    history = [
+        {"role": "user", "content": "what did that image say?"},
+        {"role": "assistant", "content": "STALE PREVIOUS-TURN ANSWER"},
+    ]
+
+    result = await agent.run("and the attached potx?", history=history)
+
+    assert len(llm.calls) == 3  # every step spent on a tool call, never a final answer
+    assert "STALE PREVIOUS-TURN ANSWER" not in result.final_answer
+    assert "step budget" in result.final_answer
+
+
 async def test_tool_call_then_final_answer_and_close():
     runtime = ToolRuntime()
     runtime.register(_echo_tool())

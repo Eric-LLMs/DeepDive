@@ -215,6 +215,7 @@ class ReactLoopAgent:
 
         await self.events.serial("agent/session-start", {"user_msg": turn.user_msg})
         messages = (turn.history or []) + [{"role": "user", "content": turn.user_msg}]
+        turn_start = messages[-1]  # this-turn boundary for the final-answer fallback
         self._log(
             turn, "session-start", user_msg=turn.user_msg, snapshot_key=self._snapshot_key(),
             context_profile=self._context_profile(system, messages),
@@ -296,10 +297,17 @@ class ReactLoopAgent:
                     }
                 )
 
-        final_answer = self._final(messages) if error is None else (
+        final_answer = self._final(messages, after=turn_start) if error is None else (
             "I ran into a model error and couldn't answer this turn. "
             f"({error})"
         )
+        if error is None and not final_answer:
+            # Step budget exhausted (or empty final content): never replay history.
+            final_answer = (
+                "This turn ended before a final answer was produced "
+                "(the model kept calling tools until the step budget ran out). "
+                "Please retry."
+            )
         return AgentResult(
             messages=messages,
             final_answer=final_answer,
@@ -349,6 +357,7 @@ class ReactLoopAgent:
 
         await self.events.serial("agent/session-start", {"user_msg": turn.user_msg})
         messages = (turn.history or []) + [{"role": "user", "content": turn.user_msg}]
+        turn_start = messages[-1]  # this-turn boundary for the final-answer fallback
         self._log(
             turn, "session-start", user_msg=turn.user_msg, snapshot_key=self._snapshot_key(),
             context_profile=self._context_profile(system, messages),
@@ -462,10 +471,17 @@ class ReactLoopAgent:
                     }
                 )
 
-        answer = self._final(messages) if error is None else (
+        answer = self._final(messages, after=turn_start) if error is None else (
             "I ran into a model error and couldn't answer this turn. "
             f"({error})"
         )
+        if error is None and not answer:
+            # Step budget exhausted (or empty final content): never replay history.
+            answer = (
+                "This turn ended before a final answer was produced "
+                "(the model kept calling tools until the step budget ran out). "
+                "Please retry."
+            )
         yield {
             "type": "done",
             "data": {
@@ -782,8 +798,18 @@ class ReactLoopAgent:
         return json.dumps(result.value, ensure_ascii=False, default=str)
 
     @staticmethod
-    def _final(messages: list[dict]) -> str:
+    def _final(messages: list[dict], *, after: dict | None = None) -> str:
+        """Last non-empty assistant text in ``messages``.
+
+        ``after`` is the current turn's user-message entry: the scan stops at it so the
+        fallback can never read *back into history* — a step-cap exit with no this-turn
+        text would otherwise replay the previous turn's answer as this turn's. Identity
+        (not index) is the boundary because ``_enforce_window`` may prune history from
+        the front.
+        """
         for m in reversed(messages):
+            if m is after:
+                break
             if m["role"] == "assistant" and m.get("content"):
                 return m["content"]
         return ""

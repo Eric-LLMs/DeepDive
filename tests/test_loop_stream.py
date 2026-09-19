@@ -162,6 +162,30 @@ async def test_stream_tool_call_then_final_answer():
     assert memory.closed
 
 
+async def test_stream_step_cap_exhausted_never_replays_history_answer():
+    """Streaming twin of the 2026-09-19 regression: step-cap exit with no final text
+    must not scan back through ``history`` into the previous turn's answer.
+    """
+    runtime = ToolRuntime()
+    runtime.register(_echo_tool())
+    llm = FakeLLM([tool_call(f"c{i}", "echo", {"x": i}) for i in range(3)])
+    agent = ReactLoopAgent(llm, runtime, SystemPrompt(), max_steps=3)
+    history = [
+        {"role": "user", "content": "what did that image say?"},
+        {"role": "assistant", "content": "STALE PREVIOUS-TURN ANSWER"},
+    ]
+    memory = _FakeMemory()
+
+    events = []
+    async for evt in agent.run_stream("and the attached potx?", history, session_memory=memory):
+        events.append(evt)
+
+    done = [e for e in events if e["type"] == "done"]
+    assert done
+    assert "STALE PREVIOUS-TURN ANSWER" not in done[-1]["data"]["answer"]
+    assert "step budget" in done[-1]["data"]["answer"]
+
+
 async def test_stream_done_messages_include_tool_round():
     """The done event's message list must reflect the tool round (echo → result → answer)."""
     runtime = ToolRuntime()
