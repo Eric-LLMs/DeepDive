@@ -1492,10 +1492,8 @@
           {
             id: "vision",
             title: "Vision (image recognition)",
-            desc: "Backing model for the agent's vision tool — pick a catalog model registered under Model Catalog. Empty falls back to the default model.",
-            fields: [
-              { key: "model", label: "Model (catalog display name or provider id)", ph: "e.g. qwen-vl-max / gpt-4o" },
-            ],
+            desc: "No global model pin: the vision tool and ingest captioning pick from each role's authorized channels (Model Catalog + role bindings), vision-marked names tried first, the rest of the role's models as a fallback. Grant image-capable channels to a role on its Channels page.",
+            fields: [],
           },
           {
             id: "amap",

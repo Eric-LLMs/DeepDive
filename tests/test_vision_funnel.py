@@ -1,12 +1,14 @@
-"""Vision routing inside the unified permission funnel (vision_caption.py).
+"""Vision routing tests (core.infrastructure.vision_caption).
 
-Doctrine: image models go through the same role-authorization gates as chat models —
-no unbound/global key is ever reachable. Selection prefers ``vision``-named catalog
-entries, then gambles the remaining authorized models in order (a model that cannot see
-images fails at call time and the chain moves on); total failure raises
-``VisionUnsupported``, an empty/invalid authorization raises ``VisionNotAuthorized``.
-The DB layer is exercised through pure seams (``rank_vision_entries``) and a stubbed
-resolver for ``describe_image`` — same no-live-DB style as ``test_security_regression``.
+Doctrine under test: the model source is ONLY the caller's role-authorized database
+list — vision-marked names (vision / multimodal / 4o / vl) tried first, the rest of the
+authorized list as a capability gamble, all-fail → VisionUnsupported ("image processing
+is not supported"). A logged-in role without models is downgraded onto the anonymous
+tier with the user's guest/free allowance consumed through the existing authorize_usage
+path (over the allowance → explicit refusal); true guests meter at the chat entry, not
+again inside vision. No global/config key is consulted anywhere. The DB layer is
+exercised through pure seams (``rank_vision_entries``) and stubbed
+``_authorized_pairs`` / resolver.
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 from core.infrastructure import vision_caption as vc
+from fastapi import HTTPException
 
 
 def _cred(name: str) -> SimpleNamespace:
@@ -24,41 +27,141 @@ def _model(name: str, provider: str = "") -> SimpleNamespace:
     return SimpleNamespace(name=name, provider_model_name=provider)
 
 
+class _Session:
+    """Async-context-manager stub; every DB accessor is monkeypatched in these tests."""
+
+    def __init__(self, user=None):
+        self._user = user
+
+    async def get(self, _model_cls, _uid):
+        return self._user
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
 # ── rank_vision_entries: pure ordering over already-authorized pairs ────────
 
 
-def test_configured_model_must_be_authorized_and_matches_exactly():
-    pairs = [(_cred("c1"), _model("DeepDive_Chat", "deepseek-v4")),
-             (_cred("c2"), _model("DeepDive_IMG", "vision-x"))]
-    hits = vc.rank_vision_entries(pairs, configured="deepdive_img", role_id="admin")
-    assert hits == [(pairs[1][0], pairs[1][1])]  # case-insensitive, name or provider id
-
-
-def test_configured_model_not_in_authorized_set_is_refused():
-    pairs = [(_cred("c1"), _model("Only_Chat"))]
-    with pytest.raises(vc.VisionNotAuthorized) as exc:
-        vc.rank_vision_entries(pairs, configured="DeepDive_IMG", role_id="guest")
-    assert "not served by any channel" in str(exc.value)
-
-
-def test_vision_named_entries_float_to_front():
+def test_vision_markers_float_to_front():
     a = (_cred("c1"), _model("Alpha"))
     v = (_cred("c2"), _model("VisionPro"))
-    p = (_cred("c3"), _model("Plain", "gemini-vision-lite"))
-    ranked = vc.rank_vision_entries([a, v, p], configured="", role_id="admin")
-    assert ranked[:2] == [v, p]  # both vision-marked (display name or provider id) first
-    assert ranked[2] == a  # the rest kept as a capability gamble
+    m = (_cred("c3"), _model("GPT", "gpt-4o-mini"))
+    q = (_cred("c4"), _model("Qwen-VL", "qwen-vl-max"))
+    d = (_cred("c5"), _model("豆包", "doubao-多模态"))
+    ranked = vc.rank_vision_entries([a, v, m, q, d])
+    assert ranked[4] == a  # the unmarked plain model sank to the gamble tail
+    assert {p[1].name for p in ranked[:4]} == {"VisionPro", "GPT", "Qwen-VL", "豆包"}
+    assert ranked[:4] == [v, m, q, d]  # relative priority order among marked ones kept
 
 
-def test_no_vision_named_still_gambles_all_authorized():
+def test_no_marked_model_gambles_whole_list_in_order():
     a = (_cred("c1"), _model("Alpha"))
     b = (_cred("c2"), _model("Beta"))
-    assert vc.rank_vision_entries([a, b], configured="", role_id="admin") == [a, b]
+    assert vc.rank_vision_entries([a, b]) == [a, b]
 
 
-def test_empty_authorized_set_is_not_authorized():
-    with pytest.raises(vc.VisionNotAuthorized):
-        vc.rank_vision_entries([], configured="", role_id="ghost")
+# ── resolve_vision_channels: who may be served, from which list ─────────────
+
+
+async def test_guest_resolves_through_the_anonymous_role(monkeypatch):
+    seen: list[str] = []
+    pairs = [(_cred("c1"), _model("Chat")), (_cred("c2"), _model("AnyVision"))]
+
+    async def fake(session_factory, *, role_id, user_id):
+        seen.append(role_id)
+        return pairs
+
+    monkeypatch.setattr(vc, "_authorized_pairs", fake)
+    chain = await vc.resolve_vision_channels(None)
+    assert seen == [vc.ANONYMOUS_ROLE]
+    assert chain == [("https://c2/v1", "key-c2", "AnyVision"), ("https://c1/v1", "key-c1", "Chat")]
+
+
+async def test_modelless_role_downgrades_and_consumes_guest_allowance(monkeypatch):
+    seen_roles: list[str] = []
+    metered: list[tuple] = []
+    anon_pairs = [(_cred("c1"), _model("GuestChat")), (_cred("c2"), _model("GuestVision"))]
+
+    async def fake_pairs(session_factory, *, role_id, user_id):
+        seen_roles.append(role_id)
+        return anon_pairs if role_id == vc.ANONYMOUS_ROLE else []
+
+    async def fake_get_role(session, role_id):
+        return SimpleNamespace(role_id=role_id)
+
+    async def fake_authorize(session, user_id, role, requests=1, tokens=0):
+        metered.append((user_id, role.role_id))
+        return "free"
+
+    monkeypatch.setattr(vc, "_authorized_pairs", fake_pairs)
+    monkeypatch.setattr(vc, "get_role", fake_get_role)
+    monkeypatch.setattr(vc, "authorize_usage", fake_authorize)
+    chain = await vc.resolve_vision_channels(lambda: _Session(), role_id="vip", user_id="u-9")
+    assert seen_roles == ["vip", vc.ANONYMOUS_ROLE]
+    assert metered == [("u-9", vc.ANONYMOUS_ROLE)]  # guest allowance, same counter path
+    assert [m for _, _, m in chain] == ["GuestVision", "GuestChat"]
+
+
+async def test_downgrade_over_guest_allowance_is_refused_explicitly(monkeypatch):
+    async def fake_pairs(session_factory, *, role_id, user_id):
+        return []
+
+    async def fake_get_role(session, role_id):
+        return SimpleNamespace(role_id=role_id)
+
+    async def fake_authorize(session, user_id, role, requests=1, tokens=0):
+        raise HTTPException(status_code=402, detail="quota")
+
+    monkeypatch.setattr(vc, "_authorized_pairs", fake_pairs)
+    monkeypatch.setattr(vc, "get_role", fake_get_role)
+    monkeypatch.setattr(vc, "authorize_usage", fake_authorize)
+    with pytest.raises(vc.VisionNotAuthorized) as exc:
+        await vc.resolve_vision_channels(lambda: _Session(), role_id="vip", user_id="u-9")
+    assert "free trial allowance exhausted" in str(exc.value)
+
+
+async def test_true_guest_is_not_metered_inside_vision(monkeypatch):
+    async def no_meter(*a, **k):  # guests were already metered at the chat entry
+        raise AssertionError("authorize_usage must not run for a true guest")
+
+    async def fake_pairs(session_factory, *, role_id, user_id):
+        return [(_cred("c1"), _model("AnyVision"))]
+
+    monkeypatch.setattr(vc, "_authorized_pairs", fake_pairs)
+    monkeypatch.setattr(vc, "authorize_usage", no_meter)
+    chain = await vc.resolve_vision_channels(None)
+    assert chain == [("https://c1/v1", "key-c1", "AnyVision")]
+
+
+async def test_user_identity_resolves_its_own_role(monkeypatch):
+    seen: list[tuple] = []
+    pairs = [(_cred("c1"), _model("XVision"))]
+
+    async def fake(session_factory, *, role_id, user_id):
+        seen.append((role_id, user_id))
+        return pairs
+
+    monkeypatch.setattr(vc, "_authorized_pairs", fake)
+    user = SimpleNamespace(is_active=True, role_id="regular")
+    chain = await vc.resolve_vision_channels(lambda: _Session(user=user), user_id="u-2")
+    assert seen == [("regular", "u-2")]
+    assert chain == [("https://c1/v1", "key-c1", "XVision")]
+
+
+async def test_chain_dedupes_identical_routes(monkeypatch):
+    same_cred = _cred("c1")
+    pairs = [(same_cred, _model("A", "dup")), (same_cred, _model("B", "dup"))]
+
+    async def fake(session_factory, *, role_id, user_id):
+        return pairs
+
+    monkeypatch.setattr(vc, "_authorized_pairs", fake)
+    chain = await vc.resolve_vision_channels(None, role_id="regular")
+    assert chain == [("https://c1/v1", "key-c1", "dup")]  # provider id wins, tried once
 
 
 # ── describe_image: walk the chain, first real answer wins ──────────────────
@@ -80,10 +183,11 @@ class _LLM:
 async def _stub_chain(monkeypatch, chain):
     async def fake(session_factory, *, user_id=None, role_id=None):
         return chain
+
     monkeypatch.setattr(vc, "resolve_vision_channels", fake)
 
 
-async def test_describe_image_tries_vision_first_then_gambles(monkeypatch):
+async def test_describe_image_tries_marked_first_then_gambles(monkeypatch):
     chain = [("https://v/v1", "kv", "vision-x"), ("https://t/v1", "kt", "text-y")]
     await _stub_chain(monkeypatch, chain)
     llm = _LLM([RuntimeError("402 Insufficient Balance"), "a red square"])
@@ -107,12 +211,3 @@ async def test_describe_image_all_fail_raises_unsupported(monkeypatch):
     with pytest.raises(vc.VisionUnsupported) as exc:
         await vc.describe_image(b"x", "", llm=llm, session_factory=None, user_id="u")
     assert "boom1" in str(exc.value) and "boom2" in str(exc.value)
-
-
-# ── identity fail-fast: no anonymous resolution, no unbound-key fallback ────
-
-
-async def test_resolve_without_identity_is_refused():
-    with pytest.raises(vc.VisionNotAuthorized) as exc:
-        await vc.resolve_vision_channels(None)
-    assert "no user identity" in str(exc.value)

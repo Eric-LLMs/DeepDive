@@ -1,19 +1,19 @@
-"""``vision``: read a drive image asset with the configured vision model.
+"""``vision``: read a drive image asset with the user's authorized models.
 
-The agent's main model is text-only (DeepSeek), so it cannot see the screenshots and
-images users attach to the chat — it only sees the ``[Attached: name (asset_id)]`` note.
-This tool resolves the image bytes from the cloud drive, sends them to the vision model
-configured in the admin console's Model Catalog, and returns the model's analysis so the
-agent can discuss the visual content.
+The agent's main model may be text-only, so it cannot see the screenshots and images
+users attach to the chat — it only sees the ``[Attached: name (asset_id)]`` note. This
+tool resolves the image bytes from the cloud drive, sends them to the vision-capable
+models the requesting user's role is authorized for, and returns the first real analysis
+so the agent can discuss the visual content.
 
-The vision model's serving channel is resolved inside the unified permission funnel
-(``core.infrastructure.vision_caption.resolve_vision_channels``): only channels bound to the
-requesting user's role are eligible — never an unbound/global key. ``tools.vision.model`` in
-the admin Tools config pins the catalog entry when set; otherwise the authorized models are
-tried in order, ``vision``-named first, remaining ones as a capability gamble. The resolution
-and the one-shot ``describe_image`` call live in ``core.infrastructure.vision_caption`` so
-the RAG ingest worker (image captioning at index time) can reuse them without importing
-this module.
+Channel selection follows the unified permission funnel
+(``core.infrastructure.vision_caption.resolve_vision_channels``): the candidate list is
+exclusively the role's database-authorized models — vision-marked names tried first, the
+rest as a capability gamble; guests use the anonymous tier under its existing daily
+quota; a model-less role downgrades onto that tier and is refused honestly once the
+free allowance runs out. The resolution and the ``describe_image`` trial chain live in
+``core.infrastructure.vision_caption`` so the RAG ingest worker (image captioning at
+index time) can reuse them without importing this module.
 """
 from __future__ import annotations
 
