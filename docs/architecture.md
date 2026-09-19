@@ -3170,6 +3170,71 @@ The worker's `asset_ingest` job extracts embedded images alongside the text:
    (§10.8); when the model needs the visual content it calls the `vision` tool with an image
    `asset_id` (§18.5). No retrieval-side change.
 
+```mermaid
+flowchart TD
+    A[document bytes] --> S["scan_embedded_images<br/>PDF: page xrefs · DOCX: blip rids<br/>PPTX: picture shapes → slide no."]
+    S -->|anchor → images| SV["save_images<br/>RAG 图片/doc/ · dedup source+sha256"]
+    SV -->|anchor → asset_ids| SM["on_split state machine<br/>strip [[PAGE/PARA:n]]<br/>meta.pages|paras + image_ids"]
+    A --> EX["extract_text(page_markers=True)<br/>PDF pages / PPT slides → [[PAGE:n]]<br/>DOCX paragraphs → [[PARA:n]]"]
+    EX --> SM
+    SM --> CH[(text leaf chunks)]
+    SV -->|unique bytes| CP["caption_chunks<br/>vision LLM ×1 per image · sem(4)<br/>failure/empty → skip"]
+    CP --> CC[(image_caption chunks)]
+    CH --> EMB[_embed_and_index<br/>leaves embed + insert]
+    CC --> EMB
+    EMB --> HIT["rag_search hit<br/>text + meta.image_ids"]
+    HIT --> V["vision tool(asset_id)<br/>pixels read on demand"]
+```
+
+**Design decisions**
+
+- **Slides ride the page axis.** A deck has no pages, but it has a strictly ordered per-frame
+  anchor (the slide number) that plays the same role. `_extract_ppt` therefore emits
+  `[[PAGE:n]]` (one per slide) instead of introducing a third marker kind: the `tasks.py`
+  annotator, the `meta["pages"]` vocabulary, and every retrieval-side consumer stay
+  untouched, and a cross-slide chunk behaves exactly like a cross-page one. The only
+  deck-specific surface is the human wording inside caption chunks (`anchor_label`).
+- **Reference into the chunk, not pixels into the vector.** Of the two candidate designs for
+  image search — (A) embed the image itself into a multimodal vector space, or (B) turn the
+  image into a text caption and embed that — this pipeline implements **B**. A:
+  requires a second embedding model, a separate vector column, and re-embedding of the whole
+  corpus to change vision models. B: reuses the entire existing vector/keyword stack
+  unchanged (caption chunks are ordinary leaves), keeps one recall path, and preserves full
+  fidelity because the chunk still points at the original asset (`meta.image_id`) which the
+  agent can open losslessly with the `vision` tool. The trade-off — a caption is a lossy
+  summary of the pixels — is exactly why the asset reference is kept alongside rather than
+  instead of.
+- **Caption once per unique bytes, anchored everywhere.** `caption_chunks` dedupes on the
+  image-bytes sha256 (the same key `save_images` uses for asset dedup), so a logo repeated
+  across 30 slides costs one vision call and yields one chunk carrying every anchor it
+  appears on. Caption output is deliberately deterministic per bytes: re-ingesting an
+  unchanged document reproduces identical caption text.
+- **Enrichment must never fail the ingest.** Each vision call is wrapped individually:
+  timeout / channel error / empty response logs a warning and drops only that image's chunk —
+  mirroring the PDF table-transcription doctrine (§10.7). If no vision model is configured,
+  `resolve_vision_channel` raises once, every caption is skipped, and the document still
+  indexes as pure text with image references intact.
+- **The flag defaults on, including for stored configs.** `from_dict` reads
+  `image_captions` with a `True` fallback, so pipeline configs persisted before this feature
+  exist activate captioning on the next re-index; operators opt out per-config in the admin
+  RAG page. Captioning only ever runs on the image-bearing ingest path — documents with no
+  embedded rasters make zero vision calls regardless of the flag.
+- **Shared vision plumbing, no tool-module coupling.** Channel resolution and the single-call
+  `describe_image` live in `core.infrastructure/vision_caption.py`; the `vision` tool and the
+  worker both consume them. The worker deliberately does not import `apps.api.tools.*` for
+  this (tool registration is an API composition-root side effect), and core stays free of any
+  apps/ import — the dependency direction is unchanged (§3 layering).
+
+**Code map** — `packages/core/infrastructure/ingest.py` (`_extract_ppt` markers,
+`_ppt_as_presentation`, `Chunk`); `apps/worker/rag_images.py` (`scan_embedded_images` /
+`save_images` / `caption_chunks`); `apps/worker/tasks.py` (`asset_ingest`: marker regexes,
+`on_split` state machine, caption hook-in between `build_chunks` and `_embed_and_index`);
+`packages/rag/pipeline/pipeline_config.py` (`image_captions` flag);
+`packages/core/infrastructure/vision_caption.py` (`resolve_vision_channel` /
+`describe_image`); consumers: `apps/api/tools/vision_tool.py`, PDF table transcription in
+`ingest.py`. Tests: `tests/test_rag_images.py` (scan anchors, template normalization, marker
+roundtrip, caption dedup/skip, config default).
+
 ### 18.4 Derived-image lifecycle (delete / trash / purge / restore)
 
 The service mirrors the FK cascade for every soft path (`drive_service.py`):
@@ -3266,6 +3331,9 @@ Consequences that keep the boundary honest:
   `.txt`/`.md`/`.csv`/`.json`/`.log` → local decode; subtitles → local cue flatten; images
   → vision; `.doc`/`.xls`/`.ppt` → refused (resave hint) — the desktop viewer's Office
   *previews* are separate, purely client-side JS renderers and do not feed any parser.
+  Text extraction is only the *reading* half: the RAG ingest additionally runs a separate
+  embedded-image pass over PDF/DOCX/PPTX packages (scan → drive assets → anchor tags →
+  caption chunks) — text and images never share a code path, they share an anchor axis (§18.3).
 
 [↑ Back to top](#table-of-contents)
 

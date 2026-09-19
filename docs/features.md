@@ -72,7 +72,7 @@
   "in knowledge" badge once indexed. Supported formats: plain text (`.txt` / `.md` / `.log` / `.json` /
   `.csv`), subtitles (`.srt` / `.vtt` / `.lrc` — indexed as timestamped cue-grouped chunks, so answers
   cite `<video name> @ H:MM:SS`), Word (`.docx`), PowerPoint (`.pptx` / `.potx` / `.ppsx` — per-slide
-  text plus speaker notes), and PDF (`.pdf`). PDFs extract body text
+  text plus speaker notes, embedded pictures extracted with slide-number anchors), and PDF (`.pdf`). PDFs extract body text
   *and* detect tables, rendering each to an image the vision LLM transcribes (a failing table is skipped,
   never fatal). The Learning Platform lets you import saved sentences and write articles; chat lets you
   import a single reply (bound to its question) or organize a whole session — the LLM merges the same
