@@ -37,6 +37,7 @@ class RagPipelineConfig:
     contextual: bool = False     # P1: LLM context prefixes per chunk (Anthropic-style)
     parent_child: bool = False   # P1: parent/leaf hierarchy (small-to-big)
     cjk: bool = False            # P2: jieba CJK keyword channel
+    image_captions: bool = True  # vision-LLM caption per embedded image → searchable leaf chunk
 
     @property
     def enabled_nodes(self) -> list[NodeConfig]:
@@ -78,6 +79,7 @@ class RagPipelineConfig:
             "contextual": self.contextual,
             "parent_child": self.parent_child,
             "cjk": self.cjk,
+            "image_captions": self.image_captions,
         }
 
     @classmethod
@@ -102,4 +104,5 @@ class RagPipelineConfig:
             contextual=bool(raw.get("contextual", False)),
             parent_child=bool(raw.get("parent_child", False)),
             cjk=bool(raw.get("cjk", False)),
+            image_captions=bool(raw.get("image_captions", True)),
         )

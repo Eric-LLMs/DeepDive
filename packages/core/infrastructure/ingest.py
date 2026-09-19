@@ -99,7 +99,7 @@ def extract_text(content: bytes, name: str, *, para_markers: bool = False) -> st
     if ext == ".xls":
         raise UnsupportedFileType("legacy .xls is not supported — resave as .xlsx")
     if ext in _PPT_EXTS:
-        return _extract_ppt(content)
+        return _extract_ppt(content, page_markers=para_markers)
     if ext == ".ppt":
         raise UnsupportedFileType("legacy .ppt is not supported — resave as .pptx")
     text = _decode(content)
@@ -255,13 +255,17 @@ def _extract_excel(content: bytes) -> str:
     return "\n".join(parts)
 
 
-def _extract_ppt(content: bytes) -> str:
+def _extract_ppt(content: bytes, *, page_markers: bool = False) -> str:
     """Extract slide text (shapes, tables, speaker notes) from a .pptx / .potx / .ppsx.
 
     One per-slide section ``## slide N`` plus a ``## slide N (notes)`` block when the
     speaker notes carry text — lecture decks live in the notes. Charts / SmartArt are
     flattened to their frame text only; pictures contribute nothing (visual content stays
     the ``vision`` tool's domain). Legacy ``.ppt`` never reaches here (rejected upstream).
+
+    ``page_markers`` prepends a ``[[PAGE:n]]`` sentinel (1-based slide number) per slide —
+    decks ride the **page** anchor axis of the RAG image pipeline (§18.3), so slide-embedded
+    images annotate the chunks that cover their slide.
     """
     import io
 
@@ -270,6 +274,8 @@ def _extract_ppt(content: bytes) -> str:
     prs = Presentation(io.BytesIO(_ppt_as_presentation(content)))
     parts: list[str] = []
     for i, slide in enumerate(prs.slides, 1):
+        if page_markers:
+            parts.append(f"[[PAGE:{i}]]")
         parts.append(f"## slide {i}")
         parts.extend(_shape_texts(slide.shapes))
         if slide.has_notes_slide:

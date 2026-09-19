@@ -6,9 +6,10 @@ chunks that discuss them. This module does the "save + reference" half:
 
 - ``scan_embedded_images`` walks the document and returns, per anchor, the images embedded
   there. Anchors are 1-based page numbers for PDF (via PyMuPDF ``get_images`` /
-  ``extract_image``) and paragraph indexes for DOCX (via the ``a:blip r:embed`` drawing
-  anchors). DOCX has no native pages, so paragraph anchoring is the closest equivalent to
-  "the image that travels with this chunk".
+  ``extract_image``) and for PPTX decks (1-based slide numbers via python-pptx picture
+  shapes, riding the same ``[[PAGE:n]]`` axis), and paragraph indexes for DOCX (via the
+  ``a:blip r:embed`` drawing anchors). DOCX has no native pages, so paragraph anchoring is
+  the closest equivalent to "the image that travels with this chunk".
 - ``save_images`` persists each image with :meth:`DriveService.save_artifact` into a
   dedicated ``RAG 图片/<doc>`` folder, records ``source_asset_id`` (the PDF/DOCX asset) on
   the image asset, and dedupes by ``(source_asset_id, content-hash)`` so re-ingesting the
@@ -23,7 +24,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import re
+
+log = logging.getLogger(__name__)
 
 _RASTER_EXTS = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
 _EXT_MIME = {
@@ -125,13 +129,63 @@ def _scan_docx(data: bytes) -> dict[int, list[dict]]:
     return out
 
 
+def _scan_pptx(data: bytes) -> dict[int, list[dict]]:
+    """Map 1-based slide number → raster pictures placed on that slide.
+
+    Slides ride the same ``[[PAGE:n]]`` anchor axis as PDF (``_extract_ppt`` emits one
+    ``[[PAGE:i]]`` per slide), so the chunk annotation state machine in ``tasks.py``
+    needs no new axis. Group shapes are recursed; the package is first normalized via
+    :func:`_ppt_as_presentation` so .potx/.ppsx scan like .pptx.
+    """
+    import io as _io
+
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    from core.infrastructure.ingest import _ppt_as_presentation
+
+    prs = Presentation(_io.BytesIO(_ppt_as_presentation(data)))
+    out: dict[int, list[dict]] = {}
+
+    def walk(shapes, slide_no: int, bucket: list[dict]) -> None:
+        for idx, sh in enumerate(shapes):
+            if sh.shape_type == MSO_SHAPE_TYPE.GROUP:
+                walk(sh.shapes, slide_no, bucket)
+                continue
+            if sh.shape_type != MSO_SHAPE_TYPE.PICTURE:
+                continue
+            try:
+                image = sh.image
+            except Exception:
+                continue
+            ext = (image.ext or "").lower()
+            if ext not in _RASTER_EXTS:
+                continue
+            bucket.append(
+                {
+                    "name": f"slide{slide_no}_{idx + 1}.{ext}",
+                    "mime": image.content_type or _EXT_MIME.get(ext, "image/png"),
+                    "data": image.blob,
+                }
+            )
+
+    for sno, slide in enumerate(prs.slides, start=1):
+        bucket: list[dict] = []
+        walk(slide.shapes, sno, bucket)
+        if bucket:
+            out[sno] = bucket
+    return out
+
+
 def scan_embedded_images(data: bytes, name: str) -> dict[int, list[dict]]:
-    """Return anchor → images for a PDF/DOCX, or ``{}`` for formats with no image pass."""
+    """Return anchor → images for a PDF/DOCX/PPTX, or ``{}`` for formats with no image pass."""
     ext = (name or "").rsplit(".", 1)[-1].lower()
     if ext == "pdf":
         return _scan_pdf(data)
     if ext == "docx":
         return _scan_docx(data)
+    if ext in {"pptx", "potx", "ppsx"}:
+        return _scan_pptx(data)
     return {}
 
 
@@ -172,3 +226,87 @@ async def save_images(
             ids.append(str(asset.id))
         out[key] = ids
     return out
+
+
+async def caption_chunks(
+    scans: dict[int, list[dict]],
+    image_ids: dict[int, list[str]],
+    doc_title: str,
+    *,
+    llm,
+    session_factory,
+    axis_key: str,
+    anchor_label: str,
+    max_concurrency: int = 4,
+) -> list:
+    """Vision-LLM caption every unique scanned image → searchable leaf chunks.
+
+    The caption turns pixels into text so the image's subject matter is recallable by the
+    standard vector/keyword pipeline — the retrieval hit still carries ``image_id``, so the
+    agent can open the original with the ``vision`` tool. Rules:
+
+    - one caption per unique image bytes (same picture on several anchors is described
+      once, riding all its anchors);
+    - per-image failure logs a warning and skips — captioning must never fail the ingest;
+    - ``axis_key`` is the meta key the text chunks use (``pages`` / ``paras``) so caption
+      and text share one anchor vocabulary; ``anchor_label`` is the human wording inside
+      the caption body (``page`` / ``paragraph`` / ``slide``).
+    """
+    import asyncio
+
+    from core.infrastructure.ingest import Chunk
+    from core.infrastructure.vision_caption import describe_image
+
+    # digest → {img, anchors, asset_ids}: dedupe by bytes, collect every anchor.
+    jobs: dict[str, dict] = {}
+    for anchor, images in scans.items():
+        ids = image_ids.get(anchor, [])
+        for pos, img in enumerate(images):
+            if pos >= len(ids):
+                continue
+            digest = hashlib.sha256(img["data"]).hexdigest()
+            job = jobs.get(digest)
+            if job is None:
+                jobs[digest] = {
+                    "img": img,
+                    "anchors": [anchor],
+                    "asset_ids": [ids[pos]],
+                }
+            else:
+                if anchor not in job["anchors"]:
+                    job["anchors"].append(anchor)
+                if ids[pos] not in job["asset_ids"]:
+                    job["asset_ids"].append(ids[pos])
+
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def one(job: dict) -> object | None:
+        anchors = sorted(job["anchors"])
+        where = ", ".join(f"{anchor_label} {a}" for a in anchors)
+        try:
+            async with sem:
+                caption = (
+                    await describe_image(
+                        job["img"]["data"],
+                        job["img"]["mime"],
+                        llm=llm,
+                        session_factory=session_factory,
+                    )
+                ).strip()
+        except Exception as exc:  # noqa: BLE001 — enrichment must never fail the ingest
+            log.warning("image caption failed for %s (%s): %s", doc_title, where, exc)
+            return None
+        if not caption:
+            return None
+        return Chunk(
+            content_en=f"Figure in {doc_title} — {where}: {caption}",
+            meta={
+                "kind": "image_caption",
+                "image_id": job["asset_ids"][0],
+                "image_ids": list(job["asset_ids"]),
+                axis_key: anchors,
+            },
+        )
+
+    results = await asyncio.gather(*(one(job) for job in jobs.values()))
+    return [c for c in results if c is not None]

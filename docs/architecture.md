@@ -1292,15 +1292,16 @@ locally to delimited rows. Everything then flows into the strategies below.
   `chunks.content_search` and matched with `to_tsvector('simple', content_search) @@
   plainto_tsquery('simple', <segmented query>)` (GIN-indexed). English queries keep the original
   `english` FTS path unchanged.
-- **Embedded images** — for PDF/DOCX the ingest extracts embedded raster images into the Cloud
+- **Embedded images** — for PDF/DOCX/PPTX the ingest extracts embedded raster images into the Cloud
   Drive (`RAG 图片/<doc>/`, `assets.source_asset_id`), threads page/paragraph markers through
   extraction, and a page/para state machine annotates each chunk's `meta` with the pages it
   spans plus the deduped **union** of the images on those pages (`image_ids`) — the agent reads
-  them with the `vision` tool on retrieval. Details in [§18.3](#183-rag-document-image-pipeline-extraction--meta-annotation).
-  **PPTX is a text-only ingest for now**: `scan_embedded_images` walks PDF pages and DOCX
-  relationship parts, so deck-embedded pictures are *not* extracted — a `.pptx` enters the
-  corpus as slide text + speaker notes + flattened table rows only (the same gap does not
-  affect chat `read_document`, which reads the text equally well).
+  them with the `vision` tool on retrieval. PPTX pictures anchor on 1-based **slide numbers**,
+  riding the same `[[PAGE:n]]` axis as PDF pages. With the pipeline config's
+  `image_captions` (default on) each unique image additionally gets one vision-LLM
+  **caption chunk** at ingest — pixels become text the standard vector/keyword recall can hit,
+  while the caption's `meta.image_id` still points at the original asset. Details in
+  [§18.3](#183-rag-document-image-pipeline-extraction--meta-annotation).
 
 ### 10.8 Query Repository — multi-source import
 
@@ -1485,8 +1486,8 @@ over exactly those hits, so a rating survives reopen without re-querying retriev
 | Govern a research stage | mechanical `research_gate` checks (deterministic, no LLM judgment); a FAIL override always spawns a PENDING `ResearchApproval` that only a human resolves (never self-approve) — see [docs/research/](research/) |
 | Delete a message's owned screenshot | `messages.attach_asset_id` → cascade soft-delete by id (folder-agnostic); `?delete_assets=0` on edit-reask keeps it; the stable `RAG/images` copy an imported Q&A references is a separate asset row that survives the delete (§18.2) |
 | Save a derived asset with its source | `assets.source_asset_id` (FK `ON DELETE CASCADE`) + content-hash dedup (`get_by_source_content`) |
-| Attach document images to RAG chunks | page/para markers → chunk `meta.pages` / `meta.image_ids` (union across pages, state machine covers unmarked blocks) |
-| Route the vision tool to a model | `tools.vision.model` → catalog model → route → credential (`_resolve_vision_channel`) |
+| Attach document images to RAG chunks | page/slide/para markers → chunk `meta.pages` / `meta.image_ids` (union across pages, state machine covers unmarked blocks); optional vision-LLM `image_caption` leaf chunk per unique image (§18.3) |
+| Route the vision tool to a model | `tools.vision.model` → catalog model → route → credential (`vision_caption.resolve_vision_channel`) |
 | Compile a publication PDF from the finalized manuscript | `ArtifactCompileService.compile_project_pdf` (`plugins/artifact/`): zero-LLM deterministic projection (`project_manuscript_to_ast`, inv. 11) → Typst CLI → drive binary + `outputs/<task name>_v{N}.pdf` mirror; **default-ON** sibling branch of the PUBLISH node (opt out with `pdf_report: false`; a PDF fault still publishes and writes `pipeline.publish.pdf_error`) — see §21 |
 | Generate a 16:9 slide deck from documents / subtitles / sessions | deck engine `toolkit/deck/` (brief chain): Pass A section-understanding (`A/text_i`, per concept batch) → Pass B multimodal visual-understanding (`B/visual_*`) → Pass C hierarchical reduce (`C/reduce_gN` + merge, threshold 15) → Pass D synthesize the canonical `PresentationBrief` (`D/synthesize`) with bounded QA repair (`D-repair/<slide>` / `notes_*` / `resynth`) → deterministic layout compilation (Pillow visuals, native editable `.pptx`, Typst PDF); deterministic wire-slip repair before validation (number coercion, locator echo reparse + unambiguous-doc backfill, prose-wrap unwrap, enum normalization — never trimming or guessing); actionable corrective retries (missing-locator exact-shape directive with honest CLAIM/GROUNDED_SYNTHESIS relabel); canonical `<name>_slides.pdf` + `.md`/`.pptx`/`deck.json`; no silent trimming, loud fail on residual gate violations; per-node real-usage stats (`BRIEF STATS` log + `deck_stats` on the job result, mounted before await so failed runs keep partial stats); dialog knobs (count 3..20 / language / format / guidance) routed per pass — see [docs/content-to-slides.md](content-to-slides.md) |
 
@@ -3066,7 +3067,7 @@ differs is how each one is *bound*:
 | Class | Origin | Folder | Binding |
 |---|---|---|---|
 | Chat screenshots | desktop 📷 region capture | `chat/temp/` (temporary — user may empty) **and** `RAG/images/` once imported | `messages.attach_asset_id` — the message **owns** it |
-| RAG document images | PDF/DOCX embedded images at ingest | `RAG 图片/<doc>/` | `assets.source_asset_id` — derived from the document |
+| RAG document images | PDF/DOCX/PPTX embedded images at ingest | `RAG 图片/<doc>/` | `assets.source_asset_id` — derived from the document |
 
 A folder is pure UI organization: deletion and lifecycle decisions key off these bindings,
 never off a folder path, so moving a file in the drive never breaks cleanup. `chat/temp/` is
@@ -3136,15 +3137,18 @@ The worker's `asset_ingest` job extracts embedded images alongside the text:
    `page.get_images(full=True)` → `page.extract_image(xref)` (raster formats only, cross-page
    xref deduped); for DOCX, the package image parts (`doc.part.rels`) are matched to the
    paragraph that references each `a:blip` `r:embed`, giving a paragraph anchor (DOCX has no
-   native page numbers — the image rides the chunk its paragraph lands in, the same intent).
+   native page numbers — the image rides the chunk its paragraph lands in, the same intent);
+   for PPTX (and `.potx`/`.ppsx`, normalized first), python-pptx picture shapes — group
+   shapes recursed — key each image by its 1-based **slide number**.
 2. **Save (dedup + bind)** — each image is uploaded to `RAG 图片/<doc>/` via
    `save_artifact(..., source_asset_id=<document id>)`; `get_by_source_content` reuses an
    existing active derived image for the same `(source, hash)`, so repeat ingests produce no
    duplicates.
 3. **Markers** — extraction re-runs with markers on: `extract_pdf_document(page_markers=True)`
-   inserts `[[PAGE:n]]` at each page start, `extract_text(para_markers=True)` inserts
-   `[[PARA:n]]` per DOCX body paragraph. Both kwargs default **off**, so existing callers
-   (document_tools, toolkit, tasks) are unaffected.
+   inserts `[[PAGE:n]]` at each page start, `_extract_ppt(page_markers=True)` inserts one
+   `[[PAGE:n]]` per slide (decks share the page anchor axis), `extract_text(para_markers=True)`
+   inserts `[[PARA:n]]` per DOCX body paragraph. Both kwargs default **off**, so existing
+   callers (document_tools, toolkit, tasks) are unaffected.
 4. **State machine** — `build_chunks(..., on_split=...)` runs a per-chunk annotator *before*
    contextualize/CJK enrichment and strips the markers. For each chunk it reads the markers it
    contains, maintains a running page/paragraph, and writes:
@@ -3154,7 +3158,15 @@ The worker's `asset_ingest` job extracts embedded images alongside the text:
    - `meta["image_ids"]` — the deduped **union** of the images on every page the chunk covers
      (cross-page chunks keep all pages' images). Table transcriptions are appended without
      markers and fall to the running page (known limitation).
-5. **Retrieval & reading** — the chunk `meta` flows untouched through `rag_search` to the agent
+5. **Caption chunks (opt-out)** — with the pipeline config's `image_captions` (default on),
+   `caption_chunks` sends each *unique* image's bytes to the vision LLM once (concurrency 4;
+   a failed or empty caption is logged and skipped — captioning never fails the ingest) and
+   appends a leaf chunk per image: `content_en` = "Figure in \<doc\> — slide/page N: \<caption\>",
+   `meta = {kind: "image_caption", image_id, image_ids, pages|paras: [anchors]}`. This is the
+   "image → text → embedding" side of the two image-search designs: the **caption** makes the
+   picture recallable by ordinary text search, while the **asset reference** keeps the pixels
+   reachable via the `vision` tool — vectors carry no image embeddings, only their description.
+6. **Retrieval & reading** — the chunk `meta` flows untouched through `rag_search` to the agent
    (§10.8); when the model needs the visual content it calls the `vision` tool with an image
    `asset_id` (§18.5). No retrieval-side change.
 
@@ -3174,10 +3186,13 @@ The service mirrors the FK cascade for every soft path (`drive_service.py`):
 ### 18.5 Vision routing
 
 The `vision` tool (`apps/api/tools/vision_tool.py`) reads an attached image by `asset_id` and
-asks a vision-capable model. `_resolve_vision_channel` resolves `tools.vision.model` (admin
-Tools config) → catalog model → its routing → credential; an empty name falls back to the first
-active catalog model. The request is OpenAI-compatible (`image_url` with a `data:` URL; images
-in the `user` message). The vision tool is **not** allowlisted in the gateway (the composition
+asks a vision-capable model. The shared plumbing lives in
+`core.infrastructure.vision_caption`: `resolve_vision_channel` resolves `tools.vision.model`
+(admin Tools config) → catalog model → its routing → credential, and `describe_image` sends one
+OpenAI-compatible request (`image_url` with a `data:` URL; images in the `user` message) — the
+RAG ingest worker reuses the same two functions for caption chunks (§18.3) without importing
+the API tool module. An empty model name falls back to the first active catalog model. The
+vision tool is **not** allowlisted in the gateway (the composition
 root in `agent_factory.py` allows `rag_search` + the toolkit generators), so the model reaches
 it through a `tool_search` discovery hop when an `[Attached: …]` note calls for it — see
 [§5.2](#52-agent-loop--reactloopagent).

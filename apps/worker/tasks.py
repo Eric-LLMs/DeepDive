@@ -66,7 +66,7 @@ from core.infrastructure.storage import get_storage, object_key
 from core.logger import reset_log_context, set_log_context
 from rag.query_cache import bump_corpus_version
 
-from apps.worker.rag_images import save_images, scan_embedded_images
+from apps.worker.rag_images import caption_chunks, save_images, scan_embedded_images
 
 # Image-attribution sentinels inserted by ``extract_document_text(page_markers=True)`` (PDF
 # → ``[[PAGE:n]]``, DOCX → ``[[PARA:n]]``). The annotator below strips them from stored
@@ -550,11 +550,13 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
         # PDF runs the async path (body + vision-transcribed tables via the PDF tools);
         # every other extension goes through the sync ``extract_text`` dispatch.
         #
-        # When the document embeds images (PDF/DOCX), each image is persisted as a
-        # cloud-drive asset (source-bound to this PDF/DOCX, deduped on re-ingest) and the
+        # When the document embeds images (PDF/DOCX/PPTX), each image is persisted as a
+        # cloud-drive asset (source-bound to this document, deduped on re-ingest) and the
         # extracted text is chunked with page/paragraph markers so every chunk's ``meta``
         # carries the image_ids of the pages it covers — the agent then sees those ids in
-        # ``rag_search`` results and reads them with the ``vision`` tool.
+        # ``rag_search`` results and reads them with the ``vision`` tool. With
+        # ``cfg.image_captions`` each unique image additionally gets a vision-LLM caption
+        # chunk, so the picture's content is findable by ordinary text recall.
         await assets.set_status(asset_id, rag_status="CHUNKING")
 
         async def _embed_and_index(chunks: list[Chunk]) -> dict:
@@ -671,6 +673,33 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
             chunks = await build_chunks(
                 text, cfg, doc_title=asset.name, llm=ctx["llm"], on_split=on_split
             )
+            # Caption ingestion (opt-out via pipeline config): each unique embedded image
+            # gets one vision-LLM description, stored as a leaf chunk on the same anchor
+            # axis as the text — the image becomes recallable by text while ``meta`` still
+            # points at the original asset for the ``vision`` tool.
+            if cfg.image_captions:
+                ext = (asset.name or "").rsplit(".", 1)[-1].lower()
+                if ext == "docx":
+                    axis_key, anchor_label = "paras", "paragraph"
+                elif ext in {"pptx", "potx", "ppsx"}:
+                    axis_key, anchor_label = "pages", "slide"
+                else:
+                    axis_key, anchor_label = "pages", "page"
+                caps = await caption_chunks(
+                    scans,
+                    page_images,
+                    asset.name,
+                    llm=ctx["llm"],
+                    session_factory=ctx["session_factory"],
+                    axis_key=axis_key,
+                    anchor_label=anchor_label,
+                )
+                if caps and cfg.cjk:
+                    from rag.query.cjk import segment
+
+                    for c in caps:
+                        c.content_search = segment(c.content_en)
+                chunks.extend(caps)
         else:
             text = await extract_document_text(data, asset.name, ctx["llm"])
             chunks = await build_chunks(text, cfg, doc_title=asset.name, llm=ctx["llm"])
