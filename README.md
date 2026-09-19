@@ -44,7 +44,7 @@ DeepDive is a persistent AI tutor that helps you deeply understand your material
 | **Learn** | • Ask questions while reading or watching — PDFs, Office docs, video, audio, images, and more (view and discuss directly in DeepDive)<br>• Get step-by-step explanations and concept breakdowns<br>• Discuss a specific moment — select a passage, page, or video moment as context |
 | **Research** | • Search across your files, notes, conversations, and sources<br>• Go beyond your material — search the web and community discussions for newer research and supporting evidence<br>• Synthesize multiple sources into grounded, structured answers |
 | **Remember** | • Save durable insights and recall them in later sessions<br>• Keep long-term memory separate from conversation history<br>• Revisit bookmarks, notes, and saved spots |
-| **Create** | • Summarize sessions, notes, and documents<br>• Generate mind maps and grounded slide decks (canonical 16:9 Typst PDF + editable PPTX)<br>• Publish research reports as citation-resolved PDFs<br>• Turn conversations into reusable knowledge that flows back into search |
+| **Create** | • Summarize sessions, notes, and documents<br>• Generate mind maps and grounded slide decks<br>• Publish research reports as citation-resolved PDFs<br>• Turn conversations into reusable knowledge that flows back into search |
 | **Collaborate** | • Share files and knowledge in workspaces<br>• Study and discuss the same material as a team with role-based access control |
 
 ## Demo
