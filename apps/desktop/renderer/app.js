@@ -5686,6 +5686,12 @@
     return !!(l && (l.status === "queued" || l.status === "running"));
   });
 
+  // The chat input 📷 button (right of the waveform): capture the window, let the user
+  // drag a region, and stage the crop as the pending attachment — the same flow the
+  // viewer context menu uses (attachCurrent("screenshot")).
+  const chatShot = document.getElementById("chat-shot");
+  chatShot.addEventListener("click", () => attachCurrent("screenshot"));
+
   // The chat input ＋ button: open an OS file picker, upload the chosen file to the
   // cloud drive, and stage it as the pending attachment (rides on the next send).
   const chatAttachPick = document.getElementById("chat-attach-pick");

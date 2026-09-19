@@ -72,14 +72,19 @@ router = APIRouter(tags=["chat"])
 
 logger = logging.getLogger(__name__)
 
+# Image suffixes that the ``vision`` tool (not ``read_document``) should open. Mirrors
+# ``_IMAGE_EXTS`` in apps/api/tools/read_document_tool.py.
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+
 
 async def _attach_note(body: ChatRequest, drive: DriveService, user_id) -> str | None:
     """Build a context note for an attached cloud asset, or ``None`` when there is none.
 
     Attachments are read-only references: we verify the caller can read the asset, then
     prefix a ``[Attached: …]`` note to the user message so the agent knows which document
-    the user is troubleshooting. The agent's existing drive tools (pdf_extract_text,
-    doc_outline, …) can then fetch the bytes by ``asset_id``.
+    the user is troubleshooting. The note also names the tool that can actually open it —
+    ``vision`` for images, ``read_document`` for PDF/Word/Excel/text — so the agent reads
+    the content instead of claiming the file cannot be parsed.
     """
     attach = body.attach or {}
     if attach.get("kind") != "asset" or user_id is None:
@@ -92,7 +97,13 @@ async def _attach_note(body: ChatRequest, drive: DriveService, user_id) -> str |
     except DriveError as exc:
         raise HTTPException(status_code=403, detail=f"no access to the attached file: {exc}")
     name = attach.get("name") or "document"
-    return f"[Attached: {name} (asset_id {asset_id})]"
+    suffix = name[name.rfind("."):].lower() if "." in name else ""
+    mime = (attach.get("mime_type") or "").lower()
+    if suffix in _IMAGE_SUFFIXES or mime.startswith("image/"):
+        hint = "Call the `vision` tool with this asset_id to see its content."
+    else:
+        hint = "Call the `read_document` tool with this asset_id to extract its text."
+    return f"[Attached: {name} (asset_id {asset_id})] {hint}"
 
 
 def _handoff_note(body: ChatRequest) -> str | None:

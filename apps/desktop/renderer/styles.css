@@ -1013,7 +1013,7 @@ pre.text-viewer {
 /* Bottom-docked chat is a wide bar: collapse the composer into one line. The actions
    row is flattened (display: contents) so its buttons become direct flex items, then
    flex order arranges them — ＋ leftmost, the input stretching in the middle, and the
-   Generate toolbar / 🎤 / 🔊 / Send clustered at the right. */
+   Generate toolbar / 🎤 / 🔊 / 📷 / Send clustered at the right. */
 #app:not(.chat-right) .chat-input-box {
   flex-direction: row;
   align-items: center;
@@ -1029,9 +1029,10 @@ pre.text-viewer {
 #app:not(.chat-right) #chat-attach-pick { order: 0; }
 #app:not(.chat-right) #chat-mic { order: 2; }
 #app:not(.chat-right) #chat-speak { order: 3; }
+#app:not(.chat-right) #chat-shot { order: 4; }
 #app:not(.chat-right) #chat-send {
-  order: 4;
-  margin-left: 0;   /* keep 🎤 🔊 Send clustered, not Send shoved to the far edge */
+  order: 5;
+  margin-left: 0;   /* keep 🎤 🔊 📷 Send clustered, not Send shoved to the far edge */
 }
 
 /* Multi-line chat input: a fixed 3-row textarea that scrolls internally once the draft

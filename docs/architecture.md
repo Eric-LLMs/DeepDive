@@ -2264,26 +2264,28 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     Gemini-style row — a **＋ attach** button, a **multi-line `<textarea>`** (its height follows
     the dock: 1 row in the Files bottom bar, 4 rows docked right or when the **Chats** tab fills
     the whole pane; **Enter sends** the message, **Shift+Enter** inserts a new line), inline
-    **🎤 / 🔊** buttons, and Send — with an attachment preview strip above it. Attach stages a pending
-    attachment that rides on the next send: pick a file (OS picker → uploaded to the cloud
+    **🎤 / 🌊(call) / 📷** buttons, and Send — with an attachment preview strip above it. Attach stages a
+    pending attachment that rides on the next send: pick a file (OS picker → uploaded to the cloud
     drive), attach the currently-open cloud asset by id, or capture a **window screenshot** —
+    the `chat-shot` 📷 button (right of the waveform call toggle) or the viewer's 📷 menu item, both
+    running the same flow:
     the `capture-window` IPC grabs the app's own window via `webContents.capturePage()`, then
     the renderer overlays a **drag-to-select region** (double-click = whole frame, Esc =
     cancel) and crops the selection. The PNG is uploaded with a real MIME type to the
     `chat/temp/` folder (temporary — a Q&A imported into RAG is *also copied* to `RAG/images/`,
     keeping the `chat/temp/` copy, §18.2) and marked **owned**; the API prefixes an
     `[Attached: …]` note to the
-    user message so the agent's document tools and the `vision` tool (§18.5) can fetch the
-    bytes by `asset_id`. The chat-header
+    user message that names the reader for the type — `read_document` for documents (§18.6),
+    `vision` for images (§18.5) — so the agent fetches the bytes by `asset_id`. The chat-header
     also carries a **⋯** session menu (pin / rename / **Import to Knowledge** / delete, plus
     **Generate Mind Map / Generate Slides / Summarize & Save Notes**) and a **hide** toggle that
     collapses the chat into a floating restore icon; a **Generate** toolbar above the input
     exposes the same three entries as one-click buttons.
 
-    The 🎤 / 🔊 input-box buttons drive the **local** speech sidecars (no cloud APIs):
+    The 🎤 / 🌊 input-box buttons drive the **local** speech sidecars (no cloud APIs):
     **🎤 push-to-talk** — click records via `MediaRecorder` (red pulse), click again uploads the
     clip to `POST /stt` (FunASR/SenseVoice), and the transcript lands in the input box for
-    review, never auto-sent. **🔊 hands-free call** — one click opens a loop of
+    review, never auto-sent. **🌊 hands-free call** (waveform icon) — one click opens a loop of
     *listen → end-of-speech auto-detected by an RMS energy VAD (WebAudio `AnalyserNode`, ~0.9 s
     trailing silence) → auto-transcribe → send through the same `/chat/stream` with
     `disable_thinking` (reasoning tokens suppressed for call turns; typed chat keeps them) →
@@ -3148,6 +3150,38 @@ in the `user` message). The vision tool is **not** allowlisted in the gateway (t
 root in `agent_factory.py` allows `rag_search` + the toolkit generators), so the model reaches
 it through a `tool_search` discovery hop when an `[Attached: …]` note calls for it — see
 [§5.2](#52-agent-loop--reactloopagent).
+
+### 18.6 Attached-document extraction (`read_document`)
+
+An attachment reaches the agent only as the `[Attached: <name> (asset_id <id>)]` note — without
+a reader the model can see the filename but never open the file, so every "summarize this PDF /
+read this spreadsheet" request collapsed into a parse-failure apology. The `read_document` tool
+(`apps/api/tools/read_document_tool.py`) closes that gap:
+
+- **Discovery** — built-in tools are auto-registered by the `*_tool.py` filename glob in
+  `apps/api/tools/__init__.py`; the earlier plural-named `pdf_tools.py` / `document_tools.py`
+  never matched it and stayed orphaned. `read_document_tool.py` follows the convention, so
+  dropping the file in is the whole registration.
+- **One entry, full format coverage** — the tool loads the asset bytes from content-addressed
+  storage (`SqlAssetRepository.get` → `object_key(sha256)` → `Storage.get`) and dispatches
+  through `core.infrastructure.ingest.extract_document_text` — the *same* extractor the ingest
+  worker uses, so chat never grows a second, drift-prone parsing stack:
+  **PDF** → PyMuPDF body text, plus table images transcribed by the vision LLM;
+  **Word** `.docx` → python-docx; **Excel** `.xlsx`/`.xlsm`/`.xltx`/`.xltm` → openpyxl
+  read-only with the ingest sheet/row caps; **plain text** `.txt`/`.md`/`.csv`/`.json`/`.log`;
+  **subtitles** `.srt`/`.vtt`/`.lrc` flattened to cue text.
+- **Image routing** — an image extension/MIME short-circuits to a pointer reply telling the
+  agent to call the `vision` tool (§18.5) with the same `asset_id`; images are a vision
+  problem, not a text-extraction one.
+- **Type-aware attach note** — `_attach_note` (`chat.py`) picks the hint by suffix: documents
+  get "call `read_document`", images get "call `vision`", so the agent needs no guessing to
+  reach the right reader through `tool_search`.
+- **Honest failure, bounded output** — legacy `.doc`/`.xls` are refused with a resave-as
+  hint (the shared stack rejects them too); a parsed-but-empty document reports "no
+  extractable text (scanned?)"; extraction errors surface verbatim instead of a silent
+  empty. The reply is capped at 20 000 chars with a `[...truncated; N chars total]` tail, so
+  one huge attachment cannot flood the context window — the agent can tell the user it only
+  saw the first part.
 
 [↑ Back to top](#table-of-contents)
 
