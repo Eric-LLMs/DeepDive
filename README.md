@@ -132,9 +132,23 @@ See [docs/architecture.md §Implementation Status](docs/architecture.md#implemen
 
 Each script installs Docker if missing, starts the data + model services, ensures the Python environment, seeds the default `admin` / `pwd@Admin` account, and launches the workbench (desktop) or web UI (server).
 
-### After first launch — configure model keys
+### After first launch — configure model access
 
-All LLM configuration lives in the database and is managed from the **admin console** — nothing else needs editing after install. Open the web UI, sign in with the seeded account (**admin / pwd@Admin**), and in the console's *Providers* tab register your upstream credentials (API key + base URL), then in *Models* map catalog entries onto those providers with routing priorities. The chat model, the embedding model, and the **vision model** used for screenshots, PDF tables, and document-image captions (`tools.vision.model` in the *Tools* tab) are all picked from this catalog — a provider that runs out of balance surfaces as HTTP 402 on the affected call, so keep a funded route active.
+Sign in with the seeded account (**admin / `pwd@Admin`**), then open **Admin → Admin Console** from the bottom-left account menu to configure a model route:
+
+1. **Providers → Credentials** — Add a provider credential with its API key and base URL.
+2. **Providers → Model Catalog** — Register the models available through that credential.
+3. **Providers → Routing & Weights** — Create a route by selecting a credential and model, then configure its priority and weight.
+4. **Roles → Channels** — Bind the available provider channels to the roles that may use them (start with the `admin` role).
+
+Once configured, the bound model routes are available to the corresponding roles.
+
+> **How the model configuration works:**
+> A **Credential** provides access to a provider. A **Model** defines which model to use. A **Route** connects a credential to a model. A **Channel** exposes one or more routes to a **Role**.
+
+All LLM configuration is stored in the database and managed through the admin console.
+
+If a provider runs out of balance, affected requests will return HTTP 402. Make sure each required channel has at least one active, funded route.
 
 ### Option B — Manual local development
 

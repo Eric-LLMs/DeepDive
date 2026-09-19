@@ -137,7 +137,25 @@ DeepDive 自研了高可控的 Agent 运行时，拒绝将核心编排委托给�
 | **Windows 桌面端** | `bash scripts/start_desktop.sh` |
 | **Linux 服务器** | `bash scripts/start_server.sh` |
 
-*脚本会自动检测并安装 Docker、拉起数据与模型服务容器、初始化 Python 环境、注入默认管理员账号（`admin / admin`），并自动启动桌面工作台或 Web 界面。*
+*脚本会自动检测并安装 Docker、拉起数据与模型服务容器、初始化 Python 环境、注入默认管理员账号（`admin / pwd@Admin`），并自动启动桌面工作台或 Web 界面。*
+
+### 首次启动后 — 配置模型访问
+
+使用预置账号 **admin / `pwd@Admin`** 登录，然后打开左下角的**账号菜单 → Admin Console（管理控制台）**，进入管理控制台配置模型路由：
+
+1. **Providers → Credentials** — 添加供应商凭证，配置 API Key 和 Base URL。
+2. **Providers → Model Catalog** — 注册该凭证可访问的模型。
+3. **Providers → Routing & Weights** — 选择 Credential 和 Model 创建模型路由，并设置优先级和权重。
+4. **Roles → Channels** — 将可用的 Provider Channel 绑定到允许使用它们的角色（建议先绑定 `admin` 角色）。
+
+完成配置后，绑定到相应角色的模型路由即可使用。
+
+> **模型配置关系：**
+> **Credential** 提供供应商访问凭证；**Model** 定义使用的模型；**Route** 将 Credential 与 Model 连接起来；**Channel** 将一个或多个 Route 暴露给指定的 **Role**。
+
+所有 LLM 配置都存储在数据库中，并通过管理控制台统一管理。
+
+如果某个供应商余额不足，相关请求会返回 HTTP 402。请确保每个需要使用的 Channel 至少有一条启用且有余额的路由。
 
 ### 方案 B —— 本地手动开发模式
 
