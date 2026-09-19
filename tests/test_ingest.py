@@ -1,6 +1,7 @@
 """Text extraction + chunking for the asset RAG-ingestion pipeline."""
 import asyncio
 import io
+import subprocess
 
 import pytest
 from core.infrastructure.ingest import (
@@ -116,4 +117,60 @@ def test_supported_extensions_includes_excel():
     exts = supported_extensions()
     assert {".xlsx", ".xlsm"} <= exts
     assert ".xls" not in exts
+
+
+def test_supported_extensions_includes_legacy_doc():
+    assert ".doc" in supported_extensions()
+
+
+def test_extract_doc_runs_antiword_with_utf8_mapping(monkeypatch):
+    from core.infrastructure import ingest
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="内容 hello".encode(), stderr=b"")
+
+    monkeypatch.delenv("ANTIWORD_PATH", raising=False)
+    monkeypatch.setattr(ingest.shutil, "which", lambda name: "/usr/bin/antiword")
+    monkeypatch.setattr(ingest.subprocess, "run", fake_run)
+    text = extract_text(b"\xd0\xcf\x11\xe0junk", "old.doc")
+    assert text == "内容 hello"
+    assert seen["cmd"][0] == "/usr/bin/antiword"
+    assert "-m" in seen["cmd"] and "UTF-8.txt" in seen["cmd"]
+    assert seen["cmd"][-1].endswith(".doc")
+
+
+def test_extract_doc_without_antiword_raises_clear_message(monkeypatch):
+    from core.infrastructure import ingest
+
+    monkeypatch.delenv("ANTIWORD_PATH", raising=False)
+    monkeypatch.setattr(ingest.shutil, "which", lambda name: None)
+    with pytest.raises(UnsupportedFileType, match="resave as .docx"):
+        extract_text(b"\xd0\xcf\x11\xe0junk", "old.doc")
+
+
+def test_extract_doc_antiword_failure_raises_clear_message(monkeypatch):
+    from core.infrastructure import ingest
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"not a Word document")
+
+    monkeypatch.delenv("ANTIWORD_PATH", raising=False)
+    monkeypatch.setattr(ingest.shutil, "which", lambda name: "/usr/bin/antiword")
+    monkeypatch.setattr(ingest.subprocess, "run", fake_run)
+    with pytest.raises(UnsupportedFileType, match="resave as .docx"):
+        extract_text(b"\xd0\xcf\x11\xe0junk", "old.doc")
+
+
+def test_extract_doc_dispatched_before_generic_decode(monkeypatch):
+    # These bytes are latin-1 decodable — if the .doc branch were missing, the generic
+    # decode fallthrough would happily return mojibake instead of refusing.
+    from core.infrastructure import ingest
+
+    monkeypatch.delenv("ANTIWORD_PATH", raising=False)
+    monkeypatch.setattr(ingest.shutil, "which", lambda name: None)
+    with pytest.raises(UnsupportedFileType):
+        ingest.extract_text(b"\xd0\xcf\x11\xe0data", "old.doc")
 

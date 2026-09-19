@@ -5,10 +5,10 @@ Attachments ride on the chat payload as a drive ``asset_id``; the agent only see
 the file, so every "parse this PDF / summarize this Word doc" request fails. This tool
 closes that gap: it loads the asset bytes from storage and runs the same extractor the
 ingest worker uses — PDF (PyMuPDF body text, tables via the vision LLM), .docx
-(python-docx), Excel (.xlsx via openpyxl), PowerPoint (.pptx/.potx/.ppsx slide text +
-speaker notes via python-pptx), plus plain text / markdown / csv / json and subtitles.
-Images are routed to the ``vision`` tool instead, and the output is capped so
-one huge document cannot flood the agent's context window.
+(python-docx), legacy .doc (antiword), Excel (.xlsx via openpyxl), PowerPoint
+(.pptx/.potx/.ppsx slide text + speaker notes via python-pptx), plus plain text /
+markdown / csv / json and subtitles. Images are routed to the ``vision`` tool instead,
+and the output is capped so one huge document cannot flood the agent's context window.
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
         define_tool(
             name="read_document",
             description="Extract the text content of a document the user attached to the "
-            "chat (PDF, Word .docx, Excel .xlsx/.xlsm, PowerPoint .pptx/.potx/.ppsx, "
+            "chat (PDF, Word .doc/.docx, Excel .xlsx/.xlsm, PowerPoint .pptx/.potx/.ppsx, "
             "txt/markdown/csv/json, subtitles). Attachments arrive as "
             "[Attached: <filename> (asset_id <id>)]. Whenever the "
             "user asks about the content of an attached document, you MUST call this tool "

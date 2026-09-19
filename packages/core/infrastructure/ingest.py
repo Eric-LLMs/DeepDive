@@ -15,7 +15,11 @@ Chunking is strategy-dispatchable (``fixed`` / ``paragraph`` / ``sentence`` /
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,7 +66,7 @@ def supported_extensions() -> set[str]:
     Single source of truth for the clients: the toolkit config endpoint surfaces these so
     the desktop picker can grey out files a generation job would refuse.
     """
-    return _TEXT_EXTS | _SUBTITLE_EXTS | _EXCEL_EXTS | _PPT_EXTS | {".pdf", ".docx"}
+    return _TEXT_EXTS | _SUBTITLE_EXTS | _EXCEL_EXTS | _PPT_EXTS | {".pdf", ".docx", ".doc"}
 
 
 @dataclass
@@ -102,6 +106,9 @@ def extract_text(content: bytes, name: str, *, para_markers: bool = False) -> st
         return _extract_ppt(content, page_markers=para_markers)
     if ext == ".ppt":
         raise UnsupportedFileType("legacy .ppt is not supported — resave as .pptx")
+    if ext == ".doc":
+        # Legacy OLE2 Word — external converter, must run BEFORE the generic decode.
+        return _extract_doc(content)
     text = _decode(content)
     if ext == ".vtt":
         cues = media.parse_vtt_text(text)
@@ -195,6 +202,41 @@ def build_subtitle_chunks(
         group.append(cue)
     emit(lines, group)
     return chunks
+
+
+def _extract_doc(content: bytes) -> str:
+    """Extract text from a legacy Word .doc (Word 97-2003, OLE2 container) via ``antiword``.
+
+    Deterministic local extraction — no LLM on this path. ``antiword`` is an external
+    binary, so the capability is environment-dependent; when it is missing (e.g. a slim
+    worker container) the file is refused with an explicit :class:`UnsupportedFileType`
+    ("resave as .docx"). That refusal must be loud: a soft-failing extractor previously let
+    the agent improvise shell commands over the raw bytes and burn the whole step budget.
+    Override the binary location with ``ANTIWORD_PATH`` when it is not on ``PATH``.
+    """
+    exe = os.environ.get("ANTIWORD_PATH") or shutil.which("antiword")
+    if not exe:
+        raise UnsupportedFileType(
+            "legacy .doc cannot be read here (antiword not installed) — resave as .docx"
+        )
+    with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as fh:
+        fh.write(content)
+        tmp_path = fh.name
+    try:
+        # -m UTF-8.txt forces Unicode output; without it antiword emits the document's
+        # original 8-bit codepage, which mojibakes CJK text.
+        proc = subprocess.run([exe, "-m", "UTF-8.txt", tmp_path], capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise UnsupportedFileType("antiword timed out on this .doc — resave as .docx")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()[:200]
+        raise UnsupportedFileType(f"antiword failed to parse this .doc ({err}) — resave as .docx")
+    return proc.stdout.decode("utf-8", "replace")
 
 
 def _extract_docx(content: bytes, *, para_markers: bool = False) -> str:
