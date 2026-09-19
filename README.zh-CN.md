@@ -18,7 +18,7 @@ DeepDive 原生支持 PDF、Office 文档、视频、音频和图片，并提供
 
 ## 什么是 DeepDive？
 
-DeepDive 是一位具备持久记忆的 AI 导师，帮助你深度理解材料、探究复杂课题，并持续构建属于自己的知识库——一切都在一个支持私有化部署的工作区中完成。
+DeepDive 是一位具备持久记忆的 AI 学习与研究助手，帮助你深度理解材料、探究复杂课题，并持续构建属于自己的知识库——一切都在一个支持私有化部署的工作区中完成。
 
 **核心差异：**
 
@@ -90,7 +90,7 @@ DeepDive 自研了高可控的 Agent 运行时，拒绝将核心编排委托给�
 * **统一知识底座，告别孤立存储**：个人网盘与共享工作区（具备 Owner / Admin / Editor / Viewer 角色权限、成员管理与追加式审计日志）基于 SHA-256 内容寻址对象存储构建，支持引用计数去重、8 MB 断点分块续传、多级目录、30 天回收站留存、文件级 ACL、组内分享与多格式在线预览。逻辑文件目录映射到内容寻址对象存储（同摘要仅存一份物理副本），对象生命周期由原子引用计数管理、引用归零才在 CAS 守卫下物理删除。网盘同时作为内容处理、检索与 Agent 工作流的共享工作目录。
 * **权限控制在资源边界处强制执行**：角色权限、租户边界、上游 LLM 凭证、模型目录与路由权重均由统一管理后台集中管控。提供带掩码（`sk-***`）的每用户密钥授权矩阵、用于邮件验证 / 密码重置的 SMTP 服务，以及无状态签名 Admin 会话机制。登录时按角色动态绑定 LLM 通道并支持自动故障转移（Failover），无可用密钥时平滑降级至访客配额，避免异常掉线。用量按免费额度优先计费，超额溢出至钱包扣款；扣款为原子操作（`UPDATE ... WHERE balance >= cost` 防超支），记录 `balance_after` 快照并支持幂等，余额不足返回 HTTP 402。
 * **多租户数据隔离，检索不失边界**：请求身份经 ContextVar 传递——RAG 与记忆召回器是进程级单例，无法构造注入用户，`/chat` 端点写入 ContextVar、召回器兜底读取。同一条可见性谓词写成两份（SQLAlchemy 表达式 + 原生 SQL 片段），确保走 tsvector/pgvector 原生 SQL 的召回与 ORM 查询遵守完全一致的三通道（本人拥有 / 工作区成员 / 文件级 ACL 含公开链接）；chunk 级谓词直接基于 `chunks.user_id` 判定，使无 asset_id 的学习 / 对话 chunk 不会越出所有者边界。词汇语料采用部分唯一索引：公共行全局唯一、私有行按用户唯一，不同用户可各自拥有同名词条而不冲突。
-* **Local-First 客户端配合私有化部署**：Electron 工作台支持离线文件工作流（文件树浏览、多格式查看器、视频逐帧截图）；大体积媒体在客户端本地预处理并回传分析产物，常规计算任务由服务端承载。语音同样全程本地：按住麦克风说话，客户端录制 `webm/opus`，经 FunASR SenseVoiceSmall CPU sidecar 转写；免提通话支持 WebAudio 能量 VAD 自动断句、句尾自动发送（仅通话轮次抑制 reasoning token）、Kokoro 朗读回复、开口即打断播放（barge-in），全屏通话浮层实时绘制频谱。视频可一键生成 PPT/PDF 学习册：基于字幕时间戳抽取关键帧，每页一帧加对应字幕文本，并内置 CJK 字体保证中文渲染不乱码；TTS 支持中英文声线自动切换、按句流式合成（首句秒回），并通过内容哈希缓存波形实现重放零延迟。完整后端技术栈（PostgreSQL/pgvector、Redis、TEI 向量推理、Kokoro TTS、FunASR STT 与 LiteLLM 网关）支持通过 `docker-compose` 一键拉起，确保所有数据完全留存在你自己的基础设施之内。
+* **Local-First 客户端配合私有化部署**：Electron 工作台支持离线文件工作流（文件树浏览、多格式查看器、视频逐帧截图）；大体积媒体在客户端本地预处理并回传分析产物，常规计算任务由服务端承载。语音同样全程本地：按住麦克风说话，客户端录制 `webm/opus`，经 FunASR SenseVoiceSmall CPU sidecar 转写；免提通话支持 WebAudio 能量 VAD 自动断句、句尾自动发送（仅通话轮次抑制 reasoning token）、Kokoro 朗读回复、开口即打断播放（barge-in），全屏通话浮层实时绘制频谱。视频可一键生成 PPT/PDF 学习册：基于字幕时间戳抽取关键帧，每页一帧加对应字幕文本，并内置 CJK 字体保证中文渲染不乱码；TTS 支持中英文声线自动切换、按句流式合成（首句秒回），并通过内容哈希缓存波形实现重放零延迟。完整后端技术栈（PostgreSQL/pgvector、Redis、TEI 向量推理、Kokoro TTS、FunASR STT 与 LiteLLM 网关）支持通过 `docker-compose` 一键拉起，确保工作区数据与核心后端服务运行在你自己的基础设施之内。
 * **三层存储架构：权威状态、交互投影与检索索引彻底分家**：系统在架构上界定清晰的数据边界：服务器本地沙箱（Scratch）独占任务状态与产物版本的唯一真理；网盘目录只作呈现给用户的外显视图，配置与历史原地覆写、报告实时投影进 `outputs/<任务名>.md`，不产生资产碎片；研究成果发布按运行序号生成版本化 `outputs/<名>_vN.md` 定稿（出版 PDF 同步落 `outputs/`，见上文内容编译），并经显式确认（Promote）标记为待入库后才触发向量化，彻底封堵旧版直传路径，从源头防止过程草稿污染全局知识库。
 
 ---
@@ -160,9 +160,11 @@ python scripts/init_db.py
 uvicorn apps.api.main:app --reload     # 访问接口文档: http://localhost:8300/docs
 ```
 
-### 方案 C —— 自托管 LLM
+### 方案 C —— LLM 后端：自托管或外部供应商
 
-LiteLLM 网关把虚拟模型 `deepdive-chat` 路由到任意 OpenAI 兼容上游（`LLM_UPSTREAM_BASE`）。把它指向自托管服务器（vLLM / Ollama / …）即可在你自己的硬件上运行整套 AI 技术栈，或指向外部供应商 —— 无需改动任何代码。
+LiteLLM 网关将虚拟模型 `deepdive-chat` 路由到任意 OpenAI 兼容上游（`LLM_UPSTREAM_BASE`）。将其指向自托管服务器（vLLM / Ollama / …），即可在自己的硬件上运行整套 AI 技术栈；也可以指向外部供应商，无需修改任何代码。
+
+与启动方式（方案 A / B）无关，LLM 后端是独立的部署选择。
 
 完整手动步骤、环境变量与桌面 / 网页 / 管理后台走查：[docs/getting-started.md](docs/getting-started.md) · [docs/configuration.md](docs/configuration.md)。
 

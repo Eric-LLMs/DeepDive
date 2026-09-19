@@ -16,7 +16,7 @@ Dive deeper: [**What you can do**](#what-you-can-do) explores the product, [**En
 
 ## What is DeepDive?
 
-DeepDive is a persistent AI tutor that helps you deeply understand your materials, investigate complex topics, and continuously build your own knowledge base — all within one self-hostable workspace.
+DeepDive is a persistent AI learning and research assistant that helps you deeply understand your materials, investigate complex topics, and continuously build your own knowledge base — all within one self-hostable workspace.
 
 **Why it's different:**
 
@@ -89,7 +89,7 @@ DeepDive implements a controllable agent runtime rather than delegating orchestr
 - **Unified knowledge substrate.** Private My Drive and shared workspaces (featuring `Owner` / `Admin` / `Editor` / `Viewer` RBAC, member management, and append-only activity logs) sit atop a SHA-256 content-addressed object store with reference-counted deduplication, 8 MB resumable chunked uploads, multi-level folders, 30-day trash retention, per-file ACLs, workspace sharing, and integrated multi-format previews. Logical file trees map to content-addressed blobs — files sharing a digest share one physical copy — and object lifetime is managed by atomic reference counting with CAS-guarded physical deletion. The drive doubles as the shared data and working directory for content processing, retrieval, and agent workflows.
 - **Resource-bound authorization.** Roles, tenant boundaries, upstream LLM provider credentials, model catalogs, and routing weights are managed from a unified admin console. It features a per-user key-grant matrix with masked credentials (`sk-***`), SMTP for email verification / password reset, and stateless signed admin sessions. Per-role LLM channels bind at login with automatic failover — users without a usable key degrade to the anonymous tier instead of losing login. Usage is metered by a free-first quota that overflows to a wallet; deductions are atomic (`UPDATE ... WHERE balance >= cost` prevents overdraft), snapshot `balance_after`, and are idempotent, returning HTTP 402 when funds run out.
 - **Tenant-safe data isolation.** Request identity rides a ContextVar because the RAG and memory recallers are process-wide singletons that cannot take per-request constructor arguments; the same visibility predicate is written twice — once as a SQLAlchemy expression, once as a raw-SQL fragment — so the tsvector/pgvector recall path enforces the identical three channels (ownership, workspace membership, per-asset ACL with public links). Chunk-level predicates filter on `chunks.user_id` directly, so learning/chat chunks without an asset_id cannot leak past their owner. The vocabulary corpus uses partial unique indexes: public rows stay globally unique while each user's private rows are unique per user, so two users can each own a same-named term without colliding.
-- **Local-first client, self-hostable infrastructure.** The Electron workbench supports offline file workflows (file tree, multi-format viewer, video frame capture); large media is processed on the client and the resulting artifacts submitted back to the server, while most content-processing workloads run server-side. Voice stays fully local too: push-to-talk dictation records `webm/opus` client-side and transcribes through a FunASR SenseVoiceSmall CPU sidecar, and a hands-free voice call is opened with one click — WebAudio energy-VAD segments speech, end-of-speech auto-sends (reasoning tokens suppressed only on call turns), Kokoro reads the answer aloud, and talking over playback barges in and interrupts; a call overlay paints a live spectrum. Videos become PPT/PDF study booklets: subtitle timestamps drive keyframe extraction, one frame plus its caption per page, with CJK-safe fonts so Chinese renders correctly; TTS auto-switches Chinese/English voices, synthesizes sentence-by-sentence so the first sentence plays back immediately, and caches waveforms by content hash for zero-latency replays. The complete backend stack — PostgreSQL/pgvector, Redis, TEI embeddings, Kokoro TTS, FunASR STT, and LiteLLM gateway — deploys seamlessly via `docker-compose`, keeping your data fully within your infrastructure.
+- **Local-first client, self-hostable infrastructure.** The Electron workbench supports offline file workflows (file tree, multi-format viewer, video frame capture); large media is processed on the client and the resulting artifacts submitted back to the server, while most content-processing workloads run server-side. Voice stays fully local too: push-to-talk dictation records `webm/opus` client-side and transcribes through a FunASR SenseVoiceSmall CPU sidecar, and a hands-free voice call is opened with one click — WebAudio energy-VAD segments speech, end-of-speech auto-sends (reasoning tokens suppressed only on call turns), Kokoro reads the answer aloud, and talking over playback barges in and interrupts; a call overlay paints a live spectrum. Videos become PPT/PDF study booklets: subtitle timestamps drive keyframe extraction, one frame plus its caption per page, with CJK-safe fonts so Chinese renders correctly; TTS auto-switches Chinese/English voices, synthesizes sentence-by-sentence so the first sentence plays back immediately, and caches waveforms by content hash for zero-latency replays. The complete backend stack — PostgreSQL/pgvector, Redis, TEI embeddings, Kokoro TTS, FunASR STT, and LiteLLM gateway — deploys seamlessly via `docker-compose`, keeping your workspace data and core backend services within your own infrastructure.
 - **Authority / projection / index separation.** Three layers are explicitly decoupled: the server scratch directory is the single authority for task state and artifacts, the cloud-drive task folder is the user-visible projection (spec and session history update in place, and report artifacts mirror live into `outputs/<task name>.md` — no asset explosion), and promotion mints a per-run versioned `outputs/<stem>_vN.md` final flipped to RAG-pending to trigger indexing — the original upload path is no longer used.
 
 ## ✅ Implementation status
@@ -99,6 +99,10 @@ DeepDive implements a controllable agent runtime rather than delegating orchestr
 | Agent Runtime | ✅ Implemented |
 | Dual-track Memory | ✅ Implemented |
 | Configurable Retrieval | ✅ Implemented |
+| Configurable RAG Node Pipeline | ✅ Implemented |
+| Voice I/O | ✅ Implemented |
+| Deck & Artifact Compilers | ✅ Implemented |
+| Workflow Core | ✅ Implemented |
 | Async Job System | ✅ Implemented |
 | Cloud Drive & Workspaces | ✅ Implemented |
 | Auth / RBAC / ACL | ✅ Implemented |
@@ -145,9 +149,11 @@ python scripts/init_db.py
 uvicorn apps.api.main:app --reload     # http://localhost:8300/docs
 ```
 
-### Option C — Self-hosted LLM
+### Option C — LLM backend: self-hosted or external
 
-The LiteLLM gateway routes the virtual model `deepdive-chat` to any OpenAI-compatible upstream (`LLM_UPSTREAM_BASE`). Point it at a self-hosted server (vLLM / Ollama / …) to run the whole AI stack on your own hardware, or at an external provider — no code change.
+The LiteLLM gateway routes the virtual model `deepdive-chat` to any OpenAI-compatible upstream (`LLM_UPSTREAM_BASE`). Point it at a self-hosted server (vLLM / Ollama / …) to run the whole AI stack on your own hardware, or at an external provider — no code changes.
+
+The LLM backend is independent of how you launch DeepDive (Option A or B) and can be deployed separately.
 
 Full manual steps, environment variables, and the desktop/web/admin walkthrough: [docs/getting-started.md](docs/getting-started.md) · [docs/configuration.md](docs/configuration.md).
 
