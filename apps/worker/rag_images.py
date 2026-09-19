@@ -238,6 +238,7 @@ async def caption_chunks(
     axis_key: str,
     anchor_label: str,
     max_concurrency: int = 4,
+    user_id=None,
 ) -> list:
     """Vision-LLM caption every unique scanned image → searchable leaf chunks.
 
@@ -248,6 +249,11 @@ async def caption_chunks(
     - one caption per unique image bytes (same picture on several anchors is described
       once, riding all its anchors);
     - per-image failure logs a warning and skips — captioning must never fail the ingest;
+      an unauthorized vision channel (``VisionNotAuthorized``) or an exhausted trial chain
+      (``VisionUnsupported``) are such skips;
+    - ``user_id`` (the document owner) binds the vision call to a role inside the
+      permission funnel — headless jobs resolve channels as the owner, never via an
+      unbound key;
     - ``axis_key`` is the meta key the text chunks use (``pages`` / ``paras``) so caption
       and text share one anchor vocabulary; ``anchor_label`` is the human wording inside
       the caption body (``page`` / ``paragraph`` / ``slide``).
@@ -291,6 +297,7 @@ async def caption_chunks(
                         job["img"]["mime"],
                         llm=llm,
                         session_factory=session_factory,
+                        user_id=user_id,
                     )
                 ).strip()
         except Exception as exc:  # noqa: BLE001 — enrichment must never fail the ingest

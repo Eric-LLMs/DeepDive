@@ -693,6 +693,7 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
                     session_factory=ctx["session_factory"],
                     axis_key=axis_key,
                     anchor_label=anchor_label,
+                    user_id=asset.user_id,
                 )
                 if caps and cfg.cjk:
                     from rag.query.cjk import segment

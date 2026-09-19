@@ -6,13 +6,14 @@ This tool resolves the image bytes from the cloud drive, sends them to the visio
 configured in the admin console's Model Catalog, and returns the model's analysis so the
 agent can discuss the visual content.
 
-The vision model's serving channel is resolved the same way the chat router does it
-(``_shared._channel_route``): a catalog entry (``LLMModelModel``) → its active route
-(``CredentialModelModel``) → the credential (``LLMCredentialModel``). Which catalog model
-is used is set via ``tools.vision.model`` in the admin console's Tools config; when empty,
-the first active catalog model is the default. The channel resolution and the one-shot
-``describe_image`` call live in ``core.infrastructure.vision_caption`` so the RAG ingest
-worker (image captioning at index time) can reuse them without importing this module.
+The vision model's serving channel is resolved inside the unified permission funnel
+(``core.infrastructure.vision_caption.resolve_vision_channels``): only channels bound to the
+requesting user's role are eligible — never an unbound/global key. ``tools.vision.model`` in
+the admin Tools config pins the catalog entry when set; otherwise the authorized models are
+tried in order, ``vision``-named first, remaining ones as a capability gamble. The resolution
+and the one-shot ``describe_image`` call live in ``core.infrastructure.vision_caption`` so
+the RAG ingest worker (image captioning at index time) can reuse them without importing
+this module.
 """
 from __future__ import annotations
 
@@ -21,9 +22,12 @@ from uuid import UUID
 
 from agent import Context, ToolExecution, ToolOutput, ToolRuntime, define_tool, text_block
 from core.infrastructure.drive_repositories import SqlAssetRepository
+from core.infrastructure.request_context import get_request_user_id
 from core.infrastructure.storage import object_key
 from core.infrastructure.vision_caption import (
     DEFAULT_PROMPT as _DEFAULT_PROMPT,
+    VisionNotAuthorized,
+    VisionUnsupported,
     describe_image,
     mime_for as _mime_for,
 )
@@ -47,13 +51,21 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
         question = (args.get("question") or "").strip()
         asset, data = await _load_asset(asset_id, ctx)
         prompt = f"基于所附图片回答以下问题：{question}" if question else _DEFAULT_PROMPT
-        return await describe_image(
-            data,
-            _mime_for(asset),
-            llm=llm,
-            session_factory=ctx.resolve("session_factory"),
-            prompt=prompt,
-        )
+        try:
+            return await describe_image(
+                data,
+                _mime_for(asset),
+                llm=llm,
+                session_factory=ctx.resolve("session_factory"),
+                prompt=prompt,
+                user_id=get_request_user_id() or asset.user_id,
+            )
+        except VisionNotAuthorized as exc:
+            # Surface the authorization failure honestly — the agent tells the user instead
+            # of the tool silently trying another key.
+            return f"Vision analysis refused: {exc}"
+        except VisionUnsupported as exc:
+            return f"Image processing not supported: {exc}"
 
     runtime.register(
         define_tool(

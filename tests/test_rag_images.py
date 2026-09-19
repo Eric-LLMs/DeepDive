@@ -71,9 +71,11 @@ async def test_caption_chunks_dedupes_by_bytes(monkeypatch):
     import core.infrastructure.vision_caption as vc
 
     calls: list[bytes] = []
+    uids: list = []
 
-    async def _d(data, mime="", *, llm, session_factory, prompt=None):
+    async def _d(data, mime="", *, llm, session_factory, prompt=None, user_id=None, role_id=None):
         calls.append(data)
+        uids.append(user_id)
         return "a red square"
 
     monkeypatch.setattr(vc, "describe_image", _d)
@@ -84,8 +86,10 @@ async def test_caption_chunks_dedupes_by_bytes(monkeypatch):
     chunks = await caption_chunks(
         scans, ids, "deck.pptx",
         llm=None, session_factory=None, axis_key="pages", anchor_label="slide",
+        user_id="owner-1",
     )
     assert len(calls) == 1  # same bytes captioned once
+    assert uids == ["owner-1"]  # owner identity reaches the funnel
     assert len(chunks) == 1
     c = chunks[0]
     assert "slide 1, slide 2" in c.content_en and "a red square" in c.content_en
@@ -98,7 +102,7 @@ async def test_caption_chunks_dedupes_by_bytes(monkeypatch):
 async def test_caption_chunks_skip_failures(monkeypatch):
     import core.infrastructure.vision_caption as vc
 
-    async def _boom(data, mime="", *, llm, session_factory, prompt=None):
+    async def _boom(data, mime="", *, llm, session_factory, prompt=None, user_id=None, role_id=None):
         raise RuntimeError("vision down")
 
     monkeypatch.setattr(vc, "describe_image", _boom)
@@ -113,7 +117,7 @@ async def test_caption_chunks_skip_failures(monkeypatch):
 async def test_caption_chunks_empty_caption_skipped(monkeypatch):
     import core.infrastructure.vision_caption as vc
 
-    async def _empty(data, mime="", *, llm, session_factory, prompt=None):
+    async def _empty(data, mime="", *, llm, session_factory, prompt=None, user_id=None, role_id=None):
         return "   "
 
     monkeypatch.setattr(vc, "describe_image", _empty)

@@ -1487,7 +1487,7 @@ over exactly those hits, so a rating survives reopen without re-querying retriev
 | Delete a message's owned screenshot | `messages.attach_asset_id` → cascade soft-delete by id (folder-agnostic); `?delete_assets=0` on edit-reask keeps it; the stable `RAG/images` copy an imported Q&A references is a separate asset row that survives the delete (§18.2) |
 | Save a derived asset with its source | `assets.source_asset_id` (FK `ON DELETE CASCADE`) + content-hash dedup (`get_by_source_content`) |
 | Attach document images to RAG chunks | page/slide/para markers → chunk `meta.pages` / `meta.image_ids` (union across pages, state machine covers unmarked blocks); optional vision-LLM `image_caption` leaf chunk per unique image (§18.3) |
-| Route the vision tool to a model | `tools.vision.model` → catalog model → route → credential (`vision_caption.resolve_vision_channel`) |
+| Route the vision tool to a model | inside the permission funnel (`vision_caption.resolve_vision_channels`): role-authorized channels only — `tools.vision.model` pins one of them, else `vision`-named first then the rest as a capability gamble; never an unbound key (§18.5) |
 | Compile a publication PDF from the finalized manuscript | `ArtifactCompileService.compile_project_pdf` (`plugins/artifact/`): zero-LLM deterministic projection (`project_manuscript_to_ast`, inv. 11) → Typst CLI → drive binary + `outputs/<task name>_v{N}.pdf` mirror; **default-ON** sibling branch of the PUBLISH node (opt out with `pdf_report: false`; a PDF fault still publishes and writes `pipeline.publish.pdf_error`) — see §21 |
 | Generate a 16:9 slide deck from documents / subtitles / sessions | deck engine `toolkit/deck/` (brief chain): Pass A section-understanding (`A/text_i`, per concept batch) → Pass B multimodal visual-understanding (`B/visual_*`) → Pass C hierarchical reduce (`C/reduce_gN` + merge, threshold 15) → Pass D synthesize the canonical `PresentationBrief` (`D/synthesize`) with bounded QA repair (`D-repair/<slide>` / `notes_*` / `resynth`) → deterministic layout compilation (Pillow visuals, native editable `.pptx`, Typst PDF); deterministic wire-slip repair before validation (number coercion, locator echo reparse + unambiguous-doc backfill, prose-wrap unwrap, enum normalization — never trimming or guessing); actionable corrective retries (missing-locator exact-shape directive with honest CLAIM/GROUNDED_SYNTHESIS relabel); canonical `<name>_slides.pdf` + `.md`/`.pptx`/`deck.json`; no silent trimming, loud fail on residual gate violations; per-node real-usage stats (`BRIEF STATS` log + `deck_stats` on the job result, mounted before await so failed runs keep partial stats); dialog knobs (count 3..20 / language / format / guidance) routed per pass — see [docs/content-to-slides.md](content-to-slides.md) |
 
@@ -3211,9 +3211,11 @@ flowchart TD
   unchanged document reproduces identical caption text.
 - **Enrichment must never fail the ingest.** Each vision call is wrapped individually:
   timeout / channel error / empty response logs a warning and drops only that image's chunk —
-  mirroring the PDF table-transcription doctrine (§10.7). If no vision model is configured,
-  `resolve_vision_channel` raises once, every caption is skipped, and the document still
-  indexes as pure text with image references intact.
+  mirroring the PDF table-transcription doctrine (§10.7). Captioning resolves its channel as
+  the *document owner* (`user_id=asset.user_id`) through the same permission funnel as the
+  chat `vision` tool (§18.5) — no unbound-key fallback on the headless path either. If the
+  owner's role has no authorized vision model, `resolve_vision_channels` raises once, every
+  caption is skipped, and the document still indexes as pure text with image references intact.
 - **The flag defaults on, including for stored configs.** `from_dict` reads
   `image_captions` with a `True` fallback, so pipeline configs persisted before this feature
   exist activate captioning on the next re-index; operators opt out per-config in the admin
@@ -3230,10 +3232,12 @@ flowchart TD
 `save_images` / `caption_chunks`); `apps/worker/tasks.py` (`asset_ingest`: marker regexes,
 `on_split` state machine, caption hook-in between `build_chunks` and `_embed_and_index`);
 `packages/rag/pipeline/pipeline_config.py` (`image_captions` flag);
-`packages/core/infrastructure/vision_caption.py` (`resolve_vision_channel` /
-`describe_image`); consumers: `apps/api/tools/vision_tool.py`, PDF table transcription in
-`ingest.py`. Tests: `tests/test_rag_images.py` (scan anchors, template normalization, marker
-roundtrip, caption dedup/skip, config default).
+`packages/core/infrastructure/vision_caption.py` (`resolve_vision_channels` /
+`rank_vision_entries` / `describe_image`); consumers: `apps/api/tools/vision_tool.py`, PDF
+table transcription in `ingest.py`. Tests: `tests/test_rag_images.py` (scan anchors,
+template normalization, marker roundtrip, caption dedup/skip, owner-id threading, config
+default), `tests/test_vision_funnel.py` (selection ranking, configured-model authorization,
+trial-chain fallback, refusal errors).
 
 ### 18.4 Derived-image lifecycle (delete / trash / purge / restore)
 
@@ -3251,13 +3255,29 @@ The service mirrors the FK cascade for every soft path (`drive_service.py`):
 ### 18.5 Vision routing
 
 The `vision` tool (`apps/api/tools/vision_tool.py`) reads an attached image by `asset_id` and
-asks a vision-capable model. The shared plumbing lives in
-`core.infrastructure.vision_caption`: `resolve_vision_channel` resolves `tools.vision.model`
-(admin Tools config) → catalog model → its routing → credential, and `describe_image` sends one
-OpenAI-compatible request (`image_url` with a `data:` URL; images in the `user` message) — the
-RAG ingest worker reuses the same two functions for caption chunks (§18.3) without importing
-the API tool module. An empty model name falls back to the first active catalog model. The
-vision tool is **not** allowlisted in the gateway (the composition
+asks a vision-capable model. Routing obeys one doctrine: **image models go through the same
+permission funnel as chat models** — `resolve_vision_channels` in
+`core.infrastructure.vision_caption` applies the same gates as `llm_routing.resolve_effective_channel`
+(role-bound active credentials minus user-level token bans), so only models the requesting
+user's **role is authorized for** are ever reachable; falling back to an unbound/global key
+is forbidden. Guests are not special-cased here — their vision calls meter against the
+existing per-role request quota in `security.authorize_usage` (admin grants a vision channel
+to the guest role to enable anonymous use). Selection over the authorized set:
+
+1. `tools.vision.model` (admin Tools config) when set — it must name one of the role's
+   authorized catalog entries, else `VisionNotAuthorized` (an unauthorized pin is an
+   authorization failure, not a cue to bypass the funnel).
+2. Otherwise the authorized entries are ordered `vision`-named first (display name or
+   provider id, case-insensitive), the rest behind them as a capability gamble — models
+   judge their own image support, no `supports_vision` column exists.
+3. `describe_image` walks the ordered chain (`vision` tool: request user via
+   `request_context`; worker captioning: document owner): first non-empty answer wins,
+   errors/empties advance. Nothing left → `VisionUnsupported`.
+
+Both terminal states are surfaced honestly — the chat tool returns "refused / not
+supported" text for the agent to relay, captioning skips with a warning — never a silent
+second key. The RAG ingest worker reuses the same functions for caption chunks (§18.3)
+without importing the API tool module. The vision tool is **not** allowlisted in the gateway (the composition
 root in `agent_factory.py` allows `rag_search` + the toolkit generators), so the model reaches
 it through a `tool_search` discovery hop when an `[Attached: …]` note calls for it — see
 [§5.2](#52-agent-loop--reactloopagent).
