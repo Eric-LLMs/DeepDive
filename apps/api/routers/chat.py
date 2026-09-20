@@ -203,13 +203,56 @@ def _viewer_abort(assembly: dict | None) -> dict | None:
     return None
 
 
+def _viewer_stub_reads(messages: list[dict] | None, stub_asset_id: str) -> list[dict]:
+    """Every ``read_document`` call this turn made against the stub's asset.
+
+    Enumerated from the assistant ``tool_calls`` (flat {id, name, arguments} shape), so
+    FAILED calls are recorded too — the trace documents what the model tried, not only
+    what succeeded. ``pages`` is the actual argument (None = full-document read).
+    """
+    reads: list[dict] = []
+    for m in messages or []:
+        for tc in m.get("tool_calls") or []:
+            if tc.get("name") != "read_document":
+                continue
+            args = tc.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:  # noqa: BLE001 - malformed args: asset match untestable
+                    args = {}
+            args = args if isinstance(args, dict) else {}
+            if str(args.get("asset_id") or "") != str(stub_asset_id):
+                continue
+            reads.append({"tool_call_id": tc.get("id"), "pages": args.get("pages")})
+    return reads
+
+
 async def _viewer_post_turn(
     assembly: dict | None, body: ChatRequest, answer: str,
+    messages: list[dict] | None,
     user_message_id: str | None, assistant_message_id: str | None,
 ) -> dict | None:
     """Persist the sent-time snapshot (user row) + citation map/validation (assistant
-    row) — both under dedicated ``meta`` keys, fully separate from ``meta["retrieval"]``."""
-    if not assembly or assembly["status"] != "injected":
+    row) — both under dedicated ``meta`` keys, fully separate from ``meta["retrieval"]``.
+
+    ``status=="stub"`` instead traces the tool-driven read: the Viewer Access Context
+    section told the model to call ``read_document``, and we record which calls it actually
+    made (incl. failures) against that asset on the assistant row."""
+    if not assembly:
+        return None
+    if assembly["status"] == "stub":
+        stub = assembly.get("stub") or {}
+        reads = _viewer_stub_reads(messages, stub.get("asset_id"))
+        payload = {
+            "mode": assembly["mode"], "status": "stub",
+            "asset_id": stub.get("asset_id"), "current_page": stub.get("page"),
+            "reads": reads,
+        }
+        if assistant_message_id:
+            await _persist_turn_meta(assistant_message_id, "viewer", payload)
+        return payload
+    if assembly["status"] != "injected":
         return None
     blocks = assembly["blocks"]
     if user_message_id:
@@ -828,7 +871,7 @@ async def chat(
             base_url=base_url or None,
             api_key=api_key or None,
             context={**({"handoff": effective_handoff} if effective_handoff else {}),
-                     **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] == "injected" else {})} or None,
+                     **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] in ("injected", "stub") else {})} or None,
         )
     finally:
         # /chat owns the run for the lifetime of this request. Hand the finished interactive
@@ -891,7 +934,8 @@ async def chat(
     if retrieval:
         await _persist_retrieval_meta(assistant_message_id, retrieval)
     viewer_payload = await _viewer_post_turn(
-        viewer_assembly, body, result.final_answer, user_message_id, assistant_message_id
+        viewer_assembly, body, result.final_answer, result.messages,
+        user_message_id, assistant_message_id
     )
     resp = {
         "answer": result.final_answer,
@@ -1109,7 +1153,7 @@ async def chat_stream(
                     base_url=base_url or None,
                     api_key=api_key or None,
                     context={**({"handoff": effective_handoff} if effective_handoff else {}),
-                             **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] == "injected" else {})} or None,
+                             **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] in ("injected", "stub") else {})} or None,
                     progress_sink=lambda evt: frames.put_nowait(("agent", evt)),
                     # Viewer FOCUS turns are on-screen Q&A about a small window of content —
                     # never pay the thinking prefill tax for them (voice-call precedent).
@@ -1186,7 +1230,8 @@ async def chat_stream(
                 await _persist_retrieval_meta(assistant_message_id, retrieval)
                 done["retrieved"] = retrieval
             viewer_payload = await _viewer_post_turn(
-                viewer_assembly, body, answer, user_message_id, assistant_message_id
+                viewer_assembly, body, answer, (final_payload or {}).get("messages"),
+                user_message_id, assistant_message_id
             )
             if viewer_payload:
                 done["viewer"] = viewer_payload

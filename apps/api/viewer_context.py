@@ -54,7 +54,7 @@ def estimate_tokens(text: str) -> int:
 # about content with the viewer open is about the content on screen. Only an unmatched
 # question (or an imperative/task request) → NONE.
 _LOCAL_WORDS = re.compile(
-    r"[这那][一]?(?:段|页|部分|句话?|小节)|第[一二三四五六七八九十百千\d]+[页张]|本[页张]|(?:这|那)[一]?篇(?!章|目|节|论文|文章)|这[一]?个?图|这张图|当前|现在|此时|这会儿|刚才|上面|下方|文中提到|此刻|这几[个张]?"
+    r"[这那][一]?(?:段|页|部分|句话?|小节)|第[一二三四五六七八九十百千\d]+(?:\s*(?:[-–~]|到)\s*[一二三四五六七八九十百千\d]+)?[页张]|本[页张]|(?:这|那)[一]?篇(?!章|目|节|论文|文章)|这[一]?个?图|这张图|当前|现在|此时|这会儿|刚才|上面|下方|文中提到|此刻|这几[个张]?"
     r"|\bthis (?:page|passage|paragraph|section|figure|image|chart|part|one)\b"
     r"|\bhere\b|\bcurrent(?:ly)? (?:page|section|slide|frame)\b|\bjust now|\babove\b|\bbelow\b"
     r"|\b(?:it|they|them|they'?re)\b",
@@ -98,6 +98,12 @@ def classify_viewer_mode(message: str, viewer: ViewerPayload | None) -> str:
     if _INTERROGATIVE_WORDS.search(message):
         return "FOCUS"
     return "NONE"
+
+
+# Viewer kinds the ``read_document`` tool can actually open — the stub router only fires for
+# these. Images/videos are excluded on purpose: they have page/text-less pipelines (vision /
+# subtitles) and a stub would send the model to a tool that cannot serve them.
+_STUB_DOC_KINDS = frozenset({"pdf", "office", "text", "markdown"})
 
 
 # ── subtitle window (media time) ──────────────────────────────────────────────
@@ -223,6 +229,23 @@ def build_viewer_blocks(
             ))
 
     if mode == "NONE":
+        # Stub eligibility: the viewer is open and followed, the asset passed the caller's
+        # read permission, NOTHING was injectable (no P0 selection survived) and the asset is
+        # a document ``read_document`` can actually open — images/videos keep the old silent
+        # NONE path (the model has no page/text tool for them and must not be routed there).
+        if (
+            not blocks
+            and viewer.follow
+            and usable_asset_id
+            and viewer.kind in _STUB_DOC_KINDS
+        ):
+            return _finish(
+                mode, blocks, viewer, rejected, status="stub",
+                stub={
+                    "name": viewer.name, "kind": viewer.kind,
+                    "asset_id": usable_asset_id, "page": viewer.page,
+                },
+            )
         return _finish(mode, blocks, viewer, rejected)
 
     # ── FOCUS / FULL main content ──
@@ -279,7 +302,7 @@ def build_viewer_blocks(
 
 
 def _finish(mode: str, blocks: list[ViewerBlock], viewer: ViewerPayload, rejected: list[str],
-            status: str | None = None) -> dict:
+            status: str | None = None, stub: dict | None = None) -> dict:
     for i, b in enumerate(blocks, start=1):
         b.tag = f"V{i}"
     if status is None:
@@ -289,6 +312,7 @@ def _finish(mode: str, blocks: list[ViewerBlock], viewer: ViewerPayload, rejecte
         "status": status,
         "blocks": blocks,
         "rejected": rejected,
+        "stub": stub,
         "asset": {"asset_id": str(viewer.asset_id) if viewer.asset_id else None,
                   "name": viewer.name, "kind": viewer.kind,
                   "page": viewer.page, "t_ms": viewer.t_ms},
@@ -309,6 +333,52 @@ _HEADER = (
 )
 
 
+def render_viewer_access_context(stub: dict) -> str:
+    """Trusted control section for a document that is OPEN but was not injected this turn.
+
+    Physically separate from ``_HEADER``/``[Vn]``: those carry UNTRUSTED data, this one
+    carries app-generated routing instructions, so it must never be spliced into the user
+    message or into a data block — it renders alone in the DYNAMIC_SUFFIX zone. The asset
+    name is user data and gets fenced: a crafted filename must not be able to forge a
+    bullet line of the trusted section.
+    """
+    aid = stub.get("asset_id")
+    page = stub.get("page")
+    page_ok = isinstance(page, int) and page > 0
+    pages_arg = f'pages="{page}"' if page_ok else 'pages="<current_page>"'
+    lines = [
+        "## Viewer Access Context",
+        "The user currently has a document open in the viewer.",
+        f"- Asset Name: {_fence(stub.get('name') or '')}",
+        f"- Asset ID: {aid}",
+        f"- Current Page: {page if page_ok else 'N/A'}",
+        "",
+        "Routing Guidelines:",
+        '- For page-addressable documents (e.g., PDF, PPTX), if the user\'s query refers to '
+        'the current page (e.g., "this page", "here"):',
+        f"  * Call read_document(asset_id=\"{aid}\", {pages_arg}).",
+        '  * If current_page is "N/A" or unavailable, do NOT fabricate a page number or '
+        'pass "N/A" as `pages`.',
+        '- If the user specifies particular pages or page ranges (e.g., "page 1", '
+        '"pages 2-5", "page 2 and 5"), pass them via `pages`.',
+        '- For documents without a page-addressable axis (e.g., DOCX, TXT, Markdown, CSV, '
+        "XLSX, subtitles):",
+        "  * Do NOT use `pages`; the tool will reject page-scoped requests for those formats.",
+        "  * Never replace a page-scoped request with a full-document read. If no directly "
+        "injected page/selection content is available, state that page-scoped reading is "
+        "unavailable for this format rather than pretending the full document is the "
+        "requested page.",
+        "- If the query requires the entire document, omit the `pages` parameter.",
+        "- Reading the viewer material is mandatory when the question concerns it. Web/RAG "
+        "search may supplement the answer when the task requires external knowledge, current "
+        "information, comparison, or additional research, but must never replace reading the "
+        "viewer material.",
+        "- If the user query is unrelated chatter, answer directly without calling "
+        "read_document.",
+    ]
+    return "\n".join(lines)
+
+
 def render_viewer_reference(blocks: list[ViewerBlock]) -> str:
     """Render blocks into the dynamic-suffix section body ('' when nothing to inject)."""
     if not blocks:
@@ -326,14 +396,21 @@ async def viewer_reference_section(context: dict) -> str:
     """Prompt section callable registered on the kernel assembler (DYNAMIC_SUFFIX).
 
     Reads this turn's sunk viewer assembly from ``AgentTurn.context["viewer"]``. No turn,
-    no ``viewer`` key, or an aborted assembly → ``""`` — the assembled prompt stays
-    byte-identical to the legacy chat path.
+    no ``viewer`` key, or an aborted/empty assembly → ``""`` — the assembled prompt stays
+    byte-identical to the legacy chat path. ``"stub"`` renders the trusted
+    Viewer-Access-Context control section *instead of* any data section — the two never
+    co-occur.
     """
     turn = (context or {}).get("turn") or current_turn()
     if turn is None or not getattr(turn, "context", None):
         return ""
     assembly = turn.context.get("viewer")
-    if not assembly or assembly.get("status") != "injected":
+    if not assembly:
+        return ""
+    status = assembly.get("status")
+    if status == "stub":
+        return render_viewer_access_context(assembly.get("stub") or {})
+    if status != "injected":
         return ""
     return render_viewer_reference(assembly.get("blocks") or [])
 

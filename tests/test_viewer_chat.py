@@ -7,9 +7,13 @@ before the agent runs, the user message is NEVER prefixed with viewer content, a
 per-turn metadata lands under dedicated ``meta["viewer"]`` / ``meta["viewer_citations"]``
 keys that cannot collide with ``meta["retrieval"]``.
 """
+import asyncio
+import json
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from api.auth import AuthUser
 from api.routers import chat as chat_mod
 from api.schemas import ChatRequest, ViewerPayload, ViewerSelection
 from api.viewer_context import build_viewer_blocks
@@ -125,7 +129,7 @@ async def test_post_turn_persists_dedicated_keys(monkeypatch):
     body = _body()
     a = build_viewer_blocks(body.viewer, body.message)
     payload = await chat_mod._viewer_post_turn(
-        a, body, "as [V1] says … and also [V9]", "uid-1", "aid-1")
+        a, body, "as [V1] says … and also [V9]", [], "uid-1", "aid-1")
     keys = {(m, k) for m, k, _ in saved}
     assert keys == {("uid-1", "viewer"), ("aid-1", "viewer_citations")}
     snapshot = saved[0][2]
@@ -143,10 +147,12 @@ async def test_post_turn_skips_non_injected(monkeypatch):
     calls = []
     monkeypatch.setattr(chat_mod, "_persist_turn_meta",
                         lambda *a: calls.append(a))
-    v = ViewerPayload(name="x.pdf", asset_id=AID)  # no focus text → blocks empty
+    # follow=False keeps this a true ``none`` — a followed pdf viewer would now stub.
+    v = ViewerPayload(name="x.pdf", asset_id=AID, follow=False)  # no focus text → no blocks
     a = build_viewer_blocks(v, "今天天气怎么样")
+    assert a["status"] == "none"
     assert await chat_mod._viewer_post_turn(a, ChatRequest(message="今天天气怎么样", viewer=v),
-                                            "sunny", "u", "x") is None
+                                            "sunny", [], "u", "x") is None
     assert calls == []
 
 
@@ -159,5 +165,159 @@ async def test_post_turn_tolerates_missing_ids(monkeypatch):
     monkeypatch.setattr(chat_mod, "_persist_turn_meta", fake_persist)
     body = _body()
     a = build_viewer_blocks(body.viewer, body.message)
-    p = await chat_mod._viewer_post_turn(a, body, "[V1]", None, None)
+    p = await chat_mod._viewer_post_turn(a, body, "[V1]", [], None, None)
     assert saved == [] and p["status"] == "injected"  # done frame still carries citations
+
+
+# ── stub trace: tool-driven reads recorded on the assistant row ───────────────
+
+async def test_post_turn_stub_trace_captures_failed_reads(monkeypatch):
+    saved: list[tuple] = []
+
+    async def fake_persist(message_id, key, value):
+        saved.append((message_id, key, value))
+
+    monkeypatch.setattr(chat_mod, "_persist_turn_meta", fake_persist)
+    v = ViewerPayload(name="paper.pdf", kind="pdf", provenance="cloud", asset_id=AID,
+                      page=3, focus_text=None)
+    # "今天天气怎么样" matches no regex → NONE; followed readable pdf → stub
+    a = build_viewer_blocks(v, "今天天气怎么样")
+    assert a["status"] == "stub" and a["stub"]["asset_id"] == str(AID)
+
+    messages = [
+        {"role": "user", "content": "今天天气怎么样"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            # FAILED call (string args, bad pages) — must still be traced
+            {"id": "c1", "name": "read_document",
+             "arguments": json.dumps({"asset_id": str(AID), "pages": "0"})},
+            # call against a different asset — must be ignored
+            {"id": "c2", "name": "read_document",
+             "arguments": json.dumps({"asset_id": str(uuid4())})},
+            # successful full-document read — dict args shape, pages None
+            {"id": "c3", "name": "read_document",
+             "arguments": {"asset_id": str(AID)}},
+        ]},
+    ]
+    p = await chat_mod._viewer_post_turn(
+        a, ChatRequest(message="今天天气怎么样", viewer=v), "answer", messages,
+        "uid-9", "aid-9")
+    assert p == {"mode": "none", "status": "stub", "asset_id": str(AID),
+                 "current_page": 3,
+                 "reads": [{"tool_call_id": "c1", "pages": "0"},
+                           {"tool_call_id": "c3", "pages": None}]}
+    assert saved == [("aid-9", "viewer", p)]  # assistant row only; user snapshot is injected-only
+
+
+# ── streaming E2E: /chat/stream stub routing + failed-read trace in done ─────
+
+import httpx  # noqa: E402
+from agent.security.approvals import MemoryApprovalBroker  # noqa: E402
+from api.auth import require_user_optional  # noqa: E402
+from api.deps import get_drive_service, get_task_queue  # noqa: E402
+from api.routers.chat import router as chat_router  # noqa: E402
+from core.infrastructure.db import UserRoleModel  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+
+from tests._memory_v2_fakes import Db, FakeSession, Llm  # noqa: E402
+
+
+class _HttpSession(FakeSession):
+    async def get(self, model, pk):
+        return None
+
+
+class _Agent:
+    """Stands in for get_agent(): records the sunk context, emits one tool round trip."""
+
+    def __init__(self, done_payload):
+        self.done_payload = done_payload
+        self.contexts: list[dict | None] = []
+
+    async def run_stream(self, user_text, history, **kw):
+        self.contexts.append(kw.get("context"))
+        yield {"type": "content", "data": "checking the page…"}
+        yield {"type": "done", "data": self.done_payload}
+
+
+async def test_stream_stub_enters_agent_and_traces_failed_read(monkeypatch, tmp_path):
+    sid = uuid4()
+    db = Db(rows=[])
+    monkeypatch.setattr(chat_mod, "SessionLocal", lambda: _HttpSession(db))
+    monkeypatch.setattr(chat_mod, "llm", Llm())
+    monkeypatch.setattr(chat_mod, "_embedder", lambda: None)
+
+    async def _route(session, token, role_id):
+        return "http://fake", "key", "model", "biz", None
+
+    monkeypatch.setattr(chat_mod, "_resolve_chat_route", _route)
+
+    async def _authz(session, uid, role):
+        return "free"
+
+    monkeypatch.setattr(chat_mod, "authorize_usage", _authz)
+    monkeypatch.setattr(chat_mod, "_resolve_research_context",
+                        lambda *a, **k: (None, None, None, None))
+    saved: list[tuple] = []
+
+    async def _persist(message_id, key, value):
+        saved.append((message_id, key, value))
+
+    monkeypatch.setattr(chat_mod, "_persist_turn_meta", _persist)
+
+    async def _usage(*a, **k):
+        return None
+
+    monkeypatch.setattr(chat_mod, "_log_usage", _usage)
+    monkeypatch.setattr(chat_mod, "get_approval_bridge",
+                        lambda: SimpleNamespace(broker=MemoryApprovalBroker()))
+
+    messages = [
+        {"role": "user", "content": "今天天气怎么样"},
+        # assistant tried a page-scoped read with an invalid spec — the tool FAILED;
+        # the trace contract records attempted calls, not just successful ones.
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "name": "read_document",
+             "arguments": json.dumps({"asset_id": str(AID), "pages": "0"})},
+        ]},
+        {"role": "tool", "tool_call_id": "c1",
+         "content": "Error: pages must be 1-based, got '0'"},
+    ]
+    agent = _Agent({"answer": "读到了。", "messages": messages, "usage": None})
+    monkeypatch.setattr(chat_mod, "get_agent", lambda: agent)
+
+    app = FastAPI()
+    app.include_router(chat_router)
+    app.dependency_overrides[require_user_optional] = lambda: AuthUser(
+        user_id=USER, username="alice", display_name=None,
+        role=UserRoleModel(role_id="user", role_name="User"), token_id=uuid4())
+    app.dependency_overrides[get_task_queue] = lambda: SimpleNamespace(
+        enqueue=lambda *a, **k: asyncio.sleep(0))
+    app.dependency_overrides[get_drive_service] = lambda: _Drive(readable={AID})
+
+    body = {
+        "message": "今天天气怎么样",
+        "session_id": str(sid),
+        "viewer": {"name": "paper.pdf", "kind": "pdf", "provenance": "cloud",
+                   "asset_id": str(AID), "page": 3, "follow": True},
+    }
+    transport = httpx.ASGITransport(app=app)
+    done = None
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        async with client.stream("POST", "/chat/stream", json=body) as r:
+            assert r.status_code == 200
+            async for line in r.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                evt = json.loads(line[5:].strip())
+                if evt.get("type") == "viewer":
+                    raise AssertionError("stub must not emit a viewer abort frame")
+                if evt.get("type") == "done":
+                    done = evt["data"]
+    assert done is not None
+    # 1) the stub assembly was sunk into the agent context (Access Context was in the prompt)
+    assert agent.contexts and agent.contexts[0]["viewer"]["status"] == "stub"
+    # 2) the done frame carries the trace; the FAILED tool call is in `reads`
+    vp = done["viewer"]
+    assert vp["status"] == "stub" and vp["asset_id"] == str(AID)
+    assert vp["current_page"] == 3
+    assert vp["reads"] == [{"tool_call_id": "c1", "pages": "0"}]

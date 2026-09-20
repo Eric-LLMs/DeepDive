@@ -1,8 +1,9 @@
 """Unit tests for the ``read_document`` chat tool (attached-document content extraction).
 
 Same style as ``test_document_tools.py``: a real :class:`LocalStorage` at tmp_path holds
-the asset bytes, and the SQL asset repository is monkeypatched with ``FakeAssets`` so no
-database is touched.
+the asset bytes, and the drive runs on fake repositories (``make_drive``) — the tool now
+authorizes through ``ensure_asset_readable`` before touching storage, and reads the
+request user from the ``request_user`` contextvar, exactly like a real chat turn.
 """
 from __future__ import annotations
 
@@ -16,33 +17,48 @@ from agent.engine.runtime import ToolRuntime
 from core.infrastructure.storage import LocalStorage, object_key
 
 from apps.api.tools import read_document_tool
-from tests._drive_fakes import FakeAssets
+from tests._drive_fakes import make_drive
 
 
 def _ctx(tmp_path) -> Context:
     ctx = Context()
     ctx.provide("storage", LocalStorage(tmp_path))
-    ctx.provide("session_factory", object)  # unused: the repo is monkeypatched
+    ctx.provide("session_factory", object)  # unused: the drive is monkeypatched
     return ctx
 
 
-async def _register(monkeypatch, tmp_path, name: str, data: bytes) -> tuple[ToolRuntime, str]:
-    """Store ``data`` as an asset named ``name`` and return (runtime, asset_id)."""
+async def _register(monkeypatch, tmp_path, name: str, data: str | bytes,
+                    user=None) -> tuple[ToolRuntime, str]:
+    """Store ``data`` as ``user``'s asset named ``name``; return (runtime, asset_id).
+
+    Also binds ``request_user`` to ``user`` so the tool's ACL check passes — same context
+    the chat router establishes around a turn.
+    """
+    if isinstance(data, str):
+        data = data.encode()
     storage = LocalStorage(tmp_path)
     sha = hashlib.sha256(data).hexdigest()
     await storage.put(object_key(sha), data)
-    assets = FakeAssets()
-    asset = await assets.create(uuid4(), name, object_sha256=sha)
-    monkeypatch.setattr(read_document_tool, "SqlAssetRepository", lambda sf: assets)
+    drive = make_drive(tmp_path)
+    uid = user or uuid4()
+    asset = await drive.assets.create(uid, name, object_sha256=sha)
+    monkeypatch.setattr(read_document_tool, "DriveService", lambda sf: drive)
+    read_document_tool.request_user.set(uid)
     runtime = ToolRuntime()
     read_document_tool.register(runtime, _ctx(tmp_path), llm=None)
     return runtime, str(asset.id)
 
 
-async def _call(runtime: ToolRuntime, asset_id: str):
-    return await runtime.execute(
-        ToolExecution("c1", "read_document", {"asset_id": asset_id})
-    )
+async def _call(runtime: ToolRuntime, asset_id: str, pages=None):
+    args = {"asset_id": asset_id}
+    if pages is not None:
+        args["pages"] = pages
+    return await runtime.execute(ToolExecution("c1", "read_document", args))
+
+
+def _err(res) -> str:
+    """Error text of a failed tool result (``ToolExecutionFailure`` carries no ``value``)."""
+    return str(res.error.message) + " " + " ".join(str(getattr(b, "text", b)) for b in res.content)
 
 
 async def test_reads_plain_text(monkeypatch, tmp_path):
@@ -187,14 +203,15 @@ async def test_legacy_xls_rejected_with_resave_hint(monkeypatch, tmp_path):
 
 
 async def _register_doc(monkeypatch, tmp_path, images, skipped=0):
-    """.doc attach with stubbed text extraction + scanner; returns (runtime, id, assets)."""
+    """.doc attach with stubbed text extraction + scanner; returns (runtime, id, drive)."""
     data = b"\xd0\xcf\x11\xe0doc container"
-    storage = LocalStorage(tmp_path)
     sha = hashlib.sha256(data).hexdigest()
-    await storage.put(object_key(sha), data)
-    assets = FakeAssets()
-    asset = await assets.create(uuid4(), "report.doc", object_sha256=sha)
-    monkeypatch.setattr(read_document_tool, "SqlAssetRepository", lambda sf: assets)
+    await LocalStorage(tmp_path).put(object_key(sha), data)
+    drive = make_drive(tmp_path)
+    uid = uuid4()
+    asset = await drive.assets.create(uid, "report.doc", object_sha256=sha)
+    monkeypatch.setattr(read_document_tool, "DriveService", lambda sf: drive)
+    read_document_tool.request_user.set(uid)
 
     async def _text(_data, _name, _llm):
         return "quarterly numbers [pic] and more"
@@ -202,27 +219,14 @@ async def _register_doc(monkeypatch, tmp_path, images, skipped=0):
     monkeypatch.setattr(read_document_tool, "extract_document_text", _text)
     monkeypatch.setattr(read_document_tool, "scan_doc_images", lambda _d: (images, skipped))
 
-    class FakeDrive:
-        def __init__(self, sf):
-            self.assets = assets
-
-        async def save_artifact(self, user_id, name, mime, content, *, folder_path=None,
-                                workspace_id=None, source_asset_id=None):
-            return await assets.create(
-                user_id, name, mime_type=mime, folder_path=folder_path,
-                object_sha256=hashlib.sha256(content).hexdigest(),
-                source_asset_id=source_asset_id,
-            )
-
-    monkeypatch.setattr(read_document_tool, "DriveService", FakeDrive)
     runtime = ToolRuntime()
     read_document_tool.register(runtime, _ctx(tmp_path), llm=None)
-    return runtime, str(asset.id), str(asset.id)
+    return runtime, str(asset.id), drive
 
 
 async def test_doc_images_minted_and_asset_ids_listed(monkeypatch, tmp_path):
     img = {"name": "doc_1.png", "mime": "image/png", "data": b"PNGBYTES"}
-    runtime, asset_id, src_id = await _register_doc(monkeypatch, tmp_path, [img])
+    runtime, asset_id, drive = await _register_doc(monkeypatch, tmp_path, [img])
     res = await _call(runtime, asset_id)
     out = str(res.value)
     assert res.is_error is False
@@ -230,8 +234,7 @@ async def test_doc_images_minted_and_asset_ids_listed(monkeypatch, tmp_path):
     assert "embedded image" in out and "vision" in out
 
     # exactly one derived asset, bound to the source doc, in the RAG folder
-    assets = read_document_tool.SqlAssetRepository(None)
-    saved = [a for a in assets.rows.values() if str(a.id) != src_id]
+    saved = [a for a in drive.assets.rows.values() if str(a.id) != asset_id]
     assert len(saved) == 1
     assert saved[0].source_asset_id is not None
     assert saved[0].folder_path == "RAG 图片/report"
@@ -240,11 +243,10 @@ async def test_doc_images_minted_and_asset_ids_listed(monkeypatch, tmp_path):
 
 async def test_doc_image_mint_dedupes_existing_asset(monkeypatch, tmp_path):
     img = {"name": "doc_1.png", "mime": "image/png", "data": b"PNGBYTES"}
-    runtime, asset_id, src_id = await _register_doc(monkeypatch, tmp_path, [img])
+    runtime, asset_id, drive = await _register_doc(monkeypatch, tmp_path, [img])
     await _call(runtime, asset_id)  # first call mints
     res2 = await _call(runtime, asset_id)  # second reuses the same asset row
-    assets = read_document_tool.SqlAssetRepository(None)
-    derived = [a for a in assets.rows.values() if a.source_asset_id is not None]
+    derived = [a for a in drive.assets.rows.values() if a.source_asset_id is not None]
     assert len(derived) == 1
     assert hashlib.sha256(img["data"]).hexdigest() == derived[0].object_sha256
     assert f"asset_id {derived[0].id}" in str(res2.value)
@@ -270,3 +272,177 @@ async def test_missing_asset_raises(monkeypatch, tmp_path):
     runtime, _ = await _register(monkeypatch, tmp_path, "a.txt", b"x")
     res = await _call(runtime, str(uuid4()))
     assert res.is_error is True
+
+
+# ── pages: parser matrix ──
+
+def test_parse_pages_spec_dedupes_and_sorts():
+    from apps.api.tools.read_document_tool import _parse_pages_spec
+
+    assert _parse_pages_spec("1,2-4,4") == [1, 2, 3, 4]
+    assert _parse_pages_spec(" 1, 3-5 , 8 ") == [1, 3, 4, 5, 8]
+    assert _parse_pages_spec("2-2") == [2]
+    assert _parse_pages_spec("3") == [3]
+
+
+def test_parse_pages_spec_rejects_malformed():
+    import pytest
+
+    from apps.api.tools.read_document_tool import _parse_pages_spec
+
+    for bad in ["", "   ", "1-", "-3", "abc", "1,,3", "5-2", "0", "2-0", "1,0"]:
+        with pytest.raises(ValueError):
+            _parse_pages_spec(bad)
+
+
+def test_parse_pages_spec_span_checked_before_expansion():
+    """A pathological range must raise WITHOUT building the expanded list."""
+    import pytest
+
+    from apps.api.tools.read_document_tool import _parse_pages_spec
+
+    with pytest.raises(ValueError, match="spans"):
+        _parse_pages_spec("1-1000000000")
+
+
+def test_parse_pages_spec_incremental_cap():
+    """16 unique pages pass; the 17th raises as it is added, never after."""
+    import pytest
+
+    from apps.api.tools.read_document_tool import _parse_pages_spec
+
+    assert len(_parse_pages_spec("1-16")) == 16
+    with pytest.raises(ValueError, match="per-call limit"):
+        _parse_pages_spec("1-16,17")
+
+
+# ── pages: execute-path contract ──
+
+def _pdf_pages(texts: list[str]) -> bytes:
+    import fitz
+
+    doc = fitz.open()
+    for t in texts:
+        page = doc.new_page()
+        if t:
+            page.insert_text((72, 72), t)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+async def test_pages_empty_string_and_wrong_type_are_errors(monkeypatch, tmp_path):
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "p.pdf", _pdf_pages(["a"]))
+    res = await _call(runtime, asset_id, pages="")
+    assert res.is_error is True and "non-empty" in _err(res)
+    res = await _call(runtime, asset_id, pages=3)
+    # schema validation rejects non-string pages before the executor ever runs
+    assert res.is_error is True and "not of type 'string'" in _err(res)
+
+
+async def test_pdf_page_scoped_reads_only_requested_pages(monkeypatch, tmp_path):
+    data = _pdf_pages(["page one text", "page two text", "page three text"])
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "paper.pdf", data)
+    res = await _call(runtime, asset_id, pages="1,3")
+    out = str(res.value)
+    assert res.is_error is False
+    assert "page one text" in out and "page three text" in out
+    assert "page two text" not in out
+    assert "[[Page 1]]" in out and "[[Page 3]]" in out
+
+
+async def test_pdf_out_of_range_fails_whole_call_before_extraction(monkeypatch, tmp_path):
+    data = _pdf_pages(["solo page"])
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "paper.pdf", data)
+    res = await _call(runtime, asset_id, pages="1,5")
+    assert res.is_error is True
+    # the valid page must NOT leak into the error, and the real count is reported
+    assert "has 1 page" in _err(res) and "out of range" in _err(res)
+    assert "[[Page 1]]" not in _err(res)
+
+
+async def test_pdf_empty_page_is_inline_warning_not_failure(monkeypatch, tmp_path):
+    data = _pdf_pages(["has text", ""])
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "mixed.pdf", data)
+    res = await _call(runtime, asset_id, pages="1,2")
+    out = str(res.value)
+    assert res.is_error is False
+    assert "has text" in out
+    assert "No extractable text found on this page" in out
+
+
+async def test_pptx_slide_scoped_and_notes_omitted(monkeypatch, tmp_path):
+    from io import BytesIO
+
+    from pptx import Presentation
+
+    prs = Presentation()
+    for i in (1, 2, 3):
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        slide.shapes.title.text = f"slide body {i}"
+        slide.notes_slide.notes_text_frame.text = f"secret note {i}"
+    buf = BytesIO()
+    prs.save(buf)
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "deck.pptx", buf.getvalue())
+    res = await _call(runtime, asset_id, pages="2")
+    out = str(res.value)
+    assert res.is_error is False
+    assert "slide body 2" in out
+    assert "slide body 1" not in out and "slide body 3" not in out
+    assert "secret note" not in out  # the page-scoped path never parses notes
+
+    res = await _call(runtime, asset_id, pages="9")
+    assert res.is_error is True and "has 3 slide" in _err(res)
+
+
+async def test_pages_rejected_for_no_page_axis(monkeypatch, tmp_path):
+    runtime, docx_id = await _register(monkeypatch, tmp_path, "notes.docx", b"whatever")
+    res = await _call(runtime, docx_id, pages="2")
+    assert res.is_error is True
+    assert "no page axis" in _err(res)
+    assert "PPTX/POTX/PPSX" in _err(res)
+
+    runtime, txt_id = await _register(monkeypatch, tmp_path, "plain.txt", b"hello")
+    res = await _call(runtime, txt_id, pages="2")
+    assert res.is_error is True and "no page axis" in _err(res)
+
+
+async def test_pages_truncation_applies_once_to_merged_output(monkeypatch, tmp_path):
+    from apps.api.tools import read_document_tool as rd
+
+    data = _pdf_pages(["alpha " * 100, "beta " * 100])
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "paper.pdf", data)
+    monkeypatch.setattr(rd, "MAX_OUTPUT_CHARS", 200)
+    res = await _call(runtime, asset_id, pages="1,2")
+    out = str(res.value)
+    assert res.is_error is False
+    assert "truncated" in out
+    # one cap on the MERGED result: never two per-page truncation notes
+    assert out.count("truncated") == 1
+    assert len(out) < 200 + 200
+
+
+# ── ACL before storage ──
+
+async def test_no_request_user_fails_before_storage(monkeypatch, tmp_path):
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "a.txt", b"hello")
+    token = read_document_tool.request_user.set(None)
+    try:
+        res = await _call(runtime, asset_id)
+    finally:
+        read_document_tool.request_user.reset(token)
+    assert res.is_error is True
+    assert "authenticated request user" in _err(res)
+
+
+async def test_foreign_asset_denied_before_bytes_fetch(monkeypatch, tmp_path):
+    runtime, asset_id = await _register(monkeypatch, tmp_path, "a.txt", b"hello")
+    # attacker context: the object bytes are gone from storage — an ACL hole would surface
+    # as "object bytes missing"; the ACL must fire first with a not-readable error.
+    sha = hashlib.sha256(b"hello").hexdigest()
+    await LocalStorage(tmp_path).delete(object_key(sha))
+    read_document_tool.request_user.set(uuid4())
+    res = await _call(runtime, asset_id)
+    assert res.is_error is True
+    assert "not readable" in _err(res)
+    assert "bytes missing" not in _err(res)
