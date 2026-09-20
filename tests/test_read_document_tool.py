@@ -186,6 +186,76 @@ async def test_legacy_xls_rejected_with_resave_hint(monkeypatch, tmp_path):
     assert "xlsx" in str(res.value)
 
 
+async def _register_doc(monkeypatch, tmp_path, images, skipped=0):
+    """.doc attach with stubbed text extraction + scanner; returns (runtime, id, assets)."""
+    data = b"\xd0\xcf\x11\xe0doc container"
+    storage = LocalStorage(tmp_path)
+    sha = hashlib.sha256(data).hexdigest()
+    await storage.put(object_key(sha), data)
+    assets = FakeAssets()
+    asset = await assets.create(uuid4(), "report.doc", object_sha256=sha)
+    monkeypatch.setattr(read_document_tool, "SqlAssetRepository", lambda sf: assets)
+
+    async def _text(_data, _name, _llm):
+        return "quarterly numbers [pic] and more"
+
+    monkeypatch.setattr(read_document_tool, "extract_document_text", _text)
+    monkeypatch.setattr(read_document_tool, "scan_doc_images", lambda _d: (images, skipped))
+
+    class FakeDrive:
+        def __init__(self, sf):
+            self.assets = assets
+
+        async def save_artifact(self, user_id, name, mime, content, *, folder_path=None,
+                                workspace_id=None, source_asset_id=None):
+            return await assets.create(
+                user_id, name, mime_type=mime, folder_path=folder_path,
+                object_sha256=hashlib.sha256(content).hexdigest(),
+                source_asset_id=source_asset_id,
+            )
+
+    monkeypatch.setattr(read_document_tool, "DriveService", FakeDrive)
+    runtime = ToolRuntime()
+    read_document_tool.register(runtime, _ctx(tmp_path), llm=None)
+    return runtime, str(asset.id), str(asset.id)
+
+
+async def test_doc_images_minted_and_asset_ids_listed(monkeypatch, tmp_path):
+    img = {"name": "doc_1.png", "mime": "image/png", "data": b"PNGBYTES"}
+    runtime, asset_id, src_id = await _register_doc(monkeypatch, tmp_path, [img])
+    res = await _call(runtime, asset_id)
+    out = str(res.value)
+    assert res.is_error is False
+    assert "quarterly numbers" in out
+    assert "embedded image" in out and "vision" in out
+
+    # exactly one derived asset, bound to the source doc, in the RAG folder
+    assets = read_document_tool.SqlAssetRepository(None)
+    saved = [a for a in assets.rows.values() if str(a.id) != src_id]
+    assert len(saved) == 1
+    assert saved[0].source_asset_id is not None
+    assert saved[0].folder_path == "RAG 图片/report"
+    assert f"asset_id {saved[0].id}" in out
+
+
+async def test_doc_image_mint_dedupes_existing_asset(monkeypatch, tmp_path):
+    img = {"name": "doc_1.png", "mime": "image/png", "data": b"PNGBYTES"}
+    runtime, asset_id, src_id = await _register_doc(monkeypatch, tmp_path, [img])
+    await _call(runtime, asset_id)  # first call mints
+    res2 = await _call(runtime, asset_id)  # second reuses the same asset row
+    assets = read_document_tool.SqlAssetRepository(None)
+    derived = [a for a in assets.rows.values() if a.source_asset_id is not None]
+    assert len(derived) == 1
+    assert hashlib.sha256(img["data"]).hexdigest() == derived[0].object_sha256
+    assert f"asset_id {derived[0].id}" in str(res2.value)
+
+
+async def test_doc_without_images_unaffected(monkeypatch, tmp_path):
+    runtime, asset_id, _ = await _register_doc(monkeypatch, tmp_path, [], skipped=2)
+    out = str((await _call(runtime, asset_id)).value)
+    assert "metafile" in out and "could not be rendered" in out
+
+
 async def test_long_document_is_truncated(monkeypatch, tmp_path):
     from apps.api.tools.read_document_tool import MAX_OUTPUT_CHARS
 

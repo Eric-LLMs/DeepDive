@@ -44,6 +44,10 @@ dependencies = [
     # Excel (.xlsx/.xlsm) for the research materials path — openpyxl read-only streaming
     # (lazy-imported in core/infrastructure/ingest.py::_extract_excel).
     "openpyxl>=3.1",
+    # Legacy .doc embedded-image recovery (core/infrastructure/doc_images.py): Pillow
+    # verifies raster blobs decode and renders WMF/EMF metafiles to PNG on Windows.
+    # Previously only transitive (python-pptx, reportlab); now declared explicitly.
+    "pillow>=10.0",
     # Slide generation: python-pptx backs the doc_slides agent tool (text-only .pptx) and
     # desktop Generate PPT. Lazy-imported in core/infrastructure/media.py.
     "python-pptx>=0.6.21",

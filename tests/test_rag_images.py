@@ -57,6 +57,47 @@ def test_scan_pptx_ignores_text_only_decks():
     assert scan_embedded_images(_pptx_with_pictures([[]]), "plain.pptx") == {}
 
 
+def test_scan_doc_anchors_images_to_pic_paragraphs(monkeypatch):
+    """``[pic]`` placeholders from the antiword pass decide the paragraph anchor."""
+    from core.infrastructure import doc_images, ingest
+
+    img = {"name": "doc_1.png", "mime": "image/png", "data": b"PNGDATA"}
+    monkeypatch.setattr(doc_images, "scan_doc_images", lambda data: ([img], 0))
+    monkeypatch.setattr(
+        ingest, "extract_text",
+        lambda data, name, *, para_markers=False:
+            "[[PARA:0]]\nintro\n\n[[PARA:3]]\nsee [pic] here",
+    )
+    scans = scan_embedded_images(b"container", "old.doc")
+    assert scans == {3: [img]}
+
+
+def test_scan_doc_falls_back_to_ordinal_anchors_without_text_pass(monkeypatch):
+    """No antiword on the box → anchoring degrades, but images are still scanned."""
+    from core.infrastructure import doc_images, ingest
+    from core.infrastructure.ingest import UnsupportedFileType
+
+    imgs = [
+        {"name": "doc_1.png", "mime": "image/png", "data": b"A"},
+        {"name": "doc_2.jpg", "mime": "image/jpeg", "data": b"B"},
+    ]
+    monkeypatch.setattr(doc_images, "scan_doc_images", lambda data: (imgs, 1))
+
+    def _boom(data, name, *, para_markers=False):
+        raise UnsupportedFileType("antiword not installed")
+
+    monkeypatch.setattr(ingest, "extract_text", _boom)
+    scans = scan_embedded_images(b"container", "old.doc")
+    assert scans == {0: [imgs[0]], 1: [imgs[1]]}
+
+
+def test_scan_doc_no_images_returns_empty(monkeypatch):
+    from core.infrastructure import doc_images
+
+    monkeypatch.setattr(doc_images, "scan_doc_images", lambda data: ([], 0))
+    assert scan_embedded_images(b"container", "old.doc") == {}
+
+
 def test_extract_ppt_page_markers_roundtrip():
     from apps.worker.tasks import _MARKER_STRIP, _PAGE_MARKER
     from core.infrastructure.ingest import extract_text

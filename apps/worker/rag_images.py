@@ -8,7 +8,8 @@ chunks that discuss them. This module does the "save + reference" half:
   there. Anchors are 1-based page numbers for PDF (via PyMuPDF ``get_images`` /
   ``extract_image``) and for PPTX decks (1-based slide numbers via python-pptx picture
   shapes, riding the same ``[[PAGE:n]]`` axis), and paragraph indexes for DOCX (via the
-  ``a:blip r:embed`` drawing anchors). DOCX has no native pages, so paragraph anchoring is
+  ``a:blip r:embed`` drawing anchors) and legacy DOC (via :mod:`core.infrastructure.doc_images`
+  magic-header recovery, anchored to the ``[pic]`` placeholders antiword leaves). DOCX has no native pages, so paragraph anchoring is
   the closest equivalent to "the image that travels with this chunk".
 - ``save_images`` persists each image with :meth:`DriveService.save_artifact` into a
   dedicated ``RAG 图片/<doc>`` folder, records ``source_asset_id`` (the PDF/DOCX asset) on
@@ -177,13 +178,56 @@ def _scan_pptx(data: bytes) -> dict[int, list[dict]]:
     return out
 
 
+_DOC_PARA_MARKER = re.compile(r"\[\[PARA:(\d+)\]\]")
+
+
+def _scan_doc(data: bytes) -> dict[int, list[dict]]:
+    """Map paragraph index → embedded images for a legacy .doc (OLE2) container.
+
+    Word 97 has no rels manifest, so :func:`scan_doc_images` recovers the pixels by
+    magic-header scan (file order). Anchoring reuses the same ``[[PARA:n]]`` axis as
+    DOCX: antiword leaves a ``[pic]`` placeholder per inline picture, so the Nth image
+    travels with the paragraph containing the Nth placeholder; when the text pass is
+    unavailable (no antiword) or the counts disagree, images fall back to ordinal
+    paragraph anchors — the assets still save and get captions, only the text-chunk
+    co-location becomes approximate.
+    """
+    from core.infrastructure.doc_images import scan_doc_images
+
+    images, skipped = scan_doc_images(data)
+    if skipped:
+        log.info("doc scan: %d metafile image(s) not renderable on this platform", skipped)
+    if not images:
+        return {}
+    pic_paras: list[int] = []
+    try:
+        from core.infrastructure.ingest import extract_text
+
+        text = extract_text(data, "doc.doc", para_markers=True)
+        para = 0
+        for line in text.split("\n"):
+            m = _DOC_PARA_MARKER.match(line)
+            if m:
+                para = int(m.group(1))
+            pic_paras.extend([para] * line.count("[pic]"))
+    except Exception as exc:  # noqa: BLE001 — anchoring is best-effort, saving is not
+        log.debug("doc anchor pass unavailable: %s", exc)
+    out: dict[int, list[dict]] = {}
+    for n, img in enumerate(images):
+        anchor = pic_paras[n] if n < len(pic_paras) else n
+        out.setdefault(anchor, []).append(img)
+    return out
+
+
 def scan_embedded_images(data: bytes, name: str) -> dict[int, list[dict]]:
-    """Return anchor → images for a PDF/DOCX/PPTX, or ``{}`` for formats with no image pass."""
+    """Return anchor → images for a PDF/DOCX/PPTX/DOC, or ``{}`` for formats with no image pass."""
     ext = (name or "").rsplit(".", 1)[-1].lower()
     if ext == "pdf":
         return _scan_pdf(data)
     if ext == "docx":
         return _scan_docx(data)
+    if ext == "doc":
+        return _scan_doc(data)
     if ext in {"pptx", "potx", "ppsx"}:
         return _scan_pptx(data)
     return {}

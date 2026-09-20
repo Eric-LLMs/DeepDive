@@ -679,7 +679,7 @@ async def asset_ingest(ctx, job_id: str, payload: dict) -> dict:
             # points at the original asset for the ``vision`` tool.
             if cfg.image_captions:
                 ext = (asset.name or "").rsplit(".", 1)[-1].lower()
-                if ext == "docx":
+                if ext in {"docx", "doc"}:
                     axis_key, anchor_label = "paras", "paragraph"
                 elif ext in {"pptx", "potx", "ppsx"}:
                     axis_key, anchor_label = "pages", "slide"

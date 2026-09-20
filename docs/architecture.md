@@ -119,7 +119,7 @@
 | Chat | agent loop with tool use, SSE streaming |
 | Research OS | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; **deterministic execution engine** — Python owns control flow through a 10-stage contract pipeline (`DISCOVER → FRAME → EVIDENCE → DESIGN → EXECUTE → EXPLAIN → WRITE → REVIEW → REPRODUCE → PUBLISH`) with repair-once bounded attempts, per-stage declared LLM call budgets + run-level turn/cost/no-progress caps, and guard gates at the transition fence: **strict** mode (default) parks a failed gate on a PENDING human override with zero rework on resume, lenient mode records it and continues; structural violations halt terminally (`BLOCKED`); lease-based crash recovery makes interrupted runs resumable; publication finality is the `PROMOTED` record (report + compiled PDF, optional slides via toolkit); desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module), [§20](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline) |
 | Workflow core (`packages/workflow`) | domain-free run engine behind Research OS: declarative `workflow_spec` (transitions / activities / cap dimensions / hooks) + state machine with lease contest, crash recovery, retry, loop-cap grading and definition-drift detection; adapter pattern (ports + ledger/lease persistence supplied by the plugin) — [§19](#19-workflow-core-packagesworkflow) |
-| Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX embedded images → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
+| Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX/PPTX package scans and `.doc` magic-header recovery → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
 | Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload). Auth endpoints are Redis **rate-limited per client IP** (login/register/recovery, fixed window, fail-open); `enforce_secure_secrets` fails fast at startup when the legacy `JWT_SECRET` default is untouched |
 | Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover. The Tokens page disables a user's access to a key per (user, channel); a user with no usable key degrades to the anonymous tier (guest quota) instead of losing login. **Guest access**: anonymous chat rides the `anonymous` role's channels with a per-day Redis limit (`guest_daily_limit`), 429 → prompt login — [§12.4](#124-business-logic--per-user-llm-key-assignment--the-disable-tokens-module) |
 | Admin console | single-file SPA at `/admin` with 5 modules (Providers / Roles / Users / Tokens / **Tools config**): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint). The **Tools config** module edits the generic `tools` namespace (web-search provider, SMTP, free-form key/value params) with a one-click *Test email*; the Chat Test user picker is a fuzzy-autocomplete text box; a **RAG** module adds live pipeline testing (per-node trace), chunking preview, node-topology editing, and golden-set eval |
@@ -3086,7 +3086,7 @@ differs is how each one is *bound*:
 | Class | Origin | Folder | Binding |
 |---|---|---|---|
 | Chat screenshots | desktop 📷 region capture | `chat/temp/` (temporary — user may empty) **and** `RAG/images/` once imported | `messages.attach_asset_id` — the message **owns** it |
-| RAG document images | PDF/DOCX/PPTX embedded images at ingest | `RAG 图片/<doc>/` | `assets.source_asset_id` — derived from the document |
+| RAG document images | PDF/DOCX/PPTX embedded images + `.doc` magic-scan recovery at ingest | `RAG 图片/<doc>/` | `assets.source_asset_id` — derived from the document |
 
 A folder is pure UI organization: deletion and lifecycle decisions key off these bindings,
 never off a folder path, so moving a file in the drive never breaks cleanup. `chat/temp/` is
@@ -3158,7 +3158,11 @@ The worker's `asset_ingest` job extracts embedded images alongside the text:
    paragraph that references each `a:blip` `r:embed`, giving a paragraph anchor (DOCX has no
    native page numbers — the image rides the chunk its paragraph lands in, the same intent);
    for PPTX (and `.potx`/`.ppsx`, normalized first), python-pptx picture shapes — group
-   shapes recursed — key each image by its 1-based **slide number**.
+   shapes recursed — key each image by its 1-based **slide number**; for legacy `.doc` (OLE2),
+   Word 97 stores inline pictures behind OfficeArt wrappers in the `Data` stream with **no rels
+   manifest to parse** (antiword leaves only a `[pic]` placeholder), so
+   `core.infrastructure.doc_images.scan_doc_images` recovers the pixels by a deterministic
+   **magic-header scan** — see the .doc recovery design below.
 2. **Save (dedup + bind)** — each image is uploaded to `RAG 图片/<doc>/` via
    `save_artifact(..., source_asset_id=<document id>)`; `get_by_source_content` reuses an
    existing active derived image for the same `(source, hash)`, so repeat ingests produce no
@@ -3166,8 +3170,9 @@ The worker's `asset_ingest` job extracts embedded images alongside the text:
 3. **Markers** — extraction re-runs with markers on: `extract_pdf_document(page_markers=True)`
    inserts `[[PAGE:n]]` at each page start, `_extract_ppt(page_markers=True)` inserts one
    `[[PAGE:n]]` per slide (decks share the page anchor axis), `extract_text(para_markers=True)`
-   inserts `[[PARA:n]]` per DOCX body paragraph. Both kwargs default **off**, so existing
-   callers (document_tools, toolkit, tasks) are unaffected.
+   inserts `[[PARA:n]]` per DOCX body paragraph and per blank-line-separated `.doc` paragraph
+   (the `.doc` scan's `[pic]` anchors are counted on the same marker axis). Both kwargs default
+   **off**, so existing callers (document_tools, toolkit, tasks) are unaffected.
 4. **State machine** — `build_chunks(..., on_split=...)` runs a per-chunk annotator *before*
    contextualize/CJK enrichment and strips the markers. For each chunk it reads the markers it
    contains, maintains a running page/paragraph, and writes:
@@ -3191,10 +3196,10 @@ The worker's `asset_ingest` job extracts embedded images alongside the text:
 
 ```mermaid
 flowchart TD
-    A[document bytes] --> S["scan_embedded_images<br/>PDF: page xrefs · DOCX: blip rids<br/>PPTX: picture shapes → slide no."]
+    A[document bytes] --> S["scan_embedded_images<br/>PDF: page xrefs · DOCX: blip rids · PPTX: picture shapes → slide no.<br/>DOC: magic-header scan → [pic] paragraph"]
     S -->|anchor → images| SV["save_images<br/>RAG 图片/doc/ · dedup source+sha256"]
     SV -->|anchor → asset_ids| SM["on_split state machine<br/>strip [[PAGE/PARA:n]]<br/>meta.pages|paras + image_ids"]
-    A --> EX["extract_text(page_markers=True)<br/>PDF pages / PPT slides → [[PAGE:n]]<br/>DOCX paragraphs → [[PARA:n]]"]
+    A --> EX["extract_text(page_markers=True)<br/>PDF pages / PPT slides → [[PAGE:n]]<br/>DOCX/DOC paragraphs → [[PARA:n]]"]
     EX --> SM
     SM --> CH[(text leaf chunks)]
     SV -->|unique bytes| CP["caption_chunks<br/>vision LLM ×1 per image · sem(4)<br/>failure/empty → skip"]
@@ -3206,6 +3211,27 @@ flowchart TD
 ```
 
 **Design decisions**
+
+- **`.doc` picture recovery is a magic scan, and it never drops silently.** An OLE2 Word 97
+  container has no `.rels`/media manifest — inline pictures sit behind OfficeArt wrappers in
+  the `Data` stream — so the scan locates raster magics (PNG / JPEG / BMP) and metafile headers
+  (EMF, WMF placeable/standard) and slices each candidate by its **container-declared extent**
+  (PNG: chunk-walk to `IEND`; JPEG: first `FFD9`, legal because `FF` is byte-stuffed inside the
+  entropy stream; BMP: header size with zeroed reserved fields; EMF: `EMR_HEADER.nBytes`;
+  WMF: standard-header byte count plus the 22-byte placeable prefix), rejecting any extent that
+  lies outside the container or past a 64 MB sanity cap. Every survivor must then **decode**
+  (Pillow verifies rasters; wrong silent drops would repeat the "[pic], cannot open" blindness
+  the scan exists to fix). WMF/EMF convert to PNG where Pillow's GDI-backed plugins exist
+  (Windows); elsewhere they are counted as *skipped* and the caller tells the user why an image
+  has no asset. Caps: 30 images, ≥512 B, sha256-deduped; output order follows first-appearance
+  position, which matches insertion order for ordinary documents. Anchoring maps the Nth image
+  to the paragraph holding the Nth `[pic]` in the `[[PARA:n]]`-marked antiword text; when the
+  text pass is unavailable (the worker container has no antiword) or the counts disagree,
+  images fall back to ordinal paragraph anchors — assets still save and caption, only the
+  text-co-location becomes approximate. Scanner lives in
+  `packages/core/infrastructure/doc_images.py`; the chat `read_document` path reuses it
+  (§18.6) under the same `(source_asset_id, sha256)` dedup key, so chat and RAG converge on
+  one set of derived assets.
 
 - **Slides ride the page axis.** A deck has no pages, but it has a strictly ordered per-frame
   anchor (the slide number) that plays the same role. `_extract_ppt` therefore emits
@@ -3247,7 +3273,9 @@ flowchart TD
   apps/ import — the dependency direction is unchanged (§3 layering).
 
 **Code map** — `packages/core/infrastructure/ingest.py` (`_extract_ppt` markers,
-`_ppt_as_presentation`, `Chunk`); `apps/worker/rag_images.py` (`scan_embedded_images` /
+`_ppt_as_presentation`, `_extract_doc` antiword pass + `[[PARA:n]]` markers, `Chunk`);
+`packages/core/infrastructure/doc_images.py` (`.doc` magic-scan recovery);
+`apps/worker/rag_images.py` (`scan_embedded_images` /
 `save_images` / `caption_chunks`); `apps/worker/tasks.py` (`asset_ingest`: marker regexes,
 `on_split` state machine, caption hook-in between `build_chunks` and `_embed_and_index`);
 `packages/rag/pipeline/pipeline_config.py` (`image_captions` flag);
@@ -3255,7 +3283,8 @@ flowchart TD
 `rank_vision_entries` / `describe_image`); consumers: `apps/api/tools/vision_tool.py`, PDF
 table transcription in `ingest.py`. Tests: `tests/test_rag_images.py` (scan anchors,
 template normalization, marker roundtrip, caption dedup/skip, owner-id threading, config
-default), `tests/test_vision_funnel.py` (selection ranking, configured-model authorization,
+default), `tests/test_doc_images.py` (extent recovery, false-positive drop, dedup, cap),
+`tests/test_vision_funnel.py` (selection ranking, configured-model authorization,
 trial-chain fallback, refusal errors).
 
 ### 18.4 Derived-image lifecycle (delete / trash / purge / restore)
@@ -3323,7 +3352,9 @@ read this spreadsheet" request collapsed into a parse-failure apology. The `read
   through `core.infrastructure.ingest.extract_document_text` — the *same* extractor the ingest
   worker uses, so chat never grows a second, drift-prone parsing stack:
   **PDF** → PyMuPDF body text, plus table images transcribed by the vision LLM;
-  **Word** `.docx` → python-docx; **Excel** `.xlsx`/`.xlsm`/`.xltx`/`.xltm` → openpyxl
+  **Word** `.docx` → python-docx; **legacy Word** `.doc` → antiword (`-m UTF-8.txt`, so CJK
+  documents come back as text instead of mojibake — see the routing note below); **Excel**
+  `.xlsx`/`.xlsm`/`.xltx`/`.xltm` → openpyxl
   read-only with the ingest sheet/row caps; **PowerPoint** `.pptx`/`.potx`/`.ppsx` →
   python-pptx per-slide text + speaker notes (templates/slide shows share the OOXML
   layout — the main content type is normalized in memory so one reader opens all three);
@@ -3332,11 +3363,23 @@ read this spreadsheet" request collapsed into a parse-failure apology. The `read
 - **Image routing** — an image extension/MIME short-circuits to a pointer reply telling the
   agent to call the `vision` tool (§18.5) with the same `asset_id`; images are a vision
   problem, not a text-extraction one.
+- **`.doc` inline pictures are minted on the spot** — antiword can only leave a `[pic]`
+  placeholder, so after a `.doc` read `doc_images.scan_doc_images` recovers the embedded
+  rasters/metafiles (§18.3 recovery design) and each is saved through `DriveService.save_artifact`
+  into `RAG 图片/<doc>/` under the same `(source_asset_id, sha256)` dedup key the RAG worker uses —
+  chat reading and knowledge-base ingest therefore reuse one set of derived assets, never two.
+  The reply then ends with a bracketed footer listing every image's `asset_id` and instructing
+  the agent to hand it to the `vision` tool, which is how an old-Word figure or a table shipped
+  as a picture becomes answerable content. Metafiles the server cannot render are reported in
+  the footer instead of vanishing, and any minting failure degrades to the plain text result:
+  image recovery must never break `read_document`.
 - **Type-aware attach note** — `_attach_note` (`chat.py`) picks the hint by suffix: documents
   get "call `read_document`", images get "call `vision`", so the agent needs no guessing to
   reach the right reader through `tool_search`.
-- **Honest failure, bounded output** — legacy `.doc`/`.xls`/`.ppt` are refused with a
-  resave-as hint (the shared stack rejects them too); a refusal or a parsed-but-empty
+- **Honest failure, bounded output** — legacy `.xls`/`.ppt` are refused with a
+  resave-as hint (the shared stack rejects them too); `.doc` goes through antiword and is
+  refused with the same hint only when the binary is missing, times out, or fails to parse —
+  a refusal is loud, never a silent mojibake fallthrough. A refusal or a parsed-but-empty
   document explicitly instructs the agent **never to substitute another document from
   the conversation** (a failed read once let the model summarize the *previous* attach —
   wrong by omission); extraction errors surface verbatim instead of a silent
@@ -3386,10 +3429,12 @@ Consequences that keep the boundary honest:
   `.pptx`/`.potx`/`.ppsx` → local per-slide text + speaker notes (content-type
   normalization lets one reader accept deck, template and slideshow packages);
   `.txt`/`.md`/`.csv`/`.json`/`.log` → local decode; subtitles → local cue flatten; images
-  → vision; `.doc`/`.xls`/`.ppt` → refused (resave hint) — the desktop viewer's Office
+  → vision; `.doc` → local antiword text (+ magic-scan picture recovery, §18.3);
+  `.xls`/`.ppt` → refused (resave hint) — the desktop viewer's Office
   *previews* are separate, purely client-side JS renderers and do not feed any parser.
   Text extraction is only the *reading* half: the RAG ingest additionally runs a separate
-  embedded-image pass over PDF/DOCX/PPTX packages (scan → drive assets → anchor tags →
+  embedded-image pass over PDF/DOCX/PPTX packages and `.doc` containers (scan → drive
+  assets → anchor tags →
   caption chunks) — text and images never share a code path, they share an anchor axis (§18.3).
 
 [↑ Back to top](#table-of-contents)

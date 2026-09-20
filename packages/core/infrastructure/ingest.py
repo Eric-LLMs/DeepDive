@@ -108,7 +108,7 @@ def extract_text(content: bytes, name: str, *, para_markers: bool = False) -> st
         raise UnsupportedFileType("legacy .ppt is not supported — resave as .pptx")
     if ext == ".doc":
         # Legacy OLE2 Word — external converter, must run BEFORE the generic decode.
-        return _extract_doc(content)
+        return _extract_doc(content, para_markers=para_markers)
     text = _decode(content)
     if ext == ".vtt":
         cues = media.parse_vtt_text(text)
@@ -204,7 +204,7 @@ def build_subtitle_chunks(
     return chunks
 
 
-def _extract_doc(content: bytes) -> str:
+def _extract_doc(content: bytes, *, para_markers: bool = False) -> str:
     """Extract text from a legacy Word .doc (Word 97-2003, OLE2 container) via ``antiword``.
 
     Deterministic local extraction — no LLM on this path. ``antiword`` is an external
@@ -236,7 +236,14 @@ def _extract_doc(content: bytes) -> str:
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip()[:200]
         raise UnsupportedFileType(f"antiword failed to parse this .doc ({err}) — resave as .docx")
-    return proc.stdout.decode("utf-8", "replace")
+    text = proc.stdout.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+    if para_markers:
+        # Same anchor axis as .docx: paragraphs = blank-line blocks of the antiword
+        # output, so images recovered by core.infrastructure.doc_images (which counts
+        # the ``[pic]`` placeholders per paragraph) anchor onto the right chunk.
+        paras = re.split(r"\n\s*\n", text)
+        text = "\n\n".join(f"[[PARA:{i}]]\n{p}" for i, p in enumerate(paras))
+    return text
 
 
 def _extract_docx(content: bytes, *, para_markers: bool = False) -> str:
