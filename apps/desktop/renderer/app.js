@@ -1286,6 +1286,7 @@
       el: div,
       add: (t) => { text += t; bubble.innerHTML = renderMarkdown(text); scroll(); },
       reset: () => { text = ""; bubble.innerHTML = ""; },
+      text: () => text, // current buffer — lets a tool boundary fold it into the status bar
     };
   }
 
@@ -1320,6 +1321,9 @@
       setPhase: (txt) => { sum.textContent = txt; },
       addThinking: (t) => { seen = true; box.textContent += t; scroll(); },
       addTool: (label) => { seen = true; box.textContent += (box.textContent ? "\n" : "") + label; },
+      // Fold a superseded step's narration into the process box (blank-line separated
+      // from prior entries) — the text is still auditable inside 💭 Thoughts.
+      addProcess: (t) => { seen = true; box.textContent += (box.textContent ? "\n\n" : "") + t; },
       done: () => {
         if (!seen) { details.remove(); return; }
         sum.textContent = "💭 Thoughts";
@@ -1715,6 +1719,7 @@
     let statusBar = null;      // collapsible reasoning/tool status line
     let streamMsg = null;      // { el, add, reset }
     let stepChanged = false;   // a new agent step began → restart the bubble on next content
+    let lastFolded = null;     // most recent narration folded into the status bar (restore fallback)
     let gotDone = false;
     let lastRetrieved = null;  // this turn's rag_search hits snapshot (done frame → 👍/👎 row)
     let researchContinuing = false; // done frame carried research_continuing → worker still driving
@@ -1733,6 +1738,19 @@
           break;
         case "tool": {
           if (!statusBar) statusBar = makeStatusBar();
+          // A tool call after a streamed step proves that step's text was intermediate
+          // narration, not the answer: fold it into the collapsible process box and
+          // clear the bubble, so the only answer the log ends with is the final
+          // post-tool one (one reply, process shown collapsed).
+          if (stepChanged && streamMsg) {
+            const narration = streamMsg.text();
+            if (narration.trim()) {
+              statusBar.addProcess(narration);
+              lastFolded = narration;
+            }
+            streamMsg.reset();
+            stepChanged = false;
+          }
           const label = TOOL_LABELS[evt.data?.name] || `⚙️ ${evt.data?.name || "tool"}…`;
           statusBar.setPhase(label);
           statusBar.addTool(label);
@@ -1808,10 +1826,23 @@
           if (viewerDone && viewerDone.status === "injected" && viewerDone.citations && streamMsg) {
             decorateViewerCitations(streamMsg.el, viewerDone.citations);
           }
-          // Fallback when no content streamed (e.g. tool round produced only reasoning).
-          if (!streamMsg && evt.data.answer) {
-            streamMsg = appendStreamingAssistant();
-            streamMsg.add(evt.data.answer);
+          // Fallback when no content streamed (e.g. tool round produced only reasoning,
+          // or the streamed bubble was folded as intermediate narration): fill the answer
+          // into the existing empty bubble instead of appending a second one.
+          if (evt.data.answer) {
+            if (!streamMsg) {
+              streamMsg = appendStreamingAssistant();
+              streamMsg.add(evt.data.answer);
+            } else if (!streamMsg.text().trim()) {
+              streamMsg.add(evt.data.answer);
+            }
+          }
+          // Handoff turns can end on a tool call with no post-tool content: every step's
+          // text got folded and the done answer is empty. Surface the last narration again
+          // so the log never ends with a blank assistant bubble.
+          if (streamMsg && !streamMsg.text().trim() && lastFolded) {
+            streamMsg.add(lastFolded);
+            lastFolded = null;
           }
           // Call mode: hands-free loop — read this answer aloud (Kokoro, same chain as the
           // bubble 🔊 Read); listening resumes when playback ends or the user barges in.
