@@ -54,13 +54,16 @@ class ApprovalBroker:
     A store registers its decision ``Future`` keyed by ``approval_id``; ``resolve`` completes
     it (locally for the memory broker; locally + via Redis pub/sub for the distributed one).
     ``owner`` lets the API verify the requester owns the approval before resolving.
+
+    A resolution carries ``allow`` plus an optional ``message`` — the client's feedback for
+    the model (why it cancelled / what happened instead), surfaced as the deny reason.
     """
 
     async def register(
         self, approval_id: str, future: asyncio.Future, *, user_id: str | None = None
     ) -> None: ...
     async def unregister(self, approval_id: str) -> None: ...
-    async def resolve(self, approval_id: str, allow: bool) -> bool: ...
+    async def resolve(self, approval_id: str, allow: bool, message: str | None = None) -> bool: ...
     async def owner(self, approval_id: str) -> str | None: ...
     async def aclose(self) -> None: ...
 
@@ -77,11 +80,11 @@ class MemoryApprovalBroker(ApprovalBroker):
     async def unregister(self, approval_id) -> None:
         self._local.pop(approval_id, None)
 
-    async def resolve(self, approval_id, allow) -> bool:
+    async def resolve(self, approval_id, allow, message=None) -> bool:
         entry = self._local.get(approval_id)
         if entry is None or entry[0].done():
             return False
-        entry[0].set_result(allow)
+        entry[0].set_result((allow, message))
         return True
 
     async def owner(self, approval_id) -> str | None:
@@ -130,11 +133,11 @@ class RedisApprovalBroker(ApprovalBroker):
     async def unregister(self, approval_id) -> None:
         self._local.pop(approval_id, None)
 
-    async def resolve(self, approval_id, allow) -> bool:
+    async def resolve(self, approval_id, allow, message=None) -> bool:
         # Local fast path (also idempotent with the listener below via done() checks).
         entry = self._local.get(approval_id)
         if entry is not None and not entry[0].done():
-            entry[0].set_result(allow)
+            entry[0].set_result((allow, message))
         status = "allowed" if allow else "denied"
         await self._redis.set(
             f"{self._state_prefix}{approval_id}",
@@ -142,7 +145,8 @@ class RedisApprovalBroker(ApprovalBroker):
             ex=self._ttl,
         )
         await self._redis.publish(
-            self._channel, json.dumps({"approval_id": approval_id, "allow": allow})
+            self._channel,
+            json.dumps({"approval_id": approval_id, "allow": allow, "message": message}),
         )
         return True
 
@@ -168,7 +172,7 @@ class RedisApprovalBroker(ApprovalBroker):
                     continue
                 entry = self._local.get(data.get("approval_id"))
                 if entry is not None and not entry[0].done():
-                    entry[0].set_result(data.get("allow", False))
+                    entry[0].set_result((data.get("allow", False), data.get("message")))
         except asyncio.CancelledError:
             pass
         finally:
@@ -222,18 +226,23 @@ class ApprovalStore:
         try:
             await self._broker.register(approval_id, future, user_id=self._user_id)
             try:
-                allowed = await asyncio.wait_for(future, self._timeout_s)
+                allowed, feedback = await asyncio.wait_for(future, self._timeout_s)
             except TimeoutError:
-                allowed = False
+                allowed, feedback = False, None
         finally:
             await self._broker.unregister(approval_id)
         if allowed:
             return PreToolDecision.allow()
-        return PreToolDecision.deny(decision.reason or "approval not granted (denied or timed out)")
+        # The resolver's feedback text wins over the generic ASK reason so the model can
+        # tell the user what actually happened (cancelled, or handed off to a background
+        # job) instead of reporting a permission failure.
+        return PreToolDecision.deny(
+            feedback or decision.reason or "approval not granted (denied or timed out)"
+        )
 
-    async def resolve(self, approval_id: str, allow: bool) -> bool:
+    async def resolve(self, approval_id: str, allow: bool, message: str | None = None) -> bool:
         """Resolve a pending approval (used by tests / direct store callers)."""
-        return await self._broker.resolve(approval_id, allow)
+        return await self._broker.resolve(approval_id, allow, message)
 
 
 class ApprovalBridge:
@@ -256,8 +265,8 @@ class ApprovalBridge:
             )
         return await store.request(exec_, decision)
 
-    async def resolve(self, approval_id: str, allow: bool) -> bool:
-        return await self.broker.resolve(approval_id, allow)
+    async def resolve(self, approval_id: str, allow: bool, message: str | None = None) -> bool:
+        return await self.broker.resolve(approval_id, allow, message)
 
     async def owner(self, approval_id: str) -> str | None:
         return await self.broker.owner(approval_id)

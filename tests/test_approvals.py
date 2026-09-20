@@ -178,7 +178,7 @@ async def test_redis_broker_cross_node_wakeup():
     broker_b = RedisApprovalBroker(redis)
     await broker_b.resolve("a1", True)
 
-    assert await asyncio.wait_for(future, 1) is True
+    assert await asyncio.wait_for(future, 1) == (True, None)
     assert json.loads(await redis.get("approval:a1"))["status"] == "allowed"
 
     await broker_a.aclose()
@@ -195,7 +195,41 @@ async def test_redis_broker_deny_via_pubsub():
     broker_b = RedisApprovalBroker(redis)
     await broker_b.resolve("a2", False)
 
-    assert await asyncio.wait_for(future, 1) is False
+    assert await asyncio.wait_for(future, 1) == (False, None)
+
+    await broker_a.aclose()
+    await broker_b.aclose()
+
+
+async def test_deny_message_replaces_generic_reason():
+    """Resolver feedback text becomes the deny reason the model sees."""
+    emitted = []
+    broker = MemoryApprovalBroker()
+    store = ApprovalStore(broker, user_id="u1", sink=emitted.append)
+    exec_ = ToolExecution(call_id="c1", name="slides_gen", arguments={})
+
+    task = asyncio.create_task(store.request(exec_, _ask(exec_)))
+    while not emitted:
+        await asyncio.sleep(0.001)
+    approval_id = emitted[0]["data"]["approval_id"]
+
+    await broker.resolve(approval_id, False, "user confirmed; a background job was started")
+    decision = await task
+    assert decision.kind == "deny"
+    assert decision.reason == "user confirmed; a background job was started"
+
+
+async def test_allow_ignores_message_and_redis_carries_it():
+    """allow=True still allows with no reason; the Redis payload keeps the message."""
+    redis = _FakeRedis()
+    broker_a = RedisApprovalBroker(redis)
+    future = asyncio.get_running_loop().create_future()
+    await broker_a.register("a3", future, user_id="u1")
+    await _wait_for_subscription(redis)
+    broker_b = RedisApprovalBroker(redis)
+    await broker_b.resolve("a3", True, "heads-up")
+
+    assert await asyncio.wait_for(future, 1) == (True, "heads-up")
 
     await broker_a.aclose()
     await broker_b.aclose()

@@ -273,7 +273,7 @@ async def resolve_approval(
         raise HTTPException(status_code=404, detail="approval not found or already resolved")
     if str(user.user_id) != owner:
         raise HTTPException(status_code=403, detail="approval belongs to another user")
-    await bridge.resolve(approval_id, body.allow)
+    await bridge.resolve(approval_id, body.allow, (body.message or "")[:500] or None)
     return {"ok": True, "allow": body.allow}
 
 

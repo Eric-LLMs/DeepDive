@@ -42,6 +42,10 @@
     // session and appends only rows whose id is NOT here, so worker-inserted progress never
     // duplicates a bubble that's already on screen (and a reopen never re-emits).
     renderedMsgIds: new Set(),
+    // Deep-copied viewer payload of the LAST sent message. The approval handler reads it
+    // after the turn is in flight, so the source the model was asked about (cloud asset
+    // id/name) survives any later viewer navigation.
+    lastSentViewer: null,
   };
   // session_id → { task_id, name, stage, status } for every chat session bound to one of this
   // user's research tasks (hidden from the Sessions sidebar). Populated by research.js from
@@ -1299,6 +1303,9 @@
     rag_search: "📚 Querying rag…",
     web_search: "🔍 Searching web…",
     translate: "🌐 Translating…",
+    summary_gen: "📝 Summarizing…",
+    mindmap_gen: "🧠 Generating mind map…",
+    slides_gen: "📽️ Generating slides…",
   };
   function makeStatusBar() {
     const details = document.createElement("details");
@@ -1662,6 +1669,67 @@
     return headers;
   }
 
+  // HITL approval frame (SSE "approval-request"): the sandbox ASKed before a WRITE tool ran.
+  // An unanswered frame stalls the turn until the server-side timeout, then auto-denies — so
+  // every frame must be answered here. Chat-triggered generation ("make slides of this page")
+  // routes through this: the model calls slides_gen/mindmap_gen purely as an intent signal.
+  // The real work stays entirely in the existing toolkit pipeline — confirming answers the
+  // frame with a *deny* whose message tells the model the platform took over, then opens the
+  // very same generate dialog the toolbar uses (source prefilled from the frozen viewer
+  // payload, output-folder picker included, background Cloud Drive job). Allowing the agent
+  // tool instead would write workspace files duplicating the cloud job, so it never happens.
+  const GEN_TOOL_TO_DIALOG = { slides_gen: "slides", mindmap_gen: "mindmap" };
+
+  async function resolveApproval(approvalId, allow, message) {
+    try {
+      await apiFetch(`/approvals/${encodeURIComponent(approvalId)}`, {
+        method: "POST",
+        body: JSON.stringify({ allow, message }),
+      });
+    } catch { /* already resolved or expired server-side — the turn unwinds on its own */ }
+  }
+
+  async function handleApprovalRequest(data) {
+    const id = data.approval_id;
+    if (!id) return;
+    const name = data.name || "tool";
+    const dialogTool = GEN_TOOL_TO_DIALOG[name];
+    if (dialogTool) {
+      const label = TOOLKIT_LABELS[dialogTool] || dialogTool;
+      const ok = await window.confirmModal({
+        title: `Generate ${label}?`,
+        message: `The assistant would like to generate ${label.toLowerCase()} from the material you asked about. You'll pick an output folder; the job runs in the background on your Cloud Drive.`,
+        okLabel: "Continue",
+      });
+      if (!ok) {
+        await resolveApproval(id, false, "用户取消了本次生成,请简短知悉。");
+        return;
+      }
+      await resolveApproval(id, false,
+        "用户已确认。生成将由云盘后台作业完成(平台已打开生成窗口),请告知用户选择目录后自动开始,不要再调用工具、不要自己写文件。");
+      // Prefill the dialog as the toolbar flow would leave it: cloud-files source with the
+      // frozen viewer asset; folder stays null = Cloud Drive root default.
+      const v = state.lastSentViewer;
+      if (v && v.asset_id && v.provenance === "cloud") {
+        genDialogState[dialogTool] = {
+          src: "files",
+          cloudFiles: [{ id: v.asset_id, name: v.name || "document" }],
+          folderPath: null,
+        };
+      }
+      openGenerateDialog(dialogTool);
+      return;
+    }
+    // Any other gated tool (fs writes, summary_gen, …): plain allow/deny. Without this the
+    // turn would silently hang for the full approval timeout.
+    const ok = await window.confirmModal({
+      title: "Allow tool call?",
+      message: `The assistant wants to run "${name}"${data.reason ? `: ${data.reason}` : ""}. Allow it?`,
+      okLabel: "Allow",
+    });
+    await resolveApproval(id, ok, ok ? null : "用户拒绝了本次工具调用。");
+  }
+
   async function sendChat(message, extra = {}, opts = {}) {
     // Render the user message with the staged attachment (if any) so the image/file shows
     // inline immediately; the pendingAttach payload is consumed below for the request.
@@ -1710,6 +1778,9 @@
     // spliced into ``message``.
     const viewerPayload = buildViewerPayload();
     if (viewerPayload) payload.viewer = viewerPayload;
+    // Frozen copy for the approval flow (below): the generation dialog must offer the SAME
+    // source the question was about, even if the user navigates the viewer mid-turn.
+    state.lastSentViewer = viewerPayload ? JSON.parse(JSON.stringify(viewerPayload)) : null;
     if (viewerPayload && viewerPayload.selections) {
       pendingSelections.length = 0; // consumed by this send (one-shot, per spec)
       renderAttachBar();
@@ -1779,6 +1850,15 @@
           } else if (v.status === "unavailable") {
             appendMsg("notice", "The viewer could not confirm a complete full-text capture, so the whole-document summary was not run. Nothing partial was substituted.");
           }
+          break;
+        }
+        case "approval-request": {
+          // The turn is blocked server-side until we resolve the approval's future. Fire-and-
+          // forget keeps the SSE pump spinning while the confirm dialog is up; the agent
+          // resumes with our deny/allow + feedback text as soon as the POST lands.
+          if (!statusBar) statusBar = makeStatusBar();
+          statusBar.setPhase("⏳ Waiting for your confirmation…");
+          handleApprovalRequest(evt.data || {});
           break;
         }
         case "done":

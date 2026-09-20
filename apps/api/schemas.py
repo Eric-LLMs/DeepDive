@@ -274,6 +274,9 @@ class ReconcileRequest(BaseModel):
 
 class ApprovalResolveRequest(BaseModel):
     allow: bool
+    # Optional client feedback surfaced to the model as the tool result when denying
+    # (e.g. "user confirmed; a background Cloud Drive job was started instead").
+    message: str | None = None
 
 
 class MediaGenerateRequest(BaseModel):
