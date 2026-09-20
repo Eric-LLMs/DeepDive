@@ -108,17 +108,17 @@
 |----|------|
 | Vocabulary subdomain | domains / terms / sentences / matches / materials / chunks (6 tables) |
 | Hybrid search | pgvector (semantic) + tsvector (keyword) + RRF fusion |
-| Agent runtime | `AgentKernel` composition root: cache-boundary `CacheBoundaryAssembler` (3 zones + `snapshot_key`) + deferred-tool `ToolGateway` + dual-track `MemoryService` (PG tsvector/pgvector RRF) + skill catalog + READ-only `Sandbox`, over `ReactLoopAgent` step loop + plugin `ToolRuntime`; `ReliableLLM` timeout/retry (error taxonomy + cancellation) + per-turn cost budget; HITL approvals (memory / Redis pub-sub broker); `run_subagent` (bounded child turns); `plan` meta-tool; shadow-git checkpoints (`revert_to_checkpoint`); Docker `BashSandbox` backend |
+| Agent runtime | `AgentKernel` composition root: cache-boundary `CacheBoundaryAssembler` (3 zones + `snapshot_key`) + deferred-tool `ToolGateway` + dual-track `MemoryService` (PG tsvector/pgvector RRF) + skill catalog + READ-only `Sandbox`, over `ReactLoopAgent` step loop + plugin `ToolRuntime`; `ReliableLLM` timeout/retry (error taxonomy + cancellation) + per-turn cost budget; HITL approvals (memory / Redis pub-sub broker; resolve carries an optional feedback message, desktop renders an inline decision card); `run_subagent` (bounded child turns); `plan` meta-tool; shadow-git checkpoints (`revert_to_checkpoint`); Docker `BashSandbox` backend |
 | Retrieval | config-driven node pipeline (query rewrite → recall → RRF → rerank, plus optional parent-expand / CRAG nodes; CJK + contextual + parent-child indexing); `in_process` default, gRPC service available (`AuthGuard` token gate / per-peer rate limit / tenant binding); admin RAG console + golden-set eval (Recall@k / Precision@k / MRR); Redis **query cache** (keyed by query/filters/top_k + config + corpus version); **retrieval-feedback loop** — grounded answers get a persistent per-message 👍/👎 source rating: the turn's `rag_search` hits are extracted server-side from the tool trace and snapshotted into `messages.meta.retrieval` (JSONB in the canonical schema; rides the done frame + `GET /sessions/{id}`), the chat bubble's rate panel posts the `POST /rag/feedback` golden-set recorder — [§10.12](#1012-query-cache--retrieval-feedback) |
 | RAG node pipeline config | the whole retrieval chain is runtime-configured from admin **RAG → Nodes**: add / remove / reorder / enable / disable stages and edit params, persisted in `app_settings.rag`, applied live — no code, no restart; ingest side likewise (chunk strategy `fixed` / `paragraph` / `sentence` / `semantic` + contextual / parent-child / CJK-jieba toggles, with a Chunking preview) — [§10.6](#106-nodes), [§10.7](#107-ingest-side-runtime-configured-chunking), [§10.10](#1010-admin-console) |
-| Query repository | unified multi-source corpus: cloud-drive files (`source_type='file'`) + Learning-Platform sentences/articles (`'learning'`) + chat Q&A pairs / LLM-grouped whole-session imports (`'chat'`); `chunks.asset_id` nullable + `source_type`/`source_id`, source-aware recall (both recallers `LEFT JOIN assets`); PDF tool chain (body text + tables rendered to PNG → vision LLM, per-table skip on failure); admin RAG → **Repository** tab lists non-file chunks with delete |
+| Query repository | unified multi-source corpus: cloud-drive files (`source_type='file'`) + Learning-Platform sentences/articles (`'learning'`) + chat Q&A pairs / LLM-grouped whole-session imports (`'chat'`) + boot-seeded built-in product manual (`'manual'`, owner-NULL, public to every tenant and guests); `chunks.asset_id` nullable + `source_type`/`source_id`, source-aware recall (both recallers `LEFT JOIN assets`); PDF tool chain (body text + tables rendered to PNG → vision LLM, per-table skip on failure); admin RAG → **Repository** tab lists non-file chunks with delete |
 | Model services | TEI embedding (BGE-M3), Kokoro TTS, FunASR SenseVoice STT, LiteLLM gateway (all Docker) |
 | Edge gateway | **Traefik** as the single public entrypoint: `:80` strips `/api` onto the host-run FastAPI and also fronts the web console (`/admin` + `/audio` `/images` `/avatars` static mounts); retrieval gRPC rides its own entryPoint (`:15052` → `h2c://retrieval:50051`); the host API is reached by **explicit IPv4** (`192.168.65.254:8300` — `host.docker.internal` also yields a ULA IPv6 the host never answers, which hangs Go's dialer); file-provider config in `deploy/traefik/`, LAN-IP published — [§13](#13-multi-tenancy-and-deployment-strategy) |
 | Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the shared `AgentKernel` composition (`apps/api/agent_factory.py`) for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output; session / cloud-file modes → caller's Cloud Drive, with a custom `prompt` + `name`) |
 | Session memory | PG-backed `sessions` / `messages` / `session_events`; **client Live State (summary + tail) is the normal-turn context source — zero SQL reads on hot turns**; threshold compaction folds raw rows into one 5-section structured summary behind a dual persistence barrier (`sessions.compaction` JSONB = durable checkpoint, revision CAS); per-session async write queue (one batch INSERT/turn); deferred finalize = incremental embed + first-time-only sidebar summary/title; trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + 30-day audit-event retention — see [§22](#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns) |
 | Migrations | single canonical init script `migrations/0001_init.sql` (final schema + reference seeds) applied once by the asyncpg runner (replaces Alembic); dev-time incremental migrations deliberately squashed |
 | Chat | agent loop with tool use, SSE streaming |
-| Viewer context | chat answers about the **open viewer**: focus chip (file · page / playhead), FOCUS / FULL / NONE intent classification, ±20 s media-time subtitle window, pinned selections / ROI / frames as explicit P0 context, honest `too_large` / `unavailable` short-circuit, clickable `[Vn]` citations — zero changes to RAG / agent runtime / memory ([§23](#23-viewer-context-provider--the-open-document-as-reference-context), features.md *Desktop Workbench*) |
+| Viewer context | chat answers about the **open viewer**: focus chip (file · page / playhead), FOCUS / FULL / NONE intent classification, ±20 s media-time subtitle window, pinned selections / ROI / frames as explicit P0 context, honest `too_large` / `unavailable` short-circuit, clickable `[Vn]` citations; when a document is open but nothing injectable, a trusted **Viewer Access Context** stub routes the model to `read_document` page-scoped reads (`pages` spec, ACL-before-storage, ≤16 pages) with a post-turn `viewer.reads` trace incl. failed calls — zero changes to RAG / agent runtime / memory ([§23](#23-viewer-context-provider--the-open-document-as-reference-context), features.md *Desktop Workbench*) |
 | Research OS | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; **deterministic execution engine** — Python owns control flow through a 10-stage contract pipeline (`DISCOVER → FRAME → EVIDENCE → DESIGN → EXECUTE → EXPLAIN → WRITE → REVIEW → REPRODUCE → PUBLISH`) with repair-once bounded attempts, per-stage declared LLM call budgets + run-level turn/cost/no-progress caps, and guard gates at the transition fence: **strict** mode (default) parks a failed gate on a PENDING human override with zero rework on resume, lenient mode records it and continues; structural violations halt terminally (`BLOCKED`); lease-based crash recovery makes interrupted runs resumable; publication finality is the `PROMOTED` record (report + compiled PDF, optional slides via toolkit); desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module), [§20](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline) |
 | Workflow core (`packages/workflow`) | domain-free run engine behind Research OS: declarative `workflow_spec` (transitions / activities / cap dimensions / hooks) + state machine with lease contest, crash recovery, retry, loop-cap grading and definition-drift detection; adapter pattern (ports + ledger/lease persistence supplied by the plugin) — [§19](#19-workflow-core-packagesworkflow) |
 | Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX/PPTX package scans and `.doc` magic-header recovery → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
@@ -569,10 +569,20 @@ runtime calls the process-global :class:`ApprovalBridge` wired as ``ToolRuntime(
 The bridge reads the per-request :class:`ApprovalStore` bound to the current task via a contextvar
 (so concurrent requests never share approval state), emits an ``approval-request`` SSE event with the
 tool name / arguments / reason, and blocks on a decision future until
-``settings.approval_timeout_seconds`` (timeout → deny). ``POST /approvals/{id}`` resolves it. The
-:class:`ApprovalBroker` is **distributed**: state lives in Redis and resolutions wake the pending SSE
-across nodes via Redis Pub/Sub; :class:`MemoryApprovalBroker` is the single-process dev/tests
-fallback. A tool that ASKs with no approver bound **degrades to deny** — safe by default.
+``settings.approval_timeout_seconds`` (timeout → deny). ``POST /approvals/{id}`` resolves it with
+``(allow, optional message)``: a decision may carry a **feedback message** that rides back to the
+model — on deny it *replaces* the generic refusal reason, so the human can tell the agent what to do
+instead. Both brokers carry the pair (memory map for single-process dev/tests; the Redis broker
+publishes the full payload across nodes); a tool that ASKs with no approver bound **degrades to
+deny** — safe by default. The desktop renders the request as an **inline decision card** in the
+conversation (Continue / Cancel with a live countdown mirroring the server timeout, plus the
+optional message box) rather than a focus-stealing modal. The same frame doubles as the confirm
+step for **model-routed generation intents**: when the user asks the chat to "generate slides /
+a mind map of this", the agent triggers `slides_gen` / `mindmap_gen`, the approval card gates the
+hand-off, and confirming *denies with a takeover message* (the platform, not the tool, now owns the
+job) while opening the same toolkit generate dialog the toolbar uses — source prefilled, output
+folder picked, background Cloud Drive job — so the toolkit pipeline is reused untouched and the
+agent can never write a duplicate deck itself.
 
 **Subagents** (:mod:`~agent.tools.subagent`) — the ``run_subagent`` tool spawns a *bounded child
 turn*: a fresh ``AgentTurn`` (empty history) on the same runtime but with a filtered tool schema —
@@ -1329,6 +1339,7 @@ locally to delimited rows. Everything then flows into the strategies below.
 The **query repository** is the unified retrieval corpus: the existing `chunks` table, extended so
 content can arrive from three entries instead of only cloud-drive files. Recall is
 **source-aware** — one query searches file, learning, and chat content together, still tenant-scoped.
+A fourth, server-owned source sits beside them: the **built-in product manual** (§ below).
 
 **Schema** (canonical `migrations/0001_init.sql`): `chunks.asset_id` is now nullable; two new columns
 `source_type TEXT NOT NULL DEFAULT 'file'` (`file` / `learning` / `chat`) and `source_id TEXT NULL`
@@ -1406,6 +1417,22 @@ via `python-docx`; `.txt`/`.md`/subtitles use the existing `extract_text` dispat
 
 **Idempotency** — every non-file import deletes the source's existing chunks first
 (`delete_by_source`) then re-inserts, so re-importing after a config change or a partial failure is safe.
+
+**Built-in product manual — boot-seeded, always-public fourth source** — the platform answers
+"how do I use DeepDive" questions from its own corpus, not from invented UI steps: eight Chinese
+manual pages ship in `packages/core/seed/manual/*.md` and are seeded at API startup
+(`core.infrastructure.manual_seed.seed_product_manual`, called from the FastAPI `lifespan`). Each
+`##` section becomes one leaf chunk (`source_type='manual'`, `user_id` NULL, no `asset_id`) prefixed
+**【doc · section】** so both keyword and vector recall see the topic; oversized sections are capped
+(1100 chars). The visibility predicate (`chunk_visible_expr` / `asset_visibility_sql`) gains a
+fourth disjunct — owner-NULL `manual` chunks are **public to every tenant and to guests** (it matches
+even when the bound `:uid` is NULL). Seeding is idempotent through an `app_settings['manual_seed']`
+version marker compared against `MANUAL_VERSION`: a matching marker short-circuits every later boot,
+a bumped constant re-seeds after a product update, and the write is **fail-soft** — an unreachable
+embedding service just logs and retries on the next boot (the marker is written only after full
+success). On a successful seed the corpus version is bumped, dropping stale query-cache hits. The
+persona (`soul.md`) routes product-usage questions through `rag_search` so answers come from this
+manual.
 
 **Verification** — admin console **RAG → Repository** tab lists every non-file chunk (source badge,
 title from `meta`, per-chunk delete via `DELETE /admin/rag/repository/{chunk_id}`); the **Test** tab
@@ -2216,7 +2243,12 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     hints are preserved, and a partial failure reports `Uploaded k/N` with the failed names
     rather than aborting the batch). The **Query Repo** column renders a status cell — `✓ In Knowledge` /
     `Importing…` / `Processing… (ETA)` / `＋ Import to Knowledge` / `Not supported` — driven by
-    `ragCell(f)` + `ingestEtaSuffix`, with a 5 s `pollWhileWorking` re-poll. Clicking a
+    `ragCell(f)` + `ingestEtaSuffix`, with a 5 s `pollWhileWorking` re-poll. The re-poll is
+    render-stable by design: the sidebar tree updates through a **keyed incremental render**
+    (existing rows patched in place — no full teardown → no flicker), its height no longer
+    oscillates under the ingest poll, tree **scroll position stays pinned** while rows insert,
+    and the main file table refreshes cells in place instead of a 5 s full rebuild that reset
+    the scroll. Clicking a
     `.md`/`.txt`/code row opens the in-window **note editor** (`#note-editor`); any other file is
     cached via `cloud-cache` and rendered by `Viewer.render` on the temp path, so PDFs, images,
     video, and audio play in window.
@@ -2265,7 +2297,12 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     now lives in the sidebar's Chats list) and, only in a research session, a full-width
     **research context bar** (`#chat-research-bar`: `🔬 Research · <task title> · [<stage>]`, a chip
     that jumps to the task's working-directory view) that hides the truncated chat title
-    (`#chat-header.research-mode`).
+    (`#chat-header.research-mode`). With **no task selected**, the Research tab opens a **blank
+    chat** — a throwaway session created with `ChatRequest.ephemeral`, which marks the session row
+    `type=1` so it never appears in the Sessions list (deleting the selected task drops back to
+    the same blank chat; typing there is free-form chat, not task control). Creating a task binds
+    its dedicated session **deterministically** in the create response: the renderer opens the
+    authoritative POST-returned session id once (no racy double-open).
   - **Note editor** — an **in-flow document panel** (not an overlay): in the Files layout it takes
     the document area above the docked chat, swapping with `#viewer` while a cloud
     `.md`/`.txt`/code note is open, so the chat is never covered; a note opened on Files stays open
@@ -2311,7 +2348,12 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     (`deepdive_subtitle_style`) and restored on the next launch.
   - **Chat** (`app.js`) — consumes the SSE `POST /chat/stream` endpoint
     (`EventSourceResponse`) with a collapsible **💭 thinking** block and incremental answer
-    rendering; the pane docks bottom/right or floats as a draggable window. Splitter and
+    rendering; the pane docks bottom/right or floats as a draggable window. Intermediate agent
+    chatter (per-step narration around tool calls) is **folded into a one-line status bar**
+    instead of rendering as extra bubbles — one reply per turn; the bar also ticks out the
+    current phase's elapsed seconds (`⋯ Working… · 7s`) so a slow model round-trip or a pending
+    approval reads as progress, never as a hang, and keeps a live activity line even on
+    thinking-suppressed turns (viewer FOCUS, voice-call). Splitter and
     floating-window drags use **pointer events + `setPointerCapture`**, so drag tracking continues
     even when the pointer passes over the `<video>` element. Sign-in / register / password-reset
     and profile/avatar editing are modal dialogs against `/auth/*`. The **input box** is a
@@ -3367,6 +3409,29 @@ read this spreadsheet" request collapsed into a parse-failure apology. The `read
 - **Image routing** — an image extension/MIME short-circuits to a pointer reply telling the
   agent to call the `vision` tool (§18.5) with the same `asset_id`; images are a vision
   problem, not a text-extraction one.
+- **Ownership before bytes** — every read authorizes first: the tool resolves the calling
+  identity from the `request_user` ContextVar and calls `DriveService.ensure_asset_readable`
+  **before** touching content-addressed storage; a missing identity or an ACL denial raises
+  as a plain tool error, so a guessed `asset_id` (e.g. one pasted from a Viewer Access
+  Context, §23) can never exfiltrate another user's bytes.
+- **Page-scoped reads (`pages`)** — the schema gains an optional string `pages` for
+  page-addressable formats, and its semantics are a strict tri-state: *omitted* → the legacy
+  whole-document path, byte-identical to before; *empty string* → rejected; *a spec* → only
+  the requested pages are parsed. `_parse_pages_spec` is a pure function: comma-separated
+  1-based tokens (`"3"`, `"2,5"`, `"1-3"`), whitespace-tolerant, `a-b` ranges, deduped and
+  sorted; malformed (`"1-"`, `"1,,3"`, non-numeric, `0`, negatives), inverted (`"5-2"`) and
+  over-cap specs raise — the cap (`MAX_REQUESTED_PAGES = 16`) is checked **pre-expansion**
+  on each span and incrementally on the accumulated set, so a `"1-1000000000"` never
+  allocates. A spec on a format without a page axis (docx/doc/xlsx/txt/md/csv/json/subtitles…)
+  is refused outright — the tool never silently falls back to a full-document read. On the
+  extraction side `packages/core` stays untouched: PDF pages come from a direct PyMuPDF pass
+  inside the tool (page count read first — **every** requested page bounds-checked before any
+  `get_text`, so an out-of-range spec fails the whole call rather than half-answering; a page
+  with no text layer yields an inline `[Page n] No extractable text found…` note, not a
+  failure), and PPTX slides reuse the core ppt helpers (`_ppt_as_presentation` /
+  `_shape_texts`) by import for exactly the requested slide indices. Per-page sections are
+  joined as `[[Page n]]` blocks and the **merged** output takes the single 20k truncation —
+  per-page truncation could let N pages multiply past the cap.
 - **`.doc` inline pictures are minted on the spot** — antiword can only leave a `[pic]`
   placeholder, so after a `.doc` read `doc_images.scan_doc_images` recovers the embedded
   rasters/metafiles (§18.3 recovery design) and each is saved through `DriveService.save_artifact`
@@ -4293,15 +4358,21 @@ the user message. Hard invariants:
   `numPages` text layers are present and non-empty) returns `unavailable`. The router aborts *before* the
   agent runs — never a silent downgrade to FOCUS, a partial-page substitute, or a RAG fallback.
 - **Reference data is data.** Blocks render inside an escalating fence under a header declaring them
-  UNTRUSTED and their content never instructions; blocks carry no tool directives. Citations use the
+  UNTRUSTED and their content never instructions; blocks carry no tool directives. The header does pin
+  the blocks' *role*: on-screen material is answered from the blocks themselves with `[Vn]` citations —
+  retrieval or `read_document` re-fetch is off-limits (viewer blocks are not drive assets and carry no
+  tool-usable `asset_id`). The only thing that may
+  instruct the model is the app-generated **Viewer Access Context** control section — trusted, rendered
+  alone, and physically exclusive with the UNTRUSTED data zone (a turn carries data blocks or the access
+  stub, never both). Citations use the
   independent `[Vn]` namespace — existing RAG reference formats are untouched, and `meta["viewer"]` /
   `meta["viewer_citations"]` occupy dedicated message-meta keys beside `meta["retrieval"]`.
 
 **Mechanism (server).** `ChatRequest.viewer` (optional `ViewerPayload`) freezes the viewport at send time:
 `{name, kind, provenance, asset_id, page, t_ms, focus_text, cues, full_text / full_chars / full_trusted,
 selections[]}` with schema caps (≤8 selections, focus_text ≤12 k chars, ≤300 cues, full_text ≤100 k).
-Classification is a strict priority: **local deictics** (这一段/页/图, 这里, 当前/现在/刚才, this page, here,
-it/they…) force FOCUS even when whole-document words co-occur → whole-scope words (整篇/全文/这篇文章/summarize…)
+Classification is a strict priority: **local deictics** (这一段/页/图, 本页, 第一页, 第2-5页, 这里, 当前/现在/刚才, this page, here,
+it/they…) force FOCUS even when whole-document words co-occur → whole-scope words (整篇/全文/这篇文章/总结/概括/归纳/梳理/结构/summarize…)
 → FULL → content interrogatives (什么意思/为什么/what does … mean) → FOCUS → else NONE; a task imperative
 (帮我写…) → NONE; the ✕ chip (`follow=false`) or an explicit `mode:"none"` turns the viewport off while P0
 survives. Video uses **media time**: the window is `[t − 20 s, t]` extended by cue overlap, the active cue is
@@ -4311,6 +4382,30 @@ the assistant row keeps `meta["viewer_citations"]` (full tag map + cited + inval
 rewritten); the done frame carries the citation map for client-side decoration. Viewer **FOCUS** turns run
 with thinking disabled — on-screen Q&A over a small window must not pay the reasoning-prefill tax (the
 voice-call precedent; FULL turns keep thinking, it is a whole-document reasoning request).
+
+**Stub routing — a blind turn still knows where to look.** NONE used to mean silence: a readable document
+open in the viewer but nothing injectable this turn left the model without any channel to the content.
+Now, when the NONE branch produces **zero blocks** and the viewer is `follow`ed, carries a readable
+`asset_id`, and is a document kind `read_document` can open (`pdf` / `office` / `text` / `markdown` —
+images and videos are excluded because their pipelines have no text/page tool to route to), the assembly
+returns `status="stub"` instead of `none`. The stub renders a **second, trusted prompt form** — the
+`## Viewer Access Context` control section — through the same `viewer_reference_section` seam:
+`stub` → control section, `injected` → the UNTRUSTED `[Vn]` data section, otherwise `""`; the two renderers
+are physically exclusive and never co-occur in one turn. The control section carries the fenced asset name
+(escalating `_fence` — a crafted filename cannot forge a bullet line of a trusted section), the asset id,
+the current page (or `N/A`), and routing guidelines the model must follow: answer current-page deictics
+with `read_document(asset_id, pages="<current page>")` (never fabricate a page when it's `N/A`), honor
+explicit page/range specs via `pages`, omit `pages` for a whole-document ask, refuse page-scoped reads for
+formats without a page axis **instead of substituting the full document**, treat reading the viewer
+material as mandatory (web/RAG may supplement, never replace), and answer unrelated chatter directly
+without a tool call. P0 selections always outrank the stub (a surviving block means `injected`);
+FULL never degrades into a stub (`too_large` / `unavailable` still abort the turn before the agent runs).
+Both chat streams sink the assembly (`status in ("injected", "stub")`) and skip `_viewer_abort`. After the
+turn, a stub run writes a **read trace** to the assistant row's `meta["viewer"]` —
+`{mode, status:"stub", asset_id, current_page, reads:[{tool_call_id, pages}, …]}` — collected from the
+turn's messages: every `read_document` call whose args name the stub asset, **including failed calls**
+(the contract records attempted specs, e.g. a rejected `pages:"0"`), and the same payload rides the
+sync response / SSE `done` frame as `viewer`.
 
 **Mechanism (desktop).** `viewer.js` tracks the focus state (`IntersectionObserver` center-band page winner
 for PDFs, `timeupdate` → media-ms for video, subtitle cues parsed to ms) and extracts honestly: page text
@@ -4326,10 +4421,18 @@ image assets referenced by `image_asset_id`. `[Vn]` tags in the streamed answer 
 asset (same asset only; otherwise a toast — never an automatic jump under the user's feet). `too_large` /
 `unavailable` land as notices, never as a silent generic answer.
 
-**Test doctrine** (`tests/test_viewer_context.py` + `tests/test_viewer_chat.py`): window arithmetic
+**Test doctrine** (`tests/test_viewer_context.py` + `tests/test_viewer_chat.py` +
+`tests/test_read_document_tool.py`): window arithmetic
 (boundary extension / active cue / future exclusion / caps); the classification priority matrix; block
 numbering & P0-before-mode ordering; every short-circuit path; fence escalation over embedded quotes;
 citation validation that never rewrites; forged-asset and per-frame permission paths at the router seam;
+the stub eligibility matrix (kind / follow / asset-readability exclusions, P0 precedence, FULL-never-
+degrades) and the Access-Context render contract (routing guidelines present, no vision mention, forged
+asset names fenced, `N/A` page handling, section dispatch stub-vs-injected-vs-none); the `pages` parser
+contract (dedupe/sort, malformed/range/over-cap/`""` rejections, bounds-checked before extraction,
+page-axis-less formats refused); ACL-before-storage on `read_document`; the stub read trace — including a
+**failed** `read_document` call captured in `viewer.reads` — asserted end-to-end on the streaming
+`/chat/stream` path via an ASGI transport;
 and the core compatibility invariant — a kernel turn without a viewer assembly assembles a prompt
 **byte-identical** to the pre-feature one even with the section registered.
 
