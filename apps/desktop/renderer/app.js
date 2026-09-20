@@ -1766,9 +1766,9 @@
       okBtn.disabled = noBtn.disabled = true;
       const feedback = gen
         ? proceed
-          ? "用户已确认。生成将由云盘后台作业完成(平台已打开生成窗口),请告知用户选择目录后自动开始,不要再调用工具、不要自己写文件。"
-          : "用户取消了本次生成,请简短知悉。"
-        : proceed ? null : "用户拒绝了本次工具调用。";
+          ? "用户已确认。本次生成由云盘后台作业完成(平台已打开生成窗口)。此指令仅适用于当前回合:请告知用户选择目录后自动开始;在当前回合不要再调用生成工具、不要自己写文件。后续回合的工具使用不受影响。"
+          : "用户取消了这一次生成请求(仅取消本次工具调用,当前回合无需重试)。请简短知悉;后续回合仍按正常规则按需调用工具。"
+        : proceed ? null : "用户拒绝了这一次工具调用(仅本次;后续回合可按需再次调用工具)。";
       // gen → always deny-with-feedback: the cloud job (opened right below) is the real
       // executor; a plain agent tool → honest allow/deny.
       await resolveApproval(id, gen ? false : proceed, feedback);

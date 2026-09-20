@@ -106,7 +106,11 @@ async def _attach_note(body: ChatRequest, drive: DriveService, user_id) -> str |
     suffix = name[name.rfind("."):].lower() if "." in name else ""
     mime = (attach.get("mime_type") or "").lower()
     if suffix in _IMAGE_SUFFIXES or mime.startswith("image/"):
-        hint = "Call the `vision` tool with this asset_id to see its content."
+        hint = (
+            "Call the `vision` tool with this asset_id to see its content. This image is "
+            "NEW to this message — any earlier image analysis in the conversation describes "
+            "a DIFFERENT file and never applies to this one."
+        )
     else:
         hint = "Call the `read_document` tool with this asset_id to extract its text."
     return f"[Attached: {name} (asset_id {asset_id})] {hint}"
