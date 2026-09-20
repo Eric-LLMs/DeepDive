@@ -38,7 +38,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from rag.query_cache import configure_query_cache
+from rag.query_cache import bump_corpus_version, configure_query_cache
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -91,6 +91,17 @@ async def lifespan(app: FastAPI):
     app.state.redis = redis
     configure_approval_broker(redis)  # distributed approval wakeup across API nodes
     configure_query_cache(redis)      # RAG query cache (keyed by config + corpus version)
+    # Built-in product manual → SQL chunks + pgvector (public, version-gated). Fail-soft:
+    # an unreachable embedding service simply retries on the next boot (the marker in
+    # app_settings is only written after a full success).
+    try:
+        from core.infrastructure.manual_seed import seed_product_manual
+        from core.infrastructure.vector import TEIEmbedder
+
+        if await seed_product_manual(SessionLocal, TEIEmbedder(timeout=120.0)):
+            await bump_corpus_version(redis)
+    except Exception:
+        logger.warning("product-manual seed failed — retrying next boot", exc_info=True)
     yield
     await redis.aclose()
 

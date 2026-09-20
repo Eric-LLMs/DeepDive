@@ -5,6 +5,10 @@ Three channels grant a user access to an asset:
 2. workspace membership (my workspace_id is in my workspace list)
 3. asset-level ACL (granted to me, or public link with grantee NULL)
 
+A fourth channel covers the built-in product manual: owner-NULL chunks with
+``source_type = 'manual'`` (seeded at boot by ``core.infrastructure.manual_seed``)
+are visible to every tenant and to guests — they carry no asset row at all.
+
 The predicate is expressed twice: as a SQLAlchemy expression (for ORM selects) and as a raw
 SQL fragment (for the tsvector / pgvector recall queries that run raw SQL).
 """
@@ -12,7 +16,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 
 from core.infrastructure.db import (
     AssetAclModel,
@@ -75,6 +79,11 @@ def chunk_visible_expr(user_id: UUID, chunk_alias=ChunkModel):
         or_(AssetAclModel.grantee_user_id == user_id, AssetAclModel.grantee_user_id.is_(None))
     )
     return or_(
+        # Built-in manual: owner-NULL ``manual`` chunks are public to everyone.
+        and_(
+            chunk_alias.source_type == "manual",
+            chunk_alias.user_id.is_(None),
+        ),
         chunk_alias.user_id == user_id,
         chunk_alias.workspace_id.in_(_visible_workspaces(user_id)),
         chunk_alias.asset_id.in_(acl_ok),
@@ -85,9 +94,12 @@ def asset_visibility_sql(user_id: UUID, chunk_alias: str = "c") -> str:
     """Raw SQL predicate over a ``chunks`` row aliased ``chunk_alias`` (bound param ``:uid``).
 
     Used by the keyword/vector recallers that run raw SQL against the ``chunks`` table.
+    The first disjunct is the public built-in manual (owner-NULL ``source_type='manual'``
+    chunks — it matches for guests too, where ``:uid`` is NULL and never equals anything).
     """
     return (
-        f"{chunk_alias}.user_id = :uid "
+        f"({chunk_alias}.source_type = 'manual' AND {chunk_alias}.user_id IS NULL) "
+        f"OR {chunk_alias}.user_id = :uid "
         f"OR {chunk_alias}.workspace_id IN "
         f"(SELECT workspace_id FROM workspace_members WHERE user_id = :uid) "
         f"OR {chunk_alias}.workspace_id IN (SELECT id FROM workspaces WHERE owner_id = :uid) "

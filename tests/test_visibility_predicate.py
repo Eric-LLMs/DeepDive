@@ -25,6 +25,27 @@ def test_visibility_sql_contains_all_three_channels():
     assert "grantee_user_id IS NULL" in sql
 
 
+def test_manual_public_channel_in_raw_sql():
+    """Owner-NULL ``source_type='manual'`` chunks stay visible even to a guest.
+
+    The keyword recaller binds ``:uid`` — NULL for guests, so the owner branch can
+    never match; the manual branch must stand as its own disjunct.
+    """
+    sql = asset_visibility_sql(uuid4())
+    assert "source_type = 'manual'" in sql
+    assert "user_id IS NULL" in sql
+
+
+def test_manual_public_channel_in_vector_sql():
+    factory = _CapturingFactory()
+    store = PgVectorStore(factory)
+    asyncio.run(store.search([0.1, 0.2], 5, {"user_id": "u-1"}))
+    sql = factory.session.sql
+    assert "chunks.source_type" in sql
+    # owner NULL is checked only by the manual branch here (the owner branch binds :uid)
+    assert "chunks.user_id IS NULL" in sql
+
+
 def test_visible_expr_builds():
     expr = asset_visible_expr(uuid4())
     assert expr is not None
