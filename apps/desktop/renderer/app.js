@@ -1305,12 +1305,22 @@
     details.appendChild(box);
     chatLog.appendChild(details);
     const scroll = () => { chatLog.scrollTop = chatLog.scrollHeight; };
+    // Whether any real activity (streamed reasoning or a tool call) ever landed. FOCUS
+    // turns run with the model's thinking suppressed (server-side) and can answer
+    // straight from the injected viewer text without calling a tool — the bar is then a
+    // bare "working" placeholder, and done() drops it instead of settling on an empty
+    // 💭 Thoughts fold.
+    let seen = false;
     return {
       el: details,
       setPhase: (txt) => { sum.textContent = txt; },
-      addThinking: (t) => { box.textContent += t; scroll(); },
-      addTool: (label) => { box.textContent += (box.textContent ? "\n" : "") + label; },
-      done: () => { sum.textContent = "💭 Thoughts"; scroll(); },
+      addThinking: (t) => { seen = true; box.textContent += t; scroll(); },
+      addTool: (label) => { seen = true; box.textContent += (box.textContent ? "\n" : "") + label; },
+      done: () => {
+        if (!seen) { details.remove(); return; }
+        sum.textContent = "💭 Thoughts";
+        scroll();
+      },
     };
   }
 
@@ -1843,6 +1853,15 @@
       }
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
 
+      // The activity line now starts with the stream instead of waiting for the first
+      // thinking/tool event: FOCUS turns (a document/video open on screen) have the
+      // model's thinking suppressed server-side and often answer straight from the
+      // injected viewer text without any tool call — with the old lazy creation the whole
+      // turn looked "dead" (no line at all). The placeholder reads ⋯ Working… and gets
+      // overwritten by real 💭/🔍/📚 phases; a turn with zero activity drops it on done().
+      statusBar = makeStatusBar();
+      statusBar.setPhase("⋯ Working…");
+
       // Parse the SSE stream: each event is a JSON "data: {...}" block separated by blank lines.
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -1875,6 +1894,9 @@
       appendMsg("error", `Request failed: ${err.message}`);
     } finally {
       chatSend.disabled = false;
+      // Settle (or drop, if it stayed an empty placeholder) the activity line on any
+      // path that skipped the done/content frames — abort, error, dropped connection.
+      if (statusBar) statusBar.done();
       // The stream ended. A turn that handed its run to the worker chain (research_continuing)
       // keeps the run slot held server-side — leave Run / Delete disabled; the live monitor or
       // the chip poll re-enables them once the worker reports is_running=false. Only a turn that
