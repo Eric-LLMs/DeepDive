@@ -242,7 +242,8 @@
         drive.selected = new Set();
       }
       renderDrive();
-      refreshMain();
+      if (quiet) refreshMainQuiet();
+      else refreshMain();
       pollWhileWorking();
     } catch (e) {
       setStatus(`Failed to load cloud drive: ${e.message}`);
@@ -348,11 +349,51 @@
   // the 5s ingest poll) skip this while a document is open so the file the user is
   // reading is never torn down underneath them; it comes back on the next refresh once
   // the document is closed. `refreshPending` marks that a re-render is owed.
-  function refreshMain() {
+  // `preserveScroll` keeps the file table's scroll offset across the rebuild — the
+  // table is re-rendered from scratch, so without it the scrollbar jumps to the top.
+  let lastMainSig = null;
+  function refreshMain(opts = {}) {
     if (!drive.loc) return;
     if (Viewer.isOpen()) { refreshPending = true; return; }
     refreshPending = false;
+    lastMainSig = mainSig();
+    const body = opts.preserveScroll ? document.querySelector("#viewer .cdt-body") : null;
+    const st = body ? body.scrollTop : null;
     browseCloudFolder(drive.loc);
+    if (st != null) {
+      const b2 = document.querySelector("#viewer .cdt-body");
+      if (b2) b2.scrollTop = st;
+    }
+  }
+
+  // Everything Viewer.renderFolder reads for the current page. Equal signature means a
+  // rebuild would produce an identical table, so background polls can skip it entirely
+  // (the flicker-free path when nothing changed). The per-second ingest ETA text is not
+  // part of the data — including a 30s clock bucket only while a visible file is still
+  // WORKING keeps the countdown roughly fresh without swapping the table every tick.
+  function mainSig() {
+    const entries = currentEntries();
+    const workingVisible = entries.some((e) => e.type !== "dir" && RAG_WORKING.has(e.rag_status));
+    return JSON.stringify({
+      k: locKey(drive.loc),
+      q: drive.query, vm: drive.viewMode, em: drive.editMode,
+      sel: [...drive.selected].sort(),
+      is: Object.keys(drive.importState).sort().map((id) => [id, drive.importState[id]]),
+      tn: drive.trash.length,
+      ws: drive.workspaces.map((w) => [w.id, w.name, w.role]),
+      e: entries.map((e) => (e.type === "dir"
+        ? ["d", e.path, e.id || null]
+        : ["f", e.id, e.name, e.size, e.rag_status || "", e.mime_type || "", e.updated_at || ""])),
+      ...(workingVisible ? { t: Math.floor(Date.now() / 30000) } : {}),
+    });
+  }
+
+  // Poll-path main refresh: rebuild only when the table data actually changed, and
+  // never move the user's scroll position when it does.
+  function refreshMainQuiet() {
+    if (Viewer.isOpen()) { refreshPending = true; return; }
+    if (mainSig() === lastMainSig) return;
+    refreshMain({ preserveScroll: true });
   }
 
   // Re-render the main area but keep the scroll position (checkbox toggles, search,
