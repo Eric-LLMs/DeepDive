@@ -32,7 +32,8 @@ RUN pip install --no-cache-dir -e "." \
 # loudly instead of hanging; `typst --version` is the build-time gate.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-         curl ca-certificates xz-utils unzip fontconfig fonts-dejavu-core \
+         # antiword: legacy .doc text extraction on the ingest path (core.infrastructure.ingest).
+         curl ca-certificates xz-utils unzip fontconfig fonts-dejavu-core antiword \
     && curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 \
          -o /tmp/typst.tar.xz \
          https://github.com/typst/typst/releases/download/v0.15.1/typst-x86_64-unknown-linux-musl.tar.xz \
