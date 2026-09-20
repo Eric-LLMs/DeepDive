@@ -126,6 +126,12 @@
   let refreshTimer = null;
   // Working-directory tree expansion, keyed per task, survives live re-renders.
   const treeOpenState = new Map(); // task_id -> Set(relative folder seg)
+  // The whole tree column is cached per task and only rebuilt when its data signature
+  // changes. The live monitor re-renders the pane every ~1.5s while a run is in flight;
+  // rebuilding an unchanged tree detached+recreated every row, which visibly flashed the
+  // sidebar. Cache reuse keeps hover/scroll/focus stable — same idea as graphDrawerSig.
+  const treeColCache = new Map(); // task_id -> { sig, col }
+  let treeScrollMemo = null;      // { taskId, top } — captured before the pane is wiped
   let stopInFlight = false;
   // Two-zone workbench: the right-hand file-preview column is persistent per task (it survives
   // monitor re-renders so an open file's content is not wiped every refresh), while the tree
@@ -971,6 +977,10 @@
     // inside it first and restore the offsets after re-attach. Without this, each live-
     // monitor refresh throws a half-read document back to the top as if freshly opened.
     const scrollMemo = capturePreviewScroll();
+    // The tree column is rebuilt-or-reused by renderTreeCol below; capture its scroll first
+    // so detaching the pane does not throw a scrolled tree back to the top.
+    const treeSc = pane.querySelector(".rtv-tree-scroll");
+    treeScrollMemo = { taskId: detail.task_id, top: treeSc ? treeSc.scrollTop : 0 };
     pane.innerHTML = "";
 
     // Card header: title + status/stage badges + actions up top, working-directory meta as
@@ -1111,7 +1121,35 @@
   // Folder rows start collapsed but the task row is expanded one level; ▸/▾ toggles expand in
   // place and each file row opens in the preview column to the right. The expansion set is kept
   // per task across live re-renders.
+  // Signature of everything the tree renders from — folder path label, the file set
+  // (identity / placement / size / RAG badge), expansion state, and the selected file.
+  // Equal signatures mean an identical tree, so the column node can be reused untouched.
+  function treeSig(detail, open) {
+    return JSON.stringify({
+      cp: detail.cloud_folder_path || "",
+      files: (detail.cloud_files || []).map((f) => [f.id, f.folder_path || "", f.name, f.size, f.rag_status || ""]),
+      open: [...open].sort(),
+      sel: previewState.taskId === detail.task_id && previewState.file ? previewState.file.id : "",
+    });
+  }
+
+  // Re-apply the captured scroll offset after the column is (re-)attached.
+  function restoreTreeScroll(col, taskId) {
+    const sc = col.querySelector(".rtv-tree-scroll");
+    if (!sc || !treeScrollMemo || treeScrollMemo.taskId !== taskId || !treeScrollMemo.top) return;
+    const top = treeScrollMemo.top;
+    requestAnimationFrame(() => { if (sc.isConnected) sc.scrollTop = top; });
+  }
+
   function renderTreeCol(detail) {
+    const open = treeOpenState.get(detail.task_id) || new Set([""]);
+    treeOpenState.set(detail.task_id, open);
+    const sig = treeSig(detail, open);
+    const cached = treeColCache.get(detail.task_id);
+    if (cached && cached.sig === sig) {
+      restoreTreeScroll(cached.col, detail.task_id);
+      return cached.col;
+    }
     const col = el("div", "rtv-col rtv-tree-col");
     const head = el("div", "rtv-col-head");
     head.appendChild(el("span", "rtv-col-title", "Working directory"));
@@ -1150,14 +1188,16 @@
         .filter((d) => d !== dir && d.startsWith(prefix) && !d.slice(prefix.length).includes("/"))
         .sort((a, b) => a.localeCompare(b));
     };
-    const open = treeOpenState.get(detail.task_id) || new Set([""]);
-    treeOpenState.set(detail.task_id, open);
 
     function toggle(dir) {
       if (open.has(dir)) open.delete(dir);
       else open.add(dir);
       const treeEl = wrap.querySelector(".rtv-tree");
       if (treeEl) treeEl.replaceWith(buildTree());
+      // Keep the cache honest: the tree now matches the new expansion set, so the next
+      // monitor refresh must not needlessly rebuild the column we just patched.
+      const c = treeColCache.get(detail.task_id);
+      if (c) c.sig = treeSig(detail, open);
     }
 
     // Subtree file totals: how many files a folder holds including everything under it. Direct
@@ -1286,6 +1326,8 @@
     }
 
     wrap.appendChild(buildTree());
+    treeColCache.set(detail.task_id, { sig, col });
+    restoreTreeScroll(col, detail.task_id);
     return col;
   }
 

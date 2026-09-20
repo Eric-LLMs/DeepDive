@@ -509,12 +509,10 @@
     if (cloudPollTimer) { clearInterval(cloudPollTimer); cloudPollTimer = null; }
     const working = () => drive.files.some((f) => RAG_WORKING.has(f.rag_status));
     if (!working()) return;
-    cloudPollTimer = setInterval(async () => {
-      if (!working()) { clearInterval(cloudPollTimer); cloudPollTimer = null; return; }
-      try {
-        await loadDrive();
-        refreshMain();
-      } catch { /* keep polling on transient failures */ }
+    cloudPollTimer = setInterval(() => {
+      // loadDrive() re-renders (incrementally — no flash), refreshes the main area and
+      // re-arms/stops this timer via pollWhileWorking, so nothing else is needed here.
+      loadDrive().catch(() => { /* keep polling on transient failures */ });
     }, 5000);
   }
 
@@ -531,156 +529,249 @@
     return l.kind === "folder" && l.ws === ws && l.path === path;
   }
 
-  // One top-level scope row (My Drive / a workspace / Trash). Clicking the ▸/▾ toggle
-  // expands in place; clicking the row browses it in the main area.
-  function topLevelRow(icon, name, ws, path, trash) {
-    const row = document.createElement("div");
-    row.className = "cd-row cd-folder" + (isCurrentLoc(ws, path, trash) ? " cd-current" : "")
-      + (trash ? " cd-trash" : " cd-top");
-    row.dataset.path = path;
-    row.dataset.ws = trash ? "__trash__" : (ws || "");
-    const hasKids = !trash && childrenOf(ws, "").folderKids.length + childrenOf(ws, "").fileKids.length > 0;
-    const open = drive.expanded.has(expKey(ws, path));
-    const tw = document.createElement("span");
-    tw.className = "cd-tw";
-    tw.textContent = trash ? "·" : hasKids ? (open ? "▾" : "▸") : "·";
-    row.appendChild(tw);
-    row.appendChild(Object.assign(document.createElement("span"), { className: "cd-icon", textContent: icon }));
-    const nm = document.createElement("span");
-    nm.className = "cd-name";
-    nm.textContent = name;
-    row.appendChild(nm);
-    const meta = document.createElement("span");
-    meta.className = "cd-meta";
-    if (trash) meta.textContent = drive.trash.length ? String(drive.trash.length) : "";
-    else if (ws != null) meta.textContent = drive.workspaces.find((x) => x.id === ws)?.role || "";
-    row.appendChild(meta);
-    row.title = trash ? "Browse Trash" : `Browse ${name}`;
-    if (!trash && hasKids) {
-      tw.addEventListener("click", (e) => {
-        e.stopPropagation();
-        if (drive.expanded.has(expKey(ws, path))) drive.expanded.delete(expKey(ws, path));
-        else drive.expanded.add(expKey(ws, path));
-        renderDrive();
+  // ── Incremental sidebar rendering ──
+  // The 5s ingest poll used to rebuild the whole tree (innerHTML = ""), which visibly
+  // flashed the sidebar every tick. Instead each render produces a declarative spec
+  // (an ordered list of keyed entries) and syncChildren() reconciles the real DOM against
+  // it: rows whose key already exists are patched in place (class/text only when needed),
+  // only genuinely new rows are created, and unchanged rows are never detached — so hover,
+  // focus and scroll survive a refresh, and a poll that changes nothing touches nothing.
+  // Row behavior (click/toggle/drag) is delegated to cdListEl below; rows carry their
+  // identity in dataset.{ws,path,id,folder}, so reused rows can't go stale.
+  //
+  // Entry shapes:
+  //   {key, type:"top",    icon, name, ws, path, trash, hasKids, open}
+  //   {key, type:"folder", ws, path, name, id, depth, hasKids, open}
+  //   {key, type:"file",   ws, file, depth}
+  //   {key, type:"box",    children:[...]}   ← .cd-kids container
+  //   {key, type:"empty",  text, pad}
+
+  function driveTreeSpec() {
+    const out = [];
+    const top = (icon, name, ws, path, trash) => {
+      const key = trash ? "top:trash" : `top:${expKey(ws, path)}`;
+      const kids = trash ? { folderKids: [], fileKids: [] } : childrenOf(ws, "");
+      out.push({
+        key, type: "top", icon, name, ws, path, trash,
+        hasKids: !trash && kids.folderKids.length + kids.fileKids.length > 0,
+        open: !trash && drive.expanded.has(expKey(ws, path)),
       });
+      if (!trash && drive.expanded.has(expKey(ws, path))) {
+        out.push({ key: `box:${key}`, type: "box", children: entriesSpec(ws, "", 1) });
+      }
+    };
+    top("☁️", "My Drive", null, "", false);
+    for (const w of drive.workspaces) top("📁", w.name, w.id, "", false);
+    top("🗑", "Trash", null, "", true);
+    const rootKids = childrenOf(null, "");
+    if (!drive.workspaces.length && !rootKids.folderKids.length && !rootKids.fileKids.length && !drive.trash.length) {
+      out.push({ key: "empty", type: "empty", text: "My Drive is empty. Right-click or use 📝 / 📁 to add files.", pad: null });
     }
-    row.addEventListener("click", () => {
-      if (trash) navigate({ kind: "trash" });
-      else if (ws == null) navigate({ kind: "root" });
-      else navigate({ kind: "workspace", ws });
-    });
+    return out;
+  }
+
+  // Children of one folder: subfolder rows (each followed by its open children box) then file rows.
+  function entriesSpec(ws, path, depth) {
+    const { folderKids, fileKids } = childrenOf(ws, path);
+    if (!folderKids.length && !fileKids.length) {
+      return [{ key: "empty", type: "empty", text: "Empty.", pad: "2px 12px" }];
+    }
+    const out = [];
+    for (const d of folderKids) {
+      const kids = childrenOf(ws, d.path);
+      const key = `dir:${expKey(ws, d.path)}`;
+      const open = drive.expanded.has(expKey(ws, d.path));
+      out.push({
+        key, type: "folder", ws, path: d.path, name: d.name, id: d.id || null, depth,
+        hasKids: kids.folderKids.length > 0 || kids.fileKids.length > 0, open,
+      });
+      if (open) out.push({ key: `box:${key}`, type: "box", children: entriesSpec(ws, d.path, depth + 1) });
+    }
+    for (const f of fileKids) out.push({ key: `file:${f.id}`, type: "file", ws, file: f, depth });
+    return out;
+  }
+
+  function rowSkeleton(cls, withMeta) {
+    const row = document.createElement("div");
+    row.className = cls;
+    const tw = document.createElement("span"); tw.className = "cd-tw";
+    const icon = document.createElement("span"); icon.className = "cd-icon";
+    const nm = document.createElement("span"); nm.className = "cd-name";
+    row.append(tw, icon, nm);
+    if (withMeta) row.appendChild(Object.assign(document.createElement("span"), { className: "cd-meta" }));
     return row;
   }
 
-  function renderDrive() {
-    cdListEl.innerHTML = "";
-    const rootKids = childrenOf(null, "");
-    cdListEl.appendChild(topLevelRow("☁️", "My Drive", null, "", false));
-    if (drive.expanded.has(expKey(null, ""))) {
+  function createEntry(en) {
+    if (en.type === "box") {
       const box = document.createElement("div");
       box.className = "cd-kids";
-      renderEntries(null, "", 1, box);
-      cdListEl.appendChild(box);
+      box.dataset.key = en.key;
+      return box;
     }
-    for (const w of drive.workspaces) {
-      cdListEl.appendChild(topLevelRow("📁", w.name, w.id, "", false));
-      if (drive.expanded.has(expKey(w.id, ""))) {
-        const box = document.createElement("div");
-        box.className = "cd-kids";
-        renderEntries(w.id, "", 1, box);
-        cdListEl.appendChild(box);
+    if (en.type === "empty") {
+      const div = document.createElement("div");
+      div.className = "cd-empty";
+      div.dataset.key = en.key;
+      return div;
+    }
+    const cls = en.type === "file"
+      ? "cd-row cd-file"
+      : "cd-row cd-folder" + (en.type === "top" ? (en.trash ? " cd-trash" : " cd-top") : "");
+    const row = rowSkeleton(cls, en.type !== "folder");
+    row.dataset.key = en.key;
+    return row;
+  }
+
+  function updateEntry(el2, en) {
+    switch (en.type) {
+      case "box":
+        syncChildren(el2, en.children);
+        break;
+      case "empty":
+        el2.textContent = en.text;
+        el2.style.padding = en.pad || "";
+        break;
+      case "top": {
+        el2.classList.toggle("cd-current", isCurrentLoc(en.ws, en.path, en.trash));
+        el2.dataset.path = en.path;
+        el2.dataset.ws = en.trash ? "__trash__" : (en.ws || "");
+        el2.querySelector(".cd-tw").textContent = en.trash ? "·" : en.hasKids ? (en.open ? "▾" : "▸") : "·";
+        el2.querySelector(".cd-icon").textContent = en.icon;
+        el2.querySelector(".cd-name").textContent = en.name;
+        const meta = el2.querySelector(".cd-meta");
+        meta.textContent = en.trash
+          ? (drive.trash.length ? String(drive.trash.length) : "")
+          : en.ws != null ? (drive.workspaces.find((x) => x.id === en.ws)?.role || "") : "";
+        el2.title = en.trash ? "Browse Trash" : `Browse ${en.name}`;
+        break;
+      }
+      case "folder": {
+        el2.classList.toggle("cd-current", isCurrentLoc(en.ws, en.path, false));
+        el2.dataset.path = en.path;
+        el2.dataset.ws = en.ws || "";
+        el2.dataset.id = en.id || "";
+        el2.style.paddingLeft = `${6 + en.depth * 16}px`;
+        el2.querySelector(".cd-tw").textContent = en.hasKids ? (en.open ? "▾" : "▸") : "·";
+        el2.querySelector(".cd-icon").textContent = "📁";
+        el2.querySelector(".cd-name").textContent = en.name;
+        el2.title = `Browse folder ${en.name} (▸ expands in place)`;
+        el2.draggable = true;
+        break;
+      }
+      case "file": {
+        const f = en.file;
+        const isText = isTextFile(f);
+        el2.dataset.folder = f.folder_path || "";
+        el2.dataset.ws = en.ws || "";
+        el2.dataset.id = f.id;
+        el2.style.paddingLeft = `${6 + en.depth * 16}px`;
+        el2.querySelector(".cd-icon").textContent = isText ? "📄" : "📦";
+        el2.querySelector(".cd-name").textContent = f.name;
+        el2.querySelector(".cd-meta").textContent = fmtSize(f.size);
+        el2.title = isText ? "Open note" : "Open in viewer";
+        el2.draggable = true;
+        break;
       }
     }
-    cdListEl.appendChild(topLevelRow("🗑", "Trash", null, "", true));
-    if (!drive.workspaces.length && !rootKids.folderKids.length && !rootKids.fileKids.length && !drive.trash.length) {
-      const empty = document.createElement("div");
-      empty.className = "cd-empty";
-      empty.textContent = "My Drive is empty. Right-click or use 📝 / 📁 to add files.";
-      cdListEl.appendChild(empty);
+  }
+
+  // Reconcile `container`'s children against `entries` (ordered, keyed). Existing rows are
+  // reused and only moved when their position changed — never removed-and-reinserted.
+  function syncChildren(container, entries) {
+    const oldByKey = new Map();
+    for (const child of Array.from(container.children)) {
+      if (child.dataset && child.dataset.key) oldByKey.set(child.dataset.key, child);
     }
+    let i = 0;
+    for (const en of entries) {
+      let el2 = oldByKey.get(en.key);
+      oldByKey.delete(en.key);
+      if (el2) updateEntry(el2, en);
+      else { el2 = createEntry(en); el2.dataset.key = en.key; updateEntry(el2, en); }
+      const ref = container.children[i];
+      if (ref !== el2) container.insertBefore(el2, ref);
+      i++;
+    }
+    for (const gone of oldByKey.values()) gone.remove();
+    // Drop keyless leftovers (e.g. the "Sign in" placeholder from a logged-out render).
+    for (const child of Array.from(container.children)) if (!child.dataset.key) child.remove();
+  }
+
+  function renderDrive() {
+    if (!cdListEl.dataset.delegated) {
+      cdListEl.dataset.delegated = "1";
+      bindTreeDelegates();
+    }
+    syncChildren(cdListEl, driveTreeSpec());
     cdPathEl.textContent = locLabel(drive.loc);
     cdPathEl.title = drive.loc.kind === "trash" ? "Trash" : `Browse ${locLabel(drive.loc)}`;
   }
 
-  // Recursively renders folder rows (▸/▾ expandable) then file rows within a scope.
-  function renderEntries(ws, path, depth, container) {
-    const { folderKids, fileKids } = childrenOf(ws, path);
-    if (!folderKids.length && !fileKids.length) {
-      const empty = document.createElement("div");
-      empty.className = "cd-empty";
-      empty.style.padding = "2px 12px";
-      empty.textContent = "Empty.";
-      container.appendChild(empty);
-      return;
-    }
-    for (const d of folderKids) {
-      const { folderKids: kids, fileKids: kf } = childrenOf(ws, d.path);
-      const hasKids = kids.length > 0 || kf.length > 0;
-      const key = expKey(ws, d.path);
-      const open = drive.expanded.has(key);
-      const row = document.createElement("div");
-      row.className = "cd-row cd-folder" + (isCurrentLoc(ws, d.path, false) ? " cd-current" : "");
-      row.dataset.path = d.path;
-      row.dataset.ws = ws || "";
-      row.dataset.id = d.id || "";
-      row.style.paddingLeft = `${6 + depth * 16}px`;
-      const tw = document.createElement("span");
-      tw.className = "cd-tw";
-      tw.textContent = hasKids ? (open ? "▾" : "▸") : "·";
-      row.appendChild(tw);
-      row.appendChild(Object.assign(document.createElement("span"), { className: "cd-icon", textContent: "📁" }));
-      const nm = document.createElement("span");
-      nm.className = "cd-name";
-      nm.textContent = d.name;
-      row.appendChild(nm);
-      row.title = `Browse folder ${d.name} (▸ expands in place)`;
-      row.draggable = true;
-      row.addEventListener("dragstart", (e) => {
-        e.dataTransfer.setData("text/plain", JSON.stringify({ kind: "folder", id: d.id || null, path: d.path, ws }));
-        e.dataTransfer.effectAllowed = "move";
-        row.classList.add("dragging");
-      });
-      row.addEventListener("dragend", () => row.classList.remove("dragging"));
-      tw.addEventListener("click", (e) => {
-        e.stopPropagation();
+  // Behavior for tree rows, bound once on the container. Handlers resolve the clicked row
+  // from its dataset + current `drive` state, so a reused row always acts on fresh data.
+  function bindTreeDelegates() {
+    const rowWs = (row) => {
+      const v = row.dataset.ws;
+      return v === "" || v === "__trash__" ? null : v;
+    };
+    cdListEl.addEventListener("click", (e) => {
+      const row = e.target.closest(".cd-row");
+      if (!row) return;
+      const onTw = !!e.target.closest(".cd-tw");
+      if (row.classList.contains("cd-trash")) {
+        if (!onTw) navigate({ kind: "trash" });
+        return;
+      }
+      if (row.classList.contains("cd-file")) {
+        const f = drive.files.find((x) => x.id === row.dataset.id);
+        if (!f) return;
+        if (isTextFile(f)) openNote(f); else openCloudFile(f);
+        return;
+      }
+      // folder-ish row (plain folder or top-level scope)
+      const ws = rowWs(row);
+      const path = row.dataset.path || "";
+      if (onTw) {
+        const kids = childrenOf(ws, path);
+        if (!kids.folderKids.length && !kids.fileKids.length) return;
+        const key = expKey(ws, path);
         if (drive.expanded.has(key)) drive.expanded.delete(key);
         else drive.expanded.add(key);
         renderDrive();
-      });
-      row.addEventListener("click", () => navigate({ kind: "folder", ws, path: d.path }));
-      container.appendChild(row);
-      if (open) {
-        const kidsBox = document.createElement("div");
-        kidsBox.className = "cd-kids";
-        renderEntries(ws, d.path, depth + 1, kidsBox);
-        container.appendChild(kidsBox);
+        return;
       }
-    }
-    for (const f of fileKids) {
-      const isText = isTextFile(f);
-      const row = document.createElement("div");
-      row.className = "cd-row cd-file";
-      row.style.paddingLeft = `${6 + depth * 16}px`;
-      row.dataset.folder = f.folder_path || "";
-      row.dataset.ws = ws || "";
-      row.dataset.id = f.id;
-      row.innerHTML = '<span class="cd-tw"></span>' +
-        `<span class="cd-icon">${isText ? "📄" : "📦"}</span>` +
-        '<span class="cd-name"></span>' +
-        '<span class="cd-meta"></span>';
-      row.querySelector(".cd-name").textContent = f.name;
-      row.querySelector(".cd-meta").textContent = fmtSize(f.size);
-      row.title = isText ? "Open note" : "Open in viewer";
-      row.draggable = true;
-      row.addEventListener("dragstart", (e) => {
-        e.dataTransfer.setData("text/plain", JSON.stringify({ kind: "file", id: f.id, name: f.name, folder_path: f.folder_path || "", ws }));
-        e.dataTransfer.effectAllowed = "move";
-        row.classList.add("dragging");
-      });
-      row.addEventListener("dragend", () => row.classList.remove("dragging"));
-      row.addEventListener("click", () => { if (isText) openNote(f); else openCloudFile(f); });
-      container.appendChild(row);
-    }
+      if (row.classList.contains("cd-top")) {
+        if (ws == null) navigate({ kind: "root" });
+        else navigate(path ? { kind: "folder", ws, path } : { kind: "workspace", ws });
+      } else {
+        navigate({ kind: "folder", ws, path });
+      }
+    });
+    cdListEl.addEventListener("dragstart", (e) => {
+      const row = e.target.closest(".cd-row");
+      if (!row || !row.draggable || !e.dataTransfer) return;
+      const ws = rowWs(row);
+      if (row.classList.contains("cd-file")) {
+        const f = drive.files.find((x) => x.id === row.dataset.id);
+        if (!f) return;
+        e.dataTransfer.setData("text/plain", JSON.stringify({
+          kind: "file", id: f.id, name: f.name, folder_path: f.folder_path || "", ws,
+        }));
+      } else if (row.classList.contains("cd-folder")) {
+        e.dataTransfer.setData("text/plain", JSON.stringify({
+          kind: "folder", id: row.dataset.id || null, path: row.dataset.path || "", ws,
+        }));
+      } else {
+        return;
+      }
+      e.dataTransfer.effectAllowed = "move";
+      row.classList.add("dragging");
+    });
+    cdListEl.addEventListener("dragend", (e) => {
+      const row = e.target.closest && e.target.closest(".cd-row");
+      if (row) row.classList.remove("dragging");
+    });
   }
 
   // ── Right-click context menu (New text file / New folder / Upload / Delete) ──
