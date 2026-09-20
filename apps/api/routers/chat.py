@@ -197,8 +197,10 @@ async def _build_viewer_assembly(body: ChatRequest, drive: DriveService, user_id
 
 
 def _viewer_abort(assembly: dict | None) -> dict | None:
-    """Short-circuit payload when the turn must not reach the agent (patch: FULL over
-    budget / untrusted full capture → honest stop, no downgrade, no RAG fallback)."""
+    """Short-circuit payload when the turn must not reach the agent. Since documents
+    stopped being intent-matched server-side, ``too_large``/``unavailable`` only arise from
+    video FULL (over budget / untrusted full capture) — honest stop, no downgrade, no RAG
+    fallback."""
     if assembly and assembly["status"] in ("too_large", "unavailable"):
         return {
             "mode": assembly["mode"], "status": assembly["status"],
@@ -1159,8 +1161,9 @@ async def chat_stream(
                     context={**({"handoff": effective_handoff} if effective_handoff else {}),
                              **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] in ("injected", "stub") else {})} or None,
                     progress_sink=lambda evt: frames.put_nowait(("agent", evt)),
-                    # Viewer FOCUS turns are on-screen Q&A about a small window of content —
+                    # Video FOCUS turns are on-screen Q&A about a small subtitle window —
                     # never pay the thinking prefill tax for them (voice-call precedent).
+                    # Documents never reach "focus" anymore (they go through the stub).
                     disable_thinking=body.disable_thinking or (
                         viewer_assembly is not None and viewer_assembly.get("mode") == "focus"
                     ),

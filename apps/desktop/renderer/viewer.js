@@ -1029,23 +1029,20 @@ const Viewer = (() => {
       }
 
       // ── Chat focus tracking ──
-      // Keep the render handles for text extraction / navigation, then watch which page is
-      // centered: the -45%/-45% band leaves only the page crossing the viewport middle
-      // intersecting, so the winner is unambiguous without scroll-position math.
+      // Keep the render handles for navigation, then watch for scroll changes: the winner
+      // page is recomputed by geometry (which page covers the viewport middle) on every
+      // intersection change and again at send time, so a batch of entries in arbitrary
+      // order can never mis-report the current page.
       pdfState.numPages = pdf.numPages;
       pdfState.wraps = pageWraps;
       if (pageObserver) pageObserver.disconnect();
-      pageObserver = new IntersectionObserver((entries) => {
-        for (const e of entries) {
-          if (!e.isIntersecting) continue;
-          const p = parseInt(e.target.dataset.page, 10);
-          if (p && state.currentPage !== p) {
-            state.currentPage = p;
-            fireFocus();
-          }
-          break;
+      pageObserver = new IntersectionObserver(() => {
+        const p = pdfCurrentPage();
+        if (p && state.currentPage !== p) {
+          state.currentPage = p;
+          fireFocus();
         }
-      }, { root: container, rootMargin: "-45% 0px -45% 0px", threshold: 0 });
+      }, { root: container, threshold: 0 });
       for (const w of pageWraps) pageObserver.observe(w);
       state.currentPage = 1;
       fireFocus();
@@ -1854,29 +1851,27 @@ const Viewer = (() => {
   }
 
   // ── Chat focus API (app.js freezes this into the per-send viewer payload) ──
-  // Everything is read from the DOM the renderers already mounted: no re-parsing, no
-  // network. Caps mirror the server schema (focus_text ≤12000, cues ≤300, full ≤100k).
-  function extractPageText(page) {
-    const wrap = pdfState.wraps[(page || 1) - 1];
-    const layer = wrap && wrap.querySelector(".pdf-text-layer");
-    return layer ? layer.innerText : "";
-  }
-
-  // Full text is only *trusted* when every page's text layer is present and non-empty —
-  // a partial or failed render must never masquerade as the complete document (the
-  // server turns a trusted=False FULL into an honest "unavailable", never a fallback).
-  function extractPdfFullText() {
-    if (!pdfState.numPages || pdfState.wraps.length !== pdfState.numPages) {
-      return { ok: false, text: "" };
+  // Documents only report IDENTITY here (name/kind/asset_id/page); their content is no
+  // longer scraped from the DOM — the server hands the open document to the model as a
+  // Viewer Access Context stub and the model fetches pages via read_document. Only video
+  // still ships extracted content (subtitles), because media time has no tool channel.
+  function pdfCurrentPage() {
+    // The page whose box covers the vertical middle of the scroll container; if the gap
+    // between pages swallows the middle line, the nearest page wins.
+    const container = viewerEl().querySelector(".pdf-container");
+    if (!container || !pdfState.wraps.length) return null;
+    const rect = container.getBoundingClientRect();
+    const mid = rect.top + container.clientHeight / 2;
+    let best = null, bestDist = Infinity;
+    for (const w of pdfState.wraps) {
+      const r = w.getBoundingClientRect();
+      if (r.top <= mid && r.bottom >= mid) {
+        return parseInt(w.dataset.page, 10) || null;
+      }
+      const dist = r.bottom < mid ? mid - r.bottom : r.top - mid;
+      if (dist < bestDist) { bestDist = dist; best = w; }
     }
-    const parts = [];
-    for (const wrap of pdfState.wraps) {
-      const layer = wrap.querySelector(".pdf-text-layer");
-      const t = layer ? layer.innerText.trim() : "";
-      if (!t) return { ok: false, text: "" };
-      parts.push(t);
-    }
-    return { ok: true, text: parts.join("\n\n") };
+    return best ? parseInt(best.dataset.page, 10) || null : null;
   }
 
   function getFocus() {
@@ -1904,20 +1899,9 @@ const Viewer = (() => {
         if (full.length <= 100_000) { f.full_text = full; f.full_trusted = true; }
       }
     } else if (state.kind === "pdf") {
-      f.page = state.currentPage || 1;
-      f.focus_text = extractPageText(f.page) || null;
-      const full = extractPdfFullText();
-      if (full.ok) {
-        f.full_chars = full.text.length;
-        if (full.text.length <= 100_000) { f.full_text = full.text; f.full_trusted = true; }
-      }
-    } else {
-      // Other in-window renderers: the visible body text is the current content.
-      const body = viewerEl().querySelector(
-        ".viewer-body, .pdf-container, .text-viewer, .docx-viewer, .sheet-viewer, .pptx-wrap"
-      );
-      const t = body ? body.innerText.trim() : "";
-      if (t) f.focus_text = t.slice(0, 12_000);
+      // Geometry at call time — never trust the observer's last event alone for the page
+      // a question is scoped to.
+      f.page = pdfCurrentPage() || state.currentPage || 1;
     }
     return f;
   }
@@ -1956,5 +1940,5 @@ const Viewer = (() => {
     }
   }
 
-  return { render, renderFolder, kindFor, localUrl, toast, close, setAttachHandler, setSubtitleCopyHandler, setSubtitleActions, setSubtitleBusy, setDocGenerateBusy, setDocumentActions, isOpen, getFocus, setOnFocusChanged, navigateTo, extractPageText, captureFrameDataUrl, capturePageDataUrl };
+  return { render, renderFolder, kindFor, localUrl, toast, close, setAttachHandler, setSubtitleCopyHandler, setSubtitleActions, setSubtitleBusy, setDocGenerateBusy, setDocumentActions, isOpen, getFocus, setOnFocusChanged, navigateTo, captureFrameDataUrl, capturePageDataUrl };
 })();

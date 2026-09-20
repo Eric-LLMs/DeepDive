@@ -5101,7 +5101,9 @@
     if (f.asset_id) p.asset_id = f.asset_id;
     if (f.page != null) p.page = f.page;
     if (f.t_ms != null) p.t_ms = f.t_ms;
-    if (f.focus_text) p.focus_text = String(f.focus_text).slice(0, 12_000);
+    // focus_text is gone: document content is no longer scraped client-side — the server
+    // routes the open doc through the Viewer Access Context and read_document. Only video
+    // still ships extracted content (cues / transcript).
     if (f.cues && f.cues.length) {
       p.cues = f.cues.slice(0, 300).map((c) => ({
         start_ms: c.start_ms, end_ms: c.end_ms, text: String(c.text || "").slice(0, 500),

@@ -37,8 +37,10 @@ class _Drive:
 
 
 def _body(message="这段在讲什么", **viewer_kw) -> ChatRequest:
-    base = dict(name="paper.pdf", kind="pdf", provenance="cloud", asset_id=AID,
-                focus_text="Attention is a mechanism.", page=7)
+    # A followed PDF with only identity + a P0 selection: documents never inject body
+    # text server-side anymore (the model reads it via read_document through the stub).
+    base = dict(name="paper.pdf", kind="pdf", provenance="cloud", asset_id=AID, page=7,
+                selections=[ViewerSelection(kind="text", text="SEL")])
     base.update(viewer_kw)
     return ChatRequest(message=message, viewer=ViewerPayload(**base))
 
@@ -61,11 +63,12 @@ async def test_assembly_none_without_viewer():
     assert await chat_mod._build_viewer_assembly(body, _Drive(), USER) is None
 
 
-async def test_focus_injected_and_user_message_untouched():
+async def test_p0_injected_and_user_message_untouched():
     body = _body()
     a = await chat_mod._build_viewer_assembly(body, _Drive(readable={AID}), USER)
-    assert a["mode"] == "focus" and a["status"] == "injected"
+    assert a["mode"] == "none" and a["status"] == "injected"
     assert [b.tag for b in a["blocks"]] == ["V1"]
+    assert a["blocks"][0].kind == "selection"
     assert a["blocks"][0].asset_id == str(AID)
     # CRITICAL boundary: the router NEVER splices viewer content into the user message.
     assert body.message == "这段在讲什么"
@@ -89,8 +92,8 @@ async def test_frame_permissions_checked_per_image_asset():
     ])
     a = await chat_mod._build_viewer_assembly(body, d, USER)
     kinds = [b.kind for b in a["blocks"]]
-    # bad frame dropped; the readable frame rides as P0 ahead of the FOCUS page block
-    assert kinds == ["frame", "page"]
+    # bad frame dropped; the readable frame rides as P0 — and P0 is now the ONLY doc block
+    assert kinds == ["frame"]
     assert any(r.startswith(f"unauthorized_frame:{bad}") for r in a["rejected"])
     # each unique image id checked once, plus the viewer's own asset
     assert sorted(c[1] for c in d.calls) == sorted({str(AID), str(ok), str(bad)})
@@ -99,22 +102,28 @@ async def test_frame_permissions_checked_per_image_asset():
 # ── _viewer_abort: honest short-circuit, no downgrade ─────────────────────────
 
 def test_viewer_abort_only_for_short_circuit_statuses():
-    v = _body().viewer
+    v = _body().viewer  # P0 selection → injected
     injected = build_viewer_blocks(v, "这段在讲什么")
     assert chat_mod._viewer_abort(injected) is None
     assert chat_mod._viewer_abort(None) is None
-    # char hint alone (no full_text) proves the budget — not the transport cap — decides
+    # char hint alone (no full_text) proves the budget — not the transport cap — decides.
+    # Only video reaches FULL now (documents bypass classification).
     tl = build_viewer_blocks(
-        ViewerPayload(name="big.pdf", kind="pdf", asset_id=AID,
+        ViewerPayload(name="big.mp4", kind="video", asset_id=AID,
                       full_chars=400_000, full_trusted=True),
-        "总结全文")
+        "总结整个视频")
     ab = chat_mod._viewer_abort(tl)
     assert ab == {"mode": "full", "status": "too_large", "rejected": []}
     un = build_viewer_blocks(
-        ViewerPayload(name="p.pdf", asset_id=AID, full_text="partial",
+        ViewerPayload(name="v.mp4", kind="video", asset_id=AID, full_text="partial",
                       full_chars=7, full_trusted=False),
-        "总结全文")
+        "总结整个视频")
     assert chat_mod._viewer_abort(un)["status"] == "unavailable"
+    # a stub never aborts: the whole point is that the agent runs and reads the doc
+    stub = build_viewer_blocks(
+        ViewerPayload(name="p.pdf", kind="pdf", asset_id=AID, page=3), "这一页讲什么")
+    assert stub["status"] == "stub"
+    assert chat_mod._viewer_abort(stub) is None
 
 
 # ── _viewer_post_turn: dedicated meta keys, citation validation ───────────────

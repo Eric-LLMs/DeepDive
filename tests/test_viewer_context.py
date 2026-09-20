@@ -1,11 +1,12 @@
-"""Viewer Context Provider — pure assembly logic (S1 vertical slice).
+"""Viewer Context Provider — pure assembly logic.
 
-Covers: media-time subtitle window arithmetic (past-only + active cue), strict-priority
-intent classification (local > full-scope > interrogative > NONE), block assembly
-(P0-first [Vn] tags, permission rejection paths), FULL short-circuits (too_large /
-unavailable — never a RAG or partial-page fallback), the dynamic-suffix renderer, and the
-core compatibility invariant: a kernel WITHOUT a viewer turn assembles a byte-identical
-prompt. Router-level wiring is in test_viewer_chat.py.
+Covers: media-time subtitle window arithmetic (past-only + active cue), the video-only
+strict-priority classifier (local > full-scope > interrogative > NONE — documents bypass
+classification entirely and land on the stub path), block assembly (P0-first [Vn] tags,
+permission rejection paths), video FULL short-circuits (too_large / unavailable — never a
+RAG or partial-page fallback), the trusted Viewer Access Context routing for stubs, the
+dynamic-suffix renderer, and the core compatibility invariant: a kernel WITHOUT a viewer
+turn assembles a byte-identical prompt. Router-level wiring is in test_viewer_chat.py.
 """
 from uuid import uuid4
 
@@ -69,7 +70,8 @@ def test_window_caps_drop_oldest_and_flag_truncated():
     assert win[-1]["text"] == "c49"  # newest kept — future still impossible
 
 
-# ── intent classification (patched priority: local > scope > interrogative) ───
+# ── intent classification (VIDEO ONLY; the classifier function itself is payload-kind
+#    agnostic — build_viewer_blocks is what restricts it to video) ─────────────
 
 @pytest.mark.parametrize("message,want", [
     # local deictics FORCE focus even alongside whole-doc words
@@ -107,12 +109,14 @@ def test_classify_no_viewer_or_closed_follow_or_explicit_none():
 
 # ── block assembly ────────────────────────────────────────────────────────────
 
-def test_focus_page_block_numbered_and_sourced():
+def test_document_never_injects_body_even_when_a_stale_client_sends_it():
+    # An older renderer may still ship focus_text/page — the server ignores document
+    # content entirely: a followed readable document lands on the stub path, the model
+    # fetches the right scope via read_document. No [Vn] page blocks for docs.
     a = build_viewer_blocks(_viewer(), "这段在讲什么")
-    assert a["mode"] == "focus" and a["status"] == "injected"
-    assert [b.tag for b in a["blocks"]] == ["V1"]
-    b = a["blocks"][0]
-    assert b.kind == "page" and b.locator == {"page": 7} and b.asset_id == str(AID)
+    assert a["mode"] == "none" and a["status"] == "stub"
+    assert a["blocks"] == []
+    assert a["stub"] == {"name": "paper.pdf", "kind": "pdf", "asset_id": str(AID), "page": 7}
 
 
 def test_none_plus_p0_still_injects_selections():
@@ -124,10 +128,12 @@ def test_none_plus_p0_still_injects_selections():
     assert "SELECTED PART" in a["blocks"][0].text
 
 
-def test_p0_before_focus_block():
-    v = _viewer(selections=[ViewerSelection(kind="text", text="SEL", locator={"page": 7})])
-    a = build_viewer_blocks(v, "这一段什么意思")
-    assert [b.kind for b in a["blocks"]] == ["selection", "page"]
+def test_p0_before_video_subtitle_block():
+    v = _viewer(kind="video", focus_text=None, page=None, t_ms=75_000,
+                cues=[_cue(74, 80, "active straddle")],
+                selections=[ViewerSelection(kind="text", text="SEL")])
+    a = build_viewer_blocks(v, "刚才什么意思")
+    assert [b.kind for b in a["blocks"]] == ["selection", "subtitle_window"]
     assert [b.tag for b in a["blocks"]] == ["V1", "V2"]
 
 
@@ -162,13 +168,14 @@ def test_subtitle_focus_block_around_playhead():
     assert b.locator["window_end_ms"] == 80_000
 
 
-# ── FULL short-circuits (no fallbacks, ever) ──────────────────────────────────
+# ── video FULL short-circuits (no fallbacks, ever; docs never reach FULL) ─────
 
 def test_full_trusted_within_budget_injects():
-    v = _viewer(full_text="X" * 500, full_chars=500, full_trusted=True)
-    a = build_viewer_blocks(v, "总结全文")
+    v = _viewer(kind="video", focus_text=None, page=None, t_ms=1000, cues=[_cue(0, 1, "a")],
+                full_text="X" * 500, full_chars=500, full_trusted=True)
+    a = build_viewer_blocks(v, "总结整个视频")
     assert a["mode"] == "full" and a["status"] == "injected"
-    assert a["blocks"][-1].kind == "full_text"
+    assert a["blocks"][-1].kind == "full_subtitles"
 
 
 def test_full_over_token_budget_too_large():
@@ -176,23 +183,26 @@ def test_full_over_token_budget_too_large():
     # yet still inside the 100k transport cap: the budget, not the cap, must decide.
     big = "X" * (VIEWER_TOKEN_BUDGET * 4 + 1)
     assert estimate_tokens(big) > VIEWER_TOKEN_BUDGET and len(big) <= 100_000
-    v = _viewer(full_text=big, full_chars=len(big), full_trusted=True)
-    a = build_viewer_blocks(v, "总结全文")
+    v = _viewer(kind="video", focus_text=None, page=None, t_ms=1000, cues=[_cue(0, 1, "a")],
+                full_text=big, full_chars=len(big), full_trusted=True)
+    a = build_viewer_blocks(v, "总结整个视频")
     assert a["status"] == "too_large"
-    assert all(b.kind not in ("full_text",) for b in a["blocks"])  # no main content
+    assert all(b.kind != "full_subtitles" for b in a["blocks"])  # no main content
 
 
 def test_full_char_hint_over_budget_short_circuits_without_text():
-    v = _viewer(full_text=None, full_chars=400_000, full_trusted=True)
-    a = build_viewer_blocks(v, "这篇论文整体讲了什么")
+    v = _viewer(kind="video", focus_text=None, page=None,
+                full_text=None, full_chars=400_000, full_trusted=True)
+    a = build_viewer_blocks(v, "总结整个视频")
     assert a["status"] == "too_large"
 
 
 def test_full_untrusted_capture_is_unavailable_not_partial():
-    v = _viewer(full_text="partial page one only", full_chars=19, full_trusted=False)
-    a = build_viewer_blocks(v, "总结全文")
+    v = _viewer(kind="video", focus_text=None, page=None,
+                full_text="partial transcript only", full_chars=21, full_trusted=False)
+    a = build_viewer_blocks(v, "总结整个视频")
     assert a["status"] == "unavailable"
-    assert not any(b.kind in ("full_text", "page") for b in a["blocks"])
+    assert not any(b.kind in ("full_subtitles", "subtitle_window", "page") for b in a["blocks"])
 
 
 # ── renderer + citation validation ────────────────────────────────────────────
@@ -228,7 +238,7 @@ def _turn_with(assembly):
 
 
 async def test_section_reads_turn_context_and_disappears_without_viewer():
-    v = _viewer()
+    v = _viewer(selections=[ViewerSelection(kind="text", text="SEL")])
     a = build_viewer_blocks(v, "这段什么意思")
     assert "[V1]" in await viewer_reference_section({"turn": _turn_with(a)})
     assert await viewer_reference_section({"turn": _turn_with(None)}) == ""
@@ -247,7 +257,8 @@ async def test_prompt_byte_identical_without_viewer_assembly():
     ctx = {"user_msg": "hello"}
     assert render_prompt(await plain.assemble(ctx)) == render_prompt(await withsec.assemble(ctx))
     # …and it does appear when injected
-    a = build_viewer_blocks(_viewer(), "这段什么意思")
+    a = build_viewer_blocks(_viewer(selections=[ViewerSelection(kind="text", text="SEL")]),
+                            "这段什么意思")
     ctx_v = {"user_msg": "hello", "turn": _turn_with(a)}
     assert "[V1]" in render_prompt(await withsec.assemble(ctx_v))
 
@@ -356,15 +367,15 @@ def test_task_intent_stubs_and_lets_the_model_judge():
 
 
 def test_full_mode_never_downgrades_to_stub():
-    # FULL + over budget → too_large (abort), never the stub path
-    v = ViewerPayload(name="big.pdf", kind="pdf", asset_id=AID,
+    # Video FULL + over budget → too_large (abort), never the stub path
+    v = ViewerPayload(name="big.mp4", kind="video", asset_id=AID,
                       full_chars=400_000, full_trusted=True)
-    a = build_viewer_blocks(v, "总结全文")
+    a = build_viewer_blocks(v, "总结整个视频")
     assert a["status"] == "too_large" and a["stub"] is None
-    # FULL + untrusted capture → unavailable, never stub
-    v2 = ViewerPayload(name="p.pdf", kind="pdf", asset_id=AID,
+    # Video FULL + untrusted capture → unavailable, never stub
+    v2 = ViewerPayload(name="v.mp4", kind="video", asset_id=AID,
                        full_text="x" * 10, full_chars=10, full_trusted=False)
-    a2 = build_viewer_blocks(v2, "总结全文")
+    a2 = build_viewer_blocks(v2, "总结整个视频")
     assert a2["status"] == "unavailable" and a2["stub"] is None
 
 
@@ -379,6 +390,7 @@ def _stub(**kw):
 def test_access_context_contains_routing_and_no_vision():
     out = render_viewer_access_context(_stub())
     assert out.startswith("## Viewer Access Context")
+    assert "NOT in this" in out  # explicit: the body is NOT pre-injected — read_document it
     assert f"- Asset ID: {AID}" in out
     assert "- Current Page: 3" in out
     assert "Routing Guidelines:" in out
@@ -415,6 +427,7 @@ async def test_section_dispatch_stub_vs_none_vs_injected():
     a_none = build_viewer_blocks(_stub_viewer(follow=False), "今天天气怎么样")
     assert await viewer_reference_section({"turn": _turn_with(a_none)}) == ""
 
-    a_inj = build_viewer_blocks(_viewer(), "这段什么意思")
+    a_inj = build_viewer_blocks(
+        _viewer(selections=[ViewerSelection(kind="text", text="SEL")]), "这段什么意思")
     out2 = await viewer_reference_section({"turn": _turn_with(a_inj)})
     assert out2.startswith("## Viewer reference context") and "Access Context" not in out2

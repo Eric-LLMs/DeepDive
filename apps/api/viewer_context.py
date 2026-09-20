@@ -1,23 +1,30 @@
 """Viewer Context Provider — pure assembly logic (no DB, no drive, no retrieval).
 
-The chat router freezes what the client extracted from the open viewer (current page
-text, subtitle cues, full text, explicit selections) into a :class:`ViewerPayload`; this
-module decides *whether* that content becomes LLM-visible reference context and how it
-is formatted. It never fetches anything:
+The chat router freezes what the client extracted from the open viewer into a
+:class:`ViewerPayload`; this module decides what reaches the prompt. There is **no
+server-side intent matching for documents**: what the user means (this page / pages 2-5 /
+the whole file) is the model's job, routed through the trusted ``## Viewer Access
+Context`` control section and served by the ``read_document`` tool. Only two things are
+injected as data:
 
-- ``Open != Inject``: the payload is candidate data. Mode classification (FOCUS / FULL /
-  NONE) decides whether the viewport content is injected; explicit selections (P0) always
-  ride along, orthogonal to the mode.
+- ``P0``: the user's explicit actions — pinned selections, image regions, captured video
+  frames. These are actions, not inferred intent, and always ride.
+- Video's media-time proximity: the ``[t-20s, t]`` subtitle window (and, on whole-video
+  requests, the full transcript). Video has no tool channel — nothing on the tool side
+  can fetch "the last 20 seconds of playback" — so it keeps regex classification.
+
+Hard rules:
+- The user message is never spliced; injection rides the ``run(context=…)`` channel.
 - Video uses **media time**: the window is ``[t - 20s, t]`` extended to overlapping cue
   boundaries, the active cue (``start <= t <= end``) is always included, and future cues
   are dropped. No playbackRate math, no lookahead.
-- Budget: the 100k-char cap in the schema is a *transport* guard; the real ceiling is
-  ``VIEWER_TOKEN_BUDGET`` (token estimate over all injected blocks). Anything over is
-  ``too_large`` — the router short-circuits before the agent runs; we never silently
-  downgrade FULL to FOCUS or fall back to RAG.
+- Video FULL short-circuits honestly: over ``VIEWER_TOKEN_BUDGET`` → ``too_large``;
+  untrusted capture → ``unavailable``. The router aborts before the agent runs — never a
+  silent downgrade or a RAG fallback.
 - Security: injected blocks are **untrusted reference data** — objective descriptions
   only, never instructions. We must not tell the model to call tools from inside a
-  reference block; the block header pins the role, the fence isolates the content.
+  reference block; the block header pins the role, the fence isolates the content. The
+  Access Context section is the opposite: trusted, app-generated, and it renders alone.
 """
 from __future__ import annotations
 
@@ -47,7 +54,7 @@ def estimate_tokens(text: str) -> int:
     return cjk + math.ceil(rest / 4)
 
 
-# ── intent classification ─────────────────────────────────────────────────────
+# ── intent classification (VIDEO ONLY — documents always fall through to the stub path) ──
 # Strict priority (approved patch #2 + follow-up): local deictics FORCE FOCUS even when a
 # whole-document word also appears ("这篇文章的这一段" → FOCUS). Then whole-scope words →
 # FULL. Then explanatory interrogatives (why/what does this mean) → FOCUS — a question
@@ -176,14 +183,19 @@ def build_viewer_blocks(
 ) -> dict:
     """Assemble the turn's viewer reference context. Returns the turn assembly dict:
 
-    ``{mode, status, blocks, rejected}`` with ``status ∈ {"none","injected","too_large",
-    "unavailable"}``. Permission results are passed in as plain booleans/ids (the chat
-    router owns drive access checks — this function stays DB-free).
+    ``{mode, status, blocks, rejected, stub, asset}`` with ``status ∈ {"none","injected",
+    "stub","too_large","unavailable"}``. Permission results are passed in as plain
+    booleans/ids (the chat router owns drive access checks — this function stays DB-free).
+
+    Documents are never intent-matched here: they always reach the ``"stub"`` path (when a
+    readable, followed, document asset is open and no P0 block survived) or plain ``"none"``.
+    Only ``video`` runs ``classify_viewer_mode`` — its media-time proximity (subtitle window /
+    full transcript) has no tool channel to route to, so content is pre-injected instead.
 
     - ``asset_readable=False`` → the implicit viewport content (focus/full/subtitles) is
       dropped and recorded in ``rejected``; user-typed selection text survives.
     - frame/roi selections whose ``image_asset_id`` is not readable → dropped (rejected).
-    - FULL short-circuits: over budget → ``too_large``; untrusted capture →
+    - video FULL short-circuits: over budget → ``too_large``; untrusted capture →
       ``unavailable``. Both inject NO main content block (P0 blocks survive in too_large,
       matching the frozen NONE/FOCUS/FULL + P0 orthogonality) and the router aborts the
       agent run on ``too_large``/``unavailable``.
@@ -191,7 +203,10 @@ def build_viewer_blocks(
     frame_readable_ids = frame_readable_ids or set()
     rejected: list[str] = []
     blocks: list[ViewerBlock] = []
-    mode = classify_viewer_mode(message, viewer)
+    # No server-side intent matching for documents: the model decides scope via the
+    # Viewer Access Context and calls read_document itself. Only video keeps the regex
+    # classifier (media-time proximity has no tool channel to route to).
+    mode = classify_viewer_mode(message, viewer) if viewer.kind == "video" else "NONE"
 
     # Identity usable for injection only after the caller's permission check passes.
     usable_asset_id = str(viewer.asset_id) if viewer.asset_id and asset_readable else None
@@ -348,7 +363,8 @@ def render_viewer_access_context(stub: dict) -> str:
     pages_arg = f'pages="{page}"' if page_ok else 'pages="<current_page>"'
     lines = [
         "## Viewer Access Context",
-        "The user currently has a document open in the viewer.",
+        "The user currently has a document open in the viewer. Its content is NOT in this",
+        "prompt — answer questions about it only after reading it with read_document.",
         f"- Asset Name: {_fence(stub.get('name') or '')}",
         f"- Asset ID: {aid}",
         f"- Current Page: {page if page_ok else 'N/A'}",
