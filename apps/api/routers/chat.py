@@ -30,6 +30,12 @@ from api.routers._shared import (
     resolve_guest_identity,
 )
 from api.schemas import ChatImportRequest, ChatRequest, ChatSessionImportRequest
+from api.viewer_context import (
+    build_viewer_blocks,
+    validate_viewer_citations,
+    viewer_citation_map,
+    viewer_snapshot,
+)
 from core.application.drive_service import DriveError, DriveService
 from core.config import settings
 from core.infrastructure.db import (
@@ -144,6 +150,80 @@ def _handoff_note(body: ChatRequest) -> str | None:
         f"mode {mode}. Do NOT create a new project — the project already exists. Continue "
         "it through the deep_research skill stages and advance to PUBLISH.]"
     )
+
+
+# ── Viewer Context Provider (reference context, never part of user_text) ──────
+# Unlike attach/handoff notes, the viewer payload is NOT prefixed to the user message:
+# it is assembled here (permissions checked at THIS layer — api.viewer_context stays
+# pure) and sunk into the turn context, where the ``viewer_reference`` prompt section
+# renders it below the cache boundary. A request without ``viewer`` is byte-identical
+# to the legacy chat path.
+
+
+async def _asset_readable(drive: DriveService, user_id, asset_id) -> bool:
+    """drive.ensure_asset_readable as a boolean — viewer context is auxiliary, a bad id
+    drops the scope instead of failing the chat request."""
+    if user_id is None or not asset_id:
+        return False
+    try:
+        await drive.ensure_asset_readable(user_id, UUID(str(asset_id)))
+        return True
+    except DriveError:
+        return False
+    except Exception:  # noqa: BLE001 - malformed uuid etc: treat as not readable
+        logger.warning("viewer: unexpected drive check failure", exc_info=True)
+        return False
+
+
+async def _build_viewer_assembly(body: ChatRequest, drive: DriveService, user_id) -> dict | None:
+    """Permission-check the viewer's asset identities, then run the pure assembler."""
+    if body.viewer is None:
+        return None
+    viewer = body.viewer
+    asset_readable = await _asset_readable(drive, user_id, viewer.asset_id)
+    frame_readable = set()
+    for sel in viewer.selections:
+        if sel.image_asset_id and str(sel.image_asset_id) not in frame_readable:
+            if await _asset_readable(drive, user_id, sel.image_asset_id):
+                frame_readable.add(str(sel.image_asset_id))
+    return build_viewer_blocks(
+        viewer, body.message,
+        asset_readable=asset_readable, frame_readable_ids=frame_readable,
+    )
+
+
+def _viewer_abort(assembly: dict | None) -> dict | None:
+    """Short-circuit payload when the turn must not reach the agent (patch: FULL over
+    budget / untrusted full capture → honest stop, no downgrade, no RAG fallback)."""
+    if assembly and assembly["status"] in ("too_large", "unavailable"):
+        return {
+            "mode": assembly["mode"], "status": assembly["status"],
+            "rejected": assembly["rejected"],
+        }
+    return None
+
+
+async def _viewer_post_turn(
+    assembly: dict | None, body: ChatRequest, answer: str,
+    user_message_id: str | None, assistant_message_id: str | None,
+) -> dict | None:
+    """Persist the sent-time snapshot (user row) + citation map/validation (assistant
+    row) — both under dedicated ``meta`` keys, fully separate from ``meta["retrieval"]``."""
+    if not assembly or assembly["status"] != "injected":
+        return None
+    blocks = assembly["blocks"]
+    if user_message_id:
+        await _persist_turn_meta(user_message_id, "viewer", viewer_snapshot(body.viewer, blocks))
+    cited, invalid = validate_viewer_citations(answer or "", blocks)
+    if assistant_message_id:
+        await _persist_turn_meta(assistant_message_id, "viewer_citations", {
+            "map": viewer_citation_map(blocks), "cited": cited, "invalid": invalid,
+        })
+    return {
+        "mode": assembly["mode"], "status": assembly["status"],
+        "citations": viewer_citation_map(blocks), "cited": cited, "invalid": invalid,
+        "rejected": assembly["rejected"],
+    }
 
 
 def _resolve_research_context(drive, user, session_id, body_handoff):
@@ -507,10 +587,11 @@ def _extract_retrieval(messages: list[dict] | None) -> dict | None:
     return {"hits": list(hits.values()), "queries": queries}
 
 
-async def _persist_retrieval_meta(message_id: str | None, retrieval: dict) -> None:
-    """Attach the retrieval snapshot to the assistant message row. Best-effort: a failure
-    only means the 👍/👎 row won't survive a reopen, never fails the turn. The row may
-    still be in-flight in the session write queue, so retry briefly on a missing row."""
+async def _persist_turn_meta(message_id: str | None, key: str, value) -> None:
+    """Attach one JSONB key to a message row (``retrieval`` / ``viewer`` / …). Best-effort:
+    a failure only means that row's metadata won't survive a reopen, never fails the turn.
+    The row may still be in-flight in the session write queue, so retry briefly on a
+    missing row."""
     if not message_id:
         return
     for attempt in range(3):
@@ -518,15 +599,19 @@ async def _persist_retrieval_meta(message_id: str | None, retrieval: dict) -> No
             async with SessionLocal() as s:
                 row = await s.get(MessageModel, UUID(message_id))
                 if row is None:
-                    raise RuntimeError("assistant row not visible yet")
+                    raise RuntimeError("message row not visible yet")
                 meta = dict(row.meta or {})
-                meta["retrieval"] = retrieval
+                meta[key] = value
                 row.meta = meta
                 await s.commit()
             return
         except Exception as exc:  # noqa: BLE001
-            logger.warning("retrieval meta persist failed (%d/3): %s", attempt + 1, exc)
+            logger.warning("meta %s persist failed (%d/3): %s", key, attempt + 1, exc)
             await asyncio.sleep(0.5)
+
+
+async def _persist_retrieval_meta(message_id: str | None, retrieval: dict) -> None:
+    await _persist_turn_meta(message_id, "retrieval", retrieval)
 
 
 def _turn_tail(items) -> list[dict]:
@@ -677,6 +762,17 @@ async def chat(
     handoff_note = _handoff_note(body)
     if handoff_note:
         user_text = f"{handoff_note}\n\n{user_text}"
+    # Viewer context: assemble + permission-check now; FULL over budget / untrusted full
+    # capture aborts the turn BEFORE the agent runs (no session write, no LLM call).
+    viewer_assembly = await _build_viewer_assembly(body, drive, user_id)
+    viewer_abort = _viewer_abort(viewer_assembly)
+    if viewer_abort:
+        return {
+            "answer": None,
+            "session_id": str(body.session_id) if body.session_id else None,
+            "user_id": str(user_id),
+            "viewer": viewer_abort,
+        }
     session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
     # Tag every log line this turn emits (research run, mirror, RAG recall) with the user +
     # session it belongs to; reset once the response is built.
@@ -731,7 +827,8 @@ async def chat(
             model=model,
             base_url=base_url or None,
             api_key=api_key or None,
-            context={"handoff": effective_handoff} if effective_handoff else None,
+            context={**({"handoff": effective_handoff} if effective_handoff else {}),
+                     **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] == "injected" else {})} or None,
         )
     finally:
         # /chat owns the run for the lifetime of this request. Hand the finished interactive
@@ -793,6 +890,9 @@ async def chat(
     retrieval = _extract_retrieval(result.messages)
     if retrieval:
         await _persist_retrieval_meta(assistant_message_id, retrieval)
+    viewer_payload = await _viewer_post_turn(
+        viewer_assembly, body, result.final_answer, user_message_id, assistant_message_id
+    )
     resp = {
         "answer": result.final_answer,
         "messages": result.messages,
@@ -803,6 +903,8 @@ async def chat(
     }
     if retrieval:
         resp["retrieved"] = retrieval
+    if viewer_payload:
+        resp["viewer"] = viewer_payload
     if compaction_payload:
         resp["compaction"] = compaction_payload
     if compaction_deferred:
@@ -897,6 +999,19 @@ async def chat_stream(
     handoff_note = _handoff_note(body)
     if handoff_note:
         user_text = f"{handoff_note}\n\n{user_text}"
+    # Viewer context assembly + FULL short-circuit (see /chat): abort BEFORE the agent
+    # loop runs — never burn a turn / LLM call when the full capture can't be honored.
+    viewer_assembly = await _build_viewer_assembly(body, drive, user_id)
+    viewer_abort = _viewer_abort(viewer_assembly)
+    if viewer_abort:
+        async def abort_gen():
+            yield {"data": json.dumps({"type": "viewer", "data": viewer_abort}, ensure_ascii=False)}
+            yield {"data": json.dumps({"type": "done", "data": {
+                "answer": None,
+                "session_id": str(body.session_id) if body.session_id else None,
+                "viewer": viewer_abort,
+            }}, ensure_ascii=False)}
+        return EventSourceResponse(abort_gen())
     session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
     # Chat-driven research: bind this session to the handoff's task so every subsequent turn
     # mirrors into the task's ``session_history.json`` (a task-local projection — the DB
@@ -988,9 +1103,14 @@ async def chat_stream(
                     model=model,
                     base_url=base_url or None,
                     api_key=api_key or None,
-                    context={"handoff": effective_handoff} if effective_handoff else None,
+                    context={**({"handoff": effective_handoff} if effective_handoff else {}),
+                             **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] == "injected" else {})} or None,
                     progress_sink=lambda evt: frames.put_nowait(("agent", evt)),
-                    disable_thinking=body.disable_thinking,
+                    # Viewer FOCUS turns are on-screen Q&A about a small window of content —
+                    # never pay the thinking prefill tax for them (voice-call precedent).
+                    disable_thinking=body.disable_thinking or (
+                        viewer_assembly is not None and viewer_assembly.get("mode") == "focus"
+                    ),
                 ):
                     frames.put_nowait(("agent", evt))
             finally:
@@ -1060,6 +1180,11 @@ async def chat_stream(
             if retrieval:
                 await _persist_retrieval_meta(assistant_message_id, retrieval)
                 done["retrieved"] = retrieval
+            viewer_payload = await _viewer_post_turn(
+                viewer_assembly, body, answer, user_message_id, assistant_message_id
+            )
+            if viewer_payload:
+                done["viewer"] = viewer_payload
             if compaction_payload:
                 done["compaction"] = compaction_payload
             if compaction_deferred:

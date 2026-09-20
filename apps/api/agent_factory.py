@@ -22,6 +22,7 @@ from agent import (
 from agent.engine.kernel import AgentKernel, KernelConfig
 from agent.memory.retrieval import RRFMemoryRetriever
 from agent.memory.service import MemoryService
+from agent.prompt.system_prompt import PromptZone
 from agent.security.approvals import get_approval_bridge
 from agent.security.sandbox import Sandbox
 from agent.tools.checkpoints import CheckpointStore
@@ -29,6 +30,7 @@ from agent.tools.fs_tools import register_fs_tools
 from agent.tools.project_context import read_project_context
 from api.tools import register_builtin_tools
 from api.tools.toolkit import register_toolkit_plugins
+from api.viewer_context import viewer_reference_section
 from core.application.drive_service import DriveService
 from core.config import export_secret_env, settings
 from core.infrastructure.db import SessionLocal
@@ -216,6 +218,14 @@ def get_agent_kernel() -> AgentKernel:
     # Toolkit content tools are primary user-facing tools: keep them resident too.
     for _toolkit_name in ("summary_gen", "mindmap_gen", "slides_gen"):
         kernel.gateway.policy.allow(_toolkit_name)
+
+    # Viewer Context Provider: the per-turn reference blocks sunk into
+    # ``run(context={"viewer": …})`` by the chat router render into the dynamic suffix
+    # below the cache boundary. Renders "" (zero prompt delta) whenever the turn carries
+    # no viewer assembly, so non-chat runs (worker, research) are byte-identical.
+    kernel.assembler.section(
+        "viewer_reference", 300, viewer_reference_section, zone=PromptZone.DYNAMIC_SUFFIX
+    )
 
     manager = PluginManager(runtime, skills, ctx)
     register_builtin_plugins(manager)

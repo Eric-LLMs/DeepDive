@@ -1682,6 +1682,15 @@
     }
     const payload = { message, session_id: state.sessionId ?? undefined, ...extra };
     if (!state.token) payload.user_id = state.guestId ?? undefined;
+    // Viewer focus: frozen NOW — scrolling/pausing after this line never affects the
+    // in-flight request. The server assembles it as reference context; it is NOT
+    // spliced into ``message``.
+    const viewerPayload = buildViewerPayload();
+    if (viewerPayload) payload.viewer = viewerPayload;
+    if (viewerPayload && viewerPayload.selections) {
+      pendingSelections.length = 0; // consumed by this send (one-shot, per spec)
+      renderAttachBar();
+    }
     if (pendingAttach) {
       payload.attach = pendingAttach;
       pendingAttach = null;
@@ -1724,6 +1733,17 @@
           if (stepChanged) { streamMsg.reset(); stepChanged = false; }
           streamMsg.add(evt.data);
           break;
+        case "viewer": {
+          // Terminal status frame on the abort path (too_large / unavailable): the agent
+          // never ran — say so plainly, never a silent downgrade.
+          const v = evt.data || {};
+          if (v.status === "too_large") {
+            appendMsg("notice", "Viewer content exceeds the per-message budget — nothing was sent to the model and no retrieval fallback was used. Try asking about the current page, or import the file first.");
+          } else if (v.status === "unavailable") {
+            appendMsg("notice", "The viewer could not confirm a complete full-text capture, so the whole-document summary was not run. Nothing partial was substituted.");
+          }
+          break;
+        }
         case "done":
           gotDone = true;
           researchContinuing = !!evt.data.research_continuing;
@@ -1767,6 +1787,12 @@
           if (lastRetrieved && streamMsg) {
             state.retrievalByMsg[streamMsg.el.dataset.id] = lastRetrieved;
             addRetrievalActions(streamMsg.el);
+          }
+          // Viewer citations: [Vn] tags in this answer become clickable sups. The map is
+          // request-local (meta["viewer_citations"] persists it server-side separately).
+          const viewerDone = evt.data.viewer;
+          if (viewerDone && viewerDone.status === "injected" && viewerDone.citations && streamMsg) {
+            decorateViewerCitations(streamMsg.el, viewerDone.citations);
           }
           // Fallback when no content streamed (e.g. tool round produced only reasoning).
           if (!streamMsg && evt.data.answer) {
@@ -4767,7 +4793,24 @@
 
   function renderAttachBar() {
     chatAttachBar.innerHTML = "";
-    chatAttachBar.classList.toggle("hidden", !pendingAttach);
+    const focusChip = buildFocusChip();
+    chatAttachBar.classList.toggle(
+      "hidden", !pendingAttach && !focusChip && !pendingSelections.length);
+    if (focusChip) chatAttachBar.appendChild(focusChip);
+    // Pinned P0 selections first: they survive the ✕ chip (only viewport sharing stops).
+    pendingSelections.forEach((sel, idx) => {
+      const chip = document.createElement("span");
+      chip.className = "chat-attach-chip";
+      const txt = document.createElement("span");
+      txt.textContent = selectionLabel(sel);
+      txt.title = "Pinned context: ships with the next message regardless of the viewer chip.";
+      const rm = document.createElement("button");
+      rm.textContent = "✕";
+      rm.title = "Remove this selection";
+      rm.addEventListener("click", () => { pendingSelections.splice(idx, 1); renderAttachBar(); });
+      chip.append(txt, rm);
+      chatAttachBar.appendChild(chip);
+    });
     if (!pendingAttach) return;
     const chip = document.createElement("span");
     chip.className = "chat-attach-chip";
@@ -4781,6 +4824,188 @@
     chip.appendChild(rm);
     chatAttachBar.appendChild(chip);
   }
+
+  // ── Viewer focus chip: what the chat can currently "see" in the viewer ──
+  // Mirrors the Claude Code pattern: opening a file adds a 👁 chip under the input; ✕
+  // only stops viewport sharing (viewerFollow=false until the next file opens) — it must
+  // NEVER clear explicitly pinned selections (P0 rides on with mode="none", S3).
+  let viewerFollow = true;
+  let lastFocusKey = null;
+  let lastFocus = null; // last non-null snapshot: lets P0 chips keep their source name
+                        // even after the viewer closed or ✕ — the text is the user's own.
+  let pendingSelections = []; // P0 chips (≤8), orthogonal to follow/mode
+
+  function addPendingSelection(sel) {
+    if (pendingSelections.length >= 8) { Viewer.toast("At most 8 selections per message."); return; }
+    if (sel.kind === "text") sel.text = String(sel.text || "").slice(0, 4000);
+    pendingSelections.push(sel);
+    renderAttachBar();
+  }
+
+  function selectionLabel(sel) {
+    if (sel.kind === "text") {
+      const t = String(sel.text || "").replace(/\s+/g, " ").trim();
+      return `📌 ${t.length > 28 ? t.slice(0, 28) + "…" : t}`;
+    }
+    if (sel.kind === "frame") return `🎞 frame @ ${fmtClock((sel.locator && sel.locator.t_ms) || 0)}`;
+    return `✂ region${sel.locator && sel.locator.page ? ` p.${sel.locator.page}` : ""}`;
+  }
+
+  function fmtClock(ms) {
+    const s = Math.floor(ms / 1000);
+    if (s >= 3600) return `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  }
+
+  function buildFocusChip() {
+    if (!viewerFollow) return null;
+    const f = Viewer.getFocus ? Viewer.getFocus() : null;
+    if (!f) return null;
+    const chip = document.createElement("span");
+    chip.className = "chat-attach-chip viewer-focus-chip";
+    let label = `👁 ${f.name}`;
+    if (f.page) label += ` · p.${f.page}`;
+    if (f.kind === "video" && f.t_ms != null) label += ` · ${fmtClock(f.t_ms)}`;
+    const txt = document.createElement("span");
+    txt.textContent = label;
+    txt.title = "Chat can discuss what the viewer is showing (current page / subtitles around the playhead). Click ✕ to stop sharing.";
+    const rm = document.createElement("button");
+    rm.textContent = "✕";
+    rm.title = "Stop sharing viewer content";
+    rm.addEventListener("click", () => { viewerFollow = false; renderAttachBar(); });
+    chip.append(txt, rm);
+    return chip;
+  }
+
+  // Freeze the viewer state at send time. Caps mirror the server schema so a request
+  // never 422s on our own payload. P0 selections ride in EVERY branch (NONE+P0 included);
+  // with nothing at all to send, returns null → the request carries no ``viewer`` field
+  // and behaves exactly like before.
+  function buildViewerPayload() {
+    const f = Viewer.getFocus ? Viewer.getFocus() : null;
+    if (f) lastFocus = f;
+    const sels = pendingSelections.slice(0, 8);
+    const p0Only = (src) => ({
+      name: src.name || "viewer", kind: src.kind || "text",
+      provenance: src.provenance || "local",
+      asset_id: src.asset_id || undefined,
+      follow: false, mode: "none", selections: sels,
+    });
+    if (!f) return sels.length && lastFocus ? p0Only(lastFocus) : null;
+    if (!viewerFollow) return sels.length ? p0Only(f) : null;
+    const p = { name: f.name, kind: f.kind, provenance: f.provenance, follow: true };
+    if (f.asset_id) p.asset_id = f.asset_id;
+    if (f.page != null) p.page = f.page;
+    if (f.t_ms != null) p.t_ms = f.t_ms;
+    if (f.focus_text) p.focus_text = String(f.focus_text).slice(0, 12_000);
+    if (f.cues && f.cues.length) {
+      p.cues = f.cues.slice(0, 300).map((c) => ({
+        start_ms: c.start_ms, end_ms: c.end_ms, text: String(c.text || "").slice(0, 500),
+      }));
+    }
+    if (f.full_text) p.full_text = f.full_text;
+    if (f.full_chars != null) p.full_chars = f.full_chars;
+    p.full_trusted = !!f.full_trusted;
+    if (sels.length) p.selections = sels;
+    return p;
+  }
+
+  // [Vn] → clickable sup, text nodes only (never touches markup already rendered). Unknown
+  // tags are left verbatim — the server validated and never rewrites the answer.
+  const _V_CITE_RE = /\[(V\d{1,2})\](?!\()/g;
+  function decorateViewerCitations(el, citations) {
+    if (!citations || !Object.keys(citations).length) return;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const targets = [];
+    while (walker.nextNode()) {
+      _V_CITE_RE.lastIndex = 0;
+      if (_V_CITE_RE.test(walker.currentNode.nodeValue)) targets.push(walker.currentNode);
+    }
+    for (const node of targets) {
+      const text = node.nodeValue;
+      const frag = document.createDocumentFragment();
+      let last = 0;
+      let m;
+      _V_CITE_RE.lastIndex = 0;
+      while ((m = _V_CITE_RE.exec(text))) {
+        const cit = citations[m[1]];
+        if (!cit) continue;
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+        const sup = document.createElement("sup");
+        sup.className = "viewer-cite";
+        sup.textContent = m[0];
+        const loc = cit.locator || {};
+        sup.title = `${cit.name || ""}${loc.page ? ` · p.${loc.page}` : ""}${loc.t_ms != null ? ` · ${fmtClock(loc.t_ms)}` : ""} — click to jump`;
+        sup.addEventListener("click", () => gotoViewerCitation(cit));
+        frag.appendChild(sup);
+        last = m.index + m[0].length;
+      }
+      if (!last) continue; // nothing matched a known tag
+      frag.appendChild(document.createTextNode(text.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    }
+  }
+
+  // Jump only when the citation's source is what the viewer is currently showing —
+  // never auto-switch documents mid-generation (spec), a toast points at the file instead.
+  function gotoViewerCitation(cit) {
+    const f = Viewer.getFocus ? Viewer.getFocus() : null;
+    const same = f && (
+      (cit.asset_id && f.asset_id && String(cit.asset_id) === String(f.asset_id)) ||
+      (!cit.asset_id && !f.asset_id && cit.name === f.name)
+    );
+    if (!same) {
+      Viewer.toast(`Open “${cit.name || "the source"}” in the viewer to jump to this citation.`);
+      return;
+    }
+    Viewer.navigateTo(cit.locator || {});
+  }
+
+  Viewer.setOnFocusChanged(() => {
+    // A different document opening re-enables tracking automatically.
+    const f = Viewer.getFocus ? Viewer.getFocus() : null;
+    const key = f ? `${f.provenance}:${f.asset_id || f.name}` : null;
+    if (key && key !== lastFocusKey) viewerFollow = true;
+    lastFocusKey = key;
+    renderAttachBar();
+  });
+
+  // ── P0 text selection: explicit 「加入对话」 button, never auto-collected ──
+  const viewerPinBtn = document.createElement("button");
+  viewerPinBtn.id = "viewer-pin-btn";
+  viewerPinBtn.textContent = "📌 加入对话";
+  viewerPinBtn.className = "hidden";
+  document.body.appendChild(viewerPinBtn);
+
+  document.addEventListener("selectionchange", () => {
+    const sel = window.getSelection();
+    const text = sel ? sel.toString().trim() : "";
+    const viewerNode = document.getElementById("viewer");
+    const inViewer = !!(sel && sel.anchorNode && viewerNode && viewerNode.contains(sel.anchorNode));
+    if (!text || !inViewer || !sel.rangeCount) { viewerPinBtn.classList.add("hidden"); return; }
+    const rect = sel.getRangeAt(0).getBoundingClientRect();
+    if (!rect || (!rect.width && !rect.height)) { viewerPinBtn.classList.add("hidden"); return; }
+    viewerPinBtn.style.left = Math.max(8, Math.min(rect.right + 6, window.innerWidth - 120)) + "px";
+    viewerPinBtn.style.top = Math.max(8, rect.top - 32) + "px";
+    viewerPinBtn.classList.remove("hidden");
+  });
+  viewerPinBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const sel = window.getSelection();
+    const text = sel ? sel.toString().trim() : "";
+    if (!text) return;
+    const f = Viewer.getFocus ? Viewer.getFocus() : null;
+    let locator = null;
+    if (f && f.page != null) locator = { page: f.page };
+    else if (f && f.kind === "video" && f.t_ms != null) locator = { t_ms: f.t_ms };
+    addPendingSelection({ kind: "text", text, locator });
+    sel.removeAllRanges();
+    viewerPinBtn.classList.add("hidden");
+  });
+  document.addEventListener("mousedown", (e) => {
+    if (e.target !== viewerPinBtn) viewerPinBtn.classList.add("hidden");
+  }, true);
 
   async function sha256Hex(bytes) {
     const buf = await crypto.subtle.digest("SHA-256", bytes);
@@ -4927,9 +5152,18 @@
         canvas.height = ch;
         const ctx = canvas.getContext("2d");
         ctx.drawImage(img, x0 * sx, y0 * sy, cw, ch, 0, 0, cw, ch);
-        finish(canvas.toDataURL("image/png"));
+        // Crop + natural-pixel locator: ROI selections ship coordinates, not just bytes.
+        finish({
+          dataUrl: canvas.toDataURL("image/png"),
+          locator: { x: Math.round(x0 * sx), y: Math.round(y0 * sy), w: cw, h: ch,
+                     image_w: img.naturalWidth, image_h: img.naturalHeight },
+        });
       };
-      const onDbl = () => finish(img.src);
+      const onDbl = () => finish({
+        dataUrl: img.src,
+        locator: { x: 0, y: 0, w: img.naturalWidth, h: img.naturalHeight,
+                   image_w: img.naturalWidth, image_h: img.naturalHeight },
+      });
       const onKey = (e) => { if (e.key === "Escape") finish(null); };
 
       overlay.addEventListener("mousedown", onDown);
@@ -4940,8 +5174,22 @@
     });
   }
 
+  // Turn a data: URL or fetchable image source (local://) into raw bytes for upload.
+  async function imageSourceToBytes(src) {
+    if (String(src).startsWith("data:")) {
+      const bin = atob(String(src).replace(/^data:[^,]*base64,/, ""));
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    }
+    const res = await fetch(src);
+    if (!res.ok) throw new Error(`image fetch failed: ${res.status}`);
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
   // The attach action shared by the viewer toolbar (🔗 / 📷) and the chat 📎 button.
-  // mode: "file" (attach the currently-open file) | "screenshot" (region selection).
+  // mode: "file" (attach the currently-open file) | "screenshot" (region selection) |
+  // "frame" (video frame pinned to the chat) | "roi" (region of an image / PDF page).
   async function attachCurrent(mode, file) {
     if (!state.token) {
       appendMsg("error", "Sign in to attach files to the chat.");
@@ -4950,6 +5198,30 @@
     }
     try {
       let created;
+      if (mode === "frame" || mode === "roi") {
+        // P0 explicit context: upload the capture, then PIN it (chips under the input) —
+        // it rides on the next send as a viewer selection, never as a file attachment.
+        const payload = file || {};
+        let bytes, locator;
+        if (mode === "frame") {
+          bytes = await imageSourceToBytes(payload.dataUrl);
+          locator = { t_ms: payload.t_ms ?? (Viewer.getFocus()?.t_ms ?? 0) };
+        } else {
+          const region = await selectRegionFromImage(payload.dataUrl);
+          if (!region) return; // cancelled
+          bytes = await imageSourceToBytes(region.dataUrl);
+          locator = { ...(payload.baseLocator || {}), ...region.locator };
+        }
+        created = await uploadBytesToCloud(
+          bytes, `${mode}_${Date.now()}.png`, "chat/temp", "image/png");
+        addPendingSelection({
+          kind: mode === "frame" ? "frame" : "roi",
+          image_asset_id: created.id,
+          locator,
+        });
+        Viewer.toast(mode === "frame" ? "Frame pinned to chat." : "Region pinned to chat.");
+        return;
+      }
       if (mode === "screenshot") {
         const shot = await window.desktopAPI.captureWindow();
         if (!shot || !shot.ok) { appendMsg("error", (shot && shot.error) || "Screenshot failed."); return; }
@@ -4957,7 +5229,7 @@
         // whole window; cancel (Esc / click-without-drag) aborts the attach.
         const region = await selectRegionFromImage(shot.data);
         if (!region) return;
-        const b64 = region.replace(/^data:image\/png;base64,/, "");
+        const b64 = region.dataUrl.replace(/^data:image\/png;base64,/, "");
         const bin = atob(b64);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);

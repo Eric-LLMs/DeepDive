@@ -1173,6 +1173,32 @@ pre.text-viewer {
   font-size: 12px;
   padding: 0;
 }
+/* Viewer focus chip: same anatomy, quieter — it reflects ambient state, not a staged file. */
+.viewer-focus-chip { opacity: 0.85; }
+
+/* Floating "pin selection to chat" button (P0) — appears next to a selection inside the viewer. */
+#viewer-pin-btn {
+  position: fixed;
+  z-index: 60;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-soft);
+  color: var(--fg);
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+#viewer-pin-btn.hidden { display: none; }
+
+/* Inline [Vn] citation produced while the viewer shared content. */
+sup.viewer-cite {
+  cursor: pointer;
+  color: var(--accent, #4a86e8);
+  font-size: 0.75em;
+  padding: 0 1px;
+}
+sup.viewer-cite:hover { text-decoration: underline; }
 
 /* Generate-toolbar row: the summary / mindmap / slides entry points. Sits at the top of
    the chat panel when docked right; JS moves it inline into the composer's button row

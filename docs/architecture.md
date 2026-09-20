@@ -92,6 +92,7 @@
   - [22.5 Checkpoint CAS & the per-session write queue](#225-checkpoint-cas--the-per-session-write-queue)
   - [22.6 Recovery, reconcile & the worker path](#226-recovery-reconcile--the-worker-path)
   - [22.7 Trade-off & configuration](#227-trade-off--configuration)
+- [23. Viewer Context Provider — The Open Document as Reference Context](#23-viewer-context-provider--the-open-document-as-reference-context)
 
 [↑ Back to top](#table-of-contents)
 
@@ -117,6 +118,7 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events`; **client Live State (summary + tail) is the normal-turn context source — zero SQL reads on hot turns**; threshold compaction folds raw rows into one 5-section structured summary behind a dual persistence barrier (`sessions.compaction` JSONB = durable checkpoint, revision CAS); per-session async write queue (one batch INSERT/turn); deferred finalize = incremental embed + first-time-only sidebar summary/title; trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + 30-day audit-event retention — see [§22](#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns) |
 | Migrations | single canonical init script `migrations/0001_init.sql` (final schema + reference seeds) applied once by the asyncpg runner (replaces Alembic); dev-time incremental migrations deliberately squashed |
 | Chat | agent loop with tool use, SSE streaming |
+| Viewer context | chat answers about the **open viewer**: focus chip (file · page / playhead), FOCUS / FULL / NONE intent classification, ±20 s media-time subtitle window, pinned selections / ROI / frames as explicit P0 context, honest `too_large` / `unavailable` short-circuit, clickable `[Vn]` citations — zero changes to RAG / agent runtime / memory ([§23](#23-viewer-context-provider--the-open-document-as-reference-context), features.md *Desktop Workbench*) |
 | Research OS | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; **deterministic execution engine** — Python owns control flow through a 10-stage contract pipeline (`DISCOVER → FRAME → EVIDENCE → DESIGN → EXECUTE → EXPLAIN → WRITE → REVIEW → REPRODUCE → PUBLISH`) with repair-once bounded attempts, per-stage declared LLM call budgets + run-level turn/cost/no-progress caps, and guard gates at the transition fence: **strict** mode (default) parks a failed gate on a PENDING human override with zero rework on resume, lenient mode records it and continues; structural violations halt terminally (`BLOCKED`); lease-based crash recovery makes interrupted runs resumable; publication finality is the `PROMOTED` record (report + compiled PDF, optional slides via toolkit); desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module), [§20](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline) |
 | Workflow core (`packages/workflow`) | domain-free run engine behind Research OS: declarative `workflow_spec` (transitions / activities / cap dimensions / hooks) + state machine with lease contest, crash recovery, retry, loop-cap grading and definition-drift detection; adapter pattern (ports + ledger/lease persistence supplied by the plugin) — [§19](#19-workflow-core-packagesworkflow) |
 | Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX/PPTX package scans and `.doc` magic-header recovery → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
@@ -1507,6 +1509,7 @@ over exactly those hits, so a rating survives reopen without re-querying retriev
 | Save a derived asset with its source | `assets.source_asset_id` (FK `ON DELETE CASCADE`) + content-hash dedup (`get_by_source_content`) |
 | Attach document images to RAG chunks | page/slide/para markers → chunk `meta.pages` / `meta.image_ids` (union across pages, state machine covers unmarked blocks); optional vision-LLM `image_caption` leaf chunk per unique image (§18.3) |
 | Route the vision tool to a model | the caller's role-authorized DB set only (`vision_caption.resolve_vision_channels`): vision-marked names first, the rest as a gamble; guests → anonymous tier under the existing daily quota, model-less role → guest-allowance downgrade; never a config/global key (§18.5) |
+| Inject the open viewer's content into a chat turn without touching retrieval | `ChatRequest.viewer` payload → pure classify/assemble in `apps/api/viewer_context.py` → `run(context={"viewer": …})` → DYNAMIC_SUFFIX order-300 section (`""` without a viewer → byte-identical legacy prompt); `[Vn]` citations persist to `meta["viewer"]` / `meta["viewer_citations"]` — see [§23](#23-viewer-context-provider--the-open-document-as-reference-context) |
 | Compile a publication PDF from the finalized manuscript | `ArtifactCompileService.compile_project_pdf` (`plugins/artifact/`): zero-LLM deterministic projection (`project_manuscript_to_ast`, inv. 11) → Typst CLI → drive binary + `outputs/<task name>_v{N}.pdf` mirror; **default-ON** sibling branch of the PUBLISH node (opt out with `pdf_report: false`; a PDF fault still publishes and writes `pipeline.publish.pdf_error`) — see §21 |
 | Generate a 16:9 slide deck from documents / subtitles / sessions | deck engine `toolkit/deck/` (brief chain): Pass A section-understanding (`A/text_i`, per concept batch) → Pass B multimodal visual-understanding (`B/visual_*`) → Pass C hierarchical reduce (`C/reduce_gN` + merge, threshold 15) → Pass D synthesize the canonical `PresentationBrief` (`D/synthesize`) with bounded QA repair (`D-repair/<slide>` / `notes_*` / `resynth`) → deterministic layout compilation (Pillow visuals, native editable `.pptx`, Typst PDF); deterministic wire-slip repair before validation (number coercion, locator echo reparse + unambiguous-doc backfill, prose-wrap unwrap, enum normalization — never trimming or guessing); actionable corrective retries (missing-locator exact-shape directive with honest CLAIM/GROUNDED_SYNTHESIS relabel); canonical `<name>_slides.pdf` + `.md`/`.pptx`/`deck.json`; no silent trimming, loud fail on residual gate violations; per-node real-usage stats (`BRIEF STATS` log + `deck_stats` on the job result, mounted before await so failed runs keep partial stats); dialog knobs (count 3..20 / language / format / guidance) routed per pass — see [docs/content-to-slides.md](content-to-slides.md) |
 
@@ -4259,5 +4262,75 @@ defer before any fold read; exactly one LLM call from raw rows with an inclusive
 second fold contains no first-summary text; every failure defers without trimming; CAS conflict;
 budget-packing residue stays at the tail top; reconcile delete/insert/update with `embedding =
 NULL`; legacy + worker recovery loads.
+
+[↑ Back to top](#table-of-contents)
+
+## 23. Viewer Context Provider — The Open Document as Reference Context
+
+**Idea.** "这段什么意思" / "刚才讲的是什么" become answerable while a file is open in the viewer — without
+touching retrieval. The viewport's current content (page text, subtitle window, full transcript, pinned
+selections) rides into the prompt as an **independent reference context** in the dynamic suffix, never into
+the user message. Hard invariants:
+
+- **Open ≠ Inject.** The payload is candidate data; a mode classifier (FOCUS / FULL / NONE) decides whether
+  viewport content is injected at all, and only the user's explicit actions (pinned selection, ROI, captured
+  frame — P0) always ride, orthogonal to the mode (`NONE + P0` is a valid turn).
+- **The user message is untouched.** The router never splices viewer content into `user_text`; the question
+  reaches the kernel verbatim. Without a viewer assembly the prompt is *byte-identical* to the legacy chat
+  path — the section is registered in `PromptZone.DYNAMIC_SUFFIX` (order 300) and its renderer returns `""`
+  whenever the turn carries no injected assembly.
+- **Zero runtime changes.** No agent-loop, RAG-pipeline, or memory edit: the injection rides the existing
+  `run(context=…)` channel that sinks into `AgentTurn.context` — the same seam the research handoff uses.
+  Worker/background turns never set the key, so they are structurally unaffected.
+- **Pure assembly, permissions at the boundary.** `apps/api/viewer_context.py` is stateless, DB-free,
+  drive-free: classification, window arithmetic, block assembly, rendering, citation validation are all pure
+  functions over the frozen payload. Drive checks live in the chat router: a forged `asset_id` drops the
+  asset identity (typed selection text survives, request continues 200) and never 403s; an unreadable frame
+  asset is dropped with a `rejected` record.
+- **Honest short-circuits.** A FULL request whose content exceeds the token budget (`VIEWER_TOKEN_BUDGET`,
+  default 24 000 tokens — the 100 k-char schema cap is transport only) returns `too_large`; one whose full
+  capture the client cannot vouch for (`full_trusted=false` — PDF full text is trusted only when all
+  `numPages` text layers are present and non-empty) returns `unavailable`. The router aborts *before* the
+  agent runs — never a silent downgrade to FOCUS, a partial-page substitute, or a RAG fallback.
+- **Reference data is data.** Blocks render inside an escalating fence under a header declaring them
+  UNTRUSTED and their content never instructions; blocks carry no tool directives. Citations use the
+  independent `[Vn]` namespace — existing RAG reference formats are untouched, and `meta["viewer"]` /
+  `meta["viewer_citations"]` occupy dedicated message-meta keys beside `meta["retrieval"]`.
+
+**Mechanism (server).** `ChatRequest.viewer` (optional `ViewerPayload`) freezes the viewport at send time:
+`{name, kind, provenance, asset_id, page, t_ms, focus_text, cues, full_text / full_chars / full_trusted,
+selections[]}` with schema caps (≤8 selections, focus_text ≤12 k chars, ≤300 cues, full_text ≤100 k).
+Classification is a strict priority: **local deictics** (这一段/页/图, 这里, 当前/现在/刚才, this page, here,
+it/they…) force FOCUS even when whole-document words co-occur → whole-scope words (整篇/全文/这篇文章/summarize…)
+→ FULL → content interrogatives (什么意思/为什么/what does … mean) → FOCUS → else NONE; a task imperative
+(帮我写…) → NONE; the ✕ chip (`follow=false`) or an explicit `mode:"none"` turns the viewport off while P0
+survives. Video uses **media time**: the window is `[t − 20 s, t]` extended by cue overlap, the active cue is
+always in, future cues never, capped at 30 cues / 4000 chars dropping oldest with a visible note. Per-turn
+persistence: the user row keeps a sanitized `meta["viewer"]` snapshot (what the model was actually shown),
+the assistant row keeps `meta["viewer_citations"]` (full tag map + cited + invalid; the answer text is never
+rewritten); the done frame carries the citation map for client-side decoration. Viewer **FOCUS** turns run
+with thinking disabled — on-screen Q&A over a small window must not pay the reasoning-prefill tax (the
+voice-call precedent; FULL turns keep thinking, it is a whole-document reasoning request).
+
+**Mechanism (desktop).** `viewer.js` tracks the focus state (`IntersectionObserver` center-band page winner
+for PDFs, `timeupdate` → media-ms for video, subtitle cues parsed to ms) and extracts honestly: page text
+comes from the rendered PDF text layer, and `extractPdfFullText` reports `ok:false` — hence
+`full_trusted:false` — unless every page layer is present and non-empty. `getFocus()` freezes a payload
+snapshot per send (paging/playing afterwards never mutates an in-flight request); `navigateTo({page, t_ms})`
+is the citation-jump sink, called only from citation clicks. `app.js` renders the focus chip (👁
+`name · p.12` / `· 22:44`) in the chat bar independently of attachments and pinned selections, shows a
+"📌 加入对话" pin on in-viewer text selections, and reuses the region-capture overlay (ROI) plus
+canvas frame capture (video, auto-paired with the subtitles at that moment) to upload owned `chat/temp/`
+image assets referenced by `image_asset_id`. `[Vn]` tags in the streamed answer decorate to clickable
+`sup` elements that jump the viewer to the cited locator when the citation points at the currently open
+asset (same asset only; otherwise a toast — never an automatic jump under the user's feet). `too_large` /
+`unavailable` land as notices, never as a silent generic answer.
+
+**Test doctrine** (`tests/test_viewer_context.py` + `tests/test_viewer_chat.py`): window arithmetic
+(boundary extension / active cue / future exclusion / caps); the classification priority matrix; block
+numbering & P0-before-mode ordering; every short-circuit path; fence escalation over embedded quotes;
+citation validation that never rewrites; forged-asset and per-frame permission paths at the router seam;
+and the core compatibility invariant — a kernel turn without a viewer assembly assembles a prompt
+**byte-identical** to the pre-feature one even with the section registered.
 
 [↑ Back to top](#table-of-contents)

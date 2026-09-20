@@ -1,7 +1,33 @@
 // Viewer: dispatch a file to the right in-window renderer by extension, falling back
 // to the OS default app for formats the window can't render natively.
 const Viewer = (() => {
-  const state = { path: null, name: null, kind: null, openPath: null, cloudFile: null, zoom: 1 };
+  const state = {
+    path: null, name: null, kind: null, openPath: null, cloudFile: null, zoom: 1,
+    // Viewer-aware chat focus: which page is centered / where the video playhead sits /
+    // the active subtitle cues (ms). app.js freezes these into the per-send viewer payload.
+    currentPage: null, videoTimeMs: 0, subtitleCues: null, subtitleName: null,
+  };
+
+  // Live refs the focus extractors need after their renderer finished mounting.
+  let videoEl = null;
+  const pdfState = { numPages: 0, wraps: [] };
+  let pageObserver = null;
+  // app.js registers this to refresh the focus chip whenever the open doc / page /
+  // playhead changes (fires on render, close, scroll, timeupdate, subtitle load).
+  let focusHandler = null;
+  function setOnFocusChanged(fn) { focusHandler = fn; }
+  function fireFocus() { if (focusHandler) { try { focusHandler(); } catch { /* chip refresh is best-effort */ } } }
+
+  function resetFocusTracking() {
+    state.currentPage = null;
+    state.videoTimeMs = 0;
+    state.subtitleCues = null;
+    state.subtitleName = null;
+    videoEl = null;
+    pdfState.numPages = 0;
+    pdfState.wraps = [];
+    if (pageObserver) { pageObserver.disconnect(); pageObserver = null; }
+  }
 
   // app.js registers this so every file toolbar can offer "attach to chat". The handler
   // receives "file" (attach the currently-open file) or "screenshot" (capture the window).
@@ -227,6 +253,8 @@ const Viewer = (() => {
     state.kind = null;
     state.openPath = null;
     state.cloudFile = null;
+    resetFocusTracking();
+    fireFocus();
     if (mounted) return; // a column-mounted doc leaves no "empty state" in the main viewer
     const empty = document.createElement("div");
     empty.id = "viewer-empty";
@@ -649,8 +677,11 @@ const Viewer = (() => {
 
     // ── Subtitles: auto-detect a sibling file, or let the user pick one ──
     let cues = [];
+    videoEl = video;
     video.addEventListener("timeupdate", () => {
       const t = video.currentTime;
+      state.videoTimeMs = Math.round(t * 1000);
+      fireFocus();
       const cue = cues.find((c) => t >= c.start && t <= c.end);
       setSubtitleText(overlay, cue ? cue.text : "");
     });
@@ -668,7 +699,15 @@ const Viewer = (() => {
           return;
         }
         cues = parsed;
-        toast(`Subtitles: ${subPath.split(/[\\/]/).pop()}`);
+        // Chat focus: keep the cues in media time (ms) for the viewer payload.
+        state.subtitleCues = parsed.map((c) => ({
+          start_ms: Math.round(c.start * 1000),
+          end_ms: Math.round(c.end * 1000),
+          text: c.text,
+        }));
+        state.subtitleName = subPath.split(/[\\/]/).pop();
+        fireFocus();
+        toast(`Subtitles: ${state.subtitleName}`);
       } catch (err) {
         toast(`Subtitle load failed: ${err.message}`);
       }
@@ -704,6 +743,17 @@ const Viewer = (() => {
       if (!attachHandler) { toast("Chat is not ready yet"); return; }
       await attachHandler("screenshot");
     });
+    // P0: pin the exact frame under the playhead; app.js uploads it as an owned asset
+    // and the server ships frame + subtitle window as reference blocks for the same t_ms.
+    menuItem("📌 Frame to Chat", async () => {
+      if (!attachHandler) { toast("Chat is not ready yet"); return; }
+      let dataUrl = null;
+      try { dataUrl = captureFrameDataUrl(); } catch { /* tainted canvas etc. */ }
+      if (!dataUrl) { toast("Cannot capture the current frame."); return; }
+      await attachHandler("frame", {
+        dataUrl, t_ms: state.videoTimeMs || Math.round(video.currentTime * 1000),
+      });
+    });
     menuItem("Generate PPT", () => generateMedia("pptx"));
     menuItem("Generate Book", () => generateMedia("pdf"));
 
@@ -730,7 +780,8 @@ const Viewer = (() => {
 
   function renderImage(filePath, name) {
     const el = clear();
-    el.appendChild(makeToolbar(name, filePath, { zoom: true, fullscreen: true }));
+    const bar = makeToolbar(name, filePath, { zoom: true, fullscreen: true });
+    el.appendChild(bar);
     const body = document.createElement("div");
     body.className = "viewer-body";
     body.style.overflow = "auto";
@@ -742,6 +793,12 @@ const Viewer = (() => {
     };
     body.appendChild(img);
     el.appendChild(body);
+    // P0: drag-select a region of the open image; app.js crops/uploads it and pins the
+    // ROI with normalized coordinates so the reference block carries the locator.
+    bar._toolItem("✂ Region to Chat", () => {
+      if (!attachHandler) { toast("Chat is not ready yet"); return; }
+      attachHandler("roi", { dataUrl: img.src });
+    });
   }
 
   async function renderPdf(filePath, name) {
@@ -749,6 +806,15 @@ const Viewer = (() => {
     const el = viewerEl();
     const bar = makeToolbar(name, state.openPath || filePath, { zoom: true, fullscreen: true });
     el.appendChild(bar);
+    // P0: select a region of the CURRENT page — the rendered page canvas is cropped via
+    // the same overlay; the locator keeps {page, x, y, w, h, image_w, image_h}.
+    bar._toolItem("✂ Page Region to Chat", () => {
+      if (!attachHandler) { toast("Chat is not ready yet"); return; }
+      let dataUrl = null;
+      try { dataUrl = capturePageDataUrl(state.currentPage || 1); } catch { /* canvas unavailable */ }
+      if (!dataUrl) { toast("Page image not ready — try again after it renders."); return; }
+      attachHandler("roi", { dataUrl, baseLocator: { page: state.currentPage || 1 } });
+    });
     const container = document.createElement("div");
     container.className = "pdf-container";
     el.appendChild(container);
@@ -930,6 +996,7 @@ const Viewer = (() => {
 
         const wrap = document.createElement("div");
         wrap.className = "pdf-page";
+        wrap.dataset.page = String(i); // chat focus: which page this wrap shows (1-based)
         wrap.appendChild(canvas);
 
         const textLayer = document.createElement("div");
@@ -960,6 +1027,28 @@ const Viewer = (() => {
         wireOverlay(overlay, pageIndex);
         redrawPage(pageIndex);
       }
+
+      // ── Chat focus tracking ──
+      // Keep the render handles for text extraction / navigation, then watch which page is
+      // centered: the -45%/-45% band leaves only the page crossing the viewport middle
+      // intersecting, so the winner is unambiguous without scroll-position math.
+      pdfState.numPages = pdf.numPages;
+      pdfState.wraps = pageWraps;
+      if (pageObserver) pageObserver.disconnect();
+      pageObserver = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (!e.isIntersecting) continue;
+          const p = parseInt(e.target.dataset.page, 10);
+          if (p && state.currentPage !== p) {
+            state.currentPage = p;
+            fireFocus();
+          }
+          break;
+        }
+      }, { root: container, rootMargin: "-45% 0px -45% 0px", threshold: 0 });
+      for (const w of pageWraps) pageObserver.observe(w);
+      state.currentPage = 1;
+      fireFocus();
 
       // ── Annotation toolbar ──
       function syncAnnotToolbar() {
@@ -1342,11 +1431,14 @@ const Viewer = (() => {
     state.name = name;
     state.kind = kindFor(name);
     state.openPath = filePath;
+    resetFocusTracking();
     // The cloud asset backing this local render path, when the opener is showing a
     // Drive file (research preview / cloud drive). Toolbars act on it directly
     // (Download / Import / Generate) instead of treating the cache as a local upload.
     state.cloudFile = (opts && opts.cloud) || null;
-    return dispatch(state.kind, filePath, name);
+    const result = dispatch(state.kind, filePath, name);
+    fireFocus(); // chip appears at once (page/text content follows as the render settles)
+    return result;
   }
 
   // Re-render the current view at the current zoom (used by the zoom buttons).
@@ -1761,5 +1853,108 @@ const Viewer = (() => {
     return state.path != null && state.kind !== "folder";
   }
 
-  return { render, renderFolder, kindFor, localUrl, toast, close, setAttachHandler, setSubtitleCopyHandler, setSubtitleActions, setSubtitleBusy, setDocGenerateBusy, setDocumentActions, isOpen };
+  // ── Chat focus API (app.js freezes this into the per-send viewer payload) ──
+  // Everything is read from the DOM the renderers already mounted: no re-parsing, no
+  // network. Caps mirror the server schema (focus_text ≤12000, cues ≤300, full ≤100k).
+  function extractPageText(page) {
+    const wrap = pdfState.wraps[(page || 1) - 1];
+    const layer = wrap && wrap.querySelector(".pdf-text-layer");
+    return layer ? layer.innerText : "";
+  }
+
+  // Full text is only *trusted* when every page's text layer is present and non-empty —
+  // a partial or failed render must never masquerade as the complete document (the
+  // server turns a trusted=False FULL into an honest "unavailable", never a fallback).
+  function extractPdfFullText() {
+    if (!pdfState.numPages || pdfState.wraps.length !== pdfState.numPages) {
+      return { ok: false, text: "" };
+    }
+    const parts = [];
+    for (const wrap of pdfState.wraps) {
+      const layer = wrap.querySelector(".pdf-text-layer");
+      const t = layer ? layer.innerText.trim() : "";
+      if (!t) return { ok: false, text: "" };
+      parts.push(t);
+    }
+    return { ok: true, text: parts.join("\n\n") };
+  }
+
+  function getFocus() {
+    if (!state.path || !state.kind) return null;
+    if (state.kind === "folder" || state.kind === "unknown" || state.kind === "audio") return null;
+    const cloud = state.cloudFile
+      || (window.__cloudDriveActive === true ? (window.__getViewerCloudFile?.() || null) : null);
+    const f = {
+      name: state.name, kind: state.kind,
+      provenance: cloud && cloud.id ? "cloud" : "local",
+      asset_id: cloud && cloud.id ? String(cloud.id) : null,
+      page: null, t_ms: null, focus_text: null,
+      cues: null, full_text: null, full_chars: null, full_trusted: false,
+    };
+    if (state.kind === "video") {
+      f.t_ms = state.videoTimeMs || 0;
+      const all = state.subtitleCues || [];
+      if (all.length) {
+        // The server only windows [t-20s, t] for FOCUS; ship the recent slice (schema
+        // cap is 300 cues) plus the complete transcript as FULL-eligible full_text.
+        const lo = Math.max(0, f.t_ms - 60_000);
+        f.cues = all.filter((c) => c.end_ms >= lo).slice(-300);
+        const full = all.map((c) => c.text).join("\n");
+        f.full_chars = full.length;
+        if (full.length <= 100_000) { f.full_text = full; f.full_trusted = true; }
+      }
+    } else if (state.kind === "pdf") {
+      f.page = state.currentPage || 1;
+      f.focus_text = extractPageText(f.page) || null;
+      const full = extractPdfFullText();
+      if (full.ok) {
+        f.full_chars = full.text.length;
+        if (full.text.length <= 100_000) { f.full_text = full.text; f.full_trusted = true; }
+      }
+    } else {
+      // Other in-window renderers: the visible body text is the current content.
+      const body = viewerEl().querySelector(
+        ".viewer-body, .pdf-container, .text-viewer, .docx-viewer, .sheet-viewer, .pptx-wrap"
+      );
+      const t = body ? body.innerText.trim() : "";
+      if (t) f.focus_text = t.slice(0, 12_000);
+    }
+    return f;
+  }
+
+  // ── P0 captures for the chat (explicit user actions only) ──
+  // Video frame at the playhead (media time) and current PDF page as PNG — the bytes are
+  // handed to app.js which uploads them as owned assets and pins a frame/roi selection.
+  function captureFrameDataUrl() {
+    if (!videoEl || !videoEl.videoWidth) return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+    canvas.getContext("2d").drawImage(videoEl, 0, 0);
+    return canvas.toDataURL("image/png");
+  }
+
+  function capturePageDataUrl(page) {
+    const wrap = pdfState.wraps[(page || state.currentPage || 1) - 1];
+    const canvas = wrap && wrap.querySelector("canvas");
+    return canvas ? canvas.toDataURL("image/png") : null;
+  }
+
+  // Jump the viewer to a citation locator — invoked ONLY from a user click (S4), never
+  // automatically while an answer is streaming.
+  function navigateTo(loc) {
+    if (!loc) return;
+    if (typeof loc.page === "number" && state.kind === "pdf") {
+      const w = pdfState.wraps[loc.page - 1];
+      if (w) {
+        w.scrollIntoView({ behavior: "smooth", block: "start" });
+        state.currentPage = loc.page;
+        fireFocus();
+      }
+    } else if (typeof loc.t_ms === "number" && videoEl) {
+      videoEl.currentTime = loc.t_ms / 1000;
+    }
+  }
+
+  return { render, renderFolder, kindFor, localUrl, toast, close, setAttachHandler, setSubtitleCopyHandler, setSubtitleActions, setSubtitleBusy, setDocGenerateBusy, setDocumentActions, isOpen, getFocus, setOnFocusChanged, navigateTo, extractPageText, captureFrameDataUrl, capturePageDataUrl };
 })();

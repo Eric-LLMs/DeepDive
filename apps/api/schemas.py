@@ -139,6 +139,82 @@ class ChatContextState(BaseModel):
     has_pending_mutations: bool = False
 
 
+class ViewerSelection(BaseModel):
+    """One explicit user action (P0 context): selected text, an image/PDF region, or a
+    captured video frame. ``kind="text"`` carries the verbatim selection; ``roi`` /
+    ``frame`` describe a visual region (locator-only until an OCR pipeline exists) and
+    may reference an already-uploaded screenshot asset via ``image_asset_id``."""
+
+    kind: Literal["text", "roi", "frame"]
+    text: str | None = None
+    locator: dict | None = None        # {page:n} | {t_ms:x} | {x,y,w,h,image_w,image_h}
+    image_asset_id: UUID | None = None
+
+
+class ViewerPayload(BaseModel):
+    """The Viewer's frozen state at click-Send (Viewer Context Provider).
+
+    Pure data the client extracted from what it already has on screen (current page text,
+    parsed subtitle cues, selection strings) — the server NEVER retrieves viewer content via
+    RAG and never sees the client's file beyond these fields. ``mode`` is the *client
+    request*; the server may downgrade it (local words in the message force FOCUS, see
+    :func:`api.viewer_context.classify_viewer_mode`). ``viewer=None`` on the request keeps
+    the whole legacy chat path byte-identical.
+    """
+
+    # ``follow`` separates viewport tracking from P0: closing the focus chip ([x]) sets
+    # follow=false but must NOT discard pending selections — a NONE+P0 turn still ships.
+    # ``mode`` is the client's explicit statement when known ("none" after the chip is
+    # closed); ``None`` = server-side intent classification decides (see classify_viewer_mode).
+    follow: bool = True
+    mode: Literal["none", "focus", "full"] | None = None
+    provenance: Literal["cloud", "local"] = "local"
+    asset_id: UUID | None = None       # cloud binding; identity/citation metadata only, never a retrieval key
+    name: str
+    kind: str = "text"                 # pdf|video|image|text|markdown|office
+    page: int | None = None
+    t_ms: int | None = None
+    focus_text: str | None = None      # current-page text (documents) — FOCUS payload
+    cues: list[dict] | None = None    # video: [{start_ms,end_ms,text}] full list; the server computes the window
+    full_text: str | None = None      # full document / full subtitles, only when it fits the caps below
+    full_chars: int | None = None     # true full length (set even when full_text is omitted for being too large)
+    full_trusted: bool = False         # client CONFIRMED it captured every page/cue — never fake partial DOM as full
+    selections: list[ViewerSelection] = []
+
+    @model_validator(mode="after")
+    def _guard_viewer_caps(self) -> "ViewerPayload":
+        if len(self.name) > 512:
+            raise ValueError("viewer.name too long")
+        if len(self.selections) > 8:
+            raise ValueError("too many viewer selections (max 8)")
+        for s in self.selections:
+            if s.text and len(s.text) > 4000:
+                raise ValueError("viewer selection text too long (max 4000 chars)")
+            if s.kind == "text" and not (s.text or "").strip():
+                raise ValueError("text selection requires non-empty text")
+        if self.focus_text and len(self.focus_text) > 12000:
+            raise ValueError("viewer.focus_text too long (max 12000 chars)")
+        if self.page is not None and not 1 <= self.page <= 10000:
+            raise ValueError("viewer.page out of range")
+        if self.t_ms is not None and self.t_ms < 0:
+            raise ValueError("viewer.t_ms must be >= 0")
+        if self.cues is not None:
+            if len(self.cues) > 300:
+                raise ValueError("too many subtitle cues (max 300)")
+            for c in self.cues:
+                if not (
+                    isinstance(c.get("start_ms"), (int, float))
+                    and isinstance(c.get("end_ms"), (int, float))
+                    and isinstance(c.get("text"), str)
+                    and c["end_ms"] >= c["start_ms"] >= 0
+                    and len(c["text"]) <= 500
+                ):
+                    raise ValueError("invalid subtitle cue (need start_ms<=end_ms, text<=500)")
+        if self.full_text is not None and len(self.full_text) > 100_000:
+            raise ValueError("viewer.full_text exceeds the 100k-char transport cap")
+        return self
+
+
 class ChatRequest(BaseModel):
     message: str
     context_state: ChatContextState | None = None  # None = legacy client → recovery-mode
@@ -159,6 +235,11 @@ class ChatRequest(BaseModel):
                                      #   mode: "research_resume" }). Formatted into a
                                      #   structured instruction prefix AND sunk into the
                                      #   turn context so tools read it at runtime.
+    viewer: ViewerPayload | None = None  # optional: Viewer Context Provider — content the client
+                                     #   extracted from the open viewer (current page, subtitle
+                                     #   window, full text, explicit selections). Delivered to
+                                     #   the LLM as a separate reference-context section; the
+                                     #   user's raw query is never modified by it.
 
     @model_validator(mode="after")
     def _guard_v2_payload(self) -> "ChatRequest":
