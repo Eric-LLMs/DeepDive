@@ -1417,16 +1417,22 @@ sup.viewer-cite:hover { text-decoration: underline; }
 
 /* Chats tab: the chat fills the entire main pane. switchTab hides the file/document window
    (#viewer, #note-editor) on this tab, so the chat column alone stretches across the whole
-   area; this overrides any global bottom/right dock sizing while the Chats tab is active. */
+   area; this overrides any global bottom/right dock sizing while the Chats tab is active.
+   The !important beats the INLINE width/height that dock-edge resizing writes onto #chat —
+   otherwise a previously right-docked (or bottom-resized) chat stays a narrow strip and the
+   rest of the pane renders blank. */
 #app.chat-fills #main { flex-direction: column; }
 #app.chat-fills #chat {
   flex: 1 1 auto;
-  height: auto;
+  height: auto !important;
   min-height: 0;
-  width: auto;
+  width: auto !important;
   min-width: 0;
   border-left: 0;
 }
+/* Edge-resizing is meaningless here (the pane is pinned to the full width/height), and the
+   handle would just write inline sizes that lie about the actual layout. */
+#app.chat-fills #chat-resize { display: none; }
 
 /* Docked chat edge-resize handle: a thin strip straddling the chat boundary. Drag it to
    resize — bottom-docked changes height (top edge), right-docked changes width (left edge).
