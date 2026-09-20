@@ -34,6 +34,10 @@
     // ``neutralSessionId`` is the normal chat session restored when the user leaves Research.
     activeResearch: null,      // { task_id, name, session_id } | null
     neutralSessionId: null,    // normal session id to restore on leaving the Research tab
+    // True while the Research tab shows its blank "new research chat" (no task selected).
+    // Guards against re-clicking the Research tab wiping a chat already started there;
+    // cleared when a task's session takes the pane over or another tab is switched to.
+    researchBlankChat: false,
     // Message ids currently rendered in the chat. The live auto-run refresh re-fetches the open
     // session and appends only rows whose id is NOT here, so worker-inserted progress never
     // duplicates a bubble that's already on screen (and a reopen never re-emits).
@@ -2621,6 +2625,8 @@
       Viewer.toast("A research run is in progress — wait for it to finish.");
       return;
     }
+    // A task session now owns the chat pane — the Research-tab blank chat is over.
+    state.researchBlankChat = false;
     state.activeResearch = { task_id: taskId, name: name || taskId, session_id: sessionId || null, description: desc, display_title: dispTitle };
     startResearchChipPoll();
     if (sessionId) {
@@ -6056,14 +6062,29 @@
     if (isResearch) {
       if (!wasResearch) {
         state.neutralSessionId = isResearchSession(state.sessionId) ? null : state.sessionId;
+        // Research tab with no task selected → the chat pane starts blank ("New research
+        // chat"), never carrying over the previous tab's conversation. Messages typed
+        // here are plain chats (no research handoff); selecting a task takes the pane
+        // over via openResearchSession. If a task IS selected, loadResearch (below)
+        // reopens its bound session, so skip the blank then; the flag stops a tab
+        // re-click from wiping a chat already started in this blank visit.
+        if (!window.currentResearchTask && !state.researchBlankChat && !chatSend.disabled) {
+          newChat();
+          chatTitle.textContent = "New research chat";
+          appendMsg("notice", "No research task selected. Pick a task in the list, or click ＋ New Research to create one. This is a blank chat — messages here are plain chats until a task is selected.");
+          state.researchBlankChat = true;
+        }
       }
-    } else if (wasResearch) {
-      state.activeResearch = null;
-      updateResearchChip();
-      stopResearchChipPoll();
-      // A research turn streaming in the chat can't be yanked out from under the run — the
-      // neutral chat restores on the next successful switch once the turn finishes.
-      if (!chatSend.disabled) openNeutralSession();
+    } else {
+      state.researchBlankChat = false;
+      if (wasResearch) {
+        state.activeResearch = null;
+        updateResearchChip();
+        stopResearchChipPoll();
+        // A research turn streaming in the chat can't be yanked out from under the run — the
+        // neutral chat restores on the next successful switch once the turn finishes.
+        if (!chatSend.disabled) openNeutralSession();
+      }
     }
     tabFiles.classList.toggle("active", !isSessions && !isResearch);
     tabSessions.classList.toggle("active", isSessions);
