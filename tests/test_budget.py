@@ -54,7 +54,10 @@ async def test_hard_budget_aborts_non_streaming_loop():
     turn = AgentTurn(user_msg="go", model="deepdive-chat", max_budget_usd=_TINY_BUDGET)
     result = await capped.run("go", turn=turn)
 
-    assert result.final_answer == ""        # never reached the final step
+    # fbd8876: budget exhaustion now ends the turn with an honest retry notice instead
+    # of an empty (or replayed) answer.
+    assert "step budget" in result.final_answer.lower()
+    assert result.final_answer != "final"   # never reached the final step
     assert len(capped.llm.calls) == 1       # one LLM call — the loop aborted
     assert result.cost_usd >= _TINY_BUDGET  # the span still reports the exhausted cost
 
