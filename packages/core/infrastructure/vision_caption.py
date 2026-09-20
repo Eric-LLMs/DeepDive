@@ -121,6 +121,19 @@ def _is_vision_named(model: LLMModelModel) -> bool:
     return any(h in text for h in _VISION_HINTS)
 
 
+def model_supports_vision(model_name: str | None) -> bool:
+    """Heuristic: does a *routed chat model* (a bare model id string, not a catalog row)
+    accept image parts? Reuses the same vision markers the trial chain trusts. Used by the
+    chat router to decide whether a freshly-attached screenshot can be INLINED as a
+    multimodal block in the current turn (so the model literally sees THIS image and cannot
+    answer from stale history text) versus falling back to the ``vision`` tool for a
+    text-only chat model. A false negative is safe: it just routes through the tool."""
+    if not model_name:
+        return False
+    name = model_name.lower()
+    return any(h in name for h in _VISION_HINTS)
+
+
 def rank_vision_entries(
     pairs: list[tuple[LLMCredentialModel, LLMModelModel]],
 ) -> list[tuple[LLMCredentialModel, LLMModelModel]]:

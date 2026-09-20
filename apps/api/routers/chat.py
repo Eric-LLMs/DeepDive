@@ -4,6 +4,7 @@ query-repository import (single Q&A pair / whole session / imported status).
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -67,6 +68,7 @@ from core.infrastructure.request_context import (
     set_request_user,
 )
 from core.infrastructure.security import authorize_usage, get_role
+from core.infrastructure.vision_caption import model_supports_vision
 from core.logger import reset_log_context, set_log_context
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
@@ -83,14 +85,19 @@ logger = logging.getLogger(__name__)
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 
 
-async def _attach_note(body: ChatRequest, drive: DriveService, user_id) -> str | None:
+async def _attach_note(body: ChatRequest, drive: DriveService, user_id, *, inline: bool) -> str | None:
     """Build a context note for an attached cloud asset, or ``None`` when there is none.
 
     Attachments are read-only references: we verify the caller can read the asset, then
     prefix a ``[Attached: …]`` note to the user message so the agent knows which document
-    the user is troubleshooting. The note also names the tool that can actually open it —
-    ``vision`` for images, ``read_document`` for PDF/Word/Excel/text — so the agent reads
-    the content instead of claiming the file cannot be parsed.
+    the user is troubleshooting. The note also names the channel that can actually open it:
+
+    - ``inline=True`` (a screenshot attached to a turn whose chat model is vision-capable):
+      the pixels ride as a multimodal block right below this note, so the model must NOT call
+      ``vision`` for it — the directive locks the answer to the embedded image and forbids
+      falling back on prior documents/RAG/earlier images (the switch that was failing).
+    - ``inline=False``: text-only chat model / non-image file → route through the right tool
+      (``vision`` for images, ``read_document`` for PDF/Word/Excel/text).
     """
     attach = body.attach or {}
     if attach.get("kind") != "asset" or user_id is None:
@@ -105,15 +112,65 @@ async def _attach_note(body: ChatRequest, drive: DriveService, user_id) -> str |
     name = attach.get("name") or "document"
     suffix = name[name.rfind("."):].lower() if "." in name else ""
     mime = (attach.get("mime_type") or "").lower()
-    if suffix in _IMAGE_SUFFIXES or mime.startswith("image/"):
+    is_image = suffix in _IMAGE_SUFFIXES or mime.startswith("image/")
+    if inline and is_image:
         hint = (
-            "Call the `vision` tool with this asset_id to see its content. This image is "
-            "NEW to this message — any earlier image analysis in the conversation describes "
-            "a DIFFERENT file and never applies to this one."
+            "The attached image is included INLINE with this message (its picture is shown "
+            "as an image part below) — you can see it directly. Answer ONLY from THIS image. "
+            "Any earlier image or document content in the conversation describes a DIFFERENT "
+            "file and never applies here; do not answer about this image from old documents, "
+            "RAG hits, or a previous screenshot. Do NOT call the `vision` tool for it."
+        )
+    elif is_image:
+        hint = (
+            "This message carries a NEW image that is NOT in the prompt as text — its "
+            "pixels are only readable through the tool. Call the `vision` tool with this "
+            "asset_id and answer ONLY from what it returns. This image is NEW to this "
+            "message — any earlier image analysis or document content in the conversation "
+            "describes a DIFFERENT file and never applies to this one; do not answer about "
+            "this image from earlier documents, RAG hits, or a previous screenshot."
         )
     else:
         hint = "Call the `read_document` tool with this asset_id to extract its text."
     return f"[Attached: {name} (asset_id {asset_id})] {hint}"
+
+
+# Screenshots larger than this are not inlined (a base64 data URL past it would bloat the
+# request and risk a provider size 4xx); the caller falls back to the ``vision`` tool path.
+_INLINE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+
+async def _resolve_inline_image(body: ChatRequest, drive: DriveService, user_id, model: str | None) -> str | None:
+    """A ``data:`` URL for the attached image when it should be INLINED this turn.
+
+    Inline conditions: the routed chat model is vision-capable (:func:`model_supports_vision`),
+    the attach is a readable image asset, and its bytes fit the size cap. Returning ``None``
+    leaves the turn on the existing ``vision``-tool path (text-only model / non-image / oversized).
+    """
+    if not model_supports_vision(model):
+        return None
+    attach = body.attach or {}
+    if attach.get("kind") != "asset" or user_id is None:
+        return None
+    asset_id = attach.get("asset_id")
+    if not asset_id:
+        return None
+    name = attach.get("name") or ""
+    mime = (attach.get("mime_type") or "").lower()
+    suffix = name[name.rfind("."):].lower() if "." in name else ""
+    if not (suffix in _IMAGE_SUFFIXES or mime.startswith("image/")):
+        return None
+    try:
+        _name, asset_mime, data = await drive.download(user_id, UUID(asset_id))
+    except DriveError as exc:
+        logger.warning("inline image: download failed (%s); using vision tool", exc)
+        return None
+    except Exception:  # noqa: BLE001 - malformed id / storage hiccup → tool path, never fail the turn
+        return None
+    if not data or len(data) > _INLINE_IMAGE_MAX_BYTES:
+        return None
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{(asset_mime or mime or 'image/png')};base64,{b64}"
 
 
 def _handoff_note(body: ChatRequest) -> str | None:
@@ -804,8 +861,13 @@ async def chat(
     owned_asset_id = (
         body.attach.get("asset_id") if body.attach and body.attach.get("owned") else None
     )
+    # Multimodal inline: when the chat model can see images and the attachment IS an image,
+    # embed the screenshot as an image part on THIS turn so the model reads the current
+    # picture instead of answering from stale conversation text (the "didn't switch to the
+    # new image" bug). Text-only models / oversized images → None → the vision-tool path.
+    inline_image = await _resolve_inline_image(body, drive, user_id, model)
     if body.attach:
-        note = await _attach_note(body, drive, user_id)
+        note = await _attach_note(body, drive, user_id, inline=inline_image is not None)
         if note:
             user_text = f"{note}\n\n{body.message}"
     handoff_note = _handoff_note(body)
@@ -877,7 +939,8 @@ async def chat(
             base_url=base_url or None,
             api_key=api_key or None,
             context={**({"handoff": effective_handoff} if effective_handoff else {}),
-                     **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] in ("injected", "stub") else {})} or None,
+                     **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] in ("injected", "stub") else {}),
+                     **({"inline_image": inline_image} if inline_image else {})} or None,
         )
     finally:
         # /chat owns the run for the lifetime of this request. Hand the finished interactive
@@ -1042,8 +1105,13 @@ async def chat_stream(
     owned_asset_id = (
         body.attach.get("asset_id") if body.attach and body.attach.get("owned") else None
     )
+    # Multimodal inline: when the chat model can see images and the attachment IS an image,
+    # embed the screenshot as an image part on THIS turn so the model reads the current
+    # picture instead of answering from stale conversation text (the "didn't switch to the
+    # new image" bug). Text-only models / oversized images → None → the vision-tool path.
+    inline_image = await _resolve_inline_image(body, drive, user_id, model)
     if body.attach:
-        note = await _attach_note(body, drive, user_id)
+        note = await _attach_note(body, drive, user_id, inline=inline_image is not None)
         if note:
             user_text = f"{note}\n\n{body.message}"
     handoff_note = _handoff_note(body)

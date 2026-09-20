@@ -71,7 +71,7 @@ def test_recall_readiness_applies_only_to_file_chunks():
 
 def test_recall_domain_filter_is_file_only():
     sql, params = _kw_sql("attention", {"user_id": "u1", "domain_id": "d1"})
-    assert "c.asset_id IS NOT NULL AND a.domain_id = :domain_id::uuid" in sql
+    assert "c.asset_id IS NOT NULL AND a.domain_id = CAST(:domain_id AS uuid)" in sql
     assert params["domain_id"] == "d1"
 
 

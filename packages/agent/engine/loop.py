@@ -175,6 +175,28 @@ class ReactLoopAgent:
             "turn": turn,
         }
 
+    def _compose_user_message(self, turn: AgentTurn) -> dict:
+        """The current turn's user message, multimodal when an inline image was attached.
+
+        When the chat router resolved a freshly-attached screenshot and the routed model is
+        vision-capable, it sinks a ``data:`` URL into ``turn.context['inline_image']``. This
+        puts the actual pixels on the CURRENT turn's message so the model literally sees the
+        image it was just given — the definitive fix for the agent answering from stale
+        conversation text instead of the newly attached image. History stays text-only (the
+        URL is never persisted), so every turn that attaches an image switches to *that*
+        image and only that one.
+        """
+        inline = (getattr(turn, "context", None) or {}).get("inline_image")
+        if isinstance(inline, str) and inline:
+            return {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": turn.user_msg},
+                    {"type": "image_url", "image_url": {"url": inline}},
+                ],
+            }
+        return {"role": "user", "content": turn.user_msg}
+
     async def run(
         self,
         user_msg: str,
@@ -214,7 +236,7 @@ class ReactLoopAgent:
         system = render_prompt(assembly)
 
         await self.events.serial("agent/session-start", {"user_msg": turn.user_msg})
-        messages = (turn.history or []) + [{"role": "user", "content": turn.user_msg}]
+        messages = (turn.history or []) + [self._compose_user_message(turn)]
         turn_start = messages[-1]  # this-turn boundary for the final-answer fallback
         self._log(
             turn, "session-start", user_msg=turn.user_msg, snapshot_key=self._snapshot_key(),
@@ -356,7 +378,7 @@ class ReactLoopAgent:
         system = render_prompt(assembly)
 
         await self.events.serial("agent/session-start", {"user_msg": turn.user_msg})
-        messages = (turn.history or []) + [{"role": "user", "content": turn.user_msg}]
+        messages = (turn.history or []) + [self._compose_user_message(turn)]
         turn_start = messages[-1]  # this-turn boundary for the final-answer fallback
         self._log(
             turn, "session-start", user_msg=turn.user_msg, snapshot_key=self._snapshot_key(),

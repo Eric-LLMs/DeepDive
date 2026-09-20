@@ -153,6 +153,7 @@ class ViewerBlock:
     text: str                     # injected content (selection/fenced text; rendered cues for subtitles)
     locator: dict = field(default_factory=dict)
     asset_id: str | None = None
+    image_asset_id: str | None = None  # for roi/frame: drive asset of the captured picture
     header: str = ""              # descriptive header used by the renderer (built by the assembler)
 
     def excerpt(self, limit: int = 200) -> str:
@@ -234,11 +235,20 @@ def build_viewer_blocks(
             loc = sel.locator or {}
             t = loc.get("t_ms")
             when = f" at {_fmt_ts(int(t))}" if isinstance(t, (int, float)) else ""
-            ident = f" (image asset_id {sel.image_asset_id})" if sel.image_asset_id else ""
+            image_id = str(sel.image_asset_id) if sel.image_asset_id else None
+            ident = f" (image asset_id {image_id})" if image_id else ""
+            has_picture = image_id is not None
             blocks.append(ViewerBlock(
                 tag="", kind=sel.kind, name=viewer.name,
-                text=sel.text.strip() if sel.text and sel.text.strip() else "(no text — visual region)",
-                locator=loc, asset_id=usable_asset_id,
+                # The picture itself is NOT injected as text — the model must read it via
+                # the ``vision`` tool (rendered as a directive below). A locator-only region
+                # with no uploaded picture has nothing to read at all.
+                text=(
+                    "(image captured — its pixels are NOT in this prompt; read it with the "
+                    "vision tool)" if has_picture
+                    else "(no text — visual region)"
+                ),
+                locator=loc, asset_id=usable_asset_id, image_asset_id=image_id,
                 header=f"captured {'video frame' if sel.kind == 'frame' else 'image region'} from "
                        f"\"{viewer.name}\"{when}{ident} (coordinates {loc or 'n/a'})",
             ))
@@ -347,6 +357,17 @@ _HEADER = (
     "open."
 )
 
+# Appended ONLY when a captured-image block is present: those pictures are NOT in the
+# prompt, so the model must read them with the ``vision`` tool and answer only from that.
+# Kept out of ``_HEADER`` so a text-only viewer turn stays free of any tool directive.
+_IMAGE_HEADER_NOTE = (
+    "\nThe exception: a block below announces itself as an IMAGE (a captured frame or\n"
+    "region). Its pixels are NOT in this prompt — you MUST call the `vision` tool with the\n"
+    "asset_id that block names to read it, and answer ONLY from that vision result. Never\n"
+    "describe such a frame from other conversation material (documents, RAG, or earlier\n"
+    "images), and never claim its content is missing — it is available through `vision`."
+)
+
 
 def render_viewer_access_context(stub: dict) -> str:
     """Trusted control section for a document that is OPEN but was not injected this turn.
@@ -399,10 +420,28 @@ def render_viewer_reference(blocks: list[ViewerBlock]) -> str:
     """Render blocks into the dynamic-suffix section body ('' when nothing to inject)."""
     if not blocks:
         return ""
-    parts = [_HEADER]
+    has_image = any(
+        b.kind in ("roi", "frame") and b.image_asset_id for b in blocks
+    )
+    parts = [_HEADER + (_IMAGE_HEADER_NOTE if has_image else "")]
     for b in blocks:
         if b.kind in ("subtitle_window",):
             parts.append(f"[{b.tag}] {b.header}:\n{b.text}")
+        elif b.kind in ("roi", "frame") and b.image_asset_id:
+            # The picture is NOT in the prompt. Emit a trusted, app-generated directive
+            # (outside the fence — only b.name is user data, and the header already fences
+            # nothing here) telling the model to read this exact frame via ``vision`` and
+            # to answer ONLY from that result. This is what stops the model inventing an
+            # answer from a previously-open document / RAG when a screenshot is attached.
+            parts.append(
+                f"[{b.tag}] {b.header}:\n"
+                f"This block is an IMAGE — its pixels are NOT included in this prompt.\n"
+                f"REQUIRED: call the `vision` tool with asset_id=\"{b.image_asset_id}\" to "
+                f"read what this frame/region actually shows, and answer ONLY from that "
+                f"vision result. Do NOT describe it from other conversation material "
+                f"(documents, RAG, or earlier images), and do NOT claim its content is "
+                f"missing — it is available through the `vision` tool."
+            )
         else:
             parts.append(f"[{b.tag}] {b.header}:\n{_fence(b.text)}")
     return "\n\n".join(parts)

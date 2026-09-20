@@ -118,10 +118,10 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events`; **client Live State (summary + tail) is the normal-turn context source — zero SQL reads on hot turns**; threshold compaction folds raw rows into one 5-section structured summary behind a dual persistence barrier (`sessions.compaction` JSONB = durable checkpoint, revision CAS); per-session async write queue (one batch INSERT/turn); deferred finalize = incremental embed + first-time-only sidebar summary/title; trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + 30-day audit-event retention — see [§22](#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns) |
 | Migrations | single canonical init script `migrations/0001_init.sql` (final schema + reference seeds) applied once by the asyncpg runner (replaces Alembic); dev-time incremental migrations deliberately squashed |
 | Chat | agent loop with tool use, SSE streaming |
-| Viewer context | chat answers about the **open viewer**: focus chip (file · page / playhead), ±20 s media-time subtitle window with video-only FOCUS / FULL / NONE classification and honest `too_large` / `unavailable` short-circuit, pinned selections / ROI / frames as explicit P0 context, clickable `[Vn]` citations; **documents are never intent-matched server-side** — every followed document reaches the model as a trusted **Viewer Access Context** stub (geometry-resolved current page) routing it to `read_document` page-scoped reads (`pages` spec, ACL-before-storage, ≤16 pages) with a post-turn `viewer.reads` trace incl. failed calls — zero changes to RAG / agent runtime / memory ([§23](#23-viewer-context-provider--the-open-document-as-reference-context), features.md *Desktop Workbench*) |
+| Viewer context | chat answers about the **open viewer**: focus chip (file · page / playhead), ±20 s media-time subtitle window with video-only FOCUS / FULL / NONE classification and honest `too_large` / `unavailable` short-circuit, pinned selections / ROI / frames as explicit P0 context (image blocks carry the captured asset's id and ship a REQUIRED `vision` directive), clickable `[Vn]` citations; **documents are never intent-matched server-side** — every followed document reaches the model as a trusted **Viewer Access Context** stub (geometry-resolved current page) routing it to `read_document` page-scoped reads (`pages` spec, ACL-before-storage, ≤16 pages) with a post-turn `viewer.reads` trace incl. failed calls — zero changes to RAG / agent runtime / memory ([§23](#23-viewer-context-provider--the-open-document-as-reference-context), features.md *Desktop Workbench*) |
 | Research OS | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; **deterministic execution engine** — Python owns control flow through a 10-stage contract pipeline (`DISCOVER → FRAME → EVIDENCE → DESIGN → EXECUTE → EXPLAIN → WRITE → REVIEW → REPRODUCE → PUBLISH`) with repair-once bounded attempts, per-stage declared LLM call budgets + run-level turn/cost/no-progress caps, and guard gates at the transition fence: **strict** mode (default) parks a failed gate on a PENDING human override with zero rework on resume, lenient mode records it and continues; structural violations halt terminally (`BLOCKED`); lease-based crash recovery makes interrupted runs resumable; publication finality is the `PROMOTED` record (report + compiled PDF, optional slides via toolkit); desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module), [§20](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline) |
 | Workflow core (`packages/workflow`) | domain-free run engine behind Research OS: declarative `workflow_spec` (transitions / activities / cap dimensions / hooks) + state machine with lease contest, crash recovery, retry, loop-cap grading and definition-drift detection; adapter pattern (ports + ledger/lease persistence supplied by the plugin) — [§19](#19-workflow-core-packagesworkflow) |
-| Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX/PPTX package scans and `.doc` magic-header recovery → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
+| Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX/PPTX package scans and `.doc` magic-header recovery → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); attached screenshots are **inlined as a multimodal image part** when the routed chat model is vision-capable, otherwise the `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
 | Auth / RBAC | opaque `login_tokens` login credentials (hashed `dd_` user + Tokens-page API tokens; **admin console login is stateless** — signed `cc_` session token, never persisted) + `access_tokens` per-user LLM-key grants + `user_roles` (regular/pro/vip/admin/anonymous) + role quota + `/auth/*` login + **self-service accounts** (`/auth/register` with an email-verification gate, `/auth/forgot-password` + `/auth/reset-password`, editable `/auth/me` profile with avatar upload). Auth endpoints are Redis **rate-limited per client IP** (login/register/recovery, fixed window, fail-open); `enforce_secure_secrets` fails fast at startup when the legacy `JWT_SECRET` default is untouched |
 | Per-role LLM channels | `role_credentials` (role ↔ `llm_credentials` N:M); login pins a random active channel to the token, chat routes through it with failover. The Tokens page disables a user's access to a key per (user, channel); a user with no usable key degrades to the anonymous tier (guest quota) instead of losing login. **Guest access**: anonymous chat rides the `anonymous` role's channels with a per-day Redis limit (`guest_daily_limit`), 429 → prompt login — [§12.4](#124-business-logic--per-user-llm-key-assignment--the-disable-tokens-module) |
 | Admin console | single-file SPA at `/admin` with 5 modules (Providers / Roles / Users / Tokens / **Tools config**): credential/model/routing CRUD, role↔channel bindings, wallet topup, per-user usage + transactions. The Tokens module splits into *LLM Keys* (the per-user key-grant matrix, masked `sk-***` + copy) and *Login Credentials* (who can sign in, each shown as a masked sha256 fingerprint). The **Tools config** module edits the generic `tools` namespace (web-search provider, SMTP, free-form key/value params) with a one-click *Test email*; the Chat Test user picker is a fuzzy-autocomplete text box; a **RAG** module adds live pipeline testing (per-node trace), chunking preview, node-topology editing, and golden-set eval |
@@ -1412,7 +1412,10 @@ via `python-docx`; `.txt`/`.md`/subtitles use the existing `extract_text` dispat
 **Recall visibility** — both recallers `LEFT JOIN assets` instead of `JOIN`:
 
 - `keyword_recall` / `vector_recall`: `AND (c.asset_id IS NULL OR a.file_status = 'READY')`; the
-  domain filter applies only to file chunks (`c.asset_id IS NOT NULL AND a.domain_id = …`).
+  domain filter applies only to file chunks (`c.asset_id IS NOT NULL AND a.domain_id = …`). Inside
+  SQLAlchemy `text()` the uuid cast is spelled `a.domain_id = CAST(:domain_id AS uuid)` — a bare
+  `:domain_id::uuid` is *not* parsed as a bind parameter when a `::` cast follows the name
+  immediately, and the driver would then never bind it.
 - Tenant isolation (`asset_visibility_sql`) already keys off `c.user_id` / `c.workspace_id`, so
   non-file chunks are visible to their owner automatically.
 - `chunk_kind='leaf'` filtering is unchanged; parent/child, contextual, and CJK enrichment apply to
@@ -3381,6 +3384,45 @@ ever reachable.
    image with a warning (§18.3). An empty authorization on a role that cannot downgrade
    raises `VisionNotAuthorized` openly.
 
+**Inline-first delivery (chat attachments) — the `vision` tool is the fallback, not the main
+path.** An image that only the tool can read is a *second-hand* picture: the chat model sees a
+text note and must spend a tool hop, and a model that skips that hop answers from whatever the
+transcript already says about some earlier image. So when the routed chat model itself can see
+images, the attachment is delivered **inside the current user message** and the tool channel is
+switched off for it:
+
+- **Capability gate** — `model_supports_vision` (`core.infrastructure.vision_caption`) reuses the
+  same `_VISION_HINTS` markers the trial chain trusts (`vision` / `multimodal` / `4o` / `vl` …,
+  case-insensitive) against the bare routed model id. A false negative is safe: the turn simply
+  stays on the tool path.
+- **Resolution** — at both chat entries (`/chat`, `/chat/stream`) `_resolve_inline_image`
+  (`chat.py`) checks attach-is-image + `DriveService.ensure_asset_readable` ownership, downloads
+  the bytes through `DriveService.download`, and returns a `data:<mime>;base64` URL capped at
+  `_INLINE_IMAGE_MAX_BYTES` (5 MB — past it the base64 would bloat the request toward provider
+  size limits). A non-vision model, a non-image / unreadable / oversized attach, or any download
+  error yields `None` and the turn proceeds exactly as the tool path always did — inlining is a
+  strict upgrade, never a new failure mode.
+- **Composition** — the URL sinks into the run through `context["inline_image"]` (the same
+  `AgentTurn.context` seam the viewer and handoff channels use, §23), and
+  `ReactLoopAgent._compose_user_message` (`packages/agent/engine/loop.py`) materializes the turn's
+  user message as a multimodal content list — `[{type: text}, {type: image_url}]` — instead of a
+  plain string. History stays text-only: the data URL is **never persisted** to the session row,
+  so every attached-image turn carries exactly its own pixels and nothing else.
+- **The note locks the channel** — `_attach_note(inline=True)` tells the model the picture is
+  embedded, to answer **only** from this image, that every earlier image/document describes a
+  different file, and explicitly **not** to call `vision` for it; the `inline=False` image note
+  keeps the inverse contract (pixels are *not* in the prompt — call `vision` with this
+  `asset_id`). Either way the switch to the new attach is the note's job, not the model's memory.
+
+```
+attached image + this turn's routed chat model
+        │
+        ├─ vision-capable ∧ readable ∧ ≤ 5 MB ─→ image_url part in the user message
+        │        (model sees THIS picture; note forbids a vision call; not persisted)
+        └─ text-only ∨ oversized ∨ download fail ─→ [Attached] note
+                 → `vision` tool via the §18.5 trial chain (authorized channels)
+```
+
 The RAG ingest worker reuses the same functions for caption chunks (§18.3) without importing
 the API tool module. The vision tool is **not** allowlisted in the gateway (the composition
 root in `agent_factory.py` allows `rag_search` + the toolkit generators), so the model reaches
@@ -3447,12 +3489,15 @@ read this spreadsheet" request collapsed into a parse-failure apology. The `read
   as a picture becomes answerable content. Metafiles the server cannot render are reported in
   the footer instead of vanishing, and any minting failure degrades to the plain text result:
   image recovery must never break `read_document`.
-- **Type-aware attach note** — `_attach_note` (`chat.py`) picks the hint by suffix: documents
-  get "call `read_document`", images get "call `vision`", so the agent needs no guessing to
-  reach the right reader through `tool_search`. The image hint additionally declares the attached
-  image **new to this message** — any earlier image analysis in the conversation describes a
-  different file and never applies — so a per-message fact can't be eroded by whatever the
-  transcript already says about a previous screenshot.
+- **Type-aware attach note** — `_attach_note` (`chat.py`) picks the hint by suffix and by the
+  turn's inline state: documents get "call `read_document`"; an image gets the *inline* contract
+  when its pixels ride in the message (§18.5) — "the picture is embedded, answer ONLY from it,
+  do NOT call `vision`" — or the *tool* contract otherwise — "the pixels are NOT in the prompt,
+  call `vision` with this asset_id". The agent needs no guessing to reach the right reader
+  through `tool_search`. Both image branches additionally declare the attached image **new to
+  this message** — any earlier image analysis in the conversation describes a different file and
+  never applies — so a per-message fact can't be eroded by whatever the transcript already says
+  about a previous screenshot.
 - **Honest failure, bounded output** — legacy `.xls`/`.ppt` are refused with a
   resave-as hint (the shared stack rejects them too); `.doc` goes through antiword and is
   refused with the same hint only when the binary is missing, times out, or fails to parse —
@@ -3485,7 +3530,7 @@ boundary, not an optimization:
 |---|---|---|
 | Text/grid extraction | **local Python** (PyMuPDF / python-docx / openpyxl / decoders) — zero LLM | nothing — raw file bytes never leave the server as model input |
 | PDF **tables** | vision LLM, but only after local `page.find_tables()` locates them | the table *rendered as an image* → transcribed text back |
-| Image attachments | vision LLM (`vision` tool, §18.5) | the image as a `data:` URL → analysis text back |
+| Image attachments | **inline** in the user message when the chat model is vision-capable (§18.5); otherwise the `vision` tool | the image as a `data:` URL → the model sees it directly (inline) or returns analysis text (tool) |
 | Understanding (summarize / answer) | chat model | **plain extracted text** as the tool result / chunk content |
 
 Consequences that keep the boundary honest:
@@ -4371,10 +4416,15 @@ message. Hard invariants:
   `unavailable`. The router aborts *before* the agent runs — never a silent downgrade to FOCUS, a
   partial-window substitute, or a RAG fallback.
 - **Reference data is data.** Blocks render inside an escalating fence under a header declaring them
-  UNTRUSTED and their content never instructions; blocks carry no tool directives. The header does pin
+  UNTRUSTED and their content never instructions; text blocks carry no tool directives. The header does pin
   the blocks' *role*: on-screen material is answered from the blocks themselves with `[Vn]` citations —
-  retrieval or `read_document` re-fetch is off-limits (viewer blocks are not drive assets and carry no
-  tool-usable `asset_id`). The only thing that may
+  retrieval or `read_document` re-fetch is off-limits (text viewer blocks are not drive assets and carry no
+  tool-usable `asset_id`). The one exception is **captured imagery**: an ROI/frame block whose `image_asset_id`
+  names an owned `chat/temp/` picture is the only block that carries a tool-usable id, and since a picture's
+  pixels are *not* in the prompt, such a block ships an app-generated **REQUIRED `vision` directive** naming
+  that id (answer only from the vision result, never recite earlier material, never claim the image is
+  missing), with the header's image note appearing **only when such a block exists** — a text-only turn's
+  header stays byte-identical. The only thing that may
   instruct the model is the app-generated **Viewer Access Context** control section — trusted, rendered
   alone, and physically exclusive with the UNTRUSTED data zone (a turn carries data blocks or the access
   stub, never both). Citations use the
@@ -4398,7 +4448,11 @@ persistence: the user row keeps a sanitized `meta["viewer"]` snapshot (what the 
 the assistant row keeps `meta["viewer_citations"]` (full tag map + cited + invalid; the answer text is never
 rewritten); the done frame carries the citation map for client-side decoration. Video **FOCUS** turns run
 with thinking disabled — on-screen Q&A over a small window must not pay the reasoning-prefill tax (the
-voice-call precedent; FULL turns keep thinking, it is a whole-content reasoning request).
+voice-call precedent; FULL turns keep thinking, it is a whole-content reasoning request). ROI/frame blocks
+keep the captured picture's drive id in `ViewerBlock.image_asset_id` — the block body itself is an honest
+placeholder ("image captured — its pixels are NOT in this prompt"), the actual reading is the per-block
+REQUIRED `vision` directive `render_viewer_reference` emits beside it (§23 "Reference data is data"), so a
+pinned frame can never be answered from stale transcript text about a *different* image.
 
 **Stub routing — the document channel, not a fallback.** NONE used to mean silence: a readable document
 open in the viewer but nothing injectable this turn left the model without any channel to the content.

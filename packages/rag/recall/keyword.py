@@ -68,11 +68,15 @@ class KeywordRecaller(Recaller):
                 " AND (c.asset_id IS NULL OR a.file_status = 'READY')"
                 f" AND ({asset_visibility_sql(filters['user_id'], 'c')})"
             )
-        # Optional domain scoping (P1): ``AND assets.domain_id = :domain_id``, file-only
-        # (non-file chunks carry no domain column; their owner scoping already applied).
+        # Optional domain scoping (P1): file-only (non-file chunks carry no domain column;
+        # their owner scoping already applied). The cast MUST use ``CAST(:domain_id AS uuid)``
+        # — SQLAlchemy's ``text()`` bind-param regex does not recognize a ``:name`` directly
+        # followed by a ``::type`` cast, so ``:domain_id::uuid`` is left literal and reaches
+        # Postgres as a bare ``:`` (syntax error at or near ":"). Only domain-scoped queries
+        # hit this, which is why it hides behind the raw-string unit tests that never compile.
         if filters and filters.get("domain_id"):
             params["domain_id"] = filters["domain_id"]
-            where += " AND (c.asset_id IS NOT NULL AND a.domain_id = :domain_id::uuid)"
+            where += " AND (c.asset_id IS NOT NULL AND a.domain_id = CAST(:domain_id AS uuid))"
         # Parent chunks are context only; recall surfaces leaves (parent_expand widens).
         where += " AND c.chunk_kind = 'leaf'"
 

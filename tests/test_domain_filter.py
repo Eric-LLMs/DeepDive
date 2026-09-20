@@ -70,8 +70,24 @@ def test_cjk_path_uses_content_search():
 
 def test_domain_filter_appends_domain_id_predicate():
     sql, params = _recall_sql("query", {"user_id": "u1", "domain_id": "d-1"})
-    assert "a.domain_id = :domain_id::uuid" in sql
+    assert "a.domain_id = CAST(:domain_id AS uuid)" in sql
     assert params["domain_id"] == "d-1"
+
+
+def test_domain_id_predicate_compiles_to_a_bound_param():
+    """Regression guard for the runtime-only bug: the raw-string assertions above never
+    compile, but a ``:domain_id::uuid`` cast reaches Postgres as a bare ``:`` (syntax error
+    at or near ':') because SQLAlchemy's text() bind regex won't treat a ``:name`` directly
+    followed by ``::`` as a parameter. Compiling under the asyncpg dialect proves the value
+    is bound (a positional ``$n``) and no stray ``:domain_id`` literal survives."""
+    from sqlalchemy import text
+    from sqlalchemy.dialects.postgresql import asyncpg
+
+    sql, _ = _recall_sql("query", {"user_id": "u1", "domain_id": "d-1"})
+    compiled = text(sql).compile(dialect=asyncpg.dialect())
+    rendered = str(compiled)
+    assert ":domain_id" not in rendered  # bound, not a literal
+    assert "CAST($" in rendered  # positional param wrapped in CAST(... AS uuid)
 
 
 def test_leaf_only_predicate_always_present():

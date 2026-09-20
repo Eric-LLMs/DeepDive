@@ -231,6 +231,119 @@ def test_injection_inside_selection_stays_fenced_data():
     assert 'ignore previous instructions' in out[out.index('"""'):]
 
 
+# ── captured-image (frame / roi) blocks → forced ``vision`` switch ──────────────
+# The regression these guard: the agent attends only to conversation TEXT and never
+# "looks at" the image attached THIS turn, so it answered a pinned video frame from a
+# previously-open document. A frame/roi block carries no pixels (they can't be text); the
+# assembly must therefore (a) record the image asset_id cleanly, (b) render a per-block
+# directive naming that id, and (c) tell the model to answer ONLY from the vision result.
+
+def _frame_viewer(**kw):
+    # A pinned frame/region is an EXPLICIT selection, so the client ships it with viewport
+    # follow OFF — classify_viewer_mode returns NONE and only the P0 block survives (this is
+    # exactly the real "open video → pin a frame → ask" path that regressed). Tests that
+    # want subtitle co-existence pass follow=True.
+    base = dict(name="clip.mp4", kind="video", provenance="local", asset_id=uuid4(),
+                focus_text=None, page=None, t_ms=69_000, cues=None, follow=False)
+    base.update(kw)
+    return ViewerPayload(**base)
+
+
+def test_frame_roi_blocks_record_image_asset_id():
+    """(1) frame/roi selection with a readable image asset → block carries that id."""
+    frame_id, roi_id = uuid4(), uuid4()
+    v = _frame_viewer(selections=[
+        ViewerSelection(kind="frame", image_asset_id=frame_id, locator={"t_ms": 69180}),
+        ViewerSelection(kind="roi", image_asset_id=roi_id,
+                        locator={"x": 1, "y": 2, "w": 3, "h": 4}),
+    ])
+    a = build_viewer_blocks(v, "这个视频讲什么", frame_readable_ids={str(frame_id), str(roi_id)})
+    by_kind = {b.kind: b for b in a["blocks"]}
+    assert {"frame", "roi"} <= set(by_kind)
+    assert by_kind["frame"].image_asset_id == str(frame_id)
+    assert by_kind["roi"].image_asset_id == str(roi_id)
+    assert a["status"] == "injected" and a["stub"] is None  # never a doc stub
+
+
+def test_frame_block_renders_real_vision_reference_not_text_stub():
+    """(2) render turns the frame block into a ``vision`` directive naming the asset_id,
+    not a fenced '(no text — visual region)' placeholder."""
+    frame_id = uuid4()
+    v = _frame_viewer(selections=[
+        ViewerSelection(kind="frame", image_asset_id=frame_id, locator={"t_ms": 69180})])
+    a = build_viewer_blocks(v, "这个视频讲什么", frame_readable_ids={str(frame_id)})
+    out = render_viewer_reference(a["blocks"])
+    assert "vision" in out.lower()
+    assert f'asset_id="{frame_id}"' in out  # the concrete id the vision tool consumes
+    assert "no text — visual region" not in out  # old contentless placeholder is gone
+    assert "ONLY" in out and "MISSING" not in out  # answer-only-from-vision; don't claim absent
+
+
+def test_pure_text_viewer_context_has_no_vision_directive():
+    """(3)+(6) a text-only viewer turn (selection / page) renders NO vision / tool directive
+    and the injected image header note is absent — the text path is byte-for-byte unchanged."""
+    v = _viewer(selections=[ViewerSelection(kind="text", text="MY SELECTION")])
+    a = build_viewer_blocks(v, "这段什么意思")
+    out = render_viewer_reference(a["blocks"])
+    low = out.lower()
+    assert "vision" not in low and "call the" not in low and "required" not in low
+    assert "MY SELECTION" in out  # still fenced as reference data
+    # A pure document focus_text (page) block likewise stays a fenced-text block.
+    doc = build_viewer_blocks(_viewer(), "这一页讲什么")
+    dout = render_viewer_reference(doc["blocks"])
+    assert "vision" not in dout.lower()
+
+
+def test_frame_payload_is_consumable_by_vision_path():
+    """(4) the block's image_asset_id is a real UUID string the existing ``vision`` tool
+    accepts (round-trips through uuid)."""
+    from uuid import UUID
+    frame_id = uuid4()
+    v = _frame_viewer(selections=[
+        ViewerSelection(kind="frame", image_asset_id=frame_id, locator={"t_ms": 1000})])
+    a = build_viewer_blocks(v, "这帧是什么", frame_readable_ids={str(frame_id)})
+    b = a["blocks"][0]
+    assert str(UUID(b.image_asset_id)) == str(frame_id)
+
+
+def test_frame_and_subtitle_coexist():
+    """(7) video FOCUS with cues AND a pinned frame → both blocks ship, frame keeps its id,
+    subtitle ships as text; render tags both."""
+    frame_id = uuid4()
+    v = _frame_viewer(
+        follow=True,
+        selections=[ViewerSelection(kind="frame", image_asset_id=frame_id, locator={"t_ms": 75000})],
+        t_ms=75_000, cues=[_cue(68, 73, "left"), _cue(74, 80, "active")],
+    )
+    a = build_viewer_blocks(v, "刚才这一帧配的这句什么意思", frame_readable_ids={str(frame_id)})
+    kinds = [b.kind for b in a["blocks"]]
+    assert "frame" in kinds and "subtitle_window" in kinds
+    out = render_viewer_reference(a["blocks"])
+    assert f'asset_id="{frame_id}"' in out and "left" in out and "active" in out
+
+
+def test_invalid_frame_asset_degrades_without_leaking():
+    """(8) an unreadable image asset is dropped (rejected), no frame block survives, no
+    vision directive leaks for it, and no unrelated document content is injected."""
+    bad = uuid4()
+    v = _frame_viewer(selections=[
+        ViewerSelection(kind="frame", image_asset_id=bad, locator={"t_ms": 1000})])
+    a = build_viewer_blocks(v, "这帧是什么", frame_readable_ids=set())  # nothing readable
+    assert all(b.kind != "frame" for b in a["blocks"])
+    assert any(r.startswith("unauthorized_frame") for r in a["rejected"])
+    # With no surviving block on a video, nothing is injected and the render is empty — the
+    # model is NOT pointed at the rejected asset id, and no document/RAG content is added.
+    assert a["status"] == "none"
+    assert render_viewer_reference(a["blocks"]) == ""
+
+
+def test_no_viewer_turn_is_unchanged():
+    """(9) a plain chat turn (no viewer key) assembles no reference section at all."""
+    import asyncio
+    assert asyncio.run(viewer_reference_section({})) == ""
+    assert asyncio.run(viewer_reference_section({"turn": _turn_with(None)})) == ""
+
+
 def _turn_with(assembly):
     turn = AgentTurn(user_msg="q", context={"viewer": assembly} if assembly else None)
     bind_turn(turn)
