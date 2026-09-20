@@ -3226,7 +3226,8 @@ flowchart TD
   has no asset. Caps: 30 images, ≥512 B, sha256-deduped; output order follows first-appearance
   position, which matches insertion order for ordinary documents. Anchoring maps the Nth image
   to the paragraph holding the Nth `[pic]` in the `[[PARA:n]]`-marked antiword text; when the
-  text pass is unavailable (the worker container has no antiword) or the counts disagree,
+  text pass is unavailable (antiword ships in the worker image, but any environment without
+  it) or the counts disagree,
   images fall back to ordinal paragraph anchors — assets still save and caption, only the
   text-co-location becomes approximate. Scanner lives in
   `packages/core/infrastructure/doc_images.py`; the chat `read_document` path reuses it
