@@ -118,7 +118,7 @@
 | Session memory | PG-backed `sessions` / `messages` / `session_events`; **client Live State (summary + tail) is the normal-turn context source — zero SQL reads on hot turns**; threshold compaction folds raw rows into one 5-section structured summary behind a dual persistence barrier (`sessions.compaction` JSONB = durable checkpoint, revision CAS); per-session async write queue (one batch INSERT/turn); deferred finalize = incremental embed + first-time-only sidebar summary/title; trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + 30-day audit-event retention — see [§22](#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns) |
 | Migrations | single canonical init script `migrations/0001_init.sql` (final schema + reference seeds) applied once by the asyncpg runner (replaces Alembic); dev-time incremental migrations deliberately squashed |
 | Chat | agent loop with tool use, SSE streaming |
-| Viewer context | chat answers about the **open viewer**: focus chip (file · page / playhead), FOCUS / FULL / NONE intent classification, ±20 s media-time subtitle window, pinned selections / ROI / frames as explicit P0 context, honest `too_large` / `unavailable` short-circuit, clickable `[Vn]` citations; when a document is open but nothing injectable, a trusted **Viewer Access Context** stub routes the model to `read_document` page-scoped reads (`pages` spec, ACL-before-storage, ≤16 pages) with a post-turn `viewer.reads` trace incl. failed calls — zero changes to RAG / agent runtime / memory ([§23](#23-viewer-context-provider--the-open-document-as-reference-context), features.md *Desktop Workbench*) |
+| Viewer context | chat answers about the **open viewer**: focus chip (file · page / playhead), ±20 s media-time subtitle window with video-only FOCUS / FULL / NONE classification and honest `too_large` / `unavailable` short-circuit, pinned selections / ROI / frames as explicit P0 context, clickable `[Vn]` citations; **documents are never intent-matched server-side** — every followed document reaches the model as a trusted **Viewer Access Context** stub (geometry-resolved current page) routing it to `read_document` page-scoped reads (`pages` spec, ACL-before-storage, ≤16 pages) with a post-turn `viewer.reads` trace incl. failed calls — zero changes to RAG / agent runtime / memory ([§23](#23-viewer-context-provider--the-open-document-as-reference-context), features.md *Desktop Workbench*) |
 | Research OS | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; **deterministic execution engine** — Python owns control flow through a 10-stage contract pipeline (`DISCOVER → FRAME → EVIDENCE → DESIGN → EXECUTE → EXPLAIN → WRITE → REVIEW → REPRODUCE → PUBLISH`) with repair-once bounded attempts, per-stage declared LLM call budgets + run-level turn/cost/no-progress caps, and guard gates at the transition fence: **strict** mode (default) parks a failed gate on a PENDING human override with zero rework on resume, lenient mode records it and continues; structural violations halt terminally (`BLOCKED`); lease-based crash recovery makes interrupted runs resumable; publication finality is the `PROMOTED` record (report + compiled PDF, optional slides via toolkit); desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module), [§20](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline) |
 | Workflow core (`packages/workflow`) | domain-free run engine behind Research OS: declarative `workflow_spec` (transitions / activities / cap dimensions / hooks) + state machine with lease contest, crash recovery, retry, loop-cap grading and definition-drift detection; adapter pattern (ports + ledger/lease persistence supplied by the plugin) — [§19](#19-workflow-core-packagesworkflow) |
 | Image handling | two image classes: chat screenshots (📷 region-select capture → `chat/temp/` upload → `messages.attach_asset_id` owned link → inline bubble thumbnails → folder-agnostic cascade delete — the `chat/temp/` copy dies with its chat; RAG import **copies** it to `RAG/images/` keeping a separate stable copy that survives the delete) and RAG document images (PDF/DOCX/PPTX package scans and `.doc` magic-header recovery → `RAG 图片/<doc>/` via `assets.source_asset_id` + content-hash dedup, page/para state machine → chunk `meta.image_ids`, cascade delete/purge/restore with the source); `vision` tool reads any attached asset by id — see [§18](#18-image-handling-screenshots--document-images) |
@@ -572,7 +572,10 @@ tool name / arguments / reason, and blocks on a decision future until
 ``settings.approval_timeout_seconds`` (timeout → deny). ``POST /approvals/{id}`` resolves it with
 ``(allow, optional message)``: a decision may carry a **feedback message** that rides back to the
 model — on deny it *replaces* the generic refusal reason, so the human can tell the agent what to do
-instead. Both brokers carry the pair (memory map for single-process dev/tests; the Redis broker
+instead. Every platform-written feedback string (confirm / cancel / the generation-takeover note) is
+scoped to the current turn in its wording — an unscoped "do not call tools again" survives in the
+transcript as a standing policy and silences unrelated tool calls (e.g. `vision` on the next
+screenshot) in later turns. Both brokers carry the pair (memory map for single-process dev/tests; the Redis broker
 publishes the full payload across nodes); a tool that ASKs with no approver bound **degrades to
 deny** — safe by default. The desktop renders the request as an **inline decision card** in the
 conversation (Continue / Cancel with a live countdown mirroring the server timeout, plus the
@@ -2353,13 +2356,15 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     instead of rendering as extra bubbles — one reply per turn; the bar also ticks out the
     current phase's elapsed seconds (`⋯ Working… · 7s`) so a slow model round-trip or a pending
     approval reads as progress, never as a hang, and keeps a live activity line even on
-    thinking-suppressed turns (viewer FOCUS, voice-call). Splitter and
+    thinking-suppressed turns (video FOCUS, voice-call). Splitter and
     floating-window drags use **pointer events + `setPointerCapture`**, so drag tracking continues
     even when the pointer passes over the `<video>` element. Sign-in / register / password-reset
     and profile/avatar editing are modal dialogs against `/auth/*`. The **input box** is a
     Gemini-style row — a **＋ attach** button, a **multi-line `<textarea>`** (its height follows
     the dock: 1 row in the Files bottom bar, 4 rows docked right or when the **Chats** tab fills
-    the whole pane; **Enter sends** the message, **Shift+Enter** inserts a new line), inline
+    the whole pane — that fill rule wins over any inline size left by edge-resizing the docked
+    chat (`!important` on `#app.chat-fills #chat`; the resize handle is hidden on the Chats tab,
+    where it could only write sizes the pinned layout ignores); **Enter sends** the message, **Shift+Enter** inserts a new line), inline
     **🎤 / 🌊(call) / 📷** buttons, and Send — with an attachment preview strip above it. Attach stages a
     pending attachment that rides on the next send: pick a file (OS picker → uploaded to the cloud
     drive), attach the currently-open cloud asset by id, or capture a **window screenshot** —
@@ -3444,7 +3449,10 @@ read this spreadsheet" request collapsed into a parse-failure apology. The `read
   image recovery must never break `read_document`.
 - **Type-aware attach note** — `_attach_note` (`chat.py`) picks the hint by suffix: documents
   get "call `read_document`", images get "call `vision`", so the agent needs no guessing to
-  reach the right reader through `tool_search`.
+  reach the right reader through `tool_search`. The image hint additionally declares the attached
+  image **new to this message** — any earlier image analysis in the conversation describes a
+  different file and never applies — so a per-message fact can't be eroded by whatever the
+  transcript already says about a previous screenshot.
 - **Honest failure, bounded output** — legacy `.xls`/`.ppt` are refused with a
   resave-as hint (the shared stack rejects them too); `.doc` goes through antiword and is
   refused with the same hint only when the binary is missing, times out, or fails to parse —
@@ -4333,13 +4341,18 @@ NULL`; legacy + worker recovery loads.
 ## 23. Viewer Context Provider — The Open Document as Reference Context
 
 **Idea.** "这段什么意思" / "刚才讲的是什么" become answerable while a file is open in the viewer — without
-touching retrieval. The viewport's current content (page text, subtitle window, full transcript, pinned
-selections) rides into the prompt as an **independent reference context** in the dynamic suffix, never into
-the user message. Hard invariants:
+touching retrieval. What rides into the prompt as an **independent reference context** in the dynamic
+suffix depends on the medium: pinned selections always; video's viewport content (subtitle window, full
+transcript) as injected data; a **document** as a trusted routing stub — the model reads it through the
+`read_document` tool instead of the server scraping and shipping its text. Nothing ever enters the user
+message. Hard invariants:
 
-- **Open ≠ Inject.** The payload is candidate data; a mode classifier (FOCUS / FULL / NONE) decides whether
-  viewport content is injected at all, and only the user's explicit actions (pinned selection, ROI, captured
-  frame — P0) always ride, orthogonal to the mode (`NONE + P0` is a valid turn).
+- **Open ≠ Inject.** For **documents** the server decides nothing about what the user wants to read — the
+  content is never injected and the Viewer Access Context stub (below) is the only channel: the model
+  scopes the question and calls `read_document` itself. The FOCUS / FULL / NONE classifier runs for
+  **video only** — media-time proximity has no tool channel to route to. Only the user's explicit actions
+  (pinned selection, ROI, captured frame — P0) always ride as data, orthogonal to everything
+  (`NONE + P0` is a valid turn).
 - **The user message is untouched.** The router never splices viewer content into `user_text`; the question
   reaches the kernel verbatim. Without a viewer assembly the prompt is *byte-identical* to the legacy chat
   path — the section is registered in `PromptZone.DYNAMIC_SUFFIX` (order 300) and its renderer returns `""`
@@ -4352,11 +4365,11 @@ the user message. Hard invariants:
   functions over the frozen payload. Drive checks live in the chat router: a forged `asset_id` drops the
   asset identity (typed selection text survives, request continues 200) and never 403s; an unreadable frame
   asset is dropped with a `rejected` record.
-- **Honest short-circuits.** A FULL request whose content exceeds the token budget (`VIEWER_TOKEN_BUDGET`,
-  default 24 000 tokens — the 100 k-char schema cap is transport only) returns `too_large`; one whose full
-  capture the client cannot vouch for (`full_trusted=false` — PDF full text is trusted only when all
-  `numPages` text layers are present and non-empty) returns `unavailable`. The router aborts *before* the
-  agent runs — never a silent downgrade to FOCUS, a partial-page substitute, or a RAG fallback.
+- **Honest short-circuits (video only).** A video FULL request whose transcript exceeds the token budget
+  (`VIEWER_TOKEN_BUDGET`, default 24 000 tokens — the 100 k-char schema cap is transport only) returns
+  `too_large`; one whose full capture the client cannot vouch for (`full_trusted=false`) returns
+  `unavailable`. The router aborts *before* the agent runs — never a silent downgrade to FOCUS, a
+  partial-window substitute, or a RAG fallback.
 - **Reference data is data.** Blocks render inside an escalating fence under a header declaring them
   UNTRUSTED and their content never instructions; blocks carry no tool directives. The header does pin
   the blocks' *role*: on-screen material is answered from the blocks themselves with `[Vn]` citations —
@@ -4370,36 +4383,43 @@ the user message. Hard invariants:
 
 **Mechanism (server).** `ChatRequest.viewer` (optional `ViewerPayload`) freezes the viewport at send time:
 `{name, kind, provenance, asset_id, page, t_ms, focus_text, cues, full_text / full_chars / full_trusted,
-selections[]}` with schema caps (≤8 selections, focus_text ≤12 k chars, ≤300 cues, full_text ≤100 k).
-Classification is a strict priority: **local deictics** (这一段/页/图, 本页, 第一页, 第2-5页, 这里, 当前/现在/刚才, this page, here,
-it/they…) force FOCUS even when whole-document words co-occur → whole-scope words (整篇/全文/这篇文章/总结/概括/归纳/梳理/结构/summarize…)
-→ FULL → content interrogatives (什么意思/为什么/what does … mean) → FOCUS → else NONE; a task imperative
+selections[]}` with schema caps (≤8 selections, focus_text ≤12 k chars, ≤300 cues, full_text ≤100 k —
+the text fields exist only for transport compatibility; a current client ships **identity** for documents).
+`build_viewer_blocks` invokes the classifier **only for `kind == "video"`** and forces mode NONE otherwise:
+word lists are a bad proxy for a model that can read the question ("前两页" slipped past the deictic
+patterns; "这一页" matched but was pinned to whatever page the observer last reported). The video
+classifier is a strict priority: **local deictics** (刚才/现在/此刻, this page, here, it/they…) force FOCUS
+even when whole-video words co-occur → whole-scope words (整部视频/这个视频/总结/summarize…) → FULL →
+content interrogatives (什么意思/为什么/what does … mean) → FOCUS → else NONE; a task imperative
 (帮我写…) → NONE; the ✕ chip (`follow=false`) or an explicit `mode:"none"` turns the viewport off while P0
 survives. Video uses **media time**: the window is `[t − 20 s, t]` extended by cue overlap, the active cue is
 always in, future cues never, capped at 30 cues / 4000 chars dropping oldest with a visible note. Per-turn
 persistence: the user row keeps a sanitized `meta["viewer"]` snapshot (what the model was actually shown),
 the assistant row keeps `meta["viewer_citations"]` (full tag map + cited + invalid; the answer text is never
-rewritten); the done frame carries the citation map for client-side decoration. Viewer **FOCUS** turns run
+rewritten); the done frame carries the citation map for client-side decoration. Video **FOCUS** turns run
 with thinking disabled — on-screen Q&A over a small window must not pay the reasoning-prefill tax (the
-voice-call precedent; FULL turns keep thinking, it is a whole-document reasoning request).
+voice-call precedent; FULL turns keep thinking, it is a whole-content reasoning request).
 
-**Stub routing — a blind turn still knows where to look.** NONE used to mean silence: a readable document
+**Stub routing — the document channel, not a fallback.** NONE used to mean silence: a readable document
 open in the viewer but nothing injectable this turn left the model without any channel to the content.
-Now, when the NONE branch produces **zero blocks** and the viewer is `follow`ed, carries a readable
-`asset_id`, and is a document kind `read_document` can open (`pdf` / `office` / `text` / `markdown` —
-images and videos are excluded because their pipelines have no text/page tool to route to), the assembly
-returns `status="stub"` instead of `none`. The stub renders a **second, trusted prompt form** — the
-`## Viewer Access Context` control section — through the same `viewer_reference_section` seam:
-`stub` → control section, `injected` → the UNTRUSTED `[Vn]` data section, otherwise `""`; the two renderers
-are physically exclusive and never co-occur in one turn. The control section carries the fenced asset name
-(escalating `_fence` — a crafted filename cannot forge a bullet line of a trusted section), the asset id,
-the current page (or `N/A`), and routing guidelines the model must follow: answer current-page deictics
-with `read_document(asset_id, pages="<current page>")` (never fabricate a page when it's `N/A`), honor
-explicit page/range specs via `pages`, omit `pages` for a whole-document ask, refuse page-scoped reads for
-formats without a page axis **instead of substituting the full document**, treat reading the viewer
-material as mandatory (web/RAG may supplement, never replace), and answer unrelated chatter directly
-without a tool call. P0 selections always outrank the stub (a surviving block means `injected`);
-FULL never degrades into a stub (`too_large` / `unavailable` still abort the turn before the agent runs).
+With document-side intent matching retired, the stub is how **every** followed-document turn without a
+P0 block reaches the agent: the NONE branch (the default for documents) produces **zero blocks**, the
+viewer is `follow`ed and carries a readable `asset_id`, and the kind is one `read_document` can open
+(`pdf` / `office` / `text` / `markdown` — images and videos are excluded because their pipelines have no
+text/page tool to route to), and the assembly returns `status="stub"` instead of `none`. The stub renders
+a **second, trusted prompt form** — the `## Viewer Access Context` control section — through the same
+`viewer_reference_section` seam: `stub` → control section, `injected` → the UNTRUSTED `[Vn]` data section,
+otherwise `""`; the two renderers are physically exclusive and never co-occur in one turn. The control
+section states up front that the document's content is **not** in the prompt, then carries the fenced
+asset name (escalating `_fence` — a crafted filename cannot forge a bullet line of a trusted section),
+the asset id, the current page (or `N/A`), and routing guidelines the model must follow: answer
+current-page deictics with `read_document(asset_id, pages="<current page>")` (never fabricate a page when
+it's `N/A`), honor explicit page/range specs via `pages`, omit `pages` for a whole-document ask, refuse
+page-scoped reads for formats without a page axis **instead of substituting the full document**, treat
+reading the viewer material as mandatory (web/RAG may supplement, never replace), and answer unrelated
+chatter directly without a tool call. P0 selections always outrank the stub (a surviving block means
+`injected`); `too_large` / `unavailable` are unreachable for documents (they are video FULL outcomes),
+so a followed, readable document turn carries either data blocks or the stub — never silence.
 Both chat streams sink the assembly (`status in ("injected", "stub")`) and skip `_viewer_abort`. After the
 turn, a stub run writes a **read trace** to the assistant row's `meta["viewer"]` —
 `{mode, status:"stub", asset_id, current_page, reads:[{tool_call_id, pages}, …]}` — collected from the
@@ -4407,10 +4427,14 @@ turn's messages: every `read_document` call whose args name the stub asset, **in
 (the contract records attempted specs, e.g. a rejected `pages:"0"`), and the same payload rides the
 sync response / SSE `done` frame as `viewer`.
 
-**Mechanism (desktop).** `viewer.js` tracks the focus state (`IntersectionObserver` center-band page winner
-for PDFs, `timeupdate` → media-ms for video, subtitle cues parsed to ms) and extracts honestly: page text
-comes from the rendered PDF text layer, and `extractPdfFullText` reports `ok:false` — hence
-`full_trusted:false` — unless every page layer is present and non-empty. `getFocus()` freezes a payload
+**Mechanism (desktop).** `viewer.js` tracks the focus state: the PDF's current page is resolved **by
+geometry at call time** — whichever page box covers the vertical middle of the scroll container wins
+(the nearest one if the middle falls in a gap); the `IntersectionObserver` only signals that scrolling
+happened and triggers a recompute, never trusting the batch's first entry (an order the browser does
+not guarantee). Video maps `timeupdate` → media-ms; subtitle cues are parsed to ms. A document send
+freezes **identity only** (`name · kind · asset_id · page`) — page/full text is no longer scraped from
+the DOM, since the server ignores those fields for documents and the model reads through
+`read_document`; video still ships its cues and full transcript. `getFocus()` freezes a payload
 snapshot per send (paging/playing afterwards never mutates an in-flight request); `navigateTo({page, t_ms})`
 is the citation-jump sink, called only from citation clicks. `app.js` renders the focus chip (👁
 `name · p.12` / `· 22:44`) in the chat bar independently of attachments and pinned selections, shows a
@@ -4423,11 +4447,14 @@ asset (same asset only; otherwise a toast — never an automatic jump under the 
 
 **Test doctrine** (`tests/test_viewer_context.py` + `tests/test_viewer_chat.py` +
 `tests/test_read_document_tool.py`): window arithmetic
-(boundary extension / active cue / future exclusion / caps); the classification priority matrix; block
+(boundary extension / active cue / future exclusion / caps); the video-only classification priority
+matrix; document content never injected — a stale client still shipping `focus_text` lands on the stub
+path, not in `[Vn]`; block
 numbering & P0-before-mode ordering; every short-circuit path; fence escalation over embedded quotes;
 citation validation that never rewrites; forged-asset and per-frame permission paths at the router seam;
-the stub eligibility matrix (kind / follow / asset-readability exclusions, P0 precedence, FULL-never-
-degrades) and the Access-Context render contract (routing guidelines present, no vision mention, forged
+the stub eligibility matrix (kind / follow / asset-readability exclusions, P0 precedence, video-FULL-
+never-degrades) and the Access-Context render contract (routing guidelines + not-injected statement
+present, no vision mention, forged
 asset names fenced, `N/A` page handling, section dispatch stub-vs-injected-vs-none); the `pages` parser
 contract (dedupe/sort, malformed/range/over-cap/`""` rejections, bounds-checked before extraction,
 page-axis-less formats refused); ACL-before-storage on `read_document`; the stub read trace — including a
