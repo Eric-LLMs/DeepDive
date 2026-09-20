@@ -54,7 +54,7 @@ def estimate_tokens(text: str) -> int:
 # about content with the viewer open is about the content on screen. Only an unmatched
 # question (or an imperative/task request) → NONE.
 _LOCAL_WORDS = re.compile(
-    r"[这那][一]?(?:段|页|部分|句话?|小节)|(?:这|那)[一]?篇(?!章|目|节|论文|文章)|这[一]?个?图|这张图|当前|现在|此时|这会儿|刚才|上面|下方|文中提到|此刻|这几[个张]?"
+    r"[这那][一]?(?:段|页|部分|句话?|小节)|第[一二三四五六七八九十百千\d]+[页张]|本[页张]|(?:这|那)[一]?篇(?!章|目|节|论文|文章)|这[一]?个?图|这张图|当前|现在|此时|这会儿|刚才|上面|下方|文中提到|此刻|这几[个张]?"
     r"|\bthis (?:page|passage|paragraph|section|figure|image|chart|part|one)\b"
     r"|\bhere\b|\bcurrent(?:ly)? (?:page|section|slide|frame)\b|\bjust now|\babove\b|\bbelow\b"
     r"|\b(?:it|they|them|they'?re)\b",
@@ -62,7 +62,7 @@ _LOCAL_WORDS = re.compile(
 )
 _FULL_WORDS = re.compile(
     r"这篇文章|文章(?:大意|讲了|主要)|这篇论文|论文(?:整体|主要|讲了)|这份文档|文档(?:整体|主要|讲了)"
-    r"|整篇|全文|整部视频|这个视频|整段视频|视频(?:主要|整体|讲了)|整体内容|主要内容|讲了什么|讲的是|大意|梗概|结构|梳理"
+    r"|整篇|全文|整部视频|这个视频|整段视频|视频(?:主要|整体|讲了)|整体内容|主要内容|讲了什么|讲的是|大意|梗概|结构|梳理|总结|概括|归纳"
     r"|\bthis (?:article|paper|document|video)\b|\bthe (?:paper|article|document)\b"
     r"|\bwhole\b|\bentire\b|\bfull text\b|\boverview\b|\bsummar\w*\b|\bmain (?:points?|idea|takeaway)s?\b"
     r"|\bwhat (?:does|is) (?:it|this|that) (?:about|cover)",

@@ -1323,15 +1323,32 @@
     // bare "working" placeholder, and done() drops it instead of settling on an empty
     // 💭 Thoughts fold.
     let seen = false;
+    // Elapsed-seconds ticker on the phase line ("⋯ Working… · 7s"): every phase (working /
+    // thinking / a tool / awaiting confirmation) carries how long it has been running, so a
+    // slow model round-trip or a blocked approval reads as progress, never as a hang. The
+    // interval is lazily started on the first phase and self-stops once the bar leaves the
+    // DOM (done/cancelled/session switch) — no dangling timer.
+    let phase = "";
+    let phaseT0 = 0;
+    let phaseTimer = null;
+    const stopTicker = () => { if (phaseTimer) { clearInterval(phaseTimer); phaseTimer = null; } };
     return {
       el: details,
-      setPhase: (txt) => { sum.textContent = txt; },
+      setPhase: (txt) => {
+        phase = txt; phaseT0 = Date.now();
+        sum.textContent = txt;
+        if (!phaseTimer) phaseTimer = setInterval(() => {
+          if (!sum.isConnected) { stopTicker(); return; }
+          sum.textContent = `${phase} · ${Math.floor((Date.now() - phaseT0) / 1000)}s`;
+        }, 1000);
+      },
       addThinking: (t) => { seen = true; box.textContent += t; scroll(); },
       addTool: (label) => { seen = true; box.textContent += (box.textContent ? "\n" : "") + label; },
       // Fold a superseded step's narration into the process box (blank-line separated
       // from prior entries) — the text is still auditable inside 💭 Thoughts.
       addProcess: (t) => { seen = true; box.textContent += (box.textContent ? "\n\n" : "") + t; },
       done: () => {
+        stopTicker();
         if (!seen) { details.remove(); return; }
         sum.textContent = "💭 Thoughts";
         scroll();
@@ -1671,14 +1688,21 @@
 
   // HITL approval frame (SSE "approval-request"): the sandbox ASKed before a WRITE tool ran.
   // An unanswered frame stalls the turn until the server-side timeout, then auto-denies — so
-  // every frame must be answered here. Chat-triggered generation ("make slides of this page")
-  // routes through this: the model calls slides_gen/mindmap_gen purely as an intent signal.
-  // The real work stays entirely in the existing toolkit pipeline — confirming answers the
-  // frame with a *deny* whose message tells the model the platform took over, then opens the
-  // very same generate dialog the toolbar uses (source prefilled from the frozen viewer
-  // payload, output-folder picker included, background Cloud Drive job). Allowing the agent
-  // tool instead would write workspace files duplicating the cloud job, so it never happens.
+  // every frame must be answered here. The decision is an INLINE card in the chat (same look
+  // as the research gate-override card) — the approval belongs to the conversation, so it is
+  // asked where the ask happened, with a live countdown so a blocked turn never reads as
+  // "stuck". Chat-triggered generation ("make slides of this page") routes through this: the
+  // model calls slides_gen/mindmap_gen purely as an intent signal. The real work stays
+  // entirely in the existing toolkit pipeline — confirming answers the frame with a *deny*
+  // whose message tells the model the platform took over, then opens the very same generate
+  // dialog the toolbar uses (source prefilled from the frozen viewer payload, output-folder
+  // picker included, background Cloud Drive job). Allowing the agent tool instead would write
+  // workspace files duplicating the cloud job, so it never happens.
   const GEN_TOOL_TO_DIALOG = { slides_gen: "slides", mindmap_gen: "mindmap" };
+  const GEN_CARD_ICON = { slides: "📽️", mindmap: "🧠" };
+  // Mirrors the server default (settings.approval_timeout_seconds); the countdown is advisory
+  // — expiry always resolves to a server-side deny, a late click POSTs into a 404 we ignore.
+  const APPROVAL_TIMEOUT_S = 120;
 
   async function resolveApproval(approvalId, allow, message) {
     try {
@@ -1694,40 +1718,77 @@
     if (!id) return;
     const name = data.name || "tool";
     const dialogTool = GEN_TOOL_TO_DIALOG[name];
-    if (dialogTool) {
-      const label = TOOLKIT_LABELS[dialogTool] || dialogTool;
-      const ok = await window.confirmModal({
-        title: `Generate ${label}?`,
-        message: `The assistant would like to generate ${label.toLowerCase()} from the material you asked about. You'll pick an output folder; the job runs in the background on your Cloud Drive.`,
-        okLabel: "Continue",
-      });
-      if (!ok) {
-        await resolveApproval(id, false, "用户取消了本次生成,请简短知悉。");
+    const gen = !!dialogTool;
+    const label = dialogTool ? TOOLKIT_LABELS[dialogTool] || dialogTool : name;
+
+    const card = document.createElement("div");
+    card.className = "research-gate-card";
+    const title = document.createElement("div");
+    title.className = "rga-title";
+    const baseTitle = gen ? `${GEN_CARD_ICON[dialogTool] || "⚙️"} Generate ${label}?` : `⚙️ Allow "${name}"?`;
+    title.textContent = `${baseTitle} · ${APPROVAL_TIMEOUT_S}s`;
+    const reason = document.createElement("div");
+    reason.className = "rga-reason";
+    reason.textContent = gen
+      ? `The assistant wants to generate ${label.toLowerCase()} from the material you asked about. You'll pick an output folder; the job runs in the background on your Cloud Drive.`
+      : data.reason || `The assistant wants to run "${name}".`;
+    const actions = document.createElement("div");
+    actions.className = "rga-actions";
+    const okBtn = document.createElement("button");
+    okBtn.className = "rga-btn approve";
+    okBtn.textContent = gen ? "✓ Continue" : "✓ Allow";
+    const noBtn = document.createElement("button");
+    noBtn.className = "rga-btn reject";
+    noBtn.textContent = gen ? "✕ Cancel" : "✕ Deny";
+    actions.append(okBtn, noBtn);
+    card.append(title, reason, actions);
+    chatLog.appendChild(card);
+    chatLog.scrollTop = chatLog.scrollHeight;
+
+    // Live countdown: keeps the wait honest, and locks the card when the backend's
+    // auto-deny fires so a click after expiry can't pretend to have decided.
+    let left = APPROVAL_TIMEOUT_S;
+    let tick = setInterval(() => {
+      if (!card.isConnected) { clearInterval(tick); return; }
+      left -= 1;
+      if (left <= 0) {
+        clearInterval(tick);
+        okBtn.disabled = noBtn.disabled = true;
+        title.textContent = `${baseTitle} · timed out`;
+        reason.textContent = "No decision in time — the request was cancelled.";
         return;
       }
-      await resolveApproval(id, false,
-        "用户已确认。生成将由云盘后台作业完成(平台已打开生成窗口),请告知用户选择目录后自动开始,不要再调用工具、不要自己写文件。");
-      // Prefill the dialog as the toolbar flow would leave it: cloud-files source with the
-      // frozen viewer asset; folder stays null = Cloud Drive root default.
-      const v = state.lastSentViewer;
-      if (v && v.asset_id && v.provenance === "cloud") {
-        genDialogState[dialogTool] = {
-          src: "files",
-          cloudFiles: [{ id: v.asset_id, name: v.name || "document" }],
-          folderPath: null,
-        };
+      title.textContent = `${baseTitle} · ${left}s`;
+    }, 1000);
+
+    const decide = async (proceed) => {
+      clearInterval(tick);
+      okBtn.disabled = noBtn.disabled = true;
+      const feedback = gen
+        ? proceed
+          ? "用户已确认。生成将由云盘后台作业完成(平台已打开生成窗口),请告知用户选择目录后自动开始,不要再调用工具、不要自己写文件。"
+          : "用户取消了本次生成,请简短知悉。"
+        : proceed ? null : "用户拒绝了本次工具调用。";
+      // gen → always deny-with-feedback: the cloud job (opened right below) is the real
+      // executor; a plain agent tool → honest allow/deny.
+      await resolveApproval(id, gen ? false : proceed, feedback);
+      card.remove();
+      if (gen && proceed) {
+        // Prefill the dialog as the toolbar flow would leave it: cloud-files source with the
+        // frozen viewer asset; folder stays null = Cloud Drive root default.
+        const v = state.lastSentViewer;
+        if (v && v.asset_id && v.provenance === "cloud") {
+          genDialogState[dialogTool] = {
+            src: "files",
+            cloudFiles: [{ id: v.asset_id, name: v.name || "document" }],
+            folderPath: null,
+          };
+        }
+        openGenerateDialog(dialogTool);
       }
-      openGenerateDialog(dialogTool);
-      return;
-    }
-    // Any other gated tool (fs writes, summary_gen, …): plain allow/deny. Without this the
-    // turn would silently hang for the full approval timeout.
-    const ok = await window.confirmModal({
-      title: "Allow tool call?",
-      message: `The assistant wants to run "${name}"${data.reason ? `: ${data.reason}` : ""}. Allow it?`,
-      okLabel: "Allow",
-    });
-    await resolveApproval(id, ok, ok ? null : "用户拒绝了本次工具调用。");
+    };
+    okBtn.addEventListener("click", () => decide(true));
+    noBtn.addEventListener("click", () => decide(false));
   }
 
   async function sendChat(message, extra = {}, opts = {}) {
