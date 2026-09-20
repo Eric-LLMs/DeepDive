@@ -1700,6 +1700,11 @@
     }
     const payload = { message, session_id: state.sessionId ?? undefined, ...extra };
     if (!state.token) payload.user_id = state.guestId ?? undefined;
+    // Research-tab blank chat (no task selected): throwaway semantics — the session the
+    // server creates for this turn is marked research-type (hidden from the Sessions list,
+    // never bound to any task), so an unbound chat is effectively not recorded. Only
+    // task-bound research chats persist in a user-visible way.
+    if (state.researchBlankChat) payload.ephemeral = true;
     // Viewer focus: frozen NOW — scrolling/pausing after this line never affects the
     // in-flight request. The server assembles it as reference context; it is NOT
     // spliced into ``message``.
@@ -2827,13 +2832,12 @@
         // dedicated session in the chat. Opening is side-effect free: the model stays silent
         // until the user types a run instruction — creating a task never auto-starts it.
         switchTab("research");
-        // Jump to the Research monitor so the new task is highlighted, then open its
-        // dedicated session in the chat. (selectResearchTask handles the list + status +
-        // working-directory render; a separate loadResearch here would double-render.)
-        if (window.selectResearchTask) window.selectResearchTask(created.task_id, title);
-        if (window.openResearchSession) {
-          window.openResearchSession(created.task_id, title, created.session_id || null);
-        }
+        // (selectResearchTask renders list + status + working-directory; a separate
+        // loadResearch here would double-render. openSession:false — the ONE session open
+        // happens right below with the authoritative session id from this POST response, so
+        // the old chat is reliably replaced by the task's bound research chat.)
+        if (window.selectResearchTask) window.selectResearchTask(created.task_id, title, { openSession: false });
+        await window.openResearchSession(created.task_id, title, created.session_id || null, description);
       } catch (err) {
         Viewer.toast(`Create failed: ${err.message}`);
         createBtn.disabled = false;
@@ -6088,7 +6092,7 @@
   function showResearchBlankChat() {
     newChat();
     chatTitle.textContent = "New research chat";
-    appendMsg("notice", "No research task selected. Pick a task in the list, or click ＋ New Research to create one. This is a blank chat — messages here are plain chats until a task is selected.");
+    appendMsg("notice", "No research task selected. Pick a task in the list, or click ＋ New Research to create one. This chat is temporary — messages here are plain Q&A and are not saved to your chat history.");
     state.researchBlankChat = true;
   }
   window.showResearchBlankChat = () => {
@@ -6108,7 +6112,10 @@
     // research.js loadResearch) reopens the selected task's dedicated session; leaving
     // Research drops the research mode and restores the neutral chat. Each task's session is
     // 1:1 and reused on every open, so switching tabs/tasks never forks a new session.
-    const wasResearch = !!state.activeResearch;
+    // The blank-chat visit counts as research mode too: leaving it must restore the
+    // neutral chat (which clears the log), otherwise the "No research task selected…"
+    // guidance line stays on screen under the Files/Chats tabs.
+    const wasResearch = !!state.activeResearch || state.researchBlankChat;
     if (isResearch) {
       if (!wasResearch) {
         state.neutralSessionId = isResearchSession(state.sessionId) ? null : state.sessionId;

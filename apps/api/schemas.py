@@ -224,6 +224,10 @@ class ChatRequest(BaseModel):
                                      #   gt_ token (api.auth.sign_guest_token), never from a
                                      #   client-supplied user_id.
     session_id: UUID | None = None   # optional: resume an existing session
+    ephemeral: bool = False          # Research-tab blank chat (no task selected): a session
+                                     #   created for this turn is marked research-type (1), so
+                                     #   an unbound throwaway chat never shows in the Sessions
+                                     #   list. Ignored when session_id resumes an existing row.
     disable_thinking: bool = False   # live voice-call turns: suppress reasoning tokens for
                                      #   this turn's model calls (faster time-to-first-sentence)
     attach: dict | None = None       # optional: { kind: "asset", asset_id, name } — a cloud

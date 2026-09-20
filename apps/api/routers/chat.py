@@ -1012,7 +1012,12 @@ async def chat_stream(
                 "viewer": viewer_abort,
             }}, ensure_ascii=False)}
         return EventSourceResponse(abort_gen())
-    session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
+    # ``ephemeral`` (Research-tab blank chat): a newly created session is marked type 1
+    # (research), i.e. hidden from the Sessions list — an unbound throwaway chat is never
+    # recorded in a user-visible way. Only task-bound research chats persist visibly.
+    session_id = body.session_id or await create_session(
+        SessionLocal, user_id, title=body.message, type=1 if body.ephemeral else 0
+    )
     # Chat-driven research: bind this session to the handoff's task so every subsequent turn
     # mirrors into the task's ``session_history.json`` (a task-local projection — the DB
     # SessionModel stays the authoritative conversation record). A binding conflict (one

@@ -493,7 +493,7 @@
   }
 
   // ── bottom layer: selected task status (read-only) ───────────────────────
-  async function loadStatus(taskId) {
+  async function loadStatus(taskId, opts = {}) {
     if (!statusBody) return;
     statusBody.innerHTML = "";
     statusBody.appendChild(el("div", "research-status-empty", "Loading…"));
@@ -505,7 +505,7 @@
       statusBody.appendChild(el("div", "research-status-empty", `Status unavailable: ${e.message}`));
       return;
     }
-    await renderStatusDetail(detail);
+    await renderStatusDetail(detail, opts);
   }
 
   // Render the left status panel from an already-fetched authoritative detail. Used by both the
@@ -1627,11 +1627,14 @@
 
   // Jump to a specific task (used right after "＋ Research" creates one, so the new task is
   // highlighted in the list, its stage shows in the status pane, and the main pane switches
-  // to its working directory while the chat drives it).
-  window.selectResearchTask = (taskId, name) => {
+  // to its working directory while the chat drives it). ``opts`` is forwarded to the status
+  // render — pass ``{ openSession: false }`` when the caller opens the chat itself (the create
+  // dialog does, with the authoritative session id from the POST response; letting this path
+  // also open it raced a second resume against the first and could wipe the bound chat).
+  window.selectResearchTask = (taskId, name, opts = {}) => {
     selectedTask = { task_id: taskId, name: name || taskId };
     loadTasks();
-    loadStatus(taskId);
+    loadStatus(taskId, opts);
     renderTaskView();
   };
 })();
