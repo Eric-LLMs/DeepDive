@@ -706,12 +706,39 @@
     for (const child of Array.from(container.children)) if (!child.dataset.key) child.remove();
   }
 
+  // Scroll anchoring for incremental renders. Rows sort alphabetically, so a file the
+  // agent writes can land at the top of the visible range and push every row below it
+  // down — the user's scroll position then shows different content ("jumping back") even
+  // though no row was rebuilt. Capture the row crossing the viewport's top edge before
+  // the sync and restore its position after, so visible content stays put across polls.
   function renderDrive() {
     if (!cdListEl.dataset.delegated) {
       cdListEl.dataset.delegated = "1";
       bindTreeDelegates();
     }
+    let anchor = null;
+    const scrollTop0 = cdListEl.scrollTop;
+    if (scrollTop0 > 0) {
+      const listTop = cdListEl.getBoundingClientRect().top;
+      for (const r of cdListEl.querySelectorAll(".cd-row")) {
+        const rt = r.getBoundingClientRect().top;
+        if (rt + r.offsetHeight > listTop && r.dataset.key) {
+          anchor = { key: r.dataset.key, off: rt - listTop };
+          break;
+        }
+      }
+    }
     syncChildren(cdListEl, driveTreeSpec());
+    if (anchor) {
+      let moved = null;
+      for (const r of cdListEl.querySelectorAll(".cd-row")) {
+        if (r.dataset.key === anchor.key) { moved = r; break; }
+      }
+      if (moved) {
+        const nt = moved.getBoundingClientRect().top - cdListEl.getBoundingClientRect().top;
+        cdListEl.scrollTop = scrollTop0 + nt - anchor.off;
+      }
+    }
     cdPathEl.textContent = locLabel(drive.loc);
     cdPathEl.title = drive.loc.kind === "trash" ? "Trash" : `Browse ${locLabel(drive.loc)}`;
   }
