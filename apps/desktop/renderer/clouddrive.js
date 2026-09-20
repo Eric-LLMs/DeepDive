@@ -205,13 +205,19 @@
     return { kind: "root" };
   }
 
-  async function loadDrive() {
+  async function loadDrive(opts = {}) {
+    // Quiet mode is for background polls (the 5s ingest loop). Showing "Loading…" and
+    // then hiding it toggles the cd-status row's display every tick; the status sits in
+    // the sidebar's flex column below the tree, so the scroll viewport grew/shrank by a
+    // row height every 5 seconds — visible bouncing even though the rows themselves no
+    // longer rebuild. User-initiated loads keep the status feedback.
+    const quiet = !!opts.quiet;
     if (!getToken()) {
       cdListEl.innerHTML = '<div class="cd-empty">Sign in to browse your cloud drive.</div>';
       setStatus("");
       return;
     }
-    setStatus("Loading…");
+    if (!quiet) setStatus("Loading…");
     try {
       const [fRes, foRes, wsRes, trRes, meRes] = await Promise.all([
         apiFetch("/files"),
@@ -226,7 +232,9 @@
       drive.trash = trRes.files || [];
       drive.me = meRes || null;
       updateIngestStart();
-      setStatus("");
+      // A quiet poll still clears a stale error line (once), then leaves the status row
+      // untouched so its display never flaps between ticks.
+      if (!quiet || cdStatusEl.textContent) setStatus("");
       if (!locStillValid(drive.loc)) {
         drive.loc = scopeRoot(drive.loc);
         drive.query = "";
@@ -512,7 +520,7 @@
     cloudPollTimer = setInterval(() => {
       // loadDrive() re-renders (incrementally — no flash), refreshes the main area and
       // re-arms/stops this timer via pollWhileWorking, so nothing else is needed here.
-      loadDrive().catch(() => { /* keep polling on transient failures */ });
+      loadDrive({ quiet: true }).catch(() => { /* keep polling on transient failures */ });
     }, 5000);
   }
 
