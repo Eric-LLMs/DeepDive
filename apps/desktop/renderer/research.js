@@ -481,6 +481,9 @@
         if (pane) { pane.classList.add("hidden"); pane.innerHTML = ""; }
         const guide = document.getElementById("research-guide");
         if (guide) guide.classList.remove("hidden");
+        // No task is selected anymore — hand the chat pane back to the Research-tab
+        // blank chat so the deleted task's session is not left showing on screen.
+        if (window.showResearchBlankChat) window.showResearchBlankChat();
       }
       loadTasks();
     } catch (err) {

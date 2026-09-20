@@ -6051,6 +6051,25 @@
     chatInput.focus();         // land the cursor in the bottom-right composer
   }
 
+  // The Research tab's empty-state chat: blank pane + guidance line, plain-chat semantics.
+  // Reached on tab entry with no selected task (switchTab) and after the selected task is
+  // deleted (window hook below), so the chat never keeps showing a dead task's session.
+  function showResearchBlankChat() {
+    newChat();
+    chatTitle.textContent = "New research chat";
+    appendMsg("notice", "No research task selected. Pick a task in the list, or click ＋ New Research to create one. This is a blank chat — messages here are plain chats until a task is selected.");
+    state.researchBlankChat = true;
+  }
+  window.showResearchBlankChat = () => {
+    if (!tabResearch || !tabResearch.classList.contains("active")) return; // only on the Research tab
+    if (chatSend.disabled) return; // never wipe mid-stream
+    state.activeResearch = null;
+    updateResearchChip();
+    stopResearchChipPoll();
+    state.researchBlankChat = false; // force the blank even if one was already up
+    showResearchBlankChat();
+  };
+
   function switchTab(name) {
     const isSessions = name === "sessions";
     const isResearch = name === "research";
@@ -6069,10 +6088,7 @@
         // reopens its bound session, so skip the blank then; the flag stops a tab
         // re-click from wiping a chat already started in this blank visit.
         if (!window.currentResearchTask && !state.researchBlankChat && !chatSend.disabled) {
-          newChat();
-          chatTitle.textContent = "New research chat";
-          appendMsg("notice", "No research task selected. Pick a task in the list, or click ＋ New Research to create one. This is a blank chat — messages here are plain chats until a task is selected.");
-          state.researchBlankChat = true;
+          showResearchBlankChat();
         }
       }
     } else {
