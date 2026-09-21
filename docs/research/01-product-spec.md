@@ -5,8 +5,8 @@
 
 ## 1. Mission
 
-DeepDive Research OS gives a user a persistent, governed, reproducible research project
-inside their existing DeepDive workspace — without leaving chat. It turns:
+Delveta Research OS gives a user a persistent, governed, reproducible research project
+inside their existing Delveta workspace — without leaving chat. It turns:
 
 > an idea, a question, a paper, a dataset, an observation
 
@@ -57,7 +57,7 @@ study; `literature × literature_review` = a review; `mixed × memo` = a researc
 
 ## 6. Non-goals (explicit)
 
-- Research OS does **not** replace DeepDive's chat/learning loop; it is a governed mode
+- Research OS does **not** replace Delveta's chat/learning loop; it is a governed mode
   layered on top of the same agent kernel.
 - It does **not** provide a statistics execution service in MVP (sandbox execution is
   Phase 2). Analysis runs as structured reasoning, and — where a profile permits — Python

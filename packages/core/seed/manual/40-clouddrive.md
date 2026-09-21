@@ -1,4 +1,4 @@
-# DeepDive 使用手册 · 云盘 Cloud Drive
+# Delveta 使用手册 · 云盘 Cloud Drive
 
 ## 打开云盘
 

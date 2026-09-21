@@ -1,25 +1,25 @@
-# <img src="docs/images/deepdive-logo.png" alt="DeepDive" width="40" valign="bottom" /> DeepDive
+# <img src="docs/images/delveta-logo.png" alt="Delveta" width="40" valign="bottom" /> Delveta
 
 [English](README.md) · [中文](README.zh-CN.md)
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-DeepDive 是一个 **AI 原生的学习与研究工作空间**——一个可自托管的环境，让你基于自己的资料进行阅读、观看、理解、研究与创作，并将数据与 AI 工作负载运行在自己的基础设施之中，并由自己掌控。它将文档与媒体工作空间，与 AI 对话、记忆、RAG、Agent、研究工作流和持久化知识结合起来，让你的资料不再只是上传给 AI 的文件，而是成为 AI 交互与持续工作的核心上下文。
+Delveta 是一个 **AI 原生的学习与研究工作空间**——一个可自托管的环境，让你基于自己的资料进行阅读、观看、理解、研究与创作，并将数据与 AI 工作负载运行在自己的基础设施之中，并由自己掌控。它将文档与媒体工作空间，与 AI 对话、记忆、RAG、Agent、研究工作流和持久化知识结合起来，让你的资料不再只是上传给 AI 的文件，而是成为 AI 交互与持续工作的核心上下文。
 
-DeepDive 原生支持 PDF、Office 文档、视频、音频和图片，并提供集成式文件管理与个人云盘存储。你可以直接划选一段文字、特定页面或视频中的某个时刻，在当前上下文中提问；还可以进一步拓展到资料之外进行研究，沉淀长期洞见，并将对话成果转化为可复用的知识与内容产物。
+Delveta 原生支持 PDF、Office 文档、视频、音频和图片，并提供集成式文件管理与个人云盘存储。你可以直接划选一段文字、特定页面或视频中的某个时刻，在当前上下文中提问；还可以进一步拓展到资料之外进行研究，沉淀长期洞见，并将对话成果转化为可复用的知识与内容产物。
 
-进一步了解 DeepDive：**[你能做什么](#你能做什么)** 演示完整产品体验，**[工程亮点](#engineering-highlights)** 拆解系统核心机制，**[架构一览](#architecture-at-a-glance)** 纵览系统全貌，完整设计文档请参考 [docs/architecture.md](docs/architecture.md)。
+进一步了解 Delveta：**[你能做什么](#你能做什么)** 演示完整产品体验，**[工程亮点](#engineering-highlights)** 拆解系统核心机制，**[架构一览](#architecture-at-a-glance)** 纵览系统全貌，完整设计文档请参考 [docs/architecture.md](docs/architecture.md)。
 
 ---
 
-## 什么是 DeepDive？
+## 什么是 Delveta？
 
-DeepDive 是一位具备持久记忆的 AI 学习与研究助手，帮助你深度理解材料、探究复杂课题，并持续构建属于自己的知识库——一切都在一个支持私有化部署的工作区中完成。
+Delveta 是一位具备持久记忆的 AI 学习与研究助手，帮助你深度理解材料、探究复杂课题，并持续构建属于自己的知识库——一切都在一个支持私有化部署的工作区中完成。
 
 **核心差异：**
 
 * **围绕材料边学边问，而非脱离上下文**：在阅读或观看音视频时，选中任何段落或画面即可就地追问，获得有据可查的概念拆解与分步详解。
-* **材料是探索的起点，而非认知的边界**：当手头资料不够时，DeepDive 的 Research OS 自动协助你跨越本地素材与外部信源开展深度调研，让新研究建立在已有积累之上。
+* **材料是探索的起点，而非认知的边界**：当手头资料不够时，Delveta 的 Research OS 自动协助你跨越本地素材与外部信源开展深度调研，让新研究建立在已有积累之上。
 * **研学成果沉淀为持久资产**：重要洞见转化为长期记忆，研讨与调研过程自动沉淀为摘要、思维导图与演示文稿，回流至可检索工作区，让后续学习随时无缝衔接。
 * **兼顾个人私密与团队协同**：既能在个人独立工作区中牢牢掌握数据主权，也能在共享工作区中按角色权限与团队成员高效协作。
 
@@ -52,7 +52,7 @@ DeepDive 是一位具备持久记忆的 AI 学习与研究助手，帮助你深�
 
 ## <a id="architecture-at-a-glance"></a>🏗️ 架构一览
 
-![平台架构 —— 租户与工作区、访问层、核心应用（agent 运行时 · 双轨记忆 · 可配置 RAG · 云工作区 · 处理）、自托管数据与 AI 服务](./docs/images/deepdive-architecture-platform-diagram.png)
+![平台架构 —— 租户与工作区、访问层、核心应用（agent 运行时 · 双轨记忆 · 可配置 RAG · 云工作区 · 处理）、自托管数据与 AI 服务](./docs/images/delveta-architecture-platform-diagram.png)
 
 * **各模块架构与流程图**（Agent 内核 · 记忆 · Prompt · RAG）：请参阅 [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md)。
 * **技术选型考量**：请参阅 [`docs/architecture.md §2 Tech Stack`](docs/architecture.md#2-tech-stack)。
@@ -63,7 +63,7 @@ DeepDive 是一位具备持久记忆的 AI 学习与研究助手，帮助你深�
 
 ## <a id="engineering-highlights"></a>🔧 工程亮点
 
-DeepDive 自研了高可控的 Agent 运行时，拒绝将核心编排委托给僵化的第三方框架。以下是系统的核心架构决策及生产级实现：
+Delveta 自研了高可控的 Agent 运行时，拒绝将核心编排委托给僵化的第三方框架。以下是系统的核心架构决策及生产级实现：
 
 ### 核心 AI 系统
 
@@ -72,7 +72,7 @@ DeepDive 自研了高可控的 Agent 运行时，拒绝将核心编排委托给�
 * **Prompt 与工具原生适配前缀缓存**：字节级稳定的 Prompt 头部（系统身份设定 + 单行工具索引目录）配合每轮动态尾部，最大化复用 LLM 前缀缓存（Prefix Caching）以大幅降低延迟与 Token 成本，并具备可度量的缓存标识。工具层采用延迟加载：优先挂载轻量 Stub 存根，仅在真正调用时才按需拉取完整 Schema。
 * **检索流程高度可配置，无需硬编码**：基于节点编排的模块化 RAG 管道（*query rewrite → vector + keyword recall → RRF fusion → cross-encoder rerank → parent expansion → CRAG relevance checks*）支持在管理后台实时调整拓扑、重排顺序或启闭节点，无需重启服务。文本切分可在同一 RAG 模块中配置 —— 支持多种切分策略（可配置窗口大小与重叠度的固定滑动窗口、段落、句子），并提供 `contextual`（LLM 为每个切片生成上下文前缀）、`parent_child`（由小到大分层检索：索引叶子节点并关联父节点窗口，召回命中叶子后自动展开父节点全文）以及 `cjk`（jieba 中文分词索引）等配置开关。支持实时分块效果预览与一键重建索引生效。同时提供 Golden-set 黄金测试集评测（`Recall@k`、`Precision@k`、`MRR`）、基于版本感知的 Redis 查询缓存（按 query + config + corpus version 联合生成 Key，重新索引后自动失效）以及基于视觉大模型的 PDF 表格解析。单节点故障时自动降级至可用通道，保障对话不中断，同时用户反馈会被实时记录并沉淀至评测数据集。全会话聊天支持增量导入：LLM 将对话按问题分段为 Q&A 块，per-message 已导入标记使重复导入零开销，源内容变更重导入时仅替换其对应块；管道每个节点记录独立的 trace（状态 / 耗时 / 输出），可在 admin Test 面板逐段查看；租户绑定的 gRPC 检索服务在入口强制租户作用域（token 鉴权 + 令牌桶限流 + 显式 guest 标记），杜绝无作用域调用跨租户全量读取。检索统一覆盖网盘文件、学习卡片与对话历史等多源语料，既可进程内直连，亦支持通过该 gRPC 服务独立部署。
 * **有据可查的内容编译（幻灯片与出版 PDF）**：content-to-slides 引擎对原始素材做单次语义设计生成整副幻灯片——每条事实携带 doc/page/line 定位符、插图落为真实图片页——随后由确定性门禁（线上格式滑差修复、jsonschema 校验、单页有界修补循环）隔离模型与本地 Typst 编译器：定稿输出 16:9 PDF，并同步产出可编辑 PPTX / Markdown / `deck.json`；全程绝不静默裁剪内容，每次运行如实记录逐节点 LLM 与渲染遥测。研究侧的 Artifact Compiler 沿用同一准则：PUBLISH 将定稿投影为 Document AST 后以 Typst 排版出版级 PDF，路径零 LLM，正文引用经证据图解析回溯源，PDF 故障绝不绑架 Markdown 发布。
-* **Research OS：以代码为骨架的确定性研究流水线 (Code-First Research Pipeline)**：针对传统 Agent 依赖大模型长链自主寻路容易引发的幻觉失控、流程漂移与成本暴冲，DeepDive 将研究执行重构为确定性控制流与有界语义引擎的解耦架构——流程确定则代码接管，大模型仅参与高密度的语义理解、证据裁决与报告生成。
+* **Research OS：以代码为骨架的确定性研究流水线 (Code-First Research Pipeline)**：针对传统 Agent 依赖大模型长链自主寻路容易引发的幻觉失控、流程漂移与成本暴冲，Delveta 将研究执行重构为确定性控制流与有界语义引擎的解耦架构——流程确定则代码接管，大模型仅参与高密度的语义理解、证据裁决与报告生成。
   * **确定性状态机护航，约束长链错误决策**：十阶段 DAG 拓扑显式定义，并由 Python 状态机严格推进，模型不负责流向选择与跳步判定，有效遏制长任务自主寻路的决策漂移与 Token 浪费；创建时锁定为严格模式（门禁未过即刻阻断）或渐进模式（如实记录诊断缺口并自动收尾，绝不伪造通过）。
   * **确定性任务下沉代码，独立节点与 I/O 并发执行**：哈希查重、数据清洗、正则校验与切片等确定性任务全由本地原生代码执行；十阶段严格串行推进，阶段内部多源外部证据采集在 SSRF 防护下并发扇出执行，大幅压缩全流程等待耗时，并统一写入不可变溯源账本。
   * **语义批量均摊与状态物化复用**：相关语义判断尽量批量提交，以尽可能少的大模型调用完成密集推理；多个节点共用的判断与状态物化沉淀至可复用存储（内存与研究账本），下游优先查表复用，仅在缺失时按需请求，减少对大模型的重复调用，大幅节省 Token 消耗与时间开销（页面复用率 100%，基于实测运行数据）。
@@ -138,11 +138,11 @@ DeepDive 自研了高可控的 Agent 运行时，拒绝将核心编排委托给�
 ### 方案 B —— 本地手动开发模式
 
 ```bash
-git clone https://github.com/Eric-LLMs/DeepDive.git
-cd DeepDive
+git clone https://github.com/Eric-LLMs/Delveta.git
+cd Delveta
 
 # 创建并激活环境
-conda create -n deepdive python=3.11 -y && conda activate deepdive
+conda create -n delveta python=3.11 -y && conda activate delveta
 cp .env.example .env            # 填入你的 LLM_UPSTREAM_KEY
 
 # 安装依赖
@@ -158,7 +158,7 @@ uvicorn apps.api.main:app --reload     # 访问接口文档: http://localhost:83
 
 ### 方案 C —— LLM 后端：自托管或外部供应商
 
-LiteLLM 网关将虚拟模型 `deepdive-chat` 路由到任意 OpenAI 兼容上游（`LLM_UPSTREAM_BASE`）。将其指向自托管服务器（vLLM / Ollama / …），即可在自己的硬件上运行整套 AI 技术栈；也可以指向外部供应商，无需修改任何代码。
+LiteLLM 网关将虚拟模型 `delveta-chat` 路由到任意 OpenAI 兼容上游（`LLM_UPSTREAM_BASE`）。将其指向自托管服务器（vLLM / Ollama / …），即可在自己的硬件上运行整套 AI 技术栈；也可以指向外部供应商，无需修改任何代码。
 
 与启动方式（方案 A / B）无关，LLM 后端是独立的部署选择。
 

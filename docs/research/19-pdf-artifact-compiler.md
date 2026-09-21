@@ -41,9 +41,9 @@ flowchart LR
     Core -. "read-only Evidence" .-> KB["ResearchService graph<br/>(04/05/12)"]
 ```
 
-## 2. Repository mapping (v5.2 → DeepDive)
+## 2. Repository mapping (v5.2 → Delveta)
 
-| v5.2 concept | DeepDive landing | Reuse / new |
+| v5.2 concept | Delveta landing | Reuse / new |
 |---|---|---|
 | `src/types/*.ts` + Zod | `packages/artifact_compiler/{source,plan,doc_ast,visual}.py` (Pydantic v2) | new |
 | RunStore (state + optimistic lock) | `packages/artifact_compiler/runstore.py` — portalocker + CAS revision + `.tmp→fsync→os.replace`, mirroring `ResearchService.atomic_update_project` | pattern reused |
@@ -120,7 +120,7 @@ Only `COMPLETED`/`NEEDS_REVIEW` may feed PUBLISH promotion of `report.pdf`.
 
 Same tree as v5.2 §2 (`manifest.json, snapshot/, evidence.json, claims.json,
 conflicts.json, plan.json, ast/, assets/, report.typ, report.pdf, qa/`), with two
-DeepDive rules bolted on:
+Delveta rules bolted on:
 
 - **Concurrency**: all `*.json` state goes through the RunStore transaction (portalocker
   exclusive lock + monotonic `run_revision` + durable replace, extras-first / run.json-last

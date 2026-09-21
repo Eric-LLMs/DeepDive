@@ -28,7 +28,7 @@ async def test_zones_partition_into_separate_fields():
 
 async def test_static_head_byte_identical_across_assembles():
     asm = CacheBoundaryAssembler()
-    asm.section("soul", 0, "You are DeepDive.", zone=PromptZone.STATIC_PREFIX)
+    asm.section("soul", 0, "You are Delveta.", zone=PromptZone.STATIC_PREFIX)
     asm.section("conventions", 10, "Use tools.", zone=PromptZone.PROJECT_CONTEXT)
 
     first = await asm.assemble({})
@@ -36,7 +36,7 @@ async def test_static_head_byte_identical_across_assembles():
     second = await asm.assemble({})
     key2 = asm.snapshot_key()
 
-    assert render_prompt(first) == "You are DeepDive.\n\nUse tools."
+    assert render_prompt(first) == "You are Delveta.\n\nUse tools."
     assert render_prompt(first) == render_prompt(second)  # stable head is byte-identical
     assert key1 == key2
     assert len(key1) == 16  # sha256 hex, truncated for the prefix-cache identity

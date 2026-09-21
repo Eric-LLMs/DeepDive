@@ -153,7 +153,7 @@
   let graphDrawerBound = false;   // scrim / close-button / Esc listeners attached once
 
   function bearerToken() {
-    try { return localStorage.getItem("deepdive_token"); } catch { return null; }
+    try { return localStorage.getItem("delveta_token"); } catch { return null; }
   }
 
   function escapeHtml(text) {

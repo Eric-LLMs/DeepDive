@@ -60,7 +60,7 @@ Routing and ranking rules:
   `domain`/project scoping) plus `web_search`. It reuses `QueryRepository`/RRF — no parallel
   retrieval system.
 
-## 4. Integration with DeepDive retrieval
+## 4. Integration with Delveta retrieval
 
 - The existing `retrieval` capability already accepts `filters={"user_id": ...}` and an
   optional `domain` scope (see `apps/api/tools/rag_search_tool.py`). Project scoping adds a

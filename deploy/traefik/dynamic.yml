@@ -8,19 +8,19 @@
 #   - gRPC:  retrieval path -> retrieval:50051 (h2c, plaintext HTTP/2), own entryPoint
 http:
   routers:
-    deepdive-api:
+    delveta-api:
       entryPoints: ["web"]
       rule: "PathPrefix(`/api`)"
       middlewares: ["strip-api"]
-      service: deepdive-api
-    deepdive-console:
+      service: delveta-api
+    delveta-console:
       entryPoints: ["web"]
       rule: "Path(`/admin`) || PathPrefix(`/admin/`) || PathPrefix(`/audio/`) || PathPrefix(`/images/`) || PathPrefix(`/avatars/`)"
-      service: deepdive-api
-    deepdive-retrieval:
+      service: delveta-api
+    delveta-retrieval:
       entryPoints: ["grpc"]
       rule: "PathPrefix(`/retrieval.v1.RetrievalService/`)"
-      service: deepdive-retrieval
+      service: delveta-retrieval
 
   middlewares:
     strip-api:
@@ -28,13 +28,13 @@ http:
         prefixes: ["/api"]
 
   services:
-    deepdive-api:
+    delveta-api:
       loadBalancer:
         servers:
           # Explicit IPv4: host.docker.internal also yields a ULA IPv6 that the host-run
           # API (bound 0.0.0.0) never answers — Go's dialer would hang on it.
           - url: "http://192.168.65.254:8300"  # = host.docker.internal (Docker Desktop host gateway)
-    deepdive-retrieval:
+    delveta-retrieval:
       loadBalancer:
         servers:
           - url: "h2c://retrieval:50051"

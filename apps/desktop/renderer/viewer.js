@@ -87,7 +87,7 @@ const Viewer = (() => {
     bg: true,
     position: "bottom", // "top" | "middle" | "bottom"
   };
-  const SUBSTYLE_KEY = "deepdive_subtitle_style";
+  const SUBSTYLE_KEY = "delveta_subtitle_style";
   function saveSubStyle() {
     try { localStorage.setItem(SUBSTYLE_KEY, JSON.stringify(subStyle)); } catch { /* ignore */ }
   }

@@ -125,7 +125,7 @@ def _read_soul() -> str:
     try:
         return soul_path.read_text(encoding="utf-8")
     except OSError:
-        return "You are DeepDive, a focused learning-workbench assistant."
+        return "You are Delveta, a focused learning-workbench assistant."
 
 
 @lru_cache

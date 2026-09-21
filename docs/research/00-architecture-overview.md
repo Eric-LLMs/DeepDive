@@ -1,6 +1,6 @@
 # 00 — Research OS: Architecture Overview
 
-> **Normative.** This document is part of the DeepDive Research OS contract set
+> **Normative.** This document is part of the Delveta Research OS contract set
 > (`docs/research/`). Every document in this directory is a **normative contract, not an
 > implementation suggestion**. Any behavior not explicitly permitted by a contract is
 > considered **prohibited by default**. Where two documents conflict, the more specific
@@ -8,7 +8,7 @@
 
 ## 1. Purpose
 
-DeepDive is a multi-tenant AI learning platform. It already ships an agent kernel
+Delveta is a multi-tenant AI learning platform. It already ships an agent kernel
 (`AgentKernel`), a Cordis-style plugin runtime (`PluginManager`), a lazy `SkillRegistry`,
 a per-user cloud drive (`DriveService`), a unified RAG retrieval capability (`retrieval` /
 `QueryRepository`), an arq async job system, and `ContextVar`-based tenant isolation.
@@ -41,7 +41,7 @@ project's current runtime state; the authoritative record lives in the database.
 
 ## 3. Layered architecture
 
-Four decoupled layers, each mounted through existing DeepDive machinery. `Stage ≠ Skill`:
+Four decoupled layers, each mounted through existing Delveta machinery. `Stage ≠ Skill`:
 stages (control), agents (executors), capability skills (method logic), and tools
 (actions) are independent.
 
@@ -56,7 +56,7 @@ Tool Layer        → 6 stateless action tools in the research Cordis plugin, th
 
 Reuse map (mandatory — do not build parallel infrastructure):
 
-| Concern | DeepDive primitive |
+| Concern | Delveta primitive |
 |---|---|
 | Plugin mount / hot reload / validation | `PluginManager` + `Plugin` (packages/agent/plugins) |
 | Tool definition | `define_tool` / `ToolOutput` (packages/agent/tools/definition.py) |

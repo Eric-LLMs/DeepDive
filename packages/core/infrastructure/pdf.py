@@ -2,7 +2,7 @@
 
 The strategy mirrors the LLMs-Lab/RAG reference (table → image → read → text) but drops
 the torch/Table-Transformer detector: PyMuPDF's built-in ``page.find_tables()`` locates
-table bounding boxes with no ML stack, and DeepDive's existing chat LLM (default
+table bounding boxes with no ML stack, and Delveta's existing chat LLM (default
 ``gpt-4o-mini``) reads the rendered table image via an OpenAI ``image_url`` content part.
 
 Degradation: a single table transcription failure logs and skips that table — the ingest

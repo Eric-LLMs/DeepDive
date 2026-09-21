@@ -1,4 +1,4 @@
-// Electron main process for the DeepDive learning workbench.
+// Electron main process for the Delveta learning workbench.
 //
 // Serves the desktop renderer (apps/desktop/renderer) over a privileged `app://`
 // protocol, proxies /api to the FastAPI backend, and gives the renderer access to
@@ -365,7 +365,7 @@ function registerIpcHandlers() {
     const ext = path.extname(String(name || "")).slice(1).toLowerCase();
     const safeExt = /^[a-z0-9]{1,10}$/i.test(ext) ? ext : "bin";
     const safeId = String(assetId).replace(/[^\w-]/g, "");
-    const dir = path.join(app.getPath("temp"), "deepdive-cloud");
+    const dir = path.join(app.getPath("temp"), "delveta-cloud");
     const target = path.join(dir, `${safeId}.${safeExt}`);
     try {
       fs.mkdirSync(dir, { recursive: true });
@@ -552,8 +552,8 @@ function registerIpcHandlers() {
   ipcMain.handle("check-update", async () => {
     try {
       const res = await net.fetch(
-        "https://api.github.com/repos/Eric-LLMs/DeepDive/releases/latest",
-        { headers: { Accept: "application/vnd.github+json", "User-Agent": "DeepDive-Desktop" } }
+        "https://api.github.com/repos/Eric-LLMs/Delveta/releases/latest",
+        { headers: { Accept: "application/vnd.github+json", "User-Agent": "Delveta-Desktop" } }
       );
       // No releases published yet → nothing newer than the current build.
       if (res.status === 404) {
@@ -889,8 +889,8 @@ function setupMenu() {
         },
         { type: "separator" },
         {
-          label: "DeepDive on GitHub",
-          click: () => shell.openExternal("https://github.com/Eric-LLMs/DeepDive"),
+          label: "Delveta on GitHub",
+          click: () => shell.openExternal("https://github.com/Eric-LLMs/Delveta"),
         },
       ],
     },
@@ -923,7 +923,7 @@ function createWindow() {
     height,
     x,
     y,
-    icon: path.join(__dirname, "deepdive.ico"),
+    icon: path.join(__dirname, "delveta.ico"),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -962,8 +962,8 @@ app.whenReady().then(() => {
     console.error(`Renderer not found at ${RENDERER_DIR}.`);
   }
   // Windows taskbar grouping + icon: bind the app to its own AppUserModelID so
-  // the taskbar shows deepdive.ico instead of the generic Electron icon.
-  app.setAppUserModelId("com.deepdive.desktop");
+  // the taskbar shows delveta.ico instead of the generic Electron icon.
+  app.setAppUserModelId("com.delveta.desktop");
   protocol.handle("app", handleAppRequest);
   protocol.handle("local", handleLocalRequest);
   // Chat voice input: the renderer records with getUserMedia, so `media` is granted

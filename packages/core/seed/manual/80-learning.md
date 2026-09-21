@@ -1,4 +1,4 @@
-# DeepDive 使用手册 · 学习平台与知识库(Web 控制台)
+# Delveta 使用手册 · 学习平台与知识库(Web 控制台)
 
 ## 词汇导入(Import Data)
 

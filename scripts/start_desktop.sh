@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-click launcher for the DeepDive desktop workbench (Electron) on Windows.
+# One-click launcher for the Delveta desktop workbench (Electron) on Windows.
 # Safe to run every time: each step is skipped when its target is already up.
 #
 # Progress (a [n/N] banner is printed before every step):
@@ -232,7 +232,7 @@ serve_web() {
 
 # ── main flow ──────────────────────────────────────────────────────────────────
 echo "=============================================="
-echo "  DeepDive launcher (Windows desktop)"
+echo "  Delveta launcher (Windows desktop)"
 echo "=============================================="
 
 step "Checking backend at $BACKEND_URL"

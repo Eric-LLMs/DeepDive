@@ -1,6 +1,6 @@
-# DeepDive Evolution Roadmap
+# Delveta Evolution Roadmap
 
-> **Purpose.** A 3–5 year engineering roadmap for scaling DeepDive from its current
+> **Purpose.** A 3–5 year engineering roadmap for scaling Delveta from its current
 > 1-process, ~15k-line modular monolith toward a multi-tenant, high-concurrency platform with
 > third-party plugins. This is **forward design, not current implementation**. Each section
 > states what exists today, what the target shape is, and the concrete trigger for doing it —

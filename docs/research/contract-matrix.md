@@ -87,7 +87,7 @@
 - [ ] No-auto-modify / human-governed — `10` §5, `11`, `16` §4.
 - [ ] Three-layer one-way storage — `13`.
 - [ ] Two-dimensional profile — `09`.
-- [ ] DeepDive-native reuse map — `00` §3.
+- [ ] Delveta-native reuse map — `00` §3.
 - [ ] EVIDENCE_GATE two-tier split: Core mandatory for all profiles; empirical checks only
       when `empirical` runs — `10` §3.1.
 - [ ] ResearchApproval PENDING invariant: `approver_user_id`/`resolved_at` null while

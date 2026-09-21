@@ -1,4 +1,4 @@
-# DeepDive — development / CI dependencies.
+# Delveta — development / CI dependencies.
 # Mirrors [project.optional-dependencies].dev in pyproject.toml.
 
 -r requirements.txt

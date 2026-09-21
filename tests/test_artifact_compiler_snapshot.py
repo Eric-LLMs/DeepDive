@@ -35,7 +35,7 @@ def build_inputs():
         artifact_id="art-1",
         metadata={
             "title": "Dive Report: 番茄盆栽 [v1]",
-            "authors": ["Enhui", "DeepDive"],
+            "authors": ["Enhui", "Delveta"],
             "keywords": ["tomato", "研究"],
             "target_audience": "growers",
         },

@@ -24,7 +24,7 @@ from typing import Any
 
 import structlog
 
-_log = structlog.get_logger("deepdive.agent")
+_log = structlog.get_logger("delveta.agent")
 
 # ── trace context ──
 _trace_id: ContextVar[str] = ContextVar("trace_id", default="")
@@ -87,7 +87,7 @@ def get_current_pricing() -> tuple[Any, Any] | None:
 _PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
-    "deepdive-chat": (0.15, 0.60),
+    "delveta-chat": (0.15, 0.60),
 }
 
 # Model names already reported as PRICING_UNKNOWN (warn once per process per model, so a

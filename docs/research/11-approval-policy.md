@@ -48,12 +48,12 @@ mutation classifier (plugin guard, monotonic deny-only)
    ├── no  → allowed
    └── yes → PENDING ResearchApproval
              ↓
-        human approval via DeepDive approval bridge (approvals.py ASK path)
+        human approval via Delveta approval bridge (approvals.py ASK path)
              ├── APPROVED → execute
              └── REJECTED / timeout → BLOCKED, no execution, reason recorded
 ```
 
-Mapping onto DeepDive today:
+Mapping onto Delveta today:
 
 - The research plugin registers a **monotonic guard** (`ToolRuntime.guard`) that denies
   the six/seven mutation classes once the relevant object exists, unless a matching

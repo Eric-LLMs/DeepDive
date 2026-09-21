@@ -1,6 +1,6 @@
-# DeepDive Architecture Design
+# Delveta Architecture Design
 
-> This document is the single source of truth (SSOT) for DeepDive. Every technical decision,
+> This document is the single source of truth (SSOT) for Delveta. Every technical decision,
 > module boundary, and deployment topology is governed here.
 
 ## Table of Contents
@@ -145,14 +145,14 @@ Dropped as non-goals (deliberate decisions, not gaps): recurring-billing **subsc
 
 ## 1. Product Positioning
 
-DeepDive is a self-hosted AI workspace for learning and research, built around your own
+Delveta is a self-hosted AI workspace for learning and research, built around your own
 knowledge.
 
 Read, watch, understand, research, and create with AI — directly alongside your own documents,
 media, and research materials. Select a passage, page, or moment and interact with AI in context,
 explore beyond your materials, and turn your work into reusable outputs.
 
-At the same time, DeepDive helps you build a persistent knowledge base from the materials you
+At the same time, Delveta helps you build a persistent knowledge base from the materials you
 work with, the insights you discover, the research you conduct, and the outputs you create. Your
 knowledge stays with you instead of being trapped in individual files or conversations.
 
@@ -160,7 +160,7 @@ This creates a continuous loop: AI helps you learn and research → your work pr
 that knowledge becomes part of your personal knowledge base → the accumulated knowledge provides
 richer context for future AI-assisted work.
 
-DeepDive brings contextual AI interaction, RAG, persistent memory, agents, research workflows,
+Delveta brings contextual AI interaction, RAG, persistent memory, agents, research workflows,
 and artifact creation together to support this loop — while keeping your data, knowledge, and AI
 workloads under your control.
 
@@ -194,7 +194,7 @@ API-only: REST/SSE at the edge, gRPC between internal services, HTTP to model se
 ## 3. Repository Structure (Monorepo)
 
 ```
-deepdive/
+delveta/
 ├── apps/
 │   ├── api/                      # package `api` (FastAPI gateway: REST/SSE + job enqueue)
 │   │   ├── main.py               # uvicorn apps.api.main:app (composition root: lifespan, app, CORS, static mounts)
@@ -270,7 +270,7 @@ deepdive/
 
 > `packages/agent`, `packages/rag`, `packages/core`, `packages/workflow`, and `apps/api` are
 > independent top-level packages (import names `agent` / `rag` / `core` / `workflow` / `api`);
-> no nested `deepdive` package layer.
+> no nested `delveta` package layer.
 > Generated proto stubs live under `packages/shared/proto` and are imported as
 > `retrieval.v1.retrieval_pb2` (a real package on the editable-install path, no `sys.path` hack).
 > The worker image follows the same rule: `pip install -e .` with the generated `.pth` rewritten to
@@ -425,7 +425,7 @@ Sections register with an `order` plus a `zone` and merge ascending within it. T
 | zone | content | stability |
 |---|---|---|
 | `PromptZone.STATIC_PREFIX` | SOUL.md identity (`apps/api/soul.md`) + complete tool catalog + full skill catalog (never truncated) | byte-identical across requests → the provider reuses its prefix cache |
-| `PromptZone.PROJECT_CONTEXT` | the first existing `DEEPDIVE.md` under `settings.workspace_dir` (read by `read_project_context`, capped at `settings.project_context_max_chars`) | stable per project; empty when absent |
+| `PromptZone.PROJECT_CONTEXT` | the first existing `DELVETA.md` under `settings.workspace_dir` (read by `read_project_context`, capped at `settings.project_context_max_chars`) | stable per project; empty when absent |
 | `PromptZone.DYNAMIC_SUFFIX` | per-step session memory brief + any `inject()` content | re-rendered every step |
 
 `assemble()` returns a `PromptAssembly {static_prefix, project_context, dynamic_suffix, tools,
@@ -446,7 +446,7 @@ memory/skill retrieval). `{{name}}` placeholders interpolate from registered var
 flat `SystemPrompt` (no zones, no boundary) still renders for backward compatibility.
 
 The **project context loader** (`agent/tools/project_context.py::read_project_context`) reads the first
-existing convention file (`DEEPDIVE.md`) under the agent's workspace and
+existing convention file (`DELVETA.md`) under the agent's workspace and
 caps it at `settings.project_context_max_chars`; the kernel registers it into
 `PromptZone.PROJECT_CONTEXT`, so project rules become part of `snapshot_key`'s cache identity and
 reach the model on every turn. When no convention file exists the zone renders nothing, keeping the
@@ -667,7 +667,7 @@ skills→`SkillRegistry`, collecting disposers so `unregister` rolls back cleanl
 These runtime mechanisms are intentionally out of scope for the Python runtime:
 a microkernel (Loader / patch-layer boot), two-queue Inbox,
 `AsyncLocalStorage` initiator tracking, Code Mode (`run_code`), and scoped per-agent registration.
-DeepDive uses a small `EventBus` + `SessionLog` (append-only session events) and Cordis-style
+Delveta uses a small `EventBus` + `SessionLog` (append-only session events) and Cordis-style
 `Context`/`Fiber` DI instead.
 
 ### 6.5 Deferred loading, permissions & sandbox
@@ -1425,7 +1425,7 @@ via `python-docx`; `.txt`/`.md`/subtitles use the existing `extract_text` dispat
 (`delete_by_source`) then re-inserts, so re-importing after a config change or a partial failure is safe.
 
 **Built-in product manual — boot-seeded, always-public fourth source** — the platform answers
-"how do I use DeepDive" questions from its own corpus, not from invented UI steps: eight Chinese
+"how do I use Delveta" questions from its own corpus, not from invented UI steps: eight Chinese
 manual pages ship in `packages/core/seed/manual/*.md` and are seeded at API startup
 (`core.infrastructure.manual_seed.seed_product_manual`, called from the FastAPI `lifespan`). Each
 `##` section becomes one leaf chunk (`source_type='manual'`, `user_id` NULL, no `asset_id`) prefixed
@@ -1527,7 +1527,7 @@ over exactly those hits, so a rating survives reopen without re-querying retriev
 | Session extension points | `agent/session-start` / `agent/session-end` observers in the loop |
 | Stable prompt head for prefix cache | `CacheBoundaryAssembler` zones (internal `CACHE_BOUNDARY` separator, never rendered) + `snapshot_key()` |
 | Load a tool schema on demand | `tool_search` meta-tool → `ToolGateway.mount(name)` (defer_loading stub) + `schema_of(name)` in the result |
-| Inject project conventions | `read_project_context` → `PromptZone.PROJECT_CONTEXT` (DEEPDIVE.md, capped) |
+| Inject project conventions | `read_project_context` → `PromptZone.PROJECT_CONTEXT` (DELVETA.md, capped) |
 | Bound the prompt window | per-message snip (`prompt_message_max_chars`) + in-run window guard (`prompt_max_chars`) + client-Live-State session compaction at the `/chat` boundary (§22) |
 | Scope tool visibility per request | `ToolVisibilityPolicy` `allow` / `deny` / `present_as` (disposers) |
 | Gate a tool by session permission | `Sandbox.guard()` + `ToolPermission` (`classify_permissions`) |
@@ -2208,7 +2208,7 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
 - **Main process** (`main.js`) — `contextIsolation: true` / `nodeIntegration: false` with a
   preload `contextBridge` (`window.desktopAPI`). It owns the app menu (**File** = Open
   Workspace… / Add File to Workspace; **View** = reload, zoom, Font Size… → Window & Display
-  settings, fullscreen, DevTools; **Help** = Help & Feedback / About / DeepDive on GitHub), a
+  settings, fullscreen, DevTools; **Help** = Help & Feedback / About / Delveta on GitHub), a
   custom `local://` protocol that streams local media/documents to the renderer, and an IPC
   surface: folder/file pickers, recursive `read-tree`, copy-into-workspace, delete-file and
   **delete-folder** (both workspace-rooted; folder delete is recursive and refuses the root),
@@ -2216,7 +2216,7 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
   rejected), **move-path** (drag-and-drop), **cloud-cache**, text reads, PDF annotation
   sidecars (`read/save/embed-annotations`), video screenshot saving, subtitle pick/find,
   version/update check, and window prefs. **cloud-cache** streams `GET /files/{id}/download`
-  with the session Bearer token into `temp/deepdive-cloud/{assetId}.{ext}` — the extension is
+  with the session Bearer token into `temp/delveta-cloud/{assetId}.{ext}` — the extension is
   whitelisted (`[a-z0-9]{1,10}`) so a hostile file name can't escape the cache directory, and
   the path is stable per asset so annotation sidecars survive re-opens. When the backend runs,
   the main process forwards `/api`, `/audio`, and `/images` to it (a zero-length request body is
@@ -2233,7 +2233,7 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     launch.
   - **Cloud Drive panel** (`clouddrive.js` + `viewer.js`) — the **☁️ Cloud** source is a full
     cloud-file manager aligned with the web console, over the same `/api/*` (Bearer token from
-    `localStorage["deepdive_token"]`). A tree shows **My Drive**, every **workspace** (with its
+    `localStorage["delveta_token"]`). A tree shows **My Drive**, every **workspace** (with its
     subfolders), and **🗑 Trash** at the bottom; selecting a node navigates the main area to that
     scope (`loc = root | workspace | folder | trash`). The main area is a **list / grid toggle**
     (☰ / ▦) with a **five-column table** — `Name | Size | RAG Status | Query Repo | Updated`
@@ -2351,7 +2351,7 @@ profile, and the **My Drive cloud panel** need the FastAPI gateway on `localhost
     loads a user-picked file (**Add Subtitle**, picker defaulting to the video's folder). A
     **Subtitles** dropdown lists **Enable / Disable / Add / Subtitle Settings**; the style panel
     (size, color, background, position) is persisted to `localStorage`
-    (`deepdive_subtitle_style`) and restored on the next launch.
+    (`delveta_subtitle_style`) and restored on the next launch.
   - **Chat** (`app.js`) — consumes the SSE `POST /chat/stream` endpoint
     (`EventSourceResponse`) with a collapsible **💭 thinking** block and incremental answer
     rendering; the pane docks bottom/right or floats as a draggable window. Intermediate agent
@@ -2475,7 +2475,7 @@ merged ascending by `order` within each zone:
 | zone | content | stability |
 |---|---|---|
 | `STATIC_PREFIX` | SOUL.md identity (`soul` section, `PERSONA_ORDER=0`) + complete tool catalog + full skill catalog (never truncated) (`HARNESS_IDENTITY_ORDER=-100` / `SKILLS_ORDER=250`) | byte-identical across requests → prefix-cache reuse |
-| `PROJECT_CONTEXT` | workspace `DEEPDIVE.md` conventions (`PROJECT_CONTEXT_ORDER=-90`) | stable per project; renders nothing when absent |
+| `PROJECT_CONTEXT` | workspace `DELVETA.md` conventions (`PROJECT_CONTEXT_ORDER=-90`) | stable per project; renders nothing when absent |
 | `DYNAMIC_SUFFIX` | session memory brief + proactive recall (`MEMORY_ORDER=200` / `+10`) + `inject()` content | re-rendered per step |
 
 `assemble()` resolves the static and project zones once and caches them
@@ -2498,7 +2498,7 @@ project-context zone is part of the prefix-cache contract.
 ### 16.4 Project context loader
 
 `agent/tools/project_context.py::read_project_context(workspace, *, files, max_chars)` reads the first
-existing convention file (`DEEPDIVE.md` by default) under the agent's workspace, caps it at
+existing convention file (`DELVETA.md` by default) under the agent's workspace, caps it at
 `settings.project_context_max_chars` (appending a
 `…(truncated)` marker), and returns `""` when none exists. The kernel registers a non-empty result
 into `PromptZone.PROJECT_CONTEXT`; an empty zone renders nothing, keeping the prompt byte-identical
@@ -2560,7 +2560,7 @@ permission guard (a READ-only session cannot gain write tools by mounting them).
 | `prompt_max_chars` | `120_000` | total-window character budget (in-run window guard + compaction trigger) |
 | `prompt_message_max_chars` | `8_000` | per-message snip cap on the request snapshot |
 | `compaction_summary_max_chars` | `2_500` | cap on the folded 5-section session summary (§22.4) |
-| `project_context_files` | `["DEEPDIVE.md"]` | convention files tried in order |
+| `project_context_files` | `["DELVETA.md"]` | convention files tried in order |
 | `project_context_max_chars` | `8_000` | cap on the project-context zone, with truncation marker |
 
 [↑ Back to top](#table-of-contents)

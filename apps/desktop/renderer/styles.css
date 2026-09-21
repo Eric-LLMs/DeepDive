@@ -742,7 +742,7 @@ pre.text-viewer {
   flex-direction: column;
   position: relative;
 }
-/* Hidden chat: collapses to the floating DeepDive logo mini-icon (#chat-mini). */
+/* Hidden chat: collapses to the floating Delveta logo mini-icon (#chat-mini). */
 #chat.minimized { display: none; }
 
 #chat-log { flex: 1; min-height: 0; overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
@@ -1472,7 +1472,7 @@ sup.viewer-cite:hover { text-decoration: underline; }
   padding: 0;
   border: 1px solid var(--border);
   border-radius: 50%;
-  background: var(--bg-soft) url("deepdive.ico") center / 72% no-repeat;
+  background: var(--bg-soft) url("delveta.ico") center / 72% no-repeat;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
   cursor: pointer;
   z-index: 70;

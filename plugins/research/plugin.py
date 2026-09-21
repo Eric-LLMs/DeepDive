@@ -4340,7 +4340,7 @@ class ResearchService:
         seq_key = f"{source}|{query}"
         seq = int(counts.get(seq_key, 0)) + 1
         header = (
-            f"<!-- DeepDive research scrape\n"
+            f"<!-- Delveta research scrape\n"
             f"Source: {source}\n"
             f"URL: {url}\n"
             f"Query: {query}\n"
@@ -4687,7 +4687,7 @@ class ResearchService:
                 host = _safe_filename(host)
                 name = f"fetch_{host}_{uuid.uuid4().hex[:10]}.md"
                 header = (
-                    f"<!-- DeepDive research scrape\n"
+                    f"<!-- Delveta research scrape\n"
                     f"Source: fetch\n"
                     f"URL: {cu}\n"
                     f"Run_version: {rv}\n"
@@ -5139,7 +5139,7 @@ class ResearchService:
                     safe = _safe_filename(orig_name) or "material"
                     dname = f"fetch_material_{safe[:60]}_{uuid.uuid4().hex[:10]}.md"
                     header = (
-                        f"<!-- DeepDive research scrape\n"
+                        f"<!-- Delveta research scrape\n"
                         f"Source: material\n"
                         f"File: {orig_name}\n"
                         f"Cloud_asset_id: {cloud_asset_id}\n"

@@ -33,7 +33,7 @@ block the MVP).
 - [x] Human-governed: no self-approval, no-auto-modify, monotonic design-lock guard.
 - [x] Three-layer one-way storage; RAG derived-only.
 - [x] Two-dimensional profile (Method × Output).
-- [x] DeepDive-native reuse map (`00` §3) — no parallel storage/scheduling system.
+- [x] Delveta-native reuse map (`00` §3) — no parallel storage/scheduling system.
 - [x] Stage names consistent across `07`, `08`, `09`, `17`.
 - [x] Tool names/actions consistent across `02`, `15`, `17`.
 - [x] Entity field names consistent across `02` and per-entity docs.
@@ -85,7 +85,7 @@ block the MVP).
 
 ## 5. Design-sources note
 
-This suite is **DeepDive-native**: it reuses `PluginManager`/Cordis DI, `define_tool`,
+This suite is **Delveta-native**: it reuses `PluginManager`/Cordis DI, `define_tool`,
 `SkillRegistry`, `AgentKernel` `run_subagent`, `DriveService.save_artifact`,
 `retrieval`/`QueryRepository`, the approval bridge, and `ContextVar` tenancy. The two
 reference research systems were used as **design sources** (state machine, evidence-ledger

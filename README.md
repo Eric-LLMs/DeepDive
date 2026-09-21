@@ -1,24 +1,24 @@
-# <img src="docs/images/deepdive-logo.png" alt="DeepDive" width="40" valign="bottom" /> DeepDive
+# <img src="docs/images/delveta-logo.png" alt="Delveta" width="40" valign="bottom" /> Delveta
 
 [English](README.md) · [中文](README.zh-CN.md)
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-DeepDive is an **AI-native learning and research workspace** — a self-hosted environment for reading, watching, understanding, researching, and creating with your own materials, designed to keep your data and AI workloads within your own infrastructure and under your control. It combines a document and media workspace with AI chat, memory, RAG, agents, research workflows, and persistent knowledge, so your materials become an active part of the AI interaction rather than just file attachments.
+Delveta is an **AI-native learning and research workspace** — a self-hosted environment for reading, watching, understanding, researching, and creating with your own materials, designed to keep your data and AI workloads within your own infrastructure and under your control. It combines a document and media workspace with AI chat, memory, RAG, agents, research workflows, and persistent knowledge, so your materials become an active part of the AI interaction rather than just file attachments.
 
-DeepDive supports PDFs, Office documents, video, audio, and images directly in the workspace, with integrated file management and personal cloud storage. Select a passage, page, or video moment and ask in context — then research beyond your materials, save durable insights, and turn conversations into reusable knowledge and artifacts.
+Delveta supports PDFs, Office documents, video, audio, and images directly in the workspace, with integrated file management and personal cloud storage. Select a passage, page, or video moment and ask in context — then research beyond your materials, save durable insights, and turn conversations into reusable knowledge and artifacts.
 
 Dive deeper: [**What you can do**](#what-you-can-do) explores the product, [**Engineering highlights**](#engineering-highlights) breaks down the system, and [**Architecture at a glance**](#architecture-at-a-glance) provides the system overview, with [docs/architecture.md](docs/architecture.md) documenting the full design.
 
-## What is DeepDive?
+## What is Delveta?
 
-DeepDive is a persistent AI learning and research assistant that helps you deeply understand your materials, investigate complex topics, and continuously build your own knowledge base — all within one self-hostable workspace.
+Delveta is a persistent AI learning and research assistant that helps you deeply understand your materials, investigate complex topics, and continuously build your own knowledge base — all within one self-hostable workspace.
 
 **Why it's different:**
 
 - **Learn with your material, not beside it.** Select and discuss passages while reading or watching, ask questions in context, and get grounded explanations and step-by-step breakdowns.
 
-- **Your material is the starting point, not the boundary.** When your sources aren't enough, DeepDive's Research OS automatically helps you investigate further across your own materials and external sources, so research can build on what you already know.
+- **Your material is the starting point, not the boundary.** When your sources aren't enough, Delveta's Research OS automatically helps you investigate further across your own materials and external sources, so research can build on what you already know.
 
 - **Learning insights become persistent knowledge.** Important insights become durable memory, while discussions and research can become summaries, mind maps, and slides that flow back into your searchable workspace, so you can pick up where you left off.
 
@@ -37,7 +37,7 @@ DeepDive is a persistent AI learning and research assistant that helps you deepl
 
 | Capability | What it lets you do |
 |---|---|
-| **Learn** | • Ask questions while reading or watching — PDFs, Office docs, video, audio, images, and more (view and discuss directly in DeepDive)<br>• Get step-by-step explanations and concept breakdowns<br>• Discuss a specific moment — select a passage, page, or video moment as context |
+| **Learn** | • Ask questions while reading or watching — PDFs, Office docs, video, audio, images, and more (view and discuss directly in Delveta)<br>• Get step-by-step explanations and concept breakdowns<br>• Discuss a specific moment — select a passage, page, or video moment as context |
 | **Research** | • Search across your files, notes, conversations, and sources<br>• Go beyond your material — search the web and community discussions for newer research and supporting evidence<br>• Synthesize multiple sources into grounded, structured answers |
 | **Remember** | • Save durable insights and recall them in later sessions<br>• Keep long-term memory separate from conversation history<br>• Revisit bookmarks, notes, and saved spots |
 | **Create** | • Summarize sessions, notes, and documents<br>• Generate mind maps and grounded slide decks<br>• Publish research reports as citation-resolved PDFs<br>• Turn conversations into reusable knowledge that flows back into search |
@@ -51,7 +51,7 @@ DeepDive is a persistent AI learning and research assistant that helps you deepl
 
 ## <a id="architecture-at-a-glance"></a>🏗️ Architecture at a glance
 
-![Platform architecture — tenants & workspaces, access layer, core application (agent runtime · dual-track memory · configurable RAG · cloud workspace · processing), self-hosted data & AI services](./docs/images/deepdive-architecture-platform-diagram.png)
+![Platform architecture — tenants & workspaces, access layer, core application (agent runtime · dual-track memory · configurable RAG · cloud workspace · processing), self-hosted data & AI services](./docs/images/delveta-architecture-platform-diagram.png)
 
 * **Module architecture & flow diagrams** (agent kernel · memory · prompt · RAG): see [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md).
 * **Tech-stack rationale**: see [`docs/architecture.md §2 Tech Stack`](docs/architecture.md#2-tech-stack).
@@ -62,7 +62,7 @@ DeepDive is a persistent AI learning and research assistant that helps you deepl
 
 ## <a id="engineering-highlights"></a>🔧 Engineering highlights
 
-DeepDive implements a controllable agent runtime rather than delegating orchestration to a rigid framework. Core architectural decisions and their production-grade implementations:
+Delveta implements a controllable agent runtime rather than delegating orchestration to a rigid framework. Core architectural decisions and their production-grade implementations:
 
 ### Core AI Systems
 
@@ -71,7 +71,7 @@ DeepDive implements a controllable agent runtime rather than delegating orchestr
 - **Cache-friendly prompts and tools.** A byte-stable prompt head (system identity + one-line tool index) paired with a dynamic per-step tail maximizes LLM prefix caching to slash latency and token costs, with a measurable cache identity. Tools use deferred loading: lightweight stubs are mounted first, and full parameter schemas are fetched only upon invocation.
 - **Configurable retrieval.** A modular node RAG pipeline *(query rewrite → vector + keyword recall → RRF fusion → cross-encoder rerank → parent expansion → CRAG relevance checks)* can be reconfigured, reordered, or toggled live via the admin console without service restarts. Chunking is configured from the same RAG module — split strategy (`fixed` sliding window with configurable size + overlap, `paragraph`, `sentence`), plus the `contextual` (LLM-written context prefix per chunk), `parent_child` (small-to-big: index leaf chunks plus larger parent windows; recall searches leaves and a hit can surface its parent's fuller text), and `cjk` (jieba keyword segmentation) switches. A live chunking preview shows exactly how a strategy splits pasted text before you commit, and re-indexing applies the config. It also adds golden-set evaluation (`Recall@k`, `Precision@k`, `MRR`), Redis query caching (keyed by query + config + corpus version, auto-invalidated on re-index), and vision-LLM transcription for PDF tables. A single node failing degrades to the surviving channels instead of breaking the chat, and user feedback is logged to a golden evaluation dataset. Whole-session chat imports are incremental: an LLM segments a conversation into Q&A blocks and a per-message imported flag makes re-imports no-ops while re-importing a changed source replaces just its blocks. Every pipeline node records a per-node trace (status / timing / output) surfaced stage-by-stage in the admin Test tab, and the tenant-bound gRPC retrieval service enforces tenant scoping at the gate — token auth, token-bucket rate limiting, and an explicit guest flag — so no un-scoped call reads across tenants. Recall spans a unified multi-source corpus — drive files, learning sentences, and chat history — served in-process or via that gRPC service.
 - **Grounded content compilation (decks & publication PDFs).** The content-to-slides engine designs a whole deck in one semantic pass over the raw sources — every fact carries a doc/page/line locator, figures land as real figure slides — then deterministic gates (wire-slip repair, jsonschema validation, a bounded single-slide patch loop) stand between the model and a local Typst compiler that renders the canonical 16:9 PDF alongside editable PPTX / Markdown / `deck.json`; nothing is ever silently trimmed, and every run records honest per-node LLM/render telemetry. The research Artifact Compiler closes the same doctrine on reports: PUBLISH projects the finalized manuscript into a Document AST and typesets a publication PDF with zero LLM in the path, resolving in-text citations back through the evidence graph, and a PDF fault never holds the Markdown publish hostage.
-- **Governed research workflows (Research OS: Code-First Research Pipeline).** To eliminate workflow drift, redundant model calls, and cost escalation in long-chain autonomous agent navigation, DeepDive restructures deep research into a decoupled architecture: a deterministic code-driven control plane paired with a bounded semantic engine—native code governs deterministic control flow, while the LLM is strictly reserved for tasks requiring semantic understanding, adjudication, and synthesis.
+- **Governed research workflows (Research OS: Code-First Research Pipeline).** To eliminate workflow drift, redundant model calls, and cost escalation in long-chain autonomous agent navigation, Delveta restructures deep research into a decoupled architecture: a deterministic code-driven control plane paired with a bounded semantic engine—native code governs deterministic control flow, while the LLM is strictly reserved for tasks requiring semantic understanding, adjudication, and synthesis.
   - **Deterministic orchestration & bounded control flow**: The ten-stage DAG is explicitly defined and driven by Python state machines; the model does not route stages or pick tools, reducing hallucination-prone workflow drift and unnecessary decisions across long autonomous chains. Runs are locked at creation into strict (halts on unmet gates) or progressive (records diagnostic gaps and settles forward without fabricating passes) modes.
   - **Native code execution & parallel execution of independent work**: Algorithmic tasks (hashing, deduplication, sanitization, chunking, schema validation) run natively in code. Stages execute in a deterministic serial order, while heterogeneous sources within a stage fan out concurrently under SSRF guardrails, drastically cutting end-to-end latency while logging to an immutable provenance ledger.
   - **Wholesale semantic batching & materialized reuse**: Related semantic inferences are batched into as few model calls as practical. Intermediate evaluations and states are materialized into reusable research storage (in-memory state, fetch ledgers, and adjudication fingerprints), allowing downstream stages to reuse cached facts directly—minimizing redundant LLM queries and substantially slashing both token spend and response latency (with 100% page reuse, based on empirical run benchmarks).
@@ -135,9 +135,9 @@ Each script installs Docker if missing, starts the data + model services, ensure
 ### Option B — Manual local development
 
 ```bash
-git clone https://github.com/Eric-LLMs/DeepDive.git
-cd DeepDive
-conda create -n deepdive python=3.11 -y && conda activate deepdive
+git clone https://github.com/Eric-LLMs/Delveta.git
+cd Delveta
+conda create -n delveta python=3.11 -y && conda activate delveta
 cp .env.example .env            # fill in LLM_UPSTREAM_KEY
 pip install -e ".[dev]"         # + pip install -e ".[rag]" for semantic search
 docker compose up -d postgres redis embedding tts llm-gateway worker
@@ -147,9 +147,9 @@ uvicorn apps.api.main:app --reload     # http://localhost:8300/docs
 
 ### Option C — LLM backend: self-hosted or external
 
-The LiteLLM gateway routes the virtual model `deepdive-chat` to any OpenAI-compatible upstream (`LLM_UPSTREAM_BASE`). Point it at a self-hosted server (vLLM / Ollama / …) to run the whole AI stack on your own hardware, or at an external provider — no code changes.
+The LiteLLM gateway routes the virtual model `delveta-chat` to any OpenAI-compatible upstream (`LLM_UPSTREAM_BASE`). Point it at a self-hosted server (vLLM / Ollama / …) to run the whole AI stack on your own hardware, or at an external provider — no code changes.
 
-The LLM backend is independent of how you launch DeepDive (Option A or B) and can be deployed separately.
+The LLM backend is independent of how you launch Delveta (Option A or B) and can be deployed separately.
 
 Full manual steps, environment variables, and the desktop/web/admin walkthrough: [docs/getting-started.md](docs/getting-started.md) · [docs/configuration.md](docs/configuration.md).
 

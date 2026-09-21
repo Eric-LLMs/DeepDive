@@ -3,22 +3,22 @@
 ## 1. Prerequisites
 
 - **Docker Desktop** — runs PostgreSQL, Redis, and the model services (embedding / rerank / TTS / LLM gateway).
-- **Conda** (Miniconda or Anaconda) — the backend runs in a `deepdive` env.
+- **Conda** (Miniconda or Anaconda) — the backend runs in a `delveta` env.
 - **Node.js 18+** — for the web frontend (optional; the API runs without it).
 - **Git**.
 
 ## 2. Clone the repository
 
 ```bash
-git clone https://github.com/Eric-LLMs/DeepDive.git
-cd DeepDive
+git clone https://github.com/Eric-LLMs/Delveta.git
+cd Delveta
 ```
 
 ## 3. Create & activate the conda environment
 
 ```bash
-conda create -n deepdive python=3.11 -y
-conda activate deepdive
+conda create -n delveta python=3.11 -y
+conda activate delveta
 ```
 
 ## 4. Configure environment
@@ -42,7 +42,7 @@ pip install -e ".[rag]"     # optional: RAG semantic search (pulls torch / sente
 docker compose up -d postgres redis embedding tts llm-gateway worker
 ```
 
-The first start downloads the models (BGE-M3, Kokoro-82M) into Docker volumes — allow a few minutes. The LLM gateway routes the virtual model `deepdive-chat` to `LLM_UPSTREAM_MODEL` using `LLM_UPSTREAM_KEY`.
+The first start downloads the models (BGE-M3, Kokoro-82M) into Docker volumes — allow a few minutes. The LLM gateway routes the virtual model `delveta-chat` to `LLM_UPSTREAM_MODEL` using `LLM_UPSTREAM_KEY`.
 
 > Skip `embedding` if you don't use semantic search, and `tts` if you don't need audio — the API degrades gracefully.
 >
@@ -53,7 +53,7 @@ The first start downloads the models (BGE-M3, Kokoro-82M) into Docker volumes �
 ```bash
 python scripts/init_db.py     # applies migrations/0001_init.sql once (creates all tables incl. jobs)
 # or run the single script directly with psql:
-psql -d deepdive -f migrations/0001_init.sql
+psql -d delveta -f migrations/0001_init.sql
 ```
 
 ## 8. Run the API

@@ -290,7 +290,7 @@ class ArtifactCompileService:
         plan = ArtifactPlan(
             artifact_id=run_id,
             metadata=ArtifactMetadata(
-                title=title, authors=["DeepDive Research"],
+                title=title, authors=["Delveta Research"],
                 language=str(project.get("language") or "zh-CN"),
             ),
             source_scope=SourceScope(

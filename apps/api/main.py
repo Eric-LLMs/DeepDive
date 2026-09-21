@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
     await redis.aclose()
 
 
-app = FastAPI(title="DeepDive API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Delveta API", version="0.1.0", lifespan=lifespan)
 
 
 @app.exception_handler(VocabError)

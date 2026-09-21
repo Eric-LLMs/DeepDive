@@ -1,4 +1,4 @@
-# DeepDive 使用手册 · 内容生成(Slides / Mindmap / Summary)
+# Delveta 使用手册 · 内容生成(Slides / Mindmap / Summary)
 
 ## 从会话或云盘文件生成
 

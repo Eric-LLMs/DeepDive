@@ -306,8 +306,8 @@ async def test_email(body: TestEmailRequest, _: AuthAdmin = Depends(require_admi
         await send_email(
             smtp,
             body.to_email.strip(),
-            "DeepDive 测试邮件",
-            "<p>这是一封来自 DeepDive 的测试邮件,SMTP 配置正常。</p>",
+            "Delveta 测试邮件",
+            "<p>这是一封来自 Delveta 的测试邮件,SMTP 配置正常。</p>",
         )
         return {"status": "ok", "message": "测试邮件已发送。"}
     except MailNotConfigured:

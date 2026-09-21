@@ -291,7 +291,7 @@ async def register(body: RegisterRequest, request: Request) -> dict:
         await session.flush()
         raw = await _issue_verification(session, row.id, "verify", 1440)
     base = str(request.base_url).rstrip("/")
-    dev = await _send_account_email("DeepDive 邮箱验证", email, base, raw, "auth/verify-email")
+    dev = await _send_account_email("Delveta 邮箱验证", email, base, raw, "auth/verify-email")
     return {"status": "ok", "message": "注册成功,请查收邮件完成邮箱验证。", **dev}
 
 
@@ -334,7 +334,7 @@ async def resend_verification(body: ResendVerificationRequest, request: Request)
     if redis is not None:
         await redis.setex(key, 60, "1")
     base = str(request.base_url).rstrip("/")
-    dev = await _send_account_email("DeepDive 邮箱验证", email, base, raw, "auth/verify-email")
+    dev = await _send_account_email("Delveta 邮箱验证", email, base, raw, "auth/verify-email")
     return {"status": "ok", "message": "验证邮件已重新发送,请查收。", **dev}
 
 
@@ -351,7 +351,7 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request) -> dict
             return {"status": "ok", "message": "如果该邮箱已注册,重置邮件将发送到您的邮箱。"}
         raw = await _issue_verification(session, user.id, "reset", 60)
     base = str(request.base_url).rstrip("/")
-    dev = await _send_account_email("DeepDive 密码重置", email, base, raw, "auth/reset-password")
+    dev = await _send_account_email("Delveta 密码重置", email, base, raw, "auth/reset-password")
     return {"status": "ok", "message": "重置邮件已发送,请查收(1 小时内有效)。", **dev}
 
 
@@ -475,7 +475,7 @@ async def update_me(
         async with SessionLocal() as session:
             raw = await _issue_verification(session, user_id, "verify", 1440)
         base = str(request.base_url).rstrip("/")
-        dev = await _send_account_email("DeepDive 邮箱验证", new_email, base, raw, "auth/verify-email")
+        dev = await _send_account_email("Delveta 邮箱验证", new_email, base, raw, "auth/verify-email")
         return {"status": "ok", "message": "资料已更新,新邮箱需验证后才能再次登录。", **dev}
     return {"status": "ok", "message": "资料已更新。"}
 

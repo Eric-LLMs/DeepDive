@@ -1,4 +1,4 @@
-"""Project context loader: DEEPDIVE.md conventions for the PROJECT_CONTEXT zone.
+"""Project context loader: DELVETA.md conventions for the PROJECT_CONTEXT zone.
 
 The cache-boundary prompt reserves a ``PromptZone.PROJECT_CONTEXT`` partition for project
 conventions. :func:`read_project_context` reads the first existing convention file under the
@@ -30,7 +30,7 @@ def read_project_context(
     the model. Reads are capped at ``max_chars``; a missing file or an empty workspace yields
     ``""``.
     """
-    for name in files or ["DEEPDIVE.md"]:
+    for name in files or ["DELVETA.md"]:
         path = (workspace / name).resolve()
         try:
             if path.is_file():

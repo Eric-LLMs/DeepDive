@@ -55,7 +55,7 @@ from agent.tools.definition import ToolOutput, define_tool
 from agent.tools.tool_permissions import ToolPermission
 from core.infrastructure.web_search import domain_search as _domain_search
 
-_USER_AGENT = "deepdive-social-search/0.1 (learning-workbench assistant)"
+_USER_AGENT = "delveta-social-search/0.1 (learning-workbench assistant)"
 _TIMEOUT = httpx.Timeout(15.0)
 _MAX_LIMIT = 25
 _SNIPPET_CHARS = 500

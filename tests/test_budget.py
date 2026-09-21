@@ -7,7 +7,7 @@ from agent import ReactLoopAgent, SystemPrompt, ToolOutput, ToolRuntime, define_
 from agent.engine.context import AgentTurn
 from agent.harness import FakeLLM, assistant, tool_call
 
-# 1000 prompt + 1000 completion tokens on deepdive-chat costs 0.00075 USD.
+# 1000 prompt + 1000 completion tokens on delveta-chat costs 0.00075 USD.
 _STEP = {
     **tool_call("c1", "echo", {"x": 1}),
     "usage": {"prompt_tokens": 1000, "completion_tokens": 1000, "total_tokens": 2000},
@@ -45,13 +45,13 @@ def _agent() -> ReactLoopAgent:
 async def test_hard_budget_aborts_non_streaming_loop():
     # Control: without a cap the same script runs both steps through to "final".
     control = _agent()
-    result = await control.run("go", model="deepdive-chat")
+    result = await control.run("go", model="delveta-chat")
     assert result.final_answer == "final"
     assert len(control.llm.calls) == 2
 
     # Capped: the budget is exhausted after the first (tool) step, so "final" never runs.
     capped = _agent()
-    turn = AgentTurn(user_msg="go", model="deepdive-chat", max_budget_usd=_TINY_BUDGET)
+    turn = AgentTurn(user_msg="go", model="delveta-chat", max_budget_usd=_TINY_BUDGET)
     result = await capped.run("go", turn=turn)
 
     # fbd8876: budget exhaustion now ends the turn with an honest retry notice instead
@@ -64,7 +64,7 @@ async def test_hard_budget_aborts_non_streaming_loop():
 
 async def test_streaming_budget_yields_error_event():
     agent = _agent()
-    turn = AgentTurn(user_msg="go", model="deepdive-chat", max_budget_usd=_TINY_BUDGET)
+    turn = AgentTurn(user_msg="go", model="delveta-chat", max_budget_usd=_TINY_BUDGET)
 
     events = [evt async for evt in agent.run_stream("go", turn=turn)]
 
@@ -81,7 +81,7 @@ async def test_tool_progress_events_stream_to_progress_sink():
     agent = ReactLoopAgent(llm, runtime, SystemPrompt())
 
     progress = []
-    result = await agent.run("go", model="deepdive-chat", progress_sink=progress.append)
+    result = await agent.run("go", model="delveta-chat", progress_sink=progress.append)
 
     assert result.final_answer == "done"
     tools = [e["data"]["name"] for e in progress if e["type"] in ("tool-start", "tool-result")]

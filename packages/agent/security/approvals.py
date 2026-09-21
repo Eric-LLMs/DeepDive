@@ -30,7 +30,7 @@ from core.config import settings
 
 from agent.engine.decisions import PreToolDecision, ToolExecution
 
-_log = structlog.get_logger("deepdive.agent")
+_log = structlog.get_logger("delveta.agent")
 
 # Per-request approval store bound for the duration of one request task. The bridge denies
 # when nothing is bound (tests / off-turn tool calls) — never blocks on a phantom request.

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>DeepDive Admin</title>
+    <title>Delveta Admin</title>
     <style>
       :root {
         --bg: #0f1115;
@@ -400,7 +400,7 @@
     <!-- Login view -->
     <div id="login-view" class="hidden">
       <div class="login-card">
-        <h1>DeepDive Admin</h1>
+        <h1>Delveta Admin</h1>
         <label><span>Username</span><input id="login-user" type="text" autocomplete="username" /></label>
         <label><span>Password</span><input id="login-pass" type="password" autocomplete="current-password" /></label>
         <button id="login-btn" type="button">Sign in</button>
@@ -414,7 +414,7 @@
         <div class="topbar">
           <div class="brand">
             <div class="logo">DD</div>
-            <span>DeepDive Admin</span>
+            <span>Delveta Admin</span>
           </div>
           <div class="right">
             <div class="settings-wrap">
@@ -463,7 +463,7 @@
 
     <script>
       (() => {
-        const TOKEN_KEY = "deepdive_admin_token";
+        const TOKEN_KEY = "delveta_admin_token";
         const loginView = document.getElementById("login-view");
         const appView = document.getElementById("app-view");
         const content = document.getElementById("content");
@@ -472,8 +472,8 @@
         const state = {};
 
         // ───────────────────────── appearance (theme + font size) ─────────────────────────
-        const THEME_KEY = "deepdive_admin_theme";
-        const FONT_KEY = "deepdive_admin_fontsize";
+        const THEME_KEY = "delveta_admin_theme";
+        const FONT_KEY = "delveta_admin_fontsize";
 
         function readPref(key, fallback) {
           try { return localStorage.getItem(key) || fallback; } catch { return fallback; }

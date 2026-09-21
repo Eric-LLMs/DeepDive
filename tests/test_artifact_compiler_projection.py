@@ -165,7 +165,7 @@ def test_compiled_pdf_source_comes_from_projection():
     doc = _ast()
     plan = ArtifactPlan(
         artifact_id="art-p",
-        metadata={"title": "番茄盆栽产量研究", "authors": ["DeepDive"], "keywords": []},
+        metadata={"title": "番茄盆栽产量研究", "authors": ["Delveta"], "keywords": []},
         source_scope={"source_ids": ["s1"], "evidence_ids": ["e1"]},
         summary_spec={"purpose": "p", "core_questions": []},
         sections=[{

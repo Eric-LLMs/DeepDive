@@ -108,7 +108,7 @@
 
 #set document(
     title: "Dive Report: 番茄盆栽 [v1]",
-    author: ("Enhui", "DeepDive"),
+    author: ("Enhui", "Delveta"),
     keywords: ("tomato", "研究"),
 )
 

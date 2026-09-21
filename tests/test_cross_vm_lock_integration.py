@@ -17,7 +17,7 @@ deployment-topology finding (it is the honest outcome recorded on 2026-09-09 ove
 Docker Desktop ``./data`` bind mount) and the fix is a topology decision, not a test
 weakening. The matrix is printed as machine-readable JSON for the report.
 
-Skips when docker/``deepdive-worker`` or the probe task dir is absent (e.g. CI).
+Skips when docker/``delveta-worker`` or the probe task dir is absent (e.g. CI).
 Run directly:  pytest tests/test_cross_vm_lock_integration.py -s -q
 """
 from __future__ import annotations
@@ -79,15 +79,15 @@ def _docker_worker_up() -> bool:
     if not shutil.which("docker"):
         return False
     r = subprocess.run(
-        ["docker", "ps", "--filter", "name=deepdive-worker",
+        ["docker", "ps", "--filter", "name=delveta-worker",
          "--filter", "status=running", "--format", "{{.Names}}"],
         capture_output=True, text=True, env=_env(), timeout=30)
-    return "deepdive-worker" in r.stdout
+    return "delveta-worker" in r.stdout
 
 
 pytestmark = pytest.mark.skipif(
     not (TASK_DIR.is_dir() and _docker_worker_up()),
-    reason="requires the task dir on ./data and a running deepdive-worker container",
+    reason="requires the task dir on ./data and a running delveta-worker container",
 )
 
 
@@ -125,7 +125,7 @@ def _container_holder() -> None:
         f"time.sleep({HOLDER_S})\")" % LK_CONT
     )
     subprocess.run(
-        ["docker", "exec", "-d", "deepdive-worker", "python", "-c", code],
+        ["docker", "exec", "-d", "delveta-worker", "python", "-c", code],
         check=True, capture_output=True, env=_env(), timeout=30)
 
 
@@ -138,7 +138,7 @@ def _wait_container_holder() -> bool:
     )
     while time.time() < deadline:
         out = subprocess.run(
-            ["docker", "exec", "deepdive-worker", "sh", "-c", probe],
+            ["docker", "exec", "delveta-worker", "sh", "-c", probe],
             capture_output=True, text=True, env=_env(), timeout=30)
         if "hit" in out.stdout:
             time.sleep(0.5)  # let the holder take the lock before probing
@@ -155,14 +155,14 @@ def _kill_container_holder() -> None:
         "done; true"
     )
     subprocess.run(
-        ["docker", "exec", "deepdive-worker", "sh", "-c", kill],
+        ["docker", "exec", "delveta-worker", "sh", "-c", kill],
         capture_output=True, env=_env(), timeout=30)
 
 
 def _container_probe() -> dict:
     code = _CODE.format(lk=LK_CONT, hold=False, hold_s=0)
     r = subprocess.run(
-        ["docker", "exec", "deepdive-worker", "python", "-c", code],
+        ["docker", "exec", "delveta-worker", "python", "-c", code],
         capture_output=True, text=True, env=_env(), timeout=60)
     out = r.stdout.strip()
     assert out, f"container probe produced no output: {r.stderr[-300:]}"

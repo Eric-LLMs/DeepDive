@@ -1,6 +1,6 @@
 """Tests for the project-context loader and its wiring into the kernel.
 
-Covers: reading the first existing convention file (``DEEPDIVE.md`` by default, or an explicit
+Covers: reading the first existing convention file (``DELVETA.md`` by default, or an explicit
 ``files`` list), the character cap with a truncation marker, the empty-workspace fallback, and
 that a non-empty ``project_context`` renders into the system prompt and feeds ``snapshot_key``
 while an absent one renders nothing.
@@ -11,8 +11,8 @@ from agent.tools.project_context import read_project_context
 from agent.prompt.system_prompt import render_prompt
 
 
-def test_reads_deepdive_md(tmp_path):
-    (tmp_path / "DEEPDIVE.md").write_text("project rules here", encoding="utf-8")
+def test_reads_delveta_md(tmp_path):
+    (tmp_path / "DELVETA.md").write_text("project rules here", encoding="utf-8")
 
     assert read_project_context(tmp_path) == "project rules here"
 
@@ -30,7 +30,7 @@ def test_empty_workspace_returns_empty(tmp_path):
 
 
 def test_caps_oversized_file_with_truncation_marker(tmp_path):
-    (tmp_path / "DEEPDIVE.md").write_text("x" * 500, encoding="utf-8")
+    (tmp_path / "DELVETA.md").write_text("x" * 500, encoding="utf-8")
 
     text = read_project_context(tmp_path, max_chars=100)
 

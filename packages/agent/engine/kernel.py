@@ -8,7 +8,7 @@ Standard prompt layout (aligned with the cache-boundary spec):
 
 - ``STATIC_PREFIX`` — SOUL.md identity + the compact tool catalog + the compressed skill
   catalog (byte-identical across requests → the provider reuses its prefix cache).
-- ``PROJECT_CONTEXT`` — DEEPDIVE.md project conventions (stable per project; empty
+- ``PROJECT_CONTEXT`` — DELVETA.md project conventions (stable per project; empty
   when none are present, in which case the zone renders nothing).
 - ``DYNAMIC_SUFFIX`` — the session memory brief (loaded once per run via ``begin_session``)
   plus any ``agent.inject()`` content; only this segment is re-rendered per step.
@@ -140,7 +140,7 @@ class AgentKernel:
         if soul:
             self.assembler.section("soul", PERSONA_ORDER, soul, zone=PromptZone.STATIC_PREFIX)
 
-        # Project conventions (DEEPDIVE.md) sit in their own stable zone; they become part of
+        # Project conventions (DELVETA.md) sit in their own stable zone; they become part of
         # the snapshot_key identity so project rules are part of the prefix-cache contract.
         if project_context:
             self.assembler.section(

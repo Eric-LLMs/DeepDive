@@ -1,4 +1,4 @@
-# DeepDive 使用手册 · 大模型 Key、路由与 Admin 配置
+# Delveta 使用手册 · 大模型 Key、路由与 Admin 配置
 
 本章面向管理员。入口:浏览器访问 **/admin**(初始管理员账号密码见项目 README「Configure Model Access」/ getting-started,首次登录后请立即修改);桌面端也可经左下角账号菜单 → **Admin** → **Admin Console** 单点登录进入。
 

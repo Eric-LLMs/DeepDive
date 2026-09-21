@@ -76,12 +76,12 @@
   function researchModeInfo(mode) {
     return RESEARCH_MODE_INFO[mode === "progressive" ? "progressive" : "strict"];
   }
-  try { state.token = localStorage.getItem("deepdive_token"); } catch { /* ignore */ }
-  try { state.guestId = localStorage.getItem("deepdive_guest_id"); } catch { /* ignore */ }
+  try { state.token = localStorage.getItem("delveta_token"); } catch { /* ignore */ }
+  try { state.guestId = localStorage.getItem("delveta_guest_id"); } catch { /* ignore */ }
   // Restore cached identity so the bottom bar shows the username immediately,
   // even before the backend revalidates the token.
   try {
-    const cachedUser = JSON.parse(localStorage.getItem("deepdive_user") || "null");
+    const cachedUser = JSON.parse(localStorage.getItem("delveta_user") || "null");
     if (cachedUser) {
       state.username = cachedUser.username ?? null;
       state.displayName = cachedUser.displayName ?? null;
@@ -378,7 +378,7 @@
     const dir = await window.desktopAPI.pickFolder();
     if (!dir) return;
     state.workspaceDir = dir;
-    try { localStorage.setItem("deepdive_workspace_dir", dir); } catch { /* ignore */ }
+    try { localStorage.setItem("delveta_workspace_dir", dir); } catch { /* ignore */ }
     await loadTree(dir);
     reflectWorkspaceName();
   }
@@ -1945,7 +1945,7 @@
           if (state.activeResearch) updateResearchChip();
           if (!state.token && evt.data.user_id) {
             state.guestId = evt.data.user_id;
-            try { localStorage.setItem("deepdive_guest_id", evt.data.user_id); } catch { /* ignore */ }
+            try { localStorage.setItem("delveta_guest_id", evt.data.user_id); } catch { /* ignore */ }
           }
           if (evt.data.notice && !state.degradedNoticeShown) {
             appendMsg("notice", evt.data.notice);
@@ -3626,17 +3626,17 @@
   const profileEditDebugCopy = document.getElementById("profile-edit-debug-copy");
   const profileAvatarStatus = document.getElementById("profile-avatar-status");
 
-  const TOKEN_KEY = "deepdive_token";
-  const USER_KEY = "deepdive_user";
+  const TOKEN_KEY = "delveta_token";
+  const USER_KEY = "delveta_user";
   // Last signed-in username, kept across restarts *and* logouts so the login modal
   // can pre-fill it (the "remember username" half of "Keep me signed in").
-  const REMEMBER_USER_KEY = "deepdive_remember_user";
-  const THEME_KEY = "deepdive_theme";
-  const ACCENT_KEY = "deepdive_accent";
-  const FONT_SIZE_KEY = "deepdive_font_size";
-  const MONO_KEY = "deepdive_mono_font";
-  const ZOOM_KEY = "deepdive_zoom";
-  const CHANNEL_KEY = "deepdive_channel";
+  const REMEMBER_USER_KEY = "delveta_remember_user";
+  const THEME_KEY = "delveta_theme";
+  const ACCENT_KEY = "delveta_accent";
+  const FONT_SIZE_KEY = "delveta_font_size";
+  const MONO_KEY = "delveta_mono_font";
+  const ZOOM_KEY = "delveta_zoom";
+  const CHANNEL_KEY = "delveta_channel";
 
   // ── Appearance prefs (theme / accent) ──
   const systemMedia = window.matchMedia("(prefers-color-scheme: dark)");
@@ -3713,12 +3713,12 @@
 
   function applyRememberBounds(on) {
     rememberBoundsRow.classList.toggle("active", !!on);
-    try { localStorage.setItem("deepdive_remember_bounds", on ? "1" : "0"); } catch { /* ignore */ }
+    try { localStorage.setItem("delveta_remember_bounds", on ? "1" : "0"); } catch { /* ignore */ }
     if (window.desktopAPI && window.desktopAPI.setPref) {
       window.desktopAPI.setPref("window.rememberBounds", !!on).catch(() => {});
     }
   }
-  try { applyRememberBounds(localStorage.getItem("deepdive_remember_bounds") !== "0"); } catch { /* ignore */ }
+  try { applyRememberBounds(localStorage.getItem("delveta_remember_bounds") !== "0"); } catch { /* ignore */ }
 
   // ── Updates pref (distribution channel) ──
   function applyChannel(ch) {
@@ -3963,7 +3963,7 @@
       ? `\n\nOS: ${navigator.platform} · App: ${aboutVersion.textContent || "?"}`
       : "";
     const url =
-      "https://github.com/Eric-LLMs/DeepDive/issues/new?" +
+      "https://github.com/Eric-LLMs/Delveta/issues/new?" +
       `title=${encodeURIComponent(`[Feedback] ${catLabel}`)}&` +
       `body=${encodeURIComponent(`**类别:** ${catLabel}\n\n${text}${diag}`)}`;
     openUrl(url);
@@ -4403,7 +4403,7 @@
   const workspaceSource = document.getElementById("workspace-source");
   if (workspaceSource) {
     workspaceSource.addEventListener("change", () => {
-      try { localStorage.setItem("deepdive_workspace_source", workspaceSource.value); } catch { /* ignore */ }
+      try { localStorage.setItem("delveta_workspace_source", workspaceSource.value); } catch { /* ignore */ }
       if (workspaceSource.value === "cloud") {
         setCloudMode(true);
       } else {
@@ -4434,7 +4434,7 @@
 
   // Restore the last workspace folder so the file tree isn't empty on launch.
   try {
-    const saved = localStorage.getItem("deepdive_workspace_dir");
+    const saved = localStorage.getItem("delveta_workspace_dir");
     if (saved) { state.workspaceDir = saved; loadTree(saved); }
   } catch { /* ignore */ }
   reflectWorkspaceName();
@@ -4442,7 +4442,7 @@
   // Restore the last source choice (cloud vs local); clouddrive.js runs after app.js
   // and refreshes the panel itself when it sees #clouddrive already visible.
   try {
-    if (workspaceSource && localStorage.getItem("deepdive_workspace_source") === "cloud") {
+    if (workspaceSource && localStorage.getItem("delveta_workspace_source") === "cloud") {
       workspaceSource.value = "cloud";
       setCloudMode(true);
     }
@@ -4529,11 +4529,11 @@
     appEl.classList.toggle("chat-right");
     syncDock();
     try {
-      localStorage.setItem("deepdive_chat_right", appEl.classList.contains("chat-right") ? "1" : "0");
+      localStorage.setItem("delveta_chat_right", appEl.classList.contains("chat-right") ? "1" : "0");
     } catch { /* ignore */ }
   });
   try {
-    if (localStorage.getItem("deepdive_chat_right") === "1") appEl.classList.add("chat-right");
+    if (localStorage.getItem("delveta_chat_right") === "1") appEl.classList.add("chat-right");
   } catch { /* ignore */ }
   syncDock();
 
@@ -4586,10 +4586,10 @@
     chatHeader.addEventListener("pointercancel", onUp);
   });
 
-  // ── Hide chat → floating DeepDive logo mini-icon ──
+  // ── Hide chat → floating Delveta logo mini-icon ──
   // Hiding just adds a class (display:none) so the chat keeps its dock side / floating
   // position / drag offset; restoring removes the class, putting it back exactly where
-  // it was. The mini icon is a fixed corner button showing the DeepDive logo.
+  // it was. The mini icon is a fixed corner button showing the Delveta logo.
   const chatHide = document.getElementById("chat-hide");
   const chatMini = document.getElementById("chat-mini");
   chatHide.addEventListener("click", () => {
@@ -4842,7 +4842,7 @@
       });
     } catch (err) {
       callStream = null;
-      appendMsg("error", `Microphone unavailable (${err && err.name ? err.name : "unknown error"}) — check the OS microphone permissions for DeepDive.`);
+      appendMsg("error", `Microphone unavailable (${err && err.name ? err.name : "unknown error"}) — check the OS microphone permissions for Delveta.`);
       return;
     }
     try {
@@ -4964,7 +4964,7 @@
       });
     } catch (err) {
       micStream = null;
-      appendMsg("error", `Microphone unavailable (${err && err.name ? err.name : "unknown error"}) — check the OS microphone permissions for DeepDive.`);
+      appendMsg("error", `Microphone unavailable (${err && err.name ? err.name : "unknown error"}) — check the OS microphone permissions for Delveta.`);
       return;
     }
     const mime = pickAudioMime();
@@ -6215,7 +6215,7 @@
       return;
     }
     // The composer needs the chat pane visible: restore it if it was hidden to the floating
-    // mini DeepDive icon.
+    // mini Delveta icon.
     if (chatEl.classList.contains("minimized")) {
       chatEl.classList.remove("minimized");
       chatMini.classList.add("hidden");
@@ -6319,7 +6319,7 @@
     appEl.classList.toggle("chat-fills", isSessions);
     syncDock(); // re-apply composer rows — Chats keeps a fixed 4 lines regardless of dock side
     if (isSessions && chatEl.classList.contains("minimized")) {
-      // A chat hidden to the mini DeepDive icon would leave the Chats pane blank.
+      // A chat hidden to the mini Delveta icon would leave the Chats pane blank.
       chatEl.classList.remove("minimized");
       if (chatMini) chatMini.classList.add("hidden");
     }
@@ -6463,10 +6463,10 @@
 
   // Pin state is client-side only (Gemini-style): a pinned session sorts above the rest.
   function getPinned() {
-    try { return JSON.parse(localStorage.getItem("deepdive_pinned") || "[]"); } catch { return []; }
+    try { return JSON.parse(localStorage.getItem("delveta_pinned") || "[]"); } catch { return []; }
   }
   function setPinned(list) {
-    try { localStorage.setItem("deepdive_pinned", JSON.stringify(list)); } catch { /* ignore */ }
+    try { localStorage.setItem("delveta_pinned", JSON.stringify(list)); } catch { /* ignore */ }
   }
   function isPinned(id) { return getPinned().includes(String(id)); }
   function togglePin(id) {

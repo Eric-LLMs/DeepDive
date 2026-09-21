@@ -1,4 +1,4 @@
-# DeepDive 使用手册 · Chat 聊天基础
+# Delveta 使用手册 · Chat 聊天基础
 
 ## 会话管理
 

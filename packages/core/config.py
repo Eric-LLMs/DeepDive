@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     )
 
     # ── Database / cache ──
-    database_url: str = "postgresql+asyncpg://deepdive:deepdive@localhost:15432/deepdive"
+    database_url: str = "postgresql+asyncpg://delveta:delveta@localhost:15432/delveta"
     redis_url: str = "redis://localhost:16379/0"
 
     # ── Worker / jobs ──
@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # ── LLM (via LiteLLM gateway; the gateway routes the virtual model name) ──
     llm_api_key: str = ""
     llm_base_url: str = "http://localhost:14000/v1"
-    llm_model: str = "deepdive-chat"
+    llm_model: str = "delveta-chat"
 
     # ── TTS (Kokoro-FastAPI service, OpenAI-compatible /v1/audio/speech) ──
     tts_base_url: str = "http://localhost:18880/v1"
@@ -182,7 +182,7 @@ class Settings(BaseSettings):
     # Per-turn cost cap (USD) — the loop aborts once the accumulated cost passes this.
     max_budget_per_turn_usd: float = 1.0
     # Workspace checkpoints: shadow-git snapshot dir (relative to the workspace root).
-    checkpoint_dir: Path = Path(".deepdive-snapshots")
+    checkpoint_dir: Path = Path(".delveta-snapshots")
     # Agent audit trail: one JSONL line per turn event (best-effort; dir created on demand).
     audit_log_path: Path = Path("data/audit.jsonl")
 
@@ -211,8 +211,8 @@ class Settings(BaseSettings):
     # memory decay, paid only at low-frequency compaction events (never in normal turns).
     compaction_summary_max_chars: int = 2500
 
-    # Project context (DEEPDIVE.md conventions injected into the prompt's PROJECT_CONTEXT zone).
-    project_context_files: list[str] = ["DEEPDIVE.md"]
+    # Project context (DELVETA.md conventions injected into the prompt's PROJECT_CONTEXT zone).
+    project_context_files: list[str] = ["DELVETA.md"]
     project_context_max_chars: int = 8000      # per-file read cap for the project convention file
 
     # ── Auth ──

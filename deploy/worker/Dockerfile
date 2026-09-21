@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir -e "." \
     # /app/packages, which would shadow the proto `retrieval` with the apps/retrieval app.
     # Pin the order explicitly (proto first) so every top-level name resolves to source.
     && printf '/app/packages/shared/proto\n/app/apps\n/app/packages\n' \
-       > /usr/local/lib/python3.12/site-packages/_editable_impl_deepdive.pth
+       > /usr/local/lib/python3.12/site-packages/_editable_impl_delveta.pth
 
 # Publication PDF toolchain (docs/19 §8): the PUBLISH node compiles report PDFs by
 # default, so the worker carries the exact stack the preflight probe checks —

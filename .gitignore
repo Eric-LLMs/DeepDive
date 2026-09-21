@@ -51,4 +51,4 @@ docs/trace_chat_prompt.md
 scripts/trace_chat_prompt.py
 
 # Local backup snapshot (nested git repo, never commit)
-.deepdive-snapshots/
+.delveta-snapshots/

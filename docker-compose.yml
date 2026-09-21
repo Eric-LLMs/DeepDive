@@ -1,4 +1,4 @@
-# DeepDive — data + model-serving infrastructure.
+# Delveta — data + model-serving infrastructure.
 #
 # The FastAPI app itself runs on the host during development (uvicorn), and talks to
 # these containers over HTTP. Model inference (LLM / embedding / TTS / STT) never
@@ -13,29 +13,31 @@
 #   - stt         FunASR serving SenseVoiceSmall      -> /v1/audio/transcriptions (port 18881, loopback only)
 #   - llm-gateway LiteLLM proxy (unified LLM routing / keys / cost)   (port 14000)
 
+name: delveta
+
 services:
   # ── Data ──────────────────────────────────────────────────────────────
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: deepdive-postgres
+    container_name: delveta-postgres
     environment:
-      POSTGRES_USER: deepdive
-      POSTGRES_PASSWORD: deepdive
-      POSTGRES_DB: deepdive
+      POSTGRES_USER: delveta
+      POSTGRES_PASSWORD: delveta
+      POSTGRES_DB: delveta
     ports:
       # 5432 sits inside a Windows Hyper-V excluded port range on some hosts; use 15432 instead.
       - "15432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U deepdive"]
+      test: ["CMD-SHELL", "pg_isready -U delveta"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: deepdive-redis
+    container_name: delveta-redis
     ports:
       # 6379 sits inside a Windows Hyper-V excluded port range on some hosts; use 16379 instead.
       - "16379:6379"
@@ -50,7 +52,7 @@ services:
   # ── Embedding (BGE-M3 via TEI) ────────────────────────────────────────
   embedding:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
-    container_name: deepdive-embedding
+    container_name: delveta-embedding
     # max-batch-tokens kept at 2048 (not the model's 8192 cap): a higher budget speeds
     # up batch embedding (fewer internal passes) but the warmup pre-allocation crashes on
     # memory-constrained hosts (~5.5 GiB for 4096). Embedding parent chunks is skipped in
@@ -81,7 +83,7 @@ services:
   # you export the model to ONNX first.
   reranker:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
-    container_name: deepdive-reranker
+    container_name: delveta-reranker
     command: --model-id BAAI/bge-reranker-v2-m3 --port 80 --max-batch-tokens 2048 --max-concurrent-requests 16
     ports:
       - "18081:80"
@@ -94,7 +96,7 @@ services:
   # ── TTS (Kokoro-82M via Kokoro-FastAPI) ───────────────────────────────
   tts:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
-    container_name: deepdive-tts
+    container_name: delveta-tts
     ports:
       - "18880:8880"
     volumes:
@@ -115,8 +117,8 @@ services:
   # the funasr-cache volume; later restarts reuse it with no network access.
   stt:
     build: ./deploy/stt
-    image: deepdive-stt:latest
-    container_name: deepdive-stt
+    image: delveta-stt:latest
+    container_name: delveta-stt
     ports:
       - "127.0.0.1:18881:8000"
     volumes:
@@ -130,12 +132,12 @@ services:
       start_period: 120s
 
   # ── LLM gateway (LiteLLM proxy) ───────────────────────────────────────
-  # The API calls a virtual model name (LLM_MODEL=deepdive-chat); LiteLLM routes it to
+  # The API calls a virtual model name (LLM_MODEL=delveta-chat); LiteLLM routes it to
   # the real upstream provider (set via LLM_UPSTREAM_* in .env), with key management,
   # cost tracking, rate limits, and per-model fallback all in one place.
   llm-gateway:
     image: ghcr.io/berriai/litellm:main-stable
-    container_name: deepdive-litellm
+    container_name: delveta-litellm
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     ports:
       # 4000 sits inside a Windows Hyper-V excluded port range (3984-4083) on this host; use 14000.
@@ -164,14 +166,14 @@ services:
     build:
       context: .
       dockerfile: deploy/worker/Dockerfile
-    container_name: deepdive-worker
+    container_name: delveta-worker
     environment:
-      DATABASE_URL: postgresql+asyncpg://deepdive:deepdive@postgres:5432/deepdive
+      DATABASE_URL: postgresql+asyncpg://delveta:delveta@postgres:5432/delveta
       REDIS_URL: redis://redis:6379/0
       EMBEDDING_BASE_URL: http://embedding:80
       LLM_BASE_URL: http://llm-gateway:4000/v1
       LLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-gateway}
-      LLM_MODEL: deepdive-chat
+      LLM_MODEL: delveta-chat
       TTS_BASE_URL: http://tts:8880/v1
       # Web search provider: add WEB_SEARCH_PROVIDER=tavily and WEB_SEARCH_API_KEY to the
       # compose .env (gitignored) to make the worker use Tavily. Defaults keep the keyless
@@ -207,15 +209,15 @@ services:
     build:
       context: .
       dockerfile: deploy/retrieval/Dockerfile
-    container_name: deepdive-retrieval
+    container_name: delveta-retrieval
     environment:
-      DATABASE_URL: postgresql+asyncpg://deepdive:deepdive@postgres:5432/deepdive
+      DATABASE_URL: postgresql+asyncpg://delveta:delveta@postgres:5432/delveta
       EMBEDDING_BASE_URL: http://embedding:80
       RERANKER_MODEL: ""            # in-process cross-encoder rerank; "" disables reranking (the TEI reranker container is legacy, not wired)
       RAG_QUERY_REWRITE: "true"
       LLM_BASE_URL: http://llm-gateway:4000/v1
       LLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-local-gateway}
-      LLM_MODEL: deepdive-chat
+      LLM_MODEL: delveta-chat
       RETRIEVAL_GRPC_ADDR: 0.0.0.0:50051
     ports:
       - "15051:50051"
@@ -234,7 +236,7 @@ services:
   # retrieval gRPC. The FastAPI app still runs on the host during development.
   traefik:
     image: traefik:v3.0
-    container_name: deepdive-traefik
+    container_name: delveta-traefik
     command:
       - "--configFile=/etc/traefik/traefik.yml"
     ports:

@@ -362,9 +362,9 @@ async def test_section_reads_turn_context_and_disappears_without_viewer():
 
 async def test_prompt_byte_identical_without_viewer_assembly():
     plain = CacheBoundaryAssembler()
-    plain.section("soul", 0, "YOU ARE DEEPDIVE", zone=PromptZone.STATIC_PREFIX)
+    plain.section("soul", 0, "YOU ARE DELVETA", zone=PromptZone.STATIC_PREFIX)
     withsec = CacheBoundaryAssembler()
-    withsec.section("soul", 0, "YOU ARE DEEPDIVE", zone=PromptZone.STATIC_PREFIX)
+    withsec.section("soul", 0, "YOU ARE DELVETA", zone=PromptZone.STATIC_PREFIX)
     withsec.section("viewer_reference", 300, viewer_reference_section,
                     zone=PromptZone.DYNAMIC_SUFFIX)
     ctx = {"user_msg": "hello"}

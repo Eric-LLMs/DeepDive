@@ -1,4 +1,4 @@
--- DeepDive canonical database initialization -- the single install script.
+-- Delveta canonical database initialization -- the single install script.
 --
 -- Fresh installs: the asyncpg runner (packages/core/infrastructure/db.py) applies
 -- this file once inside a transaction and records "0001_init" in schema_migrations.

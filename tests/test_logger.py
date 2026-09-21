@@ -184,7 +184,7 @@ def test_configure_logging_silences_research_list_access_log(tmp_path, clean_log
 
 def test_capacity_warning_level_and_format(clean_logging):
     cap, prior, prior_level = _capture_root()
-    cap_logger = logging.getLogger("deepdive.capacity")
+    cap_logger = logging.getLogger("delveta.capacity")
     saved_level = cap_logger.level
     cap_logger.setLevel(logging.DEBUG)
     try:
@@ -195,7 +195,7 @@ def test_capacity_warning_level_and_format(clean_logging):
         cap_logger.setLevel(saved_level)
         _restore_root(cap, prior, prior_level)
 
-    records = [r for r in cap.records if r.name == "deepdive.capacity"]
+    records = [r for r in cap.records if r.name == "delveta.capacity"]
     assert [r.levelname for r in records] == ["WARNING", "ERROR", "WARNING"]
     assert "component=queue" in records[0].getMessage()
     assert "at cap" in records[1].getMessage()

@@ -1,8 +1,8 @@
 {
-  "name": "deepdive-desktop",
+  "name": "delveta-desktop",
   "private": true,
   "version": "0.1.0",
-  "description": "Electron shell wrapping the DeepDive web UI",
+  "description": "Electron shell wrapping the Delveta web UI",
   "main": "main.js",
   "scripts": {
     "start": "electron .",

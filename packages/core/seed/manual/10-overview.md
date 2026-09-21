@@ -1,6 +1,6 @@
-# DeepDive 使用手册 · 产品总览
+# Delveta 使用手册 · 产品总览
 
-DeepDive 是一体化 AI 知识工作台:对话(Chat)、深度研究(Research)、云盘(Cloud Drive)、文档/视频阅读与学习平台集成在同一个产品里。
+Delveta 是一体化 AI 知识工作台:对话(Chat)、深度研究(Research)、云盘(Cloud Drive)、文档/视频阅读与学习平台集成在同一个产品里。
 
 ## 三个使用界面
 

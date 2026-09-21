@@ -201,7 +201,7 @@ serve_web() {
 
 # ── main flow ──────────────────────────────────────────────────────────────────
 echo "=============================================="
-echo "  DeepDive launcher (Linux server)"
+echo "  Delveta launcher (Linux server)"
 echo "=============================================="
 
 step "Checking backend at $BACKEND_URL"

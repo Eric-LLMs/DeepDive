@@ -1,6 +1,6 @@
 # 16 — Permission Model
 
-> **Normative.** Research tools are gated by DeepDive's existing permission and approval
+> **Normative.** Research tools are gated by Delveta's existing permission and approval
 > machinery; tenancy is enforced by the existing `ContextVar` + visibility predicates.
 > Research OS adds **no parallel security layer**.
 

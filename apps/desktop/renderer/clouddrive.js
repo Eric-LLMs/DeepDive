@@ -3,7 +3,7 @@
 // The server is the single source of truth: this panel calls the same REST API the
 // web console uses, so edits here show up in the web console on refresh and vice
 // versa. The main process proxies /api/* to the backend, and auth reuses the session
-// token app.js stores in localStorage["deepdive_token"] — this module is a separate
+// token app.js stores in localStorage["delveta_token"] — this module is a separate
 // IIFE so it reads that token directly instead of reaching into app.js's private scope.
 //
 // The main area mirrors the web CloudDrive: a five-column table (Name / Size / RAG
@@ -11,7 +11,7 @@
 // edit mode + batch actions, and the same workspace / trash / sharing semantics.
 // The sidebar tree shows My Drive, one node per workspace, and Trash at the bottom.
 (() => {
-  const TOKEN_KEY = "deepdive_token";
+  const TOKEN_KEY = "delveta_token";
 
   const cloudEl = document.getElementById("clouddrive");
   const cdPathEl = document.getElementById("cd-path");

@@ -20,7 +20,7 @@ from agent.tools.tool_permissions import ToolPermission
 
 # Large / derived artifacts never enter a checkpoint (info/exclude — no workspace .gitignore).
 _IGNORED = (
-    ".deepdive-snapshots/",
+    ".delveta-snapshots/",
     ".git/",
     "node_modules/",
     ".venv/",
@@ -55,8 +55,8 @@ class CheckpointStore:
         """Run git against the shadow git-dir with the workspace as its work-tree."""
         cmd = [
             "git",
-            "-c", "user.name=deepdive",
-            "-c", "user.email=deepdive@local",
+            "-c", "user.name=delveta",
+            "-c", "user.email=delveta@local",
             "--git-dir", str(self._git_dir),
             "--work-tree", str(self.workspace),
             *args,

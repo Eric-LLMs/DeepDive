@@ -216,7 +216,7 @@ def configure_logging(settings: Any, app: str = "api") -> None:
 
 
 # Diagnostics logger kept at root level + propagate so it lands in api.log / worker.log.
-_capacity_logger = logging.getLogger("deepdive.capacity")
+_capacity_logger = logging.getLogger("delveta.capacity")
 
 
 def capacity_warning(component: str, current: Any, limit: Any, message: str) -> None:

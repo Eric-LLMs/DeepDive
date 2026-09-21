@@ -1,4 +1,4 @@
-// Thin fetch wrapper around the DeepDive REST API.
+// Thin fetch wrapper around the Delveta REST API.
 // In dev, Vite proxies /api/* to http://localhost:8300 (see vite.config.ts).
 import type {
   Article,
@@ -24,7 +24,7 @@ import type {
 } from "./types";
 
 const BASE = "/api";
-const TOKEN_KEY = "deepdive_token";
+const TOKEN_KEY = "delveta_token";
 
 // Shared session token. The desktop client hands it over via ?sso=<token> on the
 // web console URL; direct visits can sign in through the login page instead.

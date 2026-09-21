@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# DeepDive 一键环境初始化:检查 Docker/conda → 启动数据+模型服务 → 安装依赖 → 建表
-# 用法(conda deepdive 环境内, Git Bash / WSL / Linux / macOS):bash scripts/setup.sh
+# Delveta 一键环境初始化:检查 Docker/conda → 启动数据+模型服务 → 安装依赖 → 建表
+# 用法(conda delveta 环境内, Git Bash / WSL / Linux / macOS):bash scripts/setup.sh
 set -euo pipefail
 
 echo "=============================================="
-echo "  DeepDive 环境初始化"
+echo "  Delveta 环境初始化"
 echo "=============================================="
 
-# [1/5] 检查 conda deepdive 环境
+# [1/5] 检查 conda delveta 环境
 echo ""
 echo "[1/5] 检查 conda 环境..."
-if [[ "${CONDA_DEFAULT_ENV:-}" != "deepdive" ]]; then
-    echo "  ! 当前不在 deepdive conda 环境(CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV:-<none>})"
-    echo "  → 请先: conda create -n deepdive python=3.11 -y && conda activate deepdive"
+# NOTE: "deepdive" is the pre-rename env name, accepted only so existing dev
+# environments keep working; new setups should use "delveta".
+if [[ "${CONDA_DEFAULT_ENV:-}" != "delveta" && "${CONDA_DEFAULT_ENV:-}" != "deepdive" ]]; then
+    echo "  ! 当前不在 delveta conda 环境(CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV:-<none>})"
+    echo "  → 请先: conda create -n delveta python=3.11 -y && conda activate delveta"
     exit 1
 fi
-echo "  ✓ conda deepdive 环境已激活"
+echo "  ✓ conda ${CONDA_DEFAULT_ENV} 环境已激活"
 
 # [2/5] 检查 Docker
 echo ""

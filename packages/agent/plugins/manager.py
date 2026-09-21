@@ -40,7 +40,7 @@ def _deterministic_module_name(path: Path) -> str:
     """
     parent = _sanitize_identifier(path.parent.name) or "root"
     stem = _sanitize_identifier(path.stem)
-    return f"deepdive_plugin_{parent}_{stem}"
+    return f"delveta_plugin_{parent}_{stem}"
 
 
 class PluginManager:

@@ -1,4 +1,4 @@
-# DeepDive 使用手册 · Research 深度研究
+# Delveta 使用手册 · Research 深度研究
 
 ## 创建研究任务
 

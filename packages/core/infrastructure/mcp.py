@@ -1,6 +1,6 @@
 """MCP Server: expose the tool runtime over the MCP protocol (FastMCP).
 
-Direction one: expose DeepDive's tools externally so other AI clients can call them.
+Direction one: expose Delveta's tools externally so other AI clients can call them.
 Direction two (MCP Client consuming external tools) is wired up on demand at the API layer,
 and registered into the ToolRuntime the same way.
 """
@@ -9,7 +9,7 @@ from agent.engine.runtime import ToolRuntime
 from fastmcp import FastMCP
 
 
-def build_mcp_server(runtime: ToolRuntime, name: str = "deepdive") -> FastMCP:
+def build_mcp_server(runtime: ToolRuntime, name: str = "delveta") -> FastMCP:
     mcp = FastMCP(name)
 
     def _make_handler(tool):

@@ -1,6 +1,6 @@
 """Cross-process wake-up bus (Redis Pub/Sub, invalidation hints only).
 
-DeepDive already ships a Redis pool on both sides of the process boundary (the API's
+Delveta already ships a Redis pool on both sides of the process boundary (the API's
 ``app.state.redis`` and the worker's ``ctx["redis"]``). This module exposes a module-level
 *set at startup / cleared at shutdown* publish handle so fire-and-forget wake-up events
 (the research monitor's "something changed, refetch the task") can be emitted from either

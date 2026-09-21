@@ -53,10 +53,10 @@ async def test_shadow_dir_inside_workspace_is_not_tracked(tmp_path):
     ws.mkdir()
     (ws / "a.txt").write_text("x")
     # Shadow lives inside the workspace (the production layout) — must not self-include.
-    store = CheckpointStore(ws, ws / ".deepdive-snapshots")
+    store = CheckpointStore(ws, ws / ".delveta-snapshots")
 
     await store.snapshot("first")
     # The shadow repo's own files are excluded from the snapshot.
     tracked = store._git("ls-files")
-    assert ".deepdive-snapshots" not in tracked
+    assert ".delveta-snapshots" not in tracked
     assert "a.txt" in tracked

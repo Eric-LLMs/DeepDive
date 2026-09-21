@@ -18,8 +18,8 @@ type AuthState =
 const PAGE_SIZE = 10;
 
 // ── Appearance prefs (theme / font size), persisted per-browser ──
-const THEME_KEY = "deepdive_web_theme";
-const FONT_KEY = "deepdive_web_fontsize";
+const THEME_KEY = "delveta_web_theme";
+const FONT_KEY = "delveta_web_fontsize";
 const THEME_LABELS: Record<string, string> = {
   system: "Follow System",
   dark: "Dark",
@@ -310,7 +310,7 @@ function LoginPage({ onLogin }: { onLogin: (me: Me) => void }) {
   return (
     <div className="login-wrap">
       <div className="login-card">
-        <div className="login-logo"><img src="/deepdive.png" className="brand-logo" alt="DeepDive" /> DeepDive</div>
+        <div className="login-logo"><img src="/delveta.png" className="brand-logo" alt="Delveta" /> Delveta</div>
 
         {mode === "login" && (
           <form onSubmit={submit}>
@@ -535,7 +535,7 @@ function Sidebar({ page, onNavigate }: { page: Page; onNavigate: (p: Page) => vo
   ];
   return (
     <aside className="sidebar">
-      <div className="sidebar-brand"><img src="/deepdive.png" className="brand-logo" alt="DeepDive" /> DeepDive</div>
+      <div className="sidebar-brand"><img src="/delveta.png" className="brand-logo" alt="Delveta" /> Delveta</div>
       <hr />
       <nav>
         {items.map((it) => (
@@ -564,8 +564,8 @@ function Home() {
 
   return (
     <div>
-      <h3 style={{ marginTop: 0, display: "flex", alignItems: "center", gap: 8 }}><img src="/deepdive.png" className="brand-logo brand-logo-lg" alt="DeepDive" /> DeepDive Learning Assistant</h3>
-      <h3 style={{ marginTop: 0 }}>Welcome to DeepDive</h3>
+      <h3 style={{ marginTop: 0, display: "flex", alignItems: "center", gap: 8 }}><img src="/delveta.png" className="brand-logo brand-logo-lg" alt="Delveta" /> Delveta Learning Assistant</h3>
+      <h3 style={{ marginTop: 0 }}>Welcome to Delveta</h3>
       <p className="muted">
         A domain-specific English learning tool tailored for your specific needs.
       </p>
