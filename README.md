@@ -29,6 +29,7 @@ Delveta is a persistent AI learning and research assistant that helps you deeply
 >  
 > **The Research Loop**  
 > `Question → Plan → Retrieve → Investigate → Evaluate → Synthesize → Record → Revisit`  
+> This product-level 8-step loop is implemented by the deterministic 10-stage Research OS pipeline — Discover → Frame → Evidence → Design → Execute → Explain → Write → Review → Reproduce → Publish (see the platform architecture diagram and [docs/research/](docs/research/)).  
 >  
 > **The Data Flywheel**  
 > `Material → Index → Retrieve → Transform → Artifact → Search again`
@@ -114,7 +115,7 @@ See [docs/architecture.md §Implementation Status](docs/architecture.md#implemen
 
 - [docs/architecture.md](docs/architecture.md) — full system design (single source of truth): tech stack, repository layout, agent-kernel internals, tool runtime, data model, deployment, and the implemented-vs-designed matrix.
 - [docs/architecture-diagrams.md](docs/architecture-diagrams.md) — per-module architecture diagrams and mermaid source.
-- [docs/research/](docs/research/) — Research OS contract suite (design-frozen): entities, state machine, four hard gates, three-layer storage, and the 7 research tool contracts.
+- [docs/research/](docs/research/) — Research OS contract suite (design-frozen): entities, state machine, four hard gates, three-layer storage, and the 7 research tool contracts (tool interfaces, not workflow stages).
 - [docs/getting-started.md](docs/getting-started.md) — full manual setup, one-click launchers, and the desktop/web/admin walkthrough.
 - [docs/configuration.md](docs/configuration.md) — environment-variable reference.
 - [docs/features.md](docs/features.md) — full feature walk-through (desktop workbench, chat assistant, RAG & query repository, study mode, cloud drive, roles & billing).

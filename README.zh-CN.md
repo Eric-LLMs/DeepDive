@@ -28,6 +28,7 @@ Delveta 是一位具备持久记忆的 AI 学习与研究助手，帮助你深�
 
 > **研究工作流 (The Research Loop)**  
 > `提出课题 → 规划路径 → 多源检索 → 深度调研 → 质量评估 → 综合提炼 → 归档记录 → 溯源复访`  
+> 这一产品层的 8 步闭环，在实现层由确定性的 10 阶段 Research OS 流水线承载——Discover → Frame → Evidence → Design → Execute → Explain → Write → Review → Reproduce → Publish（见平台架构图与 [docs/research/](docs/research/)）。  
 
 > **数据飞轮 (The Data Flywheel)**  
 > `原始材料 → 建立索引 → 语义检索 → 结构转化 → 知识产物 → 反哺检索`
@@ -117,7 +118,7 @@ Delveta 自研了高可控的 Agent 运行时，拒绝将核心编排委托给�
 
 * **[`docs/architecture.md`](docs/architecture.md)** —— 完整系统架构设计（单一真实数据源 SSOT）：涵盖技术栈、代码目录、Agent 内核、工具运行时、数据模型、部署架构及已实现 vs 已设计矩阵。
 * **[`docs/architecture-diagrams.md`](docs/architecture-diagrams.md)** —— 模块架构图与 Mermaid 原图源码。
-* **[`docs/research/`](docs/research/)** —— 研究操作系统（Research OS）契约套件（设计已冻结）：实体、状态机、四道硬 Gate、三层存储与 7 个研究工具契约。
+* **[`docs/research/`](docs/research/)** —— 研究操作系统（Research OS）契约套件（设计已冻结）：实体、状态机、四道硬 Gate、三层存储与 7 个研究工具契约（tool interfaces，即工具接口，不是流程阶段）。
 * **[`docs/getting-started.md`](docs/getting-started.md)** —— 手动部署指南、一键启动脚本与各端（桌面端/Web/管理后台）走查。
 * **[`docs/configuration.md`](docs/configuration.md)** —— 环境变量全量参考手册。
 * **[`docs/features.md`](docs/features.md)** —— 全功能详解（桌面工作台、聊天助手、RAG 与查询知识库、学习模式、云盘、权限与计费）。
