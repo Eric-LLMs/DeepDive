@@ -3,10 +3,6 @@
 [English](README.md) · [中文](README.zh-CN.md)
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![React](https://img.shields.io/badge/React-18-20232A?logo=react&logoColor=61DAFB)](https://react.dev/)
-[![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
 DeepDive is an **AI-native learning and research workspace** — a self-hosted environment for reading, watching, understanding, researching, and creating with your own materials, designed to keep your data and AI workloads within your own infrastructure and under your control. It combines a document and media workspace with AI chat, memory, RAG, agents, research workflows, and persistent knowledge, so your materials become an active part of the AI interaction rather than just file attachments.
 
