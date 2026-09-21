@@ -2,11 +2,11 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![React](https://img.shields.io/badge/React-18-20232A?logo=react&logoColor=61DAFB)](https://react.dev/)
 [![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 DeepDive 是一个 **AI 原生的学习与研究工作空间**——一个可自托管的环境，让你基于自己的资料进行阅读、观看、理解、研究与创作，并将数据与 AI 工作负载运行在自己的基础设施之中，并由自己掌控。它将文档与媒体工作空间，与 AI 对话、记忆、RAG、Agent、研究工作流和持久化知识结合起来，让你的资料不再只是上传给 AI 的文件，而是成为 AI 交互与持续工作的核心上下文。
 
@@ -192,4 +192,4 @@ LiteLLM 网关将虚拟模型 `deepdive-chat` 路由到任意 OpenAI 兼容上�
 
 ## 📝 许可证
 
-本项目基于 [MIT License](LICENSE) 开源。
+本项目基于 [GNU General Public License v3.0](LICENSE) 开源,详见 [LICENSE](LICENSE) 文件。

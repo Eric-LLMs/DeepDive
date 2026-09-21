@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "AI learning workbench: vocabulary + video + document + AI assistant"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "GPL-3.0-only"
 dependencies = [
     # Web / API
     "fastapi>=0.110",
