@@ -2,7 +2,7 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![React](https://img.shields.io/badge/React-18-20232A?logo=react&logoColor=61DAFB)](https://react.dev/)
@@ -192,4 +192,4 @@ LiteLLM 网关将虚拟模型 `deepdive-chat` 路由到任意 OpenAI 兼容上�
 
 ## 📝 许可证
 
-本项目基于 [GNU General Public License v3.0](LICENSE) 开源,详见 [LICENSE](LICENSE) 文件。
+本项目基于 [GNU Affero General Public License v3.0](LICENSE) 开源,详见 [LICENSE](LICENSE) 文件。
