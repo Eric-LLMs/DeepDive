@@ -877,8 +877,10 @@ async def init_db() -> None:
             sql = path.read_text(encoding="utf-8")
             async with conn.transaction():
                 await conn.execute(sql)
+                # 0001_init.sql (pg_dump) leaves search_path='' for this connection,
+                # so the bookkeeping INSERT must be schema-qualified.
                 await conn.execute(
-                    "INSERT INTO schema_migrations (version, name) VALUES ($1, $2)",
+                    "INSERT INTO public.schema_migrations (version, name) VALUES ($1, $2)",
                     version,
                     path.name,
                 )
