@@ -262,3 +262,8 @@ def test_orchestrator_resolves_agent_plan_and_executor():
     assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.LOCAL_RAG)), RetrievalExecutor)
     # ...while a still-unmapped kind degrades to the agent branch, never raising.
     assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.COMPOSITE)), AgentExecutor)
+    # Fail-Closed is STRUCTURAL: no WEB executor is registered anywhere, so a private
+    # turn's EscalateToAgent hand-back can only land on the Agent — the control plane
+    # physically cannot route LOCAL_RAG -> WEB, and the Agent's own web use stays a
+    # visible agent-level decision exactly as before Phase 4.
+    assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.WEB)), AgentExecutor)

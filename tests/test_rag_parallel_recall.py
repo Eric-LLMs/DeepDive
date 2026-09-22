@@ -142,3 +142,83 @@ async def test_non_consecutive_recall_nodes_stay_sequential():
     ))
     res = await pipe.trace("q")
     assert [t.name for t in res["trace"]] == ["vector_recall", "rrf_fusion", "keyword_recall"]
+
+
+# ── Evidence the optimization is REAL and SEMANTICS-FREE ─────────────────────────
+
+class _Timed:
+    """Records its own wall-clock window on the event loop so overlap is observable."""
+
+    def __init__(self, hits, delay):
+        self.hits = hits
+        self.delay = delay
+        self.window: tuple[float, float] | None = None
+
+    async def recall(self, query, embedding, top_k, filters=None):
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        await asyncio.sleep(self.delay)
+        self.window = (t0, loop.time())
+        return self.hits
+
+
+async def test_pair_really_overlaps_in_time():
+    # Not just "results are the same" — the two channels are CONCURRENT: their sleep
+    # windows intersect and total wall time is far under the sequential sum (2*d).
+    d = 0.08
+    vec, kw = _Timed([_hit("v1")], d), _Timed([_hit("k1")], d)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    hits = await _pipe(vec, kw).retrieve("q")
+    elapsed = loop.time() - t0
+    assert [h["id"] for h in hits] == ["v1", "k1"]
+    assert vec.window[0] < kw.window[1] and kw.window[0] < vec.window[1]
+    assert elapsed < 1.5 * d  # sequential would be >= 2*d
+
+
+@pytest.mark.parametrize("kw_down", [False, True], ids=["both-up", "keyword-down"])
+async def test_ab_diff_parallel_matches_sequential(monkeypatch, kw_down):
+    # Same inputs, same node config; the ONLY difference is the pairing switch. The
+    # sequential run (pre-Phase-4 contract, forced by emptying _RECALL_NAMES) is the
+    # oracle: hits, per-node trace (name/status/out — ms excluded as timing noise) and
+    # the error list must be IDENTICAL, including when one channel is down.
+    import rag.pipeline.executor as ex
+
+    def _fresh():
+        return _pipe(_SlowVec([_hit("v1"), _hit("v2")]), _FastKw([_hit("k1")], raise_=kw_down))
+
+    par = await _fresh().trace("q", filters={"user_id": "u"})
+    monkeypatch.setattr(ex, "_RECALL_NAMES", frozenset())  # pure sequential fallback
+    seq = await _fresh().trace("q", filters={"user_id": "u"})
+
+    assert par["hits"] == seq["hits"]
+    assert [(t.name, t.status, t.out) for t in par["trace"]] == \
+        [(t.name, t.status, t.out) for t in seq["trace"]]
+    assert par["errors"] == seq["errors"]
+
+
+class _FakeRedis:
+    def __init__(self):
+        self.store: dict[str, object] = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def setex(self, key, ttl, value):
+        self.store[key] = value
+
+
+async def test_cache_seam_unchanged_by_pair(monkeypatch):
+    # The cache wraps ABOVE the pipeline, so the pair is invisible to it: a second
+    # identical retrieve() is served from cache without re-entering either channel.
+    from rag import query_cache
+
+    vec, kw = _SlowVec([_hit("v1")]), _FastKw([_hit("k1")])
+    monkeypatch.setattr(query_cache, "_client", _FakeRedis())
+    cached = query_cache.CachedRetriever(_pipe(vec, kw), ttl_seconds=60)
+
+    first = await cached.retrieve("q", 5, {"user_id": "u"})
+    second = await cached.retrieve("q", 5, {"user_id": "u"})
+    assert [h["id"] for h in first] == ["v1", "k1"]
+    assert second == first
+    assert len(vec.filters_seen) == 1 and len(kw.filters_seen) == 1  # second call: cache hit
