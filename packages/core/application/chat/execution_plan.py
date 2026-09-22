@@ -39,7 +39,8 @@ class PolicyContext:
     direct_fast_path_enabled: bool = False  # Phase 2
     viewer_fast_path_enabled: bool = False  # Phase 3
     retrieval_fast_path_enabled: bool = False  # Phase 4
-    action_enabled: bool = False           # Phase 5
+    action_enabled: bool = False           # Phase 5A
+    composite_enabled: bool = False        # Phase 5B
     web_enabled: bool = False              # later
 
 
@@ -62,6 +63,7 @@ class ExecutionPlan:
     requires_viewer: bool = False
     requires_retrieval: bool = False
     action: dict | None = None
+    subrequests: tuple[str, ...] = ()
     reason: str = ""
     source_policy: str | None = None
 
@@ -80,7 +82,10 @@ def _source_policy(requirements, kind: PlanKind) -> str | None:
     """
     if requirements.private_only and requirements.needs_web is not Signal.HIGH:
         return "private_only"
-    if kind is PlanKind.LOCAL_RAG and not requirements.external_ok:
+    # COMPOSITE carries a private-recall sub-request, so it fences exactly like
+    # LOCAL_RAG: an escalation inherits the same source policy (the Sandbox keeps
+    # HARD-DENYing NETWORK for private_only/private_first after the swap).
+    if kind in (PlanKind.LOCAL_RAG, PlanKind.COMPOSITE) and not requirements.external_ok:
         return "private_first"
     return None
 
@@ -147,6 +152,31 @@ def build_execution_plan(
             reason="phase4: private-corpus demand is the sole capability -> staged RAG",
         )
 
+    # ── Phase 5A: ACTION (typed direct dispatch over the registered tool registry) ──
+    # L0's extractor already certified ONE allowlisted registered tool with fully-
+    # determined args. An unregistered/ambiguous/under-parameterized turn never gets
+    # ``requested_action`` set, so it maps to AGENT exactly as before this phase —
+    # the policy mapper validates NOTHING (schema gate + authz live in the executor
+    # and the host seam).
+    if policy.action_enabled and _is_action_eligible(requirements):
+        return _plan(
+            requirements, PlanKind.ACTION, action=dict(requirements.requested_action),
+            requires_memory=False,
+            reason="phase5a: certified single registered tool, args fully determined -> action",
+        )
+
+    # ── Phase 5B: COMPOSITE (static independent fan-out: viewer text + private recall) ─
+    # Only the {viewer + private} pair is v1-eligible — both inputs are independent and
+    # known BEFORE execution, so they gather once and aggregate in one generation.
+    # Anything sequenced/dynamic was never certified HIGH by L0.
+    if policy.composite_enabled and _is_composite_eligible(requirements):
+        return _plan(
+            requirements, PlanKind.COMPOSITE,
+            requires_viewer=True, requires_retrieval=True, requires_memory=False,
+            subrequests=("viewer_text", "private_recall"),
+            reason="phase5b: independent viewer+private inputs -> composite",
+        )
+
     return _agent(requirements, "no enabled fast path matches this requirement set -> agent")
 
 
@@ -181,6 +211,29 @@ def _is_retrieval_eligible(requirements: TurnRequirements) -> bool:
     return (
         requirements.needs_private is Signal.HIGH
         and requirements.needs_viewer is Signal.LOW
+        and requirements.needs_web is Signal.LOW
+        and requirements.needs_action is Signal.LOW
+        and not requirements.needs_memory
+    )
+
+
+def _is_action_eligible(requirements: TurnRequirements) -> bool:
+    """The ACTION guard: L0 certified a registered-tool direct request. ``requested_action``
+    is ONLY ever set by the DIRECT_TOOLS extractor, so presence is the full contract;
+    no second registry check here (the executor's schema gate owns that)."""
+    return (
+        requirements.needs_action is Signal.HIGH
+        and requirements.requested_action is not None
+        and requirements.needs_web is Signal.LOW
+        and not requirements.needs_memory
+    )
+
+
+def _is_composite_eligible(requirements: TurnRequirements) -> bool:
+    """The COMPOSITE v1 guard: exactly the {viewer + private} pair, nothing else."""
+    return (
+        requirements.needs_viewer is Signal.HIGH
+        and requirements.needs_private is Signal.HIGH
         and requirements.needs_web is Signal.LOW
         and requirements.needs_action is Signal.LOW
         and not requirements.needs_memory

@@ -115,6 +115,8 @@ class Settings(BaseSettings):
     chat_direct_fast_path_enabled: bool = False  # Phase 2: tool-less direct answers
     chat_viewer_fast_path_enabled: bool = False  # Phase 3: grounded over injected blocks
     chat_retrieval_fast_path_enabled: bool = False  # Phase 4: staged RAG (shared pipeline, fail-closed)
+    chat_action_fast_path_enabled: bool = False     # Phase 5A: registered typed actions (allowlist)
+    chat_composite_fast_path_enabled: bool = False  # Phase 5B: static independent composite (viewer+private)
     # Confidence gate: the L0 signal engine only routes DIRECT when every capability
     # demand is LOW, needs_memory is False, and the message is short/plain. Longer
     # turns (or ambiguous intent) stay on the Agent path.

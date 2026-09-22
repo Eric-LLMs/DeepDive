@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
+from core.application.chat.actions import match_direct_tool
 from core.config import settings
 
 
@@ -148,6 +149,17 @@ def _lex_allow_external(text: str) -> bool:
     return bool(_ALLOW_EXTERNAL_PAT.search(text))
 
 
+# Dynamic A→B dependency markers (Phase 5B): COMPOSITE only aggregates inputs that are
+# INDEPENDENT and known BEFORE execution. Sequencing words mean the second step is
+# parameterized by the first's output (multi-hop) — that is the Agent's job, so a turn
+# carrying one can NEVER certify as composite.
+_SEQUENCE_PAT = re.compile(
+    r"(?:然后|接着|再基于|据此|based on (?:that|those|the former|it)|thereupon|\bthen\b)"
+    r"|先.{0,40}?再",
+    re.IGNORECASE,
+)
+
+
 def _memory_trigger(text: str) -> bool:
     lowered = text.lower()
     return any(w in lowered for w in settings.memory_recall_trigger_words)
@@ -223,6 +235,22 @@ def resolve_requirements(ctx, message: str) -> TurnRequirements:
 
     from core.application.chat.sanitization import is_pure_user_text, sanitize_for_direct
 
+    # ACTION (Phase 5): the DIRECT_TOOLS extractor already abstained on every unclear
+    # case (no phrase, undetermined slot, compound demand, ambiguity between two
+    # specs) — a non-None hit certifies a single registered tool with fully-determined
+    # args. A co-occurring web demand or memory trigger still forces the Agent (the
+    # turn is then not "exactly one capability"); attach/viewer presence does NOT block
+    # because for the asset tools the attach IS the parameter. Zero-pollution contract:
+    # on ANY None below, the turn falls through UNTOUCHED — requested_action is simply
+    # never set, and the Agent path later receives the original user_text byte-for-byte.
+    action_hit = match_direct_tool(text, ctx)
+    if action_hit is not None and needs_web is Signal.LOW and not needs_memory:
+        return TurnRequirements(
+            needs_action=Signal.HIGH, requested_action=action_hit,
+            complexity=Complexity.LOW, confidence=Confidence.HIGH,
+            private_only=private_only, external_ok=external_ok,
+        )
+
     # VIEWER (Phase 3): the content is ALREADY on screen and injected as text, and no
     # OTHER capability is demanded — a single grounded pass over the blocks is the whole
     # job. The message need not be short (it references the shown content), only pure.
@@ -237,6 +265,29 @@ def resolve_requirements(ctx, message: str) -> TurnRequirements:
     ):
         return TurnRequirements(
             needs_viewer=Signal.HIGH, complexity=Complexity.LOW, confidence=Confidence.HIGH,
+        )
+
+    # COMPOSITE (Phase 5B): the ONLY static composite v1 — viewer content ALREADY
+    # injected as text PLUS a private-corpus recall demand, both inputs independent and
+    # known before execution. A sequencing word ("然后/先…再/then/based on that") means
+    # the second step is parameterized by the first's output (multi-hop) — that is the
+    # Agent's job, so such turns can NEVER certify here. Attach excluded: an attached
+    # document is a precise ``read_document`` target, not semantic recall input.
+    if (
+        viewer_active
+        and _viewer_ground_eligible(viewer)
+        and _lex_private(text)
+        and not attach_present
+        and needs_web is Signal.LOW
+        and needs_action is Signal.LOW
+        and not needs_memory
+        and is_pure_user_text(text)
+        and not _SEQUENCE_PAT.search(text)
+    ):
+        return TurnRequirements(
+            needs_private=Signal.HIGH, needs_viewer=Signal.HIGH,
+            complexity=Complexity.MODERATE, confidence=Confidence.HIGH,
+            private_only=private_only, external_ok=external_ok,
         )
 
     # LOCAL_RAG (Phase 4): a pure private-corpus QUESTION — the lexical private demand is

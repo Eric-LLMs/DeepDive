@@ -27,6 +27,7 @@ from core.application.chat.execution_plan import (
     PolicyContext,
     build_execution_plan,
 )
+from core.application.chat.executors.action import ActionExecutor
 from core.application.chat.executors.agent import AgentExecutor
 from core.application.chat.executors.base import (
     ChatDeps,
@@ -34,6 +35,7 @@ from core.application.chat.executors.base import (
     EscalateToAgent,
     TurnRequest,
 )
+from core.application.chat.executors.composite import CompositeExecutor
 from core.application.chat.executors.direct import DirectExecutor
 from core.application.chat.executors.retrieval import RetrievalExecutor
 from core.application.chat.executors.viewer import ViewerExecutor
@@ -63,8 +65,14 @@ _PRIVATE_ONLY_NOTE = (
 )
 
 
-def _escalation_note(source_policy: str | None) -> str:
-    if source_policy in ("private_only", "private_first"):
+def _escalation_note(plan: ExecutionPlan) -> str | None:
+    """Honest-disclosure note for escalations from branches that ACTUALLY searched the
+    private corpus (LOCAL_RAG / COMPOSITE). Any other branch (DIRECT / VIEWER / ACTION)
+    escalates with the user's text BYTE-FOR-BYTE untouched — a fast path that abstained
+    must leave zero trace in what the Agent receives. ``None`` = prepend nothing."""
+    if not plan.requires_retrieval:
+        return None
+    if plan.source_policy in ("private_only", "private_first"):
         return _HONEST_NOTE + _PRIVATE_ONLY_NOTE
     return _HONEST_NOTE
 
@@ -79,6 +87,8 @@ class TurnOrchestrator:
             DirectExecutor.kind: DirectExecutor(),
             ViewerExecutor.kind: ViewerExecutor(),
             RetrievalExecutor.kind: RetrievalExecutor(),
+            ActionExecutor.kind: ActionExecutor(),
+            CompositeExecutor.kind: CompositeExecutor(),
         }
 
     # ── plan resolution ──────────────────────────────────────────────────────────
@@ -91,6 +101,8 @@ class TurnOrchestrator:
             direct_fast_path_enabled=settings.chat_direct_fast_path_enabled,
             viewer_fast_path_enabled=settings.chat_viewer_fast_path_enabled,
             retrieval_fast_path_enabled=settings.chat_retrieval_fast_path_enabled,
+            action_enabled=settings.chat_action_fast_path_enabled,
+            composite_enabled=settings.chat_composite_fast_path_enabled,
         )
         if policy.fast_paths_enabled:
             requirements = resolve_requirements(ctx, ctx.body.message)
@@ -134,7 +146,9 @@ class TurnOrchestrator:
                     "chat.plan-escalated from=%s to=agent reason=%s",
                     plan.kind.value, esc.reason,
                 )
-                ctx.user_text = _escalation_note(plan.source_policy) + "\n\n" + ctx.user_text
+                note = _escalation_note(plan)
+                if note:
+                    ctx.user_text = note + "\n\n" + ctx.user_text
                 executor = self._executors[AgentExecutor.kind]
                 result = await executor.run(req)
         finally:
@@ -266,8 +280,11 @@ class TurnOrchestrator:
                     switched = True
                     stale_sentinels += 1  # the escalated pump still enqueues its sentinel
                     # Pre-first-event only: prepend the honest-disclosure instruction to
-                    # the Agent replay (nothing has been committed to the client yet).
-                    ctx.user_text = _escalation_note(plan.source_policy) + "\n\n" + ctx.user_text
+                    # the Agent replay ONLY when the abandoned branch had actually
+                    # searched the corpus; every other escalation is zero-pollution.
+                    note = _escalation_note(plan)
+                    if note:
+                        ctx.user_text = note + "\n\n" + ctx.user_text
                     pump_task = asyncio.create_task(pump(self._executors[AgentExecutor.kind]))
                     continue
                 if data["type"] == "done":

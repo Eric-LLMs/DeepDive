@@ -225,6 +225,62 @@ async def _resolve_identity(request: Request, body: ChatRequest, user: AuthUser 
     }
 
 
+# ── Phase 5A direct-dispatch seam (see ChatDeps.run_tool contract) ──────────────────
+# The ACTION executor calls the SAME ToolRuntime.execute the Agent loop uses: the
+# pre-execute approval waterfall, monotonic sandbox guards and tool bodies are all
+# inherited — this seam adds NO second execution framework, it only skips the ReAct
+# flow control for turns L0 certified as fully-determined single-tool requests.
+#
+# Failure classification (side-effect boundary isolation):
+#   * body raised / returned ``"preflight: …"``, unknown tool, invalid args, or ANY
+#     failure of a READ-only tool  ⇒ the side effect provably did not happen →
+#     ActionPreflightFailure → the executor escalates (Agent may clarify);
+#   * pre-body DENIAL (approval refused / sandbox / source-policy guard) ⇒ decided,
+#     terminal, no side effect → {"ok": False, "reason"} — escalating would only make
+#     the Agent re-trigger the same approval prompt;
+#   * any failure AFTER a MUTATING tool body was entered ⇒ state UNKNOWN → raise so
+#     the executor terminates honestly (never a blind Agent retry duplicating it).
+_MUTATING_DIRECT_TOOLS = frozenset({"create_folder", "add_term"})
+_PRE_BODY_DENIALS = (
+    "tool use denied", "sandbox denied:", "source policy:", "sandbox guard error",
+    "pre-execute failed", "approval required but no approver registered",
+)
+
+
+async def _run_tool(tool: str, args: dict, ctx) -> dict:
+    from agent.engine.context import _TURN_CTX, AgentTurn
+    from agent.engine.decisions import ToolExecution
+    from core.application.chat.actions import ActionPreflightFailure
+
+    runtime = get_agent().runtime
+    # Bind a turn context so the sandbox guards see this dispatch exactly like an
+    # agent turn: the turn's SOURCE POLICY fence (and any handoff context) applies
+    # unchanged; approvals flow through the ApprovalStore the stream pump bound.
+    token = _TURN_CTX.set(AgentTurn(user_msg=ctx.user_text, context=dict(ctx.agent_context or {})))
+    try:
+        exec = ToolExecution(call_id="chat-action", name=tool, arguments=dict(args))
+        result = await runtime.execute(exec)
+    finally:
+        _TURN_CTX.reset(token)
+
+    if not result.is_error:
+        return {"ok": True, "output": str(result.value if result.value is not None else "")}
+
+    msg = (result.error.message or "") if result.error else ""
+    info = dict(getattr(result.error, "info", None) or {})
+    name = info.get("name")
+    if name in ("unknown_tool", "invalid_args") or msg.startswith("preflight:"):
+        raise ActionPreflightFailure(msg)
+    if tool not in _MUTATING_DIRECT_TOOLS:
+        # Nothing this tool can do has a side effect — the Agent fallback loses nothing.
+        raise ActionPreflightFailure(msg)
+    if name is None and msg.startswith(_PRE_BODY_DENIALS):
+        return {"ok": False, "reason": msg}
+    # Mutating tool + a post-body failure class (tool_error w/o preflight prefix,
+    # invalid_output, post_blocked, execute failed) → state UNKNOWN.
+    raise RuntimeError(f"action post-execution failure ({tool}): {msg}")
+
+
 def _build_chat_deps(queue: TaskQueue, drive: DriveService) -> ChatDeps:
     """Wire the control plane's dependency bundle from this module's globals.
 
@@ -247,6 +303,8 @@ def _build_chat_deps(queue: TaskQueue, drive: DriveService) -> ChatDeps:
         # The staged RAG branch (Phase 4) answers through the SAME cache-wrapped seam
         # the agent's rag_search tool calls — one ACL / tenant / cache surface.
         retriever=get_retriever(),
+        # Phase 5A ACTION branch dispatches registered tools through the SAME runtime.
+        run_tool=_run_tool,
     )
 
 

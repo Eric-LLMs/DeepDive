@@ -61,6 +61,22 @@ class ChatDeps:
     # ACL / tenant / query-cache semantics for free (Phase 4). None = not wired →
     # the LOCAL_RAG branch degrades to the Agent before any retrieval is attempted.
     retriever: Any = None
+    # The Phase 5A direct-dispatch seam: await run_tool(tool, args, ctx) ->
+    #   {"ok": True, "output": str}   — registered tool executed, deterministic result;
+    #   {"ok": False, "reason": str}  — a DECIDED, terminal denial (provable non-execution
+    #                                    that the Agent clarifying would not change:
+    #                                    an approval denial, a policy/sandbox guard);
+    # raises ActionPreflightFailure  — ONLY when the seam can GUARANTEE the side effect
+    #                                    did not happen (schema/未注册/"preflight:" errors
+    #                                    the Agent may take over and clarify);
+    # raises anything else           — the tool body was ENTERED and the state is
+    #                                    UNKNOWN: the executor must terminate honestly
+    #                                    and NEVER re-run the action via the Agent
+    #                                    (no duplicate folder / duplicate term).
+    # The host wires it through the SAME ToolRuntime.execute the Agent uses (approval,
+    # guards, ACL pipeline inherited) — the fast path is flow control, never a second
+    # capability registry. None = not wired → the ACTION branch degrades to the Agent.
+    run_tool: Callable[[str, dict, Any], Awaitable[dict]] | None = None
 
 
 class EscalateToAgent(Exception):

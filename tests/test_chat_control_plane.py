@@ -260,10 +260,14 @@ def test_orchestrator_resolves_agent_plan_and_executor():
     # DIRECT / VIEWER / LOCAL_RAG are now registered branches...
     assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.DIRECT)), DirectExecutor)
     assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.LOCAL_RAG)), RetrievalExecutor)
-    # ...while a still-unmapped kind degrades to the agent branch, never raising.
-    assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.COMPOSITE)), AgentExecutor)
+    # ...and Phase 5 registered ACTION + COMPOSITE alongside them.
+    from core.application.chat.executors.action import ActionExecutor
+    from core.application.chat.executors.composite import CompositeExecutor
+    assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.ACTION)), ActionExecutor)
+    assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.COMPOSITE)), CompositeExecutor)
     # Fail-Closed is STRUCTURAL: no WEB executor is registered anywhere, so a private
     # turn's EscalateToAgent hand-back can only land on the Agent — the control plane
     # physically cannot route LOCAL_RAG -> WEB, and the Agent's own web use stays a
-    # visible agent-level decision exactly as before Phase 4.
+    # visible agent-level decision exactly as before Phase 4. WEB is also the example
+    # of an unmapped kind: executor_for must degrade it to AGENT, never raise.
     assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.WEB)), AgentExecutor)
