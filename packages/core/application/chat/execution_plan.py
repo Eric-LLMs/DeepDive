@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from core.application.chat.understanding import Confidence, TurnRequirements
+from core.application.chat.understanding import Confidence, Signal, TurnRequirements
 
 
 class PlanKind(str, Enum):
@@ -79,10 +79,31 @@ def build_execution_plan(
       * side-effect actions with unregistered templates -> AGENT or explicit error.
     """
     if requirements.confidence is not Confidence.HIGH:
-        return _agent(f"phase1: confidence={requirements.confidence.value} -> agent")
+        return _agent(f"confidence={requirements.confidence.value} -> agent")
     if not policy.fast_paths_enabled:
         # Control plane ships dark: the legacy full-agent path stays authoritative.
-        return _agent("phase1: fast paths disabled -> agent")
+        return _agent("fast paths disabled -> agent")
 
-    # ── Phase 2+ mappings land under the gate above, one kind per phase ──────────
-    return _agent("fast path not implemented for this requirement set -> agent")
+    # ── Phase 2: DIRECT ───────────────────────────────────────────────────────────
+    # A HIGH-confidence, zero-demand, short+pure turn is the direct case. Any
+    # capability still HIGH (defensive — L0 gates them, this is the policy guard) or a
+    # memory flag disqualifies DIRECT: memory recall authority lives with
+    # MemoryService, not this path, so a recall-eligible turn stays on the Agent.
+    if policy.direct_fast_path_enabled and _is_direct_eligible(requirements):
+        return ExecutionPlan(
+            kind=PlanKind.DIRECT, requires_memory=False,
+            reason="phase2: short pure turn, no capability demand -> direct",
+        )
+
+    return _agent("no enabled fast path matches this requirement set -> agent")
+
+
+def _is_direct_eligible(requirements: TurnRequirements) -> bool:
+    """The DIRECT capability-freeness guard (private/web/viewer/action all LOW, no memory)."""
+    return (
+        requirements.needs_private is Signal.LOW
+        and requirements.needs_web is Signal.LOW
+        and requirements.needs_viewer is Signal.LOW
+        and requirements.needs_action is Signal.LOW
+        and not requirements.needs_memory
+    )

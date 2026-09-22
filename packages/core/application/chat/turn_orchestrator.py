@@ -28,9 +28,11 @@ from core.application.chat.execution_plan import (
     build_execution_plan,
 )
 from core.application.chat.executors.agent import AgentExecutor
-from core.application.chat.executors.base import ChatDeps, TurnRequest
+from core.application.chat.executors.base import ChatDeps, ChatExecutor, TurnRequest
+from core.application.chat.executors.direct import DirectExecutor
 from core.application.chat.lifecycle import finalize_turn, handle_research_post_turn
-from core.application.chat.understanding import TurnRequirements
+from core.application.chat.understanding import TurnRequirements, resolve_requirements
+from core.config import settings
 from core.logger import reset_log_context, set_log_context
 
 logger = logging.getLogger(__name__)
@@ -39,18 +41,29 @@ logger = logging.getLogger(__name__)
 class TurnOrchestrator:
     def __init__(self, deps: ChatDeps) -> None:
         self.deps = deps
-        # Phase 1: only the fallback branch is registered. Later phases extend this
-        # registry one kind at a time behind PolicyContext gates.
-        self._executors = {AgentExecutor.kind: AgentExecutor()}
+        # Each phase registers its branch here; the PolicyContext gates below decide
+        # which kind a turn resolves to, so registration is inert until enabled.
+        self._executors = {
+            AgentExecutor.kind: AgentExecutor(),
+            DirectExecutor.kind: DirectExecutor(),
+        }
 
     # ── plan resolution ──────────────────────────────────────────────────────────
     def resolve_plan(self, ctx: ChatTurnContext) -> ExecutionPlan:
-        # Phase 1: understanding is dark (ABSTAIN) and fast paths are off, so this
-        # always yields AGENT — the kernel keeps owning memory/ACL/tool routing.
-        requirements = TurnRequirements()
-        return build_execution_plan(requirements, PolicyContext())
+        # Settings-driven gates (all OFF by default = the Phase 1 dark launch). When
+        # the master gate is closed the requirement set is irrelevant to routing, so
+        # we skip the L0 pass entirely and keep the neutral ABSTAIN contract.
+        policy = PolicyContext(
+            fast_paths_enabled=settings.chat_fast_paths_enabled,
+            direct_fast_path_enabled=settings.chat_direct_fast_path_enabled,
+        )
+        if policy.fast_paths_enabled:
+            requirements = resolve_requirements(ctx, ctx.body.message)
+        else:
+            requirements = TurnRequirements()
+        return build_execution_plan(requirements, policy)
 
-    def executor_for(self, plan: ExecutionPlan) -> AgentExecutor:
+    def executor_for(self, plan: ExecutionPlan) -> ChatExecutor:
         executor = self._executors.get(plan.kind)
         if executor is None:  # an unmapped kind must never hard-fail the turn
             logger.warning("no executor for plan kind=%s; falling back to AGENT", plan.kind)

@@ -106,6 +106,18 @@ class Settings(BaseSettings):
     deck_worker_concurrency: int = 8      # LLM calls one worker job may keep in flight
     deck_slide_timeout_s: float = 180.0   # per-attempt deadline; a timed-out page retries alone
 
+    # ── Chat control plane (Phase 2: DIRECT fast path) ──────────────────────────
+    # All OFF by default = dark launch: every turn keeps the legacy AgentExecutor
+    # path byte-for-byte. Flip the master gate only after the understanding signals
+    # and DIRECT TTFT are validated on a golden set; per-kind gates stay closed until
+    # their phase lands. ``chat_direct_*`` are the Phase 2 knobs.
+    chat_fast_paths_enabled: bool = False       # master switch for all fast paths
+    chat_direct_fast_path_enabled: bool = False  # Phase 2: tool-less direct answers
+    # Confidence gate: the L0 signal engine only routes DIRECT when every capability
+    # demand is LOW, needs_memory is False, and the message is short/plain. Longer
+    # turns (or ambiguous intent) stay on the Agent path.
+    chat_direct_max_chars: int = 400            # a pure user message must be <= this
+
     # ── Web search (agent web_search tool) ──
     # provider is free text: aggregate/keyless (no key) | duckduckgo (no key) | tavily |
     # bing | google (see web_search.py). Defaults to the keyless multi-engine aggregate so
