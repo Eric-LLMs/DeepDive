@@ -31,6 +31,9 @@ class ViewerDeps:
     validate_citations: Callable[..., tuple[list, list]]
     citation_map: Callable[..., dict]
     snapshot: Callable[..., dict]
+    # Renders the injected reference blocks into the grounded-prompt section (the
+    # viewer fast path reuses the SAME renderer the Agent path's DYNAMIC_SUFFIX uses).
+    render_reference: Callable[..., str] = lambda blocks: ""
 
 
 @dataclass

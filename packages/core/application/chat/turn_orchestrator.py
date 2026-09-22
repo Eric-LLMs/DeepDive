@@ -30,6 +30,7 @@ from core.application.chat.execution_plan import (
 from core.application.chat.executors.agent import AgentExecutor
 from core.application.chat.executors.base import ChatDeps, ChatExecutor, TurnRequest
 from core.application.chat.executors.direct import DirectExecutor
+from core.application.chat.executors.viewer import ViewerExecutor
 from core.application.chat.lifecycle import finalize_turn, handle_research_post_turn
 from core.application.chat.understanding import TurnRequirements, resolve_requirements
 from core.config import settings
@@ -46,6 +47,7 @@ class TurnOrchestrator:
         self._executors = {
             AgentExecutor.kind: AgentExecutor(),
             DirectExecutor.kind: DirectExecutor(),
+            ViewerExecutor.kind: ViewerExecutor(),
         }
 
     # ── plan resolution ──────────────────────────────────────────────────────────
@@ -56,6 +58,7 @@ class TurnOrchestrator:
         policy = PolicyContext(
             fast_paths_enabled=settings.chat_fast_paths_enabled,
             direct_fast_path_enabled=settings.chat_direct_fast_path_enabled,
+            viewer_fast_path_enabled=settings.chat_viewer_fast_path_enabled,
         )
         if policy.fast_paths_enabled:
             requirements = resolve_requirements(ctx, ctx.body.message)

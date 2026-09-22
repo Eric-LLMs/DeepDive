@@ -95,6 +95,17 @@ def build_execution_plan(
             reason="phase2: short pure turn, no capability demand -> direct",
         )
 
+    # ── Phase 3: VIEWER (grounded over already-injected text blocks) ──────────────
+    # Only a turn the L0 engine certified as needing the viewer content, with no other
+    # capability demand, maps here. ``requires_viewer`` is a marker for the executor;
+    # the STUB (read_document) and image (vision) paths were never certified HIGH, so
+    # opening a PDF with nothing injected still falls through to the Agent below.
+    if policy.viewer_fast_path_enabled and _is_viewer_eligible(requirements):
+        return ExecutionPlan(
+            kind=PlanKind.VIEWER, requires_viewer=True, requires_memory=False,
+            reason="phase3: viewer content already injected as text -> viewer-grounded",
+        )
+
     return _agent("no enabled fast path matches this requirement set -> agent")
 
 
@@ -104,6 +115,18 @@ def _is_direct_eligible(requirements: TurnRequirements) -> bool:
         requirements.needs_private is Signal.LOW
         and requirements.needs_web is Signal.LOW
         and requirements.needs_viewer is Signal.LOW
+        and requirements.needs_action is Signal.LOW
+        and not requirements.needs_memory
+    )
+
+
+def _is_viewer_eligible(requirements: TurnRequirements) -> bool:
+    """The VIEWER guard: the viewer is the SOLE demanded capability (HIGH), everything
+    else LOW and no memory — so the answer is grounded on the injected blocks alone."""
+    return (
+        requirements.needs_viewer is Signal.HIGH
+        and requirements.needs_private is Signal.LOW
+        and requirements.needs_web is Signal.LOW
         and requirements.needs_action is Signal.LOW
         and not requirements.needs_memory
     )

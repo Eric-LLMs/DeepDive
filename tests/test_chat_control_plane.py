@@ -65,6 +65,67 @@ def test_direct_kind_maps_only_under_both_gates():
     assert build_execution_plan(demanding, both_on).kind is PlanKind.AGENT
 
 
+# ── Phase 3 VIEWER policy mapping ────────────────────────────────────────────────
+
+def _viewer_req(**over):
+    kw = {"needs_viewer": Signal.HIGH, "confidence": Confidence.HIGH}
+    kw.update(over)
+    return TurnRequirements(**kw)
+
+
+def test_viewer_kind_maps_under_viewer_gate_only():
+    all_on = PolicyContext(
+        fast_paths_enabled=True, direct_fast_path_enabled=True, viewer_fast_path_enabled=True,
+    )
+    plan = build_execution_plan(_viewer_req(), all_on)
+    assert plan.kind is PlanKind.VIEWER and plan.requires_viewer is True
+    # Viewer gate OFF → a viewer-demand turn (needs_viewer HIGH) is not DIRECT either,
+    # so it falls through to AGENT.
+    only_direct = PolicyContext(fast_paths_enabled=True, direct_fast_path_enabled=True)
+    assert build_execution_plan(_viewer_req(), only_direct).kind is PlanKind.AGENT
+
+
+def test_viewer_demand_with_other_capability_stays_agent():
+    all_on = PolicyContext(
+        fast_paths_enabled=True, direct_fast_path_enabled=True, viewer_fast_path_enabled=True,
+    )
+    # The viewer must be the SOLE demand — a co-occurring private/web/memory need keeps
+    # the turn on the Agent (which owns read_document / rag / web / recall).
+    for over in (
+        {"needs_private": Signal.HIGH},
+        {"needs_web": Signal.HIGH},
+        {"needs_action": Signal.HIGH},
+        {"needs_memory": True},
+    ):
+        assert build_execution_plan(_viewer_req(**over), all_on).kind is PlanKind.AGENT, over
+
+
+def test_viewer_ground_eligible_rules():
+    from core.application.chat.understanding import _viewer_ground_eligible
+
+    b = lambda kind, img=None: SimpleNamespace(kind=kind, image_asset_id=img)
+    assert _viewer_ground_eligible({"status": "injected", "blocks": [b("selection")]}) is True
+    assert _viewer_ground_eligible({"status": "injected", "blocks": [b("page")]}) is True
+    # image/roi/frame → needs the vision tool → NOT eligible (media path stays on Agent).
+    assert _viewer_ground_eligible({"status": "injected", "blocks": [b("frame", img="9")]}) is False
+    # stub (document open, nothing injected) → NOT eligible (Open != Inject).
+    assert _viewer_ground_eligible({"status": "stub", "blocks": []}) is False
+    assert _viewer_ground_eligible({"status": "injected", "blocks": []}) is False
+    assert _viewer_ground_eligible(None) is False
+
+
+def test_l0_viewer_injected_text_is_high_but_stub_is_not():
+    # HIGH only for an already-injected TEXT turn with the viewer as the sole demand.
+    inj = _ctx(message="what does this say", viewer={
+        "status": "injected",
+        "blocks": [SimpleNamespace(kind="selection", image_asset_id=None)],
+    })
+    assert resolve_requirements(inj, "what does this say").confidence is Confidence.HIGH
+    # A stub (readable doc open, no selection) must NOT be HIGH → stays on the Agent.
+    stub = _ctx(message="summarize the document", viewer={"status": "stub", "blocks": []})
+    assert resolve_requirements(stub, "summarize the document").confidence is not Confidence.HIGH
+
+
 def test_reason_is_traceable():
     assert "agent" in build_execution_plan(TurnRequirements(), PolicyContext()).reason
 

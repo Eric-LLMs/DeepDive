@@ -33,6 +33,7 @@ from api.routers._shared import (
 from api.schemas import ChatImportRequest, ChatRequest, ChatSessionImportRequest
 from api.viewer_context import (
     build_viewer_blocks,
+    render_viewer_reference,
     validate_viewer_citations,
     viewer_citation_map,
     viewer_snapshot,
@@ -106,6 +107,7 @@ _VIEWER_DEPS = ViewerDeps(
     validate_citations=validate_viewer_citations,
     citation_map=viewer_citation_map,
     snapshot=viewer_snapshot,
+    render_reference=render_viewer_reference,
 )
 
 

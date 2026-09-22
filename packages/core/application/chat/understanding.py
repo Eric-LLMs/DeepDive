@@ -113,15 +113,42 @@ def _memory_trigger(text: str) -> bool:
     return any(w in lowered for w in settings.memory_recall_trigger_words)
 
 
+# Viewer block kinds that are pure TEXT already present in the prompt — a grounded,
+# tool-less answer can serve them. ``roi``/``frame`` are excluded: their pixels are NOT
+# in the prompt and require the Agent's ``vision`` tool, so a turn with one never
+# qualifies here (the media/vision sub-path stays on the Agent, never merged).
+_TEXT_VIEWER_KINDS = frozenset({"selection", "page", "subtitle_window", "full_text", "full_subtitles"})
+
+
+def _viewer_ground_eligible(assembly: dict) -> bool:
+    """True when the assembly has ALREADY injected text content the answer lives in.
+
+    Requires ``status == "injected"`` with at least one text-bearing block and NO
+    image block — the ``"stub"`` status (document open but nothing injected, model must
+    call ``read_document``) deliberately does NOT qualify, so opening a PDF alone can
+    never route this turn onto the viewer fast path.
+    """
+    if not assembly or assembly.get("status") != "injected":
+        return False
+    blocks = assembly.get("blocks") or []
+    if not blocks:
+        return False
+    for b in blocks:
+        kind = getattr(b, "kind", None)
+        if kind not in _TEXT_VIEWER_KINDS or getattr(b, "image_asset_id", None):
+            return False
+    return True
+
+
 def resolve_requirements(ctx, message: str) -> TurnRequirements:
     """L0: classify one turn from base-context facts + cheap lexical patterns.
 
     ``ctx`` is a :class:`~core.application.chat.context.ChatTurnContext` (duck-typed to
     avoid an import cycle); only already-resolved fields are read — no I/O is performed
-    here. Phase 2's target is the *tool-less* direct answer, so this function's job is
-    to confidently ABSTAIN from DIRECT whenever any capability could plausibly be
-    required; a turn only reaches ``Confidence.HIGH`` with all four capability signals
-    LOW when it is short, pure, and shows no private/web/action/viewer/memory demand.
+    here. The engine CONFIDENTLY abstains from a fast path whenever any capability could
+    plausibly be required. Phase 2's DIRECT needs all demands LOW; Phase 3's VIEWER
+    needs the viewer content to be ALREADY injected as text (Open != Inject enforced by
+    the ``injected``-only gate in :func:`_viewer_ground_eligible`).
     """
     text = message or ""
 
@@ -149,9 +176,25 @@ def resolve_requirements(ctx, message: str) -> TurnRequirements:
             complexity=Complexity.COMPLEX, confidence=Confidence.LOW,
         )
 
-    # DIRECT eligibility (Phase 2): pure + short + zero capability demand.
-    from core.application.chat.sanitization import sanitize_for_direct
+    from core.application.chat.sanitization import is_pure_user_text, sanitize_for_direct
 
+    # VIEWER (Phase 3): the content is ALREADY on screen and injected as text, and no
+    # OTHER capability is demanded — a single grounded pass over the blocks is the whole
+    # job. The message need not be short (it references the shown content), only pure.
+    if (
+        viewer_active
+        and is_pure_user_text(text)
+        and _viewer_ground_eligible(viewer)
+        and needs_private is Signal.LOW
+        and needs_web is Signal.LOW
+        and needs_action is Signal.LOW
+        and not needs_memory
+    ):
+        return TurnRequirements(
+            needs_viewer=Signal.HIGH, complexity=Complexity.LOW, confidence=Confidence.HIGH,
+        )
+
+    # DIRECT eligibility (Phase 2): pure + short + zero capability demand.
     clean = sanitize_for_direct(text, max_chars=settings.chat_direct_max_chars)
     if clean is None:
         # Impure / too long → not a direct candidate; let the Agent read the whole message.
@@ -162,8 +205,9 @@ def resolve_requirements(ctx, message: str) -> TurnRequirements:
 
     demands = (needs_private, needs_viewer, needs_action, needs_web)
     if any(s is Signal.HIGH for s in demands) or needs_memory:
-        # Something is needed but which capability is not fully disambiguated here —
-        # hand the whole decision to the Agent (it owns tools + recall authority).
+        # Something is needed but which capability is not fully disambiguated here (or it
+        # needs a tool: a viewer ``stub``/image, private read, web) — hand the decision to
+        # the Agent, which owns tools + recall authority.
         return TurnRequirements(
             needs_private=needs_private, needs_web=needs_web, needs_viewer=needs_viewer,
             needs_action=needs_action, needs_memory=needs_memory, confidence=Confidence.LOW,

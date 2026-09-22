@@ -59,23 +59,28 @@ def _snip(text: str) -> str:
     return text
 
 
-def _build_request(req: TurnRequest) -> list[dict]:
-    """Assemble the single-shot request: system + snipped history + this user turn."""
-    ctx = req.ctx
-    history = [
-        {"role": m["role"], "content": _snip(m["content"])}
-        for m in (ctx.history or [])
-        if isinstance(m.get("content"), str) and m.get("role") in ("user", "assistant")
-    ]
-    return [
-        {"role": "system", "content": DIRECT_SYSTEM},
-        *history,
-        {"role": "user", "content": ctx.user_text},
-    ]
-
-
 class DirectExecutor:
     kind = PlanKind.DIRECT
+
+    # Overridable seam: a subclass (e.g. the viewer branch) prepends its grounded
+    # reference section to the system prompt while reusing the entire single-shot
+    # stream/run machinery below verbatim.
+    def system_prompt(self, req: TurnRequest) -> str:
+        return DIRECT_SYSTEM
+
+    def _build_request(self, req: TurnRequest) -> list[dict]:
+        """Assemble the single-shot request: system + snipped history + this user turn."""
+        ctx = req.ctx
+        history = [
+            {"role": m["role"], "content": _snip(m["content"])}
+            for m in (ctx.history or [])
+            if isinstance(m.get("content"), str) and m.get("role") in ("user", "assistant")
+        ]
+        return [
+            {"role": "system", "content": self.system_prompt(req)},
+            *history,
+            {"role": "user", "content": ctx.user_text},
+        ]
 
     @staticmethod
     def _llm(req: TurnRequest):
@@ -87,7 +92,7 @@ class DirectExecutor:
         self, req: TurnRequest, *, progress_sink: ProgressSink
     ) -> AsyncIterator[ChatEvent]:
         ctx = req.ctx
-        request = _build_request(req)
+        request = self._build_request(req)
         messages: list[dict] = request[1:]  # history + user (system excluded from echo)
         await ctx.session_memory.append_message("user", ctx.user_text)
 
@@ -135,7 +140,7 @@ class DirectExecutor:
 
     async def run(self, req: TurnRequest) -> DirectResult:
         ctx = req.ctx
-        request = _build_request(req)
+        request = self._build_request(req)
         messages: list[dict] = request[1:]
         await ctx.session_memory.append_message("user", ctx.user_text)
 
