@@ -72,9 +72,9 @@ def _q(slot: str) -> str:
 # its second half, so abstain and let the Agent own everything.
 _OTHER_DEMAND_PAT = re.compile(
     r"\b(create|delete|save|export|schedule|rename|move|upload|download|run|execute|"
-    r"search|browse|web|internet|translate)\b|"
+    r"search|browse|web|internet|translate|vocab|vocabulary|glossary|word\s*list)\b|"
     r"(创建|新建|删除|保存|导出|安排|重命名|移动|上传|下载|运行|执行|联网|搜索|查找|"
-    r"知识库|笔记|文档|文件|翻译)",
+    r"知识库|笔记|文档|文件|翻译|词库|词汇|单词|生词本)",
     re.IGNORECASE,
 )
 # Deictic document references ("这篇文档" / "the pdf") carry no parameter — they point

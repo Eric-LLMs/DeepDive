@@ -235,16 +235,25 @@ async def _resolve_identity(request: Request, body: ChatRequest, user: AuthUser 
 #   * body raised / returned ``"preflight: …"``, unknown tool, invalid args, or ANY
 #     failure of a READ-only tool  ⇒ the side effect provably did not happen →
 #     ActionPreflightFailure → the executor escalates (Agent may clarify);
-#   * pre-body DENIAL (approval refused / sandbox / source-policy guard) ⇒ decided,
-#     terminal, no side effect → {"ok": False, "reason"} — escalating would only make
-#     the Agent re-trigger the same approval prompt;
+#   * pre-body DENIAL (approval refused / timed out / sandbox / source-policy guard) ⇒
+#     decided, terminal, no side effect → {"ok": False, "reason"} — escalating would only
+#     make the Agent re-trigger the same approval prompt;
 #   * any failure AFTER a MUTATING tool body was entered ⇒ state UNKNOWN → raise so
 #     the executor terminates honestly (never a blind Agent retry duplicating it).
+#
+# The pre-body / post-body split: a failure whose ``info["name"]`` is a BODY-stage tag
+# (invalid_output, tool_error, post_blocked) or whose runtime message starts with a
+# post-body marker below can only have arisen AFTER the tool body was entered, so its
+# side-effect state is UNKNOWN. Every denial that fires BEFORE the body (pre-execute
+# exception, ASK deny through the approval bridge, sandbox / source-policy guard) is
+# provably side-effect-free. The approval-bridge deny reason is free-form CLIENT feedback
+# (approvals.py: ``feedback or decision.reason or …``), so it cannot be matched by a prefix
+# — hence the polarity is "exclude the runtime-generated post-body markers", defaulting the
+# nameless case to a decided denial rather than enumerating every possible pre-body text.
 _MUTATING_DIRECT_TOOLS = frozenset({"create_folder", "add_term"})
-_PRE_BODY_DENIALS = (
-    "tool use denied", "sandbox denied:", "source policy:", "sandbox guard error",
-    "pre-execute failed", "approval required but no approver registered",
-)
+# Runtime-authored (NOT client-authored) prefixes marking a failure that occurred after the
+# body was entered (runtime.py:118 / :129). These keep the STATE_UNKNOWN classification.
+_POST_BODY_MARKERS = ("execute failed:", "post-execute failed:")
 
 
 async def _run_tool(tool: str, args: dict, ctx) -> dict:
@@ -279,10 +288,13 @@ async def _run_tool(tool: str, args: dict, ctx) -> dict:
     if tool not in _MUTATING_DIRECT_TOOLS:
         # Nothing this tool can do has a side effect — the Agent fallback loses nothing.
         raise ActionPreflightFailure(msg)
-    if name is None and msg.startswith(_PRE_BODY_DENIALS):
+    if name is None and not msg.startswith(_POST_BODY_MARKERS):
+        # Pre-body denial (approval refused/timed out / pre-execute exception / sandbox /
+        # source-policy guard): the body was never entered, so there is provably no side
+        # effect. Decided + terminal — escalating would only re-trigger the same prompt.
         return {"ok": False, "reason": msg}
-    # Mutating tool + a post-body failure class (tool_error w/o preflight prefix,
-    # invalid_output, post_blocked, execute failed) → state UNKNOWN.
+    # Mutating tool + a body-stage failure (tool_error/invalid_output/post_blocked by name,
+    # or an execute/post-execute waterfall error) → the body may have run → state UNKNOWN.
     raise RuntimeError(f"action post-execution failure ({tool}): {msg}")
 
 
