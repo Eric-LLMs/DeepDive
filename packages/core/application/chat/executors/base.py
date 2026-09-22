@@ -56,6 +56,26 @@ class ChatDeps:
     persist_turn_meta: Callable[[str | None, str, Any], Awaitable[None]]
     log_usage: Callable[..., Awaitable[None]]
     resolve_research: Callable[..., tuple]
+    # The cache-wrapped retrieval seam (RAGPipeline or gRPC client) — the SAME object
+    # the agent Context provides as "retrieval", so the fast path inherits the tool's
+    # ACL / tenant / query-cache semantics for free (Phase 4). None = not wired →
+    # the LOCAL_RAG branch degrades to the Agent before any retrieval is attempted.
+    retriever: Any = None
+
+
+class EscalateToAgent(Exception):
+    """Pre-commit fallback signal (design §5 Commit Point): a fast-path executor raises
+    this BEFORE emitting any user-visible event to hand the turn back to the Agent.
+    After the first content delta the channel is locked and this must never be raised.
+
+    Phase 4 uses it for the fail-closed RAG contract: a private retrieval failure or an
+    insufficient/empty result set escalates to the Agent — it NEVER re-routes to a
+    public-web path, and it never answers over missing evidence.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass

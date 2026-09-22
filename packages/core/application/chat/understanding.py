@@ -194,6 +194,26 @@ def resolve_requirements(ctx, message: str) -> TurnRequirements:
             needs_viewer=Signal.HIGH, complexity=Complexity.LOW, confidence=Confidence.HIGH,
         )
 
+    # LOCAL_RAG (Phase 4): a pure private-corpus QUESTION — the lexical private demand is
+    # the SOLE capability and no document is attached. Attach turns deliberately stay
+    # out: the attach note routes to ``read_document`` (a precise tool read of a known
+    # file), not semantic recall, and its prefixed "[Attached:" text is not a raw query
+    # anyway. Any co-occurring web/viewer/action/memory demand also disqualifies — the
+    # staged path answers only from the corpus chunks it retrieves (fail-closed).
+    if (
+        needs_private is Signal.HIGH
+        and not attach_present
+        and needs_viewer is Signal.LOW
+        and needs_web is Signal.LOW
+        and needs_action is Signal.LOW
+        and not needs_memory
+        and is_pure_user_text(text)
+    ):
+        return TurnRequirements(
+            needs_private=Signal.HIGH, complexity=Complexity.MODERATE,
+            confidence=Confidence.HIGH,
+        )
+
     # DIRECT eligibility (Phase 2): pure + short + zero capability demand.
     clean = sanitize_for_direct(text, max_chars=settings.chat_direct_max_chars)
     if clean is None:

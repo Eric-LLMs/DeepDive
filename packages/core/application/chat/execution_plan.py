@@ -106,6 +106,17 @@ def build_execution_plan(
             reason="phase3: viewer content already injected as text -> viewer-grounded",
         )
 
+    # ── Phase 4: LOCAL_RAG (staged retrieval over the SHARED pipeline) ───────────
+    # A HIGH-confidence turn whose SOLE demand is the private corpus. The executor
+    # recalls through the existing config-driven RAGPipeline seam, gates sufficiency
+    # with the existing CRAG judge, and answers grounded; failure / empty / ambiguous
+    # escalate back to AGENT (Fail-Closed — this kind never re-routes to WEB).
+    if policy.retrieval_fast_path_enabled and _is_retrieval_eligible(requirements):
+        return ExecutionPlan(
+            kind=PlanKind.LOCAL_RAG, requires_retrieval=True, requires_memory=False,
+            reason="phase4: private-corpus demand is the sole capability -> staged RAG",
+        )
+
     return _agent("no enabled fast path matches this requirement set -> agent")
 
 
@@ -126,6 +137,20 @@ def _is_viewer_eligible(requirements: TurnRequirements) -> bool:
     return (
         requirements.needs_viewer is Signal.HIGH
         and requirements.needs_private is Signal.LOW
+        and requirements.needs_web is Signal.LOW
+        and requirements.needs_action is Signal.LOW
+        and not requirements.needs_memory
+    )
+
+
+def _is_retrieval_eligible(requirements: TurnRequirements) -> bool:
+    """The LOCAL_RAG guard: the private corpus is the SOLE demanded capability. A
+    co-occurring web demand deliberately disqualifies rather than mixing sources —
+    private retrieval failure must never downgrade to public search (fail-closed),
+    and a mixed demand is the Agent's to arbitrate."""
+    return (
+        requirements.needs_private is Signal.HIGH
+        and requirements.needs_viewer is Signal.LOW
         and requirements.needs_web is Signal.LOW
         and requirements.needs_action is Signal.LOW
         and not requirements.needs_memory

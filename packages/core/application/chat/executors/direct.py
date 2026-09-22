@@ -68,8 +68,12 @@ class DirectExecutor:
     def system_prompt(self, req: TurnRequest) -> str:
         return DIRECT_SYSTEM
 
-    def _build_request(self, req: TurnRequest) -> list[dict]:
-        """Assemble the single-shot request: system + snipped history + this user turn."""
+    def _build_request(self, req: TurnRequest, system: str | None = None) -> list[dict]:
+        """Assemble the single-shot request: system + snipped history + this user turn.
+
+        ``system`` overrides :meth:`system_prompt` — the staged retrieval branch passes
+        a per-turn grounded prompt (evidence is only known at execution time).
+        """
         ctx = req.ctx
         history = [
             {"role": m["role"], "content": _snip(m["content"])}
@@ -77,7 +81,7 @@ class DirectExecutor:
             if isinstance(m.get("content"), str) and m.get("role") in ("user", "assistant")
         ]
         return [
-            {"role": "system", "content": self.system_prompt(req)},
+            {"role": "system", "content": system if system is not None else self.system_prompt(req)},
             *history,
             {"role": "user", "content": ctx.user_text},
         ]
@@ -91,8 +95,19 @@ class DirectExecutor:
     async def stream(
         self, req: TurnRequest, *, progress_sink: ProgressSink
     ) -> AsyncIterator[ChatEvent]:
+        async for evt in self._stream_request(req, self._build_request(req)):
+            yield evt
+
+    async def _stream_request(
+        self, req: TurnRequest, request: list[dict]
+    ) -> AsyncIterator[ChatEvent]:
+        """The single-shot stream machinery over an ASSEMBLED request.
+
+        Split out so a staged subclass (retrieval) can run its pre-flight stages and
+        then reuse this exact persistence / SSE / error path — one terminal shape for
+        every tool-less branch.
+        """
         ctx = req.ctx
-        request = self._build_request(req)
         messages: list[dict] = request[1:]  # history + user (system excluded from echo)
         await ctx.session_memory.append_message("user", ctx.user_text)
 
@@ -139,8 +154,11 @@ class DirectExecutor:
         }
 
     async def run(self, req: TurnRequest) -> DirectResult:
+        return await self._run_request(req, self._build_request(req))
+
+    async def _run_request(self, req: TurnRequest, request: list[dict]) -> DirectResult:
+        """The non-streaming single-shot machinery over an ASSEMBLED request."""
         ctx = req.ctx
-        request = self._build_request(req)
         messages: list[dict] = request[1:]
         await ctx.session_memory.append_message("user", ctx.user_text)
 

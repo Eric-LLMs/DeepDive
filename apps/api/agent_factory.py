@@ -111,6 +111,31 @@ def _retriever() -> RAGPipeline:
 
 
 @lru_cache
+def _retrieval_seam():
+    """THE retrieval capability seam: mode switch (in-process RAGPipeline vs gRPC client)
+    + the Redis query-cache wrapper. The agent Context provides exactly this object as
+    "retrieval"; the chat control plane hands the same seam to the staged RAG executor
+    so the fast path inherits the tool's ACL / tenant / cache semantics unchanged."""
+    if settings.retrieval_mode == "grpc":
+        return wrap_retriever(
+            GrpcRetriever(
+                settings.retrieval_grpc_addr,
+                token=settings.retrieval_grpc_token,
+                tls_ca=Path(settings.retrieval_grpc_tls_ca)
+                if settings.retrieval_grpc_tls_ca
+                else None,
+            )
+        )
+    return wrap_retriever(_retriever())
+
+
+def get_retriever():
+    """Patchable module-global seam for the cache-wrapped retriever (same object the
+    agent Context provides; lru_cached, so this is a cheap per-request read)."""
+    return _retrieval_seam()
+
+
+@lru_cache
 def _drive_service() -> DriveService:
     return DriveService(SessionLocal)
 
@@ -144,21 +169,9 @@ def get_agent_kernel() -> AgentKernel:
 
     # Retrieval is a capability seam: the tool calls require("retrieval"), so the provider
     # (in-process RAGPipeline or a gRPC client) is swappable via settings.retrieval_mode.
-    if settings.retrieval_mode == "grpc":
-        ctx.provide(
-            "retrieval",
-            wrap_retriever(
-                GrpcRetriever(
-                    settings.retrieval_grpc_addr,
-                    token=settings.retrieval_grpc_token,
-                    tls_ca=Path(settings.retrieval_grpc_tls_ca)
-                    if settings.retrieval_grpc_tls_ca
-                    else None,
-                )
-            ),
-        )
-    else:
-        ctx.provide("retrieval", wrap_retriever(_retriever()))
+    # THE same seam object is handed to the chat control plane (get_retriever) so the
+    # Phase 4 fast path and the agent tool can never diverge on cache / ACL semantics.
+    ctx.provide("retrieval", _retrieval_seam())
 
     ctx.provide("web_search", get_web_search_provider())
 

@@ -100,6 +100,43 @@ def test_viewer_demand_with_other_capability_stays_agent():
         assert build_execution_plan(_viewer_req(**over), all_on).kind is PlanKind.AGENT, over
 
 
+# ── Phase 4 LOCAL_RAG policy mapping ───────────────────────────────────────────────
+
+def _rag_req(**over):
+    kw = {"needs_private": Signal.HIGH, "confidence": Confidence.HIGH}
+    kw.update(over)
+    return TurnRequirements(**kw)
+
+
+def _all_on():
+    return PolicyContext(
+        fast_paths_enabled=True, direct_fast_path_enabled=True,
+        viewer_fast_path_enabled=True, retrieval_fast_path_enabled=True,
+    )
+
+
+def test_retrieval_kind_maps_under_retrieval_gate_only():
+    plan = build_execution_plan(_rag_req(), _all_on())
+    assert plan.kind is PlanKind.LOCAL_RAG and plan.requires_retrieval is True
+    # Everything else ON but the retrieval gate closed → still AGENT (per-kind gating).
+    no_rag = PolicyContext(
+        fast_paths_enabled=True, direct_fast_path_enabled=True, viewer_fast_path_enabled=True,
+    )
+    assert build_execution_plan(_rag_req(), no_rag).kind is PlanKind.AGENT
+
+
+def test_private_plus_other_demand_stays_agent_fail_closed():
+    # A co-occurring web demand never mixes public with private on the fast path —
+    # the Agent arbitrates. Same for viewer/action/memory co-demands.
+    for over in (
+        {"needs_web": Signal.HIGH},
+        {"needs_viewer": Signal.HIGH},
+        {"needs_action": Signal.HIGH},
+        {"needs_memory": True},
+    ):
+        assert build_execution_plan(_rag_req(**over), _all_on()).kind is PlanKind.AGENT, over
+
+
 def test_viewer_ground_eligible_rules():
     from core.application.chat.understanding import _viewer_ground_eligible
 
@@ -151,7 +188,6 @@ def test_l0_short_pure_turn_is_high():
 
 def test_l0_capability_and_memory_demands_are_not_high():
     cases = {
-        "private": "summarize my document",
         "web": "what is the latest news",
         "memory": "do you remember what we discussed earlier",
         "long": "x" * 500,
@@ -159,6 +195,18 @@ def test_l0_capability_and_memory_demands_are_not_high():
     for name, msg in cases.items():
         req = resolve_requirements(_ctx(message=msg), msg)
         assert req.confidence is not Confidence.HIGH, name
+    # Phase 4 note: "summarize my document" IS now certified HIGH — but as a SOLE
+    # private demand it can only map to LOCAL_RAG (own gate). The Phase 2 guarantee it
+    # pinned stays pinned: a private demand is NEVER DIRECT-eligible.
+    from core.application.chat.execution_plan import _is_direct_eligible
+
+    priv = "summarize my document"
+    req = resolve_requirements(_ctx(message=priv), priv)
+    assert req.needs_private is Signal.HIGH and req.confidence is Confidence.HIGH
+    assert not _is_direct_eligible(req)
+    # …and with the retrieval gate closed it still lands on the Agent.
+    direct_only = PolicyContext(fast_paths_enabled=True, direct_fast_path_enabled=True)
+    assert build_execution_plan(req, direct_only).kind is PlanKind.AGENT
 
 
 def test_l0_hard_context_facts_win():
@@ -169,11 +217,39 @@ def test_l0_hard_context_facts_win():
     assert req.needs_action is Signal.HIGH and req.confidence is Confidence.LOW
 
 
+# ── Phase 4 L0: private-corpus question certification ──────────────────────────────
+
+def test_l0_private_question_is_high_for_local_rag():
+    # A lexical private demand with no other capability is certified HIGH — the
+    # policy maps it to LOCAL_RAG only when the Phase 4 gate is on.
+    msg = "what does my knowledge base say about gradient descent"
+    req = resolve_requirements(_ctx(message=msg), msg)
+    assert req.needs_private is Signal.HIGH and req.confidence is Confidence.HIGH
+    assert build_execution_plan(req, _all_on()).kind is PlanKind.LOCAL_RAG
+
+
+def test_l0_attach_and_mixed_private_demands_are_not_high():
+    # Attach = read_document (precise tool read), NOT semantic recall — stays uncritical.
+    msg = "what does my document say about x"
+    att = _ctx(message=msg, attach={"kind": "asset", "asset_id": "1"})
+    req = resolve_requirements(att, msg)
+    assert req.confidence is not Confidence.HIGH and req.needs_private is Signal.HIGH
+    # Private + time-sensitive mixes private with public — Agent arbitrates.
+    mixed = "what does my knowledge base say about today's news"
+    req = resolve_requirements(_ctx(message=mixed), mixed)
+    assert req.confidence is not Confidence.HIGH
+    # Private + memory: recall authority stays with MemoryService (Agent).
+    mem = "do you remember what my knowledge base says about x"
+    req = resolve_requirements(_ctx(message=mem), mem)
+    assert req.confidence is not Confidence.HIGH
+
+
 # ── orchestrator registry ─────────────────────────────────────────────────────────
 
 def test_orchestrator_resolves_agent_plan_and_executor():
     from core.application.chat.executors.agent import AgentExecutor
     from core.application.chat.executors.direct import DirectExecutor
+    from core.application.chat.executors.retrieval import RetrievalExecutor
     from core.application.chat.turn_orchestrator import TurnOrchestrator
 
     ctx = _ctx(message="hi")
@@ -181,7 +257,8 @@ def test_orchestrator_resolves_agent_plan_and_executor():
     plan = orch.resolve_plan(ctx)  # master gate off by default → AGENT
     assert plan.kind is PlanKind.AGENT
     assert isinstance(orch.executor_for(plan), AgentExecutor)
-    # DIRECT is now a registered branch...
+    # DIRECT / VIEWER / LOCAL_RAG are now registered branches...
     assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.DIRECT)), DirectExecutor)
+    assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.LOCAL_RAG)), RetrievalExecutor)
     # ...while a still-unmapped kind degrades to the agent branch, never raising.
     assert isinstance(orch.executor_for(ExecutionPlan(kind=PlanKind.COMPOSITE)), AgentExecutor)

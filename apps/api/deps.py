@@ -6,15 +6,16 @@ request-scoped getters (vocab service, task queue) that only the API process nee
 background worker imports the kernel from ``api.agent_factory`` directly and never touches
 this module, so it doesn't drag in FastAPI.
 """
-from api.agent_factory import (
+from agent.engine.kernel import AgentKernel
+from api.agent_factory import (  # noqa: F401 - re-exported for routers
     _batch_embedder,
     _embedder,
     _retriever,
     get_agent_kernel,
     get_drive_service,
+    get_retriever,
     llm,
 )
-from agent.engine.kernel import AgentKernel
 from core.application.services import VocabularyService
 from core.infrastructure.db import SessionLocal
 from core.infrastructure.images import ImageScraper

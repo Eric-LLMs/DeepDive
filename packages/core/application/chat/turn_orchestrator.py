@@ -28,8 +28,14 @@ from core.application.chat.execution_plan import (
     build_execution_plan,
 )
 from core.application.chat.executors.agent import AgentExecutor
-from core.application.chat.executors.base import ChatDeps, ChatExecutor, TurnRequest
+from core.application.chat.executors.base import (
+    ChatDeps,
+    ChatExecutor,
+    EscalateToAgent,
+    TurnRequest,
+)
 from core.application.chat.executors.direct import DirectExecutor
+from core.application.chat.executors.retrieval import RetrievalExecutor
 from core.application.chat.executors.viewer import ViewerExecutor
 from core.application.chat.lifecycle import finalize_turn, handle_research_post_turn
 from core.application.chat.understanding import TurnRequirements, resolve_requirements
@@ -48,6 +54,7 @@ class TurnOrchestrator:
             AgentExecutor.kind: AgentExecutor(),
             DirectExecutor.kind: DirectExecutor(),
             ViewerExecutor.kind: ViewerExecutor(),
+            RetrievalExecutor.kind: RetrievalExecutor(),
         }
 
     # ── plan resolution ──────────────────────────────────────────────────────────
@@ -59,6 +66,7 @@ class TurnOrchestrator:
             fast_paths_enabled=settings.chat_fast_paths_enabled,
             direct_fast_path_enabled=settings.chat_direct_fast_path_enabled,
             viewer_fast_path_enabled=settings.chat_viewer_fast_path_enabled,
+            retrieval_fast_path_enabled=settings.chat_retrieval_fast_path_enabled,
         )
         if policy.fast_paths_enabled:
             requirements = resolve_requirements(ctx, ctx.body.message)
@@ -83,7 +91,19 @@ class TurnOrchestrator:
             "chat.plan-resolved turn_kind=%s reason=%s", plan.kind.value, plan.reason
         )
         try:
-            result = await executor.run(req)
+            try:
+                result = await executor.run(req)
+            except EscalateToAgent as esc:
+                # Pre-commit fast-path fallback (Phase 4 Fail-Closed): the staged
+                # retrieval refused to answer without sufficient private evidence. The
+                # Agent — with its tools — owns the turn now; it is NEVER swapped for a
+                # public-web path here.
+                logger.info(
+                    "chat.plan-escalated from=%s to=agent reason=%s",
+                    plan.kind.value, esc.reason,
+                )
+                executor = self._executors[AgentExecutor.kind]
+                result = await executor.run(req)
         finally:
             # /chat owns the run for the lifetime of this request. Hand the finished
             # interactive turn to the worker chain unless it hit a stop condition; the
@@ -135,29 +155,42 @@ class TurnOrchestrator:
         )
         set_request_approval(store)
 
-        async def pump():
+        async def pump(runner: ChatExecutor):
             # NOTE: only ever await INSIDE the executor stream (never on frames). A
             # cancelled pump awaiting frames.put would swallow CancelledError in its
             # finally and strand the run_stream generator's cleanup; the queue is
             # unbounded so put_nowait never blocks, and a client disconnect lands the
             # CancelledError in the loop below (turn-cancelled logging + memory close).
             try:
-                async for evt in executor.stream(
+                async for evt in runner.stream(
                     req, progress_sink=lambda evt: frames.put_nowait(("agent", evt))
                 ):
                     frames.put_nowait(("agent", evt))
+            except EscalateToAgent as esc:
+                # Pre-commit only: an executor raises this before emitting any event,
+                # so nothing was committed and the swap below is legal (design §5).
+                logger.info(
+                    "chat.stream-escalated from=%s to=agent reason=%s",
+                    plan.kind.value, esc.reason,
+                )
+                frames.put_nowait(("escalate", esc.reason))
             finally:
                 # Sentinel so the consumer below always terminates after the stream ends,
                 # including on cancellation (the loop already logs turn-cancelled).
                 frames.put_nowait(("agent", {"type": "done", "data": None}))
 
-        pump_task = asyncio.create_task(pump())
+        pump_task = asyncio.create_task(pump(executor))
         final = None
         research_continuing = False
         # Stream Commit Point: set on the first user-visible content delta. Until then
         # a pre-execution block may still fall back; after it the channel is locked
         # (errors terminate the stream; transparent executor switching is forbidden).
         committed = False
+        # Escalation bookkeeping: at most ONE pre-commit swap (fast path -> AGENT). The
+        # abandoned pump still enqueues its done-None sentinel; the loop below must skip
+        # it (stale_sentinels) or the turn would "finish" with an empty payload.
+        stale_sentinels = 0
+        switched = False
 
         def collect_done_payload() -> dict | None:
             """Disconnect path: pull the done payload the drained pump left in the queue
@@ -184,7 +217,27 @@ class TurnOrchestrator:
                     # Approval-request frame: forward verbatim (client POSTs /approvals/{id}).
                     yield {"data": json.dumps(data, ensure_ascii=False, default=str)}
                     continue
+                if kind == "escalate":
+                    # Pre-commit fast-path → AGENT swap (Phase 4). Re-pump the Agent into
+                    # the SAME queue; the abandoned pump's sentinel is skipped below.
+                    if committed or switched:
+                        # Channel locked / already switched: never re-route mid-flight —
+                        # surface a terminal error instead (design §5 Commit Point).
+                        error_evt = {
+                            "type": "error",
+                            "data": {"message": f"escalation after commit: {data}"},
+                        }
+                        yield {"data": json.dumps(error_evt, ensure_ascii=False)}
+                        frames.put_nowait(("agent", {"type": "done", "data": None}))
+                        continue
+                    switched = True
+                    stale_sentinels += 1  # the escalated pump still enqueues its sentinel
+                    pump_task = asyncio.create_task(pump(self._executors[AgentExecutor.kind]))
+                    continue
                 if data["type"] == "done":
+                    if stale_sentinels:
+                        stale_sentinels -= 1
+                        continue
                     final = data["data"]
                     break
                 if first_event_ms is None:
