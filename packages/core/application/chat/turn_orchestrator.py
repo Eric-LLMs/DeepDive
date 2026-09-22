@@ -44,6 +44,30 @@ from core.logger import reset_log_context, set_log_context
 
 logger = logging.getLogger(__name__)
 
+# Honest-disclosure instruction prepended to the Agent replay after a pre-commit
+# fast-path escalation (same channel as the attach/handoff notes). The private corpus
+# WAS searched and came up short — the Agent must say so instead of papering over the
+# gap, and must never present general/web knowledge as private-KB evidence. Under a
+# private source policy the web ban is additionally enforced in the sandbox, so the
+# note tells the model what the guard already hard-denies.
+_HONEST_NOTE = (
+    "[Private retrieval note: the user's knowledge base WAS searched for this question "
+    "and returned no sufficient evidence. Be honest with the user: say their knowledge "
+    "base does not contain enough information about it. NEVER present general knowledge "
+    "or web content as if it came from the user's private knowledge base — if you answer "
+    "from anything else, label it explicitly as external/general.]"
+)
+_PRIVATE_ONLY_NOTE = (
+    " This turn is restricted to private sources: do not call web_search or any other "
+    "external/network tool."
+)
+
+
+def _escalation_note(source_policy: str | None) -> str:
+    if source_policy in ("private_only", "private_first"):
+        return _HONEST_NOTE + _PRIVATE_ONLY_NOTE
+    return _HONEST_NOTE
+
 
 class TurnOrchestrator:
     def __init__(self, deps: ChatDeps) -> None:
@@ -72,7 +96,14 @@ class TurnOrchestrator:
             requirements = resolve_requirements(ctx, ctx.body.message)
         else:
             requirements = TurnRequirements()
-        return build_execution_plan(requirements, policy)
+        plan = build_execution_plan(requirements, policy)
+        # Sink the SOURCE POLICY for the Agent's sandbox (see Sandbox._turn_denied):
+        # fencing comes from the ORIGINAL request, and only when the control plane is
+        # live — with the master gate closed the neutral requirements carry no policy,
+        # so dark launch stays byte-identical to the legacy agent.
+        if plan.source_policy:
+            ctx.agent_context = {**(ctx.agent_context or {}), "source_policy": plan.source_policy}
+        return plan
 
     def executor_for(self, plan: ExecutionPlan) -> ChatExecutor:
         executor = self._executors.get(plan.kind)
@@ -96,12 +127,14 @@ class TurnOrchestrator:
             except EscalateToAgent as esc:
                 # Pre-commit fast-path fallback (Phase 4 Fail-Closed): the staged
                 # retrieval refused to answer without sufficient private evidence. The
-                # Agent — with its tools — owns the turn now; it is NEVER swapped for a
-                # public-web path here.
+                # Agent — with its tools — owns the turn now, governed by the turn's
+                # SOURCE POLICY from the original request (web stays banned under a
+                # private policy; the replay is told to disclose the corpus gap honestly).
                 logger.info(
                     "chat.plan-escalated from=%s to=agent reason=%s",
                     plan.kind.value, esc.reason,
                 )
+                ctx.user_text = _escalation_note(plan.source_policy) + "\n\n" + ctx.user_text
                 executor = self._executors[AgentExecutor.kind]
                 result = await executor.run(req)
         finally:
@@ -232,6 +265,9 @@ class TurnOrchestrator:
                         continue
                     switched = True
                     stale_sentinels += 1  # the escalated pump still enqueues its sentinel
+                    # Pre-first-event only: prepend the honest-disclosure instruction to
+                    # the Agent replay (nothing has been committed to the client yet).
+                    ctx.user_text = _escalation_note(plan.source_policy) + "\n\n" + ctx.user_text
                     pump_task = asyncio.create_task(pump(self._executors[AgentExecutor.kind]))
                     continue
                 if data["type"] == "done":

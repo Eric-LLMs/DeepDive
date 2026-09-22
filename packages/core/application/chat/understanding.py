@@ -68,6 +68,18 @@ class TurnRequirements:
     requested_action: dict | None = None
     complexity: Complexity = Complexity.LOW
     confidence: Confidence = Confidence.ABSTAIN
+    # SOURCE FACTS (independent of routing): how the ORIGINAL request restricts the
+    # answer's sources. ``private_only`` = explicit "knowledge base only / no web"
+    # restriction; ``external_ok`` = explicit permission to supplement with external
+    # sources when the corpus falls short. Source policy comes from user intent —
+    # never from the fact that a fast path failed. Detection is deliberately narrow:
+    # a false positive would silently fence the Agent in.
+    private_only: bool = False
+    # Explicit user PERMISSION to supplement with external sources when the corpus
+    # falls short ("如果查不到可以搜网络…"). Only this re-opens the web on an
+    # escalated private-first turn; without it the escalated answer must disclose
+    # the corpus gap honestly and stay on private sources.
+    external_ok: bool = False
 
 
 # ── L0 signal engine (in-process, no I/O) ──────────────────────────────────────────
@@ -94,6 +106,26 @@ _ACTION_PAT = re.compile(
     r"(创建|删除|保存|导出|安排|重命名|移动|上传|下载|运行|执行)",
     re.IGNORECASE,
 )
+# Explicit SOURCE RESTRICTION: answer from the private corpus only / no external
+# sources this turn. Narrow on purpose (see TurnRequirements.private_only).
+_PRIVATE_ONLY_PAT = re.compile(
+    r"(?:\b(?:only|just)\s+(?:use|from|based\s+on|answer(?:\s+from)?)\b[^.?;]{0,40}"
+    r"\b(?:my|the)\s+\w*\s*(?:knowledge\s*base|knowledgebase|kb|corpus|library|notes?|documents?|files?)\b)"
+    r"|(?:\b(?:without|no|don'?t|do\s+not|never)\s+(?:using\s+|calling\s+|the\s+|search\s+)?(?:web|internet|online|external)\b)"
+    r"|(?:只[用从靠按查][^。;？!]{0,12}(?:知识库|文档|笔记|资料|文件))"
+    r"|(?:不要|别|禁止|不准|不可|不得)[^。;？!]{0,6}(?:联网|上网|搜网|查网|用网络|网络搜索|外部资料|外部)",
+    re.IGNORECASE,
+)
+# Explicit permission to fall back to external sources when the private corpus is
+# insufficient — the ONLY thing that keeps web access on an escalated private-first
+# turn (default after a private-first failure is: disclose honestly, stay private).
+_ALLOW_EXTERNAL_PAT = re.compile(
+    r"(?:\b(?:can|may|could|feel\s+free\s+to|otherwise)\b[^.?;]{0,30}"
+    r"\b(?:search|check|look\s*up|use)\b[^.?;]{0,20}\b(?:the\s+)?(?:web|internet|online)\b)"
+    r"|(?:可以|也可以|允许|不妨)[^。;？!]{0,8}(?:查|搜|联网|上网|网络)"
+    r"|(?:没有|找不到|不足|不够)[^。;？!]{0,8}(?:就|再|可以)?[^。;？!]{0,4}(?:查|搜)[^。;？!]{0,6}(?:网络|网上|互联网)",
+    re.IGNORECASE,
+)
 
 
 def _lex_private(text: str) -> bool:
@@ -106,6 +138,14 @@ def _lex_web(text: str) -> bool:
 
 def _lex_action(text: str) -> bool:
     return bool(_ACTION_PAT.search(text))
+
+
+def _lex_private_only(text: str) -> bool:
+    return bool(_PRIVATE_ONLY_PAT.search(text))
+
+
+def _lex_allow_external(text: str) -> bool:
+    return bool(_ALLOW_EXTERNAL_PAT.search(text))
 
 
 def _memory_trigger(text: str) -> bool:
@@ -166,6 +206,11 @@ def resolve_requirements(ctx, message: str) -> TurnRequirements:
     needs_action = Signal.HIGH if (research_turn or handoff or _lex_action(text)) else Signal.LOW
     needs_web = Signal.HIGH if _lex_web(text) else Signal.LOW
     needs_memory = _memory_trigger(text)
+    # Source facts. An explicit restriction that CO-OCCURS with a web demand is a
+    # contradiction, not a fence — abstain (keep the normal approval funnel) rather
+    # than silently deny the Agent its network tools.
+    private_only = _lex_private_only(text) and needs_web is not Signal.HIGH
+    external_ok = _lex_allow_external(text)
 
     # A research/handoff turn is inherently a multi-step chain — force complex so the
     # policy never fast-paths it.
@@ -212,6 +257,7 @@ def resolve_requirements(ctx, message: str) -> TurnRequirements:
         return TurnRequirements(
             needs_private=Signal.HIGH, complexity=Complexity.MODERATE,
             confidence=Confidence.HIGH,
+            private_only=private_only, external_ok=external_ok,
         )
 
     # DIRECT eligibility (Phase 2): pure + short + zero capability demand.
@@ -221,6 +267,7 @@ def resolve_requirements(ctx, message: str) -> TurnRequirements:
         return TurnRequirements(
             needs_private=needs_private, needs_web=needs_web, needs_viewer=needs_viewer,
             needs_action=needs_action, needs_memory=needs_memory, confidence=Confidence.ABSTAIN,
+            private_only=private_only, external_ok=external_ok,
         )
 
     demands = (needs_private, needs_viewer, needs_action, needs_web)
@@ -231,6 +278,7 @@ def resolve_requirements(ctx, message: str) -> TurnRequirements:
         return TurnRequirements(
             needs_private=needs_private, needs_web=needs_web, needs_viewer=needs_viewer,
             needs_action=needs_action, needs_memory=needs_memory, confidence=Confidence.LOW,
+            private_only=private_only, external_ok=external_ok,
         )
 
     # Short, pure, no capability demand at all → a tool-less answer is safe and fastest.
@@ -238,4 +286,5 @@ def resolve_requirements(ctx, message: str) -> TurnRequirements:
         needs_private=needs_private, needs_web=needs_web, needs_viewer=needs_viewer,
         needs_action=needs_action, needs_memory=False,
         complexity=Complexity.LOW, confidence=Confidence.HIGH,
+        private_only=private_only, external_ok=external_ok,
     )

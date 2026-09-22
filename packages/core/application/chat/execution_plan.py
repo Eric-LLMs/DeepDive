@@ -51,6 +51,10 @@ class ExecutionPlan:
     decision stays with ``MemoryService.should_recall()``. ``action`` carries the
     normalized Action Request (ACTION kind only); final validation/authz happen in
     Pre-flight, not here. ``reason`` is the decision trace for telemetry.
+
+    ``source_policy`` records the ORIGINAL request's source restriction (``None`` /
+    ``"private_only"`` / ``"private_first"``); it is derived from user intent, NEVER
+    from a fast-path failure, and is what fences the Agent's tools after escalation.
     """
 
     kind: PlanKind
@@ -59,10 +63,34 @@ class ExecutionPlan:
     requires_retrieval: bool = False
     action: dict | None = None
     reason: str = ""
+    source_policy: str | None = None
 
 
-def _agent(reason: str) -> ExecutionPlan:
-    return ExecutionPlan(kind=PlanKind.AGENT, requires_memory=True, reason=reason)
+def _source_policy(requirements, kind: PlanKind) -> str | None:
+    """Map the source FACTS to the policy that fences the escalated Agent.
+
+    Three states, per the Fail-Closed clarification:
+      * ``private_only``   — explicit KB-only: no web, even with approval offered;
+      * ``private_first``  — the turn maps to LOCAL_RAG without an explicit external
+        permission: the corpus is the ONLY sanctioned source, so an escalation must
+        disclose the gap honestly instead of silently widening to the web;
+      * ``None``           — everything else (mixed requests, explicit "you may
+        search the web", non-private turns): the normal permission/approval funnel
+        governs. RAG failing does NOT create this fence — the user's intent does.
+    """
+    if requirements.private_only and requirements.needs_web is not Signal.HIGH:
+        return "private_only"
+    if kind is PlanKind.LOCAL_RAG and not requirements.external_ok:
+        return "private_first"
+    return None
+
+
+def _plan(requirements, kind: PlanKind, **kw) -> ExecutionPlan:
+    return ExecutionPlan(kind=kind, source_policy=_source_policy(requirements, kind), **kw)
+
+
+def _agent(requirements, reason: str) -> ExecutionPlan:
+    return _plan(requirements, PlanKind.AGENT, requires_memory=True, reason=reason)
 
 
 def build_execution_plan(
@@ -73,16 +101,18 @@ def build_execution_plan(
     Static rules (enforced from Phase 2 on):
       * anything not HIGH-confidence, any AMBIGUOUS/ABSTAIN or capability conflict
         -> AGENT (fallback);
-      * private retrieval failure must never downgrade to WEB (fail-closed);
+      * private retrieval failure escalates to AGENT under the turn's SOURCE POLICY
+        (from the original request) — the failure itself never adds nor removes a
+        web ban, and never silently substitutes external for private evidence;
       * dynamic multi-step chains never become COMPOSITE — COMPOSITE only aggregates
         independent parallel inputs;
       * side-effect actions with unregistered templates -> AGENT or explicit error.
     """
     if requirements.confidence is not Confidence.HIGH:
-        return _agent(f"confidence={requirements.confidence.value} -> agent")
+        return _agent(requirements, f"confidence={requirements.confidence.value} -> agent")
     if not policy.fast_paths_enabled:
         # Control plane ships dark: the legacy full-agent path stays authoritative.
-        return _agent("fast paths disabled -> agent")
+        return _agent(requirements, "fast paths disabled -> agent")
 
     # ── Phase 2: DIRECT ───────────────────────────────────────────────────────────
     # A HIGH-confidence, zero-demand, short+pure turn is the direct case. Any
@@ -90,8 +120,8 @@ def build_execution_plan(
     # memory flag disqualifies DIRECT: memory recall authority lives with
     # MemoryService, not this path, so a recall-eligible turn stays on the Agent.
     if policy.direct_fast_path_enabled and _is_direct_eligible(requirements):
-        return ExecutionPlan(
-            kind=PlanKind.DIRECT, requires_memory=False,
+        return _plan(
+            requirements, PlanKind.DIRECT, requires_memory=False,
             reason="phase2: short pure turn, no capability demand -> direct",
         )
 
@@ -101,8 +131,8 @@ def build_execution_plan(
     # the STUB (read_document) and image (vision) paths were never certified HIGH, so
     # opening a PDF with nothing injected still falls through to the Agent below.
     if policy.viewer_fast_path_enabled and _is_viewer_eligible(requirements):
-        return ExecutionPlan(
-            kind=PlanKind.VIEWER, requires_viewer=True, requires_memory=False,
+        return _plan(
+            requirements, PlanKind.VIEWER, requires_viewer=True, requires_memory=False,
             reason="phase3: viewer content already injected as text -> viewer-grounded",
         )
 
@@ -112,12 +142,12 @@ def build_execution_plan(
     # with the existing CRAG judge, and answers grounded; failure / empty / ambiguous
     # escalate back to AGENT (Fail-Closed — this kind never re-routes to WEB).
     if policy.retrieval_fast_path_enabled and _is_retrieval_eligible(requirements):
-        return ExecutionPlan(
-            kind=PlanKind.LOCAL_RAG, requires_retrieval=True, requires_memory=False,
+        return _plan(
+            requirements, PlanKind.LOCAL_RAG, requires_retrieval=True, requires_memory=False,
             reason="phase4: private-corpus demand is the sole capability -> staged RAG",
         )
 
-    return _agent("no enabled fast path matches this requirement set -> agent")
+    return _agent(requirements, "no enabled fast path matches this requirement set -> agent")
 
 
 def _is_direct_eligible(requirements: TurnRequirements) -> bool:

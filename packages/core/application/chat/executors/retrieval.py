@@ -113,8 +113,10 @@ class RetrievalExecutor(DirectExecutor):
             logger.warning("chat.rag-recall failed: %r", exc)
             raise EscalateToAgent(f"retrieval failed: {exc}") from exc
         if not hits:
-            # Empty private result is an HONEST escalation — the Agent may judge a web
-            # search appropriate, but this fast path never substitutes public for private.
+            # Empty private result is an HONEST escalation. Whether the escalated Agent
+            # may widen to external sources is decided by the turn's SOURCE POLICY
+            # (from the original request) — this fast path never substitutes public
+            # for private and never creates or lifts a fence by failing.
             raise EscalateToAgent("retrieval empty")
         return hits
 

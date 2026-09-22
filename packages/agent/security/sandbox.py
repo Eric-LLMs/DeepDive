@@ -73,6 +73,24 @@ class Sandbox:
     def revoke(self, permission: ToolPermission) -> None:
         self._permissions.discard(permission)
 
+    def _turn_denied(self) -> set[ToolPermission]:
+        """Permissions HARD-DENIED by the turn's sunk SOURCE POLICY.
+
+        The chat control plane sinks ``context["source_policy"]`` (``private_only`` /
+        ``private_first``) when the ORIGINAL request restricts the answer to the user's
+        private corpus. Network-class tools are then denied outright — not merely
+        un-granted, so the human-approval funnel cannot widen a restricted turn back
+        open to the web. This is the counterpart of the research-handoff GRANT in
+        :meth:`_effective_permissions`: source policy comes from user intent, never
+        from the mere fact that a retrieval fast path declined the turn.
+        """
+        turn = current_turn()
+        if turn is None:
+            return set()
+        if (turn.context or {}).get("source_policy") in ("private_only", "private_first"):
+            return {ToolPermission.NETWORK}
+        return set()
+
     # ── per-permission overrides ──
     def add_rule(self, rule: SandboxRule) -> Callable[[], None]:
         """Override the decision for one permission; returns a disposer."""
@@ -88,6 +106,8 @@ class Sandbox:
         return dispose
 
     def decision_for(self, permission: ToolPermission) -> SandboxDecision:
+        if permission in self._turn_denied():
+            return SandboxDecision.DENY
         if permission in self._rules:
             return self._rules[permission]
         return (
@@ -126,6 +146,12 @@ class Sandbox:
             if tool is None:
                 return None
             if self.check(tool, exec.arguments) is SandboxDecision.DENY:
+                if classify_permissions(tool) & self._turn_denied():
+                    # Source-policy fence: the user restricted this turn's sources.
+                    return (
+                        f"source policy: {exec.name} denied — this turn is restricted to "
+                        "the user's private corpus (no external/web sources)"
+                    )
                 tag = ",".join(permission_names(classify_permissions(tool)))
                 return f"sandbox denied: {exec.name} needs [{tag}] but the session has [{','.join(permission_names(self._effective_permissions()))}]"
             return None

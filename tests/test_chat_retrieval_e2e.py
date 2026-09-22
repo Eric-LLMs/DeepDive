@@ -86,9 +86,13 @@ class _Agent:
     def __init__(self, port):
         self.loop = SimpleNamespace(llm=port)
         self.agent_stream_calls = 0
+        self.user_texts: list[str] = []
+        self.contexts: list[dict | None] = []
 
-    async def run_stream(self, *a, **k):  # AGENT path (fallback / dark)
+    async def run_stream(self, user_text, history, **kw):  # AGENT path (fallback / dark)
         self.agent_stream_calls += 1
+        self.user_texts.append(user_text)
+        self.contexts.append(kw.get("context"))
         yield {"type": "done", "data": {"answer": "agent", "messages": [], "usage": None}}
 
 
