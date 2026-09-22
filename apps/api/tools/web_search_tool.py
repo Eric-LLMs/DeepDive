@@ -5,6 +5,7 @@ import asyncio
 import json
 
 from agent import Context, ToolExecution, ToolOutput, ToolRuntime, define_tool, text_block
+from agent.tools.tool_permissions import ToolPermission
 
 
 def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
@@ -46,6 +47,12 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
                 ],
             ),
             execute=web_search,
+            # Explicit NETWORK class: the parameter-name heuristic misses it (query/top_k
+            # carry no url hint), and READ-classified would silently escape BOTH the
+            # approval funnel AND the private-only source-policy HARD DENY — the exact
+            # hole the Phase-5 validation bench caught. Declared, like every other
+            # network tool, so fencing comes from the ORIGINAL request as designed.
+            permission={ToolPermission.NETWORK},
             # P3-5: pure network I/O against the provider seam, no local state — the
             # frozen loop serializes tools without this flag (Run 9: 13 calls, Σ 28.3 s);
             # marking it safe lets same-step search calls fan out.

@@ -258,7 +258,12 @@ async def _run_tool(tool: str, args: dict, ctx) -> dict:
     # unchanged; approvals flow through the ApprovalStore the stream pump bound.
     token = _TURN_CTX.set(AgentTurn(user_msg=ctx.user_text, context=dict(ctx.agent_context or {})))
     try:
-        exec = ToolExecution(call_id="chat-action", name=tool, arguments=dict(args))
+        # ``agent=`` is load-bearing: the sandbox guard and the ASK listener resolve the
+        # tool definition via ``exec.agent.runtime`` — without it they would see no tool
+        # and silently bypass the entire permission/approval funnel (loop.py:764 binds
+        # the agent the same way; the fast path must funnel identically, not weaker).
+        exec = ToolExecution(call_id="chat-action", name=tool, arguments=dict(args),
+                             agent=get_agent())
         result = await runtime.execute(exec)
     finally:
         _TURN_CTX.reset(token)

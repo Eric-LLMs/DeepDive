@@ -16,10 +16,14 @@ The user-visible invariant these cases pin:
 
 Drives the router through the Phase-4 harness; only ``chat_mod._run_tool`` is
 substituted (the adapter's runtime.execute classification is covered by the seed-tool
-and executor unit tests).
+and executor unit tests, and the funnel-binding contract by the direct _run_tool case
+at the bottom of this file).
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+from api.routers import chat as chat_mod
 from core.config import settings
 
 from tests.test_chat_retrieval_e2e import (
@@ -149,3 +153,26 @@ async def test_master_gate_off_is_indistinguishable_from_legacy(monkeypatch):
     await _stream(app, message=MSG)
     assert hits == [] and port.judged == 0 and port.generated == 0
     assert agent.agent_stream_calls == 1 and agent.user_texts[0] == MSG
+
+
+async def test_run_tool_binds_agent_so_the_sandbox_funnel_still_sees_the_tool(monkeypatch):
+    """Phase-5 bench regression: the synthetic ToolExecution MUST carry ``agent=`` —
+    the sandbox guard and the ASK listener resolve the tool definition through
+    ``exec.agent.runtime`` (loop.py dispatches the same way). Without it the fast path
+    would silently BYPASS the permission/approval funnel the Agent path goes through."""
+    captured = {}
+
+    class _RT:
+        async def execute(self, execution):
+            captured["execution"] = execution
+            return SimpleNamespace(is_error=False, value="Created.", error=None)
+
+    agent = SimpleNamespace(runtime=_RT())
+    monkeypatch.setattr(chat_mod, "get_agent", lambda: agent)
+    ctx = SimpleNamespace(user_text=MSG, agent_context=None)
+
+    out = await chat_mod._run_tool("create_folder", {"name": "archive"}, ctx)
+    assert out == {"ok": True, "output": "Created."}
+    assert captured["execution"].agent is agent           # guards resolve the tool
+    assert captured["execution"].name == "create_folder"
+    assert captured["execution"].arguments == {"name": "archive"}
