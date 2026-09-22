@@ -34,6 +34,12 @@ class TEIEmbedder:
         # condition, not an outage — retry with exponential backoff (~0.5/1/2/4/8s) so a
         # burst of concurrent ingests backs off instead of failing the job. Connection errors
         # still fail fast so a genuinely dead embedding service stalls nothing.
+        #
+        # ReadTimeout gets ONE immediate retry: the first embed after TEI idles is a
+        # cold-cache spike (measured ~4.1s vs ~0.3s warm), and under batch contention it can
+        # cross the fail-fast budget once. The retry hits the now-warm service; a genuinely
+        # hung service still fails within 2×timeout. See run 243eb3eb1b03 vector_recall ERROR.
+        timeout_retried = False
         for attempt in range(6):
             try:
                 resp = await self._client.post(
@@ -41,6 +47,10 @@ class TEIEmbedder:
                 )
                 resp.raise_for_status()
                 return resp.json()
+            except httpx.TimeoutException:
+                if timeout_retried:
+                    raise
+                timeout_retried = True
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 if status != 429 and not (500 <= status < 600):
@@ -113,10 +123,17 @@ class PgVectorStore:
                         chunk_visible_expr(filters["user_id"]),
                     )
                 if filters.get("domain_id"):
+                    # ``domain_id`` is tool-call input (LLM-authored); a malformed value must
+                    # not crash the node (see 09-20 16:11 ValueError: badly formed hexadecimal
+                    # UUID string). An unparseable id can match no real domain → empty result.
+                    try:
+                        domain_id = UUID(str(filters["domain_id"]))
+                    except ValueError:
+                        return []
                     stmt = stmt.where(
                         and_(
                             ChunkModel.asset_id.is_not(None),
-                            AssetModel.domain_id == UUID(str(filters["domain_id"])),
+                            AssetModel.domain_id == domain_id,
                         )
                     )
             rows = (await session.execute(stmt)).all()
