@@ -1,0 +1,88 @@
+"""ExecutionPlan: the control plane's single execution contract + pure policy.
+
+This module OWNS ``ExecutionPlan`` and the pure mapping function
+``build_execution_plan(requirements, policy)``. The mapping is in-memory only — no
+I/O, no capability probing, no authorization (those live in Pre-flight and the
+executors). ``turn_orchestrator`` is a pure consumer of the result.
+
+Phase 1 policy: fast paths are switched off globally, so every turn resolves to
+``AGENT`` and the refactor is behavior-neutral. Later phases extend the mapping
+below the ``fast_paths_enabled`` gate, one kind at a time (DIRECT -> VIEWER ->
+LOCAL_RAG -> ACTION/COMPOSITE), each behind its own feature switch.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+from core.application.chat.understanding import Confidence, TurnRequirements
+
+
+class PlanKind(str, Enum):
+    DIRECT = "direct"
+    VIEWER = "viewer"
+    LOCAL_RAG = "local_rag"
+    WEB = "web"
+    ACTION = "action"
+    COMPOSITE = "composite"
+    AGENT = "agent"
+
+
+@dataclass(frozen=True)
+class PolicyContext:
+    """Tenant/global switches consumed by the pure policy. Values only — no handles.
+
+    Phase 1: every fast-path gate is False → all traffic maps to AGENT.
+    """
+
+    fast_paths_enabled: bool = False       # global master switch
+    direct_fast_path_enabled: bool = False  # Phase 2
+    viewer_fast_path_enabled: bool = False  # Phase 3
+    retrieval_fast_path_enabled: bool = False  # Phase 4
+    action_enabled: bool = False           # Phase 5
+    web_enabled: bool = False              # later
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    """What the orchestrator must do for this turn — the sole scheduling input.
+
+    ``requires_memory`` only marks HYDRATION ELIGIBILITY; the authoritative recall
+    decision stays with ``MemoryService.should_recall()``. ``action`` carries the
+    normalized Action Request (ACTION kind only); final validation/authz happen in
+    Pre-flight, not here. ``reason`` is the decision trace for telemetry.
+    """
+
+    kind: PlanKind
+    requires_memory: bool = False
+    requires_viewer: bool = False
+    requires_retrieval: bool = False
+    action: dict | None = None
+    reason: str = ""
+
+
+def _agent(reason: str) -> ExecutionPlan:
+    return ExecutionPlan(kind=PlanKind.AGENT, requires_memory=True, reason=reason)
+
+
+def build_execution_plan(
+    requirements: TurnRequirements, policy: PolicyContext
+) -> ExecutionPlan:
+    """Pure mapping: TurnRequirements + policy switches -> ExecutionPlan.
+
+    Static rules (enforced from Phase 2 on):
+      * anything not HIGH-confidence, any AMBIGUOUS/ABSTAIN or capability conflict
+        -> AGENT (fallback);
+      * private retrieval failure must never downgrade to WEB (fail-closed);
+      * dynamic multi-step chains never become COMPOSITE — COMPOSITE only aggregates
+        independent parallel inputs;
+      * side-effect actions with unregistered templates -> AGENT or explicit error.
+    """
+    if requirements.confidence is not Confidence.HIGH:
+        return _agent(f"phase1: confidence={requirements.confidence.value} -> agent")
+    if not policy.fast_paths_enabled:
+        # Control plane ships dark: the legacy full-agent path stays authoritative.
+        return _agent("phase1: fast paths disabled -> agent")
+
+    # ── Phase 2+ mappings land under the gate above, one kind per phase ──────────
+    return _agent("fast path not implemented for this requirement set -> agent")

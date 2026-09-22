@@ -1,20 +1,20 @@
-"""Chat routes: the agent-driven ``/chat`` turn, SSE streaming (``/chat/stream``), and
-query-repository import (single Q&A pair / whole session / imported status).
+"""Chat routes: a thin HTTP/SSE adapter over the chat control plane.
+
+Business orchestration lives in ``core.application.chat`` (TurnOrchestrator +
+executors); this module only resolves the HTTP identity/channel (transport
+concern), wires :class:`ChatDeps` from the module globals (preserving the existing
+test seams), and translates orchestrator events into SSE frames. The
+query-repository import endpoints are unchanged.
 """
 from __future__ import annotations
 
-import asyncio
-import base64
-import contextlib
 import json
 import logging
+import time
+from types import SimpleNamespace
 from uuid import UUID
 
-from agent.security.approvals import (
-    ApprovalStore,
-    get_approval_bridge,
-    set_request_approval,
-)
+from agent.security.approvals import get_approval_bridge
 from api.auth import AuthUser, require_user, require_user_optional
 from api.deps import (
     _batch_embedder,
@@ -37,6 +37,39 @@ from api.viewer_context import (
     viewer_citation_map,
     viewer_snapshot,
 )
+from core.application.chat.context import (
+    ResearchConflict,
+    assemble_turn_history,
+    build_turn_context,
+)
+
+# Re-exports under the historic private names: tests (and sibling consumers) import
+# these off ``api.routers.chat``; F401 cannot see the string-level import sites.
+from core.application.chat.context import (
+    asset_readable as _asset_readable,  # noqa: F401
+)
+from core.application.chat.context import (
+    build_viewer_assembly as _build_viewer_assembly_core,
+)
+from core.application.chat.context import (
+    resolve_research_context as _resolve_research_context,
+)
+from core.application.chat.context import (
+    viewer_abort as _viewer_abort,  # noqa: F401
+)
+from core.application.chat.executors.base import ChatDeps, ViewerDeps
+from core.application.chat.lifecycle import (
+    extract_retrieval as _extract_retrieval,  # noqa: F401
+)
+from core.application.chat.lifecycle import (
+    last_written_id as _last_written_id,  # noqa: F401
+)
+from core.application.chat.lifecycle import (
+    maybe_continue_research as _maybe_continue_research,  # noqa: F401
+)
+from core.application.chat.lifecycle import persist_turn_meta as _persist_meta_impl
+from core.application.chat.lifecycle import viewer_post_turn as _viewer_post_turn_core
+from core.application.chat.turn_orchestrator import TurnOrchestrator
 from core.application.drive_service import DriveError, DriveService
 from core.config import settings
 from core.infrastructure.db import (
@@ -48,247 +81,42 @@ from core.infrastructure.db import (
 )
 from core.infrastructure.drive_repositories import SqlChunkRepository
 from core.infrastructure.ingest import build_chunks, write_query_repo_chunks
-from core.infrastructure.jobs import (
-    CHAT_SESSION_IMPORT,
-    RESEARCH_DRIVE,
-    SESSION_FINALIZE,
-    TaskQueue,
-)
-from core.infrastructure.memory import (
-    SessionMemoryStore,
-    apply_compaction,
-    assemble_recovery_history,
-    create_session,
-    needs_compaction,
-    set_session_type,
-    summary_block,
-)
+from core.infrastructure.jobs import CHAT_SESSION_IMPORT, TaskQueue
+from core.infrastructure.memory import SessionMemoryStore
 from core.infrastructure.request_context import (
     set_request_llm_channel,
     set_request_user,
 )
 from core.infrastructure.security import authorize_usage, get_role
-from core.infrastructure.vision_caption import model_supports_vision
-from core.logger import reset_log_context, set_log_context
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
-
-from plugins.research.plugin import ResearchService
 
 router = APIRouter(tags=["chat"])
 
 logger = logging.getLogger(__name__)
 
-# Image suffixes that the ``vision`` tool (not ``read_document``) should open. Mirrors
-# ``_IMAGE_EXTS`` in apps/api/tools/read_document_tool.py.
-_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+
+# ── Test-seam wrappers: the moved implementations take their session factory / llm
+# as explicit args; these module-level names stay the patchable surface AND back
+# the per-request ChatDeps wiring below.
+
+_VIEWER_DEPS = ViewerDeps(
+    build_blocks=build_viewer_blocks,
+    validate_citations=validate_viewer_citations,
+    citation_map=viewer_citation_map,
+    snapshot=viewer_snapshot,
+)
 
 
-async def _attach_note(body: ChatRequest, drive: DriveService, user_id, *, inline: bool) -> str | None:
-    """Build a context note for an attached cloud asset, or ``None`` when there is none.
-
-    Attachments are read-only references: we verify the caller can read the asset, then
-    prefix a ``[Attached: …]`` note to the user message so the agent knows which document
-    the user is troubleshooting. The note also names the channel that can actually open it:
-
-    - ``inline=True`` (a screenshot attached to a turn whose chat model is vision-capable):
-      the pixels ride as a multimodal block right below this note, so the model must NOT call
-      ``vision`` for it — the directive locks the answer to the embedded image and forbids
-      falling back on prior documents/RAG/earlier images (the switch that was failing).
-    - ``inline=False``: text-only chat model / non-image file → route through the right tool
-      (``vision`` for images, ``read_document`` for PDF/Word/Excel/text).
-    """
-    attach = body.attach or {}
-    if attach.get("kind") != "asset" or user_id is None:
-        return None
-    asset_id = attach.get("asset_id")
-    if not asset_id:
-        return None
-    try:
-        await drive.ensure_asset_readable(user_id, UUID(asset_id))
-    except DriveError as exc:
-        raise HTTPException(status_code=403, detail=f"no access to the attached file: {exc}")
-    name = attach.get("name") or "document"
-    suffix = name[name.rfind("."):].lower() if "." in name else ""
-    mime = (attach.get("mime_type") or "").lower()
-    is_image = suffix in _IMAGE_SUFFIXES or mime.startswith("image/")
-    if inline and is_image:
-        hint = (
-            "The attached image is included INLINE with this message (its picture is shown "
-            "as an image part below) — you can see it directly. Answer ONLY from THIS image. "
-            "Any earlier image or document content in the conversation describes a DIFFERENT "
-            "file and never applies here; do not answer about this image from old documents, "
-            "RAG hits, or a previous screenshot. Do NOT call the `vision` tool for it."
-        )
-    elif is_image:
-        hint = (
-            "This message carries a NEW image that is NOT in the prompt as text — its "
-            "pixels are only readable through the tool. Call the `vision` tool with this "
-            "asset_id and answer ONLY from what it returns. This image is NEW to this "
-            "message — any earlier image analysis or document content in the conversation "
-            "describes a DIFFERENT file and never applies to this one; do not answer about "
-            "this image from earlier documents, RAG hits, or a previous screenshot."
-        )
-    else:
-        hint = "Call the `read_document` tool with this asset_id to extract its text."
-    return f"[Attached: {name} (asset_id {asset_id})] {hint}"
-
-
-# Screenshots larger than this are not inlined (a base64 data URL past it would bloat the
-# request and risk a provider size 4xx); the caller falls back to the ``vision`` tool path.
-_INLINE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
-
-
-async def _resolve_inline_image(body: ChatRequest, drive: DriveService, user_id, model: str | None) -> str | None:
-    """A ``data:`` URL for the attached image when it should be INLINED this turn.
-
-    Inline conditions: the routed chat model is vision-capable (:func:`model_supports_vision`),
-    the attach is a readable image asset, and its bytes fit the size cap. Returning ``None``
-    leaves the turn on the existing ``vision``-tool path (text-only model / non-image / oversized).
-    """
-    if not model_supports_vision(model):
-        return None
-    attach = body.attach or {}
-    if attach.get("kind") != "asset" or user_id is None:
-        return None
-    asset_id = attach.get("asset_id")
-    if not asset_id:
-        return None
-    name = attach.get("name") or ""
-    mime = (attach.get("mime_type") or "").lower()
-    suffix = name[name.rfind("."):].lower() if "." in name else ""
-    if not (suffix in _IMAGE_SUFFIXES or mime.startswith("image/")):
-        return None
-    try:
-        _name, asset_mime, data = await drive.download(user_id, UUID(asset_id))
-    except DriveError as exc:
-        logger.warning("inline image: download failed (%s); using vision tool", exc)
-        return None
-    except Exception:  # noqa: BLE001 - malformed id / storage hiccup → tool path, never fail the turn
-        return None
-    if not data or len(data) > _INLINE_IMAGE_MAX_BYTES:
-        return None
-    b64 = base64.b64encode(data).decode("ascii")
-    return f"data:{(asset_mime or mime or 'image/png')};base64,{b64}"
-
-
-def _handoff_note(body: ChatRequest) -> str | None:
-    """Build a structured instruction prefix for a handoff payload, or ``None``.
-
-    Handoffs are machine-readable context attached to the first message of a turn (e.g. the
-    desktop "Resume Research in Chat" button resuming a Research OS project). The note is
-    prefixed to the user text so the agent reliably receives the project id and the resume
-    directive instead of having to infer them from prose; the same payload is sunk into the
-    turn context (``current_turn().context["handoff"]``) so tools can act on it directly.
-    """
-    handoff = body.handoff
-    if not handoff or not isinstance(handoff, dict):
-        return None
-    kind = handoff.get("kind")
-    if kind != "research":
-        return None
-    project_id = handoff.get("project_id")
-    if not project_id:
-        return None
-    mode = handoff.get("mode") or "research_resume"
-    if mode == "research_run":
-        # The desktop Run control. Mid-chain this means "drive the remaining stages"; on a
-        # task that already reached PUBLISH begin_run reset it to a NEW edition (stage ->
-        # DISCOVER, evidence graph emptied), so the agent must re-gather rather than treat
-        # the prior edition's report as current evidence.
-        return (
-            f"[Research handoff: run {project_id} via research_project (action resume), "
-            "Run-control start. Do NOT create a new project — the project already exists. "
-            "Continue the current stage and drive every remaining stage through the "
-            "deep_research skill to PUBLISH. If this task had already reached PUBLISH, it was "
-            "reset to a fresh edition: the stage is DISCOVER, gates are NOT_RUN and the "
-            "evidence graph was emptied, so re-gather sources from scratch instead of "
-            "reusing the prior edition's report as current evidence.]"
-        )
-    return (
-        f"[Research handoff: resume project {project_id} via research_project (action resume), "
-        f"mode {mode}. Do NOT create a new project — the project already exists. Continue "
-        "it through the deep_research skill stages and advance to PUBLISH.]"
-    )
-
-
-# ── Viewer Context Provider (reference context, never part of user_text) ──────
-# Unlike attach/handoff notes, the viewer payload is NOT prefixed to the user message:
-# it is assembled here (permissions checked at THIS layer — api.viewer_context stays
-# pure) and sunk into the turn context, where the ``viewer_reference`` prompt section
-# renders it below the cache boundary. A request without ``viewer`` is byte-identical
-# to the legacy chat path.
-
-
-async def _asset_readable(drive: DriveService, user_id, asset_id) -> bool:
-    """drive.ensure_asset_readable as a boolean — viewer context is auxiliary, a bad id
-    drops the scope instead of failing the chat request."""
-    if user_id is None or not asset_id:
-        return False
-    try:
-        await drive.ensure_asset_readable(user_id, UUID(str(asset_id)))
-        return True
-    except DriveError:
-        return False
-    except Exception:  # noqa: BLE001 - malformed uuid etc: treat as not readable
-        logger.warning("viewer: unexpected drive check failure", exc_info=True)
-        return False
+async def _persist_turn_meta(message_id: str | None, key: str, value) -> None:
+    """SessionLocal at CALL time — so monkeypatched seams keep working (see lifecycle)."""
+    await _persist_meta_impl(SessionLocal, message_id, key, value)
 
 
 async def _build_viewer_assembly(body: ChatRequest, drive: DriveService, user_id) -> dict | None:
-    """Permission-check the viewer's asset identities, then run the pure assembler."""
-    if body.viewer is None:
-        return None
-    viewer = body.viewer
-    asset_readable = await _asset_readable(drive, user_id, viewer.asset_id)
-    frame_readable = set()
-    for sel in viewer.selections:
-        if sel.image_asset_id and str(sel.image_asset_id) not in frame_readable:
-            if await _asset_readable(drive, user_id, sel.image_asset_id):
-                frame_readable.add(str(sel.image_asset_id))
-    return build_viewer_blocks(
-        viewer, body.message,
-        asset_readable=asset_readable, frame_readable_ids=frame_readable,
-    )
-
-
-def _viewer_abort(assembly: dict | None) -> dict | None:
-    """Short-circuit payload when the turn must not reach the agent. Since documents
-    stopped being intent-matched server-side, ``too_large``/``unavailable`` only arise from
-    video FULL (over budget / untrusted full capture) — honest stop, no downgrade, no RAG
-    fallback."""
-    if assembly and assembly["status"] in ("too_large", "unavailable"):
-        return {
-            "mode": assembly["mode"], "status": assembly["status"],
-            "rejected": assembly["rejected"],
-        }
-    return None
-
-
-def _viewer_stub_reads(messages: list[dict] | None, stub_asset_id: str) -> list[dict]:
-    """Every ``read_document`` call this turn made against the stub's asset.
-
-    Enumerated from the assistant ``tool_calls`` (flat {id, name, arguments} shape), so
-    FAILED calls are recorded too — the trace documents what the model tried, not only
-    what succeeded. ``pages`` is the actual argument (None = full-document read).
-    """
-    reads: list[dict] = []
-    for m in messages or []:
-        for tc in m.get("tool_calls") or []:
-            if tc.get("name") != "read_document":
-                continue
-            args = tc.get("arguments")
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:  # noqa: BLE001 - malformed args: asset match untestable
-                    args = {}
-            args = args if isinstance(args, dict) else {}
-            if str(args.get("asset_id") or "") != str(stub_asset_id):
-                continue
-            reads.append({"tool_call_id": tc.get("id"), "pages": args.get("pages")})
-    return reads
+    """Compat wrapper (legacy 3-arg signature) over the core viewer assembler."""
+    return await _build_viewer_assembly_core(body, drive, user_id, _VIEWER_DEPS)
 
 
 async def _viewer_post_turn(
@@ -296,190 +124,127 @@ async def _viewer_post_turn(
     messages: list[dict] | None,
     user_message_id: str | None, assistant_message_id: str | None,
 ) -> dict | None:
-    """Persist the sent-time snapshot (user row) + citation map/validation (assistant
-    row) — both under dedicated ``meta`` keys, fully separate from ``meta["retrieval"]``.
+    """Compat wrapper (legacy 6-arg signature); persistence dispatches through the
+    patchable module-global ``_persist_turn_meta`` at call time."""
+    deps = SimpleNamespace(persist_turn_meta=_persist_turn_meta, viewer=_VIEWER_DEPS)
+    return await _viewer_post_turn_core(
+        deps, assembly, body, answer, messages,
+        user_message_id, assistant_message_id,
+    )
 
-    ``status=="stub"`` instead traces the tool-driven read: the Viewer Access Context
-    section told the model to call ``read_document``, and we record which calls it actually
-    made (incl. failures) against that asset on the assistant row."""
-    if not assembly:
-        return None
-    if assembly["status"] == "stub":
-        stub = assembly.get("stub") or {}
-        reads = _viewer_stub_reads(messages, stub.get("asset_id"))
-        payload = {
-            "mode": assembly["mode"], "status": "stub",
-            "asset_id": stub.get("asset_id"), "current_page": stub.get("page"),
-            "reads": reads,
-        }
-        if assistant_message_id:
-            await _persist_turn_meta(assistant_message_id, "viewer", payload)
-        return payload
-    if assembly["status"] != "injected":
-        return None
-    blocks = assembly["blocks"]
-    if user_message_id:
-        await _persist_turn_meta(user_message_id, "viewer", viewer_snapshot(body.viewer, blocks))
-    cited, invalid = validate_viewer_citations(answer or "", blocks)
-    if assistant_message_id:
-        await _persist_turn_meta(assistant_message_id, "viewer_citations", {
-            "map": viewer_citation_map(blocks), "cited": cited, "invalid": invalid,
-        })
+
+async def _assemble_turn_history(
+    body: ChatRequest,
+    session_memory: SessionMemoryStore,
+    session_id,
+    user_text: str,
+    *,
+    model: str | None,
+    base_url: str | None,
+    api_key: str | None,
+) -> tuple[list[dict], dict | None, str | None]:
+    """Compat wrapper delegating to the core history assembler (single implementation).
+
+    Signature and module-global lookups (``SessionLocal`` / ``llm``) preserved for the
+    session-memory v2 router-assembly tests — the seam reads the globals at call time.
+    """
+    deps = SimpleNamespace(session_factory=SessionLocal, llm=llm)
+    return await assemble_turn_history(
+        body, session_memory, session_id, user_text,
+        deps=deps, model=model, base_url=base_url, api_key=api_key,
+    )
+
+
+# ── Transport: identity + quota + LLM channel (previously duplicated per route) ──
+
+
+async def _resolve_identity(request: Request, body: ChatRequest, user: AuthUser | None) -> dict:
+    """Resolve the caller (or mint a guest), the daily quota and the pinned LLM channel.
+
+    Raises HTTPException (429 / 503) exactly like the legacy handlers. A logged-in user
+    whose every LLM key is disabled on the Tokens page has *no* usable channel — they
+    still log in fine, but degrade to the anonymous tier for this request: guest daily
+    quota + anonymous routing (the "equivalent to an anonymous user" behavior; full
+    access returns when the admin re-enables a key). The anonymous tier with no channel
+    either must NOT fall back to the legacy global connection — the admin must bind a
+    channel to the role.
+    """
+    # Scope RAG / memory recall to this request's user (guest → public-link assets only).
+    set_request_user(user.user_id if user is not None else None)
+    notice = None
+    guest_token = None
+    tier = "free"
+    async with SessionLocal() as session:
+        if user is None:
+            user_id, guest_token = await resolve_guest_identity(SessionLocal, body.guest_token)
+            await _guest_quota(request.app.state.redis, user_id)
+            token = None
+            role_id = "anonymous"
+            log_user = None
+        else:
+            user_id = user.user_id
+            token = await session.get(LoginTokenModel, user.token_id)
+            role_id = user.role.role_id
+            log_user = user
+        base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, token, role_id)
+        if user is not None and not base_url and not api_key:
+            anon = await get_role(session, "anonymous")
+            anon_limit = anon.daily_request_limit if anon is not None else settings.guest_daily_limit
+            limit_txt = f"每天限 {anon_limit} 次" if anon_limit >= 0 else "按匿名用户限额"
+            await _guest_quota(
+                request.app.state.redis, user_id,
+                detail="你的额度已用完,且匿名额度也已用完。请充值或升级套餐后继续使用。",
+            )
+            role_id = "anonymous"
+            log_user = None
+            notice = (
+                f"你的渠道额度已用完,已按匿名用户身份继续使用({limit_txt})。"
+                "如需更多额度,请充值或升级套餐。"
+            )
+            base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, None, role_id)
+        elif user is not None:
+            tier = await authorize_usage(session, user.user_id, user.role)
+    if not base_url and not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
+        )
+    # Pin this request's LLM channel so context-free sub-calls (rag_search query rewrite /
+    # CRAG judge) use the same key/model as the conversation instead of the process-global
+    # default client — one turn, one channel, host and worker alike. The SSE generator runs
+    # later in the request's captured context, so setting it here covers every tool call.
+    set_request_llm_channel((model, base_url or None, api_key or None))
     return {
-        "mode": assembly["mode"], "status": assembly["status"],
-        "citations": viewer_citation_map(blocks), "cited": cited, "invalid": invalid,
-        "rejected": assembly["rejected"],
+        "user_id": user_id, "guest_token": guest_token, "log_user": log_user,
+        "tier": tier, "notice": notice, "model": model,
+        "base_url": base_url, "api_key": api_key, "business_name": business_name,
+        "credential_id": credential_id,
     }
 
 
-def _resolve_research_context(drive, user, session_id, body_handoff):
-    """Durable research handoff resolution shared by ``/chat`` and ``/chat/stream``.
+def _build_chat_deps(queue: TaskQueue, drive: DriveService) -> ChatDeps:
+    """Wire the control plane's dependency bundle from this module's globals.
 
-    Returns ``(service, bound_task_id, effective_handoff, notice)`` where ``service`` is
-    ``None`` when this session is not a research session. The client sends the handoff once
-    (the first turn of a research session); a session already bound to a task re-synthesizes
-    it here, so later turns keep the research grant (WRITE + NETWORK, see
-    :meth:`Sandbox._effective_permissions`) and the agent keeps targeting the same task
-    instead of creating a duplicate project. A binding conflict is surfaced as a non-fatal
-    in-stream notice — it never breaks the chat.
+    Everything is read AT REQUEST TIME, which keeps the established test seams alive
+    (monkeypatching ``chat_mod.get_agent`` / ``_log_usage`` / ``SessionLocal`` / …
+    before the call changes what the control plane sees).
     """
-    if user is None:
-        return None, None, None, None
-    service: ResearchService | None = None
-    effective_handoff: dict | None = None
-    if body_handoff and body_handoff.get("kind") == "research":
-        effective_handoff = body_handoff
-    else:
-        candidate = ResearchService(drive, settings.research_scratch_dir)
-        known_task = candidate.task_id_for_session(user.user_id, session_id)
-        if known_task:
-            service = candidate
-            effective_handoff = {
-                "kind": "research",
-                "project_id": known_task,
-                "mode": "research_resume",
-            }
-    bound_task_id: str | None = None
-    notice: str | None = None
-    if effective_handoff and effective_handoff.get("project_id"):
-        service = service or ResearchService(drive, settings.research_scratch_dir)
-        try:
-            bound_task_id = service.bind_session(
-                user.user_id, effective_handoff["project_id"], session_id
-            )["task_id"]
-        except Exception as exc:  # noqa: BLE001 — a binding hiccup never breaks the chat
-            logger.warning("research bind_session failed: %s", exc)
-            notice = f"⚠️ Research: session/task binding failed — {exc}"
-    return service, bound_task_id, effective_handoff, notice
+    return ChatDeps(
+        session_factory=SessionLocal,
+        queue=queue,
+        drive=drive,
+        agent=get_agent(),
+        llm=llm,
+        embedder=_embedder,
+        viewer=_VIEWER_DEPS,
+        new_approval_bridge=get_approval_bridge,
+        persist_turn_meta=_persist_turn_meta,
+        log_usage=_log_usage,
+        resolve_research=_resolve_research_context,
+    )
 
 
-async def _maybe_continue_research(
-    service: ResearchService,
-    queue: TaskQueue,
-    *,
-    user_id: UUID,
-    task_id: str,
-    run_id: str,
-    session_id: str | None,
-) -> bool:
-    """Hand an interactive research turn's run to the worker chain, or release it.
-
-    Called right after the first (interactive) turn of a run completes, *before* ``end_run``.
-    Returns ``True`` when the run was handed to ``RESEARCH_DRIVE`` (the slot stays live and
-    the worker keeps driving until PUBLISH / a gate / a stop); ``False`` when the run must be
-    released here (reached PUBLISH, a human gate override is pending, Stop was requested, or
-    the continuation could not be scheduled — the slot is never stranded).
-
-    The interactive turn is the "free" turn 0: the driver's no-progress / caps / cost grading
-    starts with auto-turn 1. The payload carries NO LLM credentials — each worker turn
-    resolves the owner's channel through the dispatch gateway at its own job start.
-    """
-    from plugins.research.driver import ResearchRunDriver, iso_now
-
-    async def _publish_async(kind: str) -> None:
-        with contextlib.suppress(Exception):
-            await service.publish_change(user_id, task_id, kind=kind)
-
-    async def _release_and_publish(kind: str) -> None:
-        # Release the active-run slot BEFORE publishing the terminal event. The caller
-        # runs ``end_run`` only after this returns, so a monitor refetch triggered by the
-        # event could otherwise observe a still-RUNNING slot (the pop hadn't committed),
-        # re-green the desktop Run button, and then never be corrected — end_run's own
-        # revision bump publishes no event. Popping first guarantees any refetch sees
-        # ``is_running=false``. end_run is idempotent, so the caller's later end_run no-ops.
-        try:
-            service.end_run(user_id, task_id)
-        except Exception as exc:  # noqa: BLE001 - the caller still attempts the release
-            logger.warning("research pre-event slot release failed: %s", exc)
-        await _publish_async(kind)
-
-    ledger = service.get_driver_checkpoint(user_id, task_id)
-    if ledger.get("cancel_requested"):
-        await _release_and_publish("run.cancelled")
-        return False
-    project = service.read_project(user_id, task_id)
-    if project.get("stage") == "PUBLISH":
-        await _release_and_publish("run.finished")
-        return False
-    if service.pending_overrides(user_id, task_id):
-        # A run parked on a gate must explain itself in the task chat first: write the
-        # deterministic review note to the session DB *before* the blocked wake-up is
-        # published, so a monitor refetch observes the note next to the Approve/Reject card.
-        if session_id:
-            try:
-                await service.emit_gate_notes(SessionLocal, user_id, task_id, session_id)
-            except Exception as exc:  # noqa: BLE001 - never fail the parking decision
-                logger.warning("research gate note emission failed: %s", exc)
-        await _release_and_publish("run.blocked")
-        return False
-
-    # Persist the interactive turn (turn 0) as the chain's starting ledger, then schedule
-    # auto-turn 1. The driver CAS-checks on arrival; a duplicate run of turn 0 is impossible
-    # (this is the only site that schedules turn_index 1).
-    try:
-        service.set_driver_checkpoint(
-            user_id, task_id,
-            patch={
-                "run_id": run_id,
-                "turn_index": 0,
-                "turn_attempt": 1,
-                "turn_state": "done",
-                "execution_id": f"{run_id}:0:1",
-                "updated_at": iso_now(),
-            },
-        )
-    except Exception as exc:  # noqa: BLE001 - treat as a schedule failure below
-        logger.warning("research continuation ledger failed: %s", exc)
-        ResearchRunDriver().abort_run(
-            service, user_id, task_id,
-            run_id=run_id, execution_id=f"{run_id}:0:1",
-            reason=f"could not record the run ledger: {exc}",
-        )
-        return False
-
-    try:
-        await queue.enqueue(
-            RESEARCH_DRIVE,
-            {
-                "user_id": str(user_id),
-                "task_id": task_id,
-                "run_id": run_id,
-                "session_id": session_id,
-                "turn_index": 1,
-            },
-            user_id=user_id,
-        )
-    except Exception as exc:  # noqa: BLE001 - never strand a RUNNING slot
-        logger.warning("research continuation enqueue failed: %s", exc)
-        ResearchRunDriver().abort_run(
-            service, user_id, task_id,
-            run_id=run_id, execution_id=f"{run_id}:0:1",
-            reason=f"could not schedule the first auto turn: {exc}",
-        )
-        return False
-
-    await _publish_async("run.turn")
-    return True
+# ── Query-repository import endpoints (unchanged by the control-plane refactor) ──
 
 
 @router.post("/chat/import")
@@ -623,170 +388,7 @@ async def chat_imported_status(
     }
 
 
-def _last_written_id(rows: list[dict], role: str) -> str | None:
-    """Id of the LAST written row with ``role`` (this turn's message), or None."""
-    for r in reversed(rows):
-        if r["role"] == role:
-            return r["message_id"]
-    return None
-
-
-def _extract_retrieval(messages: list[dict] | None) -> dict | None:
-    """Snapshot this turn's rag_search hits for the retrieval-feedback loop.
-
-    Maps assistant ``tool_calls`` (flat {id, name, arguments} shape) so each tool-role row
-    is identified by name; parses every ``rag_search`` result (a JSON list of hit dicts)
-    into a compact ``{"hits": [{id, score, text<=200}], "queries": [...]}``.
-    ``_UNAVAILABLE`` / malformed payloads contribute nothing; hits dedupe by id keeping the
-    first score. Returns None when the turn ran no successful rag_search.
-    """
-    if not messages:
-        return None
-    name_by_call: dict[str, str] = {}
-    query_by_call: dict[str, str] = {}
-    for m in messages:
-        for tc in m.get("tool_calls") or []:
-            tcid, name = tc.get("id"), tc.get("name")
-            if not tcid or not name:
-                continue
-            name_by_call[tcid] = name
-            if name == "rag_search":
-                try:
-                    q = (json.loads(tc.get("arguments") or "{}") or {}).get("query")
-                except Exception:  # noqa: BLE001 - malformed args just means no query tag
-                    q = None
-                if q:
-                    query_by_call[tcid] = str(q)
-    hits: dict[str, dict] = {}
-    queries: list[str] = []
-    for m in messages:
-        if m.get("role") != "tool":
-            continue
-        cid = m.get("tool_call_id")
-        if name_by_call.get(cid) != "rag_search":
-            continue
-        content = m.get("content")
-        if isinstance(content, list):  # text-block parts shape
-            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-        try:
-            parsed = json.loads(content) if isinstance(content, str) else None
-        except Exception:  # noqa: BLE001
-            parsed = None
-        if not isinstance(parsed, list):
-            continue
-        if cid in query_by_call and query_by_call[cid] not in queries:
-            queries.append(query_by_call[cid])
-        for h in parsed:
-            if not isinstance(h, dict):
-                continue
-            hid = h.get("id") or h.get("chunk_id")
-            if hid is None or str(hid) in hits:
-                continue
-            score = h.get("score")
-            hits[str(hid)] = {
-                "id": str(hid),
-                "score": float(score) if isinstance(score, (int, float)) else None,
-                "text": str(h.get("text") or "")[:200],
-            }
-    if not hits:
-        return None
-    return {"hits": list(hits.values()), "queries": queries}
-
-
-async def _persist_turn_meta(message_id: str | None, key: str, value) -> None:
-    """Attach one JSONB key to a message row (``retrieval`` / ``viewer`` / …). Best-effort:
-    a failure only means that row's metadata won't survive a reopen, never fails the turn.
-    The row may still be in-flight in the session write queue, so retry briefly on a
-    missing row."""
-    if not message_id:
-        return
-    for attempt in range(3):
-        try:
-            async with SessionLocal() as s:
-                row = await s.get(MessageModel, UUID(message_id))
-                if row is None:
-                    raise RuntimeError("message row not visible yet")
-                meta = dict(row.meta or {})
-                meta[key] = value
-                row.meta = meta
-                await s.commit()
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("meta %s persist failed (%d/3): %s", key, attempt + 1, exc)
-            await asyncio.sleep(0.5)
-
-
-async def _persist_retrieval_meta(message_id: str | None, retrieval: dict) -> None:
-    await _persist_turn_meta(message_id, "retrieval", retrieval)
-
-
-def _turn_tail(items) -> list[dict]:
-    """Schema tail entries → the internal tail shape ``{message_id, role, content}``."""
-    return [
-        {
-            "message_id": str(t.message_id) if t.message_id else None,
-            "role": t.role,
-            "content": t.content,
-        }
-        for t in items
-    ]
-
-
-async def _assemble_turn_history(
-    body: ChatRequest,
-    session_memory: SessionMemoryStore,
-    session_id,
-    user_text: str,
-    *,
-    model: str | None,
-    base_url: str | None,
-    api_key: str | None,
-) -> tuple[list[dict], dict | None, str | None]:
-    """Build the turn's history under session-memory v2. Returns
-    ``(history, compaction_payload, compaction_deferred)``.
-
-    - **v2 client** (``context_state`` present): ZERO SQL reads on a normal turn —
-      history = client summary + client tail, assembled in memory. Only when the
-      threshold is crossed does ``apply_compaction`` read SQL (behind its dual
-      persistence barrier). A deferred compaction changes nothing: the full (over
-      budget) tail is used as-is for this turn and the next turn retries.
-    - **Legacy client** (no ``context_state``): client-less recovery mode — bounded
-      SQL load after the checkpoint watermark + the same compaction path
-      (:func:`assemble_recovery_history`); correct but not zero-read, kept so P1
-      ships without a client update. §8.3: a v2 request whose watermark implies
-      history but whose tail is empty is a 422 at schema level — the v2 path has no
-      silent SQL fallback.
-    """
-    if body.context_state is None:
-        history, compaction, deferred, audit = await assemble_recovery_history(
-            SessionLocal, session_id, llm, user_text,
-            model=model, base_url=base_url, api_key=api_key,
-        )
-        if audit:
-            session_memory.record_event("compaction", audit)
-        return history, compaction, deferred
-
-    summary = body.context_state.summary
-    tail = _turn_tail(body.tail)
-    history = summary_block(summary) + [
-        {"role": m["role"], "content": m["content"]} for m in tail
-    ]
-    if not needs_compaction(summary=summary, tail=tail, new_message=user_text):
-        return history, None, None
-    outcome = await apply_compaction(
-        session_factory=SessionLocal,
-        session_id=session_id,
-        llm=llm,
-        tail=tail,
-        has_pending_mutations=body.context_state.has_pending_mutations,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-    )
-    if outcome.status == "compacted":
-        session_memory.record_event("compaction", outcome.audit or {})
-        return outcome.context, outcome.compaction, None
-    return history, None, outcome.deferred_reason
+# ── Chat turn: control-plane adapters ──────────────────────────────────────────
 
 
 @router.post("/chat")
@@ -797,242 +399,25 @@ async def chat(
     queue: TaskQueue = Depends(get_task_queue),
     drive: DriveService = Depends(get_drive_service),
 ):
-    # Scope RAG / memory recall to this request's user (guest → public-link assets only).
-    set_request_user(user.user_id if user is not None else None)
-    # Resolve the LLM channel for this request: a logged-in user uses the channel pinned on
-    # their token at login (failing over to another active channel of the same role); a guest
-    # uses the ``anonymous`` role's channels. A role with no usable channel falls back to the
-    # legacy /config route (empty base_url/api_key → the configured global client).
-    #
-    # A logged-in user whose every LLM key is disabled on the Tokens page has *no* usable
-    # channel — they still log in fine, but degrade to the anonymous tier for this request:
-    # guest daily quota + anonymous routing (that's the "equivalent to an anonymous user"
-    # behavior; full access returns when the admin re-enables a key).
-    notice = None
-    guest_token = None
-    tier = "free"
-    async with SessionLocal() as session:
-        if user is None:
-            user_id, guest_token = await resolve_guest_identity(SessionLocal, body.guest_token)
-            await _guest_quota(request.app.state.redis, user_id)
-            token = None
-            role_id = "anonymous"
-            log_user = None
-        else:
-            user_id = user.user_id
-            token = await session.get(LoginTokenModel, user.token_id)
-            role_id = user.role.role_id
-            log_user = user
-        base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, token, role_id)
-        if user is not None and not base_url and not api_key:
-            anon = await get_role(session, "anonymous")
-            anon_limit = anon.daily_request_limit if anon is not None else settings.guest_daily_limit
-            limit_txt = f"每天限 {anon_limit} 次" if anon_limit >= 0 else "按匿名用户限额"
-            await _guest_quota(
-                request.app.state.redis, user_id,
-                detail="你的额度已用完,且匿名额度也已用完。请充值或升级套餐后继续使用。",
-            )
-            role_id = "anonymous"
-            log_user = None
-            notice = (
-                f"你的渠道额度已用完,已按匿名用户身份继续使用({limit_txt})。"
-                "如需更多额度,请充值或升级套餐。"
-            )
-            base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, None, role_id)
-        elif user is not None:
-            tier = await authorize_usage(session, user.user_id, user.role)
-        # The anonymous tier has no channel either: do NOT fall back to the legacy global
-        # connection — tell the user instead (the admin must bind a channel to the role).
-        if not base_url and not api_key:
-            raise HTTPException(
-                status_code=503,
-                detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
-            )
-    # Pin this request's LLM channel so context-free sub-calls (rag_search query rewrite /
-    # CRAG judge) use the same key/model as the conversation instead of the process-global
-    # default client — one turn, one channel, host and worker alike.
-    set_request_llm_channel((model, base_url or None, api_key or None))
-
-    user_text = body.message
-    # Only attaches the client flagged ``owned`` (a 📷 screenshot created for this message)
-    # own a drive asset. Referential attaches (🔗 drive file / local file) leave the link
-    # NULL so deleting the message never touches a referenced document — the chat/temp
-    # folder is UI-only; the delete decision keys off this owned link.
-    owned_asset_id = (
-        body.attach.get("asset_id") if body.attach and body.attach.get("owned") else None
-    )
-    # Multimodal inline: when the chat model can see images and the attachment IS an image,
-    # embed the screenshot as an image part on THIS turn so the model reads the current
-    # picture instead of answering from stale conversation text (the "didn't switch to the
-    # new image" bug). Text-only models / oversized images → None → the vision-tool path.
-    inline_image = await _resolve_inline_image(body, drive, user_id, model)
-    if body.attach:
-        note = await _attach_note(body, drive, user_id, inline=inline_image is not None)
-        if note:
-            user_text = f"{note}\n\n{body.message}"
-    handoff_note = _handoff_note(body)
-    if handoff_note:
-        user_text = f"{handoff_note}\n\n{user_text}"
-    # Viewer context: assemble + permission-check now; FULL over budget / untrusted full
-    # capture aborts the turn BEFORE the agent runs (no session write, no LLM call).
-    viewer_assembly = await _build_viewer_assembly(body, drive, user_id)
-    viewer_abort = _viewer_abort(viewer_assembly)
-    if viewer_abort:
+    """One non-streaming chat turn through the control plane."""
+    ident = await _resolve_identity(request, body, user)
+    deps = _build_chat_deps(queue, drive)
+    try:
+        ctx = await build_turn_context(
+            body=body, deps=deps, user=user, stream=False, log_tag=True, **ident,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ResearchConflict as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    if ctx.viewer_abort:
         return {
             "answer": None,
             "session_id": str(body.session_id) if body.session_id else None,
-            "user_id": str(user_id),
-            "viewer": viewer_abort,
+            "user_id": str(ctx.user_id),
+            "viewer": ctx.viewer_abort,
         }
-    session_id = body.session_id or await create_session(SessionLocal, user_id, title=body.message)
-    # Tag every log line this turn emits (research run, mirror, RAG recall) with the user +
-    # session it belongs to; reset once the response is built.
-    log_tokens = set_log_context(user_id=str(user_id), session_id=str(session_id))
-    # Chat-driven research: bind this session to the handoff's task (mirror + grant), same
-    # durable resolution as /chat/stream. The single-task run mutex (T4 invariant #2) is
-    # shared with /chat/stream so a non-streaming turn and a streaming turn for the same task
-    # can never overlap.
-    research_service, bound_task_id, effective_handoff, research_notice = _resolve_research_context(
-        drive, user, session_id, body.handoff
-    )
-    if bound_task_id:
-        # Isolation marker: a session bound to a research task is stored as type=1 — hidden
-        # from the chat sidebar, opened only from the Research tab, deleted with the task.
-        try:
-            await set_session_type(SessionLocal, UUID(str(session_id)), 1)
-        except Exception:
-            logger.warning("research: failed to mark the bound session as type=1", exc_info=True)
-    research_turn = research_service is not None and bound_task_id is not None
-    if research_turn:
-        try:
-            # The desktop Run control on a task that already reached PUBLISH is a NEW-edition
-            # run (handoff mode "research_run"): begin_run resets the finished task so it
-            # drives DISCOVER→…→PUBLISH again into temp/vN + outputs/_vN instead of stopping
-            # at turn 0. A plain resume ("research_resume", e.g. a typed session message)
-            # never restarts a finished task — casual chat must not burn a full re-run.
-            new_edition = (effective_handoff or {}).get("mode") == "research_run"
-            research_service.begin_run(
-                user_id, bound_task_id, session_id=str(session_id), new_edition=new_edition
-            )
-        except ValueError as exc:
-            msg = str(exc)
-            if "already running" in msg:
-                raise HTTPException(status_code=409, detail=msg) from exc
-            if "not found" in msg:
-                raise HTTPException(status_code=404, detail=msg) from exc
-            raise
-    session_memory = SessionMemoryStore(
-        SessionLocal, _embedder(), llm, session_id, user_id,
-        attach_asset_id=owned_asset_id,
-    )
-    history, compaction_payload, compaction_deferred = await _assemble_turn_history(
-        body, session_memory, session_id, user_text,
-        model=model, base_url=base_url or None, api_key=api_key or None,
-    )
-    research_continuing = False
-    try:
-        result = await get_agent().run(
-            user_text,
-            history,
-            session_memory=session_memory,
-            model=model,
-            base_url=base_url or None,
-            api_key=api_key or None,
-            context={**({"handoff": effective_handoff} if effective_handoff else {}),
-                     **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] in ("injected", "stub") else {}),
-                     **({"inline_image": inline_image} if inline_image else {})} or None,
-        )
-    finally:
-        # /chat owns the run for the lifetime of this request. Hand the finished interactive
-        # turn to the worker chain unless it hit a stop condition (PUBLISH / pending gate
-        # override / cancel / enqueue failure); the single-task run slot is released only when
-        # the run is NOT handed off, so the driver chain keeps owning it across turns.
-        if research_turn and research_service is not None and bound_task_id is not None:
-            try:
-                project = research_service.read_project(user_id, bound_task_id)
-                active_run = project.get("active_run") or {}
-                run_id = active_run.get("run_id")
-                if run_id:
-                    research_continuing = await _maybe_continue_research(
-                        research_service,
-                        queue,
-                        user_id=user_id,
-                        task_id=bound_task_id,
-                        run_id=run_id,
-                        session_id=str(session_id),
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("research continuation decision failed: %s", exc)
-            if not research_continuing:
-                try:
-                    research_service.end_run(user_id, bound_task_id)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("research end_run failed: %s", exc)
-    # close() (inside run) already flushed events; defer the expensive embed+summary work.
-    # user_id rides along so the worker pins this session's owner through the dispatch
-    # gateway at job start (finalize's summarizer is an LLM call — no owner = no channel).
-    await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)}, user_id=user_id)
-    if log_user is not None:
-        await _log_usage(
-            log_user, business_name, "chat", result.usage,
-            credential_id=credential_id, paid=(tier == "paid"),
-        )
-    # This turn's user/assistant message ids come from the write queue's RETURNING rows
-    # (drained here; run()'s close() already flushed them into the buffer) — the old
-    # full-table text scan is gone. On persistence failure the ids are simply null and
-    # ``persist_failed`` tells the client its Live State still owns the transcript.
-    await session_memory.flush_writes()
-    written = session_memory.take_written()
-    user_message_id = _last_written_id(written, "user")
-    assistant_message_id = _last_written_id(written, "assistant")
-    # Mirror this turn into the bound task's session_history.json (best-effort; the DB
-    # SessionModel is the authority — a write failure only logs, it never fails the turn).
-    if research_service is not None and bound_task_id is not None:
-        try:
-            await research_service.append_session_turn(user_id, session_id, "user", body.message)
-            if result.final_answer:
-                await research_service.append_session_turn(
-                    user_id, session_id, "assistant", result.final_answer
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("research session_history mirror failed: %s", exc)
-    reset_log_context(log_tokens)
-    # Retrieval-feedback snapshot: persist + return the turn's rag_search hits so the
-    # client renders the persistent 👍/👎 row (POST /rag/feedback records the rating).
-    retrieval = _extract_retrieval(result.messages)
-    if retrieval:
-        await _persist_retrieval_meta(assistant_message_id, retrieval)
-    viewer_payload = await _viewer_post_turn(
-        viewer_assembly, body, result.final_answer, result.messages,
-        user_message_id, assistant_message_id
-    )
-    resp = {
-        "answer": result.final_answer,
-        "messages": result.messages,
-        "session_id": str(session_id),
-        "user_id": str(user_id),
-        "user_message_id": user_message_id,
-        "assistant_message_id": assistant_message_id,
-    }
-    if retrieval:
-        resp["retrieved"] = retrieval
-    if viewer_payload:
-        resp["viewer"] = viewer_payload
-    if compaction_payload:
-        resp["compaction"] = compaction_payload
-    if compaction_deferred:
-        resp["compaction_deferred"] = compaction_deferred
-    if session_memory.persist_failed:
-        resp["persist_failed"] = True
-    if guest_token:
-        resp["guest_token"] = guest_token
-    if research_continuing:
-        resp["research_continuing"] = True
-    if research_notice:
-        notice = f"{notice}\n{research_notice}" if notice else research_notice
-    if notice:
-        resp["notice"] = notice
-    return resp
+    return await TurnOrchestrator(deps).run_turn(ctx)
 
 
 @router.post("/chat/stream")
@@ -1043,354 +428,45 @@ async def chat_stream(
     queue: TaskQueue = Depends(get_task_queue),
     drive: DriveService = Depends(get_drive_service),
 ):
-    """SSE streaming chat over the full agent path (tools + session persistence + quota).
+    """SSE streaming chat over the control plane (Phase 1: full-agent path, same frames).
 
     Emits ``{"type": "thinking"|"content"|"tool", "data": ...}`` deltas as the model reasons
     and answers, then a final ``{"type": "done", "data": {answer, session_id, user_id,
     user_message_id, assistant_message_id, notice}}`` event. A user with no usable LLM key
     degrades to the anonymous tier (guest quota), matching ``/chat``.
     """
-    set_request_user(user.user_id if user is not None else None)
-    notice = None
-    guest_token = None
-    tier = "free"
-    async with SessionLocal() as session:
-        if user is None:
-            user_id, guest_token = await resolve_guest_identity(SessionLocal, body.guest_token)
-            await _guest_quota(request.app.state.redis, user_id)
-            token = None
-            role_id = "anonymous"
-            log_user = None
-        else:
-            user_id = user.user_id
-            token = await session.get(LoginTokenModel, user.token_id)
-            role_id = user.role.role_id
-            log_user = user
-        base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, token, role_id)
-        if user is not None and not base_url and not api_key:
-            anon = await get_role(session, "anonymous")
-            anon_limit = anon.daily_request_limit if anon is not None else settings.guest_daily_limit
-            limit_txt = f"每天限 {anon_limit} 次" if anon_limit >= 0 else "按匿名用户限额"
-            await _guest_quota(
-                request.app.state.redis, user_id,
-                detail="你的额度已用完,且匿名额度也已用完。请充值或升级套餐后继续使用。",
-            )
-            role_id = "anonymous"
-            log_user = None
-            notice = (
-                f"你的渠道额度已用完,已按匿名用户身份继续使用({limit_txt})。"
-                "如需更多额度,请充值或升级套餐。"
-            )
-            base_url, api_key, model, business_name, credential_id = await _resolve_chat_route(session, None, role_id)
-        elif user is not None:
-            tier = await authorize_usage(session, user.user_id, user.role)
-    # All keys + the anonymous tier are exhausted too — block, don't fall back to the
-    # legacy global connection; the user must top up / upgrade.
-    if not base_url and not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="当前没有可用的 LLM 渠道,无法使用聊天。请联系管理员配置渠道,或充值/升级套餐后重试。",
+    # Pipeline instrumentation anchors (chat-stream only): t_entry spans handler entry to
+    # the SSE done frame; the pre-agent phase covers auth/quota/channel/viewer/history
+    # assembly. Per-step agent latencies live in the TurnSpan audit (data/audit.jsonl).
+    t_entry = time.perf_counter()
+    logger.info("chat.stream-start msg_chars=%d", len(body.message or ""))
+    ident = await _resolve_identity(request, body, user)
+    deps = _build_chat_deps(queue, drive)
+    try:
+        ctx = await build_turn_context(
+            body=body, deps=deps, user=user, stream=True, log_tag=False, **ident,
         )
-    # Pin this request's LLM channel so context-free sub-calls (rag_search query rewrite /
-    # CRAG judge) use the same key/model as the conversation instead of the process-global
-    # default client. The SSE generator runs later in the request's captured context, so
-    # setting it here (before ``gen()`` is created) covers every tool call the stream makes.
-    set_request_llm_channel((model, base_url or None, api_key or None))
-
-    user_text = body.message
-    # Only attaches the client flagged ``owned`` (a 📷 screenshot created for this message)
-    # own a drive asset. Referential attaches (🔗 drive file / local file) leave the link
-    # NULL so deleting the message never touches a referenced document — the chat/temp
-    # folder is UI-only; the delete decision keys off this owned link.
-    owned_asset_id = (
-        body.attach.get("asset_id") if body.attach and body.attach.get("owned") else None
-    )
-    # Multimodal inline: when the chat model can see images and the attachment IS an image,
-    # embed the screenshot as an image part on THIS turn so the model reads the current
-    # picture instead of answering from stale conversation text (the "didn't switch to the
-    # new image" bug). Text-only models / oversized images → None → the vision-tool path.
-    inline_image = await _resolve_inline_image(body, drive, user_id, model)
-    if body.attach:
-        note = await _attach_note(body, drive, user_id, inline=inline_image is not None)
-        if note:
-            user_text = f"{note}\n\n{body.message}"
-    handoff_note = _handoff_note(body)
-    if handoff_note:
-        user_text = f"{handoff_note}\n\n{user_text}"
-    # Viewer context assembly + FULL short-circuit (see /chat): abort BEFORE the agent
-    # loop runs — never burn a turn / LLM call when the full capture can't be honored.
-    viewer_assembly = await _build_viewer_assembly(body, drive, user_id)
-    viewer_abort = _viewer_abort(viewer_assembly)
-    if viewer_abort:
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ResearchConflict as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    # Viewer context: assemble + permission-check pre-stream; FULL over budget / untrusted
+    # full capture aborts the turn BEFORE the agent runs (no session write, no LLM call).
+    if ctx.viewer_abort:
         async def abort_gen():
-            yield {"data": json.dumps({"type": "viewer", "data": viewer_abort}, ensure_ascii=False)}
+            yield {"data": json.dumps({"type": "viewer", "data": ctx.viewer_abort}, ensure_ascii=False)}
             yield {"data": json.dumps({"type": "done", "data": {
                 "answer": None,
                 "session_id": str(body.session_id) if body.session_id else None,
-                "viewer": viewer_abort,
+                "viewer": ctx.viewer_abort,
             }}, ensure_ascii=False)}
         return EventSourceResponse(abort_gen())
-    # ``ephemeral`` (Research-tab blank chat): a newly created session is marked type 1
-    # (research), i.e. hidden from the Sessions list — an unbound throwaway chat is never
-    # recorded in a user-visible way. Only task-bound research chats persist visibly.
-    session_id = body.session_id or await create_session(
-        SessionLocal, user_id, title=body.message, type=1 if body.ephemeral else 0
-    )
-    # Chat-driven research: bind this session to the handoff's task so every subsequent turn
-    # mirrors into the task's ``session_history.json`` (a task-local projection — the DB
-    # SessionModel stays the authoritative conversation record). A binding conflict (one
-    # session may drive one task only) is surfaced as a non-fatal in-stream notice.
-    #
-    # ``effective_handoff`` is the research context for THIS turn. The client only sends the
-    # handoff once (the first message of a research session), so for a session that is already
-    # bound to a task we re-synthesize it here — the turn keeps its research grant (WRITE +
-    # NETWORK, see Sandbox._effective_permissions) and the agent keeps targeting the same
-    # task instead of silently creating a duplicate project.
-    research_service, bound_task_id, effective_handoff, research_notice = _resolve_research_context(
-        drive, user, session_id, body.handoff
-    )
-    if bound_task_id:
-        # Isolation marker (see /chat): a research-bound session is stored as type=1.
-        try:
-            await set_session_type(SessionLocal, UUID(str(session_id)), 1)
-        except Exception:
-            logger.warning("research: failed to mark the bound session as type=1", exc_info=True)
-    # Single active-run mutex per task (T4 invariant #2): a second concurrent trigger for a
-    # task that is already running is a 409 conflict. The slot is released by ``end_run`` in
-    # ``gen()``'s finally, so a client disconnect cannot strand it; a crashed process's slot
-    # is adopted by ``begin_run`` after the stale window. A bound session whose task vanished
-    # degrades to a 404 rather than silently running against a dead task.
-    research_turn = research_service is not None and bound_task_id is not None
-    if research_turn:
-        try:
-            # The desktop Run control on a task that already reached PUBLISH is a NEW-edition
-            # run (handoff mode "research_run"): begin_run resets the finished task so it
-            # drives DISCOVER→…→PUBLISH again into temp/vN + outputs/_vN instead of stopping
-            # at turn 0. A plain resume ("research_resume", e.g. a typed session message)
-            # never restarts a finished task — casual chat must not burn a full re-run.
-            new_edition = (effective_handoff or {}).get("mode") == "research_run"
-            research_service.begin_run(
-                user_id, bound_task_id, session_id=str(session_id), new_edition=new_edition
-            )
-        except ValueError as exc:
-            msg = str(exc)
-            if "already running" in msg:
-                raise HTTPException(status_code=409, detail=msg) from exc
-            if "not found" in msg:
-                raise HTTPException(status_code=404, detail=msg) from exc
-            raise
-    session_memory = SessionMemoryStore(
-        SessionLocal, _embedder(), llm, session_id, user_id,
-        attach_asset_id=owned_asset_id,
-    )
-    history, compaction_payload, compaction_deferred = await _assemble_turn_history(
-        body, session_memory, session_id, user_text,
-        model=model, base_url=base_url or None, api_key=api_key or None,
-    )
+
+    logger.info("chat.stream-pre-agent duration_ms=%.0f", (time.perf_counter() - t_entry) * 1000)
+    orchestrator = TurnOrchestrator(deps)
 
     async def gen():
-        # ``notice`` lives in the enclosing ``chat_stream`` scope (set to None above); the
-        # research handoff may append to it below, so bind it nonlocal to avoid shadowing it
-        # with an unbound local (UnboundLocalError killed the stream when no notice fired).
-        nonlocal notice
-        # Tag every log line the stream emits (agent turns, research tools, finalize) with the
-        # user + session it belongs to. Set inside gen() (not chat_stream) because the SSE
-        # generator runs after chat_stream returns — the sibling pump task inherits it.
-        log_tokens = set_log_context(user_id=str(user_id), session_id=str(session_id))
-        # The agent may block on a human-in-the-loop approval (awaiting POST /approvals/{id}),
-        # so a plain `async for` over run_stream would deadlock — the stream can't advance while
-        # the approval-request frame sits unyielded. Pump the stream into a queue in a sibling
-        # task, and let the ApprovalStore's sink push approval frames into the same queue; this
-        # generator only ever reads from the queue.
-        frames: asyncio.Queue = asyncio.Queue()
-        store = ApprovalStore(
-            get_approval_bridge().broker,
-            user_id=str(user_id),
-            sink=lambda evt: frames.put_nowait(("approval", evt)),
-        )
-        set_request_approval(store)
-
-        async def pump():
-            # NOTE: only ever await INSIDE run_stream (never on frames). If the pump task
-            # suspended on `await frames.put` were cancelled there, the CancelledError would
-            # be consumed by this `finally` and the run_stream generator abandoned — its
-            # cleanup would only run on a later GC aclose (GeneratorExit, not CancelledError),
-            # so `turn-cancelled` would never be logged. The queue is unbounded, so put_nowait
-            # never blocks; a client disconnect then lands the CancelledError in the loop's
-            # `except asyncio.CancelledError`, which logs turn-cancelled and closes memory.
-            try:
-                async for evt in get_agent().run_stream(
-                    user_text,
-                    history,
-                    session_memory=session_memory,
-                    model=model,
-                    base_url=base_url or None,
-                    api_key=api_key or None,
-                    context={**({"handoff": effective_handoff} if effective_handoff else {}),
-                             **({"viewer": viewer_assembly} if viewer_assembly and viewer_assembly["status"] in ("injected", "stub") else {})} or None,
-                    progress_sink=lambda evt: frames.put_nowait(("agent", evt)),
-                    # Video FOCUS turns are on-screen Q&A about a small subtitle window —
-                    # never pay the thinking prefill tax for them (voice-call precedent).
-                    # Documents never reach "focus" anymore (they go through the stub).
-                    disable_thinking=body.disable_thinking or (
-                        viewer_assembly is not None and viewer_assembly.get("mode") == "focus"
-                    ),
-                ):
-                    frames.put_nowait(("agent", evt))
-            finally:
-                # Sentinel so the consumer below always terminates after the stream ends,
-                # including on cancellation (the loop already logs turn-cancelled).
-                frames.put_nowait(("agent", {"type": "done", "data": None}))
-
-        pump_task = asyncio.create_task(pump())
-        final = None
-        # Set when the interactive research turn hands the run to the worker chain (the slot
-        # stays live); the done frame then tells the client the run is still active.
-        research_continuing = False
-
-        def collect_done_payload() -> dict | None:
-            """Disconnect path: pull the done payload the drained pump left in the queue (the
-            ``run_stream`` event, not the None sentinel) when the loop never saw it."""
-            try:
-                while True:
-                    kind, data = frames.get_nowait()
-                    if (
-                        kind == "agent"
-                        and isinstance(data, dict)
-                        and data.get("type") == "done"
-                        and data.get("data") is not None
-                    ):
-                        return data["data"]
-            except asyncio.QueueEmpty:
-                return None
-
-        async def finalize_turn(final_payload: dict | None) -> dict:
-            """Post-run bookkeeping shared by the normal path and the research disconnect path:
-            session-finalize enqueue, usage logging, message-id resolution, and the task's
-            ``session_history.json`` mirror. The DB SessionModel stays the authoritative chat
-            record; the mirror is a task-local projection and failures only log."""
-            nonlocal notice
-            await queue.enqueue(SESSION_FINALIZE, {"session_id": str(session_id)}, user_id=user_id)
-            if log_user is not None:
-                await _log_usage(
-                    log_user, business_name, "chat_stream",
-                    final_payload["usage"] if final_payload else None,
-                    credential_id=credential_id, paid=(tier == "paid"),
-                )
-            # Resolve this turn's message ids from the write queue's RETURNING rows
-            # (same mechanism as /chat — the full-table text scan is gone).
-            answer = (final_payload or {}).get("answer", "")
-            await session_memory.flush_writes()
-            written = session_memory.take_written()
-            user_message_id = _last_written_id(written, "user")
-            assistant_message_id = _last_written_id(written, "assistant")
-            if research_service is not None and bound_task_id is not None:
-                try:
-                    await research_service.append_session_turn(user_id, session_id, "user", body.message)
-                    if answer:
-                        await research_service.append_session_turn(user_id, session_id, "assistant", answer)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("research session_history mirror failed: %s", exc)
-            done = {
-                "answer": answer,
-                "session_id": str(session_id),
-                "user_id": str(user_id),
-                "user_message_id": user_message_id,
-                "assistant_message_id": assistant_message_id,
-            }
-            # Retrieval-feedback snapshot (same contract as /chat): persist onto the
-            # assistant row + hand the client the hits to rate.
-            retrieval = _extract_retrieval((final_payload or {}).get("messages"))
-            if retrieval:
-                await _persist_retrieval_meta(assistant_message_id, retrieval)
-                done["retrieved"] = retrieval
-            viewer_payload = await _viewer_post_turn(
-                viewer_assembly, body, answer, (final_payload or {}).get("messages"),
-                user_message_id, assistant_message_id
-            )
-            if viewer_payload:
-                done["viewer"] = viewer_payload
-            if compaction_payload:
-                done["compaction"] = compaction_payload
-            if compaction_deferred:
-                done["compaction_deferred"] = compaction_deferred
-            if session_memory.persist_failed:
-                done["persist_failed"] = True
-            if guest_token:
-                done["guest_token"] = guest_token
-            if research_notice:
-                notice = f"{notice}\n{research_notice}" if notice else research_notice
-            if notice:
-                done["notice"] = notice
-            return done
-
-        try:
-            while True:
-                kind, data = await frames.get()
-                if kind == "approval":
-                    # Approval-request frame: forward verbatim (client POSTs /approvals/{id}).
-                    yield {"data": json.dumps(data, ensure_ascii=False, default=str)}
-                    continue
-                if data["type"] == "done":
-                    final = data["data"]
-                    break
-                yield {"data": json.dumps(data, ensure_ascii=False)}
-        finally:
-            set_request_approval(None)
-            if research_turn:
-                # Server-owned research run (T4 invariant #3): a client disconnect must never
-                # cancel an active run. Let the pump drain to completion so the agent's turn
-                # and its tool executions finish server-side, then still finalize the turn and
-                # release the single-task run slot.
-                with contextlib.suppress(asyncio.CancelledError):
-                    await pump_task
-                if final is None:
-                    # The loop was abandoned (client disconnect) before the done frame; run the
-                    # same post-turn bookkeeping even though no client is left to stream to.
-                    with contextlib.suppress(Exception):
-                        await finalize_turn(collect_done_payload())
-                if research_service is not None and bound_task_id is not None:
-                    # Hand the finished interactive turn to the worker chain unless it hit a
-                    # stop condition (PUBLISH / pending gate override / cancel / enqueue
-                    # failure). ``research_continuing`` is set here and read on the normal path
-                    # to tag the done frame; the single-task run slot is released only when the
-                    # run is NOT handed off, so the driver chain keeps owning it across turns.
-                    try:
-                        project = research_service.read_project(user_id, bound_task_id)
-                        active_run = project.get("active_run") or {}
-                        run_id = active_run.get("run_id")
-                        if run_id:
-                            research_continuing = await _maybe_continue_research(
-                                research_service,
-                                queue,
-                                user_id=user_id,
-                                task_id=bound_task_id,
-                                run_id=run_id,
-                                session_id=str(session_id),
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("research continuation decision failed: %s", exc)
-                    if not research_continuing:
-                        try:
-                            research_service.end_run(user_id, bound_task_id)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.warning("research end_run failed: %s", exc)
-            else:
-                # Non-research turn: the run is owned by the SSE pipe. Client disconnect stops
-                # it so the turn's awaits (wait_for/tenacity/gather) re-raise CancelledError
-                # and unwind cleanly.
-                pump_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await pump_task
-            # Release the request-scoped log context: this generator may be closed (client
-            # disconnect) at any yield point, so the user/session tags set at gen() start must
-            # not leak into the next unit of work handled by this worker.
-            reset_log_context(log_tokens)
-
-        # Normal completion path: the loop broke on the run's done frame.
-        done = await finalize_turn(final)
-        if research_continuing:
-            done["research_continuing"] = True
-        yield {"data": json.dumps({"type": "done", "data": done}, ensure_ascii=False)}
+        async for frame in orchestrator.stream_turn(ctx, t_entry=t_entry):
+            yield frame
 
     return EventSourceResponse(gen())
