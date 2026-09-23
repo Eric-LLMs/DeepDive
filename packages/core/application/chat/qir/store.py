@@ -73,8 +73,8 @@ async def publish(draft: dict, embedder, session_factory=None) -> Snapshot:
     snap = await build_snapshot(draft, embedder)  # raises before any write
     factory = session_factory or SessionLocal
     async with factory() as session:
-        _upsert(session, _ACTIVE_KEY, snap.to_json())
-        _upsert(session, _VERSION_KEY, {"version": snap.version})
+        await _upsert(session, _ACTIVE_KEY, snap.to_json())
+        await _upsert(session, _VERSION_KEY, {"version": snap.version})
         await session.commit()
     global _cache
     _cache = (snap.version, snap)
@@ -110,5 +110,8 @@ async def _read(session, key: str) -> dict | None:
     return row.value if row is not None else None
 
 
-def _upsert(session, key: str, value: dict) -> None:
-    session.merge(AppSettingModel(key=key, value=value))
+async def _upsert(session, key: str, value: dict) -> None:
+    # AsyncSession.merge is a coroutine: calling it without await stages
+    # NOTHING — commit() would then publish an empty transaction and the
+    # snapshot would silently never persist (caught by the real-DB smoke).
+    await session.merge(AppSettingModel(key=key, value=value))

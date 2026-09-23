@@ -200,6 +200,45 @@ async def test_build_fails_loudly_on_embedding_error():
         }]}, Boom())
 
 
+# ── real-DB publish regression (caught by the 2026-09-23 TEI/DB smoke) ───────────
+
+async def test_publish_actually_awaits_the_row_upserts():
+    """AsyncSession.merge is a coroutine: called without await it stages
+    NOTHING and commit() publishes an empty transaction — publish() still
+    printed success while active() read back None. This pins the write path
+    with a fake session that records every awaited merge."""
+    from core.application.chat.qir import store as qir_store
+
+    rec = {"merged": [], "commits": 0}
+
+    class FakeSession:
+        async def merge(self, obj):
+            rec["merged"].append(obj.key)
+            return obj
+
+        async def commit(self):
+            rec["commits"] += 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    qir_store.invalidate_cache()
+    snap = await qir_store.publish(
+        {"capabilities": [{
+            "id": "cap-create-folder", "tool_binding": "create_folder",
+            "description": "Create a folder.", "examples": ['make a folder "a"'],
+        }]},
+        FakeEmbedder([1.0, 0.0]),
+        lambda: FakeSession(),
+    )
+    assert sorted(rec["merged"]) == ["qir_active", "qir_version"]  # BOTH rows staged
+    assert rec["commits"] == 1  # ...in exactly one transaction
+    assert snap.version  # and the returned snapshot is real
+
+
 # ── negation guard (both layers) ──────────────────────────────────────────────────
 
 @pytest.mark.parametrize("text", [
