@@ -290,8 +290,9 @@ flowchart TB
 runs the three stages (QIR → Argument Binding → policy mapping) over the pure L0 facts; each
 PlanKind has a registered executor, every certified fast path dispatches through the ONE shared
 execution waterfall, and every uncertifiable or pre-commit-failing turn falls back to the Agent
-byte-identical. C1–C4 name the failure classes (see the design section). Regenerate the PNG via
-mermaid.ink to `./images/chat-control-plane.png`.
+byte-identical. C1–C4 name the failure classes (see the design section).
+
+![Chat control plane — three-stage plan resolution, per-kind executors, and the ONE shared waterfall](./images/chat-control-plane.png)
 
 <details>
 <summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
