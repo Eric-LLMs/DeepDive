@@ -134,6 +134,14 @@ class Settings(BaseSettings):
     chat_qir_top_k: int = 3                  # semantic candidate width
     chat_qir_min_score: float = 0.82         # cosine floor for a capability to lead
     chat_qir_margin: float = 0.06            # leader must beat runner-up by this much
+    # ── Shadow Mode (8.15, P1 step 5): the Registry Matcher's tri-state switch ──
+    # off     — the node never runs (dark-launch default);
+    # shadow  — runs every turn, logs the would_* verdict next to L0's outcome,
+    #           never touches routing, usage tagged execution_mode=shadow (8.14);
+    # on      — the P2 promotion (Matcher as authoritative ACTION router). In P1 it
+    #           behaves as shadow with a warning: a mis-set switch must never
+    #           silently hand routing to a node that only ever measured in the dark.
+    chat_matcher_mode: str = "off"
 
     # ── Web search (agent web_search tool) ──
     # provider is free text: aggregate/keyless (no key) | duckduckgo (no key) | tavily |

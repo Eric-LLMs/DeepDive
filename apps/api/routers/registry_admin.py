@@ -37,6 +37,10 @@ from core.application.chat.intent_funnel.registry import (
     update_draft,
 )
 from core.infrastructure.db import SessionLocal
+from core.infrastructure.request_context import (
+    reset_request_execution_mode,
+    set_request_execution_mode,
+)
 from fastapi import APIRouter, Depends, HTTPException
 
 router = APIRouter(tags=["registry-admin"])
@@ -105,7 +109,12 @@ async def get_preview(_: AuthAdmin = Depends(require_admin)) -> dict:
     """Dry-run the publish BUILD (validation + real embeddings) with zero writes.
     8.5's full-funnel query preview rides on top once step 5 marks execution_mode."""
     drafts = await list_drafts(session_factory=SessionLocal)
-    issues, snap = await preview_draft(drafts, _embedder())
+    # 8.14: the build's embedding calls are preview usage, not anyone's bill.
+    token = set_request_execution_mode("preview")
+    try:
+        issues, snap = await preview_draft(drafts, _embedder())
+    finally:
+        reset_request_execution_mode(token)
     return {
         "issues": issues,
         "capabilities": len(drafts),

@@ -157,6 +157,30 @@ def test_preview_reports_clean_build_without_writes(client, monkeypatch):
                    "routable": 0}
 
 
+def test_preview_build_is_tagged_execution_mode_preview(client, monkeypatch):
+    """8.14: the real embeddings a preview build spends are preview usage —
+    any call logged inside must settle outside user billing, and the pin must
+    not outlive the endpoint."""
+    from core.infrastructure.request_context import get_request_execution_mode
+
+    async def fake_list(**kw):
+        return [_entry()]
+
+    snap = Snapshot(version="qir1-abc", built_at=0.0, capabilities=())
+    seen = {}
+
+    async def fake_preview(entries, embedder):
+        seen["mode"] = get_request_execution_mode()
+        return [], snap
+
+    monkeypatch.setattr(ra, "list_drafts", fake_list)
+    monkeypatch.setattr(ra, "preview_draft", fake_preview)
+    monkeypatch.setattr(ra, "_embedder", lambda: object())
+    assert client.get("/admin/registry/preview").status_code == 200
+    assert seen["mode"] == "preview"
+    assert get_request_execution_mode() == "production"
+
+
 def test_publish_rejection_is_audited_with_all_issues(client, audits, monkeypatch):
     async def reject(*a, **kw):
         raise PublishRejectedError(["bad binding", "missing examples"])

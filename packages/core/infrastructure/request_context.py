@@ -14,6 +14,10 @@ process-global default channel (in the worker: the unconfigured llm-gateway → 
 ``/chat`` and the worker's ``research_drive``/``run_agent_turn`` set it before the agent runs;
 the retrieval shim in :mod:`api.agent_factory` forwards it per call. ``None`` means the
 configured global client is used unchanged.
+
+:data:`request_execution_mode` (8.14) tags what the context's LLM/embedding usage
+is FOR — ``production`` by default; shadow observers, admin preview builds and test
+harnesses pin their own mode so billing can exclude them.
 """
 from __future__ import annotations
 
@@ -25,10 +29,26 @@ request_llm_channel: ContextVar[tuple[str | None, str | None, str | None] | None
     "request_llm_channel", default=None
 )
 
+# ── Execution mode (docs/temp.md 8.14) ───────────────────────────────────────────
+# WHAT a call was made for, rides with WHO made it. Every usage row inherits
+# ``production`` unless a scoped observer pins another mode; the billing path
+# settles non-production usage outside real-user accounting (8.14's hole).
+EXECUTION_MODES = frozenset({"production", "shadow", "preview", "test"})
+BILLABLE_MODE = "production"
+
+request_execution_mode: ContextVar[str] = ContextVar(
+    "request_execution_mode", default=BILLABLE_MODE
+)
+
 
 def get_request_user_id() -> uuid.UUID | None:
     """Return the current request's user id, or ``None`` for a guest / no request."""
     return request_user.get()
+
+
+def get_request_execution_mode() -> str:
+    """The mode the current context's usage should be attributed to (8.14)."""
+    return request_execution_mode.get()
 
 
 def set_request_user(user_id: uuid.UUID | None) -> None:
@@ -56,3 +76,19 @@ def set_request_llm_channel(
 def reset_request_llm_channel(token: Token) -> None:
     """Undo a :func:`set_request_llm_channel` pin (restore the previous context value)."""
     request_llm_channel.reset(token)
+
+
+def set_request_execution_mode(mode: str) -> Token:
+    """Pin the current context's execution mode (shadow/preview/test observers).
+
+    Returns the ContextVar token so the scoping caller can ``reset`` it in a
+    ``finally`` — a non-production pin must never outlive the observation that
+    set it, or real user turns would silently become unbilled.
+    """
+    if mode not in EXECUTION_MODES:
+        raise ValueError(f"unknown execution mode {mode!r}; expected one of {sorted(EXECUTION_MODES)}")
+    return request_execution_mode.set(mode)
+
+
+def reset_request_execution_mode(token: Token) -> None:
+    request_execution_mode.reset(token)

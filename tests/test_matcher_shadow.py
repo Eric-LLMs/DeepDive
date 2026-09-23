@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 import types
 
-import pytest
 from core.application.chat import qir  # noqa: F401 - import order sanity for seams
 from core.application.chat.intent_funnel import funnel, matcher
 from core.application.chat.intent_funnel.contract import (
@@ -112,23 +111,27 @@ def _req():
                             needs_web=Signal.LOW, needs_memory=False)
 
 
-async def test_shadow_hook_is_inert_when_the_funnel_switch_is_off(monkeypatch):
+async def test_shadow_hook_is_inert_when_the_mode_switch_is_off(monkeypatch):
     from core.config import settings
 
-    settings.chat_qir_enabled = False
+    # step 5 decoupled the two: even with QIR on, matcher_mode=off must leave
+    # the shadow node physically dark.
+    monkeypatch.setattr(settings, "chat_qir_enabled", True)
+    monkeypatch.setattr(settings, "chat_matcher_mode", "off")
     calls = []
     monkeypatch.setattr(
         "core.application.chat.intent_funnel.registry.active_view",
         lambda **kw: calls.append(1),  # would raise if awaited; never called
     )
-    out = await funnel.route(_ctx("新建文件夹"), deps=object(), requirements=_req())
-    assert calls == []  # physically dark, exactly as pre-step-3
+    req = _req()
+    out = await funnel.route(_ctx("新建文件夹"), deps=object(), requirements=req)
+    assert calls == [] and out is req  # exactly as pre-step-3
 
 
-async def test_shadow_logs_verdict_without_touching_routing(monkeypatch, caplog):
+async def test_shadow_logs_would_verdict_without_touching_routing(monkeypatch, caplog):
     from core.config import settings
 
-    settings.chat_qir_enabled = True
+    monkeypatch.setattr(settings, "chat_matcher_mode", "shadow")
     view = _view([_entry("cap-a", aliases=("新建文件夹",))])
 
     async def fake_active(**kw):
@@ -138,7 +141,7 @@ async def test_shadow_logs_verdict_without_touching_routing(monkeypatch, caplog)
         "core.application.chat.intent_funnel.registry.active_view", fake_active
     )
     req = _req()
-    with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel.funnel"):
+    with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
         # deps without session_factory/embedder: the shadow read may work but the
         # live cascade must fail-open — both outcomes must return THE SAME object.
         out = await funnel.route(
@@ -146,14 +149,18 @@ async def test_shadow_logs_verdict_without_touching_routing(monkeypatch, caplog)
             requirements=req,
         )
     assert out is req  # byte-identical turn: the shadow cannot certify an action
-    lines = [r.getMessage() for r in caplog.records if "matcher_shadow" in r.getMessage()]
-    assert lines and "state=HIT" in lines[0] and "cap=cap-a" in lines[0]
+    line = next(r.getMessage() for r in caplog.records if "matcher_shadow" in r.getMessage())
+    assert "state=HIT" in line and "would_capability=cap-a" in line
+    # the 8.15 telemetry vocabulary
+    assert "would_route=t" in line and "would_stage=matcher" in line
+    assert "confidence=1.0" in line and "fallback_reason=-" in line
+    assert f"registry_version={view.fingerprint}" in line
 
 
 async def test_shadow_read_failure_is_fail_quiet(monkeypatch, caplog):
     from core.config import settings
 
-    settings.chat_qir_enabled = True
+    monkeypatch.setattr(settings, "chat_matcher_mode", "shadow")
 
     async def boom(**kw):
         raise RuntimeError("registry store down")
@@ -176,7 +183,7 @@ async def test_shadow_sees_l0_certification_for_comparison(monkeypatch, caplog):
     pairing is the step-3 equivalence dataset."""
     from core.config import settings
 
-    settings.chat_qir_enabled = True
+    monkeypatch.setattr(settings, "chat_matcher_mode", "shadow")
     view = _view([_entry("cap-a", tool="create_folder", aliases=("随便",))])
 
     async def fake_active(**kw):
@@ -190,7 +197,7 @@ async def test_shadow_sees_l0_certification_for_comparison(monkeypatch, caplog):
         needs_web=Signal.LOW, needs_memory=False,
         requested_action={"tool": "create_folder", "args": {}},
     )
-    with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel.funnel"):
+    with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
         out = await funnel.route(
             _ctx("提个要求"), deps=types.SimpleNamespace(session_factory=None),
             requirements=req,
@@ -198,3 +205,72 @@ async def test_shadow_sees_l0_certification_for_comparison(monkeypatch, caplog):
     assert out is req  # L0-certified turns are untouched by the shadow, too
     line = next(r.getMessage() for r in caplog.records if "matcher_shadow" in r.getMessage())
     assert "l0_tool=create_folder" in line and "state=MISS" in line
+    assert "would_route=f" in line and "fallback_reason=matcher_miss" in line
+
+
+# ── step 5: the tri-state switch + the 8.14 cost pin ─────────────────────────────
+
+async def test_mode_on_runs_shadow_semantics_with_a_warning(monkeypatch, caplog):
+    """ON is the P2 promotion: in P1 it must NEVER route — it runs shadow and
+    warns once so a mis-set switch is loud in the logs but inert in behavior."""
+    from core.application.chat.intent_funnel import shadow
+    from core.config import settings
+
+    monkeypatch.setattr(shadow, "_warned_on", False)
+    monkeypatch.setattr(settings, "chat_matcher_mode", "on")
+    view = _view([_entry("cap-a", aliases=("新建文件夹",))])
+
+    async def fake_active(**kw):
+        return view
+
+    monkeypatch.setattr(
+        "core.application.chat.intent_funnel.registry.active_view", fake_active
+    )
+    req = _req()
+    with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
+        out = await funnel.route(
+            _ctx("新建文件夹"), deps=types.SimpleNamespace(session_factory=None),
+            requirements=req,
+        )
+    assert out is req  # ON does not hand the HIT to the turn — L0 stays in charge
+    assert any("P2 deliverable" in r.getMessage() for r in caplog.records)
+    assert any("matcher_shadow mode=on" in r.getMessage() for r in caplog.records)
+
+
+async def test_unknown_mode_fails_safe_to_off(monkeypatch):
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "chat_matcher_mode", "SHADOWW")  # typo
+    calls = []
+    monkeypatch.setattr(
+        "core.application.chat.intent_funnel.registry.active_view",
+        lambda **kw: calls.append(1),
+    )
+    req = _req()
+    out = await funnel.route(_ctx("新建文件夹"), deps=object(), requirements=req)
+    assert calls == [] and out is req
+
+
+async def test_shadow_pins_execution_mode_and_always_releases_it(monkeypatch):
+    """8.14: the observation runs under execution_mode=shadow — any usage a
+    future shadow stage logs must be unbilled. The pin never leaks out, even
+    when the observation itself raises."""
+    from core.application.chat.intent_funnel.shadow import observe
+    from core.infrastructure.request_context import (
+        get_request_execution_mode,
+    )
+
+    seen = {}
+
+    async def spy_active(**kw):
+        seen["inside"] = get_request_execution_mode()
+        raise RuntimeError("registry store down")
+
+    monkeypatch.setattr(
+        "core.application.chat.intent_funnel.registry.active_view", spy_active
+    )
+    await observe(
+        _ctx("hi"), types.SimpleNamespace(session_factory=None), _req(), "shadow",
+    )
+    assert seen["inside"] == "shadow"
+    assert get_request_execution_mode() == "production"  # fail-quiet also unwinds

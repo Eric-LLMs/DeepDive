@@ -562,6 +562,9 @@ class UserUsageLogModel(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
     cost_usd: Mapped[float] = mapped_column(Numeric(12, 6), default=0)
+    execution_mode: Mapped[str] = mapped_column(
+        String, nullable=False, server_default="production"
+    )  # production | shadow | preview | test (8.14): only production debits the wallet
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

@@ -56,6 +56,10 @@ from core.infrastructure.llm_routing import (
     user_banned_from as _user_banned_from,  # noqa: F401
 )
 from core.infrastructure.memory import ensure_user
+from core.infrastructure.request_context import (
+    BILLABLE_MODE,
+    get_request_execution_mode,
+)
 from core.infrastructure.security import verify_password
 from fastapi import HTTPException, Request
 from sqlalchemy import func, select
@@ -183,6 +187,7 @@ async def _guest_quota(redis, guest_id: UUID, detail: str | None = None) -> None
 async def _log_usage(
     user: AuthUser, model: str, tool: str, usage: dict | None = None,
     credential_id: UUID | None = None, *, paid: bool = False,
+    execution_mode: str | None = None,
 ) -> None:
     """Record one usage-log row, pricing it against the catalog and debiting the wallet.
 
@@ -194,7 +199,14 @@ async def _log_usage(
 
     The cost is always the catalog model price; ``credential_id`` only records which channel
     served the request so the admin can aggregate cost per channel.
+
+    Execution-mode isolation (8.14): a non-production call (shadow observer, preview
+    build, test harness) still records its row — tagged, for telemetry grouping — but
+    NEVER debits the wallet. Mode resolution: explicit kwarg, else the ambient
+    ``request_execution_mode`` pin; production is the default and settles exactly as
+    before this column existed.
     """
+    mode = execution_mode or get_request_execution_mode()
     usage = usage or {}
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
     completion_tokens = int(usage.get("completion_tokens") or 0)
@@ -202,7 +214,7 @@ async def _log_usage(
     async with SessionLocal() as session:
         prompt_price, completion_price = await get_model_prices(session, model)
         cost = compute_cost(prompt_tokens, completion_tokens, prompt_price, completion_price)
-        if paid and cost > 0:
+        if paid and mode == BILLABLE_MODE and cost > 0:
             charge = min(cost, await get_balance(session, user.user_id))
             if charge > 0:
                 await deduct(
@@ -221,6 +233,7 @@ async def _log_usage(
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
                 cost_usd=float(cost),
+                execution_mode=mode,
             )
         )
         await session.commit()
@@ -269,7 +282,12 @@ async def _usage_report(
             .limit(30)
         )
     ).scalars().all()
-    log_filters = [UserUsageLogModel.user_id == user_id]
+    log_filters = [
+        UserUsageLogModel.user_id == user_id,
+        # 8.14: a user's usage report is their BILL — shadow/preview/test rows
+        # exist for telemetry grouping only and must never surface here.
+        UserUsageLogModel.execution_mode == BILLABLE_MODE,
+    ]
     if start_dt is not None:
         log_filters.append(UserUsageLogModel.created_at >= start_dt)
     if end_dt is not None:
