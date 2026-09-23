@@ -23,6 +23,7 @@ would accept can still be rejected here (8.4).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Sequence
 
 from sqlalchemy import func, update
@@ -47,6 +48,7 @@ from .store import (
     stage_version,
 )
 from .types import (
+    RE_PREFIX,
     STATUS_ACTIVE,
     STATUS_DEPRECATED,
     STATUS_DISABLED,
@@ -121,6 +123,13 @@ def validate_entries(entries: Sequence[CapabilityEntry]) -> list[str]:
             issues.append(f"{cid}: execution_policy {e.execution_policy!r} not in {sorted(VALID_POLICIES)}")
         if any(ch.isspace() for ch in e.permissions):
             issues.append(f"{cid}: permissions must be a single token (or empty)")
+        for lit in (*e.patterns, *e.aliases):
+            s = str(lit).strip()
+            if s.startswith(RE_PREFIX):
+                try:
+                    re.compile(s[len(RE_PREFIX):])
+                except re.error as exc:
+                    issues.append(f"{cid}: un-compilable regex pattern {s!r}: {exc}")
         for slot, source in e.arg_slots.items():
             issues.extend(
                 f"{cid}: arg_slots[{slot!r}] {msg}" for msg in _slot_issues(source)

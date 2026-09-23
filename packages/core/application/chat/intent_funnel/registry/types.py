@@ -25,6 +25,10 @@ STATUS_ACTIVE = "active"
 STATUS_DISABLED = "disabled"
 STATUS_DEPRECATED = "deprecated"
 
+# Pattern literals matching this prefix are regexes for the Matcher; everything
+# else is an exact phrase. Shared so the publish gate and the Matcher agree.
+RE_PREFIX = "re:"
+
 
 @dataclass(frozen=True)
 class CapabilityEntry:

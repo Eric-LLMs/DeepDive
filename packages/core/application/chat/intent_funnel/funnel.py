@@ -51,9 +51,37 @@ async def route(ctx, *, deps, requirements: TurnRequirements) -> TurnRequirement
     When live, hands off to ``run_intent_stage`` (the former
     ``TurnOrchestrator._qir_intent_stage``, moved verbatim).
     """
+    # P1 step-3 coexistence migration: once the QIR switch is on, ALSO run the
+    # Registry-backed Matcher node in the dark — log its verdict next to the
+    # legacy L0 outcome, never let it influence this turn. L0 stays authoritative
+    # until the measured equivalence clears it for deletion (a P2 decision).
+    if settings.chat_qir_enabled and deps is not None:
+        await _shadow_matcher(ctx, deps, requirements)
     if not qir_live(requirements, deps, ctx):
         return requirements
     return await run_intent_stage(ctx, deps, requirements)
+
+
+async def _shadow_matcher(ctx, deps, requirements: TurnRequirements) -> None:
+    """Shadow logging only (8.15 discipline applied early to Node 1): the result
+    NEVER feeds routing, and every failure is fail-quiet — a broken shadow node
+    must not change the turn in any observable way except absent log lines."""
+    try:
+        from . import matcher
+        from .registry import active_view
+
+        view = await active_view(session_factory=deps.session_factory)
+        if view is None:
+            return  # nothing published yet — no comparison possible
+        res = matcher.match(getattr(ctx.body, "message", "") or "", view)
+        l0_tool = (requirements.requested_action or {}).get("tool")
+        logger.info(
+            "matcher_shadow version=%d state=%s cap=%s candidates=%s l0_tool=%s",
+            view.version, res.state, res.capability_id or "-",
+            ",".join(res.candidates) or "-", l0_tool or "-",
+        )
+    except Exception as exc:  # noqa: BLE001 - shadow is observation, never behavior
+        logger.info("matcher shadow fail-quiet: %r", exc)
 
 
 async def run_intent_stage(ctx, deps, requirements: TurnRequirements) -> TurnRequirements:
