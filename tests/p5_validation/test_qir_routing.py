@@ -248,9 +248,12 @@ def _stage_deps():
 
 
 async def _run_stage(monkeypatch, bind_impl):
+    # P0 move: the stage now lives in intent_funnel.funnel (verbatim); this
+    # helper calls it directly exactly as it used to call the orchestrator's
+    # private _qir_intent_stage.
     from core.application.chat import qir as qir_pkg
+    from core.application.chat.intent_funnel.funnel import run_intent_stage
     from core.application.chat.qir import store as qir_store
-    from core.application.chat.turn_orchestrator import TurnOrchestrator
     from core.application.chat.understanding import TurnRequirements
 
     snap = _snapshot()
@@ -266,9 +269,8 @@ async def _run_stage(monkeypatch, bind_impl):
     monkeypatch.setattr(qir_store, "active", active)
     monkeypatch.setattr(qir_pkg, "route", route)
     monkeypatch.setattr("core.application.chat.actions.bind_arguments", bind_impl)
-    orch = TurnOrchestrator(deps=None)
     req = TurnRequirements()
-    out = await orch._qir_intent_stage(_stage_ctx('make folder "x"'), _stage_deps(), req)
+    out = await run_intent_stage(_stage_ctx('make folder "x"'), _stage_deps(), req)
     return req, out
 
 
