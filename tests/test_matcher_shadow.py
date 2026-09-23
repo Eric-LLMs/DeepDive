@@ -56,11 +56,14 @@ def test_exact_phrase_hit_is_normalized():
     res = matcher.match("新建文件夹", v)
     assert res.state == MATCH_HIT and res.capability_id == "cap-a"
     assert res.registry_version == v.fingerprint
+    assert res.matched_literal == "新建文件夹"  # the normalized alias, not just the verdict
 
 
 def test_regex_pattern_hits_and_misses():
     v = _view([_entry("cap-a", patterns=(f"{T.RE_PREFIX}(?:创建|新建)文件夹",))])
-    assert matcher.match("帮我新建文件夹好吗", v).capability_id == "cap-a"
+    res = matcher.match("帮我新建文件夹好吗", v)
+    assert res.capability_id == "cap-a"
+    assert res.matched_literal == "re:(?:创建|新建)文件夹"
     assert matcher.match("删除文件夹", v).state == MATCH_MISS
 
 
@@ -155,6 +158,8 @@ async def test_shadow_logs_would_verdict_without_touching_routing(monkeypatch, c
     assert "would_route=t" in line and "would_stage=matcher" in line
     assert "confidence=1.0" in line and "fallback_reason=-" in line
     assert f"registry_version={view.fingerprint}" in line
+    assert "pattern=新建文件夹" in line  # which alias produced the HIT
+    assert "agreement=matcher_only" in line  # Matcher hit, L0 abstained
 
 
 async def test_shadow_read_failure_is_fail_quiet(monkeypatch, caplog):
@@ -206,6 +211,37 @@ async def test_shadow_sees_l0_certification_for_comparison(monkeypatch, caplog):
     line = next(r.getMessage() for r in caplog.records if "matcher_shadow" in r.getMessage())
     assert "l0_tool=create_folder" in line and "state=MISS" in line
     assert "would_route=f" in line and "fallback_reason=matcher_miss" in line
+    assert "agreement=l0_only" in line  # L0 certified, Matcher abstained
+
+
+async def test_shadow_agreement_match_and_mismatch(monkeypatch, caplog):
+    """The two adjudication samples P2 promotion needs: HIT agreeing with L0,
+    and HIT naming a different tool than L0 certified."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "chat_matcher_mode", "shadow")
+
+    async def fake_active(**kw):
+        return _view([_entry("cap-a", tool="create_folder", aliases=("新建文件夹",))])
+
+    monkeypatch.setattr(
+        "core.application.chat.intent_funnel.registry.active_view", fake_active
+    )
+    for l0, expect in (("create_folder", "agreement=match"), ("add_term", "agreement=mismatch")):
+        req = TurnRequirements(
+            complexity=Complexity.LOW, confidence=Confidence.LOW,
+            needs_web=Signal.LOW, needs_memory=False,
+            requested_action={"tool": l0, "args": {}},
+        )
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
+            out = await funnel.route(
+                _ctx("新建文件夹"), deps=types.SimpleNamespace(session_factory=None),
+                requirements=req,
+            )
+        assert out is req  # agreement or not, the shadow never touches the turn
+        line = next(r.getMessage() for r in caplog.records if "matcher_shadow" in r.getMessage())
+        assert expect in line and "state=HIT" in line
 
 
 # ── step 5: the tri-state switch + the 8.14 cost pin ─────────────────────────────

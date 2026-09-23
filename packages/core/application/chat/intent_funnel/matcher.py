@@ -80,18 +80,29 @@ def match(query: str, view) -> MatchResult:
         return MatchResult(state=MATCH_MISS, registry_version=view.fingerprint)
     exact, regexes = build_index(view)
     hits: set[str] = set()
+    sources: dict[str, list[str]] = {}  # cid -> the literals that produced its hit
+
+    def _note(cid: str, literal: str) -> None:
+        hits.add(cid)
+        sources.setdefault(cid, []).append(literal)
+
     q = _norm(query)
     if q in exact:
-        hits |= exact[q]
+        for cid in exact[q]:
+            _note(cid, q)
     for rx, cid in regexes:
         if rx.search(query):
-            hits.add(cid)
+            _note(cid, f"{RE_PREFIX}{rx.pattern}")
     if not hits:
         return MatchResult(state=MATCH_MISS, registry_version=view.fingerprint)
     if len(hits) == 1:
+        cid = next(iter(hits))
+        # dedupe (a cap can match via several literals), keep order, bound the
+        # log line — regex sources can be long
+        literal = ";".join(dict.fromkeys(sources[cid]))[:160]
         return MatchResult(
-            state=MATCH_HIT, capability_id=next(iter(hits)),
-            registry_version=view.fingerprint,
+            state=MATCH_HIT, capability_id=cid,
+            registry_version=view.fingerprint, matched_literal=literal,
         )
     return MatchResult(
         state=MATCH_AMBIGUOUS, candidates=tuple(sorted(hits)),

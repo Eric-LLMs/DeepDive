@@ -89,14 +89,34 @@ async def _match_and_log(ctx, deps, requirements, mode: str) -> None:
     logger.info(
         "matcher_shadow mode=%s version=%d state=%s registry_version=%s "
         "would_route=%s would_capability=%s would_stage=%s confidence=%s "
-        "fallback_reason=%s candidates=%s l0_tool=%s",
+        "fallback_reason=%s candidates=%s pattern=%s l0_tool=%s agreement=%s",
         mode, view.version, res.state, view.fingerprint,
         "t" if res.state == MATCH_HIT else "f",
         res.capability_id or "-", _WOULD_STAGE,
         _confidence(res),
         _FALLBACK_REASONS.get(res.state, _DEFAULT_FALLBACK),
-        ",".join(res.candidates) or "-", l0_tool or "-",
+        ",".join(res.candidates) or "-",
+        (res.matched_literal or "-").replace(" ", "_"),
+        l0_tool or "-", _agreement(res, view, l0_tool),
     )
+
+
+def _agreement(res: MatchResult, view, l0_tool: str | None) -> str:
+    """The L0-vs-Matcher verdict pair for the equivalence dataset (8.15).
+
+    ``match``/``mismatch`` compare tool bindings — a HIT whose capability binds
+    the same tool L0 certified is agreement; a different tool is the disagreement
+    sample P2 promotion needs to adjudicate. The other three codes locate which
+    side abstained (both-miss turns are ``none``)."""
+    if res.state != MATCH_HIT:
+        return "l0_only" if l0_tool else "none"
+    tool = next((e.tool_binding for e in view.entries
+                 if e.capability_id == res.capability_id), None)
+    if not l0_tool:
+        return "matcher_only"
+    if tool is None:  # HIT on an entry outside the view — defensive, shouldn't happen
+        return "unknown"
+    return "match" if tool == l0_tool else "mismatch"
 
 
 def _confidence(res: MatchResult) -> str:

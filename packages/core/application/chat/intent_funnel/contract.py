@@ -30,6 +30,10 @@ class MatchResult:
     capability_id: str | None = None
     registry_version: str = ""
     candidates: tuple[str, ...] = ()
+    # Which pattern/alias actually produced a single HIT (shadow telemetry —
+    # the equivalence dataset needs the literal, not just the verdict).
+    # Empty for MISS/AMBIGUOUS (no single answer to attribute).
+    matched_literal: str = ""
 
 
 # ── Node 2: Recall (P1 producer; today lives inside qir.semantic) ────────────────
