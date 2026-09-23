@@ -73,13 +73,23 @@ async def publish(draft: dict, embedder, session_factory=None) -> Snapshot:
     snap = await build_snapshot(draft, embedder)  # raises before any write
     factory = session_factory or SessionLocal
     async with factory() as session:
-        await _upsert(session, _ACTIVE_KEY, snap.to_json())
-        await _upsert(session, _VERSION_KEY, {"version": snap.version})
+        await write_active(session, snap)
         await session.commit()
     global _cache
     _cache = (snap.version, snap)
     logger.info("qir.store published version=%s capabilities=%d", snap.version, len(snap.capabilities))
     return snap
+
+
+async def write_active(session, snap: Snapshot) -> None:
+    """Stage the active pair onto the CALLER's session/transaction (no commit).
+
+    Lets the Registry publish pipeline (§8.3 Build-Then-Swap) swap the QIR active
+    snapshot inside the SAME short transaction that activates the registry version
+    row — one commit, so Registry vN and Index vN can never be observed apart.
+    """
+    await _upsert(session, _ACTIVE_KEY, snap.to_json())
+    await _upsert(session, _VERSION_KEY, {"version": snap.version})
 
 
 async def unpublish(session_factory=None) -> None:

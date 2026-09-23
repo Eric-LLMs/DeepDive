@@ -8,6 +8,15 @@ Layering (docs/temp.md §8.2/§8.3):
 * Validate/Preview/Build-Then-Swap around these primitives is step 2; the Matcher
   starts reading this Registry (shadow) in step 3.
 """
+from .publish import (
+    PublishRejectedError,
+    VALID_POLICIES,
+    VALID_SOURCES,
+    preview_draft,
+    publish_draft,
+    to_qir_draft,
+    validate_entries,
+)
 from .types import (
     STATE_ACTIVE,
     STATE_FAILED,

@@ -82,11 +82,16 @@ class FakeSession:
         self.get_map = get_map or {}
         self.commit_error = commit_error
         self.added: list = []
+        self.merged: list = []
         self.commits = 0
         self.rollbacks = 0
 
     def add(self, obj):
         self.added.append(obj)
+
+    async def merge(self, obj):
+        self.merged.append(obj.key)
+        return obj
 
     async def execute(self, stmt):
         return self.results.pop(0)
@@ -323,3 +328,124 @@ async def test_active_view_marker_change_reloads_payload():
     await reg.active_view(session_factory=factory(s1))
     v = await reg.active_view(session_factory=factory(s2))
     assert v.version == 6 and v.capabilities[0].id == "cap-z"
+
+
+# ── step 2: validate / preview / build-then-swap publish ─────────────────────────
+
+class FakeEmbedder:
+    def __init__(self, vec=(1.0, 0.0), exc=None):
+        self.vec, self.exc, self.calls = vec, exc, 0
+
+    async def embed(self, texts):
+        self.calls += 1
+        if self.exc:
+            raise self.exc
+        return [list(self.vec) for _ in texts]
+
+
+def test_validate_accepts_the_full_source_enum_including_plugin_forms():
+    e = _entry(arg_slots={
+        "a": "user_input", "b": "viewer.current_page", "c": {"source": "viewer.selection"},
+        "d": "attachment", "e": "turn_context", "f": "fixed",
+        "g": "plugin:extract_folder_name",
+    })
+    assert reg.publish.validate_entries([e]) == []
+
+
+@pytest.mark.parametrize("slot,bad", [
+    ("regex:aliases", "minimal enum"),        # NOT in the frozen enum (ruling 2)
+    ("plugin:", "needs a name"),
+    (123, "must be a string"),
+    ({"nope": "user_input"}, "must be a string"),
+])
+def test_validate_rejects_bad_arg_slot_sources(slot, bad):
+    issues = reg.publish.validate_entries([_entry(arg_slots={"x": slot})])
+    assert issues and bad in issues[0]
+
+
+def test_validate_rejects_unknown_tool_binding():
+    issues = reg.publish.validate_entries([_entry(tool_binding="launch_missiles")])
+    assert any("DIRECT_TOOLS" in i for i in issues)
+
+
+def test_validate_rejects_deterministic_pattern_conflict_between_routable_caps():
+    a = _entry("cap-a", aliases=("建个目录",))
+    b = _entry("cap-b", tool_binding="add_term", patterns=("建个目录",))
+    issues = reg.publish.validate_entries([a, b])
+    assert any("deterministic conflict" in i for i in issues)
+    # same literal under a DISABLED cap is not a conflict (ruling 4: never a candidate)
+    off = _entry("cap-b", tool_binding="add_term", patterns=("建个目录",),
+                 enabled=False, status="disabled")
+    assert not any("conflict" in i for i in reg.publish.validate_entries([a, off]))
+
+
+def test_validate_rejects_enabled_deprecated_and_unknown_policy():
+    issues = reg.publish.validate_entries([
+        _entry("cap-a", enabled=True, status="deprecated"),
+        _entry("cap-b", tool_binding="add_term", execution_policy="yolo"),
+    ])
+    assert any("contradicts" in i for i in issues)
+    assert any("execution_policy" in i for i in issues)
+
+
+async def test_publish_rejects_before_touching_the_db():
+    with pytest.raises(reg.PublishRejectedError):
+        await reg.publish.publish_draft(
+            FakeEmbedder(), drafts=[_entry(tool_binding="ghost")],
+            session_factory=factory(),  # empty pool: any DB open fails the test
+        )
+
+
+async def test_preview_builds_without_writes_and_reports_issues_only():
+    issues, snap = await reg.publish.preview_draft([_entry()], FakeEmbedder())
+    assert issues == [] and snap is not None
+    assert snap.version.startswith("qir1-")  # reuses the existing QIR build path
+    issues2, snap2 = await reg.publish.preview_draft([_entry(tool_binding="ghost")], FakeEmbedder())
+    assert issues2 and snap2 is None
+
+
+async def test_publish_swaps_registry_and_qir_pair_in_one_commit():
+    entry = _entry()
+    stager = FakeSession(
+        results=[_Result(scalar=6)],
+        get_map={(RegistryVersionModel, 7): _ver_row(version=7, entry=entry, state=T.STATE_STAGED)},
+    )
+    swapper = FakeSession(
+        results=[_Result(rowcount=1), _Result(rowcount=1)],
+    )
+    finalizer = FakeSession(
+        get_map={(RegistryVersionModel, 7): _ver_row(version=7, entry=entry)},
+    )
+    reg.invalidate_cache()
+    view = await reg.publish.publish_draft(
+        FakeEmbedder(), drafts=[entry], actor_username="admin",
+        session_factory=factory(stager, swapper, finalizer),
+    )
+    # the QIR active pair rode the SAME session as the registry swap — one commit
+    assert swapper.merged == ["qir_active", "qir_version"] and swapper.commits == 1
+    assert view.version == 7 and view.state == T.STATE_ACTIVE
+
+
+async def test_publish_embedder_failure_opens_no_db_session():
+    with pytest.raises(Exception, match="embedding index build failed"):
+        await reg.publish.publish_draft(
+            FakeEmbedder(exc=RuntimeError("tei down")), drafts=[_entry()],
+            session_factory=factory(),  # zero sessions allowed
+        )
+
+
+async def test_publish_records_failed_version_when_swap_races():
+    entry = _entry()
+    stager = FakeSession(
+        results=[_Result(scalar=6)],
+        get_map={(RegistryVersionModel, 7): _ver_row(version=7, entry=entry, state=T.STATE_STAGED)},
+    )
+    # supersede lands, but our staged row vanished (rowcount 0) -> abort + mark failed
+    swapper = FakeSession(results=[_Result(rowcount=1), _Result(rowcount=0)])
+    marker = FakeSession(results=[_Result(rowcount=1)])  # mark_failed update lands
+    with pytest.raises(reg.RegistryStateError, match="mid-publish"):
+        await reg.publish.publish_draft(
+            FakeEmbedder(), drafts=[entry], session_factory=factory(stager, swapper, marker),
+        )
+    assert swapper.commits == 0  # the real AsyncSession.__aexit__ aborts the tx
+    assert marker.commits == 1  # v7 now recorded FAILED; old active untouched
