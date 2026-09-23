@@ -921,6 +921,34 @@ class RegistryVersionModel(Base):
     )
 
 
+class RegistryAuditModel(Base):
+    """Minimal publish/rollback audit trail (QIR P1 ruling 5).
+
+    The registry_versions rows already audit SUCCESSFUL publishes (actor, note);
+    this table records every admin-plane attempt INCLUDING rejections and draft
+    edits — a rejected publish leaves no version row, so without this the failed
+    door-knocking would be invisible. Denormalized actor (username string, no FK)
+    follows the ``workspace_activity`` precedent: entries survive user deletes."""
+
+    __tablename__ = "registry_audit"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    # draft_create | draft_update | publish | publish_rejected | rollback | preview
+    actor_username: Mapped[str | None] = mapped_column(String)
+    target: Mapped[str | None] = mapped_column(String)  # capability_id or "vN"
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    detail: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        Index("ix_registry_audit_created_at", "created_at"),
+    )
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MIGRATIONS_DIR = _REPO_ROOT / "migrations"
 

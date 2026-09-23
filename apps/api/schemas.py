@@ -626,3 +626,39 @@ class RouteUpsertRequest(BaseModel):
     prompt_price_per_1k: float | None = None
     completion_price_per_1k: float | None = None
     is_active: bool = True
+
+
+# ── Intent Registry admin (QIR P1) ───────────────────────────────────────────────
+
+class RegistryDraftCreateRequest(BaseModel):
+    """One Draft capability row (the editable Registry source)."""
+
+    capability_id: str
+    tool_binding: str
+    description: str = ""
+    patterns: list[str] = []
+    aliases: list[str] = []
+    examples: list[str] = []
+    negatives: list[str] = []
+    arg_slots: dict = {}
+    permissions: str = ""
+    execution_policy: str = "auto"
+    enabled: bool = True
+    status: str = "active"
+    replacement_capability_id: str | None = None
+
+
+class RegistryDraftUpdateRequest(BaseModel):
+    """Partial edit; ``expected_row_version`` is the optimistic-concurrency token
+    the editor read with the row — a stale write is rejected (409), never merged."""
+
+    expected_row_version: int
+    patch: dict
+
+
+class RegistryPublishRequest(BaseModel):
+    note: str | None = None
+
+
+class RegistryRollbackRequest(BaseModel):
+    note: str | None = None

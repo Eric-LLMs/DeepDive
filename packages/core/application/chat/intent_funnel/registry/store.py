@@ -28,7 +28,12 @@ from typing import Any, Sequence
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
-from core.infrastructure.db import CapabilityModel, RegistryVersionModel, SessionLocal
+from core.infrastructure.db import (
+    CapabilityModel,
+    RegistryAuditModel,
+    RegistryVersionModel,
+    SessionLocal,
+)
 
 from .types import (
     STATE_ACTIVE,
@@ -344,6 +349,50 @@ async def rollback(
         session_factory=factory,
     )
     return await activate_version(staged.version, session_factory=factory)
+
+
+# ── Audit trail (registry_audit) ─────────────────────────────────────────────────
+
+async def audit(
+    action: str,
+    *,
+    actor_username: str | None = None,
+    target: str | None = None,
+    ok: bool = True,
+    detail: dict | None = None,
+    session_factory: Any = None,
+) -> None:
+    """Append one admin-plane record. Fire-and-forget at call sites: the audit
+    write must never mask the operation it describes, so callers wrap it in their
+    own try/except if they cannot afford a 500 from the log line."""
+    async with _factory(session_factory)() as session:
+        session.add(RegistryAuditModel(
+            action=action, actor_username=actor_username, target=target,
+            ok=ok, detail=detail or {},
+        ))
+        await session.commit()
+
+
+async def list_audit(*, limit: int = 100, session_factory: Any = None) -> list[dict]:
+    async with _factory(session_factory)() as session:
+        rows = (
+            await session.execute(
+                select(RegistryAuditModel).order_by(
+                    RegistryAuditModel.created_at.desc()
+                ).limit(limit)
+            )
+        ).scalars().all()
+        return [
+            {
+                "action": r.action,
+                "actor_username": r.actor_username,
+                "target": r.target,
+                "ok": r.ok,
+                "detail": r.detail,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
 
 
 # ── Runtime read: the active version, cheaply ────────────────────────────────────
