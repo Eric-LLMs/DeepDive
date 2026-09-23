@@ -321,6 +321,13 @@ flowchart TB
     QIR -. "ABSTAIN — no snapshot · low score · ambiguous · NONE · timeout · store down" .-> AG
     BIND -. "C1 — args undeterminable (proven pre-body)" .-> AG
 
+    subgraph gates["Feature gates (config.py) — ALL default OFF · dark launch"]
+        GQ["chat_qir_enabled · chat_qir_decision_enabled<br/>decision gate off ⇒ semantic similarity alone<br/>can never produce a route"]
+        GF["fast_paths_enabled (master switch)<br/>+ per-kind: direct · viewer · retrieval<br/>· action (5A) · composite (5B)<br/>closed ⇒ that PlanKind never maps"]
+    end
+    GQ -. "gates stage (1) + (2)" .-> QIR
+    GF -. "gates stage (3) · all closed ⇒ every turn maps to AGENT" .-> MAP
+
     MAP --> K{"PlanKind"}
     K -- DIRECT --> DEX["DirectExecutor — single LLM answer"]
     K -- VIEWER --> VEX["ViewerExecutor — answer from injected screen text"]
