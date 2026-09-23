@@ -46,7 +46,10 @@ class FakeLLM:
         if content:
             yield {"type": "content", "data": content}
         yield {"type": "tool_calls", "data": response.get("tool_calls") or []}
-        yield {"type": "usage", "data": dict(_USAGE)}
+        # Respect a scripted ``usage`` (per-call provider usage) so stream tests can pin
+        # token conservation; falls back to the 1/1 default. Mirrors chat(), where the
+        # scripted response dict carries its own usage.
+        yield {"type": "usage", "data": dict(response.get("usage") or _USAGE)}
 
 
 def tool_call(tool_id: str, name: str, args: dict) -> dict:

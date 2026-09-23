@@ -441,7 +441,19 @@ class ReactLoopAgent:
                     "usage": step_usage,
                     "duration_ms": round((time.monotonic() - t0) * 1000),
                 })
-                turn.span.record_llm(duration_ms=(time.monotonic() - t0) * 1000)
+                step_duration_ms = (time.monotonic() - t0) * 1000
+                turn.span.record_step(
+                    index=step,
+                    tool_calls=len(tool_calls),
+                    # Same per-step DELTA convention as run(): the provider's own usage
+                    # coerced exactly like AgentTurn.add_usage, so ``sum(step.tokens)``
+                    # conserves ``turn.usage["total_tokens"]`` (audit == user_usage_logs).
+                    tokens=int((step_usage or {}).get("total_tokens") or 0),
+                    duration_ms=step_duration_ms,
+                )
+                # record_llm tags the most recently recorded step, so it must come after
+                # record_step (mirrors run()'s ordering).
+                turn.span.record_llm(duration_ms=step_duration_ms)
 
                 assistant: dict = {"role": "assistant", "content": content or None}
                 if tool_calls:

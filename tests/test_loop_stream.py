@@ -111,6 +111,108 @@ async def _collect(agent, user_msg, memory):
     return events
 
 
+# ── streaming telemetry parity: steps + token usage must reach the TurnSpan ──
+# Regression (2026-09-23 live audit): run_stream never called record_step, so every
+# streaming turn-end reported ``steps: 0`` and ``tokens: 0`` while user_usage_logs had
+# the real usage (14,036 vs 0). The span must be driven by the same provider usage the
+# DB books, with the same per-step delta convention as non-streaming run().
+
+def _usage(p: int, c: int) -> dict:
+    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _stream_resp(resp: dict, usage: dict) -> dict:
+    out = dict(resp)
+    out["usage"] = usage
+    return out
+
+
+def _new_turn():
+    from agent.engine.context import AgentTurn
+
+    return AgentTurn(user_msg="go")
+
+
+async def _drain(agent, turn):
+    async for _ in agent.run_stream("go", turn=turn):
+        pass
+    return turn.span.to_dict()
+
+
+async def test_stream_single_step_records_steps_and_tokens():
+    llm = FakeLLM([_stream_resp(stream_assistant(content="answer"), _usage(100, 10))])
+    agent = ReactLoopAgent(llm, ToolRuntime(), SystemPrompt())
+    turn = _new_turn()
+
+    d = await _drain(agent, turn)
+
+    assert d["steps"] == 1
+    assert d["llm_calls"] == 1
+    assert d["tokens"] == 110
+    assert d["tokens"] == turn.usage["total_tokens"]
+
+
+async def test_stream_two_steps_with_tool_call_counts_one_step_per_llm_round():
+    """Tool round + final answer = 2 steps; the tool call itself adds no extra step."""
+    runtime = ToolRuntime()
+    runtime.register(_echo_tool())
+    llm = FakeLLM([
+        _stream_resp(tool_call("c1", "echo", {"x": 7}), _usage(100, 10)),
+        _stream_resp(stream_assistant(content="all done"), _usage(120, 15)),
+    ])
+    agent = ReactLoopAgent(llm, runtime, SystemPrompt())
+    turn = _new_turn()
+
+    d = await _drain(agent, turn)
+
+    assert d["steps"] == 2  # 2 LLM rounds, 1 rag_search-style tool call — still 2
+    assert d["llm_calls"] == 2
+    assert [s["tool_calls"] for s in turn.span.steps] == [1, 0]
+    assert [s["tokens"] for s in turn.span.steps] == [110, 135]  # per-step deltas
+    assert sum(s["tokens"] for s in turn.span.steps) == turn.usage["total_tokens"] == d["tokens"] == 245
+
+
+async def test_stream_zero_steps_on_fatal_error_before_any_record():
+    """Fatal stream error: no step recorded (same lifecycle contract as run())."""
+    from agent.llm.llm_errors import LLMTemporaryError
+
+    class _BoomStreamLLM(FakeLLM):
+        async def chat_stream(self, messages, tools=None, **kw):
+            raise LLMTemporaryError("boom")
+            yield  # pragma: no cover — keeps this an async generator
+
+    agent = ReactLoopAgent(_BoomStreamLLM([]), ToolRuntime(), SystemPrompt())
+    turn = _new_turn()
+
+    d = await _drain(agent, turn)
+
+    assert d["steps"] == 0
+    assert d["llm_calls"] == 0
+    assert d["tokens"] == 0
+    assert any(e["kind"] == "llm_fatal" for e in turn.span.errors)
+
+
+async def test_stream_step_tokens_handle_missing_usage_without_inflating():
+    """Provider usage absent on a step → 0 delta (add_usage convention), never negative;
+    steps with usage still conserve the cumulative total."""
+    runtime = ToolRuntime()
+    runtime.register(_echo_tool())
+    llm = FakeLLM([
+        tool_call("c1", "echo", {"x": 1}),                                  # default 1/1 usage
+        _stream_resp(tool_call("c2", "echo", {"x": 2}), _usage(0, 0)),      # explicit zero
+        _stream_resp(stream_assistant(content="done"), _usage(50, 4)),
+    ])
+    agent = ReactLoopAgent(llm, runtime, SystemPrompt())
+    turn = _new_turn()
+
+    d = await _drain(agent, turn)
+
+    steps = turn.span.steps
+    assert [s["tokens"] for s in steps] == [2, 0, 54]
+    assert sum(s["tokens"] for s in steps) == turn.usage["total_tokens"] == d["tokens"] == 56
+    assert d["steps"] == 3
+
+
 async def test_stream_forward_thinking_and_content_separately():
     runtime = ToolRuntime()
     llm = FakeLLM([stream_assistant(thinking="need to recall attention", content="注意力机制是一种…")])
