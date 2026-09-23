@@ -840,6 +840,87 @@ class RagFeedbackModel(Base):
     )
 
 
+class CapabilityModel(Base):
+    """Intent Registry draft row (table ``capabilities``): the ONE editable source of
+    truth for routable capabilities (QIR P1). Runtime never reads this table directly —
+    publishing freezes the rows into an immutable ``registry_versions`` payload.
+
+    No hard delete (lifecycle doctrine): retiring a capability means flipping
+    ``status``/``enabled``; history and audit must keep referencing it. ``row_version``
+    is the optimistic-concurrency token for draft edits — a writer must present the
+    version it read, so two editors can never silently overwrite each other.
+    """
+
+    __tablename__ = "capabilities"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    capability_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    tool_binding: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Matcher columns (deterministic match): exact/regex patterns + alias phrases.
+    patterns: Mapped[list] = mapped_column(JSONB, default=list)
+    aliases: Mapped[list] = mapped_column(JSONB, default=list)
+    # Recall columns: positive examples (embedded) + negatives (contrast).
+    examples: Mapped[list] = mapped_column(JSONB, default=list)
+    negatives: Mapped[list] = mapped_column(JSONB, default=list)
+    # Argument binding slots: {arg: source} — see arg_slots enum ruling (P1 ②).
+    arg_slots: Mapped[dict] = mapped_column(JSONB, default=dict)
+    permissions: Mapped[str] = mapped_column(String, nullable=False, default="")
+    execution_policy: Mapped[str] = mapped_column(String, nullable=False, default="auto")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Lifecycle (ACTIVE / DISABLED / DEPRECATED); DEPRECATED may point at a successor.
+    status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    replacement_capability_id: Mapped[str | None] = mapped_column(String)
+    row_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class RegistryVersionModel(Base):
+    """Immutable published Registry version (table ``registry_versions``).
+
+    One row per publish/rollback: ``payload`` is the full frozen capability set that
+    was validated and built into the active snapshot. ``version`` is monotonically
+    increasing; history rows are NEVER updated in place (state transitions and
+    activation timestamps aside) — rollback stages a NEW version that copies an old
+    payload and records ``source_version``. The DB enforces "at most one active" via
+    a partial unique index (see migration), so a swap can never leave two actives.
+    """
+
+    __tablename__ = "registry_versions"
+
+    version: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # staged | active | failed | superseded (build-then-swap: a failed build stays
+    # failed and the old active keeps serving — cross-version combos are impossible).
+    state: Mapped[str] = mapped_column(
+        String, nullable=False, server_default="staged", index=True
+    )
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    source_version: Mapped[int | None] = mapped_column(BigInteger)  # rollback provenance
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))  # no FK: audit survives user deletes
+    actor_username: Mapped[str | None] = mapped_column(String)
+    note: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)  # why a staged build FAILED
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index(
+            "uq_registry_versions_single_active", "state",
+            unique=True, postgresql_where=text("state = 'active'"),
+        ),
+    )
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MIGRATIONS_DIR = _REPO_ROOT / "migrations"
 
