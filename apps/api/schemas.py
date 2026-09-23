@@ -643,6 +643,7 @@ class RegistryDraftCreateRequest(BaseModel):
     arg_slots: dict = {}
     permissions: str = ""
     execution_policy: str = "auto"
+    intent_kind: str = "action"  # action | private | web (P3; gate per kind)
     enabled: bool = True
     status: str = "active"
     replacement_capability_id: str | None = None

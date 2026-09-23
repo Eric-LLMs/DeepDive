@@ -52,6 +52,7 @@ from .types import (
     STATUS_ACTIVE,
     STATUS_DEPRECATED,
     STATUS_DISABLED,
+    VALID_KINDS,
     CapabilityEntry,
 )
 
@@ -121,6 +122,8 @@ def validate_entries(entries: Sequence[CapabilityEntry]) -> list[str]:
                     issues.append(f"{cid}: replacement {r!r} is not a capability in this set")
         if e.execution_policy not in VALID_POLICIES:
             issues.append(f"{cid}: execution_policy {e.execution_policy!r} not in {sorted(VALID_POLICIES)}")
+        if e.intent_kind not in VALID_KINDS:
+            issues.append(f"{cid}: intent_kind {e.intent_kind!r} not in {sorted(VALID_KINDS)}")
         if any(ch.isspace() for ch in e.permissions):
             issues.append(f"{cid}: permissions must be a single token (or empty)")
         for lit in (*e.patterns, *e.aliases):

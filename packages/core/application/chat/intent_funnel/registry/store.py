@@ -74,7 +74,7 @@ def _factory(session_factory: Any = None):
 # are not in here on purpose.
 DRAFT_PATCH_FIELDS = frozenset({
     "tool_binding", "description", "patterns", "aliases", "examples", "negatives",
-    "arg_slots", "permissions", "execution_policy", "enabled", "status",
+    "arg_slots", "permissions", "execution_policy", "intent_kind", "enabled", "status",
     "replacement_capability_id",
 })
 
@@ -115,6 +115,7 @@ async def create_draft(entry: CapabilityEntry, *, session_factory: Any = None) -
             arg_slots=dict(entry.arg_slots),
             permissions=entry.permissions,
             execution_policy=entry.execution_policy,
+            intent_kind=entry.intent_kind,
             enabled=entry.enabled,
             status=entry.status,
             replacement_capability_id=entry.replacement_capability_id,

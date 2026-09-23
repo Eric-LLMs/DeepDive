@@ -68,7 +68,8 @@ async def post_draft(
         patterns=tuple(body.patterns), aliases=tuple(body.aliases),
         examples=tuple(body.examples), negatives=tuple(body.negatives),
         arg_slots=dict(body.arg_slots), permissions=body.permissions,
-        execution_policy=body.execution_policy, enabled=body.enabled,
+        execution_policy=body.execution_policy, intent_kind=body.intent_kind,
+        enabled=body.enabled,
         status=body.status, replacement_capability_id=body.replacement_capability_id,
     )
     try:

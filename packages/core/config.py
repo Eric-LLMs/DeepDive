@@ -156,6 +156,11 @@ class Settings(BaseSettings):
     chat_judge_backend: str = "stub"
     chat_judge_min_confidence: float = 0.75      # online verdicts below this escalate
     chat_judge_local_url: str = ""               # deployed local judge endpoint ("" = none)
+    # P3 per-kind rollout gates (docs/temp.md §6-P3, 逐开关灰度): ACTION rides the
+    # master funnel gate + chat_action_fast_path_enabled; widened kinds each need
+    # their own switch, default OFF — registering a capability never routes it.
+    chat_funnel_private_enabled: bool = False    # private-knowledge capabilities
+    chat_funnel_web_enabled: bool = False        # web-search capabilities
 
     # ── Web search (agent web_search tool) ──
     # provider is free text: aggregate/keyless (no key) | duckduckgo (no key) | tavily |

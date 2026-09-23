@@ -29,6 +29,14 @@ STATUS_DEPRECATED = "deprecated"
 # else is an exact phrase. Shared so the publish gate and the Matcher agree.
 RE_PREFIX = "re:"
 
+# Intent kinds (P3, full-intent-space ruling): the candidate space beyond plain
+# ACTION. Each kind has its OWN rollout gate (settings.chat_funnel_*_enabled) —
+# registering a capability in the table never enables routing it (8.2/灰度令).
+KIND_ACTION = "action"
+KIND_PRIVATE = "private"
+KIND_WEB = "web"
+VALID_KINDS = frozenset({KIND_ACTION, KIND_PRIVATE, KIND_WEB})
+
 
 @dataclass(frozen=True)
 class CapabilityEntry:
@@ -45,6 +53,7 @@ class CapabilityEntry:
     arg_slots: dict[str, Any] = field(default_factory=dict)
     permissions: str = ""
     execution_policy: str = "auto"
+    intent_kind: str = KIND_ACTION
     enabled: bool = True
     status: str = STATUS_ACTIVE
     replacement_capability_id: str | None = None
@@ -77,6 +86,7 @@ class CapabilityEntry:
             arg_slots=dict(row.arg_slots or {}),
             permissions=row.permissions or "",
             execution_policy=row.execution_policy or "auto",
+            intent_kind=getattr(row, "intent_kind", None) or KIND_ACTION,
             enabled=bool(row.enabled),
             status=row.status or STATUS_ACTIVE,
             replacement_capability_id=row.replacement_capability_id,
@@ -96,6 +106,7 @@ class CapabilityEntry:
             "arg_slots": dict(self.arg_slots),
             "permissions": self.permissions,
             "execution_policy": self.execution_policy,
+            "intent_kind": self.intent_kind,
             "enabled": self.enabled,
             "status": self.status,
             "replacement_capability_id": self.replacement_capability_id,
@@ -115,6 +126,9 @@ class CapabilityEntry:
             arg_slots=dict(raw.get("arg_slots") or {}),
             permissions=str(raw.get("permissions") or ""),
             execution_policy=str(raw.get("execution_policy") or "auto"),
+            # payloads published before P3 carry no kind: ACTION is the historical
+            # and safe default (no old version can route a widened kind)
+            intent_kind=str(raw.get("intent_kind") or KIND_ACTION),
             enabled=bool(raw.get("enabled", True)),
             status=str(raw.get("status") or STATUS_ACTIVE),
             replacement_capability_id=raw.get("replacement_capability_id"),

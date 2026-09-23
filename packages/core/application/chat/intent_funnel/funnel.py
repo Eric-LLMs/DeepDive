@@ -36,6 +36,7 @@ from .contract import (
     REASON_DECISION_NONE,
     REASON_DECISION_TIMEOUT,
     REASON_JUDGE_TIMEOUT,
+    REASON_KIND_DISABLED,
     REASON_NO_CANDIDATE,
     REASON_RECALL_TIMEOUT,
     REASON_RECALL_UNAVAILABLE,
@@ -96,14 +97,29 @@ async def route(ctx, *, deps, requirements: TurnRequirements) -> TurnRequirement
 
 def funnel_live(requirements: TurnRequirements, deps, ctx) -> bool:
     """Gate for the P2 target cascade: master funnel switch + the plan-level
-    action sub-gate (the cascade's only producible plan kind is ACTION until
-    P3 widens it) + the common-layer guardrails (:mod:`guardrails`)."""
+    action sub-gate + the common-layer guardrails (:mod:`guardrails`). From P3
+    on, non-ACTION kinds additionally pass :func:`kind_enabled` per candidate;
+    this gate stays the funnel-wide door."""
     if not (settings.chat_funnel_enabled and settings.chat_fast_paths_enabled
             and settings.chat_action_fast_path_enabled and deps is not None):
         return False
     from . import guardrails
 
     return guardrails.turn_veto(ctx.body.message or "", requirements, ctx) is None
+
+
+def kind_enabled(kind: str) -> bool:
+    """P3 per-kind rollout gate (逐开关灰度): ACTION rides the master funnel gate
+    (the caller already passed it); each widened kind needs its own switch, and
+    an unknown kind routes nothing. Being IN the table was never the same as
+    being ON."""
+    if kind in ("", "action"):
+        return True
+    if kind == "private":
+        return settings.chat_funnel_private_enabled
+    if kind == "web":
+        return settings.chat_funnel_web_enabled
+    return False
 
 
 async def run_intent_stage(ctx, deps, requirements: TurnRequirements) -> TurnRequirements:
@@ -328,6 +344,9 @@ async def _run_nodes(ctx, deps, requirements, trace):
     if entry is None:  # a verdict the active table no longer honors: refuse
         trace["fallback"] = REASON_VERSION_MISMATCH
         return None
+    if not kind_enabled(entry.intent_kind):  # P3: in the table, but not ON
+        trace["fallback"] = REASON_KIND_DISABLED
+        return None
     trace["stage"] = "binder"
     try:
         bound = binder.bind(entry, message, ctx)
@@ -372,6 +391,7 @@ def _certified(requirements, entry, args, index_version, registry_fp, *,
         "registry_version": index_version,
         "funnel_registry_version": registry_fp,
         "funnel_stage": stage,
+        "funnel_kind": entry.intent_kind,
     }
     if integrity is not None:
         action["binding_integrity"] = integrity

@@ -872,6 +872,9 @@ class CapabilityModel(Base):
     arg_slots: Mapped[dict] = mapped_column(JSONB, default=dict)
     permissions: Mapped[str] = mapped_column(String, nullable=False, default="")
     execution_policy: Mapped[str] = mapped_column(String, nullable=False, default="auto")
+    # P3 intent kind (action|private|web); old rows and pre-0005 DBs default to
+    # "action" — the historical kind, see migrations/0005.
+    intent_kind: Mapped[str] = mapped_column(String, nullable=False, server_default="action")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # Lifecycle (ACTIVE / DISABLED / DEPRECATED); DEPRECATED may point at a successor.
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
