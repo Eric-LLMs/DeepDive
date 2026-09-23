@@ -93,10 +93,13 @@ async def test_malformed_action_escalates_and_never_touches_the_seam():
     assert calls == []  # pre-execution failure: the seam was NEVER entered
 
 
-async def test_seam_not_wired_escalates():
+async def test_seam_not_wired_terminates_as_integrity_never_escalates():
+    # C2 (frozen boundary 2): a missing seam is an internal wiring fault, not a
+    # user-input problem — the Agent must never serve as the recovery channel.
     req = _req(GOOD, None)
-    with pytest.raises(EscalateToAgent, match="not wired"):
-        await _drain(req)
+    events = await _drain(req)
+    assert [e["type"] for e in events] == ["content", "done"]
+    assert "not available" in events[0]["data"].lower()
 
 
 async def test_preflight_failure_escalates_once_side_effect_free():
@@ -128,6 +131,24 @@ async def test_state_unknown_terminates_honestly_never_escalates():
     assert "could not be confirmed" in data["answer"].lower()
     # The user row + the honest assistant row are persisted like any answer.
     assert [r[0] for r in req.ctx.session_memory.rows] == ["user", "assistant"]
+
+
+async def test_binding_integrity_marker_terminates_never_escalates():
+    # Stage-2 (routing-layer) C2: resolve_plan stamps a binding_integrity marker;
+    # the executor must issue the decided terminal BEFORE the schema gate (such an
+    # action carries no args) and never hand the system fault to the Agent.
+    hits = []
+
+    async def run_tool(tool, args, ctx):
+        hits.append(1)
+        return {"ok": True}
+
+    action = {"tool": "create_folder", "args": None, "binding_integrity": "no binding"}
+    req = _req(action, run_tool)
+    events = await _drain(req)
+    assert hits == []                                       # seam never entered
+    assert [e["type"] for e in events] == ["content", "done"]
+    assert "not available" in events[0]["data"].lower()
 
 
 async def test_decided_denial_is_terminal_not_an_escalation():

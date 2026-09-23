@@ -55,6 +55,17 @@ class ActionPreflightFailure(Exception):
         self.reason = reason
 
 
+class ActionIntegrityFailure(Exception):
+    """Internal binding / registry inconsistency (C2): unknown tool at the runtime,
+    missing action-binding entry, corrupt registry alignment. This is NOT a user
+    input problem — the Agent fallback must never be used to "recover" a system
+    fault. The executor terminates honestly with a terminal message."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 # Slot delimiter set (ASCII, curly, CJK quotes). A free-text slot must be quoted — an
 # unbounded name/term is dynamically parameterized and belongs on the Agent path.
 _QCHARS = '"“”‘’「」『』'
@@ -241,16 +252,46 @@ DIRECT_TOOLS: dict[str, DirectToolSpec] = {
 }
 
 
+# ── Negation guard (frozen constraint: never execute what the user denied) ──────────
+# An explicit negation cue governing one of the allowlisted action verbs MUST abstain
+# the whole L0 exact pass: "不要新建文件夹「X」" is a request NOT to create, yet the
+# phrase extractor below would happily match the verb+name span. The cue must sit in
+# the same clause immediately before the verb (bounded gap, no clause punctuation) so
+# trailing "…，但不要删除" style prose does not veto an unrelated positive request.
+# Anything the narrow guard is unsure about also abstains — fail-open to the Agent.
+_NEGATION_CUE = (
+    r"(?:不要|不用|不需要|无需|无须|别|勿|请勿|不准|不可|不得|禁止|不想|不想再|不再"
+    r"|don'?t|do not|does not need|never|no need to|not necessary to)"
+)
+_ACTION_VERB = (
+    r"(?:新建|创建|建立|添加|加入|加到|录入|删除|移除|提取|抽取|抽出|转换|保存|导出"
+    r"|create|make|add|insert|delete|remove|extract|convert|save|export)"
+)
+_NEGATION_GUARD = re.compile(
+    _NEGATION_CUE + r"[^。；;，,！!？?\n]{0,6}?" + _ACTION_VERB,
+    re.IGNORECASE,
+)
+
+
+def is_negated_request(text: str) -> bool:
+    """Sentence-level negation in front of an allowlisted action verb. Shared by the
+    L0 exact pass and the QIR argument-binding funnel — one guard, two call sites."""
+    return bool(_NEGATION_GUARD.search(text or ""))
+
+
 def match_direct_tool(text: str, ctx) -> dict | None:
     """L0 recognition: the turn demands EXACTLY one allowlisted tool, fully-parameterized.
 
     Returns a normalized request ``{"tool": …, "args": …}`` or ``None``. ``None`` is
-    the LOSSLESS fallback contract: zero matches, two matches (ambiguity), or a spec
-    whose extractor found undetermined parameters all leave the turn on the normal
-    Agent path with its original text and full tool/skill/workflow authority.
+    the LOSSLESS fallback contract: no phrase, a negated request, two matches
+    (ambiguity), or a spec whose extractor found undetermined parameters all leave
+    the turn on the normal Agent path with its original text and full tool/skill/
+    workflow authority.
     """
     if not text:
         return None
+    if is_negated_request(text):
+        return None  # "不要新建文件夹「X」" must never certify a write
     stripped = text.strip()
     hits: list[tuple[DirectToolSpec, dict[str, str]]] = []
     for spec in DIRECT_TOOLS.values():
@@ -266,6 +307,30 @@ def match_direct_tool(text: str, ctx) -> dict | None:
 
 # Back-compatible alias (tests/imports may reference the earlier name).
 match_action = match_direct_tool
+
+
+def bind_arguments(tool_binding: str, text: str, ctx) -> dict | None:
+    """Argument Binding layer: ``Capability + raw Query -> structured arguments``.
+
+    This is stage (2) of the frozen plan-resolution pipeline — owned by the action
+    binding table, NOT by QIR (which only outputs ``capability_id``). The current
+    implementation reuses the existing ``DirectToolSpec.extract`` regex recognizers;
+    that is an IMPLEMENTATION CHOICE, not an architectural principle — a future
+    constrained argument parser may replace it behind this same function shape.
+    Whatever the binding mechanism, its output still must pass ``validate_action``
+    and the Runtime governance funnel before anything executes.
+
+    ``None`` means the structured arguments cannot be determined from THIS
+    sentence + context (C1: parameters incomplete) — the caller lets the original
+    Agent path handle the turn, untouched. A missing binding entry is a registry
+    inconsistency (C2) and raises ``ActionIntegrityFailure``.
+    """
+    if is_negated_request(text):
+        return None  # second layer of the negation defense (QIR routed despite L0)
+    spec = DIRECT_TOOLS.get(tool_binding)
+    if spec is None or spec.extract is None:
+        raise ActionIntegrityFailure(f"no argument binding for tool {tool_binding!r}")
+    return spec.extract((text or "").strip(), ctx)
 
 
 def validate_action(tool: str, args: dict) -> dict:

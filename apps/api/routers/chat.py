@@ -259,7 +259,7 @@ _POST_BODY_MARKERS = ("execute failed:", "post-execute failed:")
 async def _run_tool(tool: str, args: dict, ctx) -> dict:
     from agent.engine.context import _TURN_CTX, AgentTurn
     from agent.engine.decisions import ToolExecution
-    from core.application.chat.actions import ActionPreflightFailure
+    from core.application.chat.actions import ActionIntegrityFailure, ActionPreflightFailure
 
     runtime = get_agent().runtime
     # Bind a turn context so the sandbox guards see this dispatch exactly like an
@@ -283,7 +283,13 @@ async def _run_tool(tool: str, args: dict, ctx) -> dict:
     msg = (result.error.message or "") if result.error else ""
     info = dict(getattr(result.error, "info", None) or {})
     name = info.get("name")
-    if name in ("unknown_tool", "invalid_args") or msg.startswith("preflight:"):
+    if name in ("unknown_tool", "invalid_args"):
+        # C2: the allowlist and the runtime registry disagree — a system
+        # inconsistency, NOT a user-input problem. Provably pre-body, yet it must
+        # terminate honestly instead of laundering a registry fault through the
+        # Agent as a recovery/retry channel.
+        raise ActionIntegrityFailure(msg)
+    if msg.startswith("preflight:"):
         raise ActionPreflightFailure(msg)
     if tool not in _MUTATING_DIRECT_TOOLS:
         # Nothing this tool can do has a side effect — the Agent fallback loses nothing.

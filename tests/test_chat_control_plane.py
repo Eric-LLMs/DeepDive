@@ -254,7 +254,8 @@ def test_orchestrator_resolves_agent_plan_and_executor():
 
     ctx = _ctx(message="hi")
     orch = TurnOrchestrator(deps=None)  # dark path: resolution touches no deps
-    plan = orch.resolve_plan(ctx)  # master gate off by default → AGENT
+    import asyncio
+    plan = asyncio.run(orch.resolve_plan(ctx))  # master gate off → AGENT (async since QIR stage 1)
     assert plan.kind is PlanKind.AGENT
     assert isinstance(orch.executor_for(plan), AgentExecutor)
     # DIRECT / VIEWER / LOCAL_RAG are now registered branches...

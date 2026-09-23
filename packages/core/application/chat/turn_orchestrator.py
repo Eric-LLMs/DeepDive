@@ -40,7 +40,13 @@ from core.application.chat.executors.direct import DirectExecutor
 from core.application.chat.executors.retrieval import RetrievalExecutor
 from core.application.chat.executors.viewer import ViewerExecutor
 from core.application.chat.lifecycle import finalize_turn, handle_research_post_turn
-from core.application.chat.understanding import TurnRequirements, resolve_requirements
+from core.application.chat.understanding import (
+    Complexity,
+    Confidence,
+    Signal,
+    TurnRequirements,
+    resolve_requirements,
+)
 from core.config import settings
 from core.logger import reset_log_context, set_log_context
 
@@ -92,10 +98,31 @@ class TurnOrchestrator:
         }
 
     # ── plan resolution ──────────────────────────────────────────────────────────
-    def resolve_plan(self, ctx: ChatTurnContext) -> ExecutionPlan:
-        # Settings-driven gates (all OFF by default = the Phase 1 dark launch). When
-        # the master gate is closed the requirement set is irrelevant to routing, so
-        # we skip the L0 pass entirely and keep the neutral ABSTAIN contract.
+    async def resolve_plan(self, ctx: ChatTurnContext, deps: ChatDeps | None = None) -> ExecutionPlan:
+        """The full Execution-Plan-Resolution funnel, in three ordered stages:
+
+          (1) QIR  — Intent Routing: the existing pure L0 pass first; when L0
+                     abstained from an action certification and the QIR gates are
+                     live, the semantic+decision cascade gets a chance to name ONE
+                     capability. QIR itself never plans, binds arguments or
+                     executes — it hands back a ``RouteResult`` only.
+          (2) Argument Binding — capability + raw query -> structured arguments,
+                     via the EXISTING action-binding table (``bind_arguments``).
+                     Parameters undeterminable => no route (C1: the Agent, which
+                     owns sentence-level argument understanding, keeps the turn);
+                     a binding-table inconsistency is C2 and is marked for the
+                     executor's TERMINAL path, never routed to the Agent.
+          (3) ``build_execution_plan`` — the SOLE policy mapper, unchanged: it
+                     owns feature gates, eligibility and ``source_policy``.
+
+        Failure classification (NOT a catch-all): every QIR-own failure shape
+        (no snapshot, store down, timeout, low/ambiguous similarity, decision
+        NONE, QIR exception) and the C1 binding miss ABSTAIN -> the turn maps
+        to AGENT exactly as before QIR existed, user text byte-identical. A C2
+        binding-integrity fault instead plans ACTION with an integrity marker;
+        the executor issues the decided terminal message without touching the
+        seam. Dark launch: gates closed => stages (1b)(2) never run.
+        """
         policy = PolicyContext(
             fast_paths_enabled=settings.chat_fast_paths_enabled,
             direct_fast_path_enabled=settings.chat_direct_fast_path_enabled,
@@ -104,10 +131,11 @@ class TurnOrchestrator:
             action_enabled=settings.chat_action_fast_path_enabled,
             composite_enabled=settings.chat_composite_fast_path_enabled,
         )
+        requirements = TurnRequirements()
         if policy.fast_paths_enabled:
             requirements = resolve_requirements(ctx, ctx.body.message)
-        else:
-            requirements = TurnRequirements()
+            if self._qir_live(policy, requirements, deps, ctx):
+                requirements = await self._qir_intent_stage(ctx, deps, requirements)
         plan = build_execution_plan(requirements, policy)
         # Sink the SOURCE POLICY for the Agent's sandbox (see Sandbox._turn_denied):
         # fencing comes from the ORIGINAL request, and only when the control plane is
@@ -116,6 +144,102 @@ class TurnOrchestrator:
         if plan.source_policy:
             ctx.agent_context = {**(ctx.agent_context or {}), "source_policy": plan.source_policy}
         return plan
+
+    # ── (1) QIR eligibility + (2) argument binding, funnel-internal ──────────────
+    @staticmethod
+    def _qir_live(policy: PolicyContext, requirements: TurnRequirements,
+                  deps: ChatDeps | None, ctx: ChatTurnContext) -> bool:
+        """Gate: QIR only ever ADDS an action route the L0 abstained from — it
+        never overrides an L0 certification, never touches web/memory-demanding
+        or research/handoff turns, and stays physically dark unless every
+        relevant switch is on."""
+        if not (settings.chat_qir_enabled and policy.fast_paths_enabled
+                and policy.action_enabled and deps is not None):
+            return False
+        if requirements.requested_action is not None:  # L0 already certified
+            return False
+        if requirements.needs_web is not Signal.LOW or requirements.needs_memory:
+            return False
+        if getattr(ctx, "research_turn", False) or getattr(ctx, "effective_handoff", None):
+            return False
+        from core.application.chat.sanitization import is_pure_user_text
+        return is_pure_user_text(ctx.body.message or "")
+
+    async def _qir_intent_stage(self, ctx: ChatTurnContext, deps: ChatDeps,
+                                requirements: TurnRequirements) -> TurnRequirements:
+        """QIR cascade + Argument Binding. Outcomes are classified, not swallowed:
+
+        * QIR abstain / C1 binding miss -> the ORIGINAL requirements (Agent keeps
+          the turn, zero pollution);
+        * C2 binding-integrity fault -> ACTION requirements carrying the
+          ``binding_integrity`` marker (executor TERMINAL, never Agent recovery);
+        * any other unexpected stage exception fail-opens to the original
+          requirements — a routing-layer crash must not sink the turn."""
+        from core.application.chat import qir
+        from core.application.chat.qir import store as qir_store
+
+        message = ctx.body.message or ""
+        try:
+            snapshot = await qir_store.active(deps.session_factory)
+            route = await qir.route(
+                message, snapshot=snapshot,
+                embedder=deps.embedder(), llm=deps.llm,
+                top_k=settings.chat_qir_top_k, min_score=settings.chat_qir_min_score,
+                margin=settings.chat_qir_margin,
+                decision_enabled=settings.chat_qir_decision_enabled,
+                timeout_seconds=settings.chat_qir_timeout_seconds,
+            )
+            if route is None:
+                return requirements
+            cap = snapshot.get(route.capability_id) if snapshot is not None else None
+            if cap is None or not cap.enabled or cap.id != route.capability_id:
+                return requirements  # metadata drift between route and bind
+            from core.application.chat.actions import (
+                ActionIntegrityFailure, bind_arguments,
+            )
+            try:
+                args = bind_arguments(cap.tool_binding, message, ctx)
+            except ActionIntegrityFailure as exc:
+                # C2 at the routing layer: the capability promises a binding the
+                # existing action table does not honor — a system inconsistency,
+                # NOT user-input incompleteness. The turn is planned as ACTION with
+                # an integrity marker so the executor issues the decided TERMINAL
+                # message; the Agent is never entered as a recovery channel.
+                logger.error("qir.binding integrity: %s", exc.reason)
+                return TurnRequirements(
+                    needs_action=Signal.HIGH,
+                    requested_action={
+                        "tool": cap.tool_binding, "args": None,
+                        "capability_id": cap.id,
+                        "registry_version": route.registry_version,
+                        "qir_stage": route.stage,
+                        "binding_integrity": exc.reason,
+                    },
+                    complexity=Complexity.LOW, confidence=Confidence.HIGH,
+                    private_only=requirements.private_only,
+                    external_ok=requirements.external_ok,
+                )
+            if args is None:
+                # C1: structured arguments not determinable from this sentence +
+                # context. Fall through untouched — the Agent owns understanding.
+                return requirements
+            # Same construction shape as the L0 action-hit branch (only the
+            # action fields are set; source facts ride through).
+            return TurnRequirements(
+                needs_action=Signal.HIGH,
+                requested_action={
+                    "tool": cap.tool_binding, "args": args,
+                    "capability_id": cap.id,
+                    "registry_version": route.registry_version,
+                    "qir_stage": route.stage,
+                },
+                complexity=Complexity.LOW, confidence=Confidence.HIGH,
+                private_only=requirements.private_only,
+                external_ok=requirements.external_ok,
+            )
+        except Exception as exc:  # fail-open, contract-pinned by tests
+            logger.info("qir stage fail-open: %r", exc)
+            return requirements
 
     def executor_for(self, plan: ExecutionPlan) -> ChatExecutor:
         executor = self._executors.get(plan.kind)
@@ -126,7 +250,7 @@ class TurnOrchestrator:
 
     # ── non-streaming turn (/chat) ───────────────────────────────────────────────
     async def run_turn(self, ctx: ChatTurnContext) -> dict:
-        plan = self.resolve_plan(ctx)
+        plan = await self.resolve_plan(ctx, self.deps)
         executor = self.executor_for(plan)
         req = TurnRequest(ctx=ctx, deps=self.deps, plan=plan)
         research_continuing = False
@@ -177,7 +301,7 @@ class TurnOrchestrator:
     ) -> AsyncIterator[dict]:
         """Yield SSE frame dicts (``{"data": json}``) for one streaming turn."""
         deps = self.deps
-        plan = self.resolve_plan(ctx)
+        plan = await self.resolve_plan(ctx, deps)
         executor = self.executor_for(plan)
         req = TurnRequest(ctx=ctx, deps=deps, plan=plan)
         # Tag every log line the stream emits with the user + session. Set inside the

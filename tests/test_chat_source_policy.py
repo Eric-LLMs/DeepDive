@@ -137,17 +137,24 @@ def _orchestrator():
     return TurnOrchestrator(deps=None)
 
 
+def _resolve(ctx):
+    # resolve_plan is async since QIR became stage (1) of the funnel; these
+    # gate-closed / deps=None paths touch no I/O, so a bare run is faithful.
+    import asyncio
+    return asyncio.run(_orchestrator().resolve_plan(ctx))
+
+
 def test_sink_only_when_control_plane_live(monkeypatch):
     import core.config as cfg
     monkeypatch.setattr(cfg.settings, "chat_fast_paths_enabled", True, raising=False)
     monkeypatch.setattr(cfg.settings, "chat_retrieval_fast_path_enabled", True, raising=False)
     ctx = _ctx(PRIVATE_Q)
-    _orchestrator().resolve_plan(ctx)
+    _resolve(ctx)
     assert (ctx.agent_context or {}).get("source_policy") == "private_first"
 
     monkeypatch.setattr(cfg.settings, "chat_fast_paths_enabled", False, raising=False)
     ctx2 = _ctx(PRIVATE_Q)
-    _orchestrator().resolve_plan(ctx2)
+    _resolve(ctx2)
     assert not (ctx2.agent_context or {}).get("source_policy")
 
 
@@ -156,7 +163,7 @@ def test_explicit_permission_sink_nothing(monkeypatch):
     monkeypatch.setattr(cfg.settings, "chat_fast_paths_enabled", True, raising=False)
     monkeypatch.setattr(cfg.settings, "chat_retrieval_fast_path_enabled", True, raising=False)
     ctx = _ctx(EXT_OK_Q)
-    _orchestrator().resolve_plan(ctx)
+    _resolve(ctx)
     assert not (ctx.agent_context or {}).get("source_policy")
 
 

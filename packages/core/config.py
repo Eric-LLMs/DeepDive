@@ -123,6 +123,17 @@ class Settings(BaseSettings):
     chat_direct_max_chars: int = 400            # a pure user message must be <= this
     # LOCAL_RAG recall depth — same default as the agent's rag_search tool (top_k=5).
     chat_retrieval_top_k: int = 5
+    # ── QIR (Intent Routing stage of resolve_plan): semantic + decision levels ──
+    # All OFF by default = dark launch: with the gate closed, resolve_plan behaves
+    # byte-identically to the pre-QIR L0 funnel. QIR Fail-Opens — any abstain /
+    # timeout / fault leaves the original Agent path untouched; the cascade can
+    # only ever ADD a certified ACTION, never alter a turn the L0 already routed.
+    chat_qir_enabled: bool = False           # master gate for the QIR cascade
+    chat_qir_decision_enabled: bool = False  # arbiter OFF = no routing at all
+    chat_qir_timeout_seconds: float = 2.5    # whole-cascade wall clock, then abstain
+    chat_qir_top_k: int = 3                  # semantic candidate width
+    chat_qir_min_score: float = 0.82         # cosine floor for a capability to lead
+    chat_qir_margin: float = 0.06            # leader must beat runner-up by this much
 
     # ── Web search (agent web_search tool) ──
     # provider is free text: aggregate/keyless (no key) | duckduckgo (no key) | tavily |

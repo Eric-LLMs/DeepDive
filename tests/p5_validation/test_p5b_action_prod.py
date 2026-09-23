@@ -190,11 +190,12 @@ async def test_action_add_term_ambiguous_domain_escalates(monkeypatch):
     assert res.answer == "Agent took over."
 
 
-# ── Tool Registry is the SOLE capability source: a certified-but-unregistered tool
-#    falls back losslessly (the fast path never invents a capability). ──────────────────
-async def test_action_unregistered_certified_tool_falls_back(monkeypatch):
-    # pdf_extract_text is in the DIRECT_TOOLS allowlist (so it CAN certify) but is NOT
-    # registered in this kernel's runtime — dispatch must escalate, not error.
+# ── C2 (frozen boundary 2): allowlist/runtime registry divergence is an INTEGRITY
+#    failure — terminal, honest, and never laundered through the Agent as recovery. ──
+async def test_action_unregistered_certified_tool_terminates(monkeypatch):
+    # create_folder is in the DIRECT_TOOLS allowlist (so it CAN certify) but is NOT
+    # registered in this kernel's runtime — dispatch must terminate with an
+    # integrity message; the Agent must NOT take over.
     port = ScriptedPort(steps=[STEP]); spy = Spy()
     kernel, _, _, broker = build_kernel(monkeypatch, port, spy, broker_mode="allow")
     _gate(monkeypatch, action=True)
@@ -203,5 +204,5 @@ async def test_action_unregistered_certified_tool_falls_back(monkeypatch):
     del kernel.runtime._tools["create_folder"]
     res = await sse(app, 'create a folder named "ghost"')
     assert spy.folders_created == []
-    assert port.steps == 1                                    # unknown_tool ⇒ preflight ⇒ Agent
-    assert res.answer == "Agent took over."
+    assert port.steps == 0                                    # C2 ⇒ terminal, no Agent replay
+    assert res.answer and "not available" in res.answer.lower()

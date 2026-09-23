@@ -8,7 +8,8 @@ unnecessary flow — the seam calls the SAME ``ToolRuntime.execute`` the Agent w
 Stage order encodes the side-effect boundary isolation (Phase 5 hard constraint 1):
 
   1. schema gate (:func:`validate_action`) — pre-execution, side-effect-free; a
-     malformed request escalates and the Agent owns the clarification;
+     malformed request escalates and the Agent owns the clarification; a
+     routing-stamped ``binding_integrity`` marker (stage-2 C2) terminates first;
   2. seam presence — not wired ⇒ escalate (LLM fallback intact, capability unchanged);
   3. the seam call is the SIDE-EFFECT BOUNDARY. Before it: anything the seam can PROVE
      did not execute raises :class:`ActionPreflightFailure` ⇒ escalate. After the tool
@@ -29,8 +30,10 @@ import logging
 from collections.abc import AsyncIterator
 
 from core.application.chat.actions import (
+    ActionIntegrityFailure,
     ActionPreflightFailure,
     ActionSchemaError,
+    DIRECT_TOOLS,
     validate_action,
 )
 from core.application.chat.execution_plan import PlanKind
@@ -51,6 +54,18 @@ _STATE_UNKNOWN = (
     "and try again only if it is missing."
 )
 _DENIED_PREFIX = "Could not complete that request: "
+# C2 (internal binding/runtime integrity) and C3 (registry drift / governance) are
+# decided TERMINAL outcomes: an honest message, no seam, and NEVER an escalation —
+# the Agent must not be used as a recovery channel for system faults.
+_TERMINAL_INTEGRITY = (
+    "That request references an action that is not available in the current system "
+    "configuration, so nothing was done. Please contact the administrator if this "
+    "persists."
+)
+_TERMINAL_STALE_ROUTE = (
+    "The capability resolved for this request is no longer active, so nothing was "
+    "done. Please phrase the request again."
+)
 
 
 class ActionExecutor(DirectExecutor):
@@ -62,19 +77,64 @@ class ActionExecutor(DirectExecutor):
         action = req.plan.action or {}
         tool, args = action.get("tool"), action.get("args")
 
+        # 0. QIR envelope double validation (route/execute TOCTOU): the stamped
+        #    registry_version must still be Active, the capability must still exist,
+        #    be enabled and still bind to this tool. Any drift is C3 TERMINAL —
+        #    a historical RouteResult never executes on blind trust.
+        registry_version = action.get("registry_version")
+        if registry_version is not None:
+            from core.application.chat.qir import store as qir_store
+
+            snapshot = await qir_store.active(req.deps.session_factory)
+            cap = (
+                snapshot.get(str(action.get("capability_id") or ""))
+                if snapshot is not None and snapshot.version == str(registry_version)
+                else None
+            )
+            if (
+                cap is None or not cap.enabled
+                or cap.tool_binding != tool or tool not in DIRECT_TOOLS
+            ):
+                logger.warning(
+                    "chat.action route-stale capability=%s stamped=%s active=%s",
+                    action.get("capability_id"), registry_version,
+                    snapshot.version if snapshot else None,
+                )
+                return _TERMINAL_STALE_ROUTE
+
+        # 0.5 Routing-stage binding integrity (stage-2 C2, stamped in
+        #     resolve_plan): the QIR route promised a capability whose binding the
+        #     action table does not honor. Decided TERMINAL — the Agent must not
+        #     re-plan around a system inconsistency. Checked BEFORE the schema gate
+        #     because such an action intentionally carries no args.
+        if action.get("binding_integrity"):
+            logger.error(
+                "chat.action binding-integrity tool=%s: %s",
+                tool, action.get("binding_integrity"),
+            )
+            return _TERMINAL_INTEGRITY
+
         # 1. final schema gate, BEFORE the seam — malformed ⇒ nothing executed.
         try:
             validated = validate_action(str(tool or ""), args if isinstance(args, dict) else {})
         except ActionSchemaError as exc:
             raise EscalateToAgent(f"action schema: {exc}") from exc
 
-        # 2. seam presence.
+        # 2. seam presence. A missing seam is an internal wiring fault (C2), NOT a
+        #    user-input problem — terminate honestly; never re-plan through the Agent.
         if req.deps.run_tool is None:
-            raise EscalateToAgent("action seam not wired")
+            logger.error("chat.action integrity: run_tool seam not wired (tool=%s)", tool)
+            return _TERMINAL_INTEGRITY
 
         # 3. the side-effect boundary.
         try:
             result = await req.deps.run_tool(validated["tool"], validated["args"], req.ctx)
+        except ActionIntegrityFailure as exc:
+            # C2: registry/runtime inconsistency (unknown tool, arg-schema drift).
+            # Provably pre-body, but system faults must not launder through the
+            # Agent as a retry mechanism.
+            logger.error("chat.action integrity failure tool=%s: %s", validated["tool"], exc.reason)
+            return _TERMINAL_INTEGRITY
         except ActionPreflightFailure as exc:
             # Proved: the body never ran. The Agent may clarify / re-plan.
             raise EscalateToAgent(f"preflight: {exc.reason}") from exc
