@@ -286,6 +286,82 @@ flowchart TB
 
 </details>
 
+**Chat control plane — a turn's full path from transport to a terminal answer.** `resolve_plan`
+runs the three stages (QIR → Argument Binding → policy mapping) over the pure L0 facts; each
+PlanKind has a registered executor, every certified fast path dispatches through the ONE shared
+execution waterfall, and every uncertifiable or pre-commit-failing turn falls back to the Agent
+byte-identical. C1–C4 name the failure classes (see the design section). Regenerate the PNG via
+mermaid.ink to `./images/chat-control-plane.png`.
+
+<details>
+<summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
+
+```mermaid
+flowchart TB
+    %% Invariants: fast-path fallbacks are byte-identical · the Agent is never a recovery channel
+    %% for C2/C3/C4 · the commit point (first content delta) locks the channel · gates default OFF.
+
+    subgraph transport["Transport — apps/api/routers/chat.py (unchanged)"]
+        AUTH["POST /chat · /chat/stream<br/>auth · quota · channel pin · build_turn_context"]
+    end
+
+    subgraph resolve["TurnOrchestrator.resolve_plan — three ordered stages"]
+        L0["L0 lexical facts · resolve_requirements<br/>sole exact matcher · in-process · no model call"]
+        QIR["(1) QIR intent routing (chat_qir_enabled)<br/>snapshot → semantic candidates (cosine · min_score · margin)<br/>→ decision adjudication → RouteResult{capability_id · registry_version}"]
+        BIND["(2) Argument Binding<br/>bind_arguments → existing DIRECT_TOOLS extractors<br/>negation guard at L0 + binding layers"]
+        MAP["(3) build_execution_plan — sole policy mapper<br/>per-kind gates · sole-demand eligibility · source_policy"]
+        L0 -- "action abstained · pure user text · gates live" --> QIR
+        QIR -- ROUTE --> BIND
+        L0 --> MAP
+        BIND --> MAP
+    end
+
+    AUTH --> L0
+    QIR -. "ABSTAIN — no snapshot · low score · ambiguous · NONE · timeout · store down" .-> AG
+    BIND -. "C1 — args undeterminable (proven pre-body)" .-> AG
+
+    MAP --> K{"PlanKind"}
+    K -- DIRECT --> DEX["DirectExecutor — single LLM answer"]
+    K -- VIEWER --> VEX["ViewerExecutor — answer from injected screen text"]
+    K -- LOCAL_RAG --> REX["RetrievalExecutor — staged private-corpus answer"]
+    K -- ACTION --> AEX["ActionExecutor — deterministic one-shot dispatch"]
+    K -- COMPOSITE --> CEX["CompositeExecutor — fixed grounded-read → task chain"]
+    K -- "AGENT · unmapped kinds (structural Fail-Closed: no WEB executor exists)" --> AG["AgentExecutor — ReactLoopAgent step loop"]
+
+    subgraph governance["ONE shared execution waterfall — ToolRuntime.execute (no second authority)"]
+        RW["pre-execute ASK → approval bridge → sandbox / source-policy guards → tool body"]
+        RW -- "rule-level DENY · approval denied / timeout ⇒ C3" --> TD["TERMINAL — decided-denial message"]
+        RW -- "body entered then raised ⇒ C4" --> TU["TERMINAL — STATE_UNKNOWN · never blind-retry"]
+        RW -- ok --> OUT["tool output"]
+    end
+
+    AEX -- "stage 0 registry_version re-validation (stale ⇒ C3) · stage 0.5 binding_integrity (C2 ⇒ TERMINAL) · stage 1 schema (C1 ⇒ Agent) · then the _run_tool seam = side-effect boundary" --> RW
+    CEX --> RW
+    AG -- "every agent tool call" --> RW
+    REX -. "insufficient evidence (pre-commit) + honest-disclosure note" .-> AG
+
+    subgraph stream["Response — SSE frame contract unchanged"]
+        OUT --> DONE["content → done · user + assistant rows persisted"]
+        TD --> DONE
+        TU --> DONE
+        DEX --> DONE
+        VEX --> DONE
+        REX --> DONE
+        AG --> DONE
+        DONE -.- CP["Commit Point = first content delta<br/>before it EscalateToAgent is legal (zero pollution)<br/>after it: terminate only, never re-route"]
+    end
+```
+
+</details>
+
+> **Chat control-plane invariants** — a fast path takes only turns it can certify, and its demand
+> must be the *sole* demand; abstention leaves the user text byte-identical; QIR routes (capability
+> + registry version) and never executes or binds; snapshots publish atomically (two `app_settings`
+> rows, one transaction) and the stamped version is re-validated before dispatch; C2/C3/C4 are
+> terminal by contract — the Agent clarifies user incompleteness (C1) and is never the recovery
+> channel for system faults, decided denials, or mid-write uncertainty.
+> Design: [architecture.md §24 — Chat Control Plane](architecture.md#24-chat-control-plane--plan-resolution-fast-paths--qir-intent-routing).
+
 > [architecture.md](architecture.md) is the single source of truth for the full design —
 > tech stack, repository layout, agent-kernel internals, tool runtime, data model, and deployment
 > topology (including what is implemented today vs. designed-only).

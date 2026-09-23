@@ -195,7 +195,8 @@ class TurnOrchestrator:
             if cap is None or not cap.enabled or cap.id != route.capability_id:
                 return requirements  # metadata drift between route and bind
             from core.application.chat.actions import (
-                ActionIntegrityFailure, bind_arguments,
+                ActionIntegrityFailure,
+                bind_arguments,
             )
             try:
                 args = bind_arguments(cap.tool_binding, message, ctx)
@@ -237,7 +238,7 @@ class TurnOrchestrator:
                 private_only=requirements.private_only,
                 external_ok=requirements.external_ok,
             )
-        except Exception as exc:  # fail-open, contract-pinned by tests
+        except Exception as exc:  # noqa: BLE001 - fail-open, contract-pinned by tests
             logger.info("qir stage fail-open: %r", exc)
             return requirements
 

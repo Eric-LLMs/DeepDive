@@ -72,7 +72,7 @@ async def adjudicate(
         return DecisionVerdict(None, "no candidates")
     try:
         data = await llm.complete_json(build_prompt(query, snapshot, cands), system_prompt=_SYSTEM)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - any model-side fault collapses to NONE (abstain)
         logger.info("qir.decision failed (abstain): %r", exc)
         return DecisionVerdict(None, "decision call failed")
     if not isinstance(data, dict):

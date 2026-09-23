@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 
 
 class SnapshotError(Exception):
@@ -74,7 +74,7 @@ class Snapshot:
         }
 
     @classmethod
-    def from_json(cls, raw: dict) -> "Snapshot":
+    def from_json(cls, raw: dict) -> Snapshot:
         return cls(
             version=str(raw["version"]),
             built_at=float(raw.get("built_at") or 0.0),

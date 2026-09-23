@@ -93,6 +93,7 @@
   - [22.6 Recovery, reconcile & the worker path](#226-recovery-reconcile--the-worker-path)
   - [22.7 Trade-off & configuration](#227-trade-off--configuration)
 - [23. Viewer Context Provider — The Open Document as Reference Context](#23-viewer-context-provider--the-open-document-as-reference-context)
+- [24. Chat Control Plane — Plan Resolution, Fast Paths & QIR Intent Routing](#24-chat-control-plane--plan-resolution-fast-paths--qir-intent-routing)
 
 [↑ Back to top](#table-of-contents)
 
@@ -117,7 +118,7 @@
 | Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the shared `AgentKernel` composition (`apps/api/agent_factory.py`) for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output; session / cloud-file modes → caller's Cloud Drive, with a custom `prompt` + `name`) |
 | Session memory | PG-backed `sessions` / `messages` / `session_events`; **client Live State (summary + tail) is the normal-turn context source — zero SQL reads on hot turns**; threshold compaction folds raw rows into one 5-section structured summary behind a dual persistence barrier (`sessions.compaction` JSONB = durable checkpoint, revision CAS); per-session async write queue (one batch INSERT/turn); deferred finalize = incremental embed + first-time-only sidebar summary/title; trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + 30-day audit-event retention — see [§22](#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns) |
 | Migrations | single canonical init script `migrations/0001_init.sql` (final schema + reference seeds) applied once by the asyncpg runner (replaces Alembic); dev-time incremental migrations deliberately squashed |
-| Chat | agent loop with tool use, SSE streaming |
+| Chat | agent loop with tool use, SSE streaming; over a pure control plane — `TurnOrchestrator` resolves every turn to one `ExecutionPlan` (DIRECT / VIEWER / LOCAL_RAG / ACTION / COMPOSITE / AGENT) through the three-stage pipeline QIR → Argument Binding → policy mapping, each fast path behind its own dark-launch switch (all default-off) and every fallback byte-identical to the Agent — [§24](#24-chat-control-plane--plan-resolution-fast-paths--qir-intent-routing) |
 | Viewer context | chat answers about the **open viewer**: focus chip (file · page / playhead), ±20 s media-time subtitle window with video-only FOCUS / FULL / NONE classification and honest `too_large` / `unavailable` short-circuit, pinned selections / ROI / frames as explicit P0 context (image blocks carry the captured asset's id and ship a REQUIRED `vision` directive), clickable `[Vn]` citations; **documents are never intent-matched server-side** — every followed document reaches the model as a trusted **Viewer Access Context** stub (geometry-resolved current page) routing it to `read_document` page-scoped reads (`pages` spec, ACL-before-storage, ≤16 pages) with a post-turn `viewer.reads` trace incl. failed calls — zero changes to RAG / agent runtime / memory ([§23](#23-viewer-context-provider--the-open-document-as-reference-context), features.md *Desktop Workbench*) |
 | Research OS | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; **deterministic execution engine** — Python owns control flow through a 10-stage contract pipeline (`DISCOVER → FRAME → EVIDENCE → DESIGN → EXECUTE → EXPLAIN → WRITE → REVIEW → REPRODUCE → PUBLISH`) with repair-once bounded attempts, per-stage declared LLM call budgets + run-level turn/cost/no-progress caps, and guard gates at the transition fence: **strict** mode (default) parks a failed gate on a PENDING human override with zero rework on resume, lenient mode records it and continues; structural violations halt terminally (`BLOCKED`); lease-based crash recovery makes interrupted runs resumable; publication finality is the `PROMOTED` record (report + compiled PDF, optional slides via toolkit); desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module), [§20](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline) |
 | Workflow core (`packages/workflow`) | domain-free run engine behind Research OS: declarative `workflow_spec` (transitions / activities / cap dimensions / hooks) + state machine with lease contest, crash recovery, retry, loop-cap grading and definition-drift detection; adapter pattern (ports + ledger/lease persistence supplied by the plugin) — [§19](#19-workflow-core-packagesworkflow) |
@@ -4516,5 +4517,122 @@ page-axis-less formats refused); ACL-before-storage on `read_document`; the stub
 `/chat/stream` path via an ASGI transport;
 and the core compatibility invariant — a kernel turn without a viewer assembly assembles a prompt
 **byte-identical** to the pre-feature one even with the section registered.
+
+[↑ Back to top](#table-of-contents)
+
+## 24. Chat Control Plane — Plan Resolution, Fast Paths & QIR Intent Routing
+
+**Idea.** Between the HTTP transport and the executors sits a *pure decision layer*: every turn
+resolves to exactly one `ExecutionPlan` (kind + reason + policy), and a kind maps to a registered
+executor. The ReAct loop remains the default branch — it is the right shape only when the steps
+cannot be known in advance — while turns the control plane can certify run deterministically,
+without the LLM planning flow it does not need. The plane owns no inference of its own beyond
+routing, and it is *additive by construction*: anything it cannot certify lands on the Agent with
+the user's text **byte-identical** and zero trace. The entire plane is dark-launched — a master
+switch plus one per PlanKind (`settings.chat_*_enabled`, all default `False`); with the gates
+closed, plan resolution touches nothing and behavior is identical to the legacy Agent path.
+
+**Three-stage plan resolution.** `TurnOrchestrator.resolve_plan(ctx)` (async) is the single
+decision entry, used identically by `/chat` and `/chat/stream`. Before the stages run, the pure
+lexical pass `resolve_requirements` (L0, `understanding.py`) turns hard context facts (attach /
+viewer / research / handoff) and narrow phrase patterns into `TurnRequirements` — the **sole exact
+matcher**, in-process, zero model calls. The stages then run in a fixed order:
+
+1. **(1) QIR — Query Intent Routing** (`core.application.chat.qir`). Runs only when L0 abstained
+   from an action certification, all relevant gates are live, and the turn is pure user text with
+   no web/memory demand and no research/handoff binding. Cascade: read the published snapshot →
+   **semantic candidates** (in-process cosine of the raw query against the snapshot's pre-built
+   example vectors; `min_score`, `margin`, `top_k` gates — an ambiguous head race abstains
+   *without spending the decision call*) → **decision adjudication** (one `complete_json` pass
+   choosing among the top candidates or `NONE`; negation, multi-capability ambiguity, a parameter
+   that would have to be *guessed*, and prompt-injection-shaped user text are all contractually
+   `NONE`; every model-side fault collapses to `NONE`). The output is only
+   `RouteResult{capability_id, registry_version}` — no arguments, no tool handle, no authority.
+   QIR is a *routing projection* of the capability registry, never a second planner or registry.
+2. **(2) Argument Binding** — `bind_arguments(capability.tool_binding, raw query, ctx)`
+   delegates to the **existing** `DIRECT_TOOLS` extractors (`actions.py`); the binding table stays
+   thin and singular (the regex extractors are today's implementation, not a permanent shape).
+   The negation guard `is_negated_request` is enforced at **both** defense layers (L0 match and
+   binding), so "不要新建文件夹「X」" can never certify an ACTION under any gate setting.
+3. **(3) `build_execution_plan`** — the sole policy mapper, unchanged: it owns the feature gates,
+   per-kind eligibility (a fast path takes a turn only when its demand is the *sole* demand;
+   mixed demands stay on the Agent which arbitrates), and `source_policy`.
+
+**Failure taxonomy — who owns a failed turn (C1–C4).** The classification fixes *both* the
+outcome and its location; in particular the Agent is never a recovery channel for system faults.
+
+| Class | What it is | Decided at | Outcome |
+|---|---|---|---|
+| **C1** user-input incomplete | schema miss, args undeterminable (`bind_arguments → None`), domain 0-match / >1-match preflight | executor seam proves **pre-body** | `ActionPreflightFailure → EscalateToAgent` — the Agent multi-turns the clarification; pre-commit only |
+| **C2** internal binding / integrity | `unknown_tool`, `invalid_args` (registry/runtime divergence), capability binding missing, seam not wired, `ActionIntegrityFailure` | routing layer (stamped marker) or executor | **Terminal** honest message; the plan carries `binding_integrity` so even a stage-2 C2 ends at the executor, never via the Agent |
+| **C3** governance denial | approval refused / timed out, sandbox DENY, `registry_version` stale at dispatch, capability disabled | `ToolRuntime.execute` waterfall / executor stage 0 | **Terminal** — a decided denial must not be re-asked; ASK short-circuits after a rule-level DENY |
+| **C4** post-body failure | any other exception after the tool body was entered | executor catch-all | **STATE_UNKNOWN terminal** — one "could not be confirmed" message, **never** a blind Agent replay (that is how duplicate folders get made) |
+
+**Unified execution — one waterfall.** Fast paths hold no execution authority. An ACTION /
+COMPOSITE dispatch traverses the *same* `ToolRuntime.execute` the Agent would — pre-execute ASK →
+approval bridge → monotonic sandbox / source-policy guards → the real tool body — through the
+`_run_tool` seam injected into `ChatDeps`. `DIRECT_TOOLS` is the single allowlist shared by L0
+certification, argument binding, and QIR publication (a draft whose `tool_binding` is not an
+existing entry is **rejected at publish** — QIR cannot invent executables).
+
+**Commit Point.** The first user-visible content delta locks the channel. `EscalateToAgent` is
+legal only before it; after it an error can only terminate the stream with a standardized event —
+an executor is never swapped mid-flight. Escalation is **zero-pollution** except for the two
+branches that actually searched the private corpus (LOCAL_RAG / COMPOSITE): those prepend the
+honest-disclosure note (corpus gap stated, misattribution forbidden, and under a private policy
+the web ban the sandbox already hard-denies is restated). A C2 terminal (e.g. a certified tool
+missing from the runtime registry) asserts `port.steps == 0` in production-level tests — the Agent
+is provably not re-entered.
+
+**Source policy rides the plan.** Fencing comes from the *original request*, never from the fact
+that a fast path failed: `private_only` (explicit restriction) and `private_first` (a private turn
+the retrieval path declined without external permission) map onto the Agent's sandbox through the
+existing turn-context funnel — RAG failure escalates to the Agent, it does **not** globally forbid
+web; an explicit "if nothing, search the web" leaves no fence and the normal approval funnel
+governs.
+
+**Snapshot lifecycle — publication discipline.** The capability registry (ids, tool bindings,
+descriptions, positive/negative examples) plus its derived example embeddings form one immutable
+`Snapshot`, fingerprinted `qir1-<sha256[:12]>` over the capability set. Publication (`store.publish`)
+validates the draft, embeds **all** examples, and only then writes the two `app_settings` rows
+(`qir_version` marker + `qir_active` payload) inside a **single transaction** — a reader sees the
+old pair or the new pair, never a mix; any build failure raises before the session opens, so a bad
+draft can never become Active. Reads (`store.active`) never raise: a store fault degrades to
+`None` (routing abstains, the Agent is unaffected). Coherence across workers is a *version-marker
+cache*: the per-turn read compares the cheap marker against the cached payload, and the executor
+re-validates the stamped version immediately before dispatch (route/execute TOCTOU double check).
+`unpublish` removes the pair — routing abstains everywhere, an emergency stop with no deploy.
+Capability examples are platform-level routing metadata (no user content), so the registry is
+global by construction; per-tenant example sets would filter at candidate scoring.
+
+**Executor registry & structural Fail-Closed.** `DIRECT / VIEWER / LOCAL_RAG / ACTION / COMPOSITE /
+AGENT` are registered branches; **no WEB executor exists anywhere**, so a retrieval branch's
+hand-back can structurally only land on the Agent — the control plane physically cannot route
+LOCAL_RAG → WEB, and the Agent's own web use stays a visible agent-level decision. An unmapped
+kind degrades to AGENT, never a hard fail.
+
+**Configuration** (`core/config.py`, all default `False` / conservative):
+`chat_fast_paths_enabled` (master) · `chat_direct_fast_path_enabled` · `chat_viewer_fast_path_enabled` ·
+`chat_retrieval_fast_path_enabled` · `chat_action_fast_path_enabled` · `chat_composite_fast_path_enabled` ·
+`chat_qir_enabled` · `chat_qir_decision_enabled` · `chat_qir_timeout_seconds` (2.5 s cascade wall-clock
+budget) · `chat_qir_top_k` (3) · `chat_qir_min_score` (0.82) · `chat_qir_margin` (0.06). Seeding /
+republishing the snapshot is an ops entry point: `scripts/seed_qir_snapshot.py [--check|--unpublish]`.
+
+**Structural boundaries (test-enforced).** The `qir` package never imports `api.*` / `agent.*` and
+owns no execution, no authorization, no argument extraction, no second registry (an import-boundary
+scan asserts it per module); the SSE frame contract is unchanged so `apps/web` / `apps/desktop`
+need no adaptation; `apps/api` only supplies deps (`run_tool`, embedder, session factory).
+
+**Test doctrine.** `tests/p5_validation/` carries the post-implementation bench (216 cases:
+routing matrix, action phrasing, Layer-B dispatch through the **real** `/chat/stream` + sandbox
+funnel — assertions are about *capability outcomes* (was the folder created, how many times, did
+the Agent run) rather than mocked returns; legacy-comparison pins the dark-launch
+behavior-identity), and `tests/p5_validation/test_qir_routing.py` pins the frozen boundaries:
+cascade fail-open on every shape, `RouteResult` vocabulary (no args/tool attributes), publication
+atomicity + allowlist gate, route/execute double validation, the negation guard at both layers,
+stage-2 classification (C1 → Agent vs C2 → marked terminal), and the package import boundary.
+Contract suites: `test_chat_control_plane.py` (dark launch, per-kind gating, registry degradation),
+`test_chat_action_executor.py` / `test_chat_source_policy.py` (side-effect-boundary trichotomy,
+fencing semantics), `test_chat_direct_e2e / viewer / retrieval / composite` per branch.
 
 [↑ Back to top](#table-of-contents)

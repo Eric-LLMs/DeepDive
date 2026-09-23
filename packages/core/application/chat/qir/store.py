@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from core.infrastructure.db import AppSettingModel, SessionLocal
 
-from .types import Snapshot, SnapshotError
+from .types import Snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ async def active(session_factory=None) -> Snapshot | None:
                 return None
             _cache = (version, snap)
             return snap
-    except Exception as exc:  # fail-open: routing simply abstains
+    except Exception as exc:  # noqa: BLE001 - fail-open: routing simply abstains
         logger.warning("qir.store active() failed (fail-open): %r", exc)
         return None
 

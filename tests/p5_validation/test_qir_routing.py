@@ -12,13 +12,9 @@ import asyncio
 import types
 
 import pytest
-
-import pytest
-
 from core.application.chat import qir
 from core.application.chat.actions import (
     ActionIntegrityFailure,
-    DIRECT_TOOLS,
     bind_arguments,
     is_negated_request,
     match_direct_tool,
@@ -26,14 +22,7 @@ from core.application.chat.actions import (
 from core.application.chat.qir.snapshot import build_snapshot, validate_draft
 from core.application.chat.qir.types import Capability, Snapshot, fingerprint
 
-
 # ── fixtures: a tiny hand-built snapshot with deterministic vectors ───────────────
-
-def _unit(deg_pairs):  # 2-D toy space; embedder is fake so dims are ours to choose
-    import math as _m
-    x, y = deg_pairs
-    return [_m.cos(x), _m.sin(y)]
-
 
 CAPS = (
     Capability(
@@ -163,8 +152,8 @@ async def test_fail_open_on_exception_and_timeout():
     for exc in (RuntimeError("tei down"), asyncio.TimeoutError):
         emb = FakeEmbedder([1.0, 0.0])
 
-        async def boom(texts, _e=emb):
-            raise RuntimeError("embed fail") if isinstance(exc, RuntimeError) else None
+        async def boom(texts, _exc=exc):
+            raise RuntimeError("embed fail") if isinstance(_exc, RuntimeError) else None
 
         if isinstance(exc, RuntimeError):
             emb.embed = boom  # type: ignore[method-assign]
@@ -232,7 +221,6 @@ def test_negation_guard_abstains_l0_and_binding(text):
     'create a folder named "tmp" and remember it',  # positive stays positive
 ])
 def test_positive_phrases_unaffected_by_guard(text):
-    ctx = types.SimpleNamespace(owned_asset_id=None, body=None)
     assert not is_negated_request(text)
 
 
@@ -315,8 +303,6 @@ async def test_stage2_integrity_fault_marks_terminal_action(monkeypatch):
 # ── qir package import boundary (frozen: routing layer owns no execution) ─────────
 
 def test_qir_package_imports_never_reach_api_or_agent():
-    import core.application.chat.qir as pkg
-
     mods = [
         "core.application.chat.qir",
         "core.application.chat.qir.types",
@@ -327,7 +313,8 @@ def test_qir_package_imports_never_reach_api_or_agent():
     ]
     for name in mods:
         mod = __import__(name, fromlist=["_"])
-        src = open(mod.__file__, encoding="utf-8").read()
+        with open(mod.__file__, encoding="utf-8") as fh:
+            src = fh.read()
         for line in src.splitlines():
             code = line.split("#", 1)[0]
             assert "import api" not in code and "from api" not in code, name

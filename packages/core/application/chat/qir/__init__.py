@@ -24,11 +24,11 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from .types import RouteResult, Snapshot  # noqa: F401  (public vocabulary)
+from .types import RouteResult, Snapshot
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["route", "RouteResult", "Snapshot", "store"]
+__all__ = ["RouteResult", "Snapshot", "route", "store"]
 
 
 async def route(
@@ -47,7 +47,7 @@ async def route(
                      top_k=top_k, min_score=min_score, margin=margin),
             timeout=timeout_seconds,
         )
-    except Exception as exc:  # timeout, embedder/LLM transport, anything: fail-open
+    except Exception as exc:  # noqa: BLE001 - fail-open by contract (timeout, transport, anything)
         logger.info("qir.route fail-open: %r", exc)
         return None
 
