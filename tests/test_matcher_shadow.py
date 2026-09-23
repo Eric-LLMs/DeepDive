@@ -18,6 +18,7 @@ from core.application.chat.intent_funnel.contract import (
     MATCH_AMBIGUOUS,
     MATCH_HIT,
     MATCH_MISS,
+    TurnFacts,
 )
 from core.application.chat.intent_funnel.registry import content_fingerprint
 from core.application.chat.intent_funnel.registry import types as T
@@ -51,9 +52,12 @@ def _view(entries, version=1, fingerprint=None):
 
 # ── node semantics ────────────────────────────────────────────────────────────────
 
+_TF = TurnFacts()  # plain turn: no viewer/attachment facts
+
+
 def test_exact_phrase_hit_is_normalized():
     v = _view([_entry("cap-a", aliases=(" 新建文件夹 ",))])
-    res = matcher.match("新建文件夹", v)
+    res = matcher.match("新建文件夹", _TF, v)
     assert res.state == MATCH_HIT and res.capability_id == "cap-a"
     assert res.registry_version == v.fingerprint
     assert res.matched_literal == "新建文件夹"  # the normalized alias, not just the verdict
@@ -61,10 +65,10 @@ def test_exact_phrase_hit_is_normalized():
 
 def test_regex_pattern_hits_and_misses():
     v = _view([_entry("cap-a", patterns=(f"{T.RE_PREFIX}(?:创建|新建)文件夹",))])
-    res = matcher.match("帮我新建文件夹好吗", v)
+    res = matcher.match("帮我新建文件夹好吗", _TF, v)
     assert res.capability_id == "cap-a"
     assert res.matched_literal == "re:(?:创建|新建)文件夹"
-    assert matcher.match("删除文件夹", v).state == MATCH_MISS
+    assert matcher.match("删除文件夹", _TF, v).state == MATCH_MISS
 
 
 def test_disabled_and_deprecated_caps_are_never_matched():
@@ -72,8 +76,8 @@ def test_disabled_and_deprecated_caps_are_never_matched():
         _entry("cap-off", aliases=("建目录",), enabled=False, status="disabled"),
         _entry("cap-dep", aliases=("建个目录",), status="deprecated"),
     ])
-    assert matcher.match("建目录", v).state == MATCH_MISS
-    assert matcher.match("建个目录", v).state == MATCH_MISS
+    assert matcher.match("建目录", _TF, v).state == MATCH_MISS
+    assert matcher.match("建个目录", _TF, v).state == MATCH_MISS
 
 
 def test_ambiguous_carries_all_candidates_and_never_picks():
@@ -81,7 +85,7 @@ def test_ambiguous_carries_all_candidates_and_never_picks():
         _entry("cap-a", aliases=("季度汇总",)),
         _entry("cap-b", patterns=(f"{T.RE_PREFIX}季度.*",)),
     ])
-    res = matcher.match("季度汇总", v)
+    res = matcher.match("季度汇总", _TF, v)
     assert res.state == MATCH_AMBIGUOUS
     assert res.capability_id is None
     assert set(res.candidates) == {"cap-a", "cap-b"}  # ALL of them, upward
@@ -89,8 +93,8 @@ def test_ambiguous_carries_all_candidates_and_never_picks():
 
 def test_blank_query_misses_and_bad_legacy_regex_is_skipped_not_fatal():
     v = _view([_entry("cap-a", patterns=("re:[unclosed",), aliases=("x",))])
-    assert matcher.match("", v).state == MATCH_MISS
-    assert matcher.match("x", v).state == MATCH_HIT  # the other literal still works
+    assert matcher.match("", _TF, v).state == MATCH_MISS
+    assert matcher.match("x", _TF, v).state == MATCH_HIT  # the other literal still works
 
 
 def test_index_is_cached_per_version_fingerprint_pair():
@@ -268,8 +272,8 @@ async def test_mode_on_runs_shadow_semantics_with_a_warning(monkeypatch, caplog)
             _ctx("新建文件夹"), deps=types.SimpleNamespace(session_factory=None),
             requirements=req,
         )
-    assert out is req  # ON does not hand the HIT to the turn — L0 stays in charge
-    assert any("P2 deliverable" in r.getMessage() for r in caplog.records)
+    assert out is req  # ON does not hand the HIT to the turn — the funnel gate is off
+    assert any("chat_funnel_enabled is off" in r.getMessage() for r in caplog.records)
     assert any("matcher_shadow mode=on" in r.getMessage() for r in caplog.records)
 
 

@@ -5,12 +5,14 @@ Matcher -> Recall -> Judge -> Decision, escalating ONLY upward, with the Agent
 as the byte-identical fallback consumer and the Shared Tool Runtime as the sole
 execution point.
 
-P0 scope, frozen: this package currently hosts the orchestration moved out of
-``TurnOrchestrator`` (gate + QIR cascade + argument binding, behavior
-byte-identical) and the node contracts every later phase implements against.
-No new routing SEMANTICS live here yet.
+Scope status: P0 moved the orchestration out of ``TurnOrchestrator`` (gate +
+legacy QIR cascade + argument binding, behavior byte-identical); P1 added the
+Registry/Matcher with its shadow hook; P2 implements the target cascade behind
+its OWN gate (``chat_funnel_enabled``, default OFF — the legacy lane stays
+historical, not the baseline). The Agent remains the byte-identical fallback
+consumer and the Shared Tool Runtime the sole execution point.
 """
 from . import contract
-from .funnel import qir_live, route, run_intent_stage
+from .funnel import funnel_live, qir_live, route, run_intent_stage
 
-__all__ = ["contract", "route", "qir_live", "run_intent_stage"]
+__all__ = ["contract", "route", "qir_live", "funnel_live", "run_intent_stage"]

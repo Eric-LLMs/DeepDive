@@ -23,7 +23,7 @@ from core.application.chat.intent_funnel.registry.types import (
     STATUS_ACTIVE,
 )
 
-from .contract import MATCH_AMBIGUOUS, MATCH_HIT, MATCH_MISS, MatchResult
+from .contract import MATCH_AMBIGUOUS, MATCH_HIT, MATCH_MISS, MatchResult, TurnFacts
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +72,16 @@ def build_index(view) -> tuple[dict, list]:
     return built
 
 
-def match(query: str, view) -> MatchResult:
+def match(query: str, facts: TurnFacts, view) -> MatchResult:
     """One deterministic pass over the active version's table. Cost: a dict
     lookup + a handful of regex searches — this node is allowed to be cheap enough
-    to run on every shadowed turn."""
+    to run on every shadowed turn.
+
+    ``facts`` is the formal turn-side contract (ruling 2026-09-24): the Matcher
+    receives the current turn's settled structured facts (viewer / attachment),
+    never raw history. P2's ACTION table consumes none of them yet; from P3 on,
+    table entries may gate on these facts. ``view`` is the Registry side (§8.1:
+    the ONLY match data this node reads)."""
     if not (query or "").strip():
         return MatchResult(state=MATCH_MISS, registry_version=view.fingerprint)
     exact, regexes = build_index(view)

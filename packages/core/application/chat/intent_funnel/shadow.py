@@ -7,10 +7,10 @@ docs + :func:`funnel.route`):
 * ``shadow`` — the Registry-backed Matcher runs on every turn and its verdict is
   logged as ``would_*`` telemetry next to the L0 outcome; routing is untouched
   and the Agent keeps the turn byte-identically;
-* ``on``     — the P2 promotion (Matcher becomes an authoritative ACTION router
-  after the measured L0 equivalence). In P1 it runs SHADOW semantics with a
-  warning: a mis-set switch must never silently hand routing to a node that has
-  only ever measured itself in the dark.
+* ``on``     — deterministic certification INSIDE the new cascade (only with
+  ``chat_funnel_enabled``; see funnel._run_nodes). Without the funnel gate it
+  keeps running SHADOW semantics with a one-time warning: a mis-set switch must
+  never silently hand routing to a node measured only in the dark.
 
 Two invariants this module owns:
 
@@ -30,7 +30,7 @@ from core.infrastructure.request_context import (
     set_request_execution_mode,
 )
 
-from .contract import MATCH_AMBIGUOUS, MATCH_HIT, MatchResult
+from .contract import MATCH_AMBIGUOUS, MATCH_HIT, MatchResult, TurnFacts
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +63,14 @@ async def observe(ctx, deps, requirements, mode: str) -> None:
     routes; pins execution_mode=shadow for its duration only."""
     global _warned_on
     if mode == "on" and not _warned_on:
-        _warned_on = True  # once per process — a mis-set switch, not a per-turn event
-        logger.warning(
-            "chat_matcher_mode=on: authoritative Matcher routing is a P2 deliverable; "
-            "running shadow semantics only, L0 stays authoritative"
-        )
+        from .funnel import funnel_live  # late import: funnel owns the shadow hook
+
+        if not funnel_live(requirements, deps, ctx):
+            _warned_on = True  # once per process — a mis-set switch, not a per-turn event
+            logger.warning(
+                "chat_matcher_mode=on but chat_funnel_enabled is off: authoritative "
+                "Matcher certification needs the funnel gate; shadow semantics only"
+            )
     token = set_request_execution_mode("shadow")
     try:
         await _match_and_log(ctx, deps, requirements, mode)
@@ -84,7 +87,8 @@ async def _match_and_log(ctx, deps, requirements, mode: str) -> None:
     view = await active_view(session_factory=deps.session_factory)
     if view is None:
         return  # nothing published yet — no comparison possible
-    res = matcher.match(getattr(ctx.body, "message", "") or "", view)
+    res = matcher.match(getattr(ctx.body, "message", "") or "",
+                        TurnFacts.of(ctx), view)
     l0_tool = (requirements.requested_action or {}).get("tool")
     logger.info(
         "matcher_shadow mode=%s version=%d state=%s registry_version=%s "

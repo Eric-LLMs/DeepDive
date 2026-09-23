@@ -22,6 +22,60 @@ MATCH_AMBIGUOUS = "MATCH_AMBIGUOUS"  # prefixed per 8.10; never the bare word
 
 
 @dataclass(frozen=True)
+class TurnFacts:
+    """The current turn's settled structured facts — the Matcher contract input
+    (ruling 2026-09-24). Product semantics already depend on them: "总结一下"
+    targets the session context, "总结这一页" targets ``viewer.current_page``.
+    The Matcher sees ONLY these derived facts — never the raw transcript, and it
+    never parses history itself (resolution belongs upstream, once per turn).
+    The field vocabulary mirrors the arg_slots ``source`` enum (8.1-b)."""
+
+    has_viewer: bool = False
+    viewer_asset_id: str = ""
+    viewer_current_page: int | None = None
+    has_viewer_selection: bool = False
+    has_attachment: bool = False
+    has_turn_context: bool = False  # a session-bound turn: prior context exists
+
+    @classmethod
+    def of(cls, ctx) -> "TurnFacts":
+        """Build once from the resolved turn context. ``body.viewer`` is the
+        request's ViewerPayload (schemas.py); ``attach`` a dict; both may be
+        absent on guest/plain turns."""
+        body = ctx.body
+        viewer = getattr(body, "viewer", None)
+        selections = getattr(viewer, "selections", None) or []
+        return cls(
+            has_viewer=viewer is not None,
+            viewer_asset_id=str(getattr(viewer, "asset_id", "") or ""),
+            viewer_current_page=getattr(viewer, "page", None),
+            has_viewer_selection=bool(selections),
+            has_attachment=bool(getattr(body, "attach", None)),
+            has_turn_context=bool(getattr(ctx, "session_id", None)),
+        )
+
+# ── 8.10 fallback reason codes (prefixed, never bare words) ───────────────────────
+# The new cascade's ONLY downward exits. Any of these on a funnel_trace line means
+# the turn went to the Agent with the user text BYTE-IDENTICAL (8.10).
+REASON_NO_CANDIDATE = "NO_CANDIDATE"
+REASON_RECALL_TIMEOUT = "RECALL_TIMEOUT"
+REASON_RECALL_UNAVAILABLE = "RECALL_UNAVAILABLE"
+REASON_JUDGE_REJECT = "JUDGE_REJECT"
+REASON_JUDGE_UNCERTAIN = "JUDGE_UNCERTAIN"
+REASON_JUDGE_TIMEOUT = "JUDGE_TIMEOUT"
+REASON_DECISION_NONE = "DECISION_NONE"
+REASON_DECISION_TIMEOUT = "DECISION_TIMEOUT"
+REASON_DECISION_ERROR = "DECISION_ERROR"
+REASON_REGISTRY_UNAVAILABLE = "REGISTRY_UNAVAILABLE"
+REASON_VERSION_MISMATCH = "REGISTRY_VERSION_MISMATCH"
+REASON_BIND_MISSING = "BIND_MISSING"
+REASON_BIND_AMBIGUOUS = "BIND_AMBIGUOUS"
+REASON_BIND_INVALID = "BIND_INVALID"
+REASON_CASCADE_TIMEOUT = "CASCADE_TIMEOUT"
+REASON_CASCADE_ERROR = "CASCADE_ERROR"
+
+
+@dataclass(frozen=True)
 class MatchResult:
     """Deterministic table match. AMBIGUOUS carries ALL candidate ids and the
     funnel escalates them upward (8.1) — the Matcher never picks one."""
@@ -44,6 +98,10 @@ class Candidate:
     capability_id: str
     score: float
     matched_example: str = ""
+    # which stage produced this candidate ("recall" | "matcher_ambiguous"); the
+    # Judge sees the union of Recall hits and Matcher-AMBIGUOUS escalations (8.1)
+    # and must know which ones carry a calibrated cosine score.
+    origin: str = "recall"
 
 
 @dataclass(frozen=True)
@@ -80,8 +138,10 @@ class DecisionResult:
 
 BIND_COMPLETE = "COMPLETE"
 BIND_MISSING = "MISSING"
-# BIND_AMBIGUOUS / BIND_INVALID arrive with the binder rewrite (P1+); the four
-# states never collapse into a plain None (8.7): "no arguments" is a STATE.
+# P2 binder rewrite delivers all four states (8.7): the four states never
+# collapse into a plain None — "no arguments" is a STATE, not an absence.
+BIND_AMBIGUOUS = "AMBIGUOUS"
+BIND_INVALID = "INVALID"
 
 @dataclass(frozen=True)
 class BoundArguments:

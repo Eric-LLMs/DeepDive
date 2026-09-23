@@ -142,6 +142,20 @@ class Settings(BaseSettings):
     #           behaves as shadow with a warning: a mis-set switch must never
     #           silently hand routing to a node that only ever measured in the dark.
     chat_matcher_mode: str = "off"
+    # ── Intent Funnel (P2 target architecture, docs/temp.md §3/§8): the four-node ──
+    # cascade Matcher→Recall→Judge→Decision→Binder with escalate-only-upward and
+    # fail-open Agent fallback. Dark launch: chat_funnel_enabled=False keeps the
+    # legacy path byte-identical; the knobs below are INDEPENDENT of chat_qir_*
+    # (the legacy cascade) on purpose — the new chain is tuned on its own merits.
+    chat_funnel_enabled: bool = False            # master gate for the new cascade
+    chat_funnel_timeout_seconds: float = 5.0     # whole-cascade wall clock, then Agent
+    chat_funnel_top_k: int = 3                   # Recall candidate width
+    chat_funnel_min_score: float = 0.82          # Recall quality gate (no adjudication here)
+    chat_funnel_margin: float = 0.06             # Judge(stub) leader-vs-runner-up margin
+    # Judge backend ladder (8.17): "stub" | "local" | "online" | "auto" (local→online→stub)
+    chat_judge_backend: str = "stub"
+    chat_judge_min_confidence: float = 0.75      # online verdicts below this escalate
+    chat_judge_local_url: str = ""               # deployed local judge endpoint ("" = none)
 
     # ── Web search (agent web_search tool) ──
     # provider is free text: aggregate/keyless (no key) | duckduckgo (no key) | tavily |
