@@ -133,3 +133,74 @@ async def test_complete_json_streams_json_mode_and_parses_across_chunks():
     assert kw["stream"] is True
     assert kw["response_format"] == {"type": "json_object"}
     assert kw["extra_body"] == {"enable_thinking": False}
+
+
+# ── unsolicited usage chunk (2026-09-23 regression, found by the real QIR E2E) ───
+#
+# DeepSeek sends a usage chunk even when include_usage was NOT requested. The old
+# accumulator wrote through a None sink on that chunk and raised TypeError, which
+# collapsed EVERY usage_out-less complete_json caller — notably the QIR decision
+# stage — to fail-open on exactly those channels. The guard must let the content
+# through untouched and must still capture usage when a sink IS given.
+
+class _Usage:
+    def __init__(self, prompt_tokens, completion_tokens):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+class _UsageChunk:
+    choices: list = []  # terminal usage frame: no choices at all
+
+    def __init__(self, prompt_tokens, completion_tokens):
+        self.usage = _Usage(prompt_tokens, completion_tokens)
+
+
+class _FakeStreamWithUsage(_FakeStream):
+    def __init__(self, pieces):
+        super().__init__(pieces)
+
+    def __aiter__(self):
+        async def gen():
+            for p in self._pieces:
+                yield _Chunk(p)
+            yield _UsageChunk(11, 7)
+        return gen()
+
+
+class _FakeCompletionsWithUsage:
+    def __init__(self, captured, pieces):
+        self.captured = captured
+        self.pieces = pieces
+
+    async def create(self, **kwargs):
+        self.captured.append(kwargs)
+        return _FakeStreamWithUsage(self.pieces)
+
+
+def _llm_with_usage_fake(pieces):
+    captured: list[dict] = []
+    llm = OpenAILLM(api_key="k", base_url="http://x", model="m")
+    llm.client = type("C", (), {
+        "chat": type("X", (), {
+            "completions": _FakeCompletionsWithUsage(captured, pieces),
+        })(),
+    })()
+    return llm, captured
+
+
+async def test_unsolicited_usage_chunk_does_not_crash_a_none_sink():
+    llm, _ = _llm_with_usage_fake(['{"capability_id":', ' "cap-x"}'])
+    out = await llm.complete_json("decide json", "s")  # usage_out defaults to None
+    assert out == {"capability_id": "cap-x"}
+
+
+async def test_usage_sink_still_captures_unsolicited_usage():
+    llm, captured = _llm_with_usage_fake(['{"a": 1}'])
+    sink: dict = {}
+    out = await llm.complete_json("give me json", "s", usage_out=sink)
+    assert out == {"a": 1}
+    assert sink == {"prompt_tokens": 11, "completion_tokens": 7}
+    # a sink DID request include_usage — the tolerance is about unsolicited
+    # frames on sink-less calls, not about opting into them silently
+    assert captured[0]["stream_options"] == {"include_usage": True}

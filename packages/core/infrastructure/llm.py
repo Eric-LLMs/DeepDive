@@ -179,7 +179,12 @@ class OpenAILLM:
         parts: list[str] = []
         async for chunk in stream:
             usage = getattr(chunk, "usage", None)
-            if usage is not None:
+            # NOTE the ``usage_out is not None`` guard: some providers (deepseek)
+            # send a usage chunk even when include_usage was NOT requested —
+            # writing through a None sink used to raise TypeError, which made
+            # every usage_out-less complete_json caller (QIR decision) fail-open
+            # on exactly those channels.
+            if usage is not None and usage_out is not None:
                 usage_out["prompt_tokens"] = getattr(usage, "prompt_tokens", 0) or 0
                 usage_out["completion_tokens"] = getattr(usage, "completion_tokens", 0) or 0
             if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
