@@ -21,8 +21,8 @@ from core.application.chat.intent_funnel.contract import (
     TurnFacts,
 )
 from core.application.chat.intent_funnel.registry import content_fingerprint
-from core.application.chat.intent_funnel.registry import types as T
-from core.application.chat.intent_funnel.registry.types import RegistryVersionView
+from core.application.chat.intent_funnel.registry import entry as T
+from core.application.chat.intent_funnel.registry.entry import RegistryVersionView
 from core.application.chat.understanding import (
     Complexity,
     Confidence,

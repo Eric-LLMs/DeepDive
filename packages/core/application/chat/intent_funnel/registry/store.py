@@ -35,7 +35,7 @@ from core.infrastructure.db import (
     SessionLocal,
 )
 
-from .types import (
+from .entry import (
     STATE_ACTIVE,
     STATE_FAILED,
     STATE_STAGED,

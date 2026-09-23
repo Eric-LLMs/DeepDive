@@ -18,12 +18,12 @@ from __future__ import annotations
 import logging
 import re
 
-from core.application.chat.intent_funnel.registry.types import (
+from core.application.chat.intent_funnel.registry.entry import (
     RE_PREFIX,
     STATUS_ACTIVE,
 )
 
-from .contract import MATCH_AMBIGUOUS, MATCH_HIT, MATCH_MISS, MatchResult, TurnFacts
+from ..contract import MATCH_AMBIGUOUS, MATCH_HIT, MATCH_MISS, MatchResult, TurnFacts
 
 logger = logging.getLogger(__name__)
 

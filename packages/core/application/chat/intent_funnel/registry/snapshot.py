@@ -47,7 +47,7 @@ from .store import (
     mark_failed,
     stage_version,
 )
-from .types import (
+from .entry import (
     RE_PREFIX,
     STATUS_ACTIVE,
     STATUS_DEPRECATED,

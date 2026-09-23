@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 
-from .contract import DecisionResult
+from ..contract import DecisionResult
 
 logger = logging.getLogger(__name__)
 

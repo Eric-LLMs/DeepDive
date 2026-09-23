@@ -265,7 +265,7 @@ async def _run_nodes(ctx, deps, requirements, trace):
     from .judge import adjudicate as judge_adjudicate
     from .judge import recheck as judge_recheck
     from .registry import active_view as registry_active_view
-    from .registry.types import STATUS_ACTIVE
+    from .registry.entry import STATUS_ACTIVE
 
     message = ctx.body.message or ""
 

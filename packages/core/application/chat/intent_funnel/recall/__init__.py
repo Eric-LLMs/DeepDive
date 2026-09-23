@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import math
 
-from .contract import Candidate, RecallResult
+from ..contract import Candidate, RecallResult
 
 logger = logging.getLogger(__name__)
 

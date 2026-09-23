@@ -39,7 +39,7 @@ from core.application.chat.intent_funnel.contract import (
 )
 from core.application.chat.intent_funnel.judge import base as jbase
 from core.application.chat.intent_funnel.registry import content_fingerprint
-from core.application.chat.intent_funnel.registry import types as T
+from core.application.chat.intent_funnel.registry import entry as T
 from core.application.chat.understanding import (
     Complexity,
     Confidence,

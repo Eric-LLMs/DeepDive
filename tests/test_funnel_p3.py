@@ -19,8 +19,8 @@ import types
 from core.application.chat.intent_funnel import funnel
 from core.application.chat.intent_funnel.contract import REASON_KIND_DISABLED
 from core.application.chat.intent_funnel.registry import content_fingerprint
-from core.application.chat.intent_funnel.registry import publish as pub
-from core.application.chat.intent_funnel.registry.types import (
+from core.application.chat.intent_funnel.registry import snapshot as pub
+from core.application.chat.intent_funnel.registry.entry import (
     KIND_ACTION,
     KIND_PRIVATE,
     KIND_WEB,

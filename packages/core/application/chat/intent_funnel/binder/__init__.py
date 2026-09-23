@@ -17,7 +17,7 @@ import logging
 
 from core.application.chat.actions import DIRECT_TOOLS, bind_arguments
 
-from .contract import (
+from ..contract import (
     BIND_COMPLETE,
     BIND_INVALID,
     BIND_MISSING,
