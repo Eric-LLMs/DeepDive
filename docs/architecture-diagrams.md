@@ -397,28 +397,32 @@ flowchart TB
 
     USER["chat turn · resolve_plan →<br/>funnel.route(ctx, deps, requirements)"]
 
-    subgraph entry["Entry gates — ALL default OFF, dark launch"]
-        direction TB
-        SHADOW["shadow hook · chat_matcher_mode off/shadow/on<br/>Matcher runs in the dark, would_* telemetry,<br/>routing untouched"]
-        L0B["L0 already certified ⇒ untouched<br/>(coexistence boundary)"]
-        GATE["funnel_live = chat_funnel_enabled + fast_paths_enabled<br/>+ action switch + guardrails.turn_veto:<br/>non-pure-text · web/memory demand · research/handoff<br/>vetoes as CODE, not table data"]
-        SHADOW --> L0B --> GATE
-    end
-    USER --> SHADOW
+    subgraph lane[" "]
+        direction LR
+        subgraph entry["Entry gates — ALL default OFF, dark launch"]
+            direction TB
+            SHADOW["shadow hook · chat_matcher_mode off/shadow/on<br/>Matcher runs in the dark, would_* telemetry,<br/>routing untouched"]
+            L0B["L0 already certified ⇒ untouched<br/>(coexistence boundary)"]
+            GATE["funnel_live = chat_funnel_enabled + fast_paths_enabled<br/>+ action switch + guardrails.turn_veto:<br/>non-pure-text · web/memory demand · research/handoff<br/>vetoes as CODE, not table data"]
+            SHADOW --> L0B --> GATE
+        end
+        USER --> SHADOW
 
-    subgraph cascade["Single-hop cascade (wall-clock budget chat_funnel_timeout_seconds)"]
-        direction TB
-        REG["Registry active view + paired Recall index<br/>(Build-Then-Swap pair — read together or not at all)<br/>missing ⇒ REGISTRY_UNAVAILABLE / RECALL_UNAVAILABLE"]
-        M["Node 1 · Matcher — table data only<br/>patterns/aliases · re: = regex search, else the whole<br/>normalized query must equal a literal<br/>negation guard before certifying (common layer)<br/>HIT · MISS · MATCH_AMBIGUOUS (all claimants up)"]
-        R["Node 2 · Recall — cosine top_k ≥ min_score<br/>quality-gate candidates ONLY, never adjudicates<br/>(origin=recall, calibrated score)"]
-        CAND["ONE candidate set, one convergence point<br/>matcher_hit 1.0 · matcher_ambiguous 0.0 — MERGED with<br/>recall (calibrated score wins shared ids) · empty ⇒ NO_CANDIDATE"]
-        TI["Node 3 · ToolIntentModel — at most ONE model call:<br/>select capability AND draft arguments<br/>chat_tool_intent_backend picks the chain:<br/>auto = local → online → stub (Unavailable falls through)<br/>stub = margin rules, NO model, NO extraction<br/>(arguments None ⇒ schema'd turns exit BIND_MISSING)"]
-        B["Node 4 · Binder.validate — pure schema gate<br/>Registry canonical parameters · extracts nothing<br/>COMPLETE / MISSING / INVALID<br/>(AMBIGUOUS wired in contract — no producer yet)"]
-        REG --> M
-        M -- "any non-HIT: MISS / AMBIGUOUS" --> R --> CAND
-        M -- "HIT" --> CAND
+        subgraph cascade["Single-hop cascade (wall-clock budget chat_funnel_timeout_seconds)"]
+            direction TB
+            REG["Registry active view + paired Recall index<br/>(Build-Then-Swap pair — read together or not at all)<br/>missing ⇒ REGISTRY_UNAVAILABLE / RECALL_UNAVAILABLE"]
+            M["Node 1 · Matcher — table data only<br/>patterns/aliases · re: = regex search, else the whole<br/>normalized query must equal a literal<br/>negation guard before certifying (common layer)<br/>HIT · MISS · MATCH_AMBIGUOUS (all claimants up)"]
+            R["Node 2 · Recall — cosine top_k ≥ min_score<br/>quality-gate candidates ONLY, never adjudicates<br/>(origin=recall, calibrated score)"]
+            CAND["ONE candidate set, one convergence point<br/>matcher_hit 1.0 · matcher_ambiguous 0.0 — MERGED with<br/>recall (calibrated score wins shared ids) · empty ⇒ NO_CANDIDATE"]
+            TI["Node 3 · ToolIntentModel — at most ONE model call:<br/>select capability AND draft arguments<br/>chat_tool_intent_backend picks the chain:<br/>auto = local → online → stub (Unavailable falls through)<br/>stub = margin rules, NO model, NO extraction<br/>(arguments None ⇒ schema'd turns exit BIND_MISSING)"]
+            B["Node 4 · Binder.validate — pure schema gate<br/>Registry canonical parameters · extracts nothing<br/>COMPLETE / MISSING / INVALID<br/>(AMBIGUOUS wired in contract — no producer yet)"]
+            REG --> M
+            M -- "any non-HIT: MISS / AMBIGUOUS" --> R --> CAND
+            M -- "HIT" --> CAND
+        end
+        GATE --> REG
     end
-    GATE --> REG
+    style lane fill:none,stroke:none
 
     subgraph adapters["Local Adapter — one internal reply shape from either wire format"]
         direction TB
