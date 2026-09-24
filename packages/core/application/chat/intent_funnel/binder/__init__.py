@@ -1,8 +1,8 @@
-"""Node 4 — Binder: Model A draft + Registry schema -> BoundArguments.
+"""Node 4 — Binder: ToolIntentModel draft + Registry schema -> BoundArguments.
 
 Four states, never a naked None (8.7): the argument truth is a STATE, and the
 non-COMPLETE states exit to the Agent (chain ruling 2026-09-24: the recheck
-hop is gone — on the active path the Binder VALIDATES Model A's extraction
+hop is gone — on the active path the Binder VALIDATES ToolIntentModel's extraction
 (:func:`validate`) and never extracts itself). The Binder executes nothing
 (8.8: routing metadata is all the funnel ever produces).
 
@@ -44,10 +44,10 @@ from ..registry.plugins import DIRECT_TOOLS, plugin_extractor
 logger = logging.getLogger(__name__)
 
 
-# ── the chain-ruling entry (2026-09-24): Model A extracted, Binder validates ───────
+# ── the chain-ruling entry (2026-09-24): ToolIntentModel extracted, Binder validates ───────
 
 def validate(entry, args) -> BoundArguments:
-    """Normalize/validate Model A's argument DRAFT against the Registry's
+    """Normalize/validate ToolIntentModel's argument DRAFT against the Registry's
     CANONICAL parameter schema (``entry.parameters``, 0007 ruling). The Binder
     extracts nothing on this path — it is a pure gate: unknown slot -> INVALID;
     missing/blank required slot -> MISSING (Agent owns the clarification);

@@ -108,7 +108,7 @@ def validate_entries(entries: Sequence[CapabilityEntry]) -> list[str]:
                 "binding (the Registry cannot invent executables)"
             )
         if not e.description.strip():
-            issues.append(f"{cid}: description is required (Model A card source)")
+            issues.append(f"{cid}: description is required (ToolIntentModel card source)")
         if not e.recall_corpus:
             issues.append(
                 f"{cid}: recall corpus must be non-empty and indexable "

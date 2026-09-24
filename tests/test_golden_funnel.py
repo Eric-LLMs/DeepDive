@@ -1,6 +1,6 @@
 """§8.16 Golden Set runner — executes the publish-gate matrix in
 ``tests/golden/intent_funnel_golden.yaml`` against the REAL single-hop cascade
-(Matcher HIT / Recall -> ONE Model A call -> Binder validate -> certified).
+(Matcher HIT / Recall -> ONE ToolIntentModel call -> Binder validate -> certified).
 
 Design of the fake world (kept deterministic on purpose — a golden that can
 flap is worse than no golden):
@@ -15,8 +15,8 @@ flap is worse than no golden):
   against either axis, under the 0.82 quality gate. Recall therefore never
   "resupplies" a turn the Matcher was told to miss (the negation case leans
   on exactly this);
-* the Model A hop is a SCRIPTED deterministic stand-in (backend pinned
-  "online", deps.llm = _ScriptedModelA): it parses its own card prompt, keeps
+* the ToolIntentModel hop is a SCRIPTED deterministic stand-in (backend pinned
+  "online", deps.llm = _ScriptedToolIntent): it parses its own card prompt, keeps
   the single-candidate rule, and extracts by quote-stripping — the same
   contract a deployed small model serves, made flap-free. Its scripted NONE on
   a split card set is the only negative the matrix exercises;
@@ -39,7 +39,7 @@ import yaml
 from core.application.chat.intent_funnel import funnel
 from core.application.chat.intent_funnel.contract import (
     REASON_BIND_MISSING,
-    REASON_JUDGE_REJECT,
+    REASON_TOOL_INTENT_REJECT,
     REASON_KIND_DISABLED,
     REASON_NO_CANDIDATE,
 )
@@ -63,7 +63,7 @@ GOLDEN_PATH = Path(__file__).parent / "golden" / "intent_funnel_golden.yaml"
 # YAML token -> the contract constant actually logged as fallback_reason
 FALLBACK_CODES = {
     "FUNNEL_NO_CANDIDATE": REASON_NO_CANDIDATE,
-    "FUNNEL_JUDGE_REJECT": REASON_JUDGE_REJECT,
+    "FUNNEL_TOOL_INTENT_REJECT": REASON_TOOL_INTENT_REJECT,
     "FUNNEL_BIND_MISSING": REASON_BIND_MISSING,
     "FUNNEL_KIND_DISABLED": REASON_KIND_DISABLED,
 }
@@ -186,11 +186,11 @@ def _ctx(query: str, ctx_body: dict):
     )
 
 
-class _ScriptedModelA:
-    """Deterministic stand-in for Model A (the online seam's fake llm): parses
+class _ScriptedToolIntent:
+    """Deterministic stand-in for ToolIntentModel (the online seam's fake llm): parses
     its own card prompt, applies the single-card rule, and extracts arguments
     by quote-stripping — the same contract a deployed small model serves, with
-    zero flapping. A split card set gets the honest NONE (-> JUDGE_REJECT)."""
+    zero flapping. A split card set gets the honest NONE (-> TOOL_INTENT_REJECT)."""
 
     def __init__(self):
         self.calls = 0
@@ -234,19 +234,19 @@ def _wire(monkeypatch, embedder: _Embedder):
     monkeypatch.setattr(settings, "chat_funnel_enabled", True)
     monkeypatch.setattr(settings, "chat_fast_paths_enabled", True)
     monkeypatch.setattr(settings, "chat_action_fast_path_enabled", True)
-    # Model A rides the online seam with the scripted double; every channel/
+    # ToolIntentModel rides the online seam with the scripted double; every channel/
     # floor config is pinned so a dev .env can never flap a golden.
-    monkeypatch.setattr(settings, "chat_judge_backend", "online")
-    monkeypatch.setattr(settings, "chat_judge_min_confidence", 0.75)
-    monkeypatch.setattr(settings, "chat_judge_online_model", "")
-    monkeypatch.setattr(settings, "chat_judge_online_base_url", "")
-    monkeypatch.setattr(settings, "chat_judge_online_api_key", "")
+    monkeypatch.setattr(settings, "chat_tool_intent_backend", "online")
+    monkeypatch.setattr(settings, "chat_tool_intent_min_confidence", 0.75)
+    monkeypatch.setattr(settings, "chat_tool_intent_online_model", "")
+    monkeypatch.setattr(settings, "chat_tool_intent_online_base_url", "")
+    monkeypatch.setattr(settings, "chat_tool_intent_online_api_key", "")
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", 5.0)
     # pin the ladder geometry so an env-tweaked default can never flap a golden
     monkeypatch.setattr(settings, "chat_funnel_top_k", 3)
     monkeypatch.setattr(settings, "chat_funnel_min_score", 0.82)
     return view, types.SimpleNamespace(
-        session_factory=None, embedder=lambda: embedder, llm=_ScriptedModelA(),
+        session_factory=None, embedder=lambda: embedder, llm=_ScriptedToolIntent(),
     )
 
 
@@ -303,7 +303,7 @@ async def test_golden_case(monkeypatch, caplog, case):
         assert expect["matcher_contains"] in m_field, trace
 
     if expect["route"] == "action":
-        assert deps.llm.calls == 1                  # the ONE Model A hop per certified turn
+        assert deps.llm.calls == 1                  # the ONE ToolIntentModel hop per certified turn
         assert out is not requirements              # certified: a NEW object
         act = out.requested_action
         assert act["capability_id"] == expect["capability"], trace

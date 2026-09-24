@@ -1,11 +1,11 @@
 """Intent Funnel node contracts — the vocabulary every node speaks.
 
 Chain ruling (2026-09-24, single-hop correction): the active chain is
-Matcher -> (Recall on MISS/AMBIGUOUS) -> Model A (ONE call: capability
+Matcher -> (Recall on MISS/AMBIGUOUS) -> ToolIntentModel (ONE call: capability
 selection + argument extraction) -> Binder (normalize/validate only) ->
 Execute; every non-COMPLETE outcome exits to the Agent (8.10). The former
 recheck hop and the Decision LLM node are removed from the active path —
-``JudgeVerdict`` is Model A's verdict+draft in one object. No node may pass
+``ToolIntentVerdict`` is ToolIntentModel's verdict+draft in one object. No node may pass
 anything else across the boundary, and per 8.8 a verdict carries routing
 metadata ONLY — never an executor, tool instance or authorization bypass.
 """
@@ -59,9 +59,9 @@ class TurnFacts:
 REASON_NO_CANDIDATE = "NO_CANDIDATE"
 REASON_RECALL_TIMEOUT = "RECALL_TIMEOUT"
 REASON_RECALL_UNAVAILABLE = "RECALL_UNAVAILABLE"
-REASON_JUDGE_REJECT = "JUDGE_REJECT"
-REASON_JUDGE_UNCERTAIN = "JUDGE_UNCERTAIN"
-REASON_JUDGE_TIMEOUT = "JUDGE_TIMEOUT"
+REASON_TOOL_INTENT_REJECT = "TOOL_INTENT_REJECT"
+REASON_TOOL_INTENT_UNCERTAIN = "TOOL_INTENT_UNCERTAIN"
+REASON_TOOL_INTENT_TIMEOUT = "TOOL_INTENT_TIMEOUT"
 REASON_REGISTRY_UNAVAILABLE = "REGISTRY_UNAVAILABLE"
 REASON_VERSION_MISMATCH = "REGISTRY_VERSION_MISMATCH"
 # P3: the capability's intent kind exists but its rollout gate is closed —
@@ -98,7 +98,7 @@ class Candidate:
     score: float
     matched_example: str = ""
     # which stage produced this candidate ("recall" | "matcher_ambiguous"); the
-    # Judge sees the union of Recall hits and Matcher-AMBIGUOUS escalations (8.1)
+    # ToolIntentModel sees the union of Recall hits and Matcher-AMBIGUOUS escalations (8.1)
     # and must know which ones carry a calibrated cosine score.
     origin: str = "recall"
 
@@ -110,21 +110,21 @@ class RecallResult:
     candidates: tuple[Candidate, ...] = ()
 
 
-# ── Node 3: Model A (adjudicate + extract, ONE call; P2 producer) ───────────────
+# ── Node 3: ToolIntentModel (select_and_extract + extract, ONE call; P2 producer) ───────────────
 
-JUDGE_CONFIDENT = "CONFIDENT"
-JUDGE_UNCERTAIN = "UNCERTAIN"
-JUDGE_REJECT = "REJECT"
+TOOL_INTENT_CONFIDENT = "CONFIDENT"
+TOOL_INTENT_UNCERTAIN = "UNCERTAIN"
+TOOL_INTENT_REJECT = "REJECT"
 
 
 @dataclass(frozen=True)
-class JudgeVerdict:
-    """Model A's single-call output: WHICH capability and the argument draft.
+class ToolIntentVerdict:
+    """ToolIntentModel's single-call output: WHICH capability and the argument draft.
     ``arguments`` is the raw extraction from the same reply — the Binder only
     normalizes/validates it; a backend without extraction power (stub) leaves it
     None and the turn exits BIND_MISSING."""
 
-    decision: str = JUDGE_UNCERTAIN
+    decision: str = TOOL_INTENT_UNCERTAIN
     capability_id: str | None = None
     rationale: str = field(default="", repr=False)
     arguments: dict | None = None

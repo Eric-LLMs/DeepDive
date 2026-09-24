@@ -988,8 +988,7 @@ class ChatFunnelEventModel(Base):
     matcher: Mapped[str | None] = mapped_column(String)
     recall_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     recall_top: Mapped[str | None] = mapped_column(String)
-    judge: Mapped[str | None] = mapped_column(String)
-    decision: Mapped[str | None] = mapped_column(String)
+    tool_intent: Mapped[str | None] = mapped_column(String)
     final_route: Mapped[str] = mapped_column(String, nullable=False, default="agent")
     fallback_reason: Mapped[str | None] = mapped_column(String)
     registry_version: Mapped[str | None] = mapped_column(String)  # content fingerprint

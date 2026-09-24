@@ -42,7 +42,7 @@ _FALLBACK_REASONS = {
     MATCH_AMBIGUOUS: "matcher_ambiguous",
 }
 _DEFAULT_FALLBACK = "matcher_miss"
-_WOULD_STAGE = "matcher"  # the node's own stage id; Judge/Decision arrive in P2
+_WOULD_STAGE = "matcher"  # the node's own stage id; ToolIntentModel arrives in P2
 
 _warned_on = False
 
@@ -110,7 +110,7 @@ def _agreement(res: MatchResult, view, l0_tool: str | None) -> str:
 
     ``match``/``mismatch`` compare tool bindings — a HIT whose capability binds
     the same tool L0 certified is agreement; a different tool is the disagreement
-    sample P2 promotion needs to adjudicate. The other three codes locate which
+    sample P2 promotion needs to select_and_extract. The other three codes locate which
     side abstained (both-miss turns are ``none``)."""
     if res.state != MATCH_HIT:
         return "l0_only" if l0_tool else "none"
@@ -125,5 +125,5 @@ def _agreement(res: MatchResult, view, l0_tool: str | None) -> str:
 
 def _confidence(res: MatchResult) -> str:
     """The deterministic Matcher is always sure of a table hit; a real
-    calibrated confidence arrives with the Judge (P2, 8.13's data-first plan)."""
+    calibrated confidence arrives with the ToolIntentModel (P2, 8.13's data-first plan)."""
     return "1.0" if res.state == MATCH_HIT else "0.0"

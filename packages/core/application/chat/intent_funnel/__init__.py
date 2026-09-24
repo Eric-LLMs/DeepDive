@@ -1,11 +1,11 @@
 """Intent Funnel — the independent, decoupled routing lane above the Agent.
 
 Design (docs/temp.md, "Chat 意图路由重构"), chain ruling 2026-09-24: one model
-hop per turn — Matcher HIT -> Model A, Matcher MISS/AMBIGUOUS -> Recall ->
-Model A (ONE call: capability selection + argument extraction from Candidate
+hop per turn — Matcher HIT -> ToolIntentModel, Matcher MISS/AMBIGUOUS -> Recall ->
+ToolIntentModel (ONE call: capability selection + argument extraction from Candidate
 Cards) -> Binder (normalize/validate) -> Shared Tool Runtime. Every failure
-exits to the Agent, byte-identical. Model A is a swappable provider
-(local primary, online fallback, stub) behind the judge/ ladder.
+exits to the Agent, byte-identical. ToolIntentModel is a swappable provider
+(local primary, online fallback, stub) behind the tool_intent/ ladder.
 
 Scope status: P0 moved the orchestration out of ``TurnOrchestrator`` (gate +
 legacy QIR cascade + argument binding, behavior byte-identical); P1 added the

@@ -3,7 +3,7 @@
 Pinning the P4 rulings:
 
 * 8.5: the console can dry-run ONE query through the WHOLE chain
-  (Registry → Matcher → Recall → Model A → Binder → Final Route)
+  (Registry → Matcher → Recall → ToolIntentModel → Binder → Final Route)
   with zero side effects — run_tool is not even on the preview object graph;
 * the preview is not gated by ``chat_funnel_enabled`` (the production gate
   gates PRODUCTION traffic; an admin console must be able to inspect the dark
@@ -95,17 +95,17 @@ def _open(monkeypatch, *, mode="off", private=False, funnel_on=True):
     monkeypatch.setattr(settings, "chat_action_fast_path_enabled", True)
     monkeypatch.setattr(settings, "chat_matcher_mode", mode)
     # certification lanes need real argument drafts: ride the online seam with
-    # the scripted Model A double (the stub's zero extraction power is pinned
+    # the scripted ToolIntentModel double (the stub's zero extraction power is pinned
     # in test_funnel_p2; here the ops plane is the subject)
-    monkeypatch.setattr(settings, "chat_judge_backend", "online")
-    monkeypatch.setattr(settings, "chat_judge_min_confidence", 0.75)
-    monkeypatch.setattr(settings, "chat_judge_online_model", "")
-    monkeypatch.setattr(settings, "chat_judge_timeout_seconds", 4.0)
+    monkeypatch.setattr(settings, "chat_tool_intent_backend", "online")
+    monkeypatch.setattr(settings, "chat_tool_intent_min_confidence", 0.75)
+    monkeypatch.setattr(settings, "chat_tool_intent_online_model", "")
+    monkeypatch.setattr(settings, "chat_tool_intent_timeout_seconds", 4.0)
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", 5.0)
     monkeypatch.setattr(settings, "chat_funnel_private_enabled", private)
 
 
-class _ScriptedModelA:
+class _ScriptedToolIntent:
     """Deterministic single-hop double: one card -> select it and quote-strip
     the name slot; a split card set -> the honest NONE."""
 
@@ -152,7 +152,7 @@ def _wire(monkeypatch, *, view, index=None, embedder=None, llm=None,
     return types.SimpleNamespace(
         session_factory=session_factory,
         embedder=lambda: (embedder or _Embedder()),
-        llm=llm if llm is not None else _ScriptedModelA(),
+        llm=llm if llm is not None else _ScriptedToolIntent(),
     )
 
 
@@ -172,9 +172,9 @@ async def test_preview_certifies_and_reports_the_whole_chain(monkeypatch):
     assert res["route"]["capability_id"] == "cap-a"
     assert res["route"]["tool"] == "create_folder"
     assert res["route"]["args"] == {"name": "季度报告"}
-    # single-hop chain: every certified lane exits through the Model A stage
+    # single-hop chain: every certified lane exits through the ToolIntentModel stage
     # (the old "matcher" direct-certification stage is deleted)
-    assert res["route"]["funnel_stage"] == "model_a"
+    assert res["route"]["funnel_stage"] == "tool_intent"
     assert res["route"]["funnel_kind"] == KIND_ACTION
 
 

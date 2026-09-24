@@ -119,24 +119,24 @@ class _Embedder:
         return [[1.0, 0.0] for _ in texts]
 
 
-def _open(monkeypatch, *, mode="on", private=False, judge="online"):
+def _open(monkeypatch, *, mode="on", private=False, backend="online"):
     from core.config import settings
 
     monkeypatch.setattr(settings, "chat_funnel_enabled", True)
     monkeypatch.setattr(settings, "chat_fast_paths_enabled", True)
     monkeypatch.setattr(settings, "chat_action_fast_path_enabled", True)
     monkeypatch.setattr(settings, "chat_matcher_mode", mode)
-    monkeypatch.setattr(settings, "chat_judge_backend", judge)
-    monkeypatch.setattr(settings, "chat_judge_local_url", "")
-    monkeypatch.setattr(settings, "chat_judge_min_confidence", 0.75)
-    monkeypatch.setattr(settings, "chat_judge_online_model", "")
-    monkeypatch.setattr(settings, "chat_judge_timeout_seconds", 5.0)
+    monkeypatch.setattr(settings, "chat_tool_intent_backend", backend)
+    monkeypatch.setattr(settings, "chat_tool_intent_local_url", "")
+    monkeypatch.setattr(settings, "chat_tool_intent_min_confidence", 0.75)
+    monkeypatch.setattr(settings, "chat_tool_intent_online_model", "")
+    monkeypatch.setattr(settings, "chat_tool_intent_timeout_seconds", 5.0)
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", 5.0)
     monkeypatch.setattr(settings, "chat_funnel_private_enabled", private)
 
 
-class _ScriptedModelA:
-    """Deterministic Model A double for the kind-gate lanes (the stub has no
+class _ScriptedToolIntent:
+    """Deterministic ToolIntentModel double for the kind-gate lanes (the stub has no
     extraction power by design, so certification tests ride the online seam):
     one card -> select it and quote-strip the name; a split card set -> NONE."""
 
@@ -168,7 +168,7 @@ def _wire(monkeypatch, *, view, llm=None):
         "core.application.chat.intent_funnel.recall.load_index", fake_load)
     return types.SimpleNamespace(session_factory=None,
                                  embedder=lambda: _Embedder(),
-                                 llm=llm if llm is not None else _ScriptedModelA())
+                                 llm=llm if llm is not None else _ScriptedToolIntent())
 
 
 async def test_closed_private_kind_exits_with_reason_byte_identical(monkeypatch, caplog):

@@ -1,7 +1,7 @@
 """Node 2 — Recall: query -> top-k candidates, evidence only, never adjudicates.
 
 Discipline (design §3 Node 2 + §8.17): cosine here is a QUALITY GATE (filter
-obvious garbage), the "which one" decision belongs to the Judge. The legacy
+obvious garbage), the "which one" decision belongs to the ToolIntentModel. The legacy
 QIR semantic layer mixed both roles — that entanglement is exactly what this
 node unbundles. The index is the Recall side of the Registry's Build-Then-Swap
 (§8.3): snapshot vectors are published in the SAME transaction as the registry

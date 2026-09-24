@@ -138,15 +138,21 @@ def test_reason_code_constants_avoid_bare_ambiguous():
 def test_contracts_are_frozen():
     for cls in (
         contract.MatchResult, contract.Candidate, contract.RecallResult,
-        contract.JudgeVerdict, contract.BoundArguments,
+        contract.ToolIntentVerdict, contract.BoundArguments,
         contract.IntentVerdict, contract.AgentFallback,
     ):
         assert cls.__dataclass_params__.frozen, cls.__name__
     # chain ruling 2026-09-24: the Decision node is gone from the contract, and
     # with it the second-hop recheck entry point.
     assert not hasattr(contract, "DecisionResult")
-    from core.application.chat.intent_funnel import judge
-    assert not hasattr(judge, "recheck")
+    from core.application.chat.intent_funnel import tool_intent
+    assert not hasattr(tool_intent, "recheck")
+    # naming ruling 2026-09-24: "Model A" was a placeholder and Judge/Decision
+    # were historical — the responsibility name (ToolIntentModel) is the ONLY
+    # vocabulary allowed in the contract and package namespaces.
+    bad = ("judge", "model_a", "modela", "decision")
+    assert not [n for n in dir(contract) if any(b in n.lower() for b in bad)]
+    assert not [n for n in dir(tool_intent) if any(b in n.lower() for b in bad)]
 
 
 async def test_orchestrator_calls_funnel_once_with_requirements(monkeypatch):

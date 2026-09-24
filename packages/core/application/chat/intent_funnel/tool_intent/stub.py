@@ -1,4 +1,4 @@
-"""Judge backend: deterministic margin rules over Recall candidates.
+"""Backend: deterministic margin rules over Recall candidates.
 
 The transition stub of the cost ladder (§3 Node 3, "重构过渡期先让漏斗转起来").
 It inherits the leader-vs-runner-up margin discipline the cosine corpus proved,
@@ -19,27 +19,32 @@ pinning the ladder at the deterministic end.
 """
 from __future__ import annotations
 
-from ..contract import JUDGE_CONFIDENT, JUDGE_REJECT, JUDGE_UNCERTAIN, JudgeVerdict
+from ..contract import (
+    TOOL_INTENT_CONFIDENT,
+    TOOL_INTENT_REJECT,
+    TOOL_INTENT_UNCERTAIN,
+    ToolIntentVerdict,
+)
 
 _TRUSTED = ("recall", "matcher_hit")
 
 
-def judge(candidates, *, margin: float) -> JudgeVerdict:
+def evaluate(candidates, *, margin: float) -> ToolIntentVerdict:
     if not candidates:
-        return JudgeVerdict(JUDGE_REJECT, None, "no candidates")
+        return ToolIntentVerdict(TOOL_INTENT_REJECT, None, "no candidates")
     ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
     head = ranked[0]
     if len(ranked) == 1:
         if head.origin not in _TRUSTED:
             # only a table-ambiguous candidate: no score to trust — escalate
-            return JudgeVerdict(JUDGE_UNCERTAIN, None, "matcher_ambiguous without scores")
-        return JudgeVerdict(JUDGE_CONFIDENT, head.capability_id,
+            return ToolIntentVerdict(TOOL_INTENT_UNCERTAIN, None, "matcher_ambiguous without scores")
+        return ToolIntentVerdict(TOOL_INTENT_CONFIDENT, head.capability_id,
                            "single trusted candidate")
     second = ranked[1]
     if head.origin in _TRUSTED and second.origin in _TRUSTED \
             and head.score - second.score >= margin:
-        return JudgeVerdict(
-            JUDGE_CONFIDENT, head.capability_id,
+        return ToolIntentVerdict(
+            TOOL_INTENT_CONFIDENT, head.capability_id,
             f"margin {head.score - second.score:.3f} >= {margin}",
         )
-    return JudgeVerdict(JUDGE_UNCERTAIN, None, "race too close / mixed provenance")
+    return ToolIntentVerdict(TOOL_INTENT_UNCERTAIN, None, "race too close / mixed provenance")

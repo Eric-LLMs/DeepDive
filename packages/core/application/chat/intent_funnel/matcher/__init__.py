@@ -7,7 +7,7 @@ research/handoff veto) live in the funnel common layer, not here — 8.1-a rulin
 
 Escalation discipline (8.1): no hit -> MISS (falls to Recall); one hit -> HIT;
 several capabilities hit -> MATCH_AMBIGUOUS carrying ALL candidate ids upward for
-Judge/Decision to adjudicate. The Matcher itself never picks.
+ToolIntentModel does selection+extraction. The Matcher itself never picks.
 
 P2+ promotion: with ``chat_matcher_mode=on`` (and the funnel gate) a single HIT
 certifies ACTION routing directly; the P1 shadow lane (8.15) still runs in the

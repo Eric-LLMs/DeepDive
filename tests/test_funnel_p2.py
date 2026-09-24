@@ -1,7 +1,7 @@
 """P2 — node-level tests + the single-hop cascade through funnel.route.
 
-Chain ruling 2026-09-24: Matcher HIT -> Model A (ONE call: select+extract);
-MISS/AMBIGUOUS -> Recall -> same Model A; Binder validates the draft; every
+Chain ruling 2026-09-24: Matcher HIT -> ToolIntentModel (ONE call: select+extract);
+MISS/AMBIGUOUS -> Recall -> same ToolIntentModel; Binder validates the draft; every
 failure exits to the Agent. No recheck hop, no Decision node in the active path.
 
 Discipline (ruling 2026-09-24, §8.17 pipeline doctrine): EVERY node section
@@ -27,13 +27,13 @@ from core.application.chat.intent_funnel.contract import (
     BIND_COMPLETE,
     BIND_INVALID,
     BIND_MISSING,
-    JUDGE_CONFIDENT,
-    JUDGE_REJECT,
-    JUDGE_UNCERTAIN,
+    TOOL_INTENT_CONFIDENT,
+    TOOL_INTENT_REJECT,
+    TOOL_INTENT_UNCERTAIN,
     MATCH_HIT,
     REASON_BIND_MISSING,
-    REASON_JUDGE_REJECT,
-    REASON_JUDGE_UNCERTAIN,
+    REASON_TOOL_INTENT_REJECT,
+    REASON_TOOL_INTENT_UNCERTAIN,
     REASON_NO_CANDIDATE,
     REASON_RECALL_TIMEOUT,
     REASON_RECALL_UNAVAILABLE,
@@ -42,7 +42,7 @@ from core.application.chat.intent_funnel.contract import (
     Candidate,
     TurnFacts,
 )
-from core.application.chat.intent_funnel.judge import base as jbase
+from core.application.chat.intent_funnel.tool_intent import base as jbase
 from core.application.chat.intent_funnel.registry import content_fingerprint
 from core.application.chat.intent_funnel.registry import entry as T
 from core.application.chat.understanding import (
@@ -68,7 +68,7 @@ def _entry(cid, *, tool="create_folder", patterns=(), aliases=(), arg_slots=None
     )
 
 
-# canonical-shaped schemas for the seeded tools (Model A argument targets)
+# canonical-shaped schemas for the seeded tools (ToolIntentModel argument targets)
 _NAME_SCHEMA = {"name": {"type": "string", "description": "folder name",
                          "required": True, "max_len": 120}}
 _TERM_SCHEMA = {
@@ -100,7 +100,7 @@ class _Embedder:
 class _LLM:
     """Replies are popped in order; an Exception member raises (transport fault).
     ``calls`` records the per-call channel kwargs (model/base_url/api_key/timeout/
-    temperature) so the online judge's explicit forwarding is assertable."""
+    temperature) so the online model's explicit forwarding is assertable."""
 
     def __init__(self, replies=()):
         self.replies = list(replies)
@@ -218,7 +218,7 @@ async def test_recall_scores_gate_truncate_and_never_adjudicates():
     assert ids == ["cap-a", "cap-b"]          # ranked, NOT margin-aborted
     assert res.candidates[0].matched_example == "做a"
     assert res.candidates[0].origin == "recall"
-    # near-ties survive: recall proposes, the Judge disposes (design §3)
+    # near-ties survive: recall proposes, the ToolIntentModel disposes (design §3)
 
 
 async def test_recall_blank_query_and_embedder_fault():
@@ -246,154 +246,154 @@ async def test_recall_refuses_vectors_without_examples():
     assert [c.score for c in res.candidates] == [1.0]  # orphan never scored
 
 
-# ═══════════════════════════════ judge: stub + ladder ═══════════════════════════
+# ═══════════════════════════════ tool_intent: stub + ladder ═══════════════════════════
 
 
 def test_stub_three_states():
-    from core.application.chat.intent_funnel.judge import stub
+    from core.application.chat.intent_funnel.tool_intent import stub
 
-    assert stub.judge((), margin=0.06).decision == JUDGE_REJECT
-    one = stub.judge((Candidate("cap-a", 0.91),), margin=0.06)
-    assert one.decision == JUDGE_CONFIDENT and one.capability_id == "cap-a"
-    m = stub.judge((Candidate("cap-a", 0.0, origin="matcher_ambiguous"),), margin=0.06)
-    assert m.decision == JUDGE_UNCERTAIN          # uncalibrated score: no cert
-    far = stub.judge((Candidate("cap-a", 0.90), Candidate("cap-b", 0.70)), margin=0.06)
-    assert far.decision == JUDGE_CONFIDENT and far.capability_id == "cap-a"
-    near = stub.judge((Candidate("cap-a", 0.90), Candidate("cap-b", 0.88)), margin=0.06)
-    assert near.decision == JUDGE_UNCERTAIN       # margin below floor: escalate up
+    assert stub.evaluate((), margin=0.06).decision == TOOL_INTENT_REJECT
+    one = stub.evaluate((Candidate("cap-a", 0.91),), margin=0.06)
+    assert one.decision == TOOL_INTENT_CONFIDENT and one.capability_id == "cap-a"
+    m = stub.evaluate((Candidate("cap-a", 0.0, origin="matcher_ambiguous"),), margin=0.06)
+    assert m.decision == TOOL_INTENT_UNCERTAIN          # uncalibrated score: no cert
+    far = stub.evaluate((Candidate("cap-a", 0.90), Candidate("cap-b", 0.70)), margin=0.06)
+    assert far.decision == TOOL_INTENT_CONFIDENT and far.capability_id == "cap-a"
+    near = stub.evaluate((Candidate("cap-a", 0.90), Candidate("cap-b", 0.88)), margin=0.06)
+    assert near.decision == TOOL_INTENT_UNCERTAIN       # margin below floor: escalate up
 
 
-async def test_judge_ladder_falls_through_and_sanitizes(monkeypatch):
-    from core.application.chat.intent_funnel import judge as judge_pkg
+async def test_tool_intent_ladder_falls_through_and_sanitizes(monkeypatch):
+    from core.application.chat.intent_funnel import tool_intent as ti_pkg
     from core.config import settings
 
-    monkeypatch.setattr(settings, "chat_judge_backend", "local")  # not deployed
-    monkeypatch.setattr(settings, "chat_judge_local_url", "")
+    monkeypatch.setattr(settings, "chat_tool_intent_backend", "local")  # not deployed
+    monkeypatch.setattr(settings, "chat_tool_intent_local_url", "")
 
     cands = (Candidate("cap-a", 0.9),)
-    out = await judge_pkg.adjudicate("q", cands, entries_by_id={}, llm=None)
+    out = await ti_pkg.select_and_extract("q", cands, entries_by_id={}, llm=None)
     # local unavailable -> fall through (NOT abstain); no llm -> online also down
-    assert out.decision == JUDGE_UNCERTAIN
+    assert out.decision == TOOL_INTENT_UNCERTAIN
 
-    monkeypatch.setattr(settings, "chat_judge_backend", "SHTUB")  # typo
-    out = await judge_pkg.adjudicate("q", cands, entries_by_id={}, llm=None)
-    assert out.decision == JUDGE_CONFIDENT  # unknown backend -> stub, single recall
+    monkeypatch.setattr(settings, "chat_tool_intent_backend", "SHTUB")  # typo
+    out = await ti_pkg.select_and_extract("q", cands, entries_by_id={}, llm=None)
+    assert out.decision == TOOL_INTENT_CONFIDENT  # unknown backend -> stub, single recall
 
 
-async def test_judge_reply_discipline(monkeypatch):
-    from core.application.chat.intent_funnel import judge as judge_pkg
+async def test_tool_intent_reply_discipline(monkeypatch):
+    from core.application.chat.intent_funnel import tool_intent as ti_pkg
     from core.config import settings
 
-    monkeypatch.setattr(settings, "chat_judge_min_confidence", 0.75)
+    monkeypatch.setattr(settings, "chat_tool_intent_min_confidence", 0.75)
     cands = (Candidate("cap-a", 0.9), Candidate("cap-b", 0.5))
 
-    v = judge_pkg._verdict_from_reply({"capability_id": "NONE"}, cands)
-    assert v.decision == JUDGE_REJECT and v.arguments is None
-    v = judge_pkg._verdict_from_reply({"capability_id": "cap-z", "confidence": 1.0}, cands)
-    assert v.decision == JUDGE_UNCERTAIN              # off-card is never a verdict
-    v = judge_pkg._verdict_from_reply({"capability_id": "cap-a", "confidence": 0.4}, cands)
-    assert v.decision == JUDGE_UNCERTAIN              # under the floor
-    v = judge_pkg._verdict_from_reply(
+    v = ti_pkg._verdict_from_reply({"capability_id": "NONE"}, cands)
+    assert v.decision == TOOL_INTENT_REJECT and v.arguments is None
+    v = ti_pkg._verdict_from_reply({"capability_id": "cap-z", "confidence": 1.0}, cands)
+    assert v.decision == TOOL_INTENT_UNCERTAIN              # off-card is never a verdict
+    v = ti_pkg._verdict_from_reply({"capability_id": "cap-a", "confidence": 0.4}, cands)
+    assert v.decision == TOOL_INTENT_UNCERTAIN              # under the floor
+    v = ti_pkg._verdict_from_reply(
         {"capability_id": "cap-a", "confidence": 0.9, "arguments": {"name": "x"}}, cands)
-    assert v.decision == JUDGE_CONFIDENT and v.capability_id == "cap-a"
-    assert v.arguments == {"name": "x"}               # Model A's draft rides along
+    assert v.decision == TOOL_INTENT_CONFIDENT and v.capability_id == "cap-a"
+    assert v.arguments == {"name": "x"}               # ToolIntentModel's draft rides along
     # a non-dict arguments field is dirty data, never a partial answer
-    v = judge_pkg._verdict_from_reply(
+    v = ti_pkg._verdict_from_reply(
         {"capability_id": "cap-a", "confidence": 0.9, "arguments": "name=x"}, cands)
-    assert v.decision == JUDGE_CONFIDENT and v.arguments is None
+    assert v.decision == TOOL_INTENT_CONFIDENT and v.arguments is None
 
 
-def test_judge_backends_raise_unavailable_not_answers():
-    from core.application.chat.intent_funnel.judge import local, online
+def test_tool_intent_backends_raise_unavailable_not_answers():
+    from core.application.chat.intent_funnel.tool_intent import local, online
 
     async def go():
-        with pytest.raises(jbase.JudgeUnavailable):
-            await local.judge("q", (), {}, url="")
-        with pytest.raises(jbase.JudgeUnavailable):
-            await online.judge("q", (), {}, llm=None)
-        with pytest.raises(jbase.JudgeUnavailable):
-            await online.judge("q", (), {}, llm=_LLM([RuntimeError("401")]))
+        with pytest.raises(jbase.ToolIntentUnavailable):
+            await local.model_reply("q", (), {}, url="")
+        with pytest.raises(jbase.ToolIntentUnavailable):
+            await online.model_reply("q", (), {}, llm=None)
+        with pytest.raises(jbase.ToolIntentUnavailable):
+            await online.model_reply("q", (), {}, llm=_LLM([RuntimeError("401")]))
     asyncio.run(go())
 
 
 # ── 8.17 real-backend wiring (2026-09-24 ruling: online first, dedicated
 #    small-model channel with explicit per-call forwarding) ──────────────────────
 
-async def test_judge_online_serves_and_forwards_dedicated_channel(monkeypatch):
-    from core.application.chat.intent_funnel import judge as judge_pkg
+async def test_tool_intent_online_serves_and_forwards_dedicated_channel(monkeypatch):
+    from core.application.chat.intent_funnel import tool_intent as ti_pkg
     from core.config import settings
 
-    monkeypatch.setattr(settings, "chat_judge_backend", "online")
-    monkeypatch.setattr(settings, "chat_judge_online_model", "tiny-judge")
-    monkeypatch.setattr(settings, "chat_judge_online_base_url", "https://cheap.example/v1")
-    monkeypatch.setattr(settings, "chat_judge_online_api_key", "sk-test")
+    monkeypatch.setattr(settings, "chat_tool_intent_backend", "online")
+    monkeypatch.setattr(settings, "chat_tool_intent_online_model", "tiny-model")
+    monkeypatch.setattr(settings, "chat_tool_intent_online_base_url", "https://cheap.example/v1")
+    monkeypatch.setattr(settings, "chat_tool_intent_online_api_key", "sk-test")
     llm = _LLM([{"capability_id": "cap-a", "confidence": 0.9, "arguments": {"name": "n"}}])
-    out = await judge_pkg.adjudicate(
+    out = await ti_pkg.select_and_extract(
         "新建文件夹", (Candidate("cap-a", 0.9),), entries_by_id={}, llm=llm)
-    assert out.decision == JUDGE_CONFIDENT and out.capability_id == "cap-a"
+    assert out.decision == TOOL_INTENT_CONFIDENT and out.capability_id == "cap-a"
     assert out.arguments == {"name": "n"}
     kw = llm.calls[0]
     assert kw == {
-        "model": "tiny-judge", "base_url": "https://cheap.example/v1",
-        "api_key": "sk-test", "timeout": settings.chat_judge_timeout_seconds,
+        "model": "tiny-model", "base_url": "https://cheap.example/v1",
+        "api_key": "sk-test", "timeout": settings.chat_tool_intent_timeout_seconds,
         "temperature": 0.0,
-        # Model A pins (judge call site, not the global knob): reasoning
+        # ToolIntentModel pins (per-call at the model call site, not the global knob): reasoning
         # explicitly off + output bound generous enough for the argument draft.
         "max_tokens": 256, "disable_thinking": True,
     }
 
 
-async def test_judge_online_model_without_endpoint_pair_rides_pinned_channel(monkeypatch):
+async def test_tool_intent_online_model_without_endpoint_pair_rides_pinned_channel(monkeypatch):
     """base_url/api_key are honored only as a PAIR: a half-configured dedicated
     endpoint is worse than riding the turn's pinned channel, so only the model
     name is forwarded."""
-    from core.application.chat.intent_funnel import judge as judge_pkg
+    from core.application.chat.intent_funnel import tool_intent as ti_pkg
     from core.config import settings
 
-    monkeypatch.setattr(settings, "chat_judge_backend", "online")
-    monkeypatch.setattr(settings, "chat_judge_online_model", "tiny-judge")
-    monkeypatch.setattr(settings, "chat_judge_online_base_url", "https://cheap.example/v1")
-    monkeypatch.setattr(settings, "chat_judge_online_api_key", "")
+    monkeypatch.setattr(settings, "chat_tool_intent_backend", "online")
+    monkeypatch.setattr(settings, "chat_tool_intent_online_model", "tiny-model")
+    monkeypatch.setattr(settings, "chat_tool_intent_online_base_url", "https://cheap.example/v1")
+    monkeypatch.setattr(settings, "chat_tool_intent_online_api_key", "")
     llm = _LLM([{"capability_id": "cap-a", "confidence": 0.9}])
-    out = await judge_pkg.adjudicate(
+    out = await ti_pkg.select_and_extract(
         "q", (Candidate("cap-a", 0.9),), entries_by_id={}, llm=llm)
-    assert out.decision == JUDGE_CONFIDENT
-    assert llm.calls[0].get("model") == "tiny-judge"
+    assert out.decision == TOOL_INTENT_CONFIDENT
+    assert llm.calls[0].get("model") == "tiny-model"
     assert "base_url" not in llm.calls[0] and "api_key" not in llm.calls[0]
 
 
-async def test_judge_auto_local_absent_falls_through_to_online(monkeypatch):
+async def test_tool_intent_auto_local_absent_falls_through_to_online(monkeypatch):
     """8.17 ladder: auto with nothing deployed = local skipped (fall-through,
     never abstain-to-Agent) and the online step really serves."""
-    from core.application.chat.intent_funnel import judge as judge_pkg
+    from core.application.chat.intent_funnel import tool_intent as ti_pkg
     from core.config import settings
 
-    monkeypatch.setattr(settings, "chat_judge_backend", "auto")
-    monkeypatch.setattr(settings, "chat_judge_local_url", "")
+    monkeypatch.setattr(settings, "chat_tool_intent_backend", "auto")
+    monkeypatch.setattr(settings, "chat_tool_intent_local_url", "")
     llm = _LLM([{"capability_id": "cap-a", "confidence": 0.95}])
-    out = await judge_pkg.adjudicate(
+    out = await ti_pkg.select_and_extract(
         "q", (Candidate("cap-a", 0.9),), entries_by_id={}, llm=llm)
-    assert out.decision == JUDGE_CONFIDENT and llm.prompts
+    assert out.decision == TOOL_INTENT_CONFIDENT and llm.prompts
 
 
-async def test_judge_auto_full_chain_local_unreachable_online_down_stub_serves(monkeypatch):
-    from core.application.chat.intent_funnel import judge as judge_pkg
+async def test_tool_intent_auto_full_chain_local_unreachable_online_down_stub_serves(monkeypatch):
+    from core.application.chat.intent_funnel import tool_intent as ti_pkg
     from core.config import settings
 
-    monkeypatch.setattr(settings, "chat_judge_backend", "auto")
-    # a dead port: transport fault -> JudgeUnavailable -> fall through
-    monkeypatch.setattr(settings, "chat_judge_local_url", "http://127.0.0.1:9/v1")
-    out = await judge_pkg.adjudicate(
+    monkeypatch.setattr(settings, "chat_tool_intent_backend", "auto")
+    # a dead port: transport fault -> ToolIntentUnavailable -> fall through
+    monkeypatch.setattr(settings, "chat_tool_intent_local_url", "http://127.0.0.1:9/v1")
+    out = await ti_pkg.select_and_extract(
         "q", (Candidate("cap-a", 0.9),), entries_by_id={}, llm=None)
     # local down + online (no llm) down -> the deterministic stub serves
-    assert out.decision == JUDGE_CONFIDENT and out.capability_id == "cap-a"
+    assert out.decision == TOOL_INTENT_CONFIDENT and out.capability_id == "cap-a"
     # the stub has NO extraction power: the draft stays None (honest, documented)
     assert out.arguments is None
 
 
-def test_local_judge_speaks_openai_wire_or_raises_unavailable(monkeypatch):
+def test_local_model_speaks_openai_wire_or_raises_unavailable(monkeypatch):
     import httpx
-    from core.application.chat.intent_funnel.judge import local as local_mod
+    from core.application.chat.intent_funnel.tool_intent import local as local_mod
 
     seen: dict = {}
 
@@ -431,34 +431,41 @@ def test_local_judge_speaks_openai_wire_or_raises_unavailable(monkeypatch):
     async def go():
         monkeypatch.setattr(local_mod.httpx, "AsyncClient",
                             lambda **kw: _Client(_Resp(200, ok_body)))
-        data = await local_mod.judge("q", (), {}, url="http://j/v1/")
+        data = await local_mod.model_reply("q", (), {}, url="http://j/v1/")
         assert data == {"capability_id": "cap-a", "confidence": 0.88,
                         "arguments": {"name": "报告"}}
         assert seen["url"] == "http://j/v1/chat/completions"     # base + wire
         assert seen["payload"]["messages"][0]["role"] == "system"
         assert seen["payload"]["temperature"] == 0.0
-        assert "model" not in seen["payload"]                    # no name -> server default
-        # provider swap: the model NAME comes from config only (compose sets both)
+        # provider config: the DEPLOYED default is Qwen3-0.6B at Q4_K_M (the
+        # quantization rides the Ollama tag); it appears in config/compose ONLY.
         from core.config import settings
-        monkeypatch.setattr(settings, "chat_judge_local_model", "qwen-test:0.6b")
-        await local_mod.judge("q", (), {}, url="http://j/v1")
+        assert settings.chat_tool_intent_local_model == "qwen3:0.6b-q4_K_M"
+        assert seen["payload"]["model"] == "qwen3:0.6b-q4_K_M"
+        # an explicit "" falls back to the server's own default model
+        monkeypatch.setattr(settings, "chat_tool_intent_local_model", "")
+        await local_mod.model_reply("q", (), {}, url="http://j/v1")
+        assert "model" not in seen["payload"]
+        # provider swap: the model NAME comes from config only (compose sets both)
+        monkeypatch.setattr(settings, "chat_tool_intent_local_model", "qwen-test:0.6b")
+        await local_mod.model_reply("q", (), {}, url="http://j/v1")
         assert seen["payload"]["model"] == "qwen-test:0.6b"
         monkeypatch.setattr(local_mod.httpx, "AsyncClient",
                             lambda **kw: _Client(_Resp(503, {})))
-        with pytest.raises(jbase.JudgeUnavailable):
-            await local_mod.judge("q", (), {}, url="http://j/v1")
+        with pytest.raises(jbase.ToolIntentUnavailable):
+            await local_mod.model_reply("q", (), {}, url="http://j/v1")
         # a 200 whose message is not JSON is UNAVAILABLE, never a verdict
         monkeypatch.setattr(local_mod.httpx, "AsyncClient", lambda **kw: _Client(
             _Resp(200, {"choices": [{"message": {"content": "no json here"}}]})))
-        with pytest.raises(jbase.JudgeUnavailable):
-            await local_mod.judge("q", (), {}, url="http://j/v1")
+        with pytest.raises(jbase.ToolIntentUnavailable):
+            await local_mod.model_reply("q", (), {}, url="http://j/v1")
     asyncio.run(go())
 
 
-# ═══════════════════════ Model A prompt: full Candidate Card assembly ═══════════
+# ═══════════════════════ ToolIntentModel prompt: full Candidate Card assembly ═══════════
 
 
-def test_model_a_card_carries_tool_schema_score_and_origin():
+def test_tool_intent_card_carries_tool_schema_score_and_origin():
     entry = _entry("cap-a", examples=("建个目录",), parameters=_NAME_SCHEMA)
     cands = (Candidate("cap-a", 0.676, matched_example="建个目录", origin="recall"),)
     facts = TurnFacts(has_attachment=True, viewer_asset_id="a-7")
@@ -512,7 +519,7 @@ def test_binder_negation_is_missing_not_answer():
     assert binder.bind(entry, '不要新建文件夹"x"', _ctx("")).state == BIND_MISSING
 
 
-# ── validate-only gate over Model A's draft (chain ruling 2026-09-24) ────────────
+# ── validate-only gate over ToolIntentModel's draft (chain ruling 2026-09-24) ────────────
 
 
 def test_binder_validate_normalizes_against_registry_schema():
@@ -544,15 +551,15 @@ def test_binder_validate_normalizes_against_registry_schema():
 # ═══════════════════════════════ cascade via route() ═══════════════════════════
 
 
-def _open(monkeypatch, *, mode="off", timeout=5.0, judge="online"):
+def _open(monkeypatch, *, mode="off", timeout=5.0, backend="online"):
     from core.config import settings
 
     monkeypatch.setattr(settings, "chat_funnel_enabled", True)
     monkeypatch.setattr(settings, "chat_fast_paths_enabled", True)
     monkeypatch.setattr(settings, "chat_action_fast_path_enabled", True)
     monkeypatch.setattr(settings, "chat_matcher_mode", mode)
-    monkeypatch.setattr(settings, "chat_judge_backend", judge)
-    monkeypatch.setattr(settings, "chat_judge_timeout_seconds", timeout + 1)
+    monkeypatch.setattr(settings, "chat_tool_intent_backend", backend)
+    monkeypatch.setattr(settings, "chat_tool_intent_timeout_seconds", timeout + 1)
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", timeout)
 
 
@@ -647,7 +654,7 @@ async def test_index_unavailable_and_no_candidate(monkeypatch, caplog):
 
 
 async def test_matcher_hit_single_hop_certifies(monkeypatch, caplog):
-    """HIT enters Model A with the same semantics as the Recall lane: ONE
+    """HIT enters ToolIntentModel with the same semantics as the Recall lane: ONE
     model call (select + extract), Binder validates, no second hop."""
     _open(monkeypatch)
     llm = _LLM([{"capability_id": "cap-a", "confidence": 0.95,
@@ -665,26 +672,26 @@ async def test_matcher_hit_single_hop_certifies(monkeypatch, caplog):
     assert act["capability_id"] == "cap-a"
     assert act["registry_version"] == "idx-9"          # executor TOCTOU namespace
     assert act["funnel_registry_version"] == view.fingerprint
-    assert act["funnel_stage"] == "model_a"
+    assert act["funnel_stage"] == "tool_intent"
     assert out.needs_action is Signal.HIGH and out.complexity is Complexity.LOW
-    assert len(llm.prompts) == 1                       # AT MOST one Model A call
+    assert len(llm.prompts) == 1                       # AT MOST one ToolIntentModel call
     assert "origin=matcher_hit" in llm.prompts[0]      # HIT provenance on the Card
     assert "matched_example" in llm.prompts[0]
     line = next(r.getMessage() for r in caplog.records if "funnel_trace" in r.getMessage())
     assert "final_route=action" in line and "fallback_reason=-" in line
-    assert "judge=CONFIDENT:cap-a" in line and "decision=-" in line
+    assert "tool_intent=CONFIDENT:cap-a" in line
 
 
 async def test_matcher_mode_on_still_spends_the_one_model_call(monkeypatch):
     """The direct-certification special path is DELETED: a HIT is not an
-    execution permit — Model A still adjudicates and extracts."""
+    execution permit — ToolIntentModel still adjudicates and extracts."""
     _open(monkeypatch, mode="on")
     llm = _LLM([{"capability_id": "cap-a", "confidence": 0.95,
                  "arguments": {"name": "季度报告"}}])
     _, deps = _wire(monkeypatch, view=_view(CAP), index=_index([]),
                     embedder=_Embedder([1.0, 0.0]), llm=llm)
     out = await funnel.route(_ctx(MSG), deps=deps, requirements=_req())
-    assert out.requested_action["funnel_stage"] == "model_a"
+    assert out.requested_action["funnel_stage"] == "tool_intent"
     assert out.requested_action["args"] == {"name": "季度报告"}
     assert len(llm.prompts) == 1
 
@@ -699,7 +706,7 @@ async def test_recall_lane_single_hop_certifies(monkeypatch):
     _, deps = _wire(monkeypatch, view=view, index=idx,
                     embedder=_Embedder([1.0, 0.0]), llm=llm)
     out = await funnel.route(_ctx(MSG), deps=deps, requirements=_req())
-    assert out.requested_action["funnel_stage"] == "model_a"
+    assert out.requested_action["funnel_stage"] == "tool_intent"
     assert out.requested_action["args"] == {"name": "季度报告"}
     assert len(llm.prompts) == 1
     assert "origin=recall" in llm.prompts[0]
@@ -708,7 +715,7 @@ async def test_recall_lane_single_hop_certifies(monkeypatch):
 async def test_stub_confident_without_extraction_exits_bind_missing(monkeypatch, caplog):
     """Honest consequence of the stub having no extraction power: CONFIDENT
     verdict + None draft -> validate MISSING -> straight to the Agent."""
-    _open(monkeypatch, judge="stub")
+    _open(monkeypatch, backend="stub")
     idx = _index([("cap-a", [MSG], [[1.0, 0.0]])])
     _, deps = _wire(monkeypatch, view=_view(CAP), index=idx,
                     embedder=_Embedder([1.0, 0.0]), llm=_LLM())
@@ -734,10 +741,10 @@ async def test_below_floor_verdict_returns_original(monkeypatch, caplog):
         out = await funnel.route(_ctx("整理一下笔记好吗"), deps=deps, requirements=req)
     assert out is req
     line = next(r.getMessage() for r in caplog.records if "funnel_trace" in r.getMessage())
-    assert f"fallback_reason={REASON_JUDGE_UNCERTAIN}" in line
+    assert f"fallback_reason={REASON_TOOL_INTENT_UNCERTAIN}" in line
 
 
-async def test_model_a_reject_exits_judge_reject(monkeypatch, caplog):
+async def test_tool_intent_reject_exits_tool_intent_reject(monkeypatch, caplog):
     _open(monkeypatch)
     idx = _index([("cap-a", [MSG], [[1.0, 0.0]])])
     llm = _LLM([{"capability_id": "NONE"}])
@@ -748,7 +755,7 @@ async def test_model_a_reject_exits_judge_reject(monkeypatch, caplog):
         out = await funnel.route(_ctx(MSG), deps=deps, requirements=req)
     assert out is req                                   # Agent keeps the turn
     line = next(r.getMessage() for r in caplog.records if "funnel_trace" in r.getMessage())
-    assert f"fallback_reason={REASON_JUDGE_REJECT}" in line
+    assert f"fallback_reason={REASON_TOOL_INTENT_REJECT}" in line
 
 
 async def test_verdict_not_in_active_table_is_version_mismatch(monkeypatch, caplog):
@@ -781,7 +788,7 @@ async def test_confident_but_unextractable_exits_bind_missing_no_second_hop(
     assert out is req                       # Agent owns the clarification (8.7)
     line = next(r.getMessage() for r in caplog.records if "funnel_trace" in r.getMessage())
     assert f"fallback_reason={REASON_BIND_MISSING}" in line
-    assert "judge=CONFIDENT:cap-a" in line and "recheck" not in line
+    assert "tool_intent=CONFIDENT:cap-a" in line and "recheck" not in line
     assert len(llm.prompts) == 1            # no second model hop was spent
 
 

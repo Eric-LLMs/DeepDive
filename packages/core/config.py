@@ -142,8 +142,8 @@ class Settings(BaseSettings):
     #           behaves as shadow with a warning: a mis-set switch must never
     #           silently hand routing to a node that only ever measured in the dark.
     chat_matcher_mode: str = "off"
-    # ── Intent Funnel (P2 target architecture, docs/temp.md §3/§8): the four-node ──
-    # cascade Matcher→Recall→Judge→Decision→Binder with escalate-only-upward and
+    # ── Intent Funnel (P2 target architecture, docs/temp.md §3/§8): the single-hop ──
+    # chain Matcher→Recall→ToolIntentModel(select+extract)→Binder(verify-only) with
     # fail-open Agent fallback. Dark launch: chat_funnel_enabled=False keeps the
     # legacy path byte-identical; the knobs below are INDEPENDENT of chat_qir_*
     # (the legacy cascade) on purpose — the new chain is tuned on its own merits.
@@ -151,30 +151,32 @@ class Settings(BaseSettings):
     chat_funnel_timeout_seconds: float = 5.0     # whole-cascade wall clock, then Agent
     chat_funnel_top_k: int = 3                   # Recall candidate width
     chat_funnel_min_score: float = 0.82          # Recall quality gate (no adjudication here)
-    chat_funnel_margin: float = 0.06             # Judge(stub) leader-vs-runner-up margin
-    # Judge/Model-A backend ladder (8.17 + 2026-09-24 chain ruling):
-    # "stub" | "local" | "online" | "auto" (local→online→stub). Model A is a
+    chat_funnel_margin: float = 0.06             # ToolIntentModel(stub) leader-vs-runner-up margin
+    # ToolIntentModel backend ladder (8.17 + 2026-09-24 chain ruling):
+    # "stub" | "local" | "online" | "auto" (local→online→stub). ToolIntentModel is a
     # swappable PROVIDER: the funnel only speaks the OpenAI-compatible card
-    # contract in judge/base.py — no model name or inference backend appears
+    # contract in tool_intent/base.py — no model name or inference backend appears
     # in Matcher/Recall/Binder/Runtime business logic.
-    chat_judge_backend: str = "stub"
-    chat_judge_min_confidence: float = 0.75      # model verdicts below this escalate
-    # Local Model A = the Docker ``model-a`` service (Ollama today, replaceable).
-    # chat_judge_local_url is an OpenAI-compatible BASE (e.g.
-    # http://model-a:11434/v1); "" keeps the honest
-    # "not deployed -> JudgeUnavailable -> fall through the ladder" semantics.
-    chat_judge_local_url: str = ""               # deployed local judge endpoint ("" = none)
-    # Model A provider model name, forwarded when set — the NAME (e.g. the
-    # current default qwen3:0.6b) lives in config/compose only.
-    chat_judge_local_model: str = ""
-    # Online judge rides a DEDICATED small-model channel (8.17 "小模型层"), explicit
+    chat_tool_intent_backend: str = "stub"
+    chat_tool_intent_min_confidence: float = 0.75      # model verdicts below this escalate
+    # Local ToolIntentModel = the Docker ``tool-intent`` service (Ollama today,
+    # replaceable). chat_tool_intent_local_url is an OpenAI-compatible BASE
+    # (e.g. http://tool-intent:11434/v1); "" keeps the honest
+    # "not deployed -> ToolIntentUnavailable -> fall through the ladder" semantics.
+    chat_tool_intent_local_url: str = ""               # deployed local tool-intent model endpoint ("" = none)
+    # Provider config (NOT business logic): which concrete model the local
+    # service serves. Current default = Qwen3-0.6B at Q4_K_M — Ollama encodes
+    # the quantization in the tag; swap provider/model via this key +
+    # TOOL_INTENT_OLLAMA_MODEL (compose), never by touching the chain.
+    chat_tool_intent_local_model: str = "qwen3:0.6b-q4_K_M"
+    # Online model rides a DEDICATED small-model channel (8.17 "小模型层"), explicit
     # per-call forwarding like the session-summary seam; "" model = ride the pinned
     # turn channel (legacy behavior), base_url+api_key must be set together to pin
     # a dedicated endpoint, else only the model name is forwarded.
-    chat_judge_online_model: str = ""
-    chat_judge_online_base_url: str = ""
-    chat_judge_online_api_key: str = ""
-    chat_judge_timeout_seconds: float = 4.0      # per-call guardrail inside the 5s cascade
+    chat_tool_intent_online_model: str = ""
+    chat_tool_intent_online_base_url: str = ""
+    chat_tool_intent_online_api_key: str = ""
+    chat_tool_intent_timeout_seconds: float = 4.0      # per-call guardrail inside the 5s cascade
     # P3 per-kind rollout gates (docs/temp.md §6-P3, 逐开关灰度): ACTION rides the
     # master funnel gate + chat_action_fast_path_enabled; widened kinds each need
     # their own switch, default OFF — registering a capability never routes it.

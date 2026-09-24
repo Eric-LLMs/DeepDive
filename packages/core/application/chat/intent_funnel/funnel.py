@@ -5,7 +5,7 @@ orchestrator unchanged; P1 added the Registry Matcher's shadow hook. The
 2026-09-24 chain correction pins the ACTIVE target chain to one hop:
 
     Matcher HIT  ─┐
-                  ├→ Model A (ONE call: select + extract) → Binder (validate) → Execute
+                  ├→ ToolIntentModel (ONE call: select + extract) → Binder (validate) → Execute
     MISS/AMB → Recall ─┘
 
 every non-COMPLETE outcome exits to the Agent (8.10). The recheck second hop
@@ -31,8 +31,6 @@ from core.config import settings
 
 from . import shadow
 from .contract import (
-    JUDGE_CONFIDENT,
-    JUDGE_REJECT,
     MATCH_AMBIGUOUS,
     MATCH_HIT,
     MATCH_MISS,
@@ -41,15 +39,17 @@ from .contract import (
     REASON_BIND_MISSING,
     REASON_CASCADE_ERROR,
     REASON_CASCADE_TIMEOUT,
-    REASON_JUDGE_REJECT,
-    REASON_JUDGE_TIMEOUT,
-    REASON_JUDGE_UNCERTAIN,
     REASON_KIND_DISABLED,
     REASON_NO_CANDIDATE,
     REASON_RECALL_TIMEOUT,
     REASON_RECALL_UNAVAILABLE,
     REASON_REGISTRY_UNAVAILABLE,
+    REASON_TOOL_INTENT_REJECT,
+    REASON_TOOL_INTENT_TIMEOUT,
+    REASON_TOOL_INTENT_UNCERTAIN,
     REASON_VERSION_MISMATCH,
+    TOOL_INTENT_CONFIDENT,
+    TOOL_INTENT_REJECT,
     BoundArguments,
     Candidate,
     IntentVerdict,
@@ -206,19 +206,19 @@ async def run_intent_stage(ctx, deps, requirements: TurnRequirements) -> TurnReq
             private_only=requirements.private_only,
             external_ok=requirements.external_ok,
         )
-    except Exception as exc:  # noqa: BLE001 - fail-open, contract-pinned by tests
+    except Exception as exc:
         logger.info("qir stage fail-open: %r", exc)
         return requirements
 
 
-# ── Active chain: Matcher → (Recall) → Model A → Binder(validate) → (Agent) ──────
+# ── Active chain: Matcher → (Recall) → ToolIntentModel → Binder(validate) → (Agent) ──────
 
 def _stage_reason(stage: str, *, timed_out: bool) -> str:
     """8.10 reason code for the exit point the cascade died at."""
     if timed_out:
         return {
             "recall": REASON_RECALL_TIMEOUT,
-            "model_a": REASON_JUDGE_TIMEOUT,  # the ONE model hop owns the budget
+            "tool_intent": REASON_TOOL_INTENT_TIMEOUT,  # the ONE model hop owns the budget
         }.get(stage, REASON_CASCADE_TIMEOUT)
     return {
         "registry": REASON_REGISTRY_UNAVAILABLE,
@@ -230,10 +230,10 @@ def _new_trace() -> dict:
     """The shared per-run trace record: production routing and the 8.5 query
     preview fill the SAME fields — one observability shape (8.12), one event
     row shape, so a preview can be diffed against real traffic line for line.
-    ``decision`` is a retired column kept at "-" for schema stability (the
-    Decision node was deleted by the 2026-09-24 chain ruling)."""
+    The retired Decision node's ``decision`` field was dropped outright
+    (migration 0008) — trace lines and event rows carry no historical name."""
     return {"stage": "registry", "matcher": "-", "recall_count": 0,
-            "recall_top": "-", "judge": "-", "decision": "-",
+            "recall_top": "-", "tool_intent": "-",
             "final_route": "agent", "fallback": "-", "registry": "-",
             "index": "-", "capability": None, "total_ms": 0}
 
@@ -254,7 +254,7 @@ async def _run_cascade(ctx, deps, requirements: TurnRequirements,
         )
     except asyncio.TimeoutError:
         out, trace["fallback"] = None, _stage_reason(trace["stage"], timed_out=True)
-    except Exception as exc:  # noqa: BLE001 - fail-open by contract, never sinks the turn
+    except Exception as exc:
         out = None
         trace["fallback"] = _stage_reason(trace["stage"], timed_out=False)
         logger.info("funnel fail-open at %s: %r", trace["stage"], exc)
@@ -270,10 +270,10 @@ async def _run_cascade(ctx, deps, requirements: TurnRequirements,
 def _log_trace(trace: dict) -> None:
     logger.info(
         "funnel_trace deepest_stage=%s matcher=%s recall_count=%d recall_top=%s "
-        "judge=%s decision=%s final_route=%s fallback_reason=%s "
+        "tool_intent=%s final_route=%s fallback_reason=%s "
         "registry_version=%s index_version=%s total_ms=%d",
         trace["stage"], trace["matcher"], trace["recall_count"], trace["recall_top"],
-        trace["judge"], trace["decision"], trace["final_route"], trace["fallback"],
+        trace["tool_intent"], trace["final_route"], trace["fallback"],
         trace["registry"], trace["index"], trace["total_ms"],
     )
 
@@ -300,13 +300,13 @@ async def _persist_event(deps, ctx, trace: dict) -> None:
                 session_id=str(getattr(ctx, "session_id", "") or "") or None,
                 deepest_stage=trace["stage"], matcher=trace["matcher"],
                 recall_count=trace["recall_count"], recall_top=trace["recall_top"],
-                judge=trace["judge"], decision=trace["decision"],
+                tool_intent=trace["tool_intent"],
                 final_route=trace["final_route"], fallback_reason=trace["fallback"],
                 registry_version=trace["registry"], index_version=trace["index"],
                 capability_id=trace["capability"], total_ms=trace["total_ms"],
             ))
             await session.commit()
-    except Exception as exc:  # noqa: BLE001 - telemetry never sinks a turn
+    except Exception as exc:
         logger.info("funnel event persist skipped: %r", exc)
 
 
@@ -337,7 +337,7 @@ def _preview_ctx(message: str):
 
 async def preview(message: str, *, deps) -> dict:
     """§8.5: run the ACTIVE (Registry, Index) pair end to end for one query —
-    Registry → Matcher → (Recall) → Model A → Binder → Final Route —
+    Registry → Matcher → (Recall) → ToolIntentModel → Binder → Final Route —
     and return the trace as a verdict, executing nothing. Side-effect-free by
     construction: the chain only produces routing metadata (8.8), run_tool is
     not even on this object graph, and conversation state is never touched.
@@ -365,7 +365,7 @@ async def preview(message: str, *, deps) -> dict:
     result = {
         "deepest_stage": trace["stage"], "matcher": trace["matcher"],
         "recall_count": trace["recall_count"], "recall_top": trace["recall_top"],
-        "judge": trace["judge"], "decision": trace["decision"],
+        "tool_intent": trace["tool_intent"],
         "final_route": trace["final_route"], "fallback_reason": trace["fallback"],
         "registry_version": trace["registry"], "index_version": trace["index"],
         "total_ms": trace["total_ms"], "execution_mode": "preview",
@@ -384,9 +384,9 @@ async def _run_nodes(ctx, deps, requirements, trace):
     setting trace['fallback'] — the caller converts None into the original
     object. Raises only for faults, which the caller maps by trace['stage']."""
     from . import binder, guardrails, matcher, recall
-    from .judge import adjudicate as model_a
     from .registry import active_view as registry_active_view
     from .registry.entry import STATUS_ACTIVE
+    from .tool_intent import select_and_extract as tool_intent
 
     message = ctx.body.message or ""
     facts = TurnFacts.of(ctx)
@@ -418,7 +418,7 @@ async def _run_nodes(ctx, deps, requirements, trace):
         mres = matcher.MatchResult(state=MATCH_MISS, registry_version=mres.registry_version)
     trace["matcher"] = f"{mres.state}:{mres.capability_id or mres.candidates or '-'}"
 
-    # ── One candidate set, ONE convergence point: a HIT enters Model A with the ─
+    # ── One candidate set, ONE convergence point: a HIT enters ToolIntentModel with the ─
     # same semantics as a Recall lane — the direct-certification special path is
     # deleted (chain ruling 2026-09-24). Recall runs only when the table missed.
     candidates: dict[str, Candidate] = {}
@@ -446,15 +446,15 @@ async def _run_nodes(ctx, deps, requirements, trace):
         trace["fallback"] = REASON_NO_CANDIDATE
         return None
 
-    # ── Node 2: Model A — the ONE model call of the turn (select + extract) ────
-    trace["stage"] = "model_a"
-    jv = await model_a(message, cands, entries_by_id=entries_by_id,
+    # ── Node 2: ToolIntentModel — the ONE model call of the turn (select + extract) ────
+    trace["stage"] = "tool_intent"
+    jv = await tool_intent(message, cands, entries_by_id=entries_by_id,
                        llm=deps.llm, facts=facts)
-    trace["judge"] = f"{jv.decision}:{jv.capability_id or '-'}"
-    if jv.decision != JUDGE_CONFIDENT:
+    trace["tool_intent"] = f"{jv.decision}:{jv.capability_id or '-'}"
+    if jv.decision != TOOL_INTENT_CONFIDENT:
         trace["fallback"] = (
-            REASON_JUDGE_REJECT if jv.decision == JUDGE_REJECT
-            else REASON_JUDGE_UNCERTAIN
+            REASON_TOOL_INTENT_REJECT if jv.decision == TOOL_INTENT_REJECT
+            else REASON_TOOL_INTENT_UNCERTAIN
         )
         return None
 
@@ -477,7 +477,7 @@ async def _run_nodes(ctx, deps, requirements, trace):
         return None
     trace["stage"] = "certified"
     return _certified(requirements, entry, bound.args, index.version, view.fingerprint,
-                      stage="model_a")
+                      stage="tool_intent")
 
 
 def _certified(requirements, entry, args, index_version, registry_fp, *,

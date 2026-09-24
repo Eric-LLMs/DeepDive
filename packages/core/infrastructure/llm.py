@@ -168,9 +168,9 @@ class OpenAILLM:
         schema-validated JSON output. Interactive chat paths are untouched.
 
         ``max_tokens`` bounds the output length for callers whose reply shape is
-        known small (judge verdicts); ``disable_thinking`` makes the thinking-off
+        known small (tool-intent verdicts); ``disable_thinking`` makes the thinking-off
         request EXPLICIT at that call site instead of riding the global knob —
-        the two judge experiments (2026-09-24) pin both per-call.
+        the 2026-09-24 experiments pin both per-call.
 
         When ``usage_out`` is given, the provider's real token counts are merged into
         it (``stream_options.include_usage``): the usage chunk arrives last, with no
@@ -178,7 +178,7 @@ class OpenAILLM:
         """
         kwargs: dict = {
             "model": mdl, "messages": messages, "stream": True,
-            # None keeps the historical 0.3; per-call overrides (judge) ask for 0.0.
+            # None keeps the historical 0.3; per-call overrides (ToolIntentModel) ask for 0.0.
             "temperature": 0.3 if temperature is None else temperature,
         }
         if max_tokens is not None:
@@ -246,7 +246,7 @@ class OpenAILLM:
         full-context generations (toolkit); under the streaming wire it is an idle-between-
         chunks deadline, not a total-generation cutoff. ``images`` (data-URL list) makes
         the user turn multimodal — used by the deck visual-understanding pass.
-        ``max_tokens``/``disable_thinking`` are pinned per-call by the funnel judge
+        ``max_tokens``/``disable_thinking`` are pinned per-call by the funnel ToolIntentModel
         (2026-09-24 latency experiments); every other caller keeps the old behavior.
         """
         client, mdl = self._call_channel(model, base_url, api_key, timeout=timeout)

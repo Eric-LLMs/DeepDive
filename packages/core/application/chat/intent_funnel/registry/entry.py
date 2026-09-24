@@ -56,7 +56,7 @@ class CapabilityEntry:
     # embedded on its own; they all map back to this one capability_id.
     standard_example: str = ""
     synonym_examples: tuple[str, ...] = ()
-    # CANONICAL parameter schema — the Model A Candidate Card assembles from
+    # CANONICAL parameter schema — the ToolIntentModel Candidate Card assembles from
     # HERE, never from the runtime's DIRECT_TOOLS compat layer. Shape:
     # {name: {"type": str, "description": str, "required": bool, "max_len": int?}}
     parameters: dict[str, Any] = field(default_factory=dict)

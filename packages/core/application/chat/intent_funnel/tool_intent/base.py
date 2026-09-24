@@ -1,6 +1,6 @@
-"""Shared Model A plumbing: the unavailable signal and the Card payload.
+"""Shared ToolIntentModel plumbing: the unavailable signal and the Card payload.
 
-Model A contract (chain ruling 2026-09-24): ONE call per turn does BOTH
+ToolIntentModel contract (chain ruling 2026-09-24): ONE call per turn does BOTH
 decisions — which capability the sentence demands, and the argument draft for
 it. Input discipline (8.17 #2/#3): query + TurnFacts + candidate Cards, each
 Card assembled from the Registry row by capability_id: tool binding, tool
@@ -10,12 +10,12 @@ history — and the reply is only {capability_id, confidence, arguments}.
 
 Every failure mode of the answer side is an exit to the Agent: "NONE" ->
 REJECT, an off-card id or a below-floor confidence -> UNCERTAIN, a malformed
-reply -> backend-unavailable. Model A never fabricates.
+reply -> backend-unavailable. ToolIntentModel never fabricates.
 """
 from __future__ import annotations
 
 
-class JudgeUnavailable(Exception):
+class ToolIntentUnavailable(Exception):
     """This backend cannot serve (not deployed / transport down) — fall through."""
 
 
@@ -85,10 +85,11 @@ def build_prompt(query: str, candidates, entries_by_id: dict, *, facts=None) -> 
 SYSTEM = (
     "You are a capability router and argument extractor. From the given "
     "candidates pick exactly ONE the user sentence demands; if unsure, or the "
-    "sentence negates the action, choose NONE and null arguments. For the "
-    "chosen capability, fill every REQUIRED parameter from the sentence and "
-    "turn facts; use the exact value with quotes removed; never invent values "
-    "a slot cannot be answered with — omit it instead. "
+    "sentence negates the action, choose NONE and null arguments. "
+    "capability_id must be the card heading after '###' verbatim, never the "
+    "tool name. For the chosen capability, fill every REQUIRED parameter from "
+    "the sentence and turn facts; use the exact value with quotes removed; "
+    "never invent values a slot cannot be answered with — omit it instead. "
     'Answer json only: {"capability_id": "<id or NONE>", "confidence": 0.0-1.0, '
     '"arguments": {"<slot>": "<value>", ...}}'
 )

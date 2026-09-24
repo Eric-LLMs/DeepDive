@@ -11,8 +11,8 @@
 #   - reranker    LEGACY TEI container — not wired (rerank runs in-process)   (port 18081)
 #   - tts         Kokoro-FastAPI (OpenAI-compatible)  -> /v1/audio/speech (port 18880)
 #   - stt         FunASR serving SenseVoiceSmall      -> /v1/audio/transcriptions (port 18881, loopback only)
-#   - model-a     Ollama serving the Model A small tool-calling model
-#                 (OpenAI-compatible /v1/chat/completions, port 18090, loopback only)
+#   - tool-intent   Ollama serving the ToolIntentModel small tool-calling model
+#                 (OpenAI-compatible /v1/chat/completions, port 18091, loopback only)
 #   - llm-gateway LiteLLM proxy (unified LLM routing / keys / cost)   (port 14000)
 
 name: delveta
@@ -133,33 +133,37 @@ services:
       retries: 12
       start_period: 120s
 
-  # ── Model A (chat intent funnel's single-hop selector+extractor) ─────────
-  # Standalone, replaceable inference service: the funnel only speaks the
-  # OpenAI-compatible /v1/chat/completions card contract (see
-  # packages/core/application/chat/intent_funnel/judge/), so BOTH ends of the
-  # provider seam are swappable:
-  #   * inference backend  — Ollama today; vLLM / llama.cpp server work as
-  #     drop-ins (same OpenAI wire), no business-logic change;
-  #   * model             — qwen3:0.6b today; set MODEL_A_OLLAMA_MODEL (here)
-  #     + CHAT_JUDGE_LOCAL_MODEL (app .env) to the same tag to swap.
+  # ── ToolIntentModel (chat intent funnel's capability selection + argument ───
+  # extraction, ONE call per turn). Standalone, replaceable inference service:
+  # the funnel only speaks the OpenAI-compatible /v1/chat/completions card
+  # contract (packages/core/application/chat/intent_funnel/tool_intent/), so
+  # BOTH ends of the provider seam are config, never code:
+  #   provider       = ollama (today; vLLM / llama.cpp server are drop-ins —
+  #                  same OpenAI wire, zero business-logic change)
+  #   model          = qwen3:0.6b      — swap via TOOL_INTENT_OLLAMA_MODEL
+  #   quantization   = Q4_K_M (default; NOT Q8_0) — Ollama encodes it in the
+  #                  tag, so the full default tag is qwen3:0.6b-q4_K_M
   # Weight/config live in the named volume only; the app never references a
-  # model name in code. Host wiring (app .env, gitignored):
-  #   CHAT_JUDGE_BACKEND=auto
-  #   CHAT_JUDGE_LOCAL_URL=http://localhost:18090/v1
-  #   CHAT_JUDGE_LOCAL_MODEL=qwen3:0.6b
-  # One-time after first boot: docker exec delveta-model-a ollama pull qwen3:0.6b
-  model-a:
+  # model name in business logic (config.py chat_tool_intent_local_model +
+  # this env var are the ONLY places the tag appears). Host wiring (app .env,
+  # gitignored):
+  #   CHAT_TOOL_INTENT_BACKEND=auto
+  #   CHAT_TOOL_INTENT_LOCAL_URL=http://localhost:18091/v1
+  #   CHAT_TOOL_INTENT_LOCAL_MODEL=qwen3:0.6b-q4_K_M   (config default; set only to deviate)
+  # One-time after first boot:
+  #   docker exec delveta-tool-intent ollama pull qwen3:0.6b-q4_K_M
+  tool-intent:
     image: ollama/ollama:latest
-    container_name: delveta-model-a
+    container_name: delveta-tool-intent
     ports:
       # loopback-only, same doctrine as stt: the host-run API reaches it at
-      # http://localhost:18090/v1; nothing outside this machine serves intents.
-      - "127.0.0.1:18090:11434"
+      # http://localhost:18091/v1; nothing outside this machine serves intents.
+      - "127.0.0.1:18091:11434"
     volumes:
-      - modela-cache:/root/.ollama
+      - toolintent-cache:/root/.ollama
     environment:
       OLLAMA_KEEP_ALIVE: "24h"     # ms-level first hop needs a warm model in RAM
-      OLLAMA_MODEL: ${MODEL_A_OLLAMA_MODEL:-qwen3:0.6b}   # pull-tag documentation only
+      OLLAMA_MODEL: ${TOOL_INTENT_OLLAMA_MODEL:-qwen3:0.6b-q4_K_M}   # pull-tag documentation only
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "ollama", "list"]
@@ -293,4 +297,4 @@ volumes:
   reranker-cache:
   kokoro-cache:
   funasr-cache:
-  modela-cache:
+  toolintent-cache:

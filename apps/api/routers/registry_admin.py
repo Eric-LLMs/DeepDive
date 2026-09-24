@@ -133,7 +133,7 @@ async def post_preview_route(
     body: RegistryPreviewRouteRequest, _: AuthAdmin = Depends(require_admin),
 ) -> dict:
     """§8.5 full-chain query dry-run against the ACTIVE (Registry, Index)
-    pair: Matcher → Recall → Judge → Decision → Binder → Final Route.
+    pair: Matcher → Recall → ToolIntentModel → Binder → Final Route.
     Side-effect-free by construction (the funnel never touches run_tool, 8.8)
     and writes nothing; every embedding/LLM call it makes is billed under
     ``execution_mode=preview`` (8.14). Read-only like GET /preview, so no

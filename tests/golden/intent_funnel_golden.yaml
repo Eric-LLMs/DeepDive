@@ -9,38 +9,38 @@
 # private+web constraints / sequence dependency / Agent fallback.
 #
 # expectations speak the 8.10 vocabulary: route + capability + funnel_stage,
-# or final agent + fallback_reason (+ matcher/judge trace fragment).
-# Chain ruling 2026-09-24: the active lane is Matcher/Recall -> ONE Model A
+# or final agent + fallback_reason (+ matcher/tool_intent trace fragment).
+# Chain ruling 2026-09-24: the active lane is Matcher/Recall -> ONE ToolIntentModel
 # call -> Binder validate -> certified, so every ACTION row carries
-# stage: model_a (there is no matcher-direct stage any more).
+# stage: tool_intent (there is no matcher-direct stage any more).
 
 cases:
   - id: det_match_exact_alias
     group: deterministic_match
     settings: {mode: "on"}
     query: '新建文件夹"季度报告"'
-    # the HIT lane enters the same single Model A hop as Recall (chain ruling
+    # the HIT lane enters the same single ToolIntentModel hop as Recall (chain ruling
     # 2026-09-24): the direct-certification special path is gone.
     expect: {route: action, capability: cap-folder, tool: create_folder,
-             stage: model_a, kind: action}
+             stage: tool_intent, kind: action}
 
   - id: det_match_regex_pattern
     group: deterministic_match
     settings: {mode: "on"}
     query: '新建文件夹"实验记录"'
-    expect: {route: action, capability: cap-folder, stage: model_a}
+    expect: {route: action, capability: cap-folder, stage: tool_intent}
 
   - id: paraphrase_zh_recall
     group: paraphrase_multilingual
     settings: {mode: "off"}
     query: '创建文件夹"资料归档"'
-    expect: {route: action, capability: cap-folder, stage: model_a}
+    expect: {route: action, capability: cap-folder, stage: tool_intent}
 
   - id: paraphrase_en_recall
     group: paraphrase_multilingual
     settings: {mode: "off"}
     query: 'create a folder named "Read Later"'
-    expect: {route: action, capability: cap-folder, stage: model_a}
+    expect: {route: action, capability: cap-folder, stage: tool_intent}
 
   - id: negation_guard_forces_miss
     group: negation
@@ -53,18 +53,18 @@ cases:
 
   - id: ambiguous_two_intents_escalates
     group: ambiguity_multi_intent
-    # both regexes hit one sentence; the one Model A hop answers NONE on the
+    # both regexes hit one sentence; the one ToolIntentModel hop answers NONE on the
     # split pair (no arbiter exists any more to rescue it) — Agent keeps the turn.
     settings: {mode: "on"}
     query: '新建文件夹"季度报告"并把"keystone"加入我的工程词汇库'
-    expect: {route: agent, fallback: FUNNEL_JUDGE_REJECT,
+    expect: {route: agent, fallback: FUNNEL_TOOL_INTENT_REJECT,
              matcher_contains: "AMBIGUOUS"}
 
   - id: missing_argument_last_question
     group: missing_argument
     settings: {mode: "on"}
     query: '新建文件夹'
-    # Matcher HIT enters the hop; Model A selects cap-folder but the sentence
+    # Matcher HIT enters the hop; ToolIntentModel selects cap-folder but the sentence
     # carries no quotable name -> Binder validate exits MISSING (8.7): the
     # Agent owns the clarification, no second hop tries to rescue it.
     expect: {route: agent, fallback: FUNNEL_BIND_MISSING,
@@ -75,7 +75,7 @@ cases:
     settings: {mode: "on"}
     query: '新建文件夹"季度报告"'
     ctx: {viewer_page: 3, attach: true, session: s-golden}
-    expect: {route: action, capability: cap-folder, stage: model_a}
+    expect: {route: action, capability: cap-folder, stage: tool_intent}
 
   - id: sequence_followup_not_guessed
     group: sequence_dependency
