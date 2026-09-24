@@ -462,6 +462,236 @@ def test_local_model_speaks_openai_wire_or_raises_unavailable(monkeypatch):
     asyncio.run(go())
 
 
+# ═══════════════════ ToolIntentModel local provider: native tool-calling mode ═══════════════════
+
+
+def test_local_tools_mode_sends_registry_tools_and_reads_tool_call(monkeypatch):
+    """mode=tools (Phase-1 ruling): each candidate is sent as an OpenAI function
+    (name = Registry capability_id, params = Registry schema); the reply is read
+    back from message.tool_calls into the SAME {capability_id, confidence,
+    arguments} shape. Off-card names and refusals still fail closed downstream."""
+    import httpx
+    from core.application.chat.intent_funnel import tool_intent as ti_pkg
+    from core.application.chat.intent_funnel.tool_intent import local as local_mod
+    from core.config import settings
+
+    seen: dict = {}
+
+    class _Resp:
+        def __init__(self, status, body):
+            self.status_code, self._body = status, body
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError("boom",
+                    request=httpx.Request("POST", "http://j/v1/chat/completions"),
+                    response=httpx.Response(self.status_code))
+
+        def json(self):
+            return self._body
+
+    class _Client:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None):
+            seen["url"], seen["payload"] = url, json
+            return self._resp
+
+    entry = _entry("cap-a", parameters=_NAME_SCHEMA)
+    cands = (Candidate("cap-a", 1.0, origin="matcher_hit"),)
+    monkeypatch.setattr(settings, "chat_tool_intent_local_mode", "tools")
+
+    def tool_body(name, args):
+        return {"choices": [{"message": {
+            "role": "assistant", "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": name, "arguments": args}}]}}]}
+
+    async def go():
+        # a valid on-card tool call -> selection + extracted draft, provider conf 1.0
+        monkeypatch.setattr(local_mod.httpx, "AsyncClient",
+                            lambda **kw: _Client(_Resp(200, tool_body("cap-a", '{"name": "报告"}'))))
+        data = await local_mod.model_reply("新建文件夹", cands, {"cap-a": entry}, url="http://j/v1")
+        assert data == {"capability_id": "cap-a", "confidence": 1.0, "arguments": {"name": "报告"}}
+        # the tool definitions came from the Registry (name=cap id, params from schema)
+        tool = seen["payload"]["tools"][0]["function"]
+        assert tool["name"] == "cap-a"
+        assert tool["parameters"]["properties"]["name"]["type"] == "string"
+        assert "name" in tool["parameters"]["required"]
+        assert seen["payload"]["tool_choice"] == "auto"     # abstention allowed
+        assert seen["payload"]["reasoning_effort"] == "none"  # provider pin kept
+        assert seen["payload"]["temperature"] == 0.0        # identical generation
+        # the verdict node still certifies it (candidate membership -> CONFIDENT)
+        v = ti_pkg._verdict_from_reply(data, cands)
+        assert v.decision == TOOL_INTENT_CONFIDENT and v.arguments == {"name": "报告"}
+
+        # NO tool-call -> a legitimate refusal (NONE) -> REJECT, never executed
+        monkeypatch.setattr(local_mod.httpx, "AsyncClient", lambda **kw: _Client(
+            _Resp(200, {"choices": [{"message": {"role": "assistant",
+                     "content": "no tool fits here", "tool_calls": []}}]})))
+        data = await local_mod.model_reply("今天天气", cands, {"cap-a": entry}, url="http://j/v1")
+        assert data["capability_id"] == "NONE" and data["arguments"] is None
+        assert ti_pkg._verdict_from_reply(data, cands).decision == TOOL_INTENT_REJECT
+
+        # off-card function name with provider conf 1.0 -> STILL UNCERTAIN:
+        # the confidence=1.0 never bypasses capability correctness (candidate check first)
+        monkeypatch.setattr(local_mod.httpx, "AsyncClient", lambda **kw: _Client(
+            _Resp(200, tool_body("some-invented-tool", "{}"))))
+        data = await local_mod.model_reply("q", cands, {"cap-a": entry}, url="http://j/v1")
+        assert data["capability_id"] == "some-invented-tool"
+        assert ti_pkg._verdict_from_reply(data, cands).decision == TOOL_INTENT_UNCERTAIN
+
+        # tool-call whose arguments are not valid JSON -> UNAVAILABLE (never a verdict)
+        monkeypatch.setattr(local_mod.httpx, "AsyncClient", lambda **kw: _Client(
+            _Resp(200, tool_body("cap-a", "{not json"))))
+        with pytest.raises(jbase.ToolIntentUnavailable):
+            await local_mod.model_reply("q", cands, {"cap-a": entry}, url="http://j/v1")
+
+        # a 5xx from the model service is UNAVAILABLE (fall through), not a verdict
+        monkeypatch.setattr(local_mod.httpx, "AsyncClient", lambda **kw: _Client(_Resp(503, {})))
+        with pytest.raises(jbase.ToolIntentUnavailable):
+            await local_mod.model_reply("q", cands, {"cap-a": entry}, url="http://j/v1")
+    asyncio.run(go())
+    monkeypatch.setattr(settings, "chat_tool_intent_local_mode", "prompt_json")
+
+
+def test_local_tools_markdown_fallback_normalizes_to_same_internal_shape(monkeypatch):
+    """The structured-Markdown tool output the CPU checkpoint emits when the
+    native tool-call token loses the first-token argmax is a WIRE-FORMAT issue,
+    not a semantic miss: the model already chose the right capability/tool/
+    args/confidence. When there is NO native tool_calls, the reader normalizes
+    the strict Markdown block into the SAME {capability_id, confidence,
+    arguments} shape the native path yields, so it enters the existing
+    Binder -> Runtime chain unchanged (no re-ask, no Agent hand-off).
+
+    The parser is deliberately strict — only a whole-reply, structurally valid
+    block with a JSON-object arguments AND a capability/tool consistent with
+    the Candidate/Registry counts. Prose, malformed blocks, off-card ids, bad
+    JSON and schema mismatches must all stay out of the ToolIntent path."""
+    from core.application.chat.intent_funnel import tool_intent as ti_pkg
+    from core.application.chat.intent_funnel.binder import validate as bind_validate
+    from core.application.chat.intent_funnel.tool_intent import local as local_mod
+    from core.config import settings
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._body
+
+    class _Client:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None):
+            return self._resp
+
+    entry = _entry("cap-a", parameters=_NAME_SCHEMA)            # tool_binding=create_folder
+    cands = (Candidate("cap-a", 1.0, origin="matcher_hit"),)
+    monkeypatch.setattr(settings, "chat_tool_intent_local_mode", "tools")
+
+    def content_body(text):
+        return {"choices": [{"message": {"role": "assistant", "content": text,
+                                         "tool_calls": []}}]}
+
+    def run(text):
+        async def go():
+            monkeypatch.setattr(local_mod.httpx, "AsyncClient",
+                                lambda **kw: _Client(_Resp(content_body(text))))
+            data = await local_mod.model_reply("新建文件夹", cands, {"cap-a": entry},
+                                               url="http://j/v1")
+            return data, ti_pkg._verdict_from_reply(data, cands)
+        return asyncio.run(go())
+
+    # 1) native tool_calls -> unchanged: the reader path is identical and is
+    #    CERTIFIED CONFIDENT, then the Binder validates the draft.
+    native = {"choices": [{"message": {"role": "assistant", "content": "",
+                      "tool_calls": [{"id": "c1", "type": "function",
+                                      "function": {"name": "cap-a",
+                                                   "arguments": '{"name":"报告"}'}}]}}]}
+
+    async def native_go():
+        monkeypatch.setattr(local_mod.httpx, "AsyncClient",
+                            lambda **kw: _Client(_Resp(native)))
+        return await local_mod.model_reply("q", cands, {"cap-a": entry}, url="http://j/v1")
+    nd = asyncio.run(native_go())
+    assert nd == {"capability_id": "cap-a", "confidence": 1.0, "arguments": {"name": "报告"}}
+    nv = ti_pkg._verdict_from_reply(nd, cands)
+    assert nv.decision == TOOL_INTENT_CONFIDENT
+    assert bind_validate(entry, nv.arguments).state == BIND_COMPLETE
+
+    # 2) strict Markdown block -> SAME internal shape -> same gate -> same bind
+    data, v = run('### cap-a\ntool: create_folder\narguments: {"name": "季度报告"}\nconfidence: 1.000')
+    assert data == {"capability_id": "cap-a", "confidence": 1.0, "arguments": {"name": "季度报告"}}
+    assert v.decision == TOOL_INTENT_CONFIDENT and v.arguments == {"name": "季度报告"}
+    assert bind_validate(entry, v.arguments).state == BIND_COMPLETE
+
+    # 2b) the optional ``tool:`` line may be omitted (hit-folder-2 variant)
+    data, v = run('### cap-a\narguments: {"name": "临时草稿"}\nconfidence: 0.9')
+    assert v.decision == TOOL_INTENT_CONFIDENT and v.arguments == {"name": "临时草稿"}
+
+    # 3) malformed Markdown -> NOT a tool intent -> REJECT (prose cannot bind)
+    for bad in (
+        "### cap-a\ntool: create_folder\narguments: {not json}\nconfidence: 1.0",   # bad JSON
+        '### cap-a\narguments: "name"\nconfidence: 1.0',                             # args not object
+        '### cap-a\narguments: {"name": "x"}\nconfidence: high',                     # bad confidence
+        '### cap-a\narguments: {"name": "x"}',                                       # no confidence line
+        'cap-a: {"name": "x"} confidence: 1.0',                                      # not a heading block
+        ('### cap-a\ntool: create_folder\narguments: {"name": "x"}\nconfidence: 1.0\n'
+         'more trailing prose here'),                                                # leading/trailing prose
+        '',                                                                          # empty
+        'NONE, the user sentence is a greeting, not a request.',                     # plain refusal prose
+        'The user wants a folder. capability_id: cap-a',                             # prose that mentions a cap
+    ):
+        data, v = run(bad)
+        assert v.decision in (TOOL_INTENT_REJECT, TOOL_INTENT_UNCERTAIN), bad
+        assert data["capability_id"] in ("NONE",) or v.capability_id is None, bad
+
+    # 4) capability NOT on the card / not in the Registry -> never an auto-pass
+    #    (an off-card id WITHOUT a tool line stays the gate's UNCERTAIN; a
+    #    Markdown whose tool line cannot be matched against the Registry is
+    #    disqualified by the parser itself -> REJECT)
+    data, v = run('### cap-invented\narguments: {"name": "x"}\nconfidence: 1.0')
+    assert v.decision == TOOL_INTENT_UNCERTAIN            # off-card id, gate first
+    data, v = run('### cap-invented\ntool: create_folder\narguments: {"name": "x"}\nconfidence: 1.0')
+    assert v.decision == TOOL_INTENT_REJECT               # cap not in Registry at all
+    data, v = run('### cap-a\ntool: wrong_binding\narguments: {"name": "x"}\nconfidence: 1.0')
+    assert v.decision == TOOL_INTENT_REJECT               # tool line contradicts Registry
+
+    # 5) arguments pass the parser but FAIL the Binder schema -> the Binder, not
+    #    the parser, owns that rejection: still no bindable ToolIntent to Runtime
+    data, v = run('### cap-a\narguments: {"unexpected_slot": "x"}\nconfidence: 1.0')
+    assert v.decision == TOOL_INTENT_CONFIDENT            # parser only normalizes
+    assert bind_validate(entry, v.arguments).state == BIND_INVALID  # Binder stops it
+    monkeypatch.setattr(settings, "chat_tool_intent_local_mode", "prompt_json")
+
+
+def test_local_mode_default_is_prompt_json_and_unchanged():
+    """The Phase-1 addition must not move today's behavior: with no explicit mode
+    the adapter speaks the original card JSON contract."""
+    from core.config import settings
+    assert settings.chat_tool_intent_local_mode == "prompt_json"
+    from core.application.chat.intent_funnel.tool_intent import local as local_mod
+    assert local_mod.MODES == ("prompt_json", "tools")
+
+
 # ═══════════════════════ ToolIntentModel prompt: full Candidate Card assembly ═══════════
 
 
