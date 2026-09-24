@@ -1,0 +1,106 @@
+# §8.16 Golden Set — the publish-gate regression matrix for the Intent Funnel.
+#
+# This is NOT an ad-hoc test list: it is the gate that Registry content and
+# node-strategy changes must pass before Publish/Rollout (8.16). Cases run
+# under execution_mode="test" (8.14: batch cost never lands on a user).
+#
+# Coverage per 8.16: deterministic match / paraphrase+multilingual / negation /
+# ambiguity+multi-intent / missing-arg / viewer+attachment+memory context /
+# private+web constraints / sequence dependency / Agent fallback.
+#
+# expectations speak the 8.10 vocabulary: route + capability + funnel_stage,
+# or final agent + fallback_reason (+ matcher/judge trace fragment).
+
+cases:
+  - id: det_match_exact_alias
+    group: deterministic_match
+    settings: {mode: "on"}
+    query: '新建文件夹"季度报告"'
+    expect: {route: action, capability: cap-folder, tool: create_folder,
+             stage: matcher, kind: action}
+
+  - id: det_match_regex_pattern
+    group: deterministic_match
+    settings: {mode: "on"}
+    query: '新建文件夹"实验记录"'
+    expect: {route: action, capability: cap-folder, stage: matcher}
+
+  - id: paraphrase_zh_recall
+    group: paraphrase_multilingual
+    settings: {mode: "off"}
+    query: '创建文件夹"资料归档"'
+    expect: {route: action, capability: cap-folder, stage: judge}
+
+  - id: paraphrase_en_recall
+    group: paraphrase_multilingual
+    settings: {mode: "off"}
+    query: 'create a folder named "Read Later"'
+    expect: {route: action, capability: cap-folder, stage: judge}
+
+  - id: negation_guard_forces_miss
+    group: negation
+    settings: {mode: "on"}
+    query: '不要新建文件夹"季度报告"'
+    # the regex pattern WOULD hit; the 8.1-a negation guard must force MISS
+    # and the fake corpus must not resupply the turn through Recall.
+    expect: {route: agent, fallback: FUNNEL_NO_CANDIDATE,
+             matcher_contains: "MISS"}
+
+  - id: ambiguous_two_intents_escalates
+    group: ambiguity_multi_intent
+    # both regexes hit one sentence; with no Decision arbiter (stub world)
+    # the ONLY legal exit is up-then-out: Agent keeps the turn.
+    settings: {mode: "on"}
+    query: '新建文件夹"季度报告"并把"keystone"加入我的工程词汇库'
+    expect: {route: agent, fallback: FUNNEL_DECISION_NONE,
+             matcher_contains: "AMBIGUOUS"}
+
+  - id: missing_argument_last_question
+    group: missing_argument
+    settings: {mode: "on"}
+    query: '新建文件夹'
+    # Matcher certifies the table hit; the Binder finds no quoted name:
+    # recheck (stub cannot rescue) -> Agent owns the clarification (8.7).
+    expect: {route: agent, fallback: FUNNEL_BIND_MISSING,
+             matcher_contains: "HIT:cap-folder"}
+
+  - id: viewer_and_attachment_do_not_block
+    group: context_viewer_attachment_memory
+    settings: {mode: "on"}
+    query: '新建文件夹"季度报告"'
+    ctx: {viewer_page: 3, attach: true, session: s-golden}
+    expect: {route: action, capability: cap-folder, stage: matcher}
+
+  - id: sequence_followup_not_guessed
+    group: sequence_dependency
+    settings: {mode: "on"}
+    query: '再来一个'
+    ctx: {session: s-golden}
+    # bare follow-up: table miss, vector miss — the funnel never guesses from
+    # history; the Agent owns context.
+    expect: {route: agent, fallback: FUNNEL_NO_CANDIDATE}
+
+  - id: private_kind_gate_closed
+    group: private_web_constraints
+    settings: {mode: "on", private: false}
+    query: '创建文件夹"私密日记"'
+    # IN the table, NOT ON the gate: same verdict as if the row were absent.
+    expect: {route: agent, fallback: FUNNEL_KIND_DISABLED}
+
+  - id: private_kind_gate_open
+    group: private_web_constraints
+    settings: {mode: "on", private: true}
+    query: '创建文件夹"私密日记"'
+    expect: {route: action, capability: cap-private, kind: private}
+
+  - id: web_kind_gate_closed
+    group: private_web_constraints
+    settings: {mode: "on"}
+    query: '查一下这个词的词源'
+    expect: {route: agent, fallback: FUNNEL_KIND_DISABLED}
+
+  - id: agent_fallback_plain_chat
+    group: agent_fallback
+    settings: {mode: "on"}
+    query: '今天想学点什么好'
+    expect: {route: agent, fallback: FUNNEL_NO_CANDIDATE}
