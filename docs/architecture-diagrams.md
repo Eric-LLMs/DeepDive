@@ -383,57 +383,62 @@ never the funnel's — a certified turn dispatches through the same shared water
 <summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
 
 ```mermaid
-flowchart TB
+flowchart LR
     %% Invariants: the funnel produces routing metadata only · every abstain/fault returns the
     %% ORIGINAL TurnRequirements object (byte-identical, zero pollution) · at most ONE model call
     %% per turn (chain ruling 2026-09-24) · gates default OFF · an off-card id is never a verdict.
 
-    USER["chat turn · resolve_plan → funnel.route(ctx, deps, requirements)"]
+    USER["chat turn · resolve_plan →<br/>funnel.route(ctx, deps, requirements)"]
 
-    subgraph entry["Entry gates (config.py — ALL default OFF, dark launch)"]
+    subgraph entry["Entry gates — ALL default OFF, dark launch"]
+        direction TB
         SHADOW["shadow hook · chat_matcher_mode off/shadow/on<br/>Matcher runs in the dark, would_* telemetry,<br/>routing untouched"]
         L0B["L0 already certified ⇒ untouched<br/>(coexistence boundary)"]
-        GATE["funnel_live = chat_funnel_enabled<br/>+ fast_paths_enabled + action switch<br/>+ guardrails.turn_veto — negation / research /<br/>handoff / non-pure-text vetoes as CODE, not table data"]
+        GATE["funnel_live = chat_funnel_enabled + fast_paths_enabled<br/>+ action switch + guardrails.turn_veto<br/>negation / research / handoff / non-pure-text<br/>vetoes as CODE, not table data"]
+        SHADOW --> L0B --> GATE
     end
-    USER --> SHADOW --> L0B --> GATE
+    USER --> SHADOW
 
     subgraph cascade["Single-hop cascade (wall-clock budget chat_funnel_timeout_seconds)"]
+        direction LR
         REG["Registry active view + paired Recall index<br/>(Build-Then-Swap pair — read together or not at all)<br/>missing ⇒ REGISTRY_UNAVAILABLE / RECALL_UNAVAILABLE"]
         M["Node 1 · Matcher — table data only<br/>patterns/aliases · re: = regex, else exact phrase<br/>negation guard before certifying<br/>HIT · MISS · MATCH_AMBIGUOUS (all claimants up)"]
         R["Node 2 · Recall — cosine top_k ≥ min_score<br/>candidates ONLY, never adjudicates<br/>origin=recall (calibrated score)"]
         CAND["ONE candidate set, one convergence point<br/>matcher_hit 1.0 · matcher_ambiguous 0.0<br/>empty ⇒ NO_CANDIDATE exit"]
-        TI["Node 3 · ToolIntentModel — the ONE model call:<br/>select capability AND draft arguments<br/>backend ladder chat_tool_intent_backend:<br/>stub → local → online (auto = local→online→stub)"]
+        TI["Node 3 · ToolIntentModel — the ONE model call:<br/>select capability AND draft arguments<br/>ladder chat_tool_intent_backend:<br/>stub → local → online (auto = local→online→stub)"]
         B["Node 4 · Binder.validate — pure schema gate<br/>Registry canonical parameters · extracts nothing<br/>COMPLETE / MISSING / AMBIGUOUS / INVALID"]
         REG --> M
         M -- "MISS" --> R --> CAND
         M -- "HIT / AMBIGUOUS" --> CAND
-        CAND --> TI --> B
     end
     GATE --> REG
 
     subgraph adapters["Local Adapter — one internal reply shape from either wire format"]
+        direction TB
         PJ["prompt_json mode: SYSTEM asks JSON · brace-parse"]
         NT["tools mode: native tool_calls<br/>one OpenAI function per candidate<br/>name = Registry capability_id"]
         MD["structured-Markdown fallback<br/>### cap / tool: / arguments: / confidence:<br/>strict whole-reply fullmatch · prose never matches<br/>tool line cross-checked against the Registry"]
-        GATE2["verdict gate (unchanged for both formats):<br/>NONE ⇒ REJECT · off-card ⇒ UNCERTAIN ·<br/>below floor ⇒ UNCERTAIN · else CONFIDENT + args"]
+        GATE2["verdict gate (same for both formats):<br/>NONE ⇒ REJECT · off-card ⇒ UNCERTAIN ·<br/>below floor ⇒ UNCERTAIN · else CONFIDENT + args"]
         PJ & NT & MD --> GATE2
     end
-    TI --> adapters --> B
+    CAND --> TI --> adapters
 
     subgraph exits["Fail-open exits — reason codes carry the stage prefix"]
+        direction TB
         AG["Agent fallback — ReactLoopAgent, full autonomy<br/>original query BYTE-IDENTICAL · never a<br/>side effect precedes the fallback"]
         REASONS["NO_CANDIDATE · MATCH_AMBIGUOUS · TOOL_INTENT_REJECT /<br/>UNCERTAIN / TIMEOUT · BIND_MISSING / AMBIGUOUS / INVALID ·<br/>REGISTRY_VERSION_MISMATCH · FUNNEL_KIND_DISABLED ·<br/>CASCADE_TIMEOUT / CASCADE_ERROR"]
+        REASONS -.- AG
     end
-    B -- "not COMPLETE" --> AG
-    CAND -- "empty" --> AG
+    CAND -- empty --> AG
     GATE2 -- "REJECT / UNCERTAIN" --> AG
-    REASONS -.- AG
+    GATE2 -- CONFIDENT --> B
+    B -- "not COMPLETE" --> AG
 
     CERT["Certified ACTION turn — NEW TurnRequirements<br/>requested_action {tool, args, capability_id,<br/>index-version TOCTOU stamp, funnel_stage, funnel_kind}<br/>per-kind gate: private/web switches, default OFF"]
     B -- COMPLETE --> CERT
 
     subgraph runtime["ONE shared execution waterfall — no second authority"]
-        RW["ToolRuntime.execute: auth → approval → sandbox /<br/>source-policy guards → tool body → events / audit"]
+        RW["ToolRuntime.execute: auth → approval →<br/>sandbox / source-policy guards →<br/>tool body → events / audit"]
     end
     CERT --> RW
     AG -- "every agent tool call" --> RW
