@@ -9,9 +9,9 @@ Escalation discipline (8.1): no hit -> MISS (falls to Recall); one hit -> HIT;
 several capabilities hit -> MATCH_AMBIGUOUS carrying ALL candidate ids upward for
 Judge/Decision to adjudicate. The Matcher itself never picks.
 
-P1 status: SHADOW consumer only (并存迁移) — funnel.route logs this node's verdict
-next to the legacy L0 regex outcome; deleting L0 is a P2 decision after
-equivalence is measured.
+P2+ promotion: with ``chat_matcher_mode=on`` (and the funnel gate) a single HIT
+certifies ACTION routing directly; the P1 shadow lane (8.15) still runs in the
+dark for agreement telemetry whenever the mode says so.
 """
 from __future__ import annotations
 

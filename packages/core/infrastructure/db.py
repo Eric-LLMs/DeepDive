@@ -955,6 +955,48 @@ class RegistryAuditModel(Base):
     )
 
 
+class ChatFunnelEventModel(Base):
+    """One row per Intent-Funnel route decision (QIR P4, docs/temp.md 8.12).
+
+    Telemetry, not history: nothing in the request path reads this table back
+    and the write is best-effort — a DB fault must never sink a turn. Columns
+    mirror the ``funnel_trace`` log line so logs and rows join 1:1;
+    ``execution_mode`` (8.14) separates production turns from shadow/preview/
+    test runs. ``user_id``/``session_id`` carry no FK (events survive deletes,
+    same doctrine as ``registry_audit``) and the raw query is deliberately NOT
+    stored (8.12 privacy line)."""
+
+    __tablename__ = "chat_funnel_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    execution_mode: Mapped[str] = mapped_column(
+        String, nullable=False, server_default="production"
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    session_id: Mapped[str | None] = mapped_column(String)
+    deepest_stage: Mapped[str] = mapped_column(String, nullable=False, default="registry")
+    matcher: Mapped[str | None] = mapped_column(String)
+    recall_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    recall_top: Mapped[str | None] = mapped_column(String)
+    judge: Mapped[str | None] = mapped_column(String)
+    decision: Mapped[str | None] = mapped_column(String)
+    final_route: Mapped[str] = mapped_column(String, nullable=False, default="agent")
+    fallback_reason: Mapped[str | None] = mapped_column(String)
+    registry_version: Mapped[str | None] = mapped_column(String)  # content fingerprint
+    index_version: Mapped[str | None] = mapped_column(String)
+    capability_id: Mapped[str | None] = mapped_column(String)
+    total_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        Index("ix_chat_funnel_events_created_at", "created_at"),
+        Index("ix_chat_funnel_events_execution_mode", "execution_mode"),
+    )
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MIGRATIONS_DIR = _REPO_ROOT / "migrations"
 

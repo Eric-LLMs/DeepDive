@@ -4,7 +4,7 @@ from typing import Literal
 from uuid import UUID
 
 from core.config import settings
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 
 class DomainCreate(BaseModel):
@@ -663,3 +663,8 @@ class RegistryPublishRequest(BaseModel):
 
 class RegistryRollbackRequest(BaseModel):
     note: str | None = None
+
+
+class RegistryPreviewRouteRequest(BaseModel):
+    # §8.5 full-chain query dry-run; the chain reads the ACTIVE pair only.
+    query: str = Field(min_length=1, max_length=500)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import types
 
 from core.application.chat.understanding import (
     Complexity,
@@ -218,16 +219,24 @@ def _stage_reason(stage: str, *, timed_out: bool) -> str:
     }.get(stage, REASON_CASCADE_ERROR)
 
 
-async def _cascade(ctx, deps, requirements: TurnRequirements) -> TurnRequirements:
-    """Run the four-node cascade under one wall-clock budget, fail-open to the
-    ORIGINAL requirements on every abstain/fault (8.10: the Agent's input stays
-    byte-identical). Returns the same object the pre-P2 contract guarantees;
-    only a certified turn produces a NEW requirements (never a mutation)."""
+def _new_trace() -> dict:
+    """The shared per-run trace record: production routing and the 8.5 query
+    preview fill the SAME fields — one observability shape (8.12), one event
+    row shape, so a preview can be diffed against real traffic line for line."""
+    return {"stage": "registry", "matcher": "-", "recall_count": 0,
+            "recall_top": "-", "judge": "-", "decision": "-",
+            "final_route": "agent", "fallback": "-", "registry": "-",
+            "index": "-", "capability": None, "total_ms": 0}
+
+
+async def _run_cascade(ctx, deps, requirements: TurnRequirements,
+                       trace: dict) -> TurnRequirements | None:
+    """One wall-clock-budgeted cascade run with 8.10-classified fail-open.
+    Returns a certified TurnRequirements or None (fallback reason in
+    ``trace``); the caller decides what None means (production: the original
+    object; preview: an agent-route verdict). Never raises."""
     import time
 
-    trace = {"stage": "registry", "matcher": "-", "recall_count": 0,
-             "recall_top": "-", "judge": "-", "decision": "-",
-             "final_route": "agent", "fallback": "-", "registry": "-", "index": "-"}
     t0 = time.monotonic()
     try:
         out = await asyncio.wait_for(
@@ -242,17 +251,123 @@ async def _cascade(ctx, deps, requirements: TurnRequirements) -> TurnRequirement
         logger.info("funnel fail-open at %s: %r", trace["stage"], exc)
     if out is not None:
         trace["final_route"] = "action"
+        trace["capability"] = (out.requested_action or {}).get("capability_id")
     elif trace["fallback"] == "-":
         trace["fallback"] = REASON_CASCADE_ERROR  # belt: abstain without a reason is a fault
+    trace["total_ms"] = int((time.monotonic() - t0) * 1000)
+    return out
+
+
+def _log_trace(trace: dict) -> None:
     logger.info(
         "funnel_trace deepest_stage=%s matcher=%s recall_count=%d recall_top=%s "
         "judge=%s decision=%s final_route=%s fallback_reason=%s "
         "registry_version=%s index_version=%s total_ms=%d",
         trace["stage"], trace["matcher"], trace["recall_count"], trace["recall_top"],
         trace["judge"], trace["decision"], trace["final_route"], trace["fallback"],
-        trace["registry"], trace["index"], int((time.monotonic() - t0) * 1000),
+        trace["registry"], trace["index"], trace["total_ms"],
     )
+
+
+async def _persist_event(deps, ctx, trace: dict) -> None:
+    """8.12: one row per route decision, best-effort. Telemetry must never sink
+    a turn or delay a preview, and an unwired session factory (unit tests,
+    dark lanes) is a silent no-op. The raw query is deliberately NOT stored;
+    ``execution_mode`` (8.14) separates production from shadow/preview/test."""
+    factory = getattr(deps, "session_factory", None)
+    if factory is None:
+        return
+    try:
+        from core.infrastructure.db import ChatFunnelEventModel
+        from core.infrastructure.request_context import (
+            get_request_execution_mode,
+            get_request_user_id,
+        )
+
+        async with factory() as session:
+            session.add(ChatFunnelEventModel(
+                execution_mode=get_request_execution_mode(),
+                user_id=get_request_user_id(),
+                session_id=str(getattr(ctx, "session_id", "") or "") or None,
+                deepest_stage=trace["stage"], matcher=trace["matcher"],
+                recall_count=trace["recall_count"], recall_top=trace["recall_top"],
+                judge=trace["judge"], decision=trace["decision"],
+                final_route=trace["final_route"], fallback_reason=trace["fallback"],
+                registry_version=trace["registry"], index_version=trace["index"],
+                capability_id=trace["capability"], total_ms=trace["total_ms"],
+            ))
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 - telemetry never sinks a turn
+        logger.info("funnel event persist skipped: %r", exc)
+
+
+async def _cascade(ctx, deps, requirements: TurnRequirements) -> TurnRequirements:
+    """Run the four-node cascade under one wall-clock budget, fail-open to the
+    ORIGINAL requirements on every abstain/fault (8.10: the Agent's input stays
+    byte-identical). Returns the same object the pre-P2 contract guarantees;
+    only a certified turn produces a NEW requirements (never a mutation)."""
+    trace = _new_trace()
+    out = await _run_cascade(ctx, deps, requirements, trace)
+    _log_trace(trace)
+    await _persist_event(deps, ctx, trace)
     return out if out is not None else requirements
+
+
+# ── §8.5 full-chain query preview (dry-run, side-effect-free) ─────────────────────
+
+def _preview_ctx(message: str):
+    """The minimal ctx a console can express as a one-off test query: pure
+    text, no viewer/attachment/research/handoff. (Drafts with context facts
+    ride the same contract later; the Matcher only consumes TurnFacts fields.)"""
+    return types.SimpleNamespace(
+        body=types.SimpleNamespace(message=message, attach=None, viewer=None),
+        owned_asset_id=None, research_turn=False, effective_handoff=None,
+        session_id="",
+    )
+
+
+async def preview(message: str, *, deps) -> dict:
+    """§8.5: run the ACTIVE (Registry, Index) pair end to end for one query —
+    Registry → Matcher → Recall → Judge → Decision → Binder → Final Route —
+    and return the trace as a verdict, executing nothing. Side-effect-free by
+    construction: the chain only produces routing metadata (8.8), run_tool is
+    not even on this object graph, and conversation state is never touched.
+    All embedding/LLM usage is pinned ``execution_mode=preview`` (8.14) and
+    the routing event lands with the same mode (8.12). Never raises: faults
+    surface as the 8.10 fallback_reason, exactly as they would in production."""
+    from core.infrastructure.request_context import (
+        reset_request_execution_mode,
+        set_request_execution_mode,
+    )
+
+    requirements = TurnRequirements(
+        complexity=Complexity.LOW, confidence=Confidence.LOW,
+        needs_web=Signal.LOW, needs_memory=False,
+    )
+    ctx = _preview_ctx(message)
+    trace = _new_trace()
+    token = set_request_execution_mode("preview")
+    try:
+        out = await _run_cascade(ctx, deps, requirements, trace)
+        await _persist_event(deps, ctx, trace)   # inside the pin: the event says "preview"
+    finally:
+        reset_request_execution_mode(token)
+    _log_trace(trace)
+    result = {
+        "deepest_stage": trace["stage"], "matcher": trace["matcher"],
+        "recall_count": trace["recall_count"], "recall_top": trace["recall_top"],
+        "judge": trace["judge"], "decision": trace["decision"],
+        "final_route": trace["final_route"], "fallback_reason": trace["fallback"],
+        "registry_version": trace["registry"], "index_version": trace["index"],
+        "total_ms": trace["total_ms"], "execution_mode": "preview",
+    }
+    if out is not None:
+        act = out.requested_action or {}
+        result["route"] = {k: act.get(k) for k in (
+            "capability_id", "tool", "args", "funnel_stage", "funnel_kind",
+            "binding_integrity",
+        )}
+    return result
 
 
 async def _run_nodes(ctx, deps, requirements, trace):

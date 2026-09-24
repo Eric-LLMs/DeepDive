@@ -77,17 +77,48 @@ class ActionExecutor(DirectExecutor):
         action = req.plan.action or {}
         tool, args = action.get("tool"), action.get("args")
 
-        # 0. QIR envelope double validation (route/execute TOCTOU): the stamped
-        #    registry_version must still be Active, the capability must still exist,
-        #    be enabled and still bind to this tool. Any drift is C3 TERMINAL —
-        #    a historical RouteResult never executes on blind trust.
+        # 0. Route/execute TOCTOU re-validation (8.9), in the namespace the
+        #    ROUTER actually certified (P4 unification):
+        #    * a funnel-certified turn stamps ``funnel_registry_version`` — the
+        #      Registry content fingerprint — and re-validates against the
+        #      active Registry view: same fingerprint, capability still active
+        #      and enabled, same tool binding, allowlisted tool, and the kind
+        #      gate still open (a mid-turn flip to OFF must not execute a
+        #      widened kind — 入表≠开闸 holds at dispatch too);
+        #    * a legacy QIR/L0 turn stamps ``registry_version`` (the qir index
+        #      version) — the historical check, byte-unchanged.
+        #    Any drift is C3 TERMINAL: a historical RouteResult never executes
+        #    on blind trust.
         registry_version = action.get("registry_version")
-        if registry_version is not None:
+        funnel_fp = action.get("funnel_registry_version")
+        cap_id = str(action.get("capability_id") or "")
+        if funnel_fp is not None:
+            from core.application.chat.intent_funnel import funnel as funnel_mod
+            from core.application.chat.intent_funnel.registry import active_view
+            from core.application.chat.intent_funnel.registry.entry import STATUS_ACTIVE
+
+            view = await active_view(session_factory=req.deps.session_factory)
+            entry = next(
+                (e for e in (view.entries if view is not None else ())
+                 if e.capability_id == cap_id), None,
+            )
+            if (
+                view is None or view.fingerprint != str(funnel_fp)
+                or entry is None or not entry.enabled or entry.status != STATUS_ACTIVE
+                or entry.tool_binding != tool or tool not in DIRECT_TOOLS
+                or not funnel_mod.kind_enabled(entry.intent_kind)
+            ):
+                logger.warning(
+                    "chat.action route-stale(capability=%s stamped=%s active=%s",
+                    cap_id, funnel_fp, view.fingerprint if view else None,
+                )
+                return _TERMINAL_STALE_ROUTE
+        elif registry_version is not None:
             from core.application.chat.qir import store as qir_store
 
             snapshot = await qir_store.active(req.deps.session_factory)
             cap = (
-                snapshot.get(str(action.get("capability_id") or ""))
+                snapshot.get(cap_id)
                 if snapshot is not None and snapshot.version == str(registry_version)
                 else None
             )
@@ -97,7 +128,7 @@ class ActionExecutor(DirectExecutor):
             ):
                 logger.warning(
                     "chat.action route-stale capability=%s stamped=%s active=%s",
-                    action.get("capability_id"), registry_version,
+                    cap_id, registry_version,
                     snapshot.version if snapshot else None,
                 )
                 return _TERMINAL_STALE_ROUTE
