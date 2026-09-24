@@ -286,11 +286,14 @@ flowchart TB
 
 </details>
 
-**Chat control plane — a turn's full path from transport to a terminal answer.** `resolve_plan`
-runs the three stages (QIR → Argument Binding → policy mapping) over the pure L0 facts; each
-PlanKind has a registered executor, every certified fast path dispatches through the ONE shared
-execution waterfall, and every uncertifiable or pre-commit-failing turn falls back to the Agent
-byte-identical. C1–C4 name the failure classes (see the design section).
+**Chat control plane — a turn's full path from transport to a terminal answer.**
+`resolve_plan` keeps only the lifecycle: the pure L0 pass runs first, then a SINGLE
+`intent_funnel.route()` call owns all routing (shadow hook, the new Intent-Funnel
+single-hop cascade, and the legacy QIR lane), and `build_execution_plan` is the sole
+policy mapper. Every PlanKind has a registered executor, every certified fast path
+dispatches through the ONE shared execution waterfall, and every uncertifiable or
+pre-commit-failing turn falls back to the Agent byte-identical. C1–C4 name the failure
+classes (see the design section).
 
 ![Chat control plane — three-stage plan resolution, per-kind executors, and the ONE shared waterfall](./images/chat-control-plane.png)
 
@@ -306,27 +309,28 @@ flowchart TB
         AUTH["POST /chat · /chat/stream<br/>auth · quota · channel pin · build_turn_context"]
     end
 
-    subgraph resolve["TurnOrchestrator.resolve_plan — three ordered stages"]
+    subgraph resolve["TurnOrchestrator.resolve_plan — lifecycle only; routing absorbed into intent_funnel.route() (P0 move)"]
         L0["L0 lexical facts · resolve_requirements<br/>sole exact matcher · in-process · no model call"]
-        QIR["(1) QIR intent routing (chat_qir_enabled)<br/>snapshot → semantic candidates (cosine · min_score · margin)<br/>→ decision adjudication → RouteResult{capability_id · registry_version}"]
-        BIND["(2) Argument Binding<br/>bind_arguments → existing DIRECT_TOOLS extractors<br/>negation guard at L0 + binding layers"]
-        MAP["(3) build_execution_plan — sole policy mapper<br/>per-kind gates · sole-demand eligibility · source_policy"]
-        L0 -- "action abstained · pure user text · gates live" --> QIR
-        QIR -- ROUTE --> BIND
-        L0 --> MAP
-        BIND --> MAP
+        RT["intent_funnel.route(ctx, deps, requirements)<br/>shadow hook first (chat_matcher_mode off/shadow/on)<br/>· L0-certified turn passes through untouched"]
+        FN["NEW target lane — Intent Funnel single-hop (chat_funnel_enabled)<br/>Registry+index pair → Matcher → (Recall) → ONE ToolIntentModel call<br/>select + extract · ladder stub→local→online → Binder validate<br/>certified ACTION {capability_id · index-version TOCTOU stamp}"]
+        QIR["LEGACY lane — QIR cascade run_intent_stage (chat_qir_enabled)<br/>snapshot → semantic candidates (cosine · min_score · margin)<br/>→ bounded decision → RouteResult → Argument Binding (extractors)<br/>C1 miss → Agent · C2 integrity → ACTION marked TERMINAL"]
+        MAP["build_execution_plan — sole policy mapper<br/>per-kind gates · sole-demand eligibility · source_policy"]
+        L0 --> RT
+        RT -- "funnel_live: master + action gate + guardrails.turn_veto<br/>(negation / research / handoff vetoes as code)" --> FN --> MAP
+        RT -- "else qir_live: L0 abstained · pure user text ·<br/>no web/memory/research/handoff" --> QIR --> MAP
+        RT -- "both dark / abstain — the ORIGINAL requirements object" --> MAP
     end
 
     AUTH --> L0
-    QIR -. "ABSTAIN — no snapshot · low score · ambiguous · NONE · timeout · store down" .-> AG
-    BIND -. "C1 — args undeterminable (proven pre-body)" .-> AG
+    FN -. "ABSTAIN — NO_CANDIDATE · TOOL_INTENT_REJECT / UNCERTAIN / TIMEOUT ·<br/>BIND_MISSING / AMBIGUOUS / INVALID · REGISTRY / RECALL_UNAVAILABLE ·<br/>VERSION_MISMATCH · KIND_DISABLED · CASCADE_TIMEOUT — byte-identical" .-> AG
+    QIR -. "ABSTAIN — no snapshot · low score · ambiguous · NONE · timeout ·<br/>store down · C1 args undeterminable (proven pre-body)" .-> AG
 
     subgraph gates["Feature gates (config.py) — ALL default OFF · dark launch"]
-        GQ["chat_qir_enabled · chat_qir_decision_enabled<br/>decision gate off ⇒ semantic similarity alone<br/>can never produce a route"]
+        GQ["chat_funnel_enabled (target chain master) + per-kind switches<br/>chat_funnel_private/web_enabled<br/>chat_qir_enabled · chat_qir_decision_enabled (legacy lane;<br/>decision gate off ⇒ similarity alone can never route)"]
         GF["fast_paths_enabled (master switch)<br/>+ per-kind: direct · viewer · retrieval<br/>· action (5A) · composite (5B)<br/>closed ⇒ that PlanKind never maps"]
     end
-    GQ -. "gates stage (1) + (2)" .-> QIR
-    GF -. "gates stage (3) · all closed ⇒ every turn maps to AGENT" .-> MAP
+    GQ -. "gates route()'s two lanes" .-> RT
+    GF -. "gates build_execution_plan · all closed ⇒ every turn maps to AGENT" .-> MAP
 
     MAP --> K{"PlanKind"}
     K -- DIRECT --> DEX["DirectExecutor — single LLM answer"]
@@ -363,12 +367,14 @@ flowchart TB
 </details>
 
 > **Chat control-plane invariants** — a fast path takes only turns it can certify, and its demand
-> must be the *sole* demand; abstention leaves the user text byte-identical; QIR routes (capability
-> + registry version) and never executes or binds; snapshots publish atomically (two `app_settings`
-> rows, one transaction) and the stamped version is re-validated before dispatch; C2/C3/C4 are
-> terminal by contract — the Agent clarifies user incompleteness (C1) and is never the recovery
-> channel for system faults, decided denials, or mid-write uncertainty.
-> Design: [architecture.md §24 — Chat Control Plane](architecture.md#24-chat-control-plane--plan-resolution-fast-paths--qir-intent-routing).
+> must be the *sole* demand; abstention leaves the user text byte-identical; both routing lanes
+> (new Intent-Funnel cascade, legacy QIR) produce routing metadata only — capability + version
+> stamp — and never execute or bind at the dispatch side; snapshots publish atomically and the
+> stamped version is re-validated before dispatch; C2/C3/C4 are terminal by contract — the Agent
+> clarifies user incompleteness (C1) and is never the recovery channel for system faults, decided
+> denials, or mid-write uncertainty.
+> Design: [architecture.md §24 — Chat Control Plane](architecture.md#24-chat-control-plane--plan-resolution-fast-paths--qir-intent-routing),
+> [§25 — Chat Intent Funnel](architecture.md#25-chat-intent-funnel--nodeized-routing-toolintentmodel--shared-tool-runtime).
 
 **Intent Funnel — the single-hop routing chain end to end.** `funnel.route` runs inside plan
 resolution beside the legacy QIR lane: the Registry/index pair loads first, the Matcher consults
