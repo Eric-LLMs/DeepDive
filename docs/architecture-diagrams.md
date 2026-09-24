@@ -370,6 +370,91 @@ flowchart TB
 > channel for system faults, decided denials, or mid-write uncertainty.
 > Design: [architecture.md §24 — Chat Control Plane](architecture.md#24-chat-control-plane--plan-resolution-fast-paths--qir-intent-routing).
 
+**Intent Funnel — the single-hop routing chain end to end.** `funnel.route` runs inside plan
+resolution beside the legacy QIR lane: the Registry/index pair loads first, the Matcher consults
+the table only, Recall nominates candidates without adjudicating, ONE ToolIntentModel call selects
+the capability and drafts its arguments, and the Binder only validates against the Registry
+schema. Every abstain, denial or fault exits fail-open to the Agent byte-identical; execution is
+never the funnel's — a certified turn dispatches through the same shared waterfall.
+
+![Intent Funnel — Matcher → Recall → ToolIntentModel → Binder → Runtime / Agent](./images/intent-funnel.png)
+
+<details>
+<summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
+
+```mermaid
+flowchart TB
+    %% Invariants: the funnel produces routing metadata only · every abstain/fault returns the
+    %% ORIGINAL TurnRequirements object (byte-identical, zero pollution) · at most ONE model call
+    %% per turn (chain ruling 2026-09-24) · gates default OFF · an off-card id is never a verdict.
+
+    USER["chat turn · resolve_plan → funnel.route(ctx, deps, requirements)"]
+
+    subgraph entry["Entry gates (config.py — ALL default OFF, dark launch)"]
+        SHADOW["shadow hook · chat_matcher_mode off/shadow/on<br/>Matcher runs in the dark, would_* telemetry,<br/>routing untouched"]
+        L0B["L0 already certified ⇒ untouched<br/>(coexistence boundary)"]
+        GATE["funnel_live = chat_funnel_enabled<br/>+ fast_paths_enabled + action switch<br/>+ guardrails.turn_veto — negation / research /<br/>handoff / non-pure-text vetoes as CODE, not table data"]
+    end
+    USER --> SHADOW --> L0B --> GATE
+
+    subgraph cascade["Single-hop cascade (wall-clock budget chat_funnel_timeout_seconds)"]
+        REG["Registry active view + paired Recall index<br/>(Build-Then-Swap pair — read together or not at all)<br/>missing ⇒ REGISTRY_UNAVAILABLE / RECALL_UNAVAILABLE"]
+        M["Node 1 · Matcher — table data only<br/>patterns/aliases · re: = regex, else exact phrase<br/>negation guard before certifying<br/>HIT · MISS · MATCH_AMBIGUOUS (all claimants up)"]
+        R["Node 2 · Recall — cosine top_k ≥ min_score<br/>candidates ONLY, never adjudicates<br/>origin=recall (calibrated score)"]
+        CAND["ONE candidate set, one convergence point<br/>matcher_hit 1.0 · matcher_ambiguous 0.0<br/>empty ⇒ NO_CANDIDATE exit"]
+        TI["Node 3 · ToolIntentModel — the ONE model call:<br/>select capability AND draft arguments<br/>backend ladder chat_tool_intent_backend:<br/>stub → local → online (auto = local→online→stub)"]
+        B["Node 4 · Binder.validate — pure schema gate<br/>Registry canonical parameters · extracts nothing<br/>COMPLETE / MISSING / AMBIGUOUS / INVALID"]
+        REG --> M
+        M -- "MISS" --> R --> CAND
+        M -- "HIT / AMBIGUOUS" --> CAND
+        CAND --> TI --> B
+    end
+    GATE --> REG
+
+    subgraph adapters["Local Adapter — one internal reply shape from either wire format"]
+        PJ["prompt_json mode: SYSTEM asks JSON · brace-parse"]
+        NT["tools mode: native tool_calls<br/>one OpenAI function per candidate<br/>name = Registry capability_id"]
+        MD["structured-Markdown fallback<br/>### cap / tool: / arguments: / confidence:<br/>strict whole-reply fullmatch · prose never matches<br/>tool line cross-checked against the Registry"]
+        GATE2["verdict gate (unchanged for both formats):<br/>NONE ⇒ REJECT · off-card ⇒ UNCERTAIN ·<br/>below floor ⇒ UNCERTAIN · else CONFIDENT + args"]
+        PJ & NT & MD --> GATE2
+    end
+    TI --> adapters --> B
+
+    subgraph exits["Fail-open exits — reason codes carry the stage prefix"]
+        AG["Agent fallback — ReactLoopAgent, full autonomy<br/>original query BYTE-IDENTICAL · never a<br/>side effect precedes the fallback"]
+        REASONS["NO_CANDIDATE · MATCH_AMBIGUOUS · TOOL_INTENT_REJECT /<br/>UNCERTAIN / TIMEOUT · BIND_MISSING / AMBIGUOUS / INVALID ·<br/>REGISTRY_VERSION_MISMATCH · FUNNEL_KIND_DISABLED ·<br/>CASCADE_TIMEOUT / CASCADE_ERROR"]
+    end
+    B -- "not COMPLETE" --> AG
+    CAND -- "empty" --> AG
+    GATE2 -- "REJECT / UNCERTAIN" --> AG
+    REASONS -.- AG
+
+    CERT["Certified ACTION turn — NEW TurnRequirements<br/>requested_action {tool, args, capability_id,<br/>index-version TOCTOU stamp, funnel_stage, funnel_kind}<br/>per-kind gate: private/web switches, default OFF"]
+    B -- COMPLETE --> CERT
+
+    subgraph runtime["ONE shared execution waterfall — no second authority"]
+        RW["ToolRuntime.execute: auth → approval → sandbox /<br/>source-policy guards → tool body → events / audit"]
+    end
+    CERT --> RW
+    AG -- "every agent tool call" --> RW
+
+    OBS["funnel_trace + session event row (execution_mode-tagged)<br/>deepest stage · matcher · recall top · tool-intent verdict ·<br/>final route · per-stage latency — the tuning panel"]
+    cascade -.- OBS
+```
+
+</details>
+
+> **Intent-Funnel invariants** — nodes speak only through `contract.py` structures; the Matcher
+> holds zero hardcoded business rules (safety vetoes are funnel-common-layer code); Recall filters,
+> never decides; exactly ONE ToolIntentModel call per turn (the recheck second hop was measured to
+> add zero information and deleted); a backend's own failure is an `Unavailable` fall-through, never
+> a fabricated verdict; the Adapter accepts both wire formats a tool-tuned model emits
+> (native function-calls and its structured Markdown block) but strictness is asymmetric — a
+> well-formed block always binds, prose never pretends to be a call; every non-COMPLETE outcome
+> leaves the Agent's input byte-identical; the funnel executes nothing — certified and agent turns
+> traverse the same waterfall.
+> Design: [architecture.md §25 — Chat Intent Funnel](architecture.md#25-chat-intent-funnel--nodeized-routing-toolintentmodel--shared-tool-runtime).
+
 > [architecture.md](architecture.md) is the single source of truth for the full design —
 > tech stack, repository layout, agent-kernel internals, tool runtime, data model, and deployment
 > topology (including what is implemented today vs. designed-only).
