@@ -325,6 +325,9 @@ async def test_judge_online_serves_and_forwards_dedicated_channel(monkeypatch):
         "model": "tiny-judge", "base_url": "https://cheap.example/v1",
         "api_key": "sk-test", "timeout": settings.chat_judge_timeout_seconds,
         "temperature": 0.0,
+        # 2026-09-24 latency pins (judge call site, not the global knob):
+        # reasoning explicitly off + hard output bound for the verdict.
+        "max_tokens": 100, "disable_thinking": True,
     }
 
 

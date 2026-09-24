@@ -154,6 +154,8 @@ class OpenAILLM:
         response_format: dict | None = None,
         usage_out: dict | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
+        disable_thinking: bool = False,
     ) -> str:
         """One streamed completion, accumulated to the full text.
 
@@ -165,6 +167,11 @@ class OpenAILLM:
         ``llm_disable_thinking``) removes reasoning tokens — pure latency for
         schema-validated JSON output. Interactive chat paths are untouched.
 
+        ``max_tokens`` bounds the output length for callers whose reply shape is
+        known small (judge verdicts); ``disable_thinking`` makes the thinking-off
+        request EXPLICIT at that call site instead of riding the global knob —
+        the two judge experiments (2026-09-24) pin both per-call.
+
         When ``usage_out`` is given, the provider's real token counts are merged into
         it (``stream_options.include_usage``): the usage chunk arrives last, with no
         choices — reading it off the stream keeps instrumentation honest (no estimates).
@@ -174,11 +181,13 @@ class OpenAILLM:
             # None keeps the historical 0.3; per-call overrides (judge) ask for 0.0.
             "temperature": 0.3 if temperature is None else temperature,
         }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if response_format:
             kwargs["response_format"] = response_format
         if usage_out is not None:
             kwargs["stream_options"] = {"include_usage": True}
-        if settings.llm_disable_thinking:
+        if settings.llm_disable_thinking or disable_thinking:
             kwargs["extra_body"] = {"enable_thinking": False}
         stream = await client.chat.completions.create(**kwargs)
         parts: list[str] = []
@@ -225,6 +234,8 @@ class OpenAILLM:
         usage_out: dict | None = None,
         images: list[str] | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
+        disable_thinking: bool = False,
     ) -> dict:
         """Structured completion: ask the provider for a JSON object.
 
@@ -235,6 +246,8 @@ class OpenAILLM:
         full-context generations (toolkit); under the streaming wire it is an idle-between-
         chunks deadline, not a total-generation cutoff. ``images`` (data-URL list) makes
         the user turn multimodal — used by the deck visual-understanding pass.
+        ``max_tokens``/``disable_thinking`` are pinned per-call by the funnel judge
+        (2026-09-24 latency experiments); every other caller keeps the old behavior.
         """
         client, mdl = self._call_channel(model, base_url, api_key, timeout=timeout)
         try:
@@ -243,6 +256,8 @@ class OpenAILLM:
                 response_format={"type": "json_object"},
                 usage_out=usage_out,
                 temperature=temperature,
+                max_tokens=max_tokens,
+                disable_thinking=disable_thinking,
             )
         except Exception as exc:
             raise raise_classified(exc) from exc

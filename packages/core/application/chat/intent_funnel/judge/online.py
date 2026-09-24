@@ -36,6 +36,12 @@ def _channel_kwargs() -> dict:
     return kw
 
 
+# 2026-09-24 latency experiments, pinned AT the judge call site (not riding the
+# global knob): reasoning explicitly off + a hard output bound. The verdict is
+# {capability_id, confidence} — a few dozen tokens is generous.
+JUDGE_MAX_TOKENS = 100
+
+
 async def judge(query: str, candidates, entries_by_id: dict, *, llm) -> dict:
     from core.config import settings
 
@@ -46,6 +52,8 @@ async def judge(query: str, candidates, entries_by_id: dict, *, llm) -> dict:
             build_prompt(query, candidates, entries_by_id), system_prompt=SYSTEM,
             timeout=settings.chat_judge_timeout_seconds,
             temperature=0.0,
+            max_tokens=JUDGE_MAX_TOKENS,
+            disable_thinking=True,
             **_channel_kwargs(),
         )
     except Exception as exc:  # noqa: BLE001 - transport/auth/parse faults all mean "unavailable"
