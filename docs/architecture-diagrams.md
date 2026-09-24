@@ -390,7 +390,7 @@ never the funnel's — a certified turn dispatches through the same shared water
 <summary>Mermaid source (for editing — regenerate via mermaid.ink)</summary>
 
 ```mermaid
-flowchart LR
+flowchart TB
     %% Invariants: the funnel produces routing metadata only · every abstain/fault returns the
     %% ORIGINAL TurnRequirements object (byte-identical, zero pollution) · at most ONE model call
     %% per turn (chain ruling 2026-09-24) · gates default OFF · an off-card id is never a verdict.
@@ -407,7 +407,7 @@ flowchart LR
     USER --> SHADOW
 
     subgraph cascade["Single-hop cascade (wall-clock budget chat_funnel_timeout_seconds)"]
-        direction LR
+        direction TB
         REG["Registry active view + paired Recall index<br/>(Build-Then-Swap pair — read together or not at all)<br/>missing ⇒ REGISTRY_UNAVAILABLE / RECALL_UNAVAILABLE"]
         M["Node 1 · Matcher — table data only<br/>patterns/aliases · re: = regex search, else the whole<br/>normalized query must equal a literal<br/>negation guard before certifying (common layer)<br/>HIT · MISS · MATCH_AMBIGUOUS (all claimants up)"]
         R["Node 2 · Recall — cosine top_k ≥ min_score<br/>quality-gate candidates ONLY, never adjudicates<br/>(origin=recall, calibrated score)"]
@@ -432,14 +432,16 @@ flowchart LR
     CAND --> TI
 
     subgraph exits["Fail-open exits — reason codes carry the stage prefix"]
-        direction TB
+        direction LR
         AG["Agent fallback — ReactLoopAgent, full autonomy<br/>original query BYTE-IDENTICAL · never a<br/>side effect precedes the fallback"]
         REASONS["NO_CANDIDATE · REGISTRY_UNAVAILABLE · RECALL_TIMEOUT /<br/>UNAVAILABLE · TOOL_INTENT_REJECT / UNCERTAIN / TIMEOUT ·<br/>REGISTRY_VERSION_MISMATCH · FUNNEL_KIND_DISABLED ·<br/>BIND_MISSING / AMBIGUOUS / INVALID ·<br/>CASCADE_TIMEOUT / CASCADE_ERROR"]
         REASONS -.- AG
     end
     CAND -- empty --> AG
     GATE2 -- "REJECT / UNCERTAIN" --> AG
-    GATE2 -- "CONFIDENT → entry still honored<br/>· kind ON (else VERSION_MISMATCH /<br/>KIND_DISABLED — see exits)" --> B
+    GATE2 -- CONFIDENT --> POST["post-verdict gates (funnel.py, between the<br/>verdict and the Binder): entry still in the active<br/>table? · kind_enabled? — deny ⇒ fail-open to Agent"]
+    POST -. "REGISTRY_VERSION_MISMATCH /<br/>FUNNEL_KIND_DISABLED" .-> AG
+    POST --> B
     B -- "not COMPLETE" --> AG
 
     CERT["Certified ACTION turn — NEW TurnRequirements<br/>requested_action {tool, args, capability_id,<br/>index-version TOCTOU stamp, funnel_stage, funnel_kind,<br/>funnel_registry_version = Registry fingerprint}"]
