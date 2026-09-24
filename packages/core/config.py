@@ -169,6 +169,18 @@ class Settings(BaseSettings):
     # the quantization in the tag; swap provider/model via this key +
     # TOOL_INTENT_OLLAMA_MODEL (compose), never by touching the chain.
     chat_tool_intent_local_model: str = "qwen3:0.6b-q4_K_M"
+    # Output discipline of the LOCAL provider (Adapter-layer, NOT chain logic):
+    #   "prompt_json" — the original card contract: SYSTEM asks for a JSON reply
+    #                   and the adapter brace-parses it (what a base instruct model
+    #                   like qwen3:0.6b emits well). DEFAULT = today's behavior.
+    #   "tools"       — native function-calling: one OpenAI tool per candidate
+    #                   (name = Registry capability_id, params = Registry schema);
+    #                   the adapter reads message.tool_calls back into the SAME
+    #                   {capability_id, arguments} ModelResult. Chosen for tool-tuned
+    #                   checkpoints that leak markdown/prose under prompt_json.
+    # The reply->verdict translation still validates capability_id against the
+    # candidate set and defers argument correctness to the Binder either way.
+    chat_tool_intent_local_mode: str = "prompt_json"
     # Online model rides a DEDICATED small-model channel (8.17 "小模型层"), explicit
     # per-call forwarding like the session-summary seam; "" model = ride the pinned
     # turn channel (legacy behavior), base_url+api_key must be set together to pin
