@@ -14,7 +14,10 @@ The 13 coverage items and where they are pinned:
   4 Registry       HIT from the table + fail-open when the view faults;
   5 Recall         paraphrase lane scores through the quality gate;
   6 Judge          stub CONFIDENT on a single recall candidate /
-                   UNCERTAIN escalation of a matcher split;
+                   UNCERTAIN escalation of a matcher split /
+                   the 8.17 ladder: auto falls local(absent)->online, online
+                   serves the certification AND the 8.7 recheck through the
+                   router (guardrail timeout + temp 0 forwarding asserted);
   7 Decision       the arbiter runs (NONE and off-card both collapse to Agent);
   8 Binder         HIT + unquotable name -> BIND_MISSING -> Agent asks;
   9 Runtime        the ASK approval frame surfaces (WRITE not pre-granted);
@@ -71,9 +74,11 @@ from tests.p5_validation._p5_harness import (
 from tests.p5_validation.test_p5_smoke import _gate
 
 FUNNEL_LOGGER = "core.application.chat.intent_funnel.funnel"
+SHADOW_LOGGER = "core.application.chat.intent_funnel.shadow"
 MSG_FOLDER = '新建文件夹"季度报告"'
 MSG_PARAPHRASE = '创建文件夹"资料归档"'
 MSG_BARE = "新建文件夹"
+MSG_NEGATED = '不要新建文件夹"垃圾堆"'
 MSG_COMPOUND = '新建文件夹"季度报告"并把"keystone"加入我的词汇库'
 STEP = {"content": ["Agent took over."], "tool_calls": None}
 
@@ -153,10 +158,29 @@ class DecisionDouble:
         return {"capability_id": self.cap_id, "rationale": "e2e double"}
 
 
-def _funnel_gates(monkeypatch, *, mode="on", timeout=5.0):
+class JudgeDouble:
+    """Node 3's online backend double (8.17): canned {capability_id,
+    confidence} replies; records the per-call kwargs so the dedicated-channel
+    forwarding (timeout/temperature) is assertable through the router."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = 0
+        self.prompts: list[str] = []
+        self.kwargs: list[dict] = []
+
+    async def complete_json(self, prompt, *, system_prompt=None, **kw):
+        self.calls += 1
+        self.prompts.append(prompt)
+        self.kwargs.append(kw)
+        return self.replies.pop(0) if self.replies else {}
+
+
+def _funnel_gates(monkeypatch, *, mode="on", timeout=5.0, judge_backend="stub"):
     monkeypatch.setattr(settings, "chat_funnel_enabled", True)
     monkeypatch.setattr(settings, "chat_matcher_mode", mode)
-    monkeypatch.setattr(settings, "chat_judge_backend", "stub")
+    monkeypatch.setattr(settings, "chat_judge_backend", judge_backend)
+    monkeypatch.setattr(settings, "chat_judge_local_url", "")  # not deployed (8.17 ruling)
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", timeout)
     monkeypatch.setattr(settings, "chat_funnel_top_k", 3)
     monkeypatch.setattr(settings, "chat_funnel_min_score", 0.82)
@@ -197,7 +221,8 @@ def _retire_l0(monkeypatch):
 
 
 def _setup(monkeypatch, *, mode="on", timeout=5.0, steps=None, delay=0.0,
-           decision=None, retire=False, view=None, boom=False):
+           decision=None, judge=None, judge_backend="stub", retire=False,
+           view=None, boom=False):
     port = ScriptedPort(steps=steps if steps is not None else [STEP])
     spy = Spy()
     kernel, _, _, broker = build_kernel(monkeypatch, port, spy,
@@ -209,9 +234,11 @@ def _setup(monkeypatch, *, mode="on", timeout=5.0, steps=None, delay=0.0,
     monkeypatch.setattr(chat_mod, "SessionLocal", lambda: _HttpSession(shared))
     embedder = FunnelEmbed(delay=delay)
     monkeypatch.setattr(chat_mod, "_embedder", lambda: embedder)
-    if decision is not None:
-        monkeypatch.setattr(chat_mod, "llm", decision)
-    _funnel_gates(monkeypatch, mode=mode, timeout=timeout)
+    double = judge if judge is not None else decision
+    if double is not None:
+        monkeypatch.setattr(chat_mod, "llm", double)
+    _funnel_gates(monkeypatch, mode=mode, timeout=timeout,
+                  judge_backend=judge_backend)
     _wire_world(monkeypatch, embedder=embedder, view=view, boom=boom)
     if retire:
         _retire_l0(monkeypatch)
@@ -386,3 +413,72 @@ async def test_multi_turn_routing_does_not_leak_state(monkeypatch, caplog):
     assert evs[1].final_route == "agent"
     assert evs[0].fallback_reason == "-" and evs[1].fallback_reason == REASON_NO_CANDIDATE
     assert evs[0].session_id == evs[1].session_id == session
+
+
+# ── 6+: the REAL judge ladder (8.17) through the router — auto falls local→online ──
+
+async def test_judge_auto_falls_through_to_online_and_certifies(monkeypatch, caplog):
+    # The paraphrase reaches Judge with one recall candidate; backend=auto with
+    # local undeployed must fall through to online (deps.llm seam), and the
+    # dedicated-channel forwarding (timeout guardrail + temperature 0) is what
+    # the router really sent.
+    jd = JudgeDouble([{"capability_id": "cap-folder", "confidence": 0.9}])
+    app, port, spy, _db, _emb, _ = _setup(monkeypatch, mode="off", retire=True,
+                                        judge=jd, judge_backend="auto")
+    caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
+    await sse(app, MSG_PARAPHRASE)
+
+    assert spy.folders_created == [(str(USER), "资料归档")]      # online verdict executed
+    assert port.steps == 0
+    assert jd.calls == 1                                        # local absent: online served once
+    kw = jd.kwargs[0]
+    assert kw["timeout"] == settings.chat_judge_timeout_seconds
+    assert kw["temperature"] == 0.0
+    assert "model" not in kw                                    # unconfigured: rides pinned channel
+    assert _field(_trace(caplog), "judge") == "CONFIDENT:cap-folder"
+
+
+async def test_recheck_runs_over_online_and_escalates_bind_missing(monkeypatch, caplog):
+    # mode off: the matcher HIT joins candidates, Judge CONFIDENTs it, the
+    # Binder still abstains (bare name) — and the 8.7 recheck really consults
+    # the online backend a second time before the BIND_MISSING fallback.
+    conf = {"capability_id": "cap-folder", "confidence": 0.9}
+    jd = JudgeDouble([conf, conf])
+    app, port, spy, _db, _emb, _ = _setup(monkeypatch, mode="off", judge=jd,
+                                        judge_backend="auto")
+    caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
+    await sse(app, MSG_BARE)
+
+    assert spy.folders_created == []
+    assert port.steps == 1 and port.requests[-1][-1]["content"] == MSG_BARE
+    assert jd.calls == 2                                        # adjudicate + recheck, both online
+    assert "binding problem: missing" in jd.prompts[1]          # 8.7 probe carries the issue
+    trace = _trace(caplog)
+    assert _field(trace, "judge") == "recheck:CONFIDENT"
+    assert _field(trace, "fallback_reason") == REASON_BIND_MISSING
+
+
+async def test_negated_demand_is_missed_before_certification(monkeypatch, caplog):
+    # 8.1-a: the guard turns the table HIT into a MISS at the router level —
+    # the turn fails open to the Agent byte-identical and nothing executes.
+    app, port, spy, _db, _emb, _ = _setup(monkeypatch, retire=True)
+    caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
+    res = await sse(app, MSG_NEGATED)
+
+    assert spy.folders_created == []
+    assert port.steps == 1 and port.requests[-1][-1]["content"] == MSG_NEGATED
+    trace = _trace(caplog)
+    assert _field(trace, "matcher") == "MISS:-"
+    assert _field(trace, "fallback_reason") == REASON_NO_CANDIDATE
+    assert res.answer == "Agent took over."
+
+
+# ── shadow tri-state at the router: mode off emits zero observation records ───────
+
+async def test_matcher_mode_off_records_no_shadow_telemetry(monkeypatch, caplog):
+    app, _port, _spy, _db, _emb, _ = _setup(monkeypatch, mode="off")
+    caplog.set_level(logging.INFO, logger=SHADOW_LOGGER)
+    await sse(app, MSG_FOLDER)
+
+    assert not [r for r in caplog.records
+                if r.name == SHADOW_LOGGER and "matcher_shadow" in r.getMessage()]

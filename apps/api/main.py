@@ -21,6 +21,7 @@ from api.routers.drive import users as drive_users_router
 from api.routers.drive import workspaces as drive_workspaces_router
 from api.routers.jobs import router as jobs_router
 from api.routers.rag_admin import router as rag_admin_router
+from api.routers.registry_admin import router as registry_admin_router
 from api.routers.research import research_validation_handler
 from api.routers.research import router as research_router
 from api.routers.sessions import router as sessions_router
@@ -164,6 +165,7 @@ app.include_router(sessions_router)
 app.include_router(jobs_router)
 app.include_router(rag_admin_router)
 app.include_router(research_router)
+app.include_router(registry_admin_router)
 
 
 @app.get("/health")
