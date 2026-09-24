@@ -6,33 +6,37 @@ ExecutionPlan → ActionExecutor → the REAL ``chat._run_tool`` → ToolRuntime
 sandbox ASK → approval → real tool bodies. Only the outer world is faked
 (LLM port, Registry/Index contents, embedder, drive).
 
-The 13 coverage items and where they are pinned:
+The 12 coverage items and where they are pinned:
 
   1 login          every turn runs through the authenticated dependency;
   2 DB             one chat_funnel_events row per routed turn (8.12);
   3 Intent         plain chat: funnel abstains, Agent keeps the text;
   4 Registry       HIT from the table + fail-open when the view faults;
   5 Recall         paraphrase lane scores through the quality gate;
-  6 Judge          stub CONFIDENT on a single recall candidate /
-                   UNCERTAIN escalation of a matcher split /
-                   the 8.17 ladder: auto falls local(absent)->online, online
-                   serves the certification AND the 8.7 recheck through the
-                   router (guardrail timeout + temp 0 forwarding asserted);
-  7 Decision       the arbiter runs (NONE and off-card both collapse to Agent);
-  8 Binder         HIT + unquotable name -> BIND_MISSING -> Agent asks;
-  9 Runtime        the ASK approval frame surfaces (WRITE not pre-granted);
- 10 execution      the tool body really writes (spy) + deterministic confirmation;
- 11 fallback       Agent input byte-identical on every abstain (8.10);
- 12 failure/timeout fail-open: registry fault / slow embedder never sink a turn;
- 13 multi-turn     certified turn then a plain turn in one session: two event
+  6 Model A        single hop on BOTH lanes (8.17 ladder: auto falls
+                   local(absent)->online): the one call selects AND extracts;
+                   dedicated-channel forwarding (timeout guardrail + temp 0)
+                   asserted through the router; NONE / off-card escalate;
+  7 Binder         validate-only: a CONFIDENT verdict without an extractable
+                   argument exits BIND_MISSING and the Agent owns the ask;
+                   the stub's zero extraction power is honest through the
+                   router (it certifies WHICH, never WITH WHAT);
+  8 Runtime        the ASK approval frame surfaces (WRITE not pre-granted);
+  9 execution      the tool body really writes (spy) + deterministic confirmation;
+ 10 fallback       Agent input byte-identical on every abstain (8.10);
+ 11 failure/timeout fail-open: registry fault / slow embedder never sink a turn;
+ 12 multi-turn     certified turn then a plain turn in one session: two event
                    rows, routing never leaks state.
 
-Coexistence note: while L0 is in charge the funnel only sees turns L0
-abstained from, and the Binder shares L0's extractor — so the certified-
-EXECUTION legs patch ``understanding.match_direct_tool`` to abstain, which is
-exactly the post-P2-promotion world the design targets (Matcher replaces L0).
-Everything else runs with L0 fully live, proving the byte-identical
-coexistence contract.
+Chain ruling 2026-09-24: the active path is Matcher HIT / Recall -> ONE Model A
+call -> Binder validate -> runtime. No second hop, no Decision node — several
+tests pin "exactly one model-A call per routed turn".
+
+Coexistence note: while L0 is in charge the funnel only sees turns L0 abstained
+from — so the certified-EXECUTION legs patch ``understanding.match_direct_tool``
+to abstain, which is exactly the post-P2-promotion world the design targets
+(Matcher replaces L0). Everything else runs with L0 fully live, proving the
+byte-identical coexistence contract.
 """
 from __future__ import annotations
 
@@ -46,7 +50,8 @@ from api.routers import chat as chat_mod
 from core.application.chat import understanding as understanding_mod
 from core.application.chat.intent_funnel.contract import (
     REASON_BIND_MISSING,
-    REASON_DECISION_NONE,
+    REASON_JUDGE_REJECT,
+    REASON_JUDGE_UNCERTAIN,
     REASON_NO_CANDIDATE,
     REASON_RECALL_TIMEOUT,
     REASON_REGISTRY_UNAVAILABLE,
@@ -92,6 +97,8 @@ def _entries() -> tuple[CapabilityEntry, ...]:
             description="新建一个带引号名称的文件夹。",
             patterns=("re:新建文件夹",), aliases=(MSG_FOLDER,),
             examples=(MSG_FOLDER,),
+            parameters={"name": {"type": "string", "required": True,
+                                 "max_len": 120, "description": "folder name"}},
             arg_slots={"name": {"source": "user_input"}},
             intent_kind=KIND_ACTION,
         ),
@@ -100,6 +107,10 @@ def _entries() -> tuple[CapabilityEntry, ...]:
             description="把一个词加入词汇库。",
             patterns=("re:加入我的.*词汇库",), aliases=(),
             examples=('把"keystone"加入我的词汇库',),
+            parameters={"term": {"type": "string", "required": True,
+                                 "max_len": 120, "description": "the term"},
+                        "domain": {"type": "string", "required": True,
+                                   "max_len": 60, "description": "vocabulary domain"}},
             arg_slots={"term": {"source": "user_input"},
                        "domain": {"source": "user_input"}},
             intent_kind=KIND_ACTION,
@@ -146,22 +157,11 @@ class FunnelEmbed:
                 for t in texts]
 
 
-class DecisionDouble:
-    """Node 4's LLM: complete_json is the frozen arbiter contract."""
-
-    def __init__(self, cap_id: str):
-        self.cap_id = cap_id
-        self.calls = 0
-
-    async def complete_json(self, prompt, *, system_prompt=None, **kw):
-        self.calls += 1
-        return {"capability_id": self.cap_id, "rationale": "e2e double"}
-
-
 class JudgeDouble:
-    """Node 3's online backend double (8.17): canned {capability_id,
-    confidence} replies; records the per-call kwargs so the dedicated-channel
-    forwarding (timeout/temperature) is assertable through the router."""
+    """Model A's online-backend double (8.17): canned {capability_id,
+    confidence, arguments} replies; records the per-call kwargs so the
+    dedicated-channel forwarding (timeout/temperature) is assertable through
+    the router, and the prompts so "exactly one call per turn" is countable."""
 
     def __init__(self, replies):
         self.replies = list(replies)
@@ -181,6 +181,12 @@ def _funnel_gates(monkeypatch, *, mode="on", timeout=5.0, judge_backend="stub"):
     monkeypatch.setattr(settings, "chat_matcher_mode", mode)
     monkeypatch.setattr(settings, "chat_judge_backend", judge_backend)
     monkeypatch.setattr(settings, "chat_judge_local_url", "")  # not deployed (8.17 ruling)
+    # deterministic dedicated-channel state: unconfigured means "ride the pinned
+    # channel" — the doubles' forwarded kwargs must not depend on a dev .env.
+    monkeypatch.setattr(settings, "chat_judge_online_model", "")
+    monkeypatch.setattr(settings, "chat_judge_online_base_url", "")
+    monkeypatch.setattr(settings, "chat_judge_online_api_key", "")
+    monkeypatch.setattr(settings, "chat_judge_timeout_seconds", 4.0)
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", timeout)
     monkeypatch.setattr(settings, "chat_funnel_top_k", 3)
     monkeypatch.setattr(settings, "chat_funnel_min_score", 0.82)
@@ -221,7 +227,7 @@ def _retire_l0(monkeypatch):
 
 
 def _setup(monkeypatch, *, mode="on", timeout=5.0, steps=None, delay=0.0,
-           decision=None, judge=None, judge_backend="stub", retire=False,
+           judge=None, judge_backend="stub", retire=False,
            view=None, boom=False):
     port = ScriptedPort(steps=steps if steps is not None else [STEP])
     spy = Spy()
@@ -234,9 +240,8 @@ def _setup(monkeypatch, *, mode="on", timeout=5.0, steps=None, delay=0.0,
     monkeypatch.setattr(chat_mod, "SessionLocal", lambda: _HttpSession(shared))
     embedder = FunnelEmbed(delay=delay)
     monkeypatch.setattr(chat_mod, "_embedder", lambda: embedder)
-    double = judge if judge is not None else decision
-    if double is not None:
-        monkeypatch.setattr(chat_mod, "llm", double)
+    if judge is not None:
+        monkeypatch.setattr(chat_mod, "llm", judge)
     _funnel_gates(monkeypatch, mode=mode, timeout=timeout,
                   judge_backend=judge_backend)
     _wire_world(monkeypatch, embedder=embedder, view=view, boom=boom)
@@ -285,19 +290,26 @@ async def test_plain_chat_abstains_and_lands_one_production_event(monkeypatch, c
     assert ev.index_version == "idx-e2e"
 
 
-# ── 4+9+10: Matcher-certified turn executes through the REAL runtime ───────────────
-
+# ── 4+8+9: Matcher HIT -> one Model A call (select+extract) -> executes through the
+#    REAL runtime
 async def test_matcher_certified_turn_executes_through_sandbox(monkeypatch, caplog):
-    app, port, spy, db, emb, broker = _setup(monkeypatch, retire=True)
+    jd = JudgeDouble([{"capability_id": "cap-folder", "confidence": 0.9,
+                       "arguments": {"name": "季度报告"}}])
+    app, port, spy, db, emb, broker = _setup(monkeypatch, retire=True,
+                                             judge=jd, judge_backend="online")
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     res = await sse(app, MSG_FOLDER)
 
     assert spy.folders_created == [(str(USER), "季度报告")]     # real tool body, once
     assert "Created folder" in (res.answer or "")               # deterministic confirmation
-    assert port.steps == 0 and port.single_shot == 0            # zero LLM on this lane
-    assert res.approvals                                        # 9: WRITE surfaced ASK, allowed
+    assert port.steps == 0 and port.single_shot == 0            # zero Agent LLM on this lane
+    assert jd.calls == 1                                        # the ONE Model A call
+    assert "origin=matcher_hit" in jd.prompts[0]                # HIT enters the same hop
+    assert res.approvals                                        # 8: WRITE surfaced ASK, allowed
     trace = _trace(caplog)
     assert _field(trace, "matcher") == "HIT:cap-folder"
+    assert _field(trace, "judge") == "CONFIDENT:cap-folder"
+    assert _field(trace, "decision") == "-"                     # column retired, stable "-"
     assert _field(trace, "final_route") == "action"
     assert emb.queries == []                                    # deterministic: no embedding spend
     ev = _events(db)[0]
@@ -305,15 +317,20 @@ async def test_matcher_certified_turn_executes_through_sandbox(monkeypatch, capl
     assert ev.deepest_stage == "certified"
 
 
-# ── 5+6: the Recall lane — no table hit, the example scores, Judge CONFIDENTs ──────
+# ── 5+6: the Recall lane — no table hit, the example scores, the one call certifies ─
 
-async def test_paraphrase_routes_through_recall_and_judge(monkeypatch, caplog):
-    app, port, spy, db, emb, _ = _setup(monkeypatch, mode="off", retire=True)
+async def test_paraphrase_routes_through_recall_and_model_a(monkeypatch, caplog):
+    jd = JudgeDouble([{"capability_id": "cap-folder", "confidence": 0.9,
+                       "arguments": {"name": "资料归档"}}])
+    app, port, spy, db, emb, _ = _setup(monkeypatch, mode="off", retire=True,
+                                        judge=jd, judge_backend="online")
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     await sse(app, MSG_PARAPHRASE)
 
     assert spy.folders_created == [(str(USER), "资料归档")]
     assert port.steps == 0
+    assert jd.calls == 1
+    assert "origin=recall" in jd.prompts[0]                     # same card format, recall origin
     trace = _trace(caplog)
     assert _field(trace, "matcher") == "MISS:-"
     assert _field(trace, "recall_count") == "1"
@@ -322,32 +339,35 @@ async def test_paraphrase_routes_through_recall_and_judge(monkeypatch, caplog):
     assert emb.queries == [MSG_PARAPHRASE]                      # the spend happened here
 
 
-# ── 7: the Decision node runs — NONE and off-card both escalate to the Agent ───────
+# ── 6/7: Model A's negative exits — NONE rejects, off-card escalates, one call each ─
 
-@pytest.mark.parametrize("verdict", ["NONE", "cap-ghost"],
-                         ids=["arbiter-none", "off-card"])
-async def test_decision_escalation_sends_the_turn_to_the_agent(monkeypatch, caplog,
-                                                               verdict):
-    dec = DecisionDouble(verdict)
-    app, port, spy, db, emb, _ = _setup(monkeypatch, decision=dec, retire=True)
+@pytest.mark.parametrize(
+    "reply,reason",
+    [( {"capability_id": "NONE", "confidence": 1.0}, REASON_JUDGE_REJECT),
+     ( {"capability_id": "cap-ghost", "confidence": 0.9}, REASON_JUDGE_UNCERTAIN)],
+    ids=["model-none", "off-card"])
+async def test_model_a_negative_exits_send_the_turn_to_the_agent(monkeypatch, caplog,
+                                                                 reply, reason):
+    jd = JudgeDouble([reply])
+    app, port, spy, db, emb, _ = _setup(monkeypatch, judge=jd, retire=True,
+                                        judge_backend="online")
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     await sse(app, MSG_COMPOUND)
 
     assert spy.folders_created == [] and spy.terms_added == []  # a split turn executes nothing
     assert port.steps == 1 and port.requests[-1][-1]["content"] == MSG_COMPOUND
-    assert dec.calls == 1                                       # Node 4 was really consulted
+    assert jd.calls == 1                                        # no second hop exists to spend
     trace = _trace(caplog)
-    assert "MATCH_AMBIGUOUS" in _field(trace, "matcher") or "MATCH_AMBIGUOUS" in trace
-    assert _field(trace, "decision") == "NONE"
-    assert _field(trace, "fallback_reason") == REASON_DECISION_NONE
+    assert _field(trace, "fallback_reason") == reason
 
 
-async def test_decision_pick_executes_only_the_chosen_capability(monkeypatch, caplog):
-    # the arbiter CAN route: pick cap-folder among the matcher-ambiguous pair.
-    # The Binder then abstains (compound demand) — proving Decision → Binder
-    # hand-off without executing half a compound request (8.7 last-question).
-    dec = DecisionDouble("cap-folder")
-    app, port, spy, db, emb, _ = _setup(monkeypatch, decision=dec, retire=True)
+async def test_ambiguous_choice_without_arguments_exits_bind_missing(monkeypatch, caplog):
+    # Model A may pick one capability from the matcher-ambiguous pair, but with
+    # no argument draft the Binder's schema gate abstains — the Agent owns the
+    # half-done compound demand (8.7).
+    jd = JudgeDouble([{"capability_id": "cap-folder", "confidence": 0.9}])
+    app, port, spy, db, emb, _ = _setup(monkeypatch, judge=jd, retire=True,
+                                        judge_backend="online")
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     await sse(app, MSG_COMPOUND)
 
@@ -356,9 +376,12 @@ async def test_decision_pick_executes_only_the_chosen_capability(monkeypatch, ca
     assert _field(_trace(caplog), "fallback_reason") == REASON_BIND_MISSING
 
 
-# ── 8: Binder's MISSING exit — the table hit but the name is not quotable ──────────
+# ── 7: Binder's MISSING exit through the REAL router — the stub's zero extraction ───
 
-async def test_binder_missing_escalates_with_the_reason(monkeypatch, caplog):
+async def test_stub_hit_without_extraction_escalates_bind_missing(monkeypatch, caplog):
+    # backend stub (the transition default): the matcher HIT enters the one
+    # Model A hop, the stub certifies WHICH but has no argument power, so the
+    # Binder's validate exits BIND_MISSING — zero LLM calls on the whole turn.
     app, port, spy, db, emb, _ = _setup(monkeypatch)           # L0 live: it abstains here too
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     await sse(app, MSG_BARE)
@@ -367,10 +390,11 @@ async def test_binder_missing_escalates_with_the_reason(monkeypatch, caplog):
     assert port.steps == 1 and port.requests[-1][-1]["content"] == MSG_BARE
     trace = _trace(caplog)
     assert _field(trace, "matcher") == "HIT:cap-folder"
+    assert _field(trace, "judge") == "CONFIDENT:cap-folder"
     assert _field(trace, "fallback_reason") == REASON_BIND_MISSING
 
 
-# ── 12: every fault shape fails OPEN — the turn never sinks ────────────────────────
+# ── 11: every fault shape fails OPEN — the turn never sinks ────────────────────────
 
 async def test_registry_fault_fails_open_to_the_agent(monkeypatch, caplog):
     app, port, spy, db, emb, _ = _setup(monkeypatch, boom=True)
@@ -394,10 +418,13 @@ async def test_slow_recall_times_out_fails_open(monkeypatch, caplog):
     assert _events(db)[0].fallback_reason == REASON_RECALL_TIMEOUT
 
 
-# ── 13: multi-turn — certified then plain in one session, two honest rows ──────────
+# ── 12: multi-turn — certified then plain in one session, two honest rows ──────────
 
 async def test_multi_turn_routing_does_not_leak_state(monkeypatch, caplog):
-    app, port, spy, db, emb, _ = _setup(monkeypatch, retire=True)
+    jd = JudgeDouble([{"capability_id": "cap-folder", "confidence": 0.9,
+                       "arguments": {"name": "季度报告"}}])
+    app, port, spy, db, emb, _ = _setup(monkeypatch, retire=True,
+                                        judge=jd, judge_backend="online")
     session = str(uuid4())
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     await sse(app, MSG_FOLDER, session_id=session)
@@ -407,6 +434,7 @@ async def test_multi_turn_routing_does_not_leak_state(monkeypatch, caplog):
     assert spy.folders_created == [(str(USER), "季度报告")]
     assert port.steps == 1 and port.requests[-1][-1]["content"] == "换个话题吧"
     assert r2.answer == "Agent took over."
+    assert jd.calls == 1                                        # turn 2 never reached Model A
     evs = _events(db)
     assert len(evs) == 2                                        # one row per routed turn
     assert evs[0].final_route == "action" and evs[0].capability_id == "cap-folder"
@@ -422,7 +450,8 @@ async def test_judge_auto_falls_through_to_online_and_certifies(monkeypatch, cap
     # local undeployed must fall through to online (deps.llm seam), and the
     # dedicated-channel forwarding (timeout guardrail + temperature 0) is what
     # the router really sent.
-    jd = JudgeDouble([{"capability_id": "cap-folder", "confidence": 0.9}])
+    jd = JudgeDouble([{"capability_id": "cap-folder", "confidence": 0.9,
+                       "arguments": {"name": "资料归档"}}])
     app, port, spy, _db, _emb, _ = _setup(monkeypatch, mode="off", retire=True,
                                         judge=jd, judge_backend="auto")
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
@@ -438,23 +467,23 @@ async def test_judge_auto_falls_through_to_online_and_certifies(monkeypatch, cap
     assert _field(_trace(caplog), "judge") == "CONFIDENT:cap-folder"
 
 
-async def test_recheck_runs_over_online_and_escalates_bind_missing(monkeypatch, caplog):
-    # mode off: the matcher HIT joins candidates, Judge CONFIDENTs it, the
-    # Binder still abstains (bare name) — and the 8.7 recheck really consults
-    # the online backend a second time before the BIND_MISSING fallback.
+async def test_single_hop_spends_exactly_one_model_a_call(monkeypatch, caplog):
+    # The old BIND_MISSING -> recheck -> Decision ladder is GONE: a CONFIDENT
+    # verdict with no extractable argument exits to the Agent after the ONE
+    # Model A call — no second hop consults the backend again.
     conf = {"capability_id": "cap-folder", "confidence": 0.9}
-    jd = JudgeDouble([conf, conf])
-    app, port, spy, _db, _emb, _ = _setup(monkeypatch, mode="off", judge=jd,
-                                        judge_backend="auto")
+    jd = JudgeDouble([conf, conf])                              # a spare reply must stay unused
+    app, port, spy, _db, _emb, _ = _setup(monkeypatch, mode="off", retire=True,
+                                        judge=jd, judge_backend="auto")
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     await sse(app, MSG_BARE)
 
     assert spy.folders_created == []
     assert port.steps == 1 and port.requests[-1][-1]["content"] == MSG_BARE
-    assert jd.calls == 2                                        # adjudicate + recheck, both online
-    assert "binding problem: missing" in jd.prompts[1]          # 8.7 probe carries the issue
+    assert jd.calls == 1                                        # exactly one hop per turn
     trace = _trace(caplog)
-    assert _field(trace, "judge") == "recheck:CONFIDENT"
+    assert _field(trace, "judge") == "CONFIDENT:cap-folder"
+    assert "recheck" not in trace
     assert _field(trace, "fallback_reason") == REASON_BIND_MISSING
 
 

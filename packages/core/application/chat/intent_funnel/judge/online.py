@@ -1,12 +1,12 @@
-"""Judge backend: online small model via the platform LLM seam (8.17 fallback).
+"""Model A backend: online small model via the platform LLM seam (8.17 fallback).
 
 Discipline (2026-09-23 ruling): thinking is off (the platform-wide
 ``llm_disable_thinking`` knob already does this for the chat route), the
 payload is the minimal card set from :mod:`.base`, temperature 0, and the
-reply is just {capability_id, confidence}. A transport fault is
+reply is just {capability_id, confidence, arguments}. A transport fault is
 :class:`JudgeUnavailable` (fall through the ladder); a low-confidence or
-off-card verdict is UNCERTAIN (escalate upward) — the online judge, like
-every backend, never fabricates.
+off-card verdict is UNCERTAIN — the online Model A, like every backend, never
+fabricates.
 
 Channel (2026-09-24 deployment ruling): the judge rides a DEDICATED
 small-model channel, explicit per-call forwarding like the session-summary
@@ -36,20 +36,22 @@ def _channel_kwargs() -> dict:
     return kw
 
 
-# 2026-09-24 latency experiments, pinned AT the judge call site (not riding the
-# global knob): reasoning explicitly off + a hard output bound. The verdict is
-# {capability_id, confidence} — a few dozen tokens is generous.
-JUDGE_MAX_TOKENS = 100
+# Model A reply: {capability_id, confidence, arguments}. The argument draft
+# adds a short object per required slot — 256 is generous for the seeded
+# single/two-slot tools while keeping the output bound hard.
+JUDGE_MAX_TOKENS = 256
 
 
-async def judge(query: str, candidates, entries_by_id: dict, *, llm) -> dict:
+async def judge(query: str, candidates, entries_by_id: dict, *, llm,
+                facts=None) -> dict:
     from core.config import settings
 
     if llm is None:
-        raise JudgeUnavailable("no llm on deps for the online judge")
+        raise JudgeUnavailable("no llm on deps for the online model A")
     try:
         data = await llm.complete_json(
-            build_prompt(query, candidates, entries_by_id), system_prompt=SYSTEM,
+            build_prompt(query, candidates, entries_by_id, facts=facts),
+            system_prompt=SYSTEM,
             timeout=settings.chat_judge_timeout_seconds,
             temperature=0.0,
             max_tokens=JUDGE_MAX_TOKENS,

@@ -30,6 +30,10 @@ def _entry(cid="cap-a", **kw) -> T.CapabilityEntry:
         aliases=("建个目录",),
         examples=('create a folder named "x"',),
         negatives=("不要新建文件夹",),
+        # 0007: Registry carries the canonical schema — the default entry agrees
+        # with the runtime create_folder slot so the publish-gate bridge passes.
+        parameters={"name": {"type": "string", "required": True,
+                             "max_len": 120, "description": "folder name"}},
         arg_slots={"name": "user_input"},
         permissions="",
         execution_policy="auto",
@@ -367,6 +371,41 @@ def test_validate_rejects_bad_arg_slot_sources(slot, bad):
 def test_validate_rejects_unknown_tool_binding():
     issues = reg.snapshot.validate_entries([_entry(tool_binding="launch_missiles")])
     assert any("DIRECT_TOOLS" in i for i in issues)
+
+
+def test_validate_requires_a_non_empty_layered_recall_corpus():
+    # 0007: ANY corpus layer may feed the index — standard_example,
+    # synonym_examples or the legacy examples; a blank-only row recalls nothing.
+    ok = _entry(examples=(), standard_example="新建一个文件夹",
+                synonym_examples=("建个目录",))
+    assert not [i for i in reg.snapshot.validate_entries([ok]) if "corpus" in i]
+    empty = _entry(examples=(), standard_example="  ", synonym_examples=("",))
+    assert any("recall corpus" in i
+               for i in reg.snapshot.validate_entries([empty]))
+
+
+def test_publish_gate_bridges_registry_parameters_to_runtime_schema():
+    # 0007 ruling: Registry ``parameters`` is the CANONICAL schema and this
+    # gate is the ONLY DIRECT_TOOLS cross-check (no dual independent sources,
+    # no human sync burden). Every drift direction must be rejected:
+    missing = _entry(parameters={})                     # create_folder needs 'name'
+    assert any("missing runtime slot" in i
+               for i in reg.snapshot.validate_entries([missing]))
+    extra = _entry(tool_binding="add_term", parameters={
+        "term": {"type": "string", "required": True, "max_len": 120, "description": "t"},
+        "domain": {"type": "string", "required": True, "max_len": 60, "description": "d"},
+        "ghost": {"type": "string", "required": True, "description": "g"},
+    })
+    assert any("unknown to runtime" in i
+               for i in reg.snapshot.validate_entries([extra]))
+    drift = _entry(parameters={"name": {"type": "string", "required": True,
+                                        "max_len": 999, "description": "n"}})
+    assert any("max_len" in i for i in reg.snapshot.validate_entries([drift]))
+    shape = _entry(parameters={"name": {"description": "no type, no required"}})
+    assert any(".type is required" in i
+               for i in reg.snapshot.validate_entries([shape]))
+    # the agreeing default entry passes the bridge silently
+    assert not [i for i in reg.snapshot.validate_entries([_entry()]) if "parameters" in i]
 
 
 def test_validate_rejects_deterministic_pattern_conflict_between_routable_caps():

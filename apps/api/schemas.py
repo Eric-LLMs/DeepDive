@@ -640,6 +640,11 @@ class RegistryDraftCreateRequest(BaseModel):
     aliases: list[str] = []
     examples: list[str] = []
     negatives: list[str] = []
+    # 0007 chain ruling: the recall corpus is layered (standard -> synonyms ->
+    # legacy examples) and ``parameters`` is the CANONICAL argument schema.
+    standard_example: str = ""
+    synonym_examples: list[str] = []
+    parameters: dict = {}
     arg_slots: dict = {}
     permissions: str = ""
     execution_policy: str = "auto"

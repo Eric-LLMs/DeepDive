@@ -138,10 +138,15 @@ def test_reason_code_constants_avoid_bare_ambiguous():
 def test_contracts_are_frozen():
     for cls in (
         contract.MatchResult, contract.Candidate, contract.RecallResult,
-        contract.JudgeVerdict, contract.DecisionResult, contract.BoundArguments,
+        contract.JudgeVerdict, contract.BoundArguments,
         contract.IntentVerdict, contract.AgentFallback,
     ):
         assert cls.__dataclass_params__.frozen, cls.__name__
+    # chain ruling 2026-09-24: the Decision node is gone from the contract, and
+    # with it the second-hop recheck entry point.
+    assert not hasattr(contract, "DecisionResult")
+    from core.application.chat.intent_funnel import judge
+    assert not hasattr(judge, "recheck")
 
 
 async def test_orchestrator_calls_funnel_once_with_requirements(monkeypatch):

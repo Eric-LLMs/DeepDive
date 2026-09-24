@@ -3,7 +3,7 @@
 Pinning the P4 rulings:
 
 * 8.5: the console can dry-run ONE query through the WHOLE chain
-  (Registry → Matcher → Recall → Judge → Decision → Binder → Final Route)
+  (Registry → Matcher → Recall → Model A → Binder → Final Route)
   with zero side effects — run_tool is not even on the preview object graph;
 * the preview is not gated by ``chat_funnel_enabled`` (the production gate
   gates PRODUCTION traffic; an admin console must be able to inspect the dark
@@ -20,6 +20,7 @@ Pinning the P4 rulings:
 """
 from __future__ import annotations
 
+import re
 import types
 
 import pytest
@@ -46,7 +47,10 @@ def _entry(cid, *, tool="create_folder", patterns=(), aliases=(), kind=KIND_ACTI
         capability_id=cid, tool_binding=tool,
         description=description or f"does {cid}",
         patterns=tuple(patterns), aliases=tuple(aliases),
-        examples=("做个事",), arg_slots={"name": {"source": "user_input"}},
+        examples=("做个事",),
+        parameters={"name": {"type": "string", "required": True,
+                             "max_len": 120, "description": "folder name"}},
+        arg_slots={"name": {"source": "user_input"}},
         intent_kind=kind, **kw,
     )
 
@@ -90,9 +94,29 @@ def _open(monkeypatch, *, mode="off", private=False, funnel_on=True):
     monkeypatch.setattr(settings, "chat_fast_paths_enabled", True)
     monkeypatch.setattr(settings, "chat_action_fast_path_enabled", True)
     monkeypatch.setattr(settings, "chat_matcher_mode", mode)
-    monkeypatch.setattr(settings, "chat_judge_backend", "stub")
+    # certification lanes need real argument drafts: ride the online seam with
+    # the scripted Model A double (the stub's zero extraction power is pinned
+    # in test_funnel_p2; here the ops plane is the subject)
+    monkeypatch.setattr(settings, "chat_judge_backend", "online")
+    monkeypatch.setattr(settings, "chat_judge_min_confidence", 0.75)
+    monkeypatch.setattr(settings, "chat_judge_online_model", "")
+    monkeypatch.setattr(settings, "chat_judge_timeout_seconds", 4.0)
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", 5.0)
     monkeypatch.setattr(settings, "chat_funnel_private_enabled", private)
+
+
+class _ScriptedModelA:
+    """Deterministic single-hop double: one card -> select it and quote-strip
+    the name slot; a split card set -> the honest NONE."""
+
+    async def complete_json(self, prompt, **kw):
+        caps = re.findall(r"(?m)^### (\S+)$", prompt)
+        if len(caps) != 1:
+            return {"capability_id": "NONE", "confidence": 1.0, "arguments": {}}
+        m = re.search(r"<user_sentence>(.*?)</user_sentence>", prompt, re.DOTALL)
+        quoted = re.search(r'"([^"]+)"', m.group(1) if m else "")
+        args = {"name": quoted.group(1)} if quoted else {}
+        return {"capability_id": caps[0], "confidence": 0.95, "arguments": args}
 
 
 class _FakeSession:
@@ -127,7 +151,8 @@ def _wire(monkeypatch, *, view, index=None, embedder=None, llm=None,
         "core.application.chat.intent_funnel.recall.load_index", fake_load)
     return types.SimpleNamespace(
         session_factory=session_factory,
-        embedder=lambda: (embedder or _Embedder()), llm=llm,
+        embedder=lambda: (embedder or _Embedder()),
+        llm=llm if llm is not None else _ScriptedModelA(),
     )
 
 
@@ -147,7 +172,9 @@ async def test_preview_certifies_and_reports_the_whole_chain(monkeypatch):
     assert res["route"]["capability_id"] == "cap-a"
     assert res["route"]["tool"] == "create_folder"
     assert res["route"]["args"] == {"name": "季度报告"}
-    assert res["route"]["funnel_stage"] == "matcher"
+    # single-hop chain: every certified lane exits through the Model A stage
+    # (the old "matcher" direct-certification stage is deleted)
+    assert res["route"]["funnel_stage"] == "model_a"
     assert res["route"]["funnel_kind"] == KIND_ACTION
 
 

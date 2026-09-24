@@ -50,6 +50,16 @@ class CapabilityEntry:
     aliases: tuple[str, ...] = ()
     examples: tuple[str, ...] = ()
     negatives: tuple[str, ...] = ()
+    # 0007 (chain ruling 2026-09-24): the recall corpus is layered —
+    # standard_example (the canonical sentence) + synonym_examples (synonymous
+    # phrasings) + examples (legacy candidate expressions). Every sentence is
+    # embedded on its own; they all map back to this one capability_id.
+    standard_example: str = ""
+    synonym_examples: tuple[str, ...] = ()
+    # CANONICAL parameter schema — the Model A Candidate Card assembles from
+    # HERE, never from the runtime's DIRECT_TOOLS compat layer. Shape:
+    # {name: {"type": str, "description": str, "required": bool, "max_len": int?}}
+    parameters: dict[str, Any] = field(default_factory=dict)
     arg_slots: dict[str, Any] = field(default_factory=dict)
     permissions: str = ""
     execution_policy: str = "auto"
@@ -60,15 +70,28 @@ class CapabilityEntry:
     # Optimistic-concurrency token: a write must present the row_version it read.
     row_version: int = 0
 
+    @property
+    def recall_corpus(self) -> tuple[str, ...]:
+        """Every sentence this capability is recalled by, in index order:
+        standard -> synonyms -> legacy candidate examples (blank entries out)."""
+        out: list[str] = []
+        for text in (self.standard_example, *self.synonym_examples, *self.examples):
+            s = str(text or "").strip()
+            if s and s not in out:
+                out.append(s)
+        return tuple(out)
+
     def to_capability(self) -> Capability:
         """Project to the runtime's frozen Capability (routing metadata only —
         Matcher patterns/aliases and arg_slots stay in the Registry row, they are
-        consumed by their own nodes, never smuggled through the QIR contract)."""
+        consumed by their own nodes, never smuggled through the QIR contract).
+        ``examples`` carries the FULL recall corpus: the qir index embeds and
+        scores per sentence, so corpus order == example_index order."""
         return Capability(
             id=self.capability_id,
             tool_binding=self.tool_binding,
             description=self.description,
-            examples=tuple(self.examples),
+            examples=self.recall_corpus,
             negatives=tuple(self.negatives),
             enabled=self.enabled,
         )
@@ -83,6 +106,9 @@ class CapabilityEntry:
             aliases=tuple(row.aliases or ()),
             examples=tuple(row.examples or ()),
             negatives=tuple(row.negatives or ()),
+            standard_example=getattr(row, "standard_example", None) or "",
+            synonym_examples=tuple(getattr(row, "synonym_examples", None) or ()),
+            parameters=dict(getattr(row, "parameters", None) or {}),
             arg_slots=dict(row.arg_slots or {}),
             permissions=row.permissions or "",
             execution_policy=row.execution_policy or "auto",
@@ -103,6 +129,9 @@ class CapabilityEntry:
             "aliases": list(self.aliases),
             "examples": list(self.examples),
             "negatives": list(self.negatives),
+            "standard_example": self.standard_example,
+            "synonym_examples": list(self.synonym_examples),
+            "parameters": dict(self.parameters),
             "arg_slots": dict(self.arg_slots),
             "permissions": self.permissions,
             "execution_policy": self.execution_policy,
@@ -123,6 +152,9 @@ class CapabilityEntry:
             aliases=tuple(str(a) for a in raw.get("aliases") or ()),
             examples=tuple(str(e) for e in raw.get("examples") or ()),
             negatives=tuple(str(n) for n in raw.get("negatives") or ()),
+            standard_example=str(raw.get("standard_example") or ""),
+            synonym_examples=tuple(str(s) for s in raw.get("synonym_examples") or ()),
+            parameters=dict(raw.get("parameters") or {}),
             arg_slots=dict(raw.get("arg_slots") or {}),
             permissions=str(raw.get("permissions") or ""),
             execution_policy=str(raw.get("execution_policy") or "auto"),

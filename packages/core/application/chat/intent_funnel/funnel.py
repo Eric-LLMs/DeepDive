@@ -1,13 +1,19 @@
 """Intent Funnel orchestration.
 
 P0 moved the legacy QIR cascade (:func:`run_intent_stage`) out of the
-orchestrator unchanged; P1 added the Registry Matcher's shadow hook; P2 (this
-file, ``_cascade``) adds the TARGET four-node chain — Matcher → Recall →
-Judge → Decision → Binder — with escalate-only-upward and 8.10-classified
-fail-open. The new chain is gated by its OWN switch (``chat_funnel_enabled``,
-default OFF): with it closed, route() is byte-identical to the accepted P1
-behavior and the legacy path stays as it was — it is dark historical
-implementation, not the correctness baseline of the new architecture.
+orchestrator unchanged; P1 added the Registry Matcher's shadow hook. The
+2026-09-24 chain correction pins the ACTIVE target chain to one hop:
+
+    Matcher HIT  ─┐
+                  ├→ Model A (ONE call: select + extract) → Binder (validate) → Execute
+    MISS/AMB → Recall ─┘
+
+every non-COMPLETE outcome exits to the Agent (8.10). The recheck second hop
+and the Decision LLM are deleted — the two online TTFBs they cost were the
+cascade timeout, and neither added information. The chain is gated by its own
+switch (``chat_funnel_enabled``, default OFF): with it closed, route() is
+byte-identical to the accepted P1 behavior and the legacy QIR path stays as it
+was — dark historical implementation, not the correctness baseline.
 """
 from __future__ import annotations
 
@@ -26,6 +32,7 @@ from core.config import settings
 from . import shadow
 from .contract import (
     JUDGE_CONFIDENT,
+    JUDGE_REJECT,
     MATCH_AMBIGUOUS,
     MATCH_HIT,
     MATCH_MISS,
@@ -34,9 +41,9 @@ from .contract import (
     REASON_BIND_MISSING,
     REASON_CASCADE_ERROR,
     REASON_CASCADE_TIMEOUT,
-    REASON_DECISION_NONE,
-    REASON_DECISION_TIMEOUT,
+    REASON_JUDGE_REJECT,
     REASON_JUDGE_TIMEOUT,
+    REASON_JUDGE_UNCERTAIN,
     REASON_KIND_DISABLED,
     REASON_NO_CANDIDATE,
     REASON_RECALL_TIMEOUT,
@@ -75,8 +82,9 @@ async def route(ctx, *, deps, requirements: TurnRequirements) -> TurnRequirement
 
     Returns the SAME requirements object untouched whenever the funnel is dark
     or abstains — the Agent keeps the turn, byte-identical, zero pollution.
-    With the P2 gate open, hands off to the four-node cascade (:func:`_cascade`);
-    with it closed, falls back to the legacy QIR path (dark by its own gates).
+    With the funnel gate open, hands off to the single-hop cascade
+    (:func:`_cascade`); with it closed, falls back to the legacy QIR path
+    (dark by its own gates).
     """
     # P1 step-5 tri-state (8.15): unless the switch is off, run the Registry
     # Matcher in the dark and log its would_* verdict. Observation only.
@@ -203,15 +211,14 @@ async def run_intent_stage(ctx, deps, requirements: TurnRequirements) -> TurnReq
         return requirements
 
 
-# ── P2 target cascade: Matcher → Recall → Judge → Decision → Binder → (Agent) ─────
+# ── Active chain: Matcher → (Recall) → Model A → Binder(validate) → (Agent) ──────
 
 def _stage_reason(stage: str, *, timed_out: bool) -> str:
     """8.10 reason code for the exit point the cascade died at."""
     if timed_out:
         return {
             "recall": REASON_RECALL_TIMEOUT,
-            "judge": REASON_JUDGE_TIMEOUT,
-            "decision": REASON_DECISION_TIMEOUT,
+            "model_a": REASON_JUDGE_TIMEOUT,  # the ONE model hop owns the budget
         }.get(stage, REASON_CASCADE_TIMEOUT)
     return {
         "registry": REASON_REGISTRY_UNAVAILABLE,
@@ -222,7 +229,9 @@ def _stage_reason(stage: str, *, timed_out: bool) -> str:
 def _new_trace() -> dict:
     """The shared per-run trace record: production routing and the 8.5 query
     preview fill the SAME fields — one observability shape (8.12), one event
-    row shape, so a preview can be diffed against real traffic line for line."""
+    row shape, so a preview can be diffed against real traffic line for line.
+    ``decision`` is a retired column kept at "-" for schema stability (the
+    Decision node was deleted by the 2026-09-24 chain ruling)."""
     return {"stage": "registry", "matcher": "-", "recall_count": 0,
             "recall_top": "-", "judge": "-", "decision": "-",
             "final_route": "agent", "fallback": "-", "registry": "-",
@@ -302,7 +311,7 @@ async def _persist_event(deps, ctx, trace: dict) -> None:
 
 
 async def _cascade(ctx, deps, requirements: TurnRequirements) -> TurnRequirements:
-    """Run the four-node cascade under one wall-clock budget, fail-open to the
+    """Run the single-hop cascade under one wall-clock budget, fail-open to the
     ORIGINAL requirements on every abstain/fault (8.10: the Agent's input stays
     byte-identical). Returns the same object the pre-P2 contract guarantees;
     only a certified turn produces a NEW requirements (never a mutation)."""
@@ -328,7 +337,7 @@ def _preview_ctx(message: str):
 
 async def preview(message: str, *, deps) -> dict:
     """§8.5: run the ACTIVE (Registry, Index) pair end to end for one query —
-    Registry → Matcher → Recall → Judge → Decision → Binder → Final Route —
+    Registry → Matcher → (Recall) → Model A → Binder → Final Route —
     and return the trace as a verdict, executing nothing. Side-effect-free by
     construction: the chain only produces routing metadata (8.8), run_tool is
     not even on this object graph, and conversation state is never touched.
@@ -374,15 +383,13 @@ async def _run_nodes(ctx, deps, requirements, trace):
     """The cascade body. Returns a certified TurnRequirements, or None after
     setting trace['fallback'] — the caller converts None into the original
     object. Raises only for faults, which the caller maps by trace['stage']."""
-    from core.application.chat.actions import ActionIntegrityFailure
-
-    from . import binder, decision, guardrails, matcher, recall
-    from .judge import adjudicate as judge_adjudicate
-    from .judge import recheck as judge_recheck
+    from . import binder, guardrails, matcher, recall
+    from .judge import adjudicate as model_a
     from .registry import active_view as registry_active_view
     from .registry.entry import STATUS_ACTIVE
 
     message = ctx.body.message or ""
+    facts = TurnFacts.of(ctx)
 
     # ── Registry + Recall index (the Build-Then-Swap pair, §8.3) ──────────────
     view = await registry_active_view(session_factory=deps.session_factory)
@@ -394,6 +401,9 @@ async def _run_nodes(ctx, deps, requirements, trace):
         e.capability_id: e for e in view.entries
         if e.enabled and e.status == STATUS_ACTIVE
     }
+    # The index is loaded even for the HIT lane: the certified turn stamps its
+    # version for the executor's TOCTOU re-validation, and a Registry without
+    # its Build-Then-Swap pair is unusable regardless of lane (§8.3).
     trace["stage"] = "recall"
     index = await recall.load_index(deps.session_factory)
     if index is None:
@@ -403,59 +413,53 @@ async def _run_nodes(ctx, deps, requirements, trace):
 
     # ── Node 1: Matcher (table-only; the negation guard applies BEFORE it ───────
     # can certify anything, ruling 8.1-a) ────────────────────────────────────────
-    mres = matcher.match(message, TurnFacts.of(ctx), view)
+    mres = matcher.match(message, facts, view)
     if mres.state != MATCH_MISS and guardrails.negated(message):
         mres = matcher.MatchResult(state=MATCH_MISS, registry_version=mres.registry_version)
     trace["matcher"] = f"{mres.state}:{mres.capability_id or mres.candidates or '-'}"
 
+    # ── One candidate set, ONE convergence point: a HIT enters Model A with the ─
+    # same semantics as a Recall lane — the direct-certification special path is
+    # deleted (chain ruling 2026-09-24). Recall runs only when the table missed.
     candidates: dict[str, Candidate] = {}
-    cap_id: str | None = None
-    stage = "matcher"
     if mres.state == MATCH_AMBIGUOUS:
         for cid in mres.candidates:
             candidates[cid] = Candidate(cid, 0.0, origin="matcher_ambiguous")
     elif mres.state == MATCH_HIT:
-        if shadow.matcher_mode() == "on":
-            cap_id = mres.capability_id  # deterministic certification, no spend below
-        else:
-            candidates[mres.capability_id] = Candidate(
-                mres.capability_id, 0.0, origin="matcher_hit",
-            )
-
-    # ── Node 2: Recall — quality gate only, then Node 3 / Node 4 upward ────────
-    if cap_id is None:
+        candidates[mres.capability_id] = Candidate(
+            mres.capability_id, 1.0, matched_example=mres.matched_literal,
+            origin="matcher_hit",
+        )
+    if mres.state != MATCH_HIT:
         rres = await recall.recall(
             index, message, embedder=deps.embedder(),
             top_k=settings.chat_funnel_top_k, min_score=settings.chat_funnel_min_score,
         )
         for cand in rres.candidates:  # recall scores win provenance: calibrated
             candidates[cand.capability_id] = cand
-        trace["recall_count"] = len(candidates)
-        if candidates:
-            top = max(candidates.values(), key=lambda c: c.score)
-            trace["recall_top"] = f"{top.capability_id}@{top.score:.3f}"
-        cands = sorted(candidates.values(), key=lambda c: c.score, reverse=True)
-        if not cands:
-            trace["fallback"] = REASON_NO_CANDIDATE
-            return None
-        trace["stage"] = "judge"
-        jv = await judge_adjudicate(message, cands, entries_by_id=entries_by_id, llm=deps.llm)
-        trace["judge"] = f"{jv.decision}:{jv.capability_id or '-'}"
-        if jv.decision == JUDGE_CONFIDENT:
-            cap_id, stage = jv.capability_id, "judge"
-        else:  # UNCERTAIN / REJECT escalate upward — the ONLY exit is Decision
-            trace["stage"] = "decision"
-            dr = await decision.adjudicate(
-                message, cands, entries_by_id=entries_by_id, llm=deps.llm,
-            )
-            trace["decision"] = dr.capability_id or "NONE"
-            if dr.capability_id is None:
-                trace["fallback"] = REASON_DECISION_NONE
-                return None
-            cap_id, stage = dr.capability_id, "decision"
+    trace["recall_count"] = len(candidates)
+    if candidates:
+        top = max(candidates.values(), key=lambda c: c.score)
+        trace["recall_top"] = f"{top.capability_id}@{top.score:.3f}"
+    cands = sorted(candidates.values(), key=lambda c: c.score, reverse=True)
+    if not cands:
+        trace["fallback"] = REASON_NO_CANDIDATE
+        return None
 
-    # ── Capability → Binder (four states, §8.7) → certified ACTION metadata ────
-    entry = entries_by_id.get(cap_id)
+    # ── Node 2: Model A — the ONE model call of the turn (select + extract) ────
+    trace["stage"] = "model_a"
+    jv = await model_a(message, cands, entries_by_id=entries_by_id,
+                       llm=deps.llm, facts=facts)
+    trace["judge"] = f"{jv.decision}:{jv.capability_id or '-'}"
+    if jv.decision != JUDGE_CONFIDENT:
+        trace["fallback"] = (
+            REASON_JUDGE_REJECT if jv.decision == JUDGE_REJECT
+            else REASON_JUDGE_UNCERTAIN
+        )
+        return None
+
+    # ── Capability → Binder validate → certified ACTION metadata ───────────────
+    entry = entries_by_id.get(jv.capability_id)
     if entry is None:  # a verdict the active table no longer honors: refuse
         trace["fallback"] = REASON_VERSION_MISMATCH
         return None
@@ -463,26 +467,8 @@ async def _run_nodes(ctx, deps, requirements, trace):
         trace["fallback"] = REASON_KIND_DISABLED
         return None
     trace["stage"] = "binder"
-    try:
-        bound = binder.bind(entry, message, ctx)
-    except ActionIntegrityFailure as exc:
-        # C2 at the routing layer (unchanged doctrine): the Registry promises a
-        # binding the tool table does not honor — terminal marker, never Agent.
-        logger.error("funnel.binding integrity: %s", exc.reason)
-        trace["stage"] = "certified"
-        return _certified(requirements, entry, None, index.version, view.fingerprint,
-                          stage="binder", integrity=exc.reason)
+    bound = binder.validate(entry, jv.arguments)
     if not bound.is_complete:
-        issue = bound.state.lower()
-        rv = await judge_recheck(
-            message, entry.capability_id, entry=entry, issue=issue,
-            candidates=[candidates[entry.capability_id]]
-            if entry.capability_id in candidates else [], llm=deps.llm,
-        )
-        trace["judge"] = f"recheck:{rv.decision}"
-        # Whatever the recheck says, the Agent gets the turn + the reason: a
-        # REJECT confirms abandonment; an unresolved case is clarified by the
-        # Agent (8.7 — the question is the Agent's, last step by design).
         trace["fallback"] = {
             "MISSING": REASON_BIND_MISSING,
             "AMBIGUOUS": REASON_BIND_AMBIGUOUS,
@@ -491,7 +477,7 @@ async def _run_nodes(ctx, deps, requirements, trace):
         return None
     trace["stage"] = "certified"
     return _certified(requirements, entry, bound.args, index.version, view.fingerprint,
-                      stage=stage)
+                      stage="model_a")
 
 
 def _certified(requirements, entry, args, index_version, registry_fp, *,

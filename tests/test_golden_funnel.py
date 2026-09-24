@@ -1,5 +1,6 @@
 """§8.16 Golden Set runner — executes the publish-gate matrix in
-``tests/golden/intent_funnel_golden.yaml`` against the REAL four-node cascade.
+``tests/golden/intent_funnel_golden.yaml`` against the REAL single-hop cascade
+(Matcher HIT / Recall -> ONE Model A call -> Binder validate -> certified).
 
 Design of the fake world (kept deterministic on purpose — a golden that can
 flap is worse than no golden):
@@ -14,8 +15,11 @@ flap is worse than no golden):
   against either axis, under the 0.82 quality gate. Recall therefore never
   "resupplies" a turn the Matcher was told to miss (the negation case leans
   on exactly this);
-* judge backend is the stub, decision LLM is None: the ladder's only exits
-  are the deterministic CONFIDENT / escalate-to-NONE paths the matrix pins;
+* the Model A hop is a SCRIPTED deterministic stand-in (backend pinned
+  "online", deps.llm = _ScriptedModelA): it parses its own card prompt, keeps
+  the single-candidate rule, and extracts by quote-stripping — the same
+  contract a deployed small model serves, made flap-free. Its scripted NONE on
+  a split card set is the only negative the matrix exercises;
 * every run is pinned ``execution_mode="test"`` (8.14: a batch of goldens must
   never land cost on a user) and the embedder PROVES the pin rode every call.
 
@@ -35,7 +39,7 @@ import yaml
 from core.application.chat.intent_funnel import funnel
 from core.application.chat.intent_funnel.contract import (
     REASON_BIND_MISSING,
-    REASON_DECISION_NONE,
+    REASON_JUDGE_REJECT,
     REASON_KIND_DISABLED,
     REASON_NO_CANDIDATE,
 )
@@ -59,7 +63,7 @@ GOLDEN_PATH = Path(__file__).parent / "golden" / "intent_funnel_golden.yaml"
 # YAML token -> the contract constant actually logged as fallback_reason
 FALLBACK_CODES = {
     "FUNNEL_NO_CANDIDATE": REASON_NO_CANDIDATE,
-    "FUNNEL_DECISION_NONE": REASON_DECISION_NONE,
+    "FUNNEL_JUDGE_REJECT": REASON_JUDGE_REJECT,
     "FUNNEL_BIND_MISSING": REASON_BIND_MISSING,
     "FUNNEL_KIND_DISABLED": REASON_KIND_DISABLED,
 }
@@ -92,6 +96,8 @@ def _table() -> tuple[CapabilityEntry, ...]:
             description="新建一个带引号名称的文件夹。",
             patterns=("re:新建文件夹",), aliases=(MSG_FOLDER,),
             examples=(MSG_FOLDER,),
+            parameters={"name": {"type": "string", "required": True,
+                                 "max_len": 120, "description": "folder name"}},
             arg_slots={"name": {"source": "user_input"}},
             intent_kind=KIND_ACTION,
         ),
@@ -100,6 +106,10 @@ def _table() -> tuple[CapabilityEntry, ...]:
             description="把一个词加入指定领域的词汇库。",
             patterns=("re:加入我的.*词汇库",), aliases=(),
             examples=(MSG_VOCAB_EXAMPLE,),
+            parameters={"term": {"type": "string", "required": True,
+                                 "max_len": 120, "description": "the term"},
+                        "domain": {"type": "string", "required": True,
+                                   "max_len": 60, "description": "vocabulary domain"}},
             arg_slots={"term": {"source": "user_input"},
                        "domain": {"source": "user_input"}},
             intent_kind=KIND_ACTION,
@@ -109,6 +119,8 @@ def _table() -> tuple[CapabilityEntry, ...]:
             description="在私有空间创建文件夹(演示 private kind 开关)。",
             patterns=(), aliases=(MSG_PRIVATE,),
             examples=(),
+            parameters={"name": {"type": "string", "required": True,
+                                 "max_len": 120, "description": "folder name"}},
             arg_slots={"name": {"source": "user_input"}},
             intent_kind=KIND_PRIVATE,
         ),
@@ -117,6 +129,8 @@ def _table() -> tuple[CapabilityEntry, ...]:
             description="查询词源等外部知识(演示 web kind 开关)。",
             patterns=(), aliases=(MSG_WEB,),
             examples=(),
+            parameters={"query": {"type": "string", "required": True,
+                                  "max_len": 200, "description": "search request"}},
             intent_kind=KIND_WEB,
         ),
     )
@@ -172,6 +186,36 @@ def _ctx(query: str, ctx_body: dict):
     )
 
 
+class _ScriptedModelA:
+    """Deterministic stand-in for Model A (the online seam's fake llm): parses
+    its own card prompt, applies the single-card rule, and extracts arguments
+    by quote-stripping — the same contract a deployed small model serves, with
+    zero flapping. A split card set gets the honest NONE (-> JUDGE_REJECT)."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def complete_json(self, prompt, **kw):
+        self.calls += 1
+        caps = re.findall(r"(?m)^### (\S+)$", prompt)
+        m = re.search(r"<user_sentence>(.*?)</user_sentence>", prompt, re.DOTALL)
+        sentence = m.group(1) if m else ""
+        if len(caps) != 1:
+            return {"capability_id": "NONE", "confidence": 1.0, "arguments": {}}
+        cap = caps[0]
+        quoted = re.search(r'"([^"]+)"', sentence)
+        if cap in ("cap-folder", "cap-private"):
+            args = {"name": quoted.group(1)} if quoted else {}
+        elif cap == "cap-vocab":
+            args = {"term": quoted.group(1)} if quoted else {}
+            dom = re.search(r"我的(.+?)词汇库", sentence)
+            if dom:
+                args["domain"] = dom.group(1)
+        else:  # cap-web
+            args = {"query": sentence}
+        return {"capability_id": cap, "confidence": 0.95, "arguments": args}
+
+
 def _wire(monkeypatch, embedder: _Embedder):
     from core.config import settings
 
@@ -190,13 +234,19 @@ def _wire(monkeypatch, embedder: _Embedder):
     monkeypatch.setattr(settings, "chat_funnel_enabled", True)
     monkeypatch.setattr(settings, "chat_fast_paths_enabled", True)
     monkeypatch.setattr(settings, "chat_action_fast_path_enabled", True)
-    monkeypatch.setattr(settings, "chat_judge_backend", "stub")
+    # Model A rides the online seam with the scripted double; every channel/
+    # floor config is pinned so a dev .env can never flap a golden.
+    monkeypatch.setattr(settings, "chat_judge_backend", "online")
+    monkeypatch.setattr(settings, "chat_judge_min_confidence", 0.75)
+    monkeypatch.setattr(settings, "chat_judge_online_model", "")
+    monkeypatch.setattr(settings, "chat_judge_online_base_url", "")
+    monkeypatch.setattr(settings, "chat_judge_online_api_key", "")
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", 5.0)
     # pin the ladder geometry so an env-tweaked default can never flap a golden
     monkeypatch.setattr(settings, "chat_funnel_top_k", 3)
     monkeypatch.setattr(settings, "chat_funnel_min_score", 0.82)
     return view, types.SimpleNamespace(
-        session_factory=None, embedder=lambda: embedder, llm=None,
+        session_factory=None, embedder=lambda: embedder, llm=_ScriptedModelA(),
     )
 
 
@@ -253,7 +303,8 @@ async def test_golden_case(monkeypatch, caplog, case):
         assert expect["matcher_contains"] in m_field, trace
 
     if expect["route"] == "action":
-        assert out is not requirements                  # certified: a NEW object
+        assert deps.llm.calls == 1                  # the ONE Model A hop per certified turn
+        assert out is not requirements              # certified: a NEW object
         act = out.requested_action
         assert act["capability_id"] == expect["capability"], trace
         if "tool" in expect:

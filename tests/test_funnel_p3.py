@@ -14,6 +14,7 @@ Pinning the P3 ruling ("扩表不改接口,逐开关灰度"):
 from __future__ import annotations
 
 import logging
+import re
 import types
 
 from core.application.chat.intent_funnel import funnel
@@ -35,6 +36,8 @@ def _entry(cid, *, tool="create_folder", aliases=(), kind=KIND_ACTION, **kw):
     return CapabilityEntry(
         capability_id=cid, tool_binding=tool, description=f"does {cid}",
         aliases=tuple(aliases), examples=("做个事",),
+        parameters={"name": {"type": "string", "required": True,
+                             "max_len": 120, "description": "folder name"}},
         arg_slots={"name": {"source": "user_input"}}, intent_kind=kind, **kw,
     )
 
@@ -116,19 +119,42 @@ class _Embedder:
         return [[1.0, 0.0] for _ in texts]
 
 
-def _open(monkeypatch, *, mode="on", private=False):
+def _open(monkeypatch, *, mode="on", private=False, judge="online"):
     from core.config import settings
 
     monkeypatch.setattr(settings, "chat_funnel_enabled", True)
     monkeypatch.setattr(settings, "chat_fast_paths_enabled", True)
     monkeypatch.setattr(settings, "chat_action_fast_path_enabled", True)
     monkeypatch.setattr(settings, "chat_matcher_mode", mode)
-    monkeypatch.setattr(settings, "chat_judge_backend", "stub")
+    monkeypatch.setattr(settings, "chat_judge_backend", judge)
+    monkeypatch.setattr(settings, "chat_judge_local_url", "")
+    monkeypatch.setattr(settings, "chat_judge_min_confidence", 0.75)
+    monkeypatch.setattr(settings, "chat_judge_online_model", "")
+    monkeypatch.setattr(settings, "chat_judge_timeout_seconds", 5.0)
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", 5.0)
     monkeypatch.setattr(settings, "chat_funnel_private_enabled", private)
 
 
-def _wire(monkeypatch, *, view):
+class _ScriptedModelA:
+    """Deterministic Model A double for the kind-gate lanes (the stub has no
+    extraction power by design, so certification tests ride the online seam):
+    one card -> select it and quote-strip the name; a split card set -> NONE."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def complete_json(self, prompt, **kw):
+        self.calls += 1
+        caps = re.findall(r"(?m)^### (\S+)$", prompt)
+        if len(caps) != 1:
+            return {"capability_id": "NONE", "confidence": 1.0, "arguments": {}}
+        m = re.search(r"<user_sentence>(.*?)</user_sentence>", prompt, re.DOTALL)
+        quoted = re.search(r'"([^"]+)"', m.group(1) if m else "")
+        args = {"name": quoted.group(1)} if quoted else {}
+        return {"capability_id": caps[0], "confidence": 0.95, "arguments": args}
+
+
+def _wire(monkeypatch, *, view, llm=None):
     async def fake_active(**kw):
         return view
 
@@ -141,7 +167,8 @@ def _wire(monkeypatch, *, view):
     monkeypatch.setattr(
         "core.application.chat.intent_funnel.recall.load_index", fake_load)
     return types.SimpleNamespace(session_factory=None,
-                                 embedder=lambda: _Embedder(), llm=None)
+                                 embedder=lambda: _Embedder(),
+                                 llm=llm if llm is not None else _ScriptedModelA())
 
 
 async def test_closed_private_kind_exits_with_reason_byte_identical(monkeypatch, caplog):

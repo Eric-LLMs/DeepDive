@@ -152,13 +152,21 @@ class Settings(BaseSettings):
     chat_funnel_top_k: int = 3                   # Recall candidate width
     chat_funnel_min_score: float = 0.82          # Recall quality gate (no adjudication here)
     chat_funnel_margin: float = 0.06             # Judge(stub) leader-vs-runner-up margin
-    # Judge backend ladder (8.17): "stub" | "local" | "online" | "auto" (local→online→stub)
+    # Judge/Model-A backend ladder (8.17 + 2026-09-24 chain ruling):
+    # "stub" | "local" | "online" | "auto" (local→online→stub). Model A is a
+    # swappable PROVIDER: the funnel only speaks the OpenAI-compatible card
+    # contract in judge/base.py — no model name or inference backend appears
+    # in Matcher/Recall/Binder/Runtime business logic.
     chat_judge_backend: str = "stub"
-    chat_judge_min_confidence: float = 0.75      # online verdicts below this escalate
-    # 2026-09-24 deployment ruling: local judge deployment deferred — "" keeps the
-    # honest "not deployed -> JudgeUnavailable -> fall through the ladder" semantics.
-    # chat_judge_local_url is an OpenAI-compatible BASE (e.g. http://localhost:18090/v1).
+    chat_judge_min_confidence: float = 0.75      # model verdicts below this escalate
+    # Local Model A = the Docker ``model-a`` service (Ollama today, replaceable).
+    # chat_judge_local_url is an OpenAI-compatible BASE (e.g.
+    # http://model-a:11434/v1); "" keeps the honest
+    # "not deployed -> JudgeUnavailable -> fall through the ladder" semantics.
     chat_judge_local_url: str = ""               # deployed local judge endpoint ("" = none)
+    # Model A provider model name, forwarded when set — the NAME (e.g. the
+    # current default qwen3:0.6b) lives in config/compose only.
+    chat_judge_local_model: str = ""
     # Online judge rides a DEDICATED small-model channel (8.17 "小模型层"), explicit
     # per-call forwarding like the session-summary seam; "" model = ride the pinned
     # turn channel (legacy behavior), base_url+api_key must be set together to pin

@@ -868,6 +868,14 @@ class CapabilityModel(Base):
     # Recall columns: positive examples (embedded) + negatives (contrast).
     examples: Mapped[list] = mapped_column(JSONB, default=list)
     negatives: Mapped[list] = mapped_column(JSONB, default=list)
+    # 0007 corpus tiers: the recall corpus is standard_example + synonym_examples
+    # + examples (candidate expressions), every sentence embedded independently.
+    standard_example: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    synonym_examples: Mapped[list] = mapped_column(JSONB, default=list)
+    # Canonical parameter schema for the Candidate Card (0007):
+    # {name: {type, description, required, max_len?}} — the publish gate is the
+    # only bridge to the runtime's DIRECT_TOOLS compat layer (no double truth).
+    parameters: Mapped[dict] = mapped_column(JSONB, default=dict)
     # Argument binding slots: {arg: source} — see arg_slots enum ruling (P1 ②).
     arg_slots: Mapped[dict] = mapped_column(JSONB, default=dict)
     permissions: Mapped[str] = mapped_column(String, nullable=False, default="")

@@ -1,18 +1,23 @@
-"""Node 5 — Binder: Capability + Query + Facts + arg_slots -> BoundArguments.
+"""Node 4 — Binder: Model A draft + Registry schema -> BoundArguments.
 
 Four states, never a naked None (8.7): the argument truth is a STATE, and the
-non-COMPLETE states escalate UPWARD (Judge.recheck first, Agent clarification
-last) — the Binder itself executes nothing (8.8: routing metadata is all the
-funnel ever produces).
+non-COMPLETE states exit to the Agent (chain ruling 2026-09-24: the recheck
+hop is gone — on the active path the Binder VALIDATES Model A's extraction
+(:func:`validate`) and never extracts itself). The Binder executes nothing
+(8.8: routing metadata is all the funnel ever produces).
+
+:func:`bind` (extract-then-validate via the entry's declared plugin) remains
+for the LEGACY lanes (L0/QIR compat, p5 monkeypatch seam); the new funnel only
+calls :func:`validate`.
 
 Since the 2026-09-24 structure rulings this node DEFINES the binding pipeline —
 :func:`bind_arguments` (capability + raw query -> structured args) and
 :func:`validate_action` (the executor's final schema gate) moved here from
 ``chat.actions``, which keeps a lazy façade for its historic import surface.
 
-The extraction ENGINE stays code (ruling 8.1-b): arg_slots declares WHICH
-source feeds each slot — ``user_input`` (default) or ``plugin:<name>``; the
-extractor bodies live in the registry roster
+The extraction ENGINE of the legacy path stays code (ruling 8.1-b): arg_slots
+declares WHICH source feeds each slot — ``user_input`` (default) or
+``plugin:<name>``; the extractor bodies live in the registry roster
 (:mod:`core.application.chat.intent_funnel.registry.plugins`), which the
 publish gate validates and this node resolves. The Registry entry's ``arg_slots``
 is the slot whitelist — anything an extractor returns outside it is dirty
@@ -37,6 +42,42 @@ from ..contract import (
 from ..registry.plugins import DIRECT_TOOLS, plugin_extractor
 
 logger = logging.getLogger(__name__)
+
+
+# ── the chain-ruling entry (2026-09-24): Model A extracted, Binder validates ───────
+
+def validate(entry, args) -> BoundArguments:
+    """Normalize/validate Model A's argument DRAFT against the Registry's
+    CANONICAL parameter schema (``entry.parameters``, 0007 ruling). The Binder
+    extracts nothing on this path — it is a pure gate: unknown slot -> INVALID;
+    missing/blank required slot -> MISSING (Agent owns the clarification);
+    over-length -> INVALID. The executor's own ``validate_action`` stays the
+    final runtime-side gate; the publish gate guarantees the two schemas agree.
+    A capability with an empty schema needs no arguments at all: any draft (or
+    none, e.g. the stub backend's) normalizes to COMPLETE {}."""
+    schema = dict(entry.parameters or {})
+    if not schema:
+        return BoundArguments(BIND_COMPLETE, {})
+    if not isinstance(args, dict):
+        return BoundArguments(BIND_MISSING)
+    if set(args) - set(schema):
+        return BoundArguments(BIND_INVALID, args)
+    out: dict[str, str] = {}
+    for name, raw in schema.items():
+        spec = raw if isinstance(raw, dict) else {}
+        val = args.get(name)
+        if val is None or (isinstance(val, str) and not val.strip()):
+            if spec.get("required", True):
+                return BoundArguments(BIND_MISSING)
+            continue
+        if not isinstance(val, str):
+            val = str(val)
+        val = val.strip()
+        max_len = spec.get("max_len")
+        if max_len is not None and len(val) > int(max_len):
+            return BoundArguments(BIND_INVALID, args)
+        out[name] = val
+    return BoundArguments(BIND_COMPLETE, out)
 
 
 # ── the binding pipeline (moved from chat.actions, behavior byte-identical) ────────

@@ -108,9 +108,13 @@ def validate_entries(entries: Sequence[CapabilityEntry]) -> list[str]:
                 "binding (the Registry cannot invent executables)"
             )
         if not e.description.strip():
-            issues.append(f"{cid}: description is required (judge prompt source)")
-        if not [x for x in e.examples if str(x).strip()]:
-            issues.append(f"{cid}: recall examples must be non-empty and indexable")
+            issues.append(f"{cid}: description is required (Model A card source)")
+        if not e.recall_corpus:
+            issues.append(
+                f"{cid}: recall corpus must be non-empty and indexable "
+                "(standard_example / synonym_examples / examples)"
+            )
+        issues.extend(f"{cid}: {msg}" for msg in _parameter_issues(e))
         if e.status not in VALID_STATUSES:
             issues.append(f"{cid}: status {e.status!r} not in {sorted(VALID_STATUSES)}")
         if e.enabled and e.status != STATUS_ACTIVE:
@@ -169,6 +173,46 @@ def _routable(e: CapabilityEntry) -> bool:
     return e.enabled and e.status == STATUS_ACTIVE
 
 
+def _parameter_issues(e: CapabilityEntry) -> list[str]:
+    """Registry is the CANONICAL parameter-schema source (0007 chain ruling);
+    DIRECT_TOOLS.arg_schema is the runtime compat layer. This gate is the only
+    bridge: a mechanical cross-check, so no human sync burden exists. Rules:
+    slot-name sets must agree, ``max_len`` (when given) must match the runtime
+    bound, and every parameter carries the Card-minimal shape."""
+    issues: list[str] = []
+    spec = DIRECT_TOOLS.get(e.tool_binding)
+    if spec is None:
+        return issues  # tool_binding membership already reported above
+    runtime: dict[str, int] = dict(spec.arg_schema or {})
+    declared: dict[str, Any] = dict(e.parameters or {})
+    for slot in sorted(set(runtime) - set(declared)):
+        issues.append(
+            f"parameters missing runtime slot {slot!r} of {e.tool_binding!r} "
+            "(Registry must carry the full schema — dual sources forbidden)"
+        )
+    for slot in sorted(set(declared) - set(runtime)):
+        issues.append(
+            f"parameters declares {slot!r}, unknown to runtime tool {e.tool_binding!r}"
+        )
+    for slot, raw in sorted(declared.items()):
+        if not isinstance(raw, dict):
+            issues.append(f"parameters[{slot!r}] must be an object")
+            continue
+        if not str(raw.get("type") or "").strip():
+            issues.append(f"parameters[{slot!r}].type is required")
+        if not str(raw.get("description") or "").strip():
+            issues.append(f"parameters[{slot!r}].description is required (Card source)")
+        if not isinstance(raw.get("required"), bool):
+            issues.append(f"parameters[{slot!r}].required must be a bool")
+        max_len = raw.get("max_len")
+        if max_len is not None and slot in runtime and int(max_len) != int(runtime[slot]):
+            issues.append(
+                f"parameters[{slot!r}].max_len={max_len} contradicts runtime "
+                f"bound {runtime[slot]} of {e.tool_binding!r}"
+            )
+    return issues
+
+
 def _pattern_conflicts(entries: Sequence[CapabilityEntry]) -> list[str]:
     """Deterministic-match collision: the same literal in two ROUTABLE capabilities
     makes the Matcher ambiguous by construction — reject at the gate instead."""
@@ -200,7 +244,7 @@ def to_qir_draft(entries: Sequence[CapabilityEntry]) -> dict:
                 "id": e.capability_id,
                 "tool_binding": e.tool_binding,
                 "description": e.description,
-                "examples": list(e.examples),
+                "examples": list(e.recall_corpus),
                 "negatives": list(e.negatives),
                 "enabled": e.enabled and e.status == STATUS_ACTIVE,
             }

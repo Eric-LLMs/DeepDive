@@ -1,14 +1,13 @@
 """Intent Funnel node contracts — the vocabulary every node speaks.
 
-P0 status (frozen discipline, see docs/temp.md "P0 施工纪律"): each node gets its
-contract BEFORE an implementation is wired. Today only ``IntentVerdict`` and
-``BoundArguments`` have producers — the funnel wraps the existing QIR
-``RouteResult`` and ``actions.bind_arguments`` through them (adapter wiring,
-zero behavior change). ``MatchResult`` / ``RecallResult`` / ``JudgeVerdict`` /
-``DecisionResult`` are contract-only placeholders: producers arrive in P1
-(Registry/Matcher) and P2 (Judge). No node may pass anything else across the
-boundary, and per 8.8 a verdict carries routing metadata ONLY — never an
-executor, tool instance or authorization bypass.
+Chain ruling (2026-09-24, single-hop correction): the active chain is
+Matcher -> (Recall on MISS/AMBIGUOUS) -> Model A (ONE call: capability
+selection + argument extraction) -> Binder (normalize/validate only) ->
+Execute; every non-COMPLETE outcome exits to the Agent (8.10). The former
+recheck hop and the Decision LLM node are removed from the active path —
+``JudgeVerdict`` is Model A's verdict+draft in one object. No node may pass
+anything else across the boundary, and per 8.8 a verdict carries routing
+metadata ONLY — never an executor, tool instance or authorization bypass.
 """
 from __future__ import annotations
 
@@ -63,9 +62,6 @@ REASON_RECALL_UNAVAILABLE = "RECALL_UNAVAILABLE"
 REASON_JUDGE_REJECT = "JUDGE_REJECT"
 REASON_JUDGE_UNCERTAIN = "JUDGE_UNCERTAIN"
 REASON_JUDGE_TIMEOUT = "JUDGE_TIMEOUT"
-REASON_DECISION_NONE = "DECISION_NONE"
-REASON_DECISION_TIMEOUT = "DECISION_TIMEOUT"
-REASON_DECISION_ERROR = "DECISION_ERROR"
 REASON_REGISTRY_UNAVAILABLE = "REGISTRY_UNAVAILABLE"
 REASON_VERSION_MISMATCH = "REGISTRY_VERSION_MISMATCH"
 # P3: the capability's intent kind exists but its rollout gate is closed —
@@ -114,7 +110,7 @@ class RecallResult:
     candidates: tuple[Candidate, ...] = ()
 
 
-# ── Node 3: Judge (P2 producer; no behavior exists yet) ──────────────────────────
+# ── Node 3: Model A (adjudicate + extract, ONE call; P2 producer) ───────────────
 
 JUDGE_CONFIDENT = "CONFIDENT"
 JUDGE_UNCERTAIN = "UNCERTAIN"
@@ -123,18 +119,15 @@ JUDGE_REJECT = "REJECT"
 
 @dataclass(frozen=True)
 class JudgeVerdict:
+    """Model A's single-call output: WHICH capability and the argument draft.
+    ``arguments`` is the raw extraction from the same reply — the Binder only
+    normalizes/validates it; a backend without extraction power (stub) leaves it
+    None and the turn exits BIND_MISSING."""
+
     decision: str = JUDGE_UNCERTAIN
     capability_id: str | None = None
     rationale: str = field(default="", repr=False)
-
-
-# ── Node 4: Decision LLM (P2 producer; today lives inside qir.decision) ──────────
-
-
-@dataclass(frozen=True)
-class DecisionResult:
-    capability_id: str | None  # None == NONE -> Agent
-    rationale: str = field(default="", repr=False)
+    arguments: dict | None = None
 
 
 # ── Binder (wired in P0 over the existing actions.bind_arguments) ────────────────

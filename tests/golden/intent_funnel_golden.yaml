@@ -10,32 +10,37 @@
 #
 # expectations speak the 8.10 vocabulary: route + capability + funnel_stage,
 # or final agent + fallback_reason (+ matcher/judge trace fragment).
+# Chain ruling 2026-09-24: the active lane is Matcher/Recall -> ONE Model A
+# call -> Binder validate -> certified, so every ACTION row carries
+# stage: model_a (there is no matcher-direct stage any more).
 
 cases:
   - id: det_match_exact_alias
     group: deterministic_match
     settings: {mode: "on"}
     query: '新建文件夹"季度报告"'
+    # the HIT lane enters the same single Model A hop as Recall (chain ruling
+    # 2026-09-24): the direct-certification special path is gone.
     expect: {route: action, capability: cap-folder, tool: create_folder,
-             stage: matcher, kind: action}
+             stage: model_a, kind: action}
 
   - id: det_match_regex_pattern
     group: deterministic_match
     settings: {mode: "on"}
     query: '新建文件夹"实验记录"'
-    expect: {route: action, capability: cap-folder, stage: matcher}
+    expect: {route: action, capability: cap-folder, stage: model_a}
 
   - id: paraphrase_zh_recall
     group: paraphrase_multilingual
     settings: {mode: "off"}
     query: '创建文件夹"资料归档"'
-    expect: {route: action, capability: cap-folder, stage: judge}
+    expect: {route: action, capability: cap-folder, stage: model_a}
 
   - id: paraphrase_en_recall
     group: paraphrase_multilingual
     settings: {mode: "off"}
     query: 'create a folder named "Read Later"'
-    expect: {route: action, capability: cap-folder, stage: judge}
+    expect: {route: action, capability: cap-folder, stage: model_a}
 
   - id: negation_guard_forces_miss
     group: negation
@@ -48,19 +53,20 @@ cases:
 
   - id: ambiguous_two_intents_escalates
     group: ambiguity_multi_intent
-    # both regexes hit one sentence; with no Decision arbiter (stub world)
-    # the ONLY legal exit is up-then-out: Agent keeps the turn.
+    # both regexes hit one sentence; the one Model A hop answers NONE on the
+    # split pair (no arbiter exists any more to rescue it) — Agent keeps the turn.
     settings: {mode: "on"}
     query: '新建文件夹"季度报告"并把"keystone"加入我的工程词汇库'
-    expect: {route: agent, fallback: FUNNEL_DECISION_NONE,
+    expect: {route: agent, fallback: FUNNEL_JUDGE_REJECT,
              matcher_contains: "AMBIGUOUS"}
 
   - id: missing_argument_last_question
     group: missing_argument
     settings: {mode: "on"}
     query: '新建文件夹'
-    # Matcher certifies the table hit; the Binder finds no quoted name:
-    # recheck (stub cannot rescue) -> Agent owns the clarification (8.7).
+    # Matcher HIT enters the hop; Model A selects cap-folder but the sentence
+    # carries no quotable name -> Binder validate exits MISSING (8.7): the
+    # Agent owns the clarification, no second hop tries to rescue it.
     expect: {route: agent, fallback: FUNNEL_BIND_MISSING,
              matcher_contains: "HIT:cap-folder"}
 
@@ -69,7 +75,7 @@ cases:
     settings: {mode: "on"}
     query: '新建文件夹"季度报告"'
     ctx: {viewer_page: 3, attach: true, session: s-golden}
-    expect: {route: action, capability: cap-folder, stage: matcher}
+    expect: {route: action, capability: cap-folder, stage: model_a}
 
   - id: sequence_followup_not_guessed
     group: sequence_dependency
