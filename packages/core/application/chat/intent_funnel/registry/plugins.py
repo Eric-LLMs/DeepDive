@@ -1,0 +1,224 @@
+"""Node-layer roster — the argument EXTRACTORS (8.1-b) and the L0 action table.
+
+Ruling 8.1-b: the Registry table registers WHICH extractor each capability uses
+(``arg_slots[*].source = "plugin:<name>"``); the extractor BODIES — the
+"look at context, abstain if wrong" regex judgement — stay code, here, with
+their enable/version discipline following the Registry (the publish gate
+validates every ``plugin:<name>`` against :data:`PLUGINS`).
+
+This module is the DAG LEAF of the funnel: it imports nothing from the chat
+application layer (the previous cycle blocker lived here — anything that needs
+these names imports them FROM here, never the other way). Extractor contract:
+``(text, ctx) -> dict | None``; ``None`` means abstain — an undetermined slot, a
+compound turn, a missing context reference. Recognition failure is NO answer,
+never a guess.
+
+``DIRECT_TOOLS`` is the legacy L0 action-binding table (tool -> spec). Post
+ruling 2026-09-24 it is DEFINED here (moved verbatim from ``chat.actions``,
+which keeps lazy façades for its historic import surface); the funnel Binder
+(:mod:`..binder`) consumes it for schemas and default extractors.
+"""
+from __future__ import annotations
+
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+# Slot delimiter set (ASCII, curly, CJK quotes). A free-text slot must be quoted — an
+# unbounded name/term is dynamically parameterized and belongs on the Agent path.
+_QCHARS = '"“”‘’「」『』'
+_OPEN = "[" + _QCHARS + "]"
+_SLOT = "[^" + _QCHARS + "]+"
+
+
+def _q(slot: str) -> str:
+    """``<quote>slot<quote>`` with one named capture for the slot content."""
+    return _OPEN + "(?P<" + slot + ">" + _SLOT + ")" + _OPEN
+
+
+# Words that mark a SECOND capability demand outside the matched span. A certified
+# direct call must be (nearly) the whole request: a compound turn would silently lose
+# its second half, so abstain and let the Agent own everything.
+_OTHER_DEMAND_PAT = re.compile(
+    r"\b(create|delete|save|export|schedule|rename|move|upload|download|run|execute|"
+    r"search|browse|web|internet|translate|vocab|vocabulary|glossary|word\s*list)\b|"
+    r"(创建|新建|删除|保存|导出|安排|重命名|移动|上传|下载|运行|执行|联网|搜索|查找|"
+    r"知识库|笔记|文档|文件|翻译|词库|词汇|单词|生词本)",
+    re.IGNORECASE,
+)
+# Deictic document references ("这篇文档" / "the pdf") carry no parameter — they point
+# at the asset the CONTEXT resolves, so they are stripped before the demand check
+# ("给这篇文档生成脑图" must NOT abstain merely because "文档" appears).
+_DEICTIC_PAT = re.compile(
+    r"(?:这|该|那|当前|本|附件里的?|刚上传的?)(?:份|个|篇|张)?\s*"
+    r"(?:文档|文件|pdf|ppt|幻灯片|图片|截图|图)"
+    r"|(?:this|the|that|attached|current|uploaded)\s+(?:document|doc|file|pdf|deck|image|screenshot|picture)"
+    r"|(?:上面|上文|选区里?的?)\s*(?:的)?\s*内容"
+    r"|(?:上面|上文|选区里)的?",
+    re.IGNORECASE,
+)
+
+# ── asset-id resolution from ALREADY-resolved context facts (no I/O) ────────────────
+
+def _asset_id(ctx) -> str | None:
+    """The single asset this turn points at (attach or owned upload), else None."""
+    owned = getattr(ctx, "owned_asset_id", None)
+    if owned:
+        return str(owned)
+    attach = getattr(getattr(ctx, "body", None), "attach", None)
+    if attach is None:
+        return None
+    if isinstance(attach, dict):
+        return str(attach.get("asset_id") or "") or None
+    aid = getattr(attach, "asset_id", None)
+    return str(aid) if aid else None
+
+
+def _phrase(pattern: str, *, flags: int = 0) -> re.Pattern:
+    return re.compile(pattern, flags)
+
+
+def extract_asset_text(text: str, ctx) -> dict | None:
+    """Extractor for tools whose ONLY argument is the context asset id."""
+    pattern = _phrase(
+        r"(?:提取|抽取|抽出|转换|转成)[^。;？!]{0,8}(?:全文|文字|文本)"
+        r"|(?:text\s*extract|extract\s+(?:the\s+)?text|get\s+the\s+text)",
+        flags=re.IGNORECASE,
+    )
+
+    def _match(m) -> dict | None:
+        rest = (text[: m.start()] + " " + text[m.end():]).strip()
+        rest = _DEICTIC_PAT.sub(" ", rest)
+        if _OTHER_DEMAND_PAT.search(rest):
+            return None  # compound turn → Agent
+        asset = _asset_id(ctx)
+        if asset is None:
+            return None  # parameter undetermined → Agent (LLM fallback intact)
+        return {"asset_id": asset}
+
+    m = pattern.search(text)
+    return _match(m) if m else None
+
+
+def extract_quoted_folder_name(text: str, ctx) -> dict | None:
+    for pat in (
+        # EN: create/make [me] [a|an|the|new|my]* folder [named|called|titled] "NAME"
+        _phrase(
+            r"(?:create|make)\s+(?:me\s+)?(?:(?:a|an|the|new|my)\s+)*(?:folder|directory)"
+            r"(?:\s+(?:named|called|titled))?\s+" + _q("name"),
+            flags=re.IGNORECASE,
+        ),
+        # ZH: 新建/创建 [一个] 文件夹 "NAME"
+        _phrase(r"(?:新建|创建|建立)\s*(?:一个)?\s*文件夹\s*" + _q("name")),
+        # ZH: 新建/创建 [一个] 叫|名为|名叫 "NAME" 的文件夹
+        _phrase(
+            r"(?:新建|创建|建立)\s*(?:一个)?\s*(?:叫|名为|名叫)\s*" + _q("name")
+            + r"\s*的\s*(?:文件夹|目录)"
+        ),
+    ):
+        m = pat.search(text)
+        if m:
+            rest = (text[: m.start()] + " " + text[m.end():]).strip()
+            rest = _DEICTIC_PAT.sub(" ", rest)
+            if _OTHER_DEMAND_PAT.search(rest):
+                return None
+            name = (m.group("name") or "").strip()
+            return {"name": name} if name else None
+    return None
+
+
+def extract_quoted_term_domain(text: str, ctx) -> dict | None:
+    for pat in (
+        # EN: add "TERM" to (my|the|our) DOMAIN (vocab|vocabulary|word list|glossary)
+        _phrase(
+            r"add\s+" + _q("term")
+            + r"\s+(?:to|in|into)\s+(?:my|the|our)\s+(?P<domain>[\w][\w\s-]*?)"
+            r"\s+(?:vocab(?:ulary)?|word\s*list|glossary)",
+            flags=re.IGNORECASE,
+        ),
+        # ZH: 把/将 "TERM" 加入|添加到 [我的] DOMAIN 词汇库|单词库|词库|生词本.
+        # (?!我的) makes a MISSING domain fail instead of swallowing the pronoun.
+        _phrase(
+            r"(?:把|将)\s*" + _q("term")
+            + r"\s*(?:加入|添加到|加到|录入)\s*(?:我的|这个)?\s*"
+            r"(?P<domain>(?!我的|这个)[\w][\w\s]{0,29}?)"
+            r"\s*(?:词汇库|单词库|词库|生词本)"
+        ),
+    ):
+        m = pat.search(text)
+        if m:
+            rest = (text[: m.start()] + " " + text[m.end():]).strip()
+            rest = _DEICTIC_PAT.sub(" ", rest)
+            if _OTHER_DEMAND_PAT.search(rest):
+                return None
+            term = (m.group("term") or "").strip()
+            domain = (m.group("domain") or "").strip()
+            return {"term": term, "domain": domain} if term and domain else None
+    return None
+
+
+# ── roster (8.1-b): plugin:<name> resolves HERE; publish gate validates against it ──
+
+PLUGINS: dict[str, Callable[[str, object], dict | None]] = {
+    "quoted_folder_name": extract_quoted_folder_name,
+    "quoted_term_domain": extract_quoted_term_domain,
+    "context_asset": extract_asset_text,
+}
+
+
+def plugin_extractor(source: str) -> Callable[[str, object], dict | None] | None:
+    """``plugin:<name>`` -> the registered callable; None when unknown — the CALLER
+    decides (publish gate rejects, runtime raises C2; neither guesses)."""
+    if not source.startswith("plugin:"):
+        return None
+    return PLUGINS.get(source[len("plugin:"):].strip())
+
+
+@dataclass(frozen=True)
+class DirectToolSpec:
+    """One allowlist entry: a REGISTERED tool name, an extractor certifying the turn
+    demands exactly that tool with fully-determined args, and the schema gate."""
+
+    tool: str
+    description: str
+    arg_schema: dict[str, int] = field(default_factory=dict)
+    extract: Callable[[str, object], dict | None] | None = None
+
+
+# ── Seed vocabulary (service actions registered as tools alongside these specs) ─────
+
+DIRECT_TOOLS: dict[str, DirectToolSpec] = {
+    spec.tool: spec
+    for spec in (
+        DirectToolSpec(
+            tool="create_folder",
+            description="Create a folder with an explicit quoted name.",
+            arg_schema={"name": 120},
+            extract=extract_quoted_folder_name,
+        ),
+        DirectToolSpec(
+            tool="add_term",
+            description="Add a quoted term to an explicitly-named vocabulary domain.",
+            arg_schema={"term": 120, "domain": 60},
+            extract=extract_quoted_term_domain,
+        ),
+        # The asset tool below is ALREADY-registered and single-shot atomic; its only
+        # parameter (asset_id) is fully determined by the request context — the
+        # extractor certifies both the phrase and the asset presence.
+        DirectToolSpec(
+            tool="pdf_extract_text",
+            description="Extract the full text of the attached document.",
+            arg_schema={"asset_id": 64},
+            extract=extract_asset_text,
+        ),
+        # EXCLUDED from v1, with the verified reason (admission = single-shot atomic
+        # tool + fully-determined args + no implicit multi-step):
+        #  * ``doc_mindmap`` / ``doc_slides`` — product paths are the toolkit workflows
+        #    (``mindmap_gen`` Mermaid / ``slides_gen`` deck engine); the same-named
+        #    tools in document_tools.py are downgraded text wrappers.
+        #  * ``doc_outline`` — body runs ``extract_document_text``, which itself may
+        #    fan out vision-LLM calls on embedded images before the generation call:
+        #    not a deterministic single return.
+        # Unverified capabilities stay on the Agent path; L0 never claims them.
+    )
+}

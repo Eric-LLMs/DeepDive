@@ -28,25 +28,14 @@ from typing import Any, Sequence
 
 from sqlalchemy import func, update
 
-from core.application.chat.actions import DIRECT_TOOLS
+# ``build_snapshot`` is late-bound inside preview/publish: a top-level import
+# here cycles when the entry point is ``qir.snapshot`` itself (qir.snapshot
+# needs registry.plugins -> registry/__init__ -> this module, which would then
+# re-enter a half-built qir.snapshot).
 from core.application.chat.qir import store as qir_store
-from core.application.chat.qir.snapshot import build_snapshot
 from core.application.chat.qir.types import Snapshot
 from core.infrastructure.db import RegistryVersionModel
 
-from .store import (
-    RegistryError,
-    RegistryStateError,
-    STATE_ACTIVE,
-    STATE_STAGED,
-    STATE_SUPERSEDED,
-    RegistryVersionView,
-    _factory,
-    get_version,
-    invalidate_cache,
-    mark_failed,
-    stage_version,
-)
 from .entry import (
     RE_PREFIX,
     STATUS_ACTIVE,
@@ -55,12 +44,28 @@ from .entry import (
     VALID_KINDS,
     CapabilityEntry,
 )
+from .plugins import DIRECT_TOOLS, PLUGINS  # same package: the action roster (leaf)
+from .store import (
+    STATE_ACTIVE,
+    STATE_STAGED,
+    STATE_SUPERSEDED,
+    RegistryError,
+    RegistryStateError,
+    RegistryVersionView,
+    _factory,
+    get_version,
+    invalidate_cache,
+    mark_failed,
+    stage_version,
+)
 
 logger = logging.getLogger(__name__)
 
 # arg_slots.source minimal enum (P1 ruling 2 — no speculative additions).
 # plugin:<name> is the seventh form: the table registers WHICH extractor, the
-# extractor itself stays in code (8.1-b).
+# extractor itself stays in code (8.1-b) — and since the 2026-09-24 wiring the
+# name MUST exist in PLUGINS (roster membership = the "启停/版本归 Registry 管"
+# discipline: an unregistered extractor can never pass the publish gate).
 VALID_SOURCES = frozenset({
     "user_input", "viewer.current_page", "viewer.selection",
     "attachment", "turn_context", "fixed",
@@ -148,7 +153,12 @@ def _slot_issues(source: Any) -> list[str]:
     if src in VALID_SOURCES:
         return []
     if src.startswith("plugin:"):
-        return [] if src[len("plugin:"):].strip() else ["plugin: source needs a name"]
+        name = src[len("plugin:"):].strip()
+        if not name:
+            return ["plugin: source needs a name"]
+        if name not in PLUGINS:
+            return [f"plugin:{name!r} is not registered in the extractor roster"]
+        return []
     return [
         f"source {src!r} outside the minimal enum "
         f"{sorted(VALID_SOURCES)} or plugin:<name>"
@@ -208,6 +218,8 @@ async def preview_draft(
     ZERO writes. The full-funnel query preview (Matcher->...->Route) rides on the
     returned snapshot once the step-3 Matcher reads the Registry; tool execution
     is never in reach of this function (8.8: intent nodes hold no execution)."""
+    from core.application.chat.qir.snapshot import build_snapshot  # late-bound, see top
+
     issues = validate_entries(entries)
     if issues:
         return issues, None
@@ -231,6 +243,8 @@ async def publish_draft(
     Raises PublishRejectedError / SnapshotError BEFORE any write; after staging,
     any swap failure marks the new version FAILED (history shows why) and the old
     active pair keeps serving untouched."""
+    from core.application.chat.qir.snapshot import build_snapshot  # late-bound, see top
+
     from .store import list_drafts  # local to keep the import graph flat
 
     factory = _factory(session_factory)

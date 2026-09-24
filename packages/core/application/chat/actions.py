@@ -7,15 +7,25 @@ DIRECT_TOOL can invoke is a tool already registered in the agent's ``ToolRuntime
 partially-parameterized turn loses nothing: it falls through to the Agent + LLM + full
 tool/skill/workflow machinery exactly as before the fast path existed.
 
-This module therefore carries ONLY:
+Since the 2026-09-24 structure rulings (docs/temp.md 落点对表) this module carries
+ONLY the L0 flow-control layer and the governance vocabulary. It is a TERMINAL
+leaf: nothing importable from here may reach back into the funnel — funnel and
+understanding import this module at their top level, so the moved names below are
+served by an EXPLICIT lookup table, never by function-level imports.
 
-  * the allowlist (which registered tools may be dispatched directly);
-  * per-tool PARAMETER EXTRACTORS — pure recognizers that turn the user message plus
-    already-resolved context facts (attach / owned asset id) into a fully-determined
-    argument set. An extractor returns ``None`` whenever anything is undetermined
-    (no quoted slot, missing asset reference, a co-occurring second demand, ambiguity
-    between two specs) — recognition failure means NO routing, never a guess.
-  * :func:`validate_action` — the executor's final schema gate BEFORE the seam.
+  * :func:`match_direct_tool` — the L0 exact pass over the binding table;
+  * :func:`is_negated_request` — the global negation guard (the funnel's
+    :func:`guardrails.negated` is its public re-export);
+  * the executor-governance exceptions (:class:`ActionSchemaError`,
+    :class:`ActionPreflightFailure`, :class:`ActionIntegrityFailure`).
+
+The PARAMETER EXTRACTORS + ``DirectToolSpec`` + ``DIRECT_TOOLS`` table moved to
+:mod:`core.application.chat.intent_funnel.registry.plugins` (8.1-b roster — DAG
+leaf, nothing in the chat layer is imported there); :func:`bind_arguments` and
+:func:`validate_action` moved to :mod:`core.application.chat.intent_funnel.binder`
+(the Binder node owns argument truth, 8.7). Historic ``from …actions import``
+sites keep working through the lazy module ``__getattr__`` façade at the bottom
+of this file — late-bound so the module DAG stays acyclic.
 
 No execution, no authorization, no I/O here. The side-effect boundary is enforced by
 :class:`~core.application.chat.executors.action.ActionExecutor` + the host seam (see
@@ -35,8 +45,6 @@ stays on the Agent.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
-from dataclasses import dataclass, field
 
 
 class ActionSchemaError(Exception):
@@ -64,192 +72,6 @@ class ActionIntegrityFailure(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
-
-
-# Slot delimiter set (ASCII, curly, CJK quotes). A free-text slot must be quoted — an
-# unbounded name/term is dynamically parameterized and belongs on the Agent path.
-_QCHARS = '"“”‘’「」『』'
-_OPEN = "[" + _QCHARS + "]"
-_SLOT = "[^" + _QCHARS + "]+"
-
-
-def _q(slot: str) -> str:
-    """``<quote>slot<quote>`` with one named capture for the slot content."""
-    return _OPEN + "(?P<" + slot + ">" + _SLOT + ")" + _OPEN
-
-
-# Words that mark a SECOND capability demand outside the matched span. A certified
-# direct call must be (nearly) the whole request: a compound turn would silently lose
-# its second half, so abstain and let the Agent own everything.
-_OTHER_DEMAND_PAT = re.compile(
-    r"\b(create|delete|save|export|schedule|rename|move|upload|download|run|execute|"
-    r"search|browse|web|internet|translate|vocab|vocabulary|glossary|word\s*list)\b|"
-    r"(创建|新建|删除|保存|导出|安排|重命名|移动|上传|下载|运行|执行|联网|搜索|查找|"
-    r"知识库|笔记|文档|文件|翻译|词库|词汇|单词|生词本)",
-    re.IGNORECASE,
-)
-# Deictic document references ("这篇文档" / "the pdf") carry no parameter — they point
-# at the asset the CONTEXT resolves, so they are stripped before the demand check
-# ("给这篇文档生成脑图" must NOT abstain merely because "文档" appears).
-_DEICTIC_PAT = re.compile(
-    r"(?:这|该|那|当前|本|附件里的?|刚上传的?)(?:份|个|篇|张)?\s*"
-    r"(?:文档|文件|pdf|ppt|幻灯片|图片|截图|图)"
-    r"|(?:this|the|that|attached|current|uploaded)\s+(?:document|doc|file|pdf|deck|image|screenshot|picture)"
-    r"|(?:上面|上文|选区里?的?)\s*(?:的)?\s*内容"
-    r"|(?:上面|上文|选区里)的?",
-    re.IGNORECASE,
-)
-
-# ── asset-id resolution from ALREADY-resolved context facts (no I/O) ────────────────
-
-def _asset_id(ctx) -> str | None:
-    """The single asset this turn points at (attach or owned upload), else None."""
-    owned = getattr(ctx, "owned_asset_id", None)
-    if owned:
-        return str(owned)
-    attach = getattr(getattr(ctx, "body", None), "attach", None)
-    if attach is None:
-        return None
-    if isinstance(attach, dict):
-        return str(attach.get("asset_id") or "") or None
-    aid = getattr(attach, "asset_id", None)
-    return str(aid) if aid else None
-
-
-def _phrase(pattern: str, *, flags: int = 0) -> re.Pattern:
-    return re.compile(pattern, flags)
-
-
-def _extract_asset_tool(pattern: re.Pattern) -> Callable[[str, object], dict | None]:
-    """Extractor factory for tools whose ONLY argument is the context asset id."""
-
-    def extract(text: str, ctx) -> dict | None:
-        m = pattern.search(text)
-        if not m:
-            return None
-        rest = (text[: m.start()] + " " + text[m.end():]).strip()
-        rest = _DEICTIC_PAT.sub(" ", rest)
-        if _OTHER_DEMAND_PAT.search(rest):
-            return None  # compound turn → Agent
-        asset = _asset_id(ctx)
-        if asset is None:
-            return None  # parameter undetermined → Agent (LLM fallback intact)
-        return {"asset_id": asset}
-
-    return extract
-
-
-@dataclass(frozen=True)
-class DirectToolSpec:
-    """One allowlist entry: a REGISTERED tool name, an extractor certifying the turn
-    demands exactly that tool with fully-determined args, and the schema gate."""
-
-    tool: str
-    description: str
-    arg_schema: dict[str, int] = field(default_factory=dict)
-    extract: Callable[[str, object], dict | None] | None = None
-
-
-# ── Seed vocabulary (service actions registered as tools alongside these specs) ─────
-
-def _extract_create_folder(text: str, ctx) -> dict | None:
-    for pat in (
-        # EN: create/make [me] [a|an|the|new|my]* folder [named|called|titled] "NAME"
-        _phrase(
-            r"(?:create|make)\s+(?:me\s+)?(?:(?:a|an|the|new|my)\s+)*(?:folder|directory)"
-            r"(?:\s+(?:named|called|titled))?\s+" + _q("name"),
-            flags=re.IGNORECASE,
-        ),
-        # ZH: 新建/创建 [一个] 文件夹 "NAME"
-        _phrase(r"(?:新建|创建|建立)\s*(?:一个)?\s*文件夹\s*" + _q("name")),
-        # ZH: 新建/创建 [一个] 叫|名为|名叫 "NAME" 的文件夹
-        _phrase(
-            r"(?:新建|创建|建立)\s*(?:一个)?\s*(?:叫|名为|名叫)\s*" + _q("name")
-            + r"\s*的\s*(?:文件夹|目录)"
-        ),
-    ):
-        m = pat.search(text)
-        if m:
-            rest = (text[: m.start()] + " " + text[m.end():]).strip()
-            rest = _DEICTIC_PAT.sub(" ", rest)
-            if _OTHER_DEMAND_PAT.search(rest):
-                return None
-            name = (m.group("name") or "").strip()
-            return {"name": name} if name else None
-    return None
-
-
-def _extract_add_term(text: str, ctx) -> dict | None:
-    for pat in (
-        # EN: add "TERM" to (my|the|our) DOMAIN (vocab|vocabulary|word list|glossary)
-        _phrase(
-            r"add\s+" + _q("term")
-            + r"\s+(?:to|in|into)\s+(?:my|the|our)\s+(?P<domain>[\w][\w\s-]*?)"
-            r"\s+(?:vocab(?:ulary)?|word\s*list|glossary)",
-            flags=re.IGNORECASE,
-        ),
-        # ZH: 把/将 "TERM" 加入|添加到 [我的] DOMAIN 词汇库|单词库|词库|生词本.
-        # (?!我的) makes a MISSING domain fail instead of swallowing the pronoun.
-        _phrase(
-            r"(?:把|将)\s*" + _q("term")
-            + r"\s*(?:加入|添加到|加到|录入)\s*(?:我的|这个)?\s*"
-            r"(?P<domain>(?!我的|这个)[\w][\w\s]{0,29}?)"
-            r"\s*(?:词汇库|单词库|词库|生词本)"
-        ),
-    ):
-        m = pat.search(text)
-        if m:
-            rest = (text[: m.start()] + " " + text[m.end():]).strip()
-            rest = _DEICTIC_PAT.sub(" ", rest)
-            if _OTHER_DEMAND_PAT.search(rest):
-                return None
-            term = (m.group("term") or "").strip()
-            domain = (m.group("domain") or "").strip()
-            return {"term": term, "domain": domain} if term and domain else None
-    return None
-
-
-DIRECT_TOOLS: dict[str, DirectToolSpec] = {
-    spec.tool: spec
-    for spec in (
-        DirectToolSpec(
-            tool="create_folder",
-            description="Create a folder with an explicit quoted name.",
-            arg_schema={"name": 120},
-            extract=_extract_create_folder,
-        ),
-        DirectToolSpec(
-            tool="add_term",
-            description="Add a quoted term to an explicitly-named vocabulary domain.",
-            arg_schema={"term": 120, "domain": 60},
-            extract=_extract_add_term,
-        ),
-        # The asset tool below is ALREADY-registered and single-shot atomic; its only
-        # parameter (asset_id) is fully determined by the request context — the
-        # extractor certifies both the phrase and the asset presence.
-        DirectToolSpec(
-            tool="pdf_extract_text",
-            description="Extract the full text of the attached document.",
-            arg_schema={"asset_id": 64},
-            extract=_extract_asset_tool(
-                _phrase(
-                    r"(?:提取|抽取|抽出|转换|转成)[^。;？!]{0,8}(?:全文|文字|文本)"
-                    r"|(?:text\s*extract|extract\s+(?:the\s+)?text|get\s+the\s+text)",
-                    flags=re.IGNORECASE,
-                )
-            ),
-        ),
-        # EXCLUDED from v1, with the verified reason (admission = single-shot atomic
-        # tool + fully-determined args + no implicit multi-step):
-        #  * ``doc_mindmap`` / ``doc_slides`` — product paths are the toolkit workflows
-        #    (``mindmap_gen`` Mermaid / ``slides_gen`` deck engine); the same-named
-        #    tools in document_tools.py are downgraded text wrappers.
-        #  * ``doc_outline`` — body runs ``extract_document_text``, which itself may
-        #    fan out vision-LLM calls on embedded images before the generation call:
-        #    not a deterministic single return.
-        # Unverified capabilities stay on the Agent path; L0 never claims them.
-    )
-}
 
 
 # ── Negation guard (frozen constraint: never execute what the user denied) ──────────
@@ -287,68 +109,57 @@ def match_direct_tool(text: str, ctx) -> dict | None:
     (ambiguity), or a spec whose extractor found undetermined parameters all leave
     the turn on the normal Agent path with its original text and full tool/skill/
     workflow authority.
-    """
+
+    The binding table is resolved through the lazy façade below (call time, never
+    import time — this module is a terminal leaf of the chat layer)."""
     if not text:
         return None
     if is_negated_request(text):
         return None  # "不要新建文件夹「X」" must never certify a write
     stripped = text.strip()
-    hits: list[tuple[DirectToolSpec, dict[str, str]]] = []
-    for spec in DIRECT_TOOLS.values():
+    hits: list[tuple[str, dict[str, str]]] = []
+    for spec in _moved()["DIRECT_TOOLS"].values():
         assert spec.extract is not None
         args = spec.extract(stripped, ctx)
         if args:
-            hits.append((spec, args))
+            hits.append((spec.tool, args))
     if len(hits) != 1:
         return None
-    spec, args = hits[0]
-    return {"tool": spec.tool, "args": args}
+    tool, args = hits[0]
+    return {"tool": tool, "args": args}
 
 
 # Back-compatible alias (tests/imports may reference the earlier name).
 match_action = match_direct_tool
 
 
-def bind_arguments(tool_binding: str, text: str, ctx) -> dict | None:
-    """Argument Binding layer: ``Capability + raw Query -> structured arguments``.
+# ── moved definitions, kept reachable through this historic import surface ─────────
+# ``bind_arguments``/``validate_action`` are DEFINED in the funnel Binder node (8.7);
+# ``DIRECT_TOOLS``/``DirectToolSpec``/``PLUGINS`` live in the registry roster (8.1-b).
+# The façade is LAZY (module ``__getattr__``): it preserves both the old import sites
+# and the monkeypatch seam used by the legacy QIR lane — the funnel's late
+# ``from …actions import bind_arguments`` reads this module's attribute at CALL time.
 
-    This is stage (2) of the frozen plan-resolution pipeline — owned by the action
-    binding table, NOT by QIR (which only outputs ``capability_id``). The current
-    implementation reuses the existing ``DirectToolSpec.extract`` regex recognizers;
-    that is an IMPLEMENTATION CHOICE, not an architectural principle — a future
-    constrained argument parser may replace it behind this same function shape.
-    Whatever the binding mechanism, its output still must pass ``validate_action``
-    and the Runtime governance funnel before anything executes.
-
-    ``None`` means the structured arguments cannot be determined from THIS
-    sentence + context (C1: parameters incomplete) — the caller lets the original
-    Agent path handle the turn, untouched. A missing binding entry is a registry
-    inconsistency (C2) and raises ``ActionIntegrityFailure``.
-    """
-    if is_negated_request(text):
-        return None  # second layer of the negation defense (QIR routed despite L0)
-    spec = DIRECT_TOOLS.get(tool_binding)
-    if spec is None or spec.extract is None:
-        raise ActionIntegrityFailure(f"no argument binding for tool {tool_binding!r}")
-    return spec.extract((text or "").strip(), ctx)
+def _moved() -> dict:
+    # ORDER MATTERS: resolve the leaf roster BEFORE the binder — the qir
+    # snapshot imports DIRECT_TOOLS through this facade while the registry
+    # package is still initializing, and binder itself pauses on that import.
+    from core.application.chat.intent_funnel.registry import plugins
+    out = {
+        "DIRECT_TOOLS": plugins.DIRECT_TOOLS,
+        "DirectToolSpec": plugins.DirectToolSpec,
+        "PLUGINS": plugins.PLUGINS,
+    }
+    from core.application.chat.intent_funnel import binder
+    out.update({
+        "bind_arguments": binder.bind_arguments,
+        "validate_action": binder.validate_action,
+    })
+    return out
 
 
-def validate_action(tool: str, args: dict) -> dict:
-    """Final schema gate (executor, BEFORE the seam): the tool must be on the allowlist,
-    every required slot present, str, stripped, within length bounds. Raises
-    :class:`ActionSchemaError` — a pre-execution, side-effect-free failure the executor
-    may safely escalate (the Agent owns the clarification)."""
-    spec = DIRECT_TOOLS.get(tool)
-    if spec is None:
-        raise ActionSchemaError(f"tool not on the direct-call allowlist: {tool!r}")
-    if not isinstance(args, dict):
-        raise ActionSchemaError("args must be a mapping")
-    out: dict[str, str] = {}
-    for slot, max_len in spec.arg_schema.items():
-        val = args.get(slot)
-        if not isinstance(val, str) or not (val := val.strip()):
-            raise ActionSchemaError(f"missing slot: {slot}")
-        if len(val) > max_len:
-            raise ActionSchemaError(f"slot too long: {slot} (>{max_len})")
-        out[slot] = val
-    return {"tool": tool, "args": out}
+def __getattr__(name: str):
+    moved = _moved()
+    if name in moved:
+        return moved[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

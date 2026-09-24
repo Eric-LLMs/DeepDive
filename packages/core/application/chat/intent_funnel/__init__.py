@@ -13,6 +13,19 @@ historical, not the baseline). The Agent remains the byte-identical fallback
 consumer and the Shared Tool Runtime the sole execution point.
 """
 from . import contract
-from .funnel import funnel_live, qir_live, route, run_intent_stage
 
-__all__ = ["contract", "route", "qir_live", "funnel_live", "run_intent_stage"]
+# LAZY re-exports (2026-09-24 structure rulings): ``funnel`` imports
+# ``understanding`` which imports ``actions`` — eagerly importing funnel here
+# would detonate a cycle whenever ``actions``' façade resolves its moved names
+# (actions -> registry/binder -> this package -> funnel -> understanding ->
+# actions, with understanding still half-built). Attribute access happens at
+# CALL time, when every module in that chain is fully initialized.
+
+def __getattr__(name: str):
+    if name in ("funnel_live", "qir_live", "route", "run_intent_stage"):
+        from . import funnel as _funnel
+        return getattr(_funnel, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = ["contract", "funnel_live", "qir_live", "route", "run_intent_stage"]

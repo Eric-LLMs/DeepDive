@@ -347,7 +347,7 @@ def test_validate_accepts_the_full_source_enum_including_plugin_forms():
     e = _entry(arg_slots={
         "a": "user_input", "b": "viewer.current_page", "c": {"source": "viewer.selection"},
         "d": "attachment", "e": "turn_context", "f": "fixed",
-        "g": "plugin:extract_folder_name",
+        "g": "plugin:quoted_folder_name",  # 8.1-b wiring: name must be in the roster
     })
     assert reg.snapshot.validate_entries([e]) == []
 
@@ -355,6 +355,7 @@ def test_validate_accepts_the_full_source_enum_including_plugin_forms():
 @pytest.mark.parametrize("slot,bad", [
     ("regex:aliases", "minimal enum"),        # NOT in the frozen enum (ruling 2)
     ("plugin:", "needs a name"),
+    ("plugin:no_such_extractor", "not registered"),  # roster membership (8.1-b)
     (123, "must be a string"),
     ({"nope": "user_input"}, "must be a string"),
 ])

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import time
 
-from core.application.chat.actions import DIRECT_TOOLS
+# Import the leaf directly: the ``actions`` facade resolves its moved names
+# lazily, and a top-level from-import here could re-enter a half-built binder.
+from core.application.chat.intent_funnel.registry.plugins import DIRECT_TOOLS
 
 from .types import Capability, ExampleVector, Snapshot, SnapshotError, fingerprint
 
