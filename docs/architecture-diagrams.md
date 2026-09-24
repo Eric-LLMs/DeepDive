@@ -378,9 +378,10 @@ flowchart TB
 
 **Intent Funnel — the single-hop routing chain end to end.** `funnel.route` runs inside plan
 resolution beside the legacy QIR lane: the Registry/index pair loads first, the Matcher consults
-the table only, Recall nominates candidates without adjudicating, ONE ToolIntentModel call selects
-the capability and drafts its arguments, and the Binder only validates against the Registry
-schema. Every abstain, denial or fault exits fail-open to the Agent byte-identical; execution is
+the table only, Recall runs on any non-HIT and nominates candidates without adjudicating, at most
+ONE ToolIntentModel call selects the capability and drafts its arguments (the stub backend makes
+no model call and extracts nothing), and the Binder only validates against the Registry schema.
+Every abstain, denial or fault exits fail-open to the Agent byte-identical; execution is
 never the funnel's — a certified turn dispatches through the same shared waterfall.
 
 ![Intent Funnel — Matcher → Recall → ToolIntentModel → Binder → Runtime / Agent](./images/intent-funnel.png)
@@ -411,8 +412,8 @@ flowchart LR
         M["Node 1 · Matcher — table data only<br/>patterns/aliases · re: = regex search, else the whole<br/>normalized query must equal a literal<br/>negation guard before certifying (common layer)<br/>HIT · MISS · MATCH_AMBIGUOUS (all claimants up)"]
         R["Node 2 · Recall — cosine top_k ≥ min_score<br/>quality-gate candidates ONLY, never adjudicates<br/>(origin=recall, calibrated score)"]
         CAND["ONE candidate set, one convergence point<br/>matcher_hit 1.0 · matcher_ambiguous 0.0 — MERGED with<br/>recall (calibrated score wins shared ids) · empty ⇒ NO_CANDIDATE"]
-        TI["Node 3 · ToolIntentModel — the ONE model call:<br/>select capability AND draft arguments<br/>ladder chat_tool_intent_backend:<br/>stub → local → online (auto = local→online→stub)"]
-        B["Node 4 · Binder.validate — pure schema gate<br/>Registry canonical parameters · extracts nothing<br/>COMPLETE / MISSING / AMBIGUOUS / INVALID"]
+        TI["Node 3 · ToolIntentModel — at most ONE model call:<br/>select capability AND draft arguments<br/>chat_tool_intent_backend picks the chain:<br/>auto = local → online → stub (Unavailable falls through)<br/>stub = margin rules, NO model, NO extraction<br/>(arguments None ⇒ schema'd turns exit BIND_MISSING)"]
+        B["Node 4 · Binder.validate — pure schema gate<br/>Registry canonical parameters · extracts nothing<br/>COMPLETE / MISSING / INVALID<br/>(AMBIGUOUS wired in contract — no producer yet)"]
         REG --> M
         M -- "any non-HIT: MISS / AMBIGUOUS" --> R --> CAND
         M -- "HIT" --> CAND
@@ -421,13 +422,14 @@ flowchart LR
 
     subgraph adapters["Local Adapter — one internal reply shape from either wire format"]
         direction TB
-        PJ["prompt_json mode: SYSTEM asks JSON · brace-parse"]
-        NT["tools mode: native tool_calls<br/>one OpenAI function per candidate<br/>name = Registry capability_id"]
-        MD["structured-Markdown fallback<br/>### cap / tool: / arguments: / confidence:<br/>strict whole-reply fullmatch · prose never matches<br/>tool line cross-checked against the Registry"]
-        GATE2["verdict gate (same for both formats):<br/>NONE ⇒ REJECT · off-card ⇒ UNCERTAIN ·<br/>below floor ⇒ UNCERTAIN · else CONFIDENT + args"]
-        PJ & NT & MD --> GATE2
+        TI -- "prompt_json mode" --> PJ["brace-parse the JSON reply"]
+        TI -- "tools mode" --> NT["native tool_calls<br/>one OpenAI function per candidate<br/>name = Registry capability_id"]
+        NT -. "no tool_calls in reply →" .-> MD["structured-Markdown fallback<br/>### cap / tool: / arguments: / confidence:<br/>strict whole-reply fullmatch · prose never matches<br/>tool line cross-checked against the Registry"]
+        PJ --> GATE2["verdict gate (same for every format):<br/>NONE ⇒ REJECT · off-card ⇒ UNCERTAIN ·<br/>below floor ⇒ UNCERTAIN · else CONFIDENT + args"]
+        NT -- "tool_calls" --> GATE2
+        MD -- "parsed block" --> GATE2
     end
-    CAND --> TI --> adapters
+    CAND --> TI
 
     subgraph exits["Fail-open exits — reason codes carry the stage prefix"]
         direction TB
@@ -440,17 +442,18 @@ flowchart LR
     GATE2 -- "CONFIDENT → entry still honored<br/>· kind ON (else VERSION_MISMATCH /<br/>KIND_DISABLED — see exits)" --> B
     B -- "not COMPLETE" --> AG
 
-    CERT["Certified ACTION turn — NEW TurnRequirements<br/>requested_action {tool, args, capability_id,<br/>index-version TOCTOU stamp, funnel_stage, funnel_kind}"]
+    CERT["Certified ACTION turn — NEW TurnRequirements<br/>requested_action {tool, args, capability_id,<br/>index-version TOCTOU stamp, funnel_stage, funnel_kind,<br/>funnel_registry_version = Registry fingerprint}"]
     B -- COMPLETE --> CERT
+    CERT --> EX["ActionExecutor._dispatch — the funnel executed NOTHING,<br/>the plan stage owns this: TOCTOU re-validate the stamped<br/>fingerprint / active entry / same tool / kind still ON<br/>(drift ⇒ decided TERMINAL, never an Agent retry) ·<br/>binding_integrity marker ⇒ TERMINAL · validate_action<br/>schema gate — malformed ⇒ proven pre-body, Agent clarifies"]
 
     subgraph runtime["ONE shared execution waterfall — no second authority"]
-        RW["ToolRuntime.execute: auth → approval →<br/>sandbox / source-policy guards →<br/>tool body → events / audit"]
+        RW["runtime.execute stages (fail-closed each):<br/>tools/pre-execute (approval ASK · sandbox ·<br/>source-policy) → monotonic guard →<br/>tools/execute (tool body) → tools/post-execute<br/>→ events / audit"]
     end
-    CERT --> RW
+    EX --> RW
     AG -- "every agent tool call" --> RW
 
     OBS["funnel_trace + session event row (execution_mode-tagged)<br/>deepest stage · matcher · recall top · tool-intent verdict ·<br/>final route · per-stage latency — the tuning panel"]
-    cascade -.- OBS
+    B -.- OBS
 ```
 
 </details>
