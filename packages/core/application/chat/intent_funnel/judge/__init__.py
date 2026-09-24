@@ -96,24 +96,32 @@ async def recheck(query: str, capability_id: str, *, entry, issue: str,
     """The 8.7 binding-review pass: can this capability still stand given an
     extraction problem? Only a REJECT changes the outcome downstream (the
     capability is abandoned WITHOUT reaching the Agent as a false route);
-    anything else escalates with the BIND_* reason attached."""
+    anything else escalates with the BIND_* reason attached.
+
+    Ladder (2026-09-24 fix): every non-stub backend really gets called —
+    ``auto`` tries local first and falls through to online, exactly like
+    :func:`adjudicate`; the earlier "auto + no local -> UNCERTAIN" short
+    circuit skipped the online step the ruling requires. Only the
+    deterministic stub (no extraction power) answers "cannot review"
+    directly."""
     from core.config import settings
 
     backend = _backend()
-    if backend == "stub" or (backend == "auto" and not settings.chat_judge_local_url):
-        # the deterministic stub has no extraction power — it cannot rescue a
-        # missing/invalid argument, only the model backends can re-adjudicate
+    if backend == "stub":
         return JudgeVerdict(JUDGE_UNCERTAIN, capability_id, f"binding {issue}")
     probe = [c for c in candidates if c.capability_id == capability_id]
     if not probe:
         return JudgeVerdict(JUDGE_UNCERTAIN, capability_id, f"binding {issue}")
-    try:
-        verdict = await _model_judge(
-            "local" if backend in ("local", "auto") and settings.chat_judge_local_url else "online",
-            f"{query}\n\n(binding problem: {issue})", probe,
-            {capability_id: entry}, llm,
-        )
-    except JudgeUnavailable as exc:
-        logger.info("judge recheck unavailable (%r); escalating unresolved", exc)
-        return JudgeVerdict(JUDGE_UNCERTAIN, capability_id, f"binding {issue}")
-    return verdict
+    chain = {"auto": ("local", "online"),
+             "local": ("local",), "online": ("online",)}[backend]
+    recheck_query = f"{query}\n\n(binding problem: {issue})"
+    for step in chain:
+        if step == "local" and not settings.chat_judge_local_url:
+            continue  # not deployed: fall through, never abstain-to-Agent
+        try:
+            return await _model_judge(
+                step, recheck_query, probe, {capability_id: entry}, llm)
+        except JudgeUnavailable as exc:
+            logger.info("judge recheck %s unavailable (%r); trying next", step, exc)
+    logger.info("judge recheck found no serving backend; escalating unresolved")
+    return JudgeVerdict(JUDGE_UNCERTAIN, capability_id, f"binding {issue}")

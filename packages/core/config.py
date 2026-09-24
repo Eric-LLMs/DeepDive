@@ -155,7 +155,18 @@ class Settings(BaseSettings):
     # Judge backend ladder (8.17): "stub" | "local" | "online" | "auto" (local→online→stub)
     chat_judge_backend: str = "stub"
     chat_judge_min_confidence: float = 0.75      # online verdicts below this escalate
+    # 2026-09-24 deployment ruling: local judge deployment deferred — "" keeps the
+    # honest "not deployed -> JudgeUnavailable -> fall through the ladder" semantics.
+    # chat_judge_local_url is an OpenAI-compatible BASE (e.g. http://localhost:18090/v1).
     chat_judge_local_url: str = ""               # deployed local judge endpoint ("" = none)
+    # Online judge rides a DEDICATED small-model channel (8.17 "小模型层"), explicit
+    # per-call forwarding like the session-summary seam; "" model = ride the pinned
+    # turn channel (legacy behavior), base_url+api_key must be set together to pin
+    # a dedicated endpoint, else only the model name is forwarded.
+    chat_judge_online_model: str = ""
+    chat_judge_online_base_url: str = ""
+    chat_judge_online_api_key: str = ""
+    chat_judge_timeout_seconds: float = 4.0      # per-call guardrail inside the 5s cascade
     # P3 per-kind rollout gates (docs/temp.md §6-P3, 逐开关灰度): ACTION rides the
     # master funnel gate + chat_action_fast_path_enabled; widened kinds each need
     # their own switch, default OFF — registering a capability never routes it.

@@ -153,6 +153,7 @@ class OpenAILLM:
         self, client: AsyncOpenAI, mdl: str, messages: list[dict],
         response_format: dict | None = None,
         usage_out: dict | None = None,
+        temperature: float | None = None,
     ) -> str:
         """One streamed completion, accumulated to the full text.
 
@@ -168,7 +169,11 @@ class OpenAILLM:
         it (``stream_options.include_usage``): the usage chunk arrives last, with no
         choices — reading it off the stream keeps instrumentation honest (no estimates).
         """
-        kwargs: dict = {"model": mdl, "messages": messages, "temperature": 0.3, "stream": True}
+        kwargs: dict = {
+            "model": mdl, "messages": messages, "stream": True,
+            # None keeps the historical 0.3; per-call overrides (judge) ask for 0.0.
+            "temperature": 0.3 if temperature is None else temperature,
+        }
         if response_format:
             kwargs["response_format"] = response_format
         if usage_out is not None:
@@ -199,13 +204,15 @@ class OpenAILLM:
         base_url: str | None = None,
         api_key: str | None = None,
         timeout: float | None = None,
+        temperature: float | None = None,
     ) -> str:
         # A per-call ``timeout`` (e.g. toolkit full-context generation) forces a fresh
         # client; without it the shared client's global wall time applies. Under the
         # streaming wire this bounds IDLE time between chunks, not total generation.
         client, mdl = self._call_channel(model, base_url, api_key, timeout=timeout)
         return await self._stream_accumulate(
-            client, mdl, self._messages(prompt, system_prompt))
+            client, mdl, self._messages(prompt, system_prompt),
+            temperature=temperature)
 
     async def complete_json(
         self,
@@ -217,6 +224,7 @@ class OpenAILLM:
         timeout: float | None = None,
         usage_out: dict | None = None,
         images: list[str] | None = None,
+        temperature: float | None = None,
     ) -> dict:
         """Structured completion: ask the provider for a JSON object.
 
@@ -234,6 +242,7 @@ class OpenAILLM:
                 client, mdl, self._messages(prompt, system_prompt, images=images),
                 response_format={"type": "json_object"},
                 usage_out=usage_out,
+                temperature=temperature,
             )
         except Exception as exc:
             raise raise_classified(exc) from exc

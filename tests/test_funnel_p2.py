@@ -81,14 +81,18 @@ class _Embedder:
 
 
 class _LLM:
-    """Replies are popped in order; an Exception member raises (transport fault)."""
+    """Replies are popped in order; an Exception member raises (transport fault).
+    ``calls`` records the per-call channel kwargs (model/base_url/api_key/timeout/
+    temperature) so the online judge's explicit forwarding is assertable."""
 
     def __init__(self, replies=()):
         self.replies = list(replies)
         self.prompts = []
+        self.calls: list[dict] = []
 
-    async def complete_json(self, prompt, *, system_prompt=None):
+    async def complete_json(self, prompt, *, system_prompt=None, **kw):
         self.prompts.append(prompt)
+        self.calls.append(kw)
         if not self.replies:
             return {}
         r = self.replies.pop(0)
@@ -298,6 +302,148 @@ def test_judge_backends_raise_unavailable_not_answers():
             await online.judge("q", (), {}, llm=None)
         with pytest.raises(jbase.JudgeUnavailable):
             await online.judge("q", (), {}, llm=_LLM([RuntimeError("401")]))
+    asyncio.run(go())
+
+
+# ── 8.17 real-backend wiring (2026-09-24 ruling: online first, dedicated
+#    small-model channel with explicit per-call forwarding) ──────────────────────
+
+async def test_judge_online_serves_and_forwards_dedicated_channel(monkeypatch):
+    from core.application.chat.intent_funnel import judge as judge_pkg
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "chat_judge_backend", "online")
+    monkeypatch.setattr(settings, "chat_judge_online_model", "tiny-judge")
+    monkeypatch.setattr(settings, "chat_judge_online_base_url", "https://cheap.example/v1")
+    monkeypatch.setattr(settings, "chat_judge_online_api_key", "sk-test")
+    llm = _LLM([{"capability_id": "cap-a", "confidence": 0.9}])
+    out = await judge_pkg.adjudicate(
+        "新建文件夹", (Candidate("cap-a", 0.9),), entries_by_id={}, llm=llm)
+    assert out.decision == JUDGE_CONFIDENT and out.capability_id == "cap-a"
+    kw = llm.calls[0]
+    assert kw == {
+        "model": "tiny-judge", "base_url": "https://cheap.example/v1",
+        "api_key": "sk-test", "timeout": settings.chat_judge_timeout_seconds,
+        "temperature": 0.0,
+    }
+
+
+async def test_judge_online_model_without_endpoint_pair_rides_pinned_channel(monkeypatch):
+    """base_url/api_key are honored only as a PAIR: a half-configured dedicated
+    endpoint is worse than riding the turn's pinned channel, so only the model
+    name is forwarded."""
+    from core.application.chat.intent_funnel import judge as judge_pkg
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "chat_judge_backend", "online")
+    monkeypatch.setattr(settings, "chat_judge_online_model", "tiny-judge")
+    monkeypatch.setattr(settings, "chat_judge_online_base_url", "https://cheap.example/v1")
+    monkeypatch.setattr(settings, "chat_judge_online_api_key", "")
+    llm = _LLM([{"capability_id": "cap-a", "confidence": 0.9}])
+    out = await judge_pkg.adjudicate(
+        "q", (Candidate("cap-a", 0.9),), entries_by_id={}, llm=llm)
+    assert out.decision == JUDGE_CONFIDENT
+    assert llm.calls[0].get("model") == "tiny-judge"
+    assert "base_url" not in llm.calls[0] and "api_key" not in llm.calls[0]
+
+
+async def test_judge_auto_local_absent_falls_through_to_online(monkeypatch):
+    """8.17 ladder: auto with nothing deployed = local skipped (fall-through,
+    never abstain-to-Agent) and the online step really serves."""
+    from core.application.chat.intent_funnel import judge as judge_pkg
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "chat_judge_backend", "auto")
+    monkeypatch.setattr(settings, "chat_judge_local_url", "")
+    llm = _LLM([{"capability_id": "cap-a", "confidence": 0.95}])
+    out = await judge_pkg.adjudicate(
+        "q", (Candidate("cap-a", 0.9),), entries_by_id={}, llm=llm)
+    assert out.decision == JUDGE_CONFIDENT and llm.prompts
+
+
+async def test_judge_auto_full_chain_local_unreachable_online_down_stub_serves(monkeypatch):
+    from core.application.chat.intent_funnel import judge as judge_pkg
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "chat_judge_backend", "auto")
+    # a dead port: transport fault -> JudgeUnavailable -> fall through
+    monkeypatch.setattr(settings, "chat_judge_local_url", "http://127.0.0.1:9/v1")
+    out = await judge_pkg.adjudicate(
+        "q", (Candidate("cap-a", 0.9),), entries_by_id={}, llm=None)
+    # local down + online (no llm) down -> the deterministic stub serves
+    assert out.decision == JUDGE_CONFIDENT and out.capability_id == "cap-a"
+
+
+async def test_judge_recheck_auto_without_local_really_calls_online(monkeypatch):
+    """The 2026-09-24 recheck fix: auto + no local must try ONLINE, not
+    short-circuit to UNCERTAIN the way the old code did."""
+    from core.application.chat.intent_funnel import judge as judge_pkg
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "chat_judge_backend", "auto")
+    monkeypatch.setattr(settings, "chat_judge_local_url", "")
+    monkeypatch.setattr(settings, "chat_judge_online_model", "")
+    llm = _LLM([{"capability_id": "cap-a", "confidence": 0.9}])
+    v = await judge_pkg.recheck("新建文件夹", "cap-a", entry=_entry("cap-a"),
+                                issue="missing",
+                                candidates=(Candidate("cap-a", 0.9),), llm=llm)
+    assert v.decision == JUDGE_CONFIDENT and v.capability_id == "cap-a"
+    assert "binding problem: missing" in llm.prompts[0]
+
+
+def test_local_judge_speaks_openai_wire_or_raises_unavailable(monkeypatch):
+    import httpx
+    from core.application.chat.intent_funnel.judge import local as local_mod
+
+    seen: dict = {}
+
+    class _Resp:
+        def __init__(self, status, body):
+            self.status_code, self._body = status, body
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    "boom", request=httpx.Request("POST", "http://j/v1/chat/completions"),
+                    response=httpx.Response(self.status_code))
+
+        def json(self):
+            return self._body
+
+    class _Client:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None):
+            seen["url"], seen["payload"] = url, json
+            return self._resp
+
+    ok_body = {"choices": [{"message": {
+        "content": 'verdict: {"capability_id": "cap-a", "confidence": 0.88}'}}]}
+
+    async def go():
+        monkeypatch.setattr(local_mod.httpx, "AsyncClient",
+                            lambda **kw: _Client(_Resp(200, ok_body)))
+        data = await local_mod.judge("q", (), {}, url="http://j/v1/")
+        assert data == {"capability_id": "cap-a", "confidence": 0.88}
+        assert seen["url"] == "http://j/v1/chat/completions"     # base + wire
+        assert seen["payload"]["messages"][0]["role"] == "system"
+        assert seen["payload"]["temperature"] == 0.0
+        monkeypatch.setattr(local_mod.httpx, "AsyncClient",
+                            lambda **kw: _Client(_Resp(503, {})))
+        with pytest.raises(jbase.JudgeUnavailable):
+            await local_mod.judge("q", (), {}, url="http://j/v1")
+        # a 200 whose message is not JSON is UNAVAILABLE, never a verdict
+        monkeypatch.setattr(local_mod.httpx, "AsyncClient", lambda **kw: _Client(
+            _Resp(200, {"choices": [{"message": {"content": "no json here"}}]})))
+        with pytest.raises(jbase.JudgeUnavailable):
+            await local_mod.judge("q", (), {}, url="http://j/v1")
     asyncio.run(go())
 
 
