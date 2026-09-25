@@ -367,8 +367,9 @@ async def preview(message: str, *, deps) -> dict:
     ctx = _preview_ctx(message)
     trace = _new_trace()
     token = set_request_execution_mode("preview")
+    capture: dict = {}
     try:
-        out = await _run_cascade(ctx, deps, requirements, trace)
+        out = await _run_cascade(ctx, deps, requirements, trace, capture=capture)
         await _persist_event(deps, ctx, trace)   # inside the pin: the event says "preview"
     finally:
         reset_request_execution_mode(token)
@@ -380,6 +381,13 @@ async def preview(message: str, *, deps) -> dict:
         "final_route": trace["final_route"], "fallback_reason": trace["fallback"],
         "registry_version": trace["registry"], "index_version": trace["index"],
         "total_ms": trace["total_ms"], "execution_mode": "preview",
+        # Console dry-run detail (Phase 5): what the model actually saw — each
+        # candidate's origin, matched corpus sentence and kind — plus the raw
+        # verdict and Binder state. Read-only projection of `capture`.
+        "candidates": capture.get("candidates", []),
+        "recall_raw": capture.get("recall_raw", []),
+        "model_verdict": capture.get("tool_intent"),
+        "binder_state": capture.get("binder"),
     }
     if out is not None:
         act = out.requested_action or {}
@@ -530,9 +538,16 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
         trace["recall_top"] = f"{top.capability_id}@{top.score:.3f}"
     cands = sorted(candidates.values(), key=lambda c: c.score, reverse=True)
     if capture is not None:
+        # corpus kind for the console dry-run (Phase 5): position 0 of a cap's
+        # intent_corpus is the canonical sentence, the rest are synonyms.
+        ex_kind = {
+            (c.id, e): ("canonical" if i == 0 else "synonym")
+            for c in index.capabilities for i, e in enumerate(c.examples)
+        }
         capture["candidates"] = [
             {"capability_id": c.capability_id, "score": c.score, "origin": c.origin,
-             "matched_example": c.matched_example}
+             "matched_example": c.matched_example,
+             "kind": ex_kind.get((c.capability_id, c.matched_example), "-")}
             for c in cands
         ]
     if model_candidate_floor is not None:
