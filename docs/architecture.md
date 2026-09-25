@@ -4659,7 +4659,158 @@ fencing semantics), `test_chat_direct_e2e / viewer / retrieval / composite` per 
 > 2026-09-24 chain ruling — the second online round-trip was measured to add zero
 > information and to *be* the cascade timeout.
 
-### 25.1 Goals & Principles
+### 25.1 Intent Recognition Iteration
+
+The primary purpose of Delveta's Intent Funnel is to reduce the cost and
+latency of Tool-related decisions.
+
+Without the Intent Funnel, ordinary Tool-related queries may repeatedly
+reach the online / large language model Agent path. This introduces three
+major costs:
+
+1. **Latency** — online / large models require significantly more inference
+   time than local lightweight models.
+2. **Token consumption** — sending Tool classification and routing decisions
+   through large-model inference consumes unnecessary input/output tokens.
+3. **Compute cost** — using a large model to determine whether a query is
+   asking to execute a Tool, and which Tool should be executed, is
+   substantially more expensive than performing the same classification with
+   a local lightweight model.
+
+The Intent Funnel therefore moves the inexpensive, high-frequency Tool
+classification work to a local lightweight model:
+
+```text
+User Query
+    │
+    ▼
+Intent Funnel
+    │
+    ├── Exact Match
+    │
+    └── Vector Recall
+            │
+            ▼
+      Local ToolIntentModel
+            │
+            ├── ACTION
+            │      │
+            │      ▼
+            │   Tool Runtime
+            │
+            └── NONE / UNCERTAIN
+                   │
+                   ▼
+              Agent / Normal Chat
+```
+
+The goal is not merely to classify intent. It is to avoid unnecessarily
+invoking the expensive Agent / online large-model path for Tool decisions
+that can be resolved locally.
+
+This creates a simple engineering objective:
+
+> **Resolve as many Tool decisions as possible with inexpensive local
+> inference, while preserving correct Tool execution and avoiding incorrect
+> execution.**
+
+### 25.2 Iterative Recall Optimization
+
+The Recall threshold is intentionally kept relatively conservative. The
+system does not continuously lower the threshold simply to increase Action
+Recall.
+
+Instead, Recall is improved by continuously expanding the Query Corpus.
+
+The iteration loop is:
+
+```text
+Fixed Recall Threshold
+        │
+        ▼
+Filter low-relevance queries
+        │
+        ├── Non-Action / irrelevant queries remain filtered
+        │
+        └── Some genuine Actions may be missed
+                         │
+                         ▼
+                  Mine Recall Misses
+                         │
+                         ▼
+              Add validated Query
+              to synonym_examples
+                         │
+                         ▼
+                  Re-embed Corpus
+                         │
+                         ▼
+              Re-evaluate Recall
+                         │
+                         ▼
+             More Actions recalled
+             at the same threshold
+                         │
+                         └──────────↺
+```
+
+The key principle is:
+
+> **Keep the threshold stable; improve Recall by expanding Query diversity
+> and semantic coverage.**
+
+Each iteration evaluates two dimensions independently:
+
+1. **Action Coverage** — whether more genuine Tool Actions are retrieved by
+   the candidate Recall stage.
+2. **Non-Action Filtering** — whether irrelevant / non-action queries remain
+   outside the candidate pool.
+
+The desired evolution is:
+
+```text
+Threshold       Query Corpus       Action Recall
+   fixed            grows               ↑
+```
+
+rather than:
+
+```text
+Threshold           ↓                 Action Recall ↑
+```
+
+When a genuine Tool Action is missed, the preferred remediation is to add
+a validated natural-language Query to that capability's
+`synonym_examples`, rather than immediately lowering the global threshold.
+
+This allows Delveta to progressively improve semantic coverage while
+keeping the candidate filtering boundary stable.
+
+Over time:
+
+```text
+More real-world Action Queries
+            ↓
+More diverse synonym_examples
+            ↓
+Better semantic coverage
+            ↓
+Higher Recall at the same threshold
+            ↓
+More Tool decisions handled locally
+            ↓
+Fewer unnecessary Agent / online LLM calls
+            ↓
+Lower latency + lower token consumption + lower compute cost
+```
+
+This forms a continuous production optimization loop:
+
+> **Mine missed Actions → expand Query Corpus → improve Recall → keep more
+> Tool decisions on the local lightweight path → reduce expensive Agent /
+> online LLM inference.**
+
+### 25.3 Goals & Principles
 
 Turn the "guess the intent" path from scattered parts into **one decoupled,
 nodeized funnel**, and the "how to execute" path into **a single Runtime choke
@@ -4682,7 +4833,7 @@ point**. Four principles:
    example corpus) lives in the Registry row alone; the intent nodes emit only
    the *capability symbol*, never execution authority.
 
-### 25.2 The Active Chain
+### 25.4 The Active Chain
 
 ```
 Matcher HIT ──┐
@@ -4704,7 +4855,7 @@ Gate composition (`funnel_live`): master `chat_funnel_enabled` +
 code, deliberately, not table data, ruling 8.1-a). A turn L0 already certified
 is never touched during the coexistence period (migration-boundary ruling, not
 a statement that L0 is the baseline). P3 widened intent kinds pass the extra
-per-kind gate in §25.9.
+per-kind gate in §25.11.
 
 Cascade body (`_run_nodes`, one wall-clock budget `chat_funnel_timeout_seconds`):
 
@@ -4734,7 +4885,7 @@ Cascade body (`_run_nodes`, one wall-clock budget `chat_funnel_timeout_seconds`)
    confidence below `chat_tool_intent_min_confidence` → `UNCERTAIN`; else
    `CONFIDENT` with the argument draft. Anything but CONFIDENT exits to the
    Agent (`TOOL_INTENT_REJECT` / `TOOL_INTENT_UNCERTAIN` / `TOOL_INTENT_TIMEOUT`).
-   Backend ladder and wire disciplines: §25.4.
+   Backend ladder and wire disciplines: §25.6.
 5. **Binder** (Node 4, `binder/`): `validate(entry, arguments)` against the
    Registry's **canonical parameter schema** — pure validation, the Binder
    extracts nothing on the active path. Non-COMPLETE states exit straight to the
@@ -4753,7 +4904,7 @@ explicitly open in the main-window viewer (say "summarize this page" and it
 means that) or the session context (default). There is no "web page" object
 class; ambiguous candidates can only come from Registry-registered capabilities.
 
-### 25.3 Node Contracts & the Registry (single source of truth)
+### 25.5 Node Contracts & the Registry (single source of truth)
 
 Node I/O lives in `contract.py` (frozen dataclasses; nodes speak nothing else):
 
@@ -4785,7 +4936,7 @@ CapabilityEntry:
     arg_slots: dict                 # slot -> source declaration, incl. "plugin:<name>" (8.1-b)
     permissions: str
     execution_policy: str           # auto / approval / sandbox rule reference
-    intent_kind: str                # "action" | "private" | "web" (P3, §25.9)
+    intent_kind: str                # "action" | "private" | "web" (P3, §25.11)
     enabled / status / replacement_capability_id    # lifecycle (§8.6, no hard delete)
     row_version: int                # optimistic concurrency — silent overwrite impossible
 ```
@@ -4823,7 +4974,7 @@ read and edited by humans, and logic that cannot be honestly tabulated is not
 stuffed into it; what a node cannot decide escalates, and the model layers
 bottom out.
 
-### 25.4 ToolIntentModel — Backends, Wire Discipline & Output Adapters
+### 25.6 ToolIntentModel — Backends, Wire Discipline & Output Adapters
 
 Payload discipline (`tool_intent/base.py`, 8.17): input = query + `TurnFacts` +
 one **Card per candidate**, assembled from the Registry row by capability_id —
@@ -4857,7 +5008,7 @@ every backend, so providers are interchangeable above this module.
 
 **Local output disciplines** (`chat_tool_intent_local_mode`) — the Adapter
 normalizes whatever the model emits into the ONE internal reply shape
-`{capability_id, confidence, arguments}`; the verdict gate (§25.2 step 4) and
+`{capability_id, confidence, arguments}`; the verdict gate (§25.4 step 4) and
 the Binder stay the sole correctness owners either way — an off-card id is
 still `UNCERTAIN`, never an auto-pass:
 
@@ -4909,7 +5060,7 @@ Adapter's format coverage, not its willingness to believe.
 unparseable) raises `ToolIntentUnavailable` and falls through the ladder; the
 ToolIntentModel never invents a verdict out of its own outage.
 
-### 25.5 Failures, Fallback & Stale Dispatch (§8.9–§8.11)
+### 25.7 Failures, Fallback & Stale Dispatch (§8.9–§8.11)
 
 Reason codes carry their stage prefix (8.10; bare `AMBIGUOUS` is banned — it
 collides with `Confidence.AMBIGUOUS`):
@@ -4935,7 +5086,7 @@ channel. **Stale dispatch is never ordinary Agent fallback**: pre-Commit-Point
 with zero side effects it gets exactly one re-route against the current
 version; a second stale is Terminal/C3 (§24 table, §8.9).
 
-### 25.6 Observability, Execution Modes & Shadow (§8.12, §8.14, §8.15)
+### 25.8 Observability, Execution Modes & Shadow (§8.12, §8.14, §8.15)
 
 Every cascade run produces a `funnel_trace` — deepest stage, matcher state,
 recall count/top score, tool-intent verdict, final route, fallback reason,
@@ -4968,7 +5119,7 @@ trace as a verdict. Executing nothing is structural: the chain only produces
 routing metadata, `run_tool` is not on the preview object graph at all, and
 usage lands `execution_mode=preview`.
 
-### 25.7 Repository Structure (implemented)
+### 25.9 Repository Structure (implemented)
 
 ```
 packages/core/application/chat/
@@ -5029,14 +5180,14 @@ architecture violation to be split, not a detail to argue about. (The legacy
 QIR semantic layer entangling cosine scoring with adjudication is the named
 counter-example this unbundles.)
 
-### 25.8 Publish-Gate & Safety Digest (8.4 / 8.6 / 8.8)
+### 25.10 Publish-Gate & Safety Digest (8.4 / 8.6 / 8.8)
 
 - **Lifecycle** — no hard deletes: `ACTIVE / DISABLED / DEPRECATED` +
   optional `replacement_capability_id`; history, published snapshots and audits
   survive a disable. A disabled/deprecated capability is never an executable
   candidate; admin/audit views still see it (ruling 4, pinned in
   `test_intent_registry`).
-- **Publish validation** — the §25.3 checklist; any single failure refuses the
+- **Publish validation** — the §25.5 checklist; any single failure refuses the
   publish before anything is written.
 - **Safety boundary** — intent nodes never hold execution permission. The
   unified chain is
@@ -5046,7 +5197,7 @@ counter-example this unbundles.)
   `capability_id · registry_version · routing stage · confidence · routing metadata`
   — never an executor, a tool instance, or an authorization bypass.
 
-### 25.9 Full Intent Space & Rollout (§6 / §8.19–§8.20)
+### 25.11 Full Intent Space & Rollout (§6 / §8.19–§8.20)
 
 `intent_kind` widens the candidate space beyond plain ACTION: `action` /
 `private` / `web`. **Being IN the table was never the same as being ON**: each
@@ -5070,7 +5221,7 @@ rollback/audit, observability — rollout opening is an ops decision, never a
 default flip (`chat_funnel_enabled=False`, `chat_tool_intent_backend="stub"`
 stay the shipped code defaults until Shadow + authenticated E2E say otherwise).
 
-### 25.10 The Five Adjudications (2026-09-23)
+### 25.12 The Five Adjudications (2026-09-23)
 
 The §8 constraints were drafted with five claims that fought the code; each was
 adjudicated and written back into the text above:
@@ -5083,7 +5234,7 @@ adjudicated and written back into the text above:
 | **d** | "three layers under 50 ms" was never measured | clause voided — no time limit for now; every node keeps recording latency; a future threshold ships as configuration from Shadow measurements, never as prose in this document | 8.13 |
 | **e** | who receives a multi-capability match was left unstated | upward with ALL candidates (Matcher → model); session objects are only the open viewer file or the session context — there is no "web page" candidate class | 8.1 / 25.2 |
 
-### 25.11 Configuration (`core/config.py`, all dark by default)
+### 25.13 Configuration (`core/config.py`, all dark by default)
 
 ```
 chat_funnel_enabled=False          chat_funnel_timeout_seconds=5.0
@@ -5100,7 +5251,7 @@ The `chat_funnel_*` knobs are deliberately INDEPENDENT of the legacy
 `chat_qir_*` set — the new chain is tuned on its own merits; the legacy QIR
 lane (§24) stays byte-identical while the funnel gate is closed.
 
-### 25.12 Test Doctrine
+### 25.14 Test Doctrine
 
 Node-independent suites (fake contracts only — swapping a node's algorithm
 never touches another node's tests): `test_funnel_p2.py` (cascade lanes, gate
