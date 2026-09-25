@@ -453,6 +453,7 @@
             <div class="nav-item" data-page="tokens">Tokens</div>
             <div class="nav-item" data-page="tools">Tools config</div>
             <div class="nav-item" data-page="rag">RAG</div>
+            <div class="nav-item" data-page="intent-registry">Intent Registry</div>
           </div>
           <div class="content" id="content"></div>
         </div>
@@ -799,6 +800,7 @@
             tokens: renderTokensPage,
             tools: renderToolsPage,
             rag: renderRagPage,
+            "intent-registry": renderRegistryPage,
           };
           (renderers[page] || renderProvidersPage)();
         }
@@ -3402,6 +3404,413 @@
           };
           refresh.onclick = load;
           await load();
+        }
+
+        // ───────────────────────── Intent Registry console ─────────────────────────
+        // Draft rows are the editable source of truth; publishing is the QIR
+        // Build-Then-Swap. Field duties (ruling 2026-09-25): the query corpus
+        // (standard + synonyms) feeds BOTH Exact Match and Vector Recall;
+        // negatives are model-card boundary only; legacy examples are card
+        // context; patterns/aliases are inert storage.
+        let regDrafts = [];
+        let regSel = null;
+        let regTab = "overview";
+
+        async function renderRegistryPage() {
+          content.innerHTML = "";
+          const head = el("div", "page-head");
+          const t = el("div");
+          t.appendChild(el("h2", "", "Intent Registry"));
+          t.appendChild(el("div", "sub", "Draft capability rows → validate → publish (Build-Then-Swap). Versions, rollback, audit and the query dry-run live under Versions."));
+          head.appendChild(t);
+          content.appendChild(head);
+
+          try {
+            const d = await apiFetch("/admin/registry/drafts");
+            regDrafts = d.drafts || [];
+          } catch (e) { content.appendChild(errBox(e)); return; }
+          if (!regDrafts.length) { content.appendChild(emptyState("No draft capabilities yet.")); return; }
+          if (!regSel || !regDrafts.some((x) => x.capability_id === regSel)) {
+            regSel = regDrafts[0].capability_id;
+          }
+
+          const layout = el("div");
+          layout.style.cssText = "display:flex;gap:16px;align-items:flex-start";
+          content.appendChild(layout);
+
+          const left = el("div", "legacy-card");
+          left.style.cssText = "flex:0 0 240px;width:240px";
+          left.appendChild(el("div", "section-title", "Capabilities"));
+          for (const d of regDrafts) {
+            const item = el("div", "nav-item" + (d.capability_id === regSel ? " active" : ""), d.capability_id);
+            item.style.padding = "6px 8px";
+            item.onclick = () => { regSel = d.capability_id; renderRegistryPage(); };
+            left.appendChild(item);
+          }
+          layout.appendChild(left);
+
+          const right = el("div");
+          right.style.cssText = "flex:1;min-width:0";
+          layout.appendChild(right);
+
+          const tabs = el("div", "tabs");
+          for (const [key, label] of [
+            ["overview", "Overview"], ["queries", "Queries"], ["negatives", "Negatives"],
+            ["legacy", "Legacy examples"], ["params", "Params"], ["versions", "Versions"],
+          ]) {
+            const tab = el("div", "tab" + (regTab === key ? " active" : ""), label);
+            tab.onclick = () => { regTab = key; renderRegistryPage(); };
+            tabs.appendChild(tab);
+          }
+          right.appendChild(tabs);
+
+          const section = el("div");
+          right.appendChild(section);
+          const draft = regDrafts.find((x) => x.capability_id === regSel);
+          if (regTab === "overview") renderRegOverview(section, draft);
+          else if (regTab === "queries") await renderRegQueries(section, draft);
+          else if (regTab === "negatives") renderRegNegatives(section, draft);
+          else if (regTab === "legacy") renderRegLegacy(section, draft);
+          else if (regTab === "params") renderRegParams(section, draft);
+          else await renderRegVersions(section);
+        }
+
+        async function regPatch(patch) {
+          const draft = regDrafts.find((x) => x.capability_id === regSel);
+          try {
+            await apiFetch("/admin/registry/drafts/" + encodeURIComponent(regSel), {
+              method: "PATCH",
+              body: JSON.stringify({ patch, expected_row_version: draft.row_version }),
+            });
+            toast("Draft saved: " + regSel, "ok");
+          } catch (e) {
+            toast(e.message, "error");
+          }
+          await renderRegistryPage();
+        }
+
+        function regListEditor(values, placeholder) {
+          const wrap = el("div");
+          const rows = [];
+          const addRow = (v) => {
+            const row = el("div", "kv-row");
+            const i = textInput(v || "", { placeholder });
+            i.style.flex = "1";
+            const del = el("button", "btn ghost", "✕");
+            del.type = "button";
+            del.onclick = () => { row.remove(); const k = rows.indexOf(i); if (k >= 0) rows.splice(k, 1); };
+            row.append(i, del);
+            wrap.appendChild(row);
+            rows.push(i);
+          };
+          (values || []).forEach(addRow);
+          const add = el("button", "btn ghost", "+ Add sentence");
+          add.type = "button";
+          add.onclick = () => addRow("");
+          wrap.appendChild(add);
+          return { node: wrap, get: () => rows.map((i) => i.value.trim()).filter(Boolean) };
+        }
+
+        // ── Overview ──
+        function renderRegOverview(container, draft) {
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "section-title", draft.capability_id));
+          const idIn = textInput(draft.capability_id); idIn.disabled = true;
+          const tool = textInput(draft.tool_binding);
+          const desc = el("textarea"); desc.rows = 3; desc.value = draft.description || "";
+          const kind = select([{ label: "action", value: "action" }, { label: "private", value: "private" }, { label: "web", value: "web" }], draft.intent_kind);
+          const status = select([{ label: "active", value: "active" }, { label: "disabled", value: "disabled" }, { label: "deprecated", value: "deprecated" }], draft.status);
+          const repl = textInput(draft.replacement_capability_id || "");
+          const perms = textInput(draft.permissions || "");
+          const policy = textInput(draft.execution_policy || "auto");
+          let enabled = draft.enabled;
+          const sw = switchToggle(enabled, (on) => { enabled = on; });
+          const enLabel = el("label", "field");
+          enLabel.append(sw, el("span", "", "enabled"));
+          card.append(
+            field("Capability ID", idIn),
+            field("Tool binding", tool, "Executed when this capability is certified"),
+            field("Description", desc, "One-liner shown on the ToolIntentModel card"),
+            field("Intent kind", kind),
+            field("Status", status),
+            field("Replacement capability", repl, "Meaningful for deprecated rows"),
+            field("Permissions", perms),
+            field("Execution policy", policy),
+            enLabel,
+          );
+          const save = el("button", "btn primary", "Save");
+          save.type = "button";
+          save.onclick = () => regPatch({
+            tool_binding: tool.value.trim(),
+            description: desc.value,
+            intent_kind: kind.value,
+            status: status.value,
+            replacement_capability_id: repl.value.trim(),
+            permissions: perms.value.trim(),
+            execution_policy: policy.value.trim() || "auto",
+            enabled,
+          });
+          const res = el("div", "test-res");
+          const row = el("div", "row-actions"); row.append(save, res);
+          card.appendChild(row);
+          card.appendChild(el("div", "hint", "Row version: " + draft.row_version + " (optimistic token — a stale save is rejected 409, never merged)."));
+          container.appendChild(card);
+        }
+
+        // ── Queries (the shared Exact/Recall corpus) ──
+        async function renderRegQueries(container, draft) {
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "section-title", "Query corpus"));
+          card.appendChild(el("div", "hint", "Feeds BOTH Exact Match and Vector Recall — one shared corpus. The standard sentence is the canonical anchor; synonyms are embedded alongside it."));
+          const std = textInput(draft.standard_example || "");
+          const syn = regListEditor(draft.synonym_examples || [], "synonym sentence");
+          card.append(
+            field("Standard example", std, "The canonical sentence (row kind = canonical)"),
+            syn.node,
+          );
+          const save = el("button", "btn primary", "Save");
+          save.type = "button";
+          save.onclick = () => regPatch({ standard_example: std.value.trim(), synonym_examples: syn.get() });
+          card.appendChild(save);
+          container.appendChild(card);
+
+          const libCard = el("div", "legacy-card");
+          libCard.appendChild(el("div", "section-title", "What the library actually carries"));
+          libCard.appendChild(el("div", "hint", "Draft ≠ active: an edited sentence shows “draft only” until a publish lands it in the active index."));
+          const refresh = el("button", "btn ghost", "Refresh");
+          refresh.type = "button";
+          const out = el("div");
+          libCard.append(refresh, out);
+          container.appendChild(libCard);
+          const load = async () => {
+            out.innerHTML = "";
+            try {
+              const d = await apiFetch("/admin/registry/intent-corpus/" + encodeURIComponent(draft.capability_id));
+              out.appendChild(el("div", "hint", "active index: " + (d.qir_version || "— none published —")));
+              if (!d.sentences.length) { out.appendChild(emptyState("No intent corpus — standard_example is required before publish.")); return; }
+              const { wrap, tbody } = table(["sentence", "kind", "in active index"]);
+              for (const s of d.sentences) {
+                const tr = el("tr");
+                tr.appendChild(td(s.text));
+                tr.appendChild(td(s.kind));
+                tr.appendChild(td(badge(s.in_active_index ? "in library" : "draft only", s.in_active_index ? "ok" : "accent")));
+                tbody.appendChild(tr);
+              }
+              out.appendChild(wrap);
+              if ((d.card_only.legacy_examples || []).length) {
+                out.appendChild(el("div", "hint", "Card-only (legacy examples — never Exact/Recall): " + d.card_only.legacy_examples.join(" · ")));
+              }
+            } catch (e) { out.appendChild(errBox(e)); }
+          };
+          refresh.onclick = load;
+          await load();
+        }
+
+        // ── Negatives ──
+        function renderRegNegatives(container, draft) {
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "section-title", "Negative examples"));
+          card.appendChild(el("div", "hint", "Model-card semantic boundary ONLY — negatives never enter Exact Match or Vector Recall (they must not be recallable at all)."));
+          const neg = regListEditor(draft.negatives || [], "near-miss that is NOT this action");
+          card.appendChild(neg.node);
+          const save = el("button", "btn primary", "Save");
+          save.type = "button";
+          save.onclick = () => regPatch({ negatives: neg.get() });
+          card.appendChild(save);
+          container.appendChild(card);
+        }
+
+        // ── Legacy examples (read-only) ──
+        function renderRegLegacy(container, draft) {
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "section-title", "Legacy fields — read-only"));
+          const list = (arr) => ((arr || []).length ? (arr || []).join(" · ") : "—");
+          card.append(
+            field("Legacy examples (card context only)", textInput(list(draft.examples))),
+            el("div", "hint", "Legacy examples still reach the ToolIntentModel card as semantic context, but never Exact Match and never Vector Recall."),
+            field("Patterns (inert storage)", textInput(list(draft.patterns))),
+            field("Aliases (inert storage)", textInput(list(draft.aliases))),
+          );
+          card.appendChild(el("div", "hint", "The Intent chain no longer uses patterns/aliases — the Matcher is exact-only since the 2026-09-25 ruling. Kept for history; editable via the drafts PATCH API only."));
+          card.querySelectorAll("input").forEach((i) => { i.disabled = true; });
+          container.appendChild(card);
+        }
+
+        // ── Params (JSON) ──
+        function renderRegParams(container, draft) {
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "section-title", "Parameters & argument slots"));
+          card.appendChild(el("div", "hint", "JSON objects. parameters is the canonical argument schema the Binder validates against; arg_slots maps detected slots to parameters."));
+          const p = el("textarea"); p.rows = 8; p.value = JSON.stringify(draft.parameters || {}, null, 2);
+          const a = el("textarea"); a.rows = 8; a.value = JSON.stringify(draft.arg_slots || {}, null, 2);
+          card.append(field("parameters", p), field("arg_slots", a));
+          const save = el("button", "btn primary", "Save");
+          save.type = "button";
+          save.onclick = async () => {
+            let pv, av;
+            try { pv = JSON.parse(p.value || "{}"); av = JSON.parse(a.value || "{}"); }
+            catch { toast("Invalid JSON — not saved", "error"); return; }
+            await regPatch({ parameters: pv, arg_slots: av });
+          };
+          const res = el("div", "test-res");
+          const row = el("div", "row-actions"); row.append(save, res);
+          card.appendChild(row);
+          container.appendChild(card);
+        }
+
+        // ── Versions: preview / publish / rollback / audit / route dry-run ──
+        async function renderRegVersions(container) {
+          // Publish-build dry-run (embeddings included, zero writes)
+          const buildCard = el("div", "legacy-card");
+          buildCard.appendChild(el("div", "section-title", "Validate / preview build"));
+          buildCard.appendChild(el("div", "hint", "Dry-runs the publish build — validation issues plus real embeddings — without writing anything."));
+          const pvBtn = el("button", "btn ghost", "Preview build");
+          pvBtn.type = "button";
+          const pvOut = el("div");
+          buildCard.append(pvBtn, pvOut);
+          container.appendChild(buildCard);
+          pvBtn.onclick = async () => {
+            pvOut.innerHTML = "";
+            try {
+              const d = await apiFetch("/admin/registry/preview");
+              pvOut.appendChild(el("div", "hint", "capabilities=" + d.capabilities + " · routable=" + d.routable + " · snapshot=" + (d.snapshot_version || "—")));
+              const issues = d.issues || [];
+              if (!issues.length) pvOut.appendChild(badge("no issues", "ok"));
+              else for (const s of issues) pvOut.appendChild(el("div", "trace-out err", s));
+            } catch (e) { pvOut.appendChild(errBox(e)); }
+          };
+
+          // Publish
+          const pubCard = el("div", "legacy-card");
+          pubCard.appendChild(el("div", "section-title", "Publish"));
+          pubCard.appendChild(el("div", "hint", "Build-Then-Swap: registry version, QIR pointer and the example rows land in ONE transaction. Rejected publishes are audit-recorded and leave no version row."));
+          const note = textInput("", { placeholder: "optional note for the audit trail" });
+          const pubBtn = el("button", "btn primary", "Publish");
+          pubBtn.type = "button";
+          pubBtn.onclick = async () => {
+            pubBtn.disabled = true;
+            try {
+              const d = await apiFetch("/admin/registry/publish", { method: "POST", body: JSON.stringify({ note: note.value.trim() || null }) });
+              toast("Published v" + d.version + " (" + d.state + ")", "ok");
+              await renderRegistryPage();
+            } catch (e) { toast("Publish failed: " + e.message, "error"); pubBtn.disabled = false; }
+          };
+          const prow = el("div", "row-actions"); prow.append(field("Note", note), pubBtn);
+          pubCard.appendChild(prow);
+          container.appendChild(pubCard);
+
+          // Full-chain query dry-run against the ACTIVE pair
+          const routeCard = el("div", "legacy-card");
+          routeCard.appendChild(el("div", "section-title", "Query dry-run (active Registry + Index)"));
+          routeCard.appendChild(el("div", "hint", "Matcher → Recall → ToolIntentModel → Binder → Final Route, side-effect free; model/embedding usage is billed as preview."));
+          const q = el("textarea"); q.rows = 2; q.placeholder = "e.g. 创建一个叫 notes 的文件夹";
+          const runBtn = el("button", "btn ghost", "Run");
+          runBtn.type = "button";
+          const routeOut = el("div");
+          routeCard.append(field("Query", q), runBtn, routeOut);
+          container.appendChild(routeCard);
+          runBtn.onclick = async () => {
+            const query = q.value.trim();
+            if (!query) { toast("Enter a query first", "error"); return; }
+            runBtn.disabled = true;
+            routeOut.innerHTML = "";
+            try {
+              const d = await apiFetch("/admin/registry/preview-route", { method: "POST", body: JSON.stringify({ query }) });
+              const sum = el("div", "hint");
+              sum.textContent = "deepest_stage=" + d.deepest_stage + " · matcher=" + d.matcher
+                + " · recall=" + d.recall_count + (d.recall_top !== "-" ? " (top " + d.recall_top + ")" : "")
+                + " · tool_intent=" + d.tool_intent
+                + (d.binder_state ? " · binder=" + d.binder_state : "")
+                + " · final_route=" + d.final_route
+                + (d.fallback_reason && d.fallback_reason !== "-" ? " · fallback=" + d.fallback_reason : "")
+                + " · " + d.total_ms + " ms · registry=" + (d.registry_version || "—") + " index=" + (d.index_version || "—");
+              routeOut.appendChild(sum);
+              const cands = d.candidates || [];
+              if (cands.length) {
+                const { wrap, tbody } = table(["capability", "origin", "kind", "matched sentence", "score"]);
+                for (const c of cands) {
+                  const tr = el("tr");
+                  tr.appendChild(td(c.capability_id));
+                  tr.appendChild(td(c.origin));
+                  tr.appendChild(td(c.kind || "—"));
+                  tr.appendChild(td(c.matched_example || "—"));
+                  tr.appendChild(td(c.origin === "recall" ? Number(c.score).toFixed(3) : "table"));
+                  tbody.appendChild(tr);
+                }
+                routeOut.appendChild(wrap);
+              } else {
+                routeOut.appendChild(el("div", "hint", "Empty candidate set — Action Detection still ran; the model could only answer NONE."));
+              }
+              if (d.model_verdict) {
+                routeOut.appendChild(el("pre", "trace-out", JSON.stringify(d.model_verdict, null, 2)));
+              }
+              if (d.route) routeOut.appendChild(el("pre", "trace-out ok", JSON.stringify(d.route, null, 2)));
+            } catch (e) { routeOut.appendChild(errBox(e)); }
+            runBtn.disabled = false;
+          };
+
+          // Version history + rollback
+          const verCard = el("div", "legacy-card");
+          verCard.appendChild(el("div", "section-title", "Version history"));
+          const verOut = el("div");
+          verCard.appendChild(verOut);
+          container.appendChild(verCard);
+          try {
+            const d = await apiFetch("/admin/registry/versions");
+            const { wrap, tbody } = table(["version", "state", "fingerprint", "source", "actor", "caps", "routable", "note", ""]);
+            for (const v of (d.versions || [])) {
+              const tr = el("tr");
+              tr.appendChild(td("v" + v.version));
+              tr.appendChild(td(badge(v.state, v.state === "active" ? "ok" : v.state === "failed" ? "danger" : "")));
+              tr.appendChild(td(maskHash(v.fingerprint)));
+              tr.appendChild(td(v.source_version != null ? "v" + v.source_version : "—"));
+              tr.appendChild(td(v.actor_username || "—"));
+              tr.appendChild(td(String(v.capabilities)));
+              tr.appendChild(td(String(v.routable)));
+              tr.appendChild(td(v.note || (v.error ? "✗ " + v.error : "—")));
+              const cell = el("td");
+              if (v.state !== "active") {
+                let armed = false;
+                const rb = el("button", "btn sm ghost", "Rollback");
+                rb.type = "button";
+                rb.onclick = async () => {
+                  if (!armed) { armed = true; rb.textContent = "Confirm?"; rb.className = "btn sm danger"; return; }
+                  rb.disabled = true;
+                  try {
+                    await apiFetch("/admin/registry/versions/" + v.version + "/rollback", { method: "POST", body: JSON.stringify({}) });
+                    toast("Rolled back to v" + v.version, "ok");
+                    await renderRegistryPage();
+                  } catch (e) { toast("Rollback failed: " + e.message, "error"); rb.disabled = false; }
+                };
+                cell.appendChild(rb);
+              }
+              tr.appendChild(cell);
+              tbody.appendChild(tr);
+            }
+            verOut.appendChild(wrap);
+          } catch (e) { verOut.appendChild(errBox(e)); }
+
+          // Audit trail
+          const audCard = el("div", "legacy-card");
+          audCard.appendChild(el("div", "section-title", "Audit trail"));
+          const audOut = el("div");
+          audCard.appendChild(audOut);
+          container.appendChild(audCard);
+          try {
+            const d = await apiFetch("/admin/registry/audit?limit=50");
+            const { wrap, tbody } = table(["when", "action", "actor", "target", "ok", "detail"]);
+            for (const a of (d.entries || [])) {
+              const tr = el("tr");
+              tr.appendChild(td((a.created_at || "").replace("T", " ").slice(0, 19)));
+              tr.appendChild(td(a.action));
+              tr.appendChild(td(a.actor_username || "—"));
+              tr.appendChild(td(a.target || "—"));
+              tr.appendChild(td(badge(a.ok ? "ok" : "fail", a.ok ? "ok" : "danger")));
+              tr.appendChild(td(a.detail && Object.keys(a.detail).length ? JSON.stringify(a.detail) : "—"));
+              tbody.appendChild(tr);
+            }
+            audOut.appendChild(wrap);
+          } catch (e) { audOut.appendChild(errBox(e)); }
         }
 
         boot();

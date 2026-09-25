@@ -109,6 +109,42 @@ async def patch_draft(
 
 # ── validate / preview / publish / rollback ───────────────────────────────────────
 
+@router.get("/admin/registry/intent-corpus/{capability_id}")
+async def get_intent_corpus(
+    capability_id: str, _: AuthAdmin = Depends(require_admin),
+) -> dict:
+    """Phase 4 read-only view: WHICH sentences of this draft row feed the Exact
+    Match set and the vector library (qir_examples, migration 0009), and which
+    of them the CURRENTLY ACTIVE index actually carries. Draft ≠ active: a
+    freshly edited sentence shows in_library=false until a publish lands it."""
+    from core.application.chat.qir import store as qir_store
+
+    drafts = await list_drafts(session_factory=SessionLocal)
+    entry = next(
+        (e for e in drafts if e.capability_id == capability_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"no draft for {capability_id!r}")
+    snap = await qir_store.active(SessionLocal)
+    cap = snap.get(capability_id) if snap is not None else None
+    active_sentences = set(cap.examples) if cap is not None else set()
+    return {
+        "capability_id": capability_id,
+        "qir_version": snap.version if snap is not None else None,
+        "sentences": [
+            {"text": s,
+             "kind": "canonical" if i == 0 else "synonym",
+             "in_active_index": s in active_sentences}
+            for i, s in enumerate(entry.intent_corpus)
+        ],
+        "card_only": {
+            "legacy_examples": list(entry.examples),
+            "negatives": list(entry.negatives),
+        },
+        "legacy_inert": {"patterns": list(entry.patterns),
+                         "aliases": list(entry.aliases)},
+    }
+
+
 @router.get("/admin/registry/preview")
 async def get_preview(_: AuthAdmin = Depends(require_admin)) -> dict:
     """Dry-run the publish BUILD (validation + real embeddings) with zero writes.

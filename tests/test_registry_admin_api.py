@@ -259,3 +259,95 @@ def test_audit_read_passthrough(client, monkeypatch):
     assert client.get("/admin/registry/audit?limit=9999").json() == {
         "entries": [{"action": "publish", "ok": True}]
     }
+
+
+# ── Phase 4 read-only intent-corpus view ─────────────────────────────────────────
+
+def _corpus_entry(cid="cap-a"):
+    return CapabilityEntry(
+        capability_id=cid, tool_binding="create_folder", description="d",
+        standard_example="新建文件夹", synonym_examples=("建个目录", "创建文件夹"),
+        patterns=("re:x",), aliases=("old",), examples=("legacy sentence",),
+        negatives=("怎么新建文件夹",),
+    )
+
+
+def _snap_with(examples):
+    from core.application.chat.qir.types import Capability, Snapshot
+    return Snapshot(
+        version="qir1-live", built_at=0.0,
+        capabilities=(Capability(id="cap-a", tool_binding="create_folder",
+                                 description="d", examples=examples),),
+    )
+
+
+def test_intent_corpus_marks_draft_vs_active_index(client, monkeypatch):
+    """in_active_index is a DRAFT-vs-ACTIVE statement: a freshly edited
+    sentence is 'draft only' until a publish lands it in qir_examples."""
+    from core.application.chat.qir import store as qir_store
+
+    async def fake_list(**kw):
+        return [_corpus_entry()]
+
+    async def fake_active(factory):
+        return _snap_with(("新建文件夹", "别的旧句"))  # synonym not yet published
+
+    monkeypatch.setattr(ra, "list_drafts", fake_list)
+    monkeypatch.setattr(qir_store, "active", fake_active)
+    out = client.get("/admin/registry/intent-corpus/cap-a").json()
+    assert out["qir_version"] == "qir1-live"
+    assert [(s["text"], s["kind"], s["in_active_index"]) for s in out["sentences"]] == [
+        ("新建文件夹", "canonical", True),
+        ("建个目录", "synonym", False),
+        ("创建文件夹", "synonym", False),
+    ]
+    # card-only and inert halves are surfaced for the page labels
+    assert out["card_only"] == {"legacy_examples": ["legacy sentence"],
+                                "negatives": ["怎么新建文件夹"]}
+    assert out["legacy_inert"] == {"patterns": ["re:x"], "aliases": ["old"]}
+
+
+def test_intent_corpus_without_publish_is_all_draft(client, monkeypatch):
+    from core.application.chat.qir import store as qir_store
+
+    async def fake_list(**kw):
+        return [_corpus_entry()]
+
+    async def none_active(factory):
+        return None
+
+    monkeypatch.setattr(ra, "list_drafts", fake_list)
+    monkeypatch.setattr(qir_store, "active", none_active)
+    out = client.get("/admin/registry/intent-corpus/cap-a").json()
+    assert out["qir_version"] is None
+    assert all(not s["in_active_index"] for s in out["sentences"])
+
+
+def test_intent_corpus_unknown_capability_is_404(client, monkeypatch):
+    async def fake_list(**kw):
+        return [_corpus_entry("cap-other")]
+
+    monkeypatch.setattr(ra, "list_drafts", fake_list)
+    assert client.get("/admin/registry/intent-corpus/cap-a").status_code == 404
+
+
+# ── §8.5 preview-route passthrough (the dry-run box on the Versions tab) ─────────
+
+def test_preview_route_strips_query_and_passthrough_verdict(client, monkeypatch):
+    from core.application.chat.intent_funnel import funnel
+
+    seen = {}
+
+    async def fake_preview(query, *, deps):
+        seen["query"] = query
+        return {"final_route": "agent", "fallback_reason": "TOOL_INTENT_REJECT",
+                "candidates": [], "execution_mode": "preview"}
+
+    monkeypatch.setattr(funnel, "preview", fake_preview)
+    r = client.post("/admin/registry/preview-route", json={"query": "  新建文件夹?  "})
+    assert r.status_code == 200
+    assert seen["query"] == "新建文件夹?"
+    assert r.json()["execution_mode"] == "preview"
+    # the schema gate: an empty query never reaches the funnel
+    assert client.post("/admin/registry/preview-route",
+                       json={"query": ""}).status_code == 422
