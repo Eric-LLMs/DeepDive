@@ -4802,6 +4802,125 @@ This forms a continuous production optimization loop:
 > Tool decisions on the local lightweight path → reduce expensive Agent /
 > online LLM inference.**
 
+#### Recall Evaluation Baseline (2026-09-26)
+
+This section records the current Recall baseline after the initial Query
+Corpus construction and the broad query-expansion pass. It is the reference
+point every future expansion iteration is measured against.
+
+**Corpus under evaluation**
+
+- 18 user-facing Actions
+- 550 total queries (Standard Queries + Similar Queries)
+- Query expansion applied across all 18 Actions
+
+**Evaluation dataset (fresh, never in the corpus)**
+
+- 72 Action queries = 18 Actions × 4
+- 72 Non-Action queries sampled (seeded) from the existing AGENT / ABSTAIN
+  pool of the synthetic-workload dataset
+- 144 evaluation queries in total
+- Zero normalized exact overlap with the 550-query Recall corpus
+
+**Method — Recall-only offline sweep**
+
+- Threshold range 0.50–0.90, step 0.01 → 41 thresholds
+- Strict admission rule: `score >= threshold`
+- `top_k = 10`; no candidate truncation affected the expected Action at
+  evaluation time
+- Same embedding service and same cosine best-example scoring as the
+  production Recall node; no changes were made to production Recall
+  configuration, Registry, ToolIntentModel, Binder, Runtime, or production data
+
+| Threshold | Action Recall Coverage | Non-Action False Admission |
+|---:|---:|---:|
+| 0.50 | 100.0% | 94.4% |
+| 0.51 | 100.0% | 91.7% |
+| 0.52 | 100.0% | 87.5% |
+| 0.53 | 100.0% | 84.7% |
+| 0.54 | 100.0% | 83.3% |
+| 0.55 | 100.0% | 80.6% |
+| 0.56 | 100.0% | 76.4% |
+| 0.57 | 100.0% | 73.6% |
+| 0.58 | 100.0% | 70.8% |
+| 0.59 | 100.0% | 68.1% |
+| 0.60 | 100.0% | 68.1% |
+| 0.61 | 100.0% | 66.7% |
+| 0.62 | 100.0% | 62.5% |
+| 0.63 | 100.0% | 61.1% |
+| 0.64 | 100.0% | 56.9% |
+| 0.65 | 100.0% | 51.4% |
+| 0.66 | 98.6% | 48.6% |
+| 0.67 | 97.2% | 47.2% |
+| 0.68 | 95.8% | 44.4% |
+| 0.69 | 94.4% | 41.7% |
+| 0.70 | 94.4% | 37.5% |
+| 0.71 | 94.4% | 34.7% |
+| 0.72 | 94.4% | 33.3% |
+| 0.73 | 94.4% | 27.8% |
+| 0.74 | 93.1% | 25.0% |
+| 0.75 | 90.3% | 25.0% |
+| 0.76 | 88.9% | 20.8% |
+| 0.77 | 84.7% | 16.7% |
+| 0.78 | 80.6% | 13.9% |
+| 0.79 | 77.8% | 11.1% |
+| 0.80 | 73.6% | 11.1% |
+| 0.81 | 69.4% | 6.9% |
+| 0.82 | 61.1% | 5.6% |
+| 0.83 | 55.6% | 5.6% |
+| 0.84 | 47.2% | 5.6% |
+| 0.85 | 41.7% | 5.6% |
+| 0.86 | 36.1% | 5.6% |
+| 0.87 | 26.4% | 4.2% |
+| 0.88 | 19.4% | 4.2% |
+| 0.89 | 13.9% | 4.2% |
+| 0.90 | 13.9% | 1.4% |
+
+**Current production threshold**
+
+The production setting remains `chat_funnel_min_score =` **`0.82`**; it was
+not changed as part of the evaluation. **0.82** is described here only as the
+current production threshold and the current evaluation reference point —
+not as a mathematically optimal value.
+
+At threshold = **0.82**:
+
+- Action Recall Coverage: 44 / 72 = 61.1%
+- Non-Action False Admission: 4 / 72 = 5.6%
+
+**Interpretation**
+
+The expanded 550-query corpus substantially improves Action-side Recall
+coverage compared with the earlier small-corpus baseline. However,
+similarity-based Recall alone cannot cleanly separate genuine Tool Actions
+from Agent / Non-Action requests. Increasing the threshold reduces candidate
+admission but also causes substantial Action Recall loss.
+
+Therefore:
+
+- Recall is responsible for candidate retrieval.
+- Recall is not the final intent decision layer.
+- ToolIntentModel remains responsible for downstream intent discrimination
+  after candidate retrieval.
+
+**Future query expansion — case-by-case**
+
+The Query Corpus was NOT modified by this documentation change; this sweep is
+the baseline going forward. The next phase is **case-by-case Query
+Expansion** — an iterative, evidence-driven optimization loop, not one-time
+manual corpus inflation. For each Recall miss observed at the relevant
+threshold:
+
+1. Inspect the query and its retrieved candidates.
+2. Identify the missing semantic pattern / linguistic variation.
+3. Decide whether the miss is genuinely within the Action's intended semantic
+   boundary.
+4. Add a validated query variant to the appropriate Action's Similar Query
+   corpus.
+5. Re-embed the corpus.
+6. Re-run the same 144-query evaluation and the same 0.01 threshold sweep.
+7. Compare the new results against this baseline.
+
 ### 25.3 Goals & Principles
 
 Turn the "guess the intent" path from scattered parts into **one decoupled,
