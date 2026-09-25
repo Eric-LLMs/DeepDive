@@ -12,6 +12,7 @@ from pathlib import Path
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
@@ -19,6 +20,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    PrimaryKeyConstraint,
     String,
     Text,
     func,
@@ -1001,6 +1003,42 @@ class ChatFunnelEventModel(Base):
     __table_args__ = (
         Index("ix_chat_funnel_events_created_at", "created_at"),
         Index("ix_chat_funnel_events_execution_mode", "execution_mode"),
+    )
+
+
+class QirExampleModel(Base):
+    """The SQL Intent Query Library (migration 0009, Phase 3): one row per
+    curated sentence per published version — ``standard_example`` (kind
+    ``canonical``, index 0) and ``synonym_examples`` (``synonym``) via
+    ``CapabilityEntry.intent_corpus``, each with its own embedding. Legacy
+    ``examples`` have NO path into this table (ruling 2026-09-25).
+
+    The PRIMARY KEY is (qir_version, capability_id, example_index): every ANN
+    query carries the single-version predicate, so cross-version recall is
+    physically impossible. The active pointer itself rides ``app_settings`` and
+    the rows land in the SAME Build-Then-Swap transaction as the registry
+    version activation."""
+
+    __tablename__ = "qir_examples"
+
+    capability_id: Mapped[str] = mapped_column(Text, nullable=False)
+    example_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    language: Mapped[str] = mapped_column(String, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list] = mapped_column(
+        Vector(settings.embedding_dim), nullable=False
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    qir_version: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        PrimaryKeyConstraint("qir_version", "capability_id", "example_index"),
+        CheckConstraint("kind IN ('canonical', 'synonym')", name="qir_examples_kind_check"),
+        CheckConstraint("language IN ('zh', 'en')", name="qir_examples_language_check"),
+        Index("qir_examples_version_enabled_idx", "qir_version", "enabled"),
     )
 
 

@@ -109,10 +109,11 @@ def validate_entries(entries: Sequence[CapabilityEntry]) -> list[str]:
             )
         if not e.description.strip():
             issues.append(f"{cid}: description is required (ToolIntentModel card source)")
-        if not e.recall_corpus:
+        if not e.intent_corpus:
             issues.append(
-                f"{cid}: recall corpus must be non-empty and indexable "
-                "(standard_example / synonym_examples / examples)"
+                f"{cid}: intent corpus must be non-empty and indexable "
+                "(standard_example / synonym_examples — legacy examples no "
+                "longer feed Exact or Recall, ruling 2026-09-25)"
             )
         issues.extend(f"{cid}: {msg}" for msg in _parameter_issues(e))
         if e.status not in VALID_STATUSES:
@@ -244,7 +245,7 @@ def to_qir_draft(entries: Sequence[CapabilityEntry]) -> dict:
                 "id": e.capability_id,
                 "tool_binding": e.tool_binding,
                 "description": e.description,
-                "examples": list(e.recall_corpus),
+                "examples": list(e.intent_corpus),
                 "negatives": list(e.negatives),
                 "enabled": e.enabled and e.status == STATUS_ACTIVE,
             }

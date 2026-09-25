@@ -26,6 +26,12 @@ def _entry(cid="cap-a", **kw) -> T.CapabilityEntry:
         capability_id=cid,
         tool_binding="create_folder",
         description="Create a folder.",
+        # 0009 (ruling 2026-09-25): the intent corpus — standard + synonyms — is
+        # the ONLY thing that feeds Exact Match and the vector library.
+        standard_example="新建文件夹",
+        synonym_examples=("建个目录",),
+        # legacy lanes stay STORABLE but inert: patterns/aliases feed nothing and
+        # examples are card context, never recall anchors.
         patterns=("新建文件夹",),
         aliases=("建个目录",),
         examples=('create a folder named "x"',),
@@ -156,7 +162,9 @@ def test_fingerprint_order_independent_and_row_version_blind():
 def test_to_capability_projects_only_routing_fields():
     cap = _entry().to_capability()
     assert cap.id == "cap-a" and cap.tool_binding == "create_folder"
-    assert cap.examples == ('create a folder named "x"',)
+    # 0009 ruling: the projection carries the INTENT corpus — the legacy
+    # examples field is card context and must NOT cross into the recall lane.
+    assert cap.examples == ("新建文件夹", "建个目录")
     # patterns/aliases/arg_slots never cross into the QIR vocabulary
     assert not hasattr(cap, "patterns")
 
@@ -373,15 +381,20 @@ def test_validate_rejects_unknown_tool_binding():
     assert any("DIRECT_TOOLS" in i for i in issues)
 
 
-def test_validate_requires_a_non_empty_layered_recall_corpus():
-    # 0007: ANY corpus layer may feed the index — standard_example,
-    # synonym_examples or the legacy examples; a blank-only row recalls nothing.
+def test_validate_requires_a_non_empty_intent_corpus():
+    # 0009 ruling (2026-09-25): ONLY standard_example / synonym_examples feed
+    # Exact and the vector library — a row whose only sentences are legacy
+    # examples is now un-publishable, not half-alive.
     ok = _entry(examples=(), standard_example="新建一个文件夹",
                 synonym_examples=("建个目录",))
     assert not [i for i in reg.snapshot.validate_entries([ok]) if "corpus" in i]
     empty = _entry(examples=(), standard_example="  ", synonym_examples=("",))
-    assert any("recall corpus" in i
+    assert any("intent corpus" in i
                for i in reg.snapshot.validate_entries([empty]))
+    legacy_only = _entry(standard_example="", synonym_examples=(),
+                         examples=("create a folder named \"x\"",))
+    assert any("intent corpus" in i
+               for i in reg.snapshot.validate_entries([legacy_only]))
 
 
 def test_publish_gate_bridges_registry_parameters_to_runtime_schema():
@@ -451,7 +464,8 @@ async def test_publish_swaps_registry_and_qir_pair_in_one_commit():
         get_map={(RegistryVersionModel, 7): _ver_row(version=7, entry=entry, state=T.STATE_STAGED)},
     )
     swapper = FakeSession(
-        results=[_Result(rowcount=1), _Result(rowcount=1)],
+        # supersede, activate, then the 0009 purge of non-active rows
+        results=[_Result(rowcount=1), _Result(rowcount=1), _Result(rowcount=0)],
     )
     finalizer = FakeSession(
         get_map={(RegistryVersionModel, 7): _ver_row(version=7, entry=entry)},
@@ -464,6 +478,15 @@ async def test_publish_swaps_registry_and_qir_pair_in_one_commit():
     # the QIR active pair rode the SAME session as the registry swap — one commit
     assert swapper.merged == ["qir_active", "qir_version"] and swapper.commits == 1
     assert view.version == 7 and view.state == T.STATE_ACTIVE
+    # 0009 (Phase 3): the example vectors landed as ROWS of the same version,
+    # in that one transaction — position 0 is canonical, CJK text tags zh.
+    rows = swapper.added
+    assert [r.kind for r in rows] == ["canonical", "synonym"]
+    assert {r.capability_id for r in rows} == {"cap-a"}
+    assert len({r.qir_version for r in rows}) == 1
+    assert rows[0].qir_version.startswith("qir1-")
+    assert all(r.language == "zh" and r.enabled for r in rows)
+    assert [r.text for r in rows] == list(entry.intent_corpus)
 
 
 async def test_publish_embedder_failure_opens_no_db_session():

@@ -77,20 +77,11 @@ class CapabilityEntry:
         deduped. Single source of truth for BOTH the Matcher exact set AND the
         PGVector recall corpus (Phase 1/3 ruling) — one property, no drift.
         Legacy ``examples`` and ``negatives`` are deliberately NOT here: they
-        are card context / card boundary, never match or recall anchors."""
+        are card context / card boundary, never match or recall anchors.
+        (The pre-ruling ``recall_corpus`` that folded legacy examples into the
+        embedding set is deleted — one corpus, no silent second lane.)"""
         out: list[str] = []
         for text in (self.standard_example, *self.synonym_examples):
-            s = str(text or "").strip()
-            if s and s not in out:
-                out.append(s)
-        return tuple(out)
-
-    @property
-    def recall_corpus(self) -> tuple[str, ...]:
-        """Every sentence this capability is recalled by, in index order:
-        standard -> synonyms -> legacy candidate examples (blank entries out)."""
-        out: list[str] = []
-        for text in (self.standard_example, *self.synonym_examples, *self.examples):
             s = str(text or "").strip()
             if s and s not in out:
                 out.append(s)
@@ -100,13 +91,14 @@ class CapabilityEntry:
         """Project to the runtime's frozen Capability (routing metadata only —
         Matcher patterns/aliases and arg_slots stay in the Registry row, they are
         consumed by their own nodes, never smuggled through the QIR contract).
-        ``examples`` carries the FULL recall corpus: the qir index embeds and
-        scores per sentence, so corpus order == example_index order."""
+        ``examples`` carries the INTENT corpus only (standard + synonyms,
+        ruling 2026-09-25): the qir index embeds and scores per sentence and
+        legacy ``examples`` are card context, never recall anchors."""
         return Capability(
             id=self.capability_id,
             tool_binding=self.tool_binding,
             description=self.description,
-            examples=self.recall_corpus,
+            examples=self.intent_corpus,
             negatives=tuple(self.negatives),
             enabled=self.enabled,
         )
