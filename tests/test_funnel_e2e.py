@@ -310,7 +310,7 @@ async def test_matcher_certified_turn_executes_through_sandbox(monkeypatch, capl
     assert "Created folder" in (res.answer or "")               # deterministic confirmation
     assert port.steps == 0 and port.single_shot == 0            # zero Agent LLM on this lane
     assert jd.calls == 1                                        # the ONE ToolIntentModel call
-    assert "origin=matcher_hit" in jd.prompts[0]                # HIT enters the same hop
+    assert "evidence: exact standard-query match (table)" in jd.prompts[0]  # HIT provenance: label, not score
     assert res.approvals                                        # 8: WRITE surfaced ASK, allowed
     trace = _trace(caplog)
     assert _field(trace, "matcher") == "HIT:cap-folder"
