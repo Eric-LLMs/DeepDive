@@ -216,6 +216,21 @@ async def test_publish_actually_awaits_the_row_upserts():
             rec["merged"].append(obj.key)
             return obj
 
+        async def execute(self, stmt, params=None):
+            # Phase-3 storage contract (ruling 2026-09-25): write_active purges
+            # non-active versions' qir_examples rows inside the SAME
+            # transaction. The stub only records the call — the merge/commit
+            # assertions below are unchanged.
+            rec.setdefault("executed", []).append(str(stmt))
+
+            class _R:
+                def all(self_inner):
+                    return []
+            return _R()
+
+        def add(self, obj):
+            rec.setdefault("added", []).append(obj)
+
         async def commit(self):
             rec["commits"] += 1
 
