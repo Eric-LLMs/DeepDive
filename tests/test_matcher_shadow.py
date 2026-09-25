@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import types
 
+import pytest
 from core.application.chat import qir  # noqa: F401 - import order sanity for seams
 from core.application.chat.intent_funnel import funnel, matcher
 from core.application.chat.intent_funnel.contract import (
@@ -31,10 +32,11 @@ from core.application.chat.understanding import (
 )
 
 
-def _entry(cid, *, tool="create_folder", patterns=(), aliases=(), enabled=True,
-           status="active", examples=("做个事",)):
+def _entry(cid, *, tool="create_folder", standard="", synonyms=(), patterns=(),
+           aliases=(), enabled=True, status="active", examples=("做个事",)):
     return T.CapabilityEntry(
         capability_id=cid, tool_binding=tool, description="d",
+        standard_example=standard, synonym_examples=tuple(synonyms),
         patterns=tuple(patterns), aliases=tuple(aliases), examples=tuple(examples),
         enabled=enabled, status=status,
     )
@@ -50,40 +52,75 @@ def _view(entries, version=1, fingerprint=None):
     )
 
 
-# ── node semantics ────────────────────────────────────────────────────────────────
+# ── node semantics (Exact Positive Match only, ruling 2026-09-25) ────────────────
 
 _TF = TurnFacts()  # plain turn: no viewer/attachment facts
 
 
-def test_exact_phrase_hit_is_normalized():
-    v = _view([_entry("cap-a", aliases=(" 新建文件夹 ",))])
+def test_exact_standard_hit_is_normalized():
+    v = _view([_entry("cap-a", standard=" 新建文件夹 ")])
     res = matcher.match("新建文件夹", _TF, v)
     assert res.state == MATCH_HIT and res.capability_id == "cap-a"
     assert res.registry_version == v.fingerprint
-    assert res.matched_literal == "新建文件夹"  # the normalized alias, not just the verdict
+    # the HIT literal is the normalized corpus sentence — never a regex string
+    assert res.matched_literal == "新建文件夹"
 
 
-def test_regex_pattern_hits_and_misses():
-    v = _view([_entry("cap-a", patterns=(f"{T.RE_PREFIX}(?:创建|新建)文件夹",))])
-    res = matcher.match("帮我新建文件夹好吗", _TF, v)
-    assert res.capability_id == "cap-a"
-    assert res.matched_literal == "re:(?:创建|新建)文件夹"
-    assert matcher.match("删除文件夹", _TF, v).state == MATCH_MISS
+def test_exact_synonym_hit():
+    v = _view([_entry("cap-a", standard="新建文件夹", synonyms=("建个新目录",))])
+    res = matcher.match("建个新目录", _TF, v)
+    assert res.state == MATCH_HIT and res.matched_literal == "建个新目录"
+
+
+def test_regex_patterns_and_aliases_are_inert_storage():
+    # The Action-Contract ruling deletes regex from the Matcher's runtime path:
+    # a stored ``re:`` pattern or a legacy alias can NEVER produce a HIT, even
+    # as an exact whole-sentence match.
+    v = _view([_entry("cap-a", patterns=("re:新建文件夹", "新建文件夹"),
+                      aliases=("建目录",))])
+    assert matcher.match("新建文件夹", _TF, v).state == MATCH_MISS
+    assert matcher.match("帮我新建文件夹好吗", _TF, v).state == MATCH_MISS
+    assert matcher.match("建目录", _TF, v).state == MATCH_MISS
+
+
+def test_legacy_examples_are_not_match_data():
+    v = _view([_entry("cap-a", standard="新建文件夹", examples=("请创建一个文件夹",))])
+    assert matcher.match("请创建一个文件夹", _TF, v).state == MATCH_MISS
+
+
+@pytest.mark.parametrize("query", [
+    "你能不能创建文件夹？",   # question about capability
+    "怎么创建文件夹？",       # how-to
+    "不要创建文件夹",         # negation
+    "如果需要创建文件夹，告诉我",  # hypothetical
+    '我同事说"创建一个文件夹"',    # quoted speech
+    "创建一个叫 notes 的文件夹",   # new phrasing (may go recall+model)
+    "请创建 notes 文件夹",         # ditto
+])
+def test_sentence_variants_never_hit_the_exact_table(query):
+    # corpus holds the canonical sentences; every non-identical sentence above
+    # must MISS (escalate to Recall + ToolIntentModel), and NONE of them may be
+    # substring-matched the way the old regex lane did.
+    v = _view([_entry("cap-folder", standard="创建一个文件夹",
+                      synonyms=("请新建一个文件夹",))])
+    assert matcher.match(query, _TF, v).state == MATCH_MISS
 
 
 def test_disabled_and_deprecated_caps_are_never_matched():
     v = _view([
-        _entry("cap-off", aliases=("建目录",), enabled=False, status="disabled"),
-        _entry("cap-dep", aliases=("建个目录",), status="deprecated"),
+        _entry("cap-off", standard="建目录", enabled=False, status="disabled"),
+        _entry("cap-dep", standard="建个目录", status="deprecated"),
     ])
     assert matcher.match("建目录", _TF, v).state == MATCH_MISS
     assert matcher.match("建个目录", _TF, v).state == MATCH_MISS
 
 
 def test_ambiguous_carries_all_candidates_and_never_picks():
+    # the SAME curated sentence registered under two capabilities — exact-only
+    # AMBIGUOUS can only come from human curation overlap, never from regex.
     v = _view([
-        _entry("cap-a", aliases=("季度汇总",)),
-        _entry("cap-b", patterns=(f"{T.RE_PREFIX}季度.*",)),
+        _entry("cap-a", standard="季度汇总"),
+        _entry("cap-b", synonyms=("季度汇总",)),
     ])
     res = matcher.match("季度汇总", _TF, v)
     assert res.state == MATCH_AMBIGUOUS
@@ -92,17 +129,17 @@ def test_ambiguous_carries_all_candidates_and_never_picks():
 
 
 def test_blank_query_misses_and_bad_legacy_regex_is_skipped_not_fatal():
-    v = _view([_entry("cap-a", patterns=("re:[unclosed",), aliases=("x",))])
+    v = _view([_entry("cap-a", patterns=("re:[unclosed",), standard="x")])
     assert matcher.match("", _TF, v).state == MATCH_MISS
-    assert matcher.match("x", _TF, v).state == MATCH_HIT  # the other literal still works
+    assert matcher.match("x", _TF, v).state == MATCH_HIT  # the corpus row still works
 
 
 def test_index_is_cached_per_version_fingerprint_pair():
-    v = _view([_entry("cap-a", aliases=("x",))], version=1)
+    v = _view([_entry("cap-a", standard="x")], version=1)
     matcher._INDEX_CACHE.clear()
     first = matcher.build_index(v)
     assert matcher.build_index(v) is first  # same (version, fingerprint) -> same object
-    v2 = _view([_entry("cap-a", aliases=("x", "y"))], version=2)
+    v2 = _view([_entry("cap-a", standard="x", synonyms=("y",))], version=2)
     assert matcher.build_index(v2) is not first  # different content -> new index
 
 
@@ -139,7 +176,7 @@ async def test_shadow_logs_would_verdict_without_touching_routing(monkeypatch, c
     from core.config import settings
 
     monkeypatch.setattr(settings, "chat_matcher_mode", "shadow")
-    view = _view([_entry("cap-a", aliases=("新建文件夹",))])
+    view = _view([_entry("cap-a", standard="新建文件夹")])
 
     async def fake_active(**kw):
         return view
@@ -162,7 +199,7 @@ async def test_shadow_logs_would_verdict_without_touching_routing(monkeypatch, c
     assert "would_route=t" in line and "would_stage=matcher" in line
     assert "confidence=1.0" in line and "fallback_reason=-" in line
     assert f"registry_version={view.fingerprint}" in line
-    assert "pattern=新建文件夹" in line  # which alias produced the HIT
+    assert "pattern=新建文件夹" in line  # which exact corpus sentence produced the HIT
     assert "agreement=matcher_only" in line  # Matcher hit, L0 abstained
 
 
@@ -193,7 +230,7 @@ async def test_shadow_sees_l0_certification_for_comparison(monkeypatch, caplog):
     from core.config import settings
 
     monkeypatch.setattr(settings, "chat_matcher_mode", "shadow")
-    view = _view([_entry("cap-a", tool="create_folder", aliases=("随便",))])
+    view = _view([_entry("cap-a", tool="create_folder", standard="随便")])
 
     async def fake_active(**kw):
         return view
@@ -226,7 +263,7 @@ async def test_shadow_agreement_match_and_mismatch(monkeypatch, caplog):
     monkeypatch.setattr(settings, "chat_matcher_mode", "shadow")
 
     async def fake_active(**kw):
-        return _view([_entry("cap-a", tool="create_folder", aliases=("新建文件夹",))])
+        return _view([_entry("cap-a", tool="create_folder", standard="新建文件夹")])
 
     monkeypatch.setattr(
         "core.application.chat.intent_funnel.registry.active_view", fake_active
@@ -258,7 +295,7 @@ async def test_mode_on_runs_shadow_semantics_with_a_warning(monkeypatch, caplog)
 
     monkeypatch.setattr(shadow, "_warned_on", False)
     monkeypatch.setattr(settings, "chat_matcher_mode", "on")
-    view = _view([_entry("cap-a", aliases=("新建文件夹",))])
+    view = _view([_entry("cap-a", standard="新建文件夹")])
 
     async def fake_active(**kw):
         return view

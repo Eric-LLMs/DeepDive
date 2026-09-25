@@ -100,6 +100,8 @@ async def _match_and_log(ctx, deps, requirements, mode: str) -> None:
         _confidence(res),
         _FALLBACK_REASONS.get(res.state, _DEFAULT_FALLBACK),
         ",".join(res.candidates) or "-",
+        # exact-only Matcher (ruling 2026-09-25): this is the human-readable
+        # corpus sentence that produced the HIT — never a regex literal
         (res.matched_literal or "-").replace(" ", "_"),
         l0_tool or "-", _agreement(res, view, l0_tool),
     )

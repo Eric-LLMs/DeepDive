@@ -50,23 +50,27 @@ def _verdict_from_reply(data: dict, candidates) -> ToolIntentVerdict:
     valid = {c.capability_id for c in candidates}
     args = data.get("arguments")
     args = dict(args) if isinstance(args, dict) else None
-    if not cap_id or cap_id.upper() == "NONE":
-        return ToolIntentVerdict(TOOL_INTENT_REJECT, None, "tool_intent chose NONE")
-    if cap_id not in valid:
-        # off-card invention stays an uncertainty, it is never a verdict
-        return ToolIntentVerdict(TOOL_INTENT_UNCERTAIN, None, f"off-card id {cap_id!r}")
     try:
         confidence = float(data.get("confidence") or 0.0)
     except (TypeError, ValueError):
         confidence = 0.0
+    if not cap_id or cap_id.upper() == "NONE":
+        return ToolIntentVerdict(TOOL_INTENT_REJECT, None, "tool_intent chose NONE",
+                                 confidence=None)
+    if cap_id not in valid:
+        # off-card invention stays an uncertainty, it is never a verdict
+        return ToolIntentVerdict(TOOL_INTENT_UNCERTAIN, None, f"off-card id {cap_id!r}",
+                                 confidence=None)
     from core.config import settings
 
     if confidence < settings.chat_tool_intent_min_confidence:
         return ToolIntentVerdict(
             TOOL_INTENT_UNCERTAIN, cap_id, f"confidence {confidence:.2f} below floor",
+            confidence=confidence,  # telemetry: the raw value, floor kept honest
         )
     return ToolIntentVerdict(
         TOOL_INTENT_CONFIDENT, cap_id, f"confidence {confidence:.2f}", arguments=args,
+        confidence=confidence,
     )
 
 
@@ -85,11 +89,14 @@ async def _model_call(backend, query, candidates, entries_by_id, llm, facts) -> 
 
 async def select_and_extract(query: str, candidates, *, entries_by_id: dict,
                      llm=None, facts=None) -> ToolIntentVerdict:
-    """Run the ONE ToolIntentModel pass under the configured backend ladder."""
+    """Run the ONE ToolIntentModel pass under the configured backend ladder.
+
+    Action Detection is unconditional (ruling 2026-09-25): an EMPTY candidate
+    list is a legitimate input — the model sees the explicit "(none registered
+    for this turn)" card set and can only answer NONE -> REJECT. There is no
+    pre-model short-circuit any more."""
     from core.config import settings
 
-    if not candidates:
-        return ToolIntentVerdict(TOOL_INTENT_REJECT, None, "no candidates")
     backend = _backend()
     chain = ({"auto": ("local", "online", "stub"),
               "local": ("local",), "online": ("online",), "stub": ("stub",)}[backend])

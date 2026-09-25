@@ -32,10 +32,13 @@ from core.application.chat.intent_funnel.registry.entry import (
 MSG = '新建文件夹"季度报告"'
 
 
-def _entry(cid, *, tool="create_folder", aliases=(), kind=KIND_ACTION, **kw):
+def _entry(cid, *, tool="create_folder", corpus=(), kind=KIND_ACTION, **kw):
+    # corpus = the exact-set sentences (standard + synonyms, ruling 2026-09-25)
+    corpus = tuple(corpus)
     return CapabilityEntry(
         capability_id=cid, tool_binding=tool, description=f"does {cid}",
-        aliases=tuple(aliases), examples=("做个事",),
+        standard_example=corpus[0] if corpus else "",
+        synonym_examples=corpus[1:], examples=("做个事",),
         parameters={"name": {"type": "string", "required": True,
                              "max_len": 120, "description": "folder name"}},
         arg_slots={"name": {"source": "user_input"}}, intent_kind=kind, **kw,
@@ -173,7 +176,7 @@ def _wire(monkeypatch, *, view, llm=None):
 
 async def test_closed_private_kind_exits_with_reason_byte_identical(monkeypatch, caplog):
     _open(monkeypatch, private=False)
-    view = _view([_entry("cap-p", kind=KIND_PRIVATE, aliases=(MSG,))])
+    view = _view([_entry("cap-p", kind=KIND_PRIVATE, corpus=(MSG,))])
     deps = _wire(monkeypatch, view=view)
     req = _req()
     with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
@@ -185,7 +188,7 @@ async def test_closed_private_kind_exits_with_reason_byte_identical(monkeypatch,
 
 async def test_opened_private_kind_certifies_with_kind_metadata(monkeypatch, caplog):
     _open(monkeypatch, private=True)
-    view = _view([_entry("cap-p", kind=KIND_PRIVATE, aliases=(MSG,))])
+    view = _view([_entry("cap-p", kind=KIND_PRIVATE, corpus=(MSG,))])
     deps = _wire(monkeypatch, view=view)
     with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
         out = await funnel.route(_ctx(MSG), deps=deps, requirements=_req())
@@ -198,7 +201,7 @@ async def test_opened_private_kind_certifies_with_kind_metadata(monkeypatch, cap
 
 async def test_action_kind_needs_no_extra_switch(monkeypatch):
     _open(monkeypatch, private=False)
-    view = _view([_entry("cap-a", kind=KIND_ACTION, aliases=(MSG,))])
+    view = _view([_entry("cap-a", kind=KIND_ACTION, corpus=(MSG,))])
     deps = _wire(monkeypatch, view=view)
     out = await funnel.route(_ctx(MSG), deps=deps, requirements=_req())
     assert out.requested_action["funnel_kind"] == KIND_ACTION

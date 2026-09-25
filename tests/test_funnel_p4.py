@@ -27,8 +27,8 @@ import pytest
 from core.application.chat.intent_funnel import funnel
 from core.application.chat.intent_funnel.contract import (
     REASON_KIND_DISABLED,
-    REASON_NO_CANDIDATE,
     REASON_REGISTRY_UNAVAILABLE,
+    REASON_TOOL_INTENT_REJECT,
 )
 from core.application.chat.intent_funnel.registry import content_fingerprint
 from core.application.chat.intent_funnel.registry.entry import (
@@ -41,11 +41,15 @@ from core.application.chat.intent_funnel.registry.entry import (
 MSG = '新建文件夹"季度报告"'
 
 
-def _entry(cid, *, tool="create_folder", patterns=(), aliases=(), kind=KIND_ACTION,
-           description=None, **kw):
+def _entry(cid, *, tool="create_folder", corpus=(), patterns=(), aliases=(),
+           kind=KIND_ACTION, description=None, **kw):
+    # corpus = the exact-set sentences (standard + synonyms, ruling 2026-09-25)
+    corpus = tuple(corpus)
     return CapabilityEntry(
         capability_id=cid, tool_binding=tool,
         description=description or f"does {cid}",
+        standard_example=corpus[0] if corpus else "",
+        synonym_examples=corpus[1:],
         patterns=tuple(patterns), aliases=tuple(aliases),
         examples=("做个事",),
         parameters={"name": {"type": "string", "required": True,
@@ -161,7 +165,7 @@ def _wire(monkeypatch, *, view, index=None, embedder=None, llm=None,
 
 async def test_preview_certifies_and_reports_the_whole_chain(monkeypatch):
     _open(monkeypatch, mode="on")
-    view = _view([_entry("cap-a", aliases=(MSG,))])
+    view = _view([_entry("cap-a", corpus=(MSG,))])
     deps = _wire(monkeypatch, view=view)
     res = await funnel.preview(MSG, deps=deps)
     assert res["final_route"] == "action"
@@ -180,11 +184,11 @@ async def test_preview_certifies_and_reports_the_whole_chain(monkeypatch):
 
 async def test_preview_abstains_with_the_reason_and_no_route(monkeypatch):
     _open(monkeypatch, mode="off")
-    view = _view([_entry("cap-a", aliases=(MSG,))])
+    view = _view([_entry("cap-a", corpus=(MSG,))])
     deps = _wire(monkeypatch, view=view)
     res = await funnel.preview("完全无关的一句话", deps=deps)
     assert res["final_route"] == "agent"
-    assert res["fallback_reason"] == REASON_NO_CANDIDATE
+    assert res["fallback_reason"] == REASON_TOOL_INTENT_REJECT
     assert "route" not in res
 
 
@@ -192,7 +196,7 @@ async def test_preview_ignores_the_production_gate(monkeypatch):
     # an admin must be able to dry-run the DARK lane: the funnel gate scopes
     # production traffic, not the console.
     _open(monkeypatch, mode="on", funnel_on=False)
-    view = _view([_entry("cap-a", aliases=(MSG,))])
+    view = _view([_entry("cap-a", corpus=(MSG,))])
     deps = _wire(monkeypatch, view=view)
     res = await funnel.preview(MSG, deps=deps)
     assert res["final_route"] == "action"
@@ -200,7 +204,7 @@ async def test_preview_ignores_the_production_gate(monkeypatch):
 
 async def test_preview_honors_the_kind_gate(monkeypatch):
     _open(monkeypatch, mode="on", private=False)
-    view = _view([_entry("cap-p", aliases=(MSG,), kind=KIND_PRIVATE)])
+    view = _view([_entry("cap-p", corpus=(MSG,), kind=KIND_PRIVATE)])
     deps = _wire(monkeypatch, view=view)
     res = await funnel.preview(MSG, deps=deps)
     assert res["final_route"] == "agent"
@@ -216,7 +220,7 @@ async def test_preview_pins_execution_mode_and_always_resets(monkeypatch):
     from core.infrastructure.request_context import get_request_execution_mode
 
     _open(monkeypatch, mode="off")
-    view = _view([_entry("cap-a", aliases=(MSG,))])
+    view = _view([_entry("cap-a", corpus=(MSG,))])
     seen = []
     deps = _wire(monkeypatch, view=view, embedder=_Embedder(seen))
     res = await funnel.preview("查一查", deps=deps)
@@ -243,7 +247,7 @@ async def test_preview_fail_open_on_registry_fault(monkeypatch):
 async def test_preview_cannot_reach_the_tool_runtime(monkeypatch):
     # 8.8 by construction: the funnel object graph has no run_tool at all.
     _open(monkeypatch, mode="on")
-    view = _view([_entry("cap-a", aliases=(MSG,))])
+    view = _view([_entry("cap-a", corpus=(MSG,))])
     deps = _wire(monkeypatch, view=view)
     assert not hasattr(deps, "run_tool")
     res = await funnel.preview(MSG, deps=deps)
@@ -255,7 +259,7 @@ async def test_preview_cannot_reach_the_tool_runtime(monkeypatch):
 
 async def test_certified_turn_writes_production_event(monkeypatch):
     _open(monkeypatch, mode="on")
-    view = _view([_entry("cap-a", aliases=(MSG,))])
+    view = _view([_entry("cap-a", corpus=(MSG,))])
     rows = []
     deps = _wire(monkeypatch, view=view, session_factory=lambda: _FakeSession(rows))
     from core.application.chat.understanding import (
@@ -281,7 +285,7 @@ async def test_certified_turn_writes_production_event(monkeypatch):
 
 async def test_abstain_writes_the_fallback_event(monkeypatch):
     _open(monkeypatch, mode="off")
-    view = _view([_entry("cap-a", aliases=(MSG,))])
+    view = _view([_entry("cap-a", corpus=(MSG,))])
     rows = []
     deps = _wire(monkeypatch, view=view, session_factory=lambda: _FakeSession(rows))
     from core.application.chat.understanding import (
@@ -297,12 +301,12 @@ async def test_abstain_writes_the_fallback_event(monkeypatch):
     out = await funnel.route(_ctx("无关句子"), deps=deps, requirements=requirements)
     assert out is requirements
     assert rows[0].final_route == "agent"
-    assert rows[0].fallback_reason == REASON_NO_CANDIDATE
+    assert rows[0].fallback_reason == REASON_TOOL_INTENT_REJECT
 
 
 async def test_event_write_failure_never_sinks_the_turn(monkeypatch):
     _open(monkeypatch, mode="on")
-    view = _view([_entry("cap-a", aliases=(MSG,))])
+    view = _view([_entry("cap-a", corpus=(MSG,))])
 
     def angry_factory():
         raise RuntimeError("telemetry db on fire")
@@ -324,7 +328,7 @@ async def test_event_write_failure_never_sinks_the_turn(monkeypatch):
 
 async def test_preview_event_lands_with_preview_mode(monkeypatch):
     _open(monkeypatch, mode="on")
-    view = _view([_entry("cap-a", aliases=(MSG,))])
+    view = _view([_entry("cap-a", corpus=(MSG,))])
     rows = []
     deps = _wire(monkeypatch, view=view, session_factory=lambda: _FakeSession(rows))
     await funnel.preview(MSG, deps=deps)
@@ -374,7 +378,7 @@ async def _patch_view(monkeypatch, view):
 
 async def test_funnel_stamped_dispatch_ok_when_view_unchanged(monkeypatch):
     _open(monkeypatch, mode="on")
-    view = _view([_entry("cap-a", aliases=(MSG,))])
+    view = _view([_entry("cap-a", corpus=(MSG,))])
     await _patch_view(monkeypatch, view)
     calls = []
 
@@ -389,8 +393,8 @@ async def test_funnel_stamped_dispatch_ok_when_view_unchanged(monkeypatch):
 
 async def test_fingerprint_drift_is_terminal_stale(monkeypatch):
     _open(monkeypatch, mode="on")
-    routed = _view([_entry("cap-a", aliases=(MSG,))], version=1)
-    drifted = _view([_entry("cap-a", aliases=(MSG,), description="changed"),
+    routed = _view([_entry("cap-a", corpus=(MSG,))], version=1)
+    drifted = _view([_entry("cap-a", corpus=(MSG,), description="changed"),
                      _entry("cap-b")], version=2)
     await _patch_view(monkeypatch, drifted)
     calls = []
@@ -409,7 +413,7 @@ async def test_capability_disabled_mid_air_is_terminal_stale(monkeypatch):
     _open(monkeypatch, mode="on")
     # isolate the ENTRY rule from the fingerprint rule: publish a v2 whose
     # fingerprint we stamp, but whose entry is disabled — dispatch must die.
-    after = _view([_entry("cap-a", aliases=(MSG,), enabled=False, status="disabled")])
+    after = _view([_entry("cap-a", corpus=(MSG,), enabled=False, status="disabled")])
     await _patch_view(monkeypatch, after)
     from core.application.chat.executors.action import _TERMINAL_STALE_ROUTE
 
@@ -422,7 +426,7 @@ async def test_capability_disabled_mid_air_is_terminal_stale(monkeypatch):
 
 async def test_private_gate_flipped_off_kills_dispatch(monkeypatch):
     _open(monkeypatch, mode="on", private=True)
-    view = _view([_entry("cap-a", aliases=(MSG,), kind=KIND_PRIVATE)])
+    view = _view([_entry("cap-a", corpus=(MSG,), kind=KIND_PRIVATE)])
     await _patch_view(monkeypatch, view)
     calls = []
 

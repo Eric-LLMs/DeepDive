@@ -52,7 +52,6 @@ from core.application.chat.intent_funnel.contract import (
     REASON_BIND_MISSING,
     REASON_TOOL_INTENT_REJECT,
     REASON_TOOL_INTENT_UNCERTAIN,
-    REASON_NO_CANDIDATE,
     REASON_RECALL_TIMEOUT,
     REASON_REGISTRY_UNAVAILABLE,
 )
@@ -95,6 +94,9 @@ def _entries() -> tuple[CapabilityEntry, ...]:
         CapabilityEntry(
             capability_id="cap-folder", tool_binding="create_folder",
             description="新建一个带引号名称的文件夹。",
+            # exact corpus (ruling 2026-09-25): the two canonical phrasings are
+            # HIT-able; the stored regex/alias fields are inert legacy storage.
+            standard_example=MSG_FOLDER, synonym_examples=(MSG_BARE, MSG_COMPOUND),
             patterns=("re:新建文件夹",), aliases=(MSG_FOLDER,),
             examples=(MSG_FOLDER,),
             parameters={"name": {"type": "string", "required": True,
@@ -105,6 +107,8 @@ def _entries() -> tuple[CapabilityEntry, ...]:
         CapabilityEntry(
             capability_id="cap-vocab", tool_binding="add_term",
             description="把一个词加入词汇库。",
+            standard_example='把"keystone"加入我的词汇库',
+            synonym_examples=(MSG_COMPOUND,),
             patterns=("re:加入我的.*词汇库",), aliases=(),
             examples=('把"keystone"加入我的词汇库',),
             parameters={"term": {"type": "string", "required": True,
@@ -279,13 +283,15 @@ async def test_plain_chat_abstains_and_lands_one_production_event(monkeypatch, c
     assert port.requests[-1][-1]["content"] == msg             # 8.10 byte-identical
     trace = _trace(caplog)
     assert _field(trace, "matcher") == "MISS:-"
-    assert _field(trace, "fallback_reason") == REASON_NO_CANDIDATE
+    # unconditional Action Detection (ruling 2026-09-25): no candidate is NOT an
+    # exit — the model sees the empty table and answers NONE
+    assert _field(trace, "fallback_reason") == REASON_TOOL_INTENT_REJECT
     assert _field(trace, "final_route") == "agent"
     evs = _events(db)
     assert len(evs) == 1                                       # 8.12 one row per route
     ev = evs[0]
     assert ev.execution_mode == "production" and ev.final_route == "agent"
-    assert ev.fallback_reason == REASON_NO_CANDIDATE
+    assert ev.fallback_reason == REASON_TOOL_INTENT_REJECT
     assert ev.session_id                                        # real turn: session stamped
     assert ev.index_version == "idx-e2e"
 
@@ -433,12 +439,13 @@ async def test_multi_turn_routing_does_not_leak_state(monkeypatch, caplog):
     assert spy.folders_created == [(str(USER), "季度报告")]
     assert port.steps == 1 and port.requests[-1][-1]["content"] == "换个话题吧"
     assert r2.answer == "Agent took over."
-    assert jd.calls == 1                                        # turn 2 never reached ToolIntentModel
+    assert jd.calls == 2                                        # turn 2 also pays the
+    # unconditional Action check: empty table -> the model answers NONE (REJECT)
     evs = _events(db)
     assert len(evs) == 2                                        # one row per routed turn
     assert evs[0].final_route == "action" and evs[0].capability_id == "cap-folder"
     assert evs[1].final_route == "agent"
-    assert evs[0].fallback_reason == "-" and evs[1].fallback_reason == REASON_NO_CANDIDATE
+    assert evs[0].fallback_reason == "-" and evs[1].fallback_reason == REASON_TOOL_INTENT_REJECT
     assert evs[0].session_id == evs[1].session_id == session
 
 
@@ -487,8 +494,9 @@ async def test_single_hop_spends_exactly_one_tool_intent_call(monkeypatch, caplo
 
 
 async def test_negated_demand_is_missed_before_certification(monkeypatch, caplog):
-    # 8.1-a: the guard turns the table HIT into a MISS at the router level —
-    # the turn fails open to the Agent byte-identical and nothing executes.
+    # a negated demand is not one of the curated exact sentences, so the table
+    # misses it on its own; the 8.1-a guard stays as defense in depth. The
+    # empty recall set still reaches the model, which answers NONE (REJECT).
     app, port, spy, _db, _emb, _ = _setup(monkeypatch, retire=True)
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     res = await sse(app, MSG_NEGATED)
@@ -497,7 +505,7 @@ async def test_negated_demand_is_missed_before_certification(monkeypatch, caplog
     assert port.steps == 1 and port.requests[-1][-1]["content"] == MSG_NEGATED
     trace = _trace(caplog)
     assert _field(trace, "matcher") == "MISS:-"
-    assert _field(trace, "fallback_reason") == REASON_NO_CANDIDATE
+    assert _field(trace, "fallback_reason") == REASON_TOOL_INTENT_REJECT
     assert res.answer == "Agent took over."
 
 

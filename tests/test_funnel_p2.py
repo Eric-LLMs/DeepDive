@@ -34,7 +34,6 @@ from core.application.chat.intent_funnel.contract import (
     REASON_BIND_MISSING,
     REASON_TOOL_INTENT_REJECT,
     REASON_TOOL_INTENT_UNCERTAIN,
-    REASON_NO_CANDIDATE,
     REASON_RECALL_TIMEOUT,
     REASON_RECALL_UNAVAILABLE,
     REASON_REGISTRY_UNAVAILABLE,
@@ -55,11 +54,16 @@ from core.application.chat.understanding import (
 # ════════════════════════ shared fakes (contract-shaped, minimal) ═══════════════
 
 
-def _entry(cid, *, tool="create_folder", patterns=(), aliases=(), arg_slots=None,
-           enabled=True, status="active", examples=("做个事",), negatives=(),
-           parameters=None):
+def _entry(cid, *, tool="create_folder", corpus=(), patterns=(), aliases=(),
+           arg_slots=None, enabled=True, status="active", examples=("做个事",),
+           negatives=(), parameters=None):
+    # ``corpus`` feeds the EXACT set (standard + synonyms, ruling 2026-09-25);
+    # patterns/aliases stay storable but are inert as far as the Matcher goes.
+    corpus = tuple(corpus)
     return T.CapabilityEntry(
         capability_id=cid, tool_binding=tool, description=f"does {cid}",
+        standard_example=corpus[0] if corpus else "",
+        synonym_examples=corpus[1:],
         patterns=tuple(patterns), aliases=tuple(aliases), examples=tuple(examples),
         negatives=tuple(negatives), arg_slots=arg_slots if arg_slots is not None
         else {"name": {"source": "user_input"}},
@@ -172,7 +176,7 @@ def test_turn_facts_plain_turn_is_all_empty():
 
 
 def test_matcher_contract_takes_facts_and_never_history():
-    v = _view([_entry("cap-a", aliases=("新建文件夹",))])
+    v = _view([_entry("cap-a", corpus=("新建文件夹",))])
     facts = TurnFacts(has_viewer=True, viewer_current_page=3)
     # facts is a REQUIRED contract slot; verdicts stay table-only (8.1)
     assert matcher.match("新建文件夹", facts, v).state == MATCH_HIT
@@ -714,6 +718,31 @@ def test_tool_intent_card_carries_tool_schema_score_and_origin():
     assert "params: none" in p2
 
 
+def test_prompt_defensively_replaces_leaked_regex_literal(caplog):
+    # Defense in depth (ruling 2026-09-25): the exact-only Matcher can no
+    # longer hand a raw regex to a card; IF one ever leaks through a legacy
+    # path, build_prompt swaps in the standard sentence and says so loudly.
+    import logging as _logging
+
+    entry = _entry("cap-a", corpus=("新建一个文件夹",))
+    cands = (Candidate("cap-a", 1.0, matched_example="re:新建文件夹",
+                       origin="matcher_hit"),)
+    with caplog.at_level(_logging.WARNING,
+                         logger="core.application.chat.intent_funnel.tool_intent.base"):
+        p = jbase.build_prompt("q", cands, {"cap-a": entry})
+    assert "re:新建文件夹" not in p
+    assert "matched_example: 新建一个文件夹" in p
+    assert any("regex literal leaked" in r.getMessage() for r in caplog.records)
+
+
+def test_prompt_empty_candidate_set_is_explicit_not_silent():
+    # the unconditional-Action-Detection contract needs the model to SEE that
+    # the table offered nothing — an honest empty line, never an empty section.
+    p = jbase.build_prompt("随便聊聊", (), {})
+    assert "Candidates:\n\n(none registered for this turn)" in p
+    assert "<user_sentence>随便聊聊</user_sentence>" in p
+
+
 # ═══════════════════════════════ binder (four states, 8.7) ═════════════════════
 
 
@@ -813,7 +842,7 @@ def _wire(monkeypatch, *, view, index, embedder, llm):
 
 
 MSG = '新建文件夹"季度报告"'
-CAP = [_entry("cap-a", aliases=(MSG,), examples=("建个目录",), parameters=_NAME_SCHEMA)]
+CAP = [_entry("cap-a", corpus=(MSG,), examples=("建个目录",), parameters=_NAME_SCHEMA)]
 
 
 async def test_gate_closed_cascade_is_physically_dark(monkeypatch):
@@ -865,7 +894,10 @@ async def test_registry_unavailable_fails_open(monkeypatch, caplog):
     assert "deepest_stage=registry" in line and "final_route=agent" in line
 
 
-async def test_index_unavailable_and_no_candidate(monkeypatch, caplog):
+async def test_index_unavailable_and_empty_set_still_reaches_model(monkeypatch, caplog):
+    """Action Detection is unconditional (ruling 2026-09-25): no index is a
+    fault (RECALL_UNAVAILABLE), but an EMPTY candidate set is not — the model
+    must still see the turn and answer NONE; NO_CANDIDATE is never produced."""
     _open(monkeypatch)
     req = _req()
     _, deps = _wire(monkeypatch, view=_view(CAP), index=None,
@@ -875,12 +907,17 @@ async def test_index_unavailable_and_no_candidate(monkeypatch, caplog):
     assert f"fallback_reason={REASON_RECALL_UNAVAILABLE}" in caplog.records[-1].getMessage()
 
     empty_idx = _index([])
+    llm = _LLM([{"capability_id": "NONE"}])
     _, deps = _wire(monkeypatch, view=_view(CAP), index=empty_idx,
-                    embedder=_Embedder([1, 0]), llm=_LLM())
+                    embedder=_Embedder([1, 0]), llm=llm)
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
         assert await funnel.route(_ctx("随便聊聊"), deps=deps, requirements=req) is req
-    assert f"fallback_reason={REASON_NO_CANDIDATE}" in caplog.records[-1].getMessage()
+    line = caplog.records[-1].getMessage()
+    assert f"fallback_reason={REASON_TOOL_INTENT_REJECT}" in line
+    assert "NO_CANDIDATE" not in line
+    assert len(llm.prompts) == 1                      # the model WAS called…
+    assert "(none registered for this turn)" in llm.prompts[0]  # …on an empty card set
 
 
 async def test_matcher_hit_single_hop_certifies(monkeypatch, caplog):
@@ -1007,7 +1044,7 @@ async def test_confident_but_unextractable_exits_bind_missing_no_second_hop(
     """The old BIND_MISSING -> recheck -> Decision chain is GONE: one CONFIDENT
     verdict, one missing draft, straight to the Agent."""
     _open(monkeypatch)
-    view = _view([_entry("cap-a", aliases=("新建文件夹",), parameters=_NAME_SCHEMA)])
+    view = _view([_entry("cap-a", corpus=("新建文件夹",), parameters=_NAME_SCHEMA)])
     idx = _index([("cap-a", ["建个目录"], [[0.2, 0.8]])])
     llm = _LLM([{"capability_id": "cap-a", "confidence": 0.95}])   # no arguments
     _, deps = _wire(monkeypatch, view=view, index=idx,
@@ -1066,22 +1103,27 @@ async def _view_ok():
 
 async def test_negated_matcher_hit_is_forced_to_miss(monkeypatch, caplog):
     _open(monkeypatch, mode="on")
-    # regex alias so "不要新建文件夹" would HIT without the negation guard
-    view = _view([_entry("cap-a", patterns=("re:新建文件夹",))])
+    # the corpus itself contains the negated sentence: an exact HIT WOULD fire —
+    # only the 8.1-a guard can veto it. Then the empty recall lane still must
+    # reach the model (unconditional Action Detection), which answers NONE.
+    view = _view([_entry("cap-a", corpus=("不要新建文件夹",))])
+    llm = _LLM([{"capability_id": "NONE"}])
     _, deps = _wire(monkeypatch, view=view, index=_index([]),
-                    embedder=_Embedder([1.0, 0.0]), llm=_LLM())
+                    embedder=_Embedder([1.0, 0.0]), llm=llm)
     req = _req()
     with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
         out = await funnel.route(_ctx("不要新建文件夹"), deps=deps, requirements=req)
     assert out is req
     line = next(r.getMessage() for r in caplog.records if "funnel_trace" in r.getMessage())
-    assert "matcher=MISS" in line and f"fallback_reason={REASON_NO_CANDIDATE}" in line
+    assert "matcher=MISS" in line
+    assert f"fallback_reason={REASON_TOOL_INTENT_REJECT}" in line
+    assert len(llm.prompts) == 1 and "(none registered for this turn)" in llm.prompts[0]
 
 
 async def test_ambiguous_carries_all_candidates_into_the_one_call(monkeypatch):
     _open(monkeypatch)
-    v = _view([_entry("cap-a", aliases=("季度汇总",), parameters=_NAME_SCHEMA),
-               _entry("cap-b", tool="add_term", aliases=("季度汇总",),
+    v = _view([_entry("cap-a", corpus=("季度汇总",), parameters=_NAME_SCHEMA),
+               _entry("cap-b", tool="add_term", corpus=("季度汇总",),
                       parameters=_TERM_SCHEMA)])
     llm = _LLM([{"capability_id": "cap-b", "confidence": 0.9,
                  "arguments": {"term": "季度汇总", "domain": "财务"}}])

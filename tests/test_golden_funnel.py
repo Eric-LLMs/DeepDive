@@ -6,10 +6,12 @@ Design of the fake world (kept deterministic on purpose — a golden that can
 flap is worse than no golden):
 
 * the Registry table carries exactly the four capabilities the matrix names:
-  ``cap-folder`` (exact alias + ``re:新建文件夹`` regex, example vector [1,0]),
-  ``cap-vocab`` (``re:加入我的.*词汇库`` regex only — so the multi-intent
-  sentence produces MATCH_AMBIGUOUS, which exact aliases can never do),
-  ``cap-private`` / ``cap-web`` (exact aliases behind widened kind gates);
+  ``cap-folder`` (exact standard sentence + curated synonyms; a legacy ``re:``
+  pattern stays in storage as INERT proof — the exact-only Matcher (ruling
+  2026-09-25) never reads it; example vector [1,0]),
+  ``cap-vocab`` (own standard + the shared multi-intent synonym — two caps
+  curating one sentence is what produces MATCH_AMBIGUOUS now),
+  ``cap-private`` / ``cap-web`` (exact standards behind widened kind gates);
 * the embedder is a vector map: the two sanctioned paraphrases score 1.0
   against cap-folder, EVERYTHING else falls to [0.7,0.7] — cosine 0.707
   against either axis, under the 0.82 quality gate. Recall therefore never
@@ -41,7 +43,6 @@ from core.application.chat.intent_funnel.contract import (
     REASON_BIND_MISSING,
     REASON_TOOL_INTENT_REJECT,
     REASON_KIND_DISABLED,
-    REASON_NO_CANDIDATE,
 )
 from core.application.chat.intent_funnel.registry import content_fingerprint
 from core.application.chat.intent_funnel.registry.entry import (
@@ -60,18 +61,23 @@ from core.infrastructure.request_context import (
 FUNNEL_LOGGER = "core.application.chat.intent_funnel.funnel"
 GOLDEN_PATH = Path(__file__).parent / "golden" / "intent_funnel_golden.yaml"
 
-# YAML token -> the contract constant actually logged as fallback_reason
+# YAML token -> the contract constant actually logged as fallback_reason.
+# FUNNEL_NO_CANDIDATE is retired (ruling 2026-09-25): an empty candidate set
+# now reaches ToolIntentModel, whose NONE lands on FUNNEL_TOOL_INTENT_REJECT.
 FALLBACK_CODES = {
-    "FUNNEL_NO_CANDIDATE": REASON_NO_CANDIDATE,
     "FUNNEL_TOOL_INTENT_REJECT": REASON_TOOL_INTENT_REJECT,
     "FUNNEL_BIND_MISSING": REASON_BIND_MISSING,
     "FUNNEL_KIND_DISABLED": REASON_KIND_DISABLED,
 }
 
 MSG_FOLDER = '新建文件夹"季度报告"'
+MSG_BARE_FOLDER = "新建文件夹"
 MSG_PRIVATE = '创建文件夹"私密日记"'
 MSG_WEB = "查一下这个词的词源"
 MSG_VOCAB_EXAMPLE = '把"keystone"加入我的工程词汇库'
+# ONE sentence curated under BOTH action caps — the only way exact-only
+# matching can ever produce MATCH_AMBIGUOUS
+MSG_MULTI_INTENT = '新建文件夹"季度报告"并把"keystone"加入我的工程词汇库'
 
 # the ONLY paraphrases the fake corpus embeds near cap-folder (cos 1.0);
 # everything else falls to [0.7,0.7] -> 0.707 < min_score 0.82 -> no candidate
@@ -94,6 +100,10 @@ def _table() -> tuple[CapabilityEntry, ...]:
         CapabilityEntry(
             capability_id="cap-folder", tool_binding="create_folder",
             description="新建一个带引号名称的文件夹。",
+            standard_example=MSG_FOLDER,
+            synonym_examples=(MSG_BARE_FOLDER, MSG_MULTI_INTENT),
+            # INERT legacy storage: the exact-only Matcher never reads these
+            # (ruling 2026-09-25) — kept here so the goldens prove it
             patterns=("re:新建文件夹",), aliases=(MSG_FOLDER,),
             examples=(MSG_FOLDER,),
             parameters={"name": {"type": "string", "required": True,
@@ -104,6 +114,8 @@ def _table() -> tuple[CapabilityEntry, ...]:
         CapabilityEntry(
             capability_id="cap-vocab", tool_binding="add_term",
             description="把一个词加入指定领域的词汇库。",
+            standard_example=MSG_VOCAB_EXAMPLE,
+            synonym_examples=(MSG_MULTI_INTENT,),
             patterns=("re:加入我的.*词汇库",), aliases=(),
             examples=(MSG_VOCAB_EXAMPLE,),
             parameters={"term": {"type": "string", "required": True,
@@ -117,7 +129,8 @@ def _table() -> tuple[CapabilityEntry, ...]:
         CapabilityEntry(
             capability_id="cap-private", tool_binding="create_folder",
             description="在私有空间创建文件夹(演示 private kind 开关)。",
-            patterns=(), aliases=(MSG_PRIVATE,),
+            standard_example=MSG_PRIVATE,
+            patterns=(), aliases=(),
             examples=(),
             parameters={"name": {"type": "string", "required": True,
                                  "max_len": 120, "description": "folder name"}},
@@ -127,7 +140,8 @@ def _table() -> tuple[CapabilityEntry, ...]:
         CapabilityEntry(
             capability_id="cap-web", tool_binding="web_search",
             description="查询词源等外部知识(演示 web kind 开关)。",
-            patterns=(), aliases=(MSG_WEB,),
+            standard_example=MSG_WEB,
+            patterns=(), aliases=(),
             examples=(),
             parameters={"query": {"type": "string", "required": True,
                                   "max_len": 200, "description": "search request"}},

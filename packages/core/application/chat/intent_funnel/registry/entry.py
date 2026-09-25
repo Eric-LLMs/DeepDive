@@ -71,6 +71,21 @@ class CapabilityEntry:
     row_version: int = 0
 
     @property
+    def intent_corpus(self) -> tuple[str, ...]:
+        """THE intent-expression corpus (Action-Contract ruling 2026-09-25):
+        standard_example + synonym_examples, blanks out, order preserved,
+        deduped. Single source of truth for BOTH the Matcher exact set AND the
+        PGVector recall corpus (Phase 1/3 ruling) — one property, no drift.
+        Legacy ``examples`` and ``negatives`` are deliberately NOT here: they
+        are card context / card boundary, never match or recall anchors."""
+        out: list[str] = []
+        for text in (self.standard_example, *self.synonym_examples):
+            s = str(text or "").strip()
+            if s and s not in out:
+                out.append(s)
+        return tuple(out)
+
+    @property
     def recall_corpus(self) -> tuple[str, ...]:
         """Every sentence this capability is recalled by, in index order:
         standard -> synonyms -> legacy candidate examples (blank entries out)."""

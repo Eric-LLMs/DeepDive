@@ -13,22 +13,30 @@
 # Chain ruling 2026-09-24: the active lane is Matcher/Recall -> ONE ToolIntentModel
 # call -> Binder validate -> certified, so every ACTION row carries
 # stage: tool_intent (there is no matcher-direct stage any more).
+# Action-Contract ruling 2026-09-25: the Matcher is EXACT-ONLY over the curated
+# intent corpus (regex is inert storage), and an empty candidate set still
+# reaches ToolIntentModel — FUNNEL_NO_CANDIDATE is retired; the honest exit of
+# "nothing on the table" is the model's own NONE -> FUNNEL_TOOL_INTENT_REJECT.
 
 cases:
-  - id: det_match_exact_alias
+  - id: det_match_exact_standard
     group: deterministic_match
     settings: {mode: "on"}
     query: '新建文件夹"季度报告"'
-    # the HIT lane enters the same single ToolIntentModel hop as Recall (chain ruling
-    # 2026-09-24): the direct-certification special path is gone.
+    # the standard corpus sentence matches EXACTLY -> HIT; the HIT lane enters
+    # the same single ToolIntentModel hop as Recall (chain ruling 2026-09-24).
     expect: {route: action, capability: cap-folder, tool: create_folder,
              stage: tool_intent, kind: action}
 
-  - id: det_match_regex_pattern
+  - id: det_regex_is_inert
     group: deterministic_match
     settings: {mode: "on"}
     query: '新建文件夹"实验记录"'
-    expect: {route: action, capability: cap-folder, stage: tool_intent}
+    # the legacy ``re:新建文件夹`` pattern WOULD have hit pre-ruling; the
+    # exact-only Matcher never reads it. Recall falls under the quality gate,
+    # the empty set still reaches the model, which answers NONE.
+    expect: {route: agent, fallback: FUNNEL_TOOL_INTENT_REJECT,
+             matcher_contains: "MISS"}
 
   - id: paraphrase_zh_recall
     group: paraphrase_multilingual
@@ -46,15 +54,18 @@ cases:
     group: negation
     settings: {mode: "on"}
     query: '不要新建文件夹"季度报告"'
-    # the regex pattern WOULD hit; the 8.1-a negation guard must force MISS
-    # and the fake corpus must not resupply the turn through Recall.
-    expect: {route: agent, fallback: FUNNEL_NO_CANDIDATE,
+    # the 8.1-a negation guard applies before any certification; the fake
+    # corpus must not resupply the turn through Recall either — the empty
+    # candidate set reaches the model, whose NONE is the honest exit.
+    expect: {route: agent, fallback: FUNNEL_TOOL_INTENT_REJECT,
              matcher_contains: "MISS"}
 
   - id: ambiguous_two_intents_escalates
     group: ambiguity_multi_intent
-    # both regexes hit one sentence; the one ToolIntentModel hop answers NONE on the
-    # split pair (no arbiter exists any more to rescue it) — Agent keeps the turn.
+    # ONE sentence curated under BOTH action caps — the only way the
+    # exact-only Matcher can produce AMBIGUOUS; the one ToolIntentModel hop
+    # answers NONE on the split pair (no arbiter exists any more) — Agent keeps
+    # the turn.
     settings: {mode: "on"}
     query: '新建文件夹"季度报告"并把"keystone"加入我的工程词汇库'
     expect: {route: agent, fallback: FUNNEL_TOOL_INTENT_REJECT,
@@ -64,9 +75,9 @@ cases:
     group: missing_argument
     settings: {mode: "on"}
     query: '新建文件夹'
-    # Matcher HIT enters the hop; ToolIntentModel selects cap-folder but the sentence
-    # carries no quotable name -> Binder validate exits MISSING (8.7): the
-    # Agent owns the clarification, no second hop tries to rescue it.
+    # a curated synonym -> HIT; ToolIntentModel selects cap-folder but the
+    # sentence carries no quotable name -> Binder validate exits MISSING
+    # (8.7): the Agent owns the clarification, no second hop tries to rescue it.
     expect: {route: agent, fallback: FUNNEL_BIND_MISSING,
              matcher_contains: "HIT:cap-folder"}
 
@@ -83,8 +94,8 @@ cases:
     query: '再来一个'
     ctx: {session: s-golden}
     # bare follow-up: table miss, vector miss — the funnel never guesses from
-    # history; the Agent owns context.
-    expect: {route: agent, fallback: FUNNEL_NO_CANDIDATE}
+    # history; the unconditional model call answers NONE, the Agent owns context.
+    expect: {route: agent, fallback: FUNNEL_TOOL_INTENT_REJECT}
 
   - id: private_kind_gate_closed
     group: private_web_constraints
@@ -109,4 +120,4 @@ cases:
     group: agent_fallback
     settings: {mode: "on"}
     query: '今天想学点什么好'
-    expect: {route: agent, fallback: FUNNEL_NO_CANDIDATE}
+    expect: {route: agent, fallback: FUNNEL_TOOL_INTENT_REJECT}

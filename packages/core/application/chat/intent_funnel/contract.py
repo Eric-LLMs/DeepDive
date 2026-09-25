@@ -56,6 +56,9 @@ class TurnFacts:
 # ── 8.10 fallback reason codes (prefixed, never bare words) ───────────────────────
 # The new cascade's ONLY downward exits. Any of these on a funnel_trace line means
 # the turn went to the Agent with the user text BYTE-IDENTICAL (8.10).
+# Retired on the new lane (Action-Contract ruling 2026-09-25): an empty
+# candidate set must still pass ToolIntentModel, so the funnel never emits this
+# reason any more. Constant kept so archived traces/A-B rows stay decodable.
 REASON_NO_CANDIDATE = "NO_CANDIDATE"
 REASON_RECALL_TIMEOUT = "RECALL_TIMEOUT"
 REASON_RECALL_UNAVAILABLE = "RECALL_UNAVAILABLE"
@@ -128,6 +131,10 @@ class ToolIntentVerdict:
     capability_id: str | None = None
     rationale: str = field(default="", repr=False)
     arguments: dict | None = None
+    # TELEMETRY ONLY (pure additive, Phase E): the raw confidence reported by
+    # the model, kept even when the floor turned it into UNCERTAIN, so Shadow
+    # evaluation can sweep floors offline. Routing never reads this field.
+    confidence: float | None = None
 
 
 # ── Binder (wired in P0 over the existing actions.bind_arguments) ────────────────
