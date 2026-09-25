@@ -4651,14 +4651,6 @@ fencing semantics), `test_chat_direct_e2e / viewer / retrieval / composite` per 
 
 ## 25. Chat Intent Funnel — Nodeized Routing, ToolIntentModel & Shared Tool Runtime
 
-> Consolidated English text of the two frozen design artifacts (the *Chat Intent
-> Routing Refactor — Design Brief* and the *Intent Funnel · Code Structure Design*,
-> both 2026-09-23), stated as the design the shipped code actually implements. The
-> one consequential correction against the draft: the brief's Node 3 (Judge) and
-> Node 4 (Decision LLM) were collapsed into a **single ToolIntentModel hop** by the
-> 2026-09-24 chain ruling — the second online round-trip was measured to add zero
-> information and to *be* the cascade timeout.
-
 ### 25.1 Intent Recognition Iteration
 
 The primary purpose of Delveta's Intent Funnel is to reduce the cost and
