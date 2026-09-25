@@ -4802,11 +4802,11 @@ This forms a continuous production optimization loop:
 > Tool decisions on the local lightweight path → reduce expensive Agent /
 > online LLM inference.**
 
-#### Recall Evaluation Baseline (2026-09-26)
+#### Recall Evaluation Baseline
 
-This section records the current Recall baseline after the initial Query
-Corpus construction and the broad query-expansion pass. It is the reference
-point every future expansion iteration is measured against.
+This section records the Recall baseline for the first initialized Similar
+Query collection. It is the reference point every future expansion iteration
+is measured against.
 
 **Corpus under evaluation**
 
@@ -4866,7 +4866,7 @@ point every future expansion iteration is measured against.
 | 0.79 | 77.8% | 11.1% |
 | 0.80 | 73.6% | 11.1% |
 | 0.81 | 69.4% | 6.9% |
-| 0.82 | 61.1% | 5.6% |
+| **0.82** | **61.1%** | **5.6%** |
 | 0.83 | 55.6% | 5.6% |
 | 0.84 | 47.2% | 5.6% |
 | 0.85 | 41.7% | 5.6% |
