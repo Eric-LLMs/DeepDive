@@ -765,6 +765,19 @@ def test_prompt_contract_says_provenance_is_not_action():
     assert '"capability_id"' in jbase.SYSTEM and "NONE" in jbase.SYSTEM
 
 
+def test_output_lock_rides_at_the_end_of_the_user_prompt():
+    # 2026-09-25 smoke finding: the long semantic contract alone lost JSON
+    # discipline on the 0.6B (markdown bullets; a prose NONE even parsed as
+    # backend-unavailable). The envelope template rides LAST (recency) and
+    # carries PLACEHOLDERS ONLY — a real example value there is echoed
+    # verbatim for every query (observed), which would be a silent mass-FP.
+    p = jbase.build_prompt("随便聊聊", (), {})
+    assert p.endswith(jbase.OUTPUT_LOCK)
+    assert '"capability_id"' in p and '"confidence"' in p and '"arguments"' in p
+    for leak in ("报告", "季度", "notes", "quark"):
+        assert leak not in jbase.OUTPUT_LOCK            # no echoable example values
+
+
 def test_card_example_guardrail_truncates_and_says_so(caplog):
     """A curatorial runaway must not silently blow the small-model window."""
     import logging as _logging
