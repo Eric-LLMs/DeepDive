@@ -289,11 +289,14 @@ def _log_trace(trace: dict) -> None:
     )
 
 
-async def _persist_event(deps, ctx, trace: dict) -> None:
+async def _persist_event(deps, ctx, trace: dict, trace_json: dict | None = None) -> None:
     """8.12: one row per route decision, best-effort. Telemetry must never sink
     a turn or delay a preview, and an unwired session factory (unit tests,
     dark lanes) is a silent no-op. The raw query is deliberately NOT stored;
-    ``execution_mode`` (8.14) separates production from shadow/preview/test."""
+    ``execution_mode`` (8.14) separates production from shadow/preview/test.
+    ``trace_json`` (Phase 6, settings.chat_funnel_trace_capture) is the single
+    exception to the no-query rule: a dark-launched, admin-gated observability
+    blob carrying query + rebuilt cards + verdict — never the full prompt."""
     factory = getattr(deps, "session_factory", None)
     if factory is None:
         return
@@ -315,6 +318,7 @@ async def _persist_event(deps, ctx, trace: dict) -> None:
                 final_route=trace["final_route"], fallback_reason=trace["fallback"],
                 registry_version=trace["registry"], index_version=trace["index"],
                 capability_id=trace["capability"], total_ms=trace["total_ms"],
+                trace_json=trace_json,
             ))
             await session.commit()
     except Exception as exc:
@@ -327,10 +331,29 @@ async def _cascade(ctx, deps, requirements: TurnRequirements) -> TurnRequirement
     byte-identical). Returns the same object the pre-P2 contract guarantees;
     only a certified turn produces a NEW requirements (never a mutation)."""
     trace = _new_trace()
-    out = await _run_cascade(ctx, deps, requirements, trace)
+    # Phase 6 dark launch: with chat_funnel_trace_capture OFF the cascade is
+    # byte-identical to before; ON opens the same evaluation capture seam the
+    # shadow/preview lanes use, and its summary rides the event row.
+    capture: dict | None = {} if settings.chat_funnel_trace_capture else None
+    out = await _run_cascade(ctx, deps, requirements, trace, capture=capture)
     _log_trace(trace)
-    await _persist_event(deps, ctx, trace)
+    await _persist_event(deps, ctx, trace, _trace_json(capture, ctx))
     return out if out is not None else requirements
+
+
+def _trace_json(capture: dict | None, ctx) -> dict | None:
+    """The observability blob (never the full prompt): what the model saw and
+    what it decided, rebuilt from the capture seam. None = capture off."""
+    if capture is None:
+        return None
+    return {
+        "query": getattr(getattr(ctx, "body", None), "message", None),
+        "matcher": capture.get("matcher"),
+        "candidates": capture.get("candidates", []),
+        "model_verdict": capture.get("tool_intent"),
+        "entry": capture.get("entry"),
+        "binder_state": capture.get("binder"),
+    }
 
 
 # ── §8.5 full-chain query preview (dry-run, side-effect-free) ─────────────────────

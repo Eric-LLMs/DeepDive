@@ -322,6 +322,36 @@ async def test_matcher_certified_turn_executes_through_sandbox(monkeypatch, capl
     assert ev.deepest_stage == "certified"
 
 
+# ── Phase 6 dark switch: chat_funnel_trace_capture ────────────────────────────────
+
+async def test_trace_capture_lands_only_when_the_switch_is_on(monkeypatch):
+    """OFF (default): the event write is byte-identical — trace_json stays None.
+    ON: the row carries the rebuilt card summary + query + verdict (never the
+    full prompt), from the same capture seam the shadow/preview lanes use."""
+    jd = ToolIntentDouble([{"capability_id": "cap-folder", "confidence": 0.9,
+                            "arguments": {"name": "季度报告"}}])
+    app, port, spy, db, emb, _ = _setup(monkeypatch, retire=True,
+                                        tool_intent=jd, tool_intent_backend="online")
+    await sse(app, MSG_FOLDER)
+    assert _events(db)[0].trace_json is None
+
+    monkeypatch.setattr(settings, "chat_funnel_trace_capture", True)
+    jd2 = ToolIntentDouble([{"capability_id": "cap-folder", "confidence": 0.9,
+                             "arguments": {"name": "季度报告"}}])
+    app2, _, _, db2, _, _ = _setup(monkeypatch, retire=True,
+                                   tool_intent=jd2, tool_intent_backend="online")
+    await sse(app2, MSG_FOLDER)
+    tj = _events(db2)[0].trace_json
+    assert tj is not None
+    assert tj["query"] == MSG_FOLDER
+    hit = tj["candidates"][0]
+    assert hit["capability_id"] == "cap-folder" and hit["origin"] == "matcher_hit"
+    assert hit["kind"] == "canonical"                  # MSG_FOLDER is the standard example
+    assert tj["model_verdict"]["decision"] == "CONFIDENT"
+    assert tj["binder_state"] == "COMPLETE"
+    assert "entry" in tj and tj["entry"]["tool_binding"] == "create_folder"
+
+
 # ── 5+6: the Recall lane — no table hit, the example scores, the one call certifies ─
 
 async def test_paraphrase_routes_through_recall_and_tool_intent(monkeypatch, caplog):

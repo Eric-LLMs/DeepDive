@@ -27,6 +27,10 @@ litellm>=1.40
 tenacity>=8.2
 structlog>=24.0
 
+# Observability (Phase 6): psutil backs the CPU/RAM gauges on
+# /admin/observability/latency (absent → null, never a hard failure).
+psutil>=5.9
+
 # MCP
 fastmcp>=0.2
 

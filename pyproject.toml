@@ -30,6 +30,9 @@ dependencies = [
     "litellm>=1.40",
     "tenacity>=8.2",
     "structlog>=24.0",
+    # Observability (Phase 6): psutil backs the CPU/RAM gauges on the admin
+    # latency endpoint (gracefully absent → null, never a hard dependency).
+    "psutil>=5.9",
     # NOTE: TTS (Kokoro) and embedding (BGE-M3) run as separate Docker services;
     # the API only calls them over HTTP via `openai` / `httpx` (declared above).
     # MCP

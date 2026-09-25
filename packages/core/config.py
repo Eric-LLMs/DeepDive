@@ -152,6 +152,10 @@ class Settings(BaseSettings):
     chat_funnel_top_k: int = 3                   # Recall candidate width
     chat_funnel_min_score: float = 0.82          # Recall quality gate (no adjudication here)
     chat_funnel_margin: float = 0.06             # ToolIntentModel(stub) leader-vs-runner-up margin
+    # Phase 6 observability: when ON, each funnel event row also carries
+    # trace_json (rebuilt candidate-card summary + query + verdict — never the
+    # full prompt). Dark launch: OFF keeps the write path byte-identical.
+    chat_funnel_trace_capture: bool = False
     # ToolIntentModel backend ladder (8.17 + 2026-09-24 chain ruling):
     # "stub" | "local" | "online" | "auto" (local→online→stub). ToolIntentModel is a
     # swappable PROVIDER: the funnel only speaks the OpenAI-compatible card

@@ -454,6 +454,7 @@
             <div class="nav-item" data-page="tools">Tools config</div>
             <div class="nav-item" data-page="rag">RAG</div>
             <div class="nav-item" data-page="intent-registry">Intent Registry</div>
+            <div class="nav-item" data-page="observability">Observability</div>
           </div>
           <div class="content" id="content"></div>
         </div>
@@ -801,6 +802,7 @@
             tools: renderToolsPage,
             rag: renderRagPage,
             "intent-registry": renderRegistryPage,
+            observability: renderObservabilityPage,
           };
           (renderers[page] || renderProvidersPage)();
         }
@@ -3811,6 +3813,157 @@
             }
             audOut.appendChild(wrap);
           } catch (e) { audOut.appendChild(errBox(e)); }
+        }
+
+        // ───────────────────────── Observability console (Phase 6) ─────────────────────────
+        let obsTab = "logs";
+
+        async function renderObservabilityPage() {
+          content.innerHTML = "";
+          const head = el("div", "page-head");
+          const t = el("div");
+          t.appendChild(el("h2", "", "Observability"));
+          t.appendChild(el("div", "sub", "Log tail, funnel decision events (8.12), and latency probes — read-only, no new pipeline."));
+          head.appendChild(t);
+          content.appendChild(head);
+
+          const tabs = el("div", "tabs");
+          for (const [key, label] of [["logs", "Logs"], ["events", "Funnel Events"], ["perf", "Performance"]]) {
+            const tab = el("div", "tab" + (obsTab === key ? " active" : ""), label);
+            tab.onclick = () => { obsTab = key; renderObservabilityPage(); };
+            tabs.appendChild(tab);
+          }
+          content.appendChild(tabs);
+          const section = el("div");
+          content.appendChild(section);
+          if (obsTab === "logs") await renderObsLogs(section);
+          else if (obsTab === "events") await renderObsEvents(section);
+          else await renderObsPerf(section);
+        }
+
+        async function renderObsLogs(container) {
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "section-title", "Process log tail"));
+          const file = select([{ label: "api.log", value: "api" }, { label: "worker.log", value: "worker" }], "api");
+          const level = select([{ label: "all", value: "all" }, { label: "warning+", value: "warning" }, { label: "error+", value: "error" }], "all");
+          const limit = numInput(200);
+          const btn = el("button", "btn ghost", "Load");
+          btn.type = "button";
+          const out = el("div");
+          card.append(field("File", file), field("Level", level), field("Lines", limit), btn, out);
+          container.appendChild(card);
+          const load = async () => {
+            out.innerHTML = "";
+            try {
+              const d = await apiFetch("/admin/observability/logs?file=" + file.value + "&level=" + level.value + "&limit=" + (parseInt(limit.value, 10) || 200));
+              out.appendChild(el("div", "hint", (d.file || "") + (d.missing ? " — file not found yet" : "") + (d.truncated ? " · truncated" : "")));
+              const pre = el("pre", "trace-out");
+              pre.style.maxHeight = "60vh";
+              pre.style.overflow = "auto";
+              pre.textContent = (d.lines || []).join("\n") || "(no matching lines)";
+              out.appendChild(pre);
+            } catch (e) { out.appendChild(errBox(e)); }
+          };
+          btn.onclick = load;
+          await load();
+        }
+
+        async function renderObsEvents(container) {
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "section-title", "Funnel decision events"));
+          const mode = select([{ label: "any", value: "" }, { label: "production", value: "production" }, { label: "preview", value: "preview" }, { label: "shadow", value: "shadow" }, { label: "test", value: "test" }], "");
+          const route = select([{ label: "any", value: "" }, { label: "action", value: "action" }, { label: "agent", value: "agent" }], "");
+          const limit = numInput(50);
+          const btn = el("button", "btn ghost", "Load");
+          btn.type = "button";
+          const out = el("div");
+          card.append(field("Mode", mode), field("Final route", route), field("Limit", limit), btn, out);
+          container.appendChild(card);
+          const load = async () => {
+            out.innerHTML = "";
+            try {
+              const qs = new URLSearchParams({ limit: String(parseInt(limit.value, 10) || 50) });
+              if (mode.value) qs.set("mode", mode.value);
+              if (route.value) qs.set("route", route.value);
+              const d = await apiFetch("/admin/observability/funnel-events?" + qs.toString());
+              const events = d.events || [];
+              if (!events.length) { out.appendChild(emptyState("No events in this window.")); return; }
+              for (const ev of events) {
+                const row = el("div", "node-trace");
+                const h = el("div", "trace-head");
+                h.appendChild(el("span", "cell-main code", (ev.created_at || "").replace("T", " ").slice(0, 19)));
+                h.appendChild(badge(ev.final_route, ev.final_route === "action" ? "ok" : ""));
+                if (ev.execution_mode !== "production") h.appendChild(badge(ev.execution_mode, "accent"));
+                if (ev.fallback_reason && ev.fallback_reason !== "-") h.appendChild(badge(ev.fallback_reason, "danger"));
+                h.appendChild(el("span", "trace-ms", (ev.total_ms != null ? ev.total_ms + " ms" : "")));
+                row.appendChild(h);
+                const meta = el("div", "hint");
+                meta.textContent = "stage=" + ev.deepest_stage + " · matcher=" + (ev.matcher || "-")
+                  + " · recall=" + ev.recall_count + " (" + (ev.recall_top || "-") + ")"
+                  + " · tool_intent=" + (ev.tool_intent || "-")
+                  + (ev.capability_id ? " · cap=" + ev.capability_id : "")
+                  + " · registry=" + (ev.registry_version || "—") + " index=" + (ev.index_version || "—");
+                row.appendChild(meta);
+                if (ev.trace_json) row.appendChild(el("pre", "trace-out", JSON.stringify(ev.trace_json, null, 2)));
+                out.appendChild(row);
+              }
+            } catch (e) { out.appendChild(errBox(e)); }
+          };
+          btn.onclick = load;
+          await load();
+        }
+
+        async function renderObsPerf(container) {
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "section-title", "Latency & system probes"));
+          const hours = numInput(24);
+          const btn = el("button", "btn ghost", "Refresh");
+          btn.type = "button";
+          const out = el("div");
+          card.append(field("Window (hours)", hours), btn, out);
+          container.appendChild(card);
+          const load = async () => {
+            out.innerHTML = "";
+            try {
+              const d = await apiFetch("/admin/observability/latency?hours=" + (parseInt(hours.value, 10) || 24));
+              if (d.funnel_ms && d.funnel_ms.length) {
+                const { wrap, tbody } = table(["final route", "count", "p50 ms", "p95 ms", "p99 ms"]);
+                for (const f of d.funnel_ms) {
+                  const tr = el("tr");
+                  tr.appendChild(td(f.final_route));
+                  tr.appendChild(td(String(f.count)));
+                  tr.appendChild(td(String(f.p50)));
+                  tr.appendChild(td(String(f.p95)));
+                  tr.appendChild(td(String(f.p99)));
+                  tbody.appendChild(tr);
+                }
+                out.appendChild(wrap);
+              } else {
+                out.appendChild(el("div", "hint", "No funnel events in the window" + (d.db_error ? " — " + d.db_error : "") + "."));
+              }
+              const probes = [];
+              probes.push("db ping: " + (d.db_ping_ms != null ? d.db_ping_ms + " ms" : "—"));
+              const eh = d.embed_health;
+              probes.push("embedding /health: " + (eh ? (eh.ok ? "ok " + eh.ms + " ms" : "DOWN") : "—"));
+              if (d.system) probes.push("cpu " + d.system.cpu_percent + "% · mem " + d.system.mem_percent + "% · rss " + d.system.rss_mb + " MB");
+              out.appendChild(el("div", "hint", probes.join("  ·  ")));
+              if (d.llm_activity && d.llm_activity.length) {
+                out.appendChild(el("div", "section-sub", "LLM activity (tokens/cost — per-call latency is not recorded)"));
+                const { wrap, tbody } = table(["model", "calls", "tokens", "cost usd"]);
+                for (const m of d.llm_activity) {
+                  const tr = el("tr");
+                  tr.appendChild(td(m.model));
+                  tr.appendChild(td(String(m.calls)));
+                  tr.appendChild(td(String(m.tokens)));
+                  tr.appendChild(td(m.cost_usd.toFixed(4)));
+                  tbody.appendChild(tr);
+                }
+                out.appendChild(wrap);
+              }
+            } catch (e) { out.appendChild(errBox(e)); }
+          };
+          btn.onclick = load;
+          await load();
         }
 
         boot();
