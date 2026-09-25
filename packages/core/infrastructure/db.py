@@ -965,6 +965,80 @@ class RegistryAuditModel(Base):
     )
 
 
+class ActionCatalogModel(Base):
+    """The Action Universe: every USER-FACING action that exists in the system
+    (migration 0011, Action-Universe ruling 2026-09-25). Deliberately separate
+    from ``capabilities`` — catalog membership is inventory, NEVER routing.
+    An action becomes routable only by an explicit register -> Draft -> Validate
+    -> Publish sequence; joining it to ``capabilities.tool_binding`` is how the
+    admin console derives the live route (single source, no stored drift)."""
+
+    __tablename__ = "action_catalog"
+
+    action_key: Mapped[str] = mapped_column(String, primary_key=True)
+    display_name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    tool_binding: Mapped[str] = mapped_column(String, nullable=False)
+    route: Mapped[str] = mapped_column(String, nullable=False, default="agent")
+    implementation_ref: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # user_facing | deprecated (no hard delete, same 8.6 doctrine)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="user_facing")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ActionQueryDraftModel(Base):
+    """Draft-Configuration head for a not-yet-registered action (migration 0011).
+    Pre-Registry only: these sentences are NEVER read by the Matcher, Recall or
+    any runtime component; registration copies them into a capabilities Draft row
+    and from there ONLY the publish lifecycle can build qir_examples."""
+
+    __tablename__ = "action_query_drafts"
+
+    action_key: Mapped[str] = mapped_column(String, primary_key=True)
+    updated_by: Mapped[str | None] = mapped_column(String)
+    # Pre-Registry parameter configuration (migration 0012). Same shape as the
+    # Registry ``parameters`` field (slot -> {type, description, required, ...}),
+    # so registration copies it 1:1 — no second parameter model.
+    parameters: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # Binder argument-slot mapping, same shape as CapabilityEntry.arg_slots.
+    arg_slots: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ActionQueryDraftItemModel(Base):
+    """One sentence of a pre-Registry query draft. kind maps 1:1 onto the
+    Registry field it would become on register:
+    standard -> standard_example, similar -> synonym_examples, negative ->
+    negatives. position orders the list editors."""
+
+    __tablename__ = "action_query_draft_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    action_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ChatFunnelEventModel(Base):
     """One row per Intent-Funnel route decision (QIR P4, docs/temp.md 8.12).
 
