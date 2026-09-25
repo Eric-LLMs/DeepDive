@@ -15,8 +15,10 @@ from api.deps import _embedder
 from api.schemas import (
     RegistryDraftCreateRequest,
     RegistryDraftUpdateRequest,
+    RegistryDraftParamsRequest,
     RegistryPreviewRouteRequest,
     RegistryPublishRequest,
+    RegistryQueryDraftRequest,
     RegistryRollbackRequest,
 )
 from core.application.chat.intent_funnel.registry import (
@@ -26,6 +28,7 @@ from core.application.chat.intent_funnel.registry import (
     RegistryError,
     RegistryNotFoundError,
     RegistryStateError,
+    active_view,
     audit,
     create_draft,
     get_version,
@@ -37,6 +40,8 @@ from core.application.chat.intent_funnel.registry import (
     rollback,
     update_draft,
 )
+from core.application.chat.intent_funnel.registry import catalog
+from core.application.chat.intent_funnel.registry.plugins import DIRECT_TOOLS
 from core.infrastructure.db import SessionLocal
 from core.infrastructure.request_context import (
     reset_request_execution_mode,
@@ -105,6 +110,273 @@ async def patch_draft(
                 detail={"patch": body.patch, "row_version": updated.row_version},
                 session_factory=SessionLocal)
     return {"draft": _entry_json(updated)}
+
+
+# ── Tool Schema (runtime truth, read-only) ────────────────────────────────────────
+# The Advanced tab renders PARAMETERS from the SAME schema the Agent loop hands the
+# model (``ToolRuntime.schemas()`` -> ``ToolDefinition.parameters`` JSON Schema).
+# This endpoint is a projection, not a second parameter model: it writes nothing,
+# and a tool that is absent here has no runtime binding (Registry inadmissibility
+# is derived separately from DIRECT_TOOLS — never inferred from this listing).
+
+@router.get("/admin/registry/tool-schemas")
+async def get_tool_schemas(_: AuthAdmin = Depends(require_admin)) -> dict:
+    from api.deps import get_agent_kernel
+
+    schemas = get_agent_kernel().runtime.schemas()
+    return {"tools": [
+        {
+            "name": s["name"],
+            "description": s.get("description", ""),
+            "parameters": s.get("parameters", {}),
+            "in_direct_tools": s["name"] in DIRECT_TOOLS,
+        }
+        for s in sorted(schemas, key=lambda x: x["name"])
+    ]}
+
+
+# ── Action Catalog (Action Universe, migration 0011) ─────────────────────────────
+# Inventory + PRE-REGISTRY query drafts. These routes can never publish or write
+# the runtime corpus: register copies a Draft Configuration into a capabilities
+# DRAFT row, and from there the ONLY way to active is the existing
+# Draft -> Validate -> Publish lifecycle below.
+
+async def _catalog_view() -> dict:
+    """Catalog rows joined to the Registry: registered / published / funnel
+    eligibility computed at read time (no stored second truth)."""
+    rows = await catalog.list_catalog(session_factory=SessionLocal)
+    drafts = await list_drafts(session_factory=SessionLocal)
+    by_tool = {d.tool_binding: d for d in drafts}
+    view = await active_view(session_factory=SessionLocal)
+    published = {
+        e.capability_id for e in (view.entries if view is not None else ())
+        if e.enabled and e.status == "active"
+    }
+    counts = await catalog.draft_counts(SessionLocal)
+    actions = []
+    for r in rows:
+        d = by_tool.get(r["tool_binding"])
+        funnel = "not configured"
+        route = r["route"]
+        if d is not None:
+            routable = d.enabled and d.status == "active" and d.intent_kind == "action"
+            funnel = "enabled" if (routable and d.capability_id in published) else (
+                "disabled" if not d.enabled or d.status != "active" else "draft (not published)")
+            route = "funnel" if funnel == "enabled" else "agent"
+        actions.append({
+            **r,
+            "bindable": r["tool_binding"] in DIRECT_TOOLS,
+            "registered": d is not None,
+            "capability_id": d.capability_id if d else None,
+            "registry_status": d.status if d else None,
+            "registry_enabled": d.enabled if d else None,
+            "intent_kind": d.intent_kind if d else None,
+            "published": bool(d and d.capability_id in published),
+            "funnel": funnel,
+            "current_route": route,
+            "registry_corpus": (
+                {
+                    "standard": 1 if (d.standard_example or "").strip() else 0,
+                    "similar": len([s for s in d.synonym_examples if str(s).strip()]),
+                    "negatives": len([s for s in d.negatives if str(s).strip()]),
+                } if d is not None else None
+            ),
+            "query_draft": counts.get(r["action_key"]),
+        })
+    # Draft rows whose binding has no catalog row (added via the raw drafts API)
+    # must still show up — the Universe never silently loses a routable action.
+    catalog_tools = {r["tool_binding"] for r in rows}
+    for d in drafts:
+        if d.tool_binding in catalog_tools:
+            continue
+        actions.append({
+            "action_key": d.capability_id, "display_name": d.capability_id,
+            "description": d.description, "tool_binding": d.tool_binding,
+            "route": "agent", "implementation_ref": "(no catalog row — drafts API only)",
+            "status": "user_facing",
+            "bindable": d.tool_binding in DIRECT_TOOLS,
+            "registered": True, "capability_id": d.capability_id,
+            "registry_status": d.status, "registry_enabled": d.enabled,
+            "intent_kind": d.intent_kind,
+            "published": d.capability_id in published,
+            "funnel": "draft (not published)", "current_route": "agent",
+            "registry_corpus": {
+                "standard": 1 if (d.standard_example or "").strip() else 0,
+                "similar": len([s for s in d.synonym_examples if str(s).strip()]),
+                "negatives": len([s for s in d.negatives if str(s).strip()]),
+            },
+            "query_draft": None,
+        })
+    return {"actions": actions}
+
+
+@router.get("/admin/registry/catalog")
+async def get_catalog(_: AuthAdmin = Depends(require_admin)) -> dict:
+    return await _catalog_view()
+
+
+@router.get("/admin/registry/catalog/{action_key}/query-draft")
+async def get_catalog_query_draft(
+    action_key: str, _: AuthAdmin = Depends(require_admin)
+) -> dict:
+    cat = await catalog.get_catalog(action_key, session_factory=SessionLocal)
+    if cat is None:
+        raise HTTPException(status_code=404, detail=f"unknown action {action_key!r}")
+    draft = await catalog.get_query_draft(action_key, session_factory=SessionLocal)
+    drafts = await list_drafts(session_factory=SessionLocal)
+    draft["registered"] = any(d.tool_binding == cat["tool_binding"] for d in drafts)
+    return draft
+
+
+@router.put("/admin/registry/catalog/{action_key}/query-draft")
+async def put_catalog_query_draft(
+    action_key: str, body: RegistryQueryDraftRequest,
+    admin: AuthAdmin = Depends(require_admin),
+) -> dict:
+    """Save the PRE-REGISTRY Draft Configuration. Registered actions are
+    rejected: one editor per sentence, their corpus lives in the capabilities
+    Draft row (Queries tab) — no second lifecycle, no silent divergence."""
+    drafts = await list_drafts(session_factory=SessionLocal)
+    rows = await catalog.list_catalog(session_factory=SessionLocal)
+    me = next((r for r in rows if r["action_key"] == action_key), None)
+    if me is None:
+        raise HTTPException(status_code=404, detail=f"unknown action {action_key!r}")
+    if any(d.tool_binding == me["tool_binding"] for d in drafts):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{action_key} is registered — edit its Query corpus on the "
+                   "Registry draft (Queries tab), not as a catalog draft",
+        )
+    try:
+        saved = await catalog.upsert_query_draft(
+            action_key,
+            standard=body.standard_example,
+            similar=body.synonym_examples,
+            negatives=body.negatives,
+            updated_by=admin.username,
+            session_factory=SessionLocal,
+        )
+    except RegistryNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await audit("query_draft_update", actor_username=admin.username, target=action_key,
+                detail={"similar": len(saved["similar"]), "negatives": len(saved["negatives"])},
+                session_factory=SessionLocal)
+    saved["registered"] = False
+    return saved
+
+
+@router.put("/admin/registry/catalog/{action_key}/params-draft")
+async def put_catalog_params_draft(
+    action_key: str, body: RegistryDraftParamsRequest,
+    admin: AuthAdmin = Depends(require_admin),
+) -> dict:
+    """Save the PRE-REGISTRY parameter configuration (migration 0012). Same
+    shapes as the Registry capability fields — register copies them 1:1. The
+    runtime TOOL SCHEMA is never stored here; it is read live via
+    GET /admin/registry/tool-schemas. Registered actions are rejected: their
+    parameters live in the capabilities Draft row (one editor per field)."""
+    drafts = await list_drafts(session_factory=SessionLocal)
+    rows = await catalog.list_catalog(session_factory=SessionLocal)
+    me = next((r for r in rows if r["action_key"] == action_key), None)
+    if me is None:
+        raise HTTPException(status_code=404, detail=f"unknown action {action_key!r}")
+    if any(d.tool_binding == me["tool_binding"] for d in drafts):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{action_key} is registered — edit its parameters on the "
+                   "Registry draft (Advanced tab), not as a catalog draft",
+        )
+    try:
+        saved = await catalog.upsert_draft_parameters(
+            action_key,
+            parameters=body.parameters, arg_slots=body.arg_slots,
+            updated_by=admin.username,
+            session_factory=SessionLocal,
+        )
+    except RegistryNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await audit("params_draft_update", actor_username=admin.username, target=action_key,
+                detail={"parameters": len(saved["parameters"]),
+                        "arg_slots": len(saved["arg_slots"])},
+                session_factory=SessionLocal)
+    saved["registered"] = False
+    return saved
+
+
+@router.post("/admin/registry/catalog/{action_key}/register")
+async def post_catalog_register(
+    action_key: str, admin: AuthAdmin = Depends(require_admin)
+) -> dict:
+    """Agent-only -> Registry DRAFT (the Enable-in-Intent-Funnel admission).
+    Copies the Draft Configuration into a new capabilities row; the action then
+    walks the existing Draft -> Validate -> Publish path like any other. This
+    endpoint never publishes and never touches the active index."""
+    rows = await catalog.list_catalog(session_factory=SessionLocal)
+    me = next((r for r in rows if r["action_key"] == action_key), None)
+    if me is None:
+        raise HTTPException(status_code=404, detail=f"unknown action {action_key!r}")
+    drafts = await list_drafts(session_factory=SessionLocal)
+    if any(d.tool_binding == me["tool_binding"] for d in drafts):
+        raise HTTPException(status_code=409, detail=f"{action_key} is already registered")
+    spec = DIRECT_TOOLS.get(me["tool_binding"])
+    if spec is None:
+        # Honest refusal: the publish gate rejects non-DIRECT_TOOLS bindings,
+        # and with no hard-delete a premature row would block EVERY publish.
+        # Admitting a tool to DIRECT_TOOLS is a separate RUNTIME task.
+        raise HTTPException(
+            status_code=409,
+            detail=f"tool {me['tool_binding']!r} is not an executable DIRECT_TOOLS "
+                   "binding yet — Registry cannot invent executables. Runtime "
+                   "admission of this tool is a separate task.",
+        )
+    draft = await catalog.get_query_draft(action_key, session_factory=SessionLocal)
+    if not draft["standard"]:
+        raise HTTPException(
+            status_code=422,
+            detail="configure a Standard Query before registering "
+                   "(publish gate requires a non-empty intent corpus)",
+        )
+    capability_id = f"cap-{action_key}"
+    # Parameters: the admin's pre-Registry configuration (Advanced tab) wins;
+    # with none saved, fall back to the mechanical spec.arg_schema projection
+    # so registration never produces a parameter-less action.
+    parameters = dict(draft.get("parameters") or {})
+    if not parameters:
+        parameters = {
+            slot: {
+                "type": "string",
+                "description": f"{slot} argument of {me['tool_binding']}",
+                "required": True,
+                "max_len": int(bound),
+            }
+            for slot, bound in (spec.arg_schema or {}).items()
+        }
+    entry = CapabilityEntry(
+        capability_id=capability_id,
+        tool_binding=me["tool_binding"],
+        description=me["description"] or me["display_name"],
+        standard_example=draft["standard"],
+        synonym_examples=tuple(draft["similar"]),
+        negatives=tuple(draft["negatives"]),
+        parameters=parameters,
+        arg_slots=dict(draft.get("arg_slots") or {}),
+        intent_kind="action",
+        enabled=True,
+        status="active",
+    )
+    try:
+        created = await create_draft(entry, session_factory=SessionLocal)
+    except RegistryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await audit("catalog_register", actor_username=admin.username,
+                target=capability_id,
+                detail={"action_key": action_key, "from": "action_catalog"},
+                session_factory=SessionLocal)
+    return {"draft": _entry_json(created)}
 
 
 # ── validate / preview / publish / rollback ───────────────────────────────────────

@@ -286,6 +286,58 @@
       .section-title:first-child { margin-top: 0; }
       .kbd-note { font-size: 12px; color: var(--muted); }
 
+      /* ── Query Corpus manager (Queries tab, read-only-first) ── */
+      .qc-head { margin-bottom: 14px; }
+      .qc-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+      .qc-caption { font-size: 12px; color: var(--muted); margin-top: 3px; line-height: 1.5; }
+      .qc-help {
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 15px; height: 15px; border-radius: 50%; border: 1px solid var(--border);
+        color: var(--muted); font-size: 10px; cursor: help; vertical-align: 1px;
+      }
+      .qc-standard {
+        background: var(--bg2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+        border-radius: 8px; padding: 14px 16px; margin-bottom: 16px;
+        display: flex; align-items: flex-start; gap: 12px;
+      }
+      .qc-standard .qc-std-body { flex: 1; min-width: 0; }
+      .qc-standard .qc-label {
+        font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+        color: var(--muted); margin-bottom: 5px; display: flex; align-items: center; gap: 7px;
+      }
+      .qc-standard .qc-text { font-size: 15.5px; font-weight: 600; line-height: 1.45; word-wrap: break-word; overflow-wrap: break-word; }
+      .qc-section-bar {
+        display: flex; align-items: center; justify-content: space-between; gap: 10px;
+        margin: 0 0 4px; padding: 10px 2px 8px; border-bottom: 1px solid var(--border);
+      }
+      .qc-section-bar .qc-count { font-size: 13px; font-weight: 600; }
+      .qc-section-bar .qc-count .n { color: var(--muted); font-weight: 500; }
+      .qc-list-caption { font-size: 11.5px; color: var(--muted); padding: 6px 2px 2px; }
+      .qc-row {
+        display: flex; align-items: flex-start; gap: 10px; padding: 8px 8px; border-radius: 6px;
+        border-bottom: 1px solid var(--border); transition: background .12s ease;
+      }
+      .qc-row:last-child { border-bottom: none; }
+      .qc-row:hover { background: var(--bg2); }
+      .qc-row .qc-num { font-family: var(--mono); font-size: 11.5px; color: var(--muted); flex: none; padding-top: 3px; width: 22px; text-align: right; }
+      .qc-lang {
+        flex: none; font-size: 9.5px; font-weight: 700; letter-spacing: .04em; color: var(--muted);
+        border: 1px solid var(--border); border-radius: 4px; padding: 1.5px 4px; margin-top: 2.5px;
+      }
+      .qc-text-cell { flex: 1; min-width: 0; font-size: 13.5px; line-height: 1.5; word-wrap: break-word; overflow-wrap: break-word; }
+      .qc-edit-btn { opacity: .35; transition: opacity .12s ease; flex: none; }
+      .qc-row:hover .qc-edit-btn, .qc-standard:hover .qc-edit-btn { opacity: 1; }
+      .qc-editing { background: var(--accent-dim); border-radius: 6px; }
+      .qc-edit-area { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+      .qc-edit-area textarea {
+        width: 100%; background: var(--bg); border: 1px solid var(--accent); color: var(--text);
+        border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 13.5px; line-height: 1.5;
+        resize: vertical; min-height: 60px;
+      }
+      .qc-edit-area textarea:focus { outline: none; }
+      .qc-edit-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+      .qc-new-badge { font-size: 10.5px; color: var(--accent); font-weight: 600; margin-right: auto; align-self: center; }
+
       /* ── RAG node trace ── */
       .node-trace { border: 1px solid var(--border); border-radius: 8px; margin-top: 8px; overflow: hidden; }
       .node-trace .trace-head {
@@ -3409,107 +3461,253 @@
         }
 
         // ───────────────────────── Intent Registry console ─────────────────────────
-        // Draft rows are the editable source of truth; publishing is the QIR
-        // Build-Then-Swap. Field duties (ruling 2026-09-25): the query corpus
-        // (standard + synonyms) feeds BOTH Exact Match and Vector Recall;
-        // negatives are model-card boundary only; legacy examples are card
-        // context; patterns/aliases are inert storage.
-        let regDrafts = [];
-        let regSel = null;
+        // IA (Action-Universe ruling 2026-09-25): Action Universe list → Action
+        // Detail (Overview / Queries / Negatives / Advanced / Versions).
+        // Four concepts, never conflated:
+        //   Universe  = action_catalog (every user-facing action; inventory only)
+        //   Registry  = capabilities Draft rows (registered, editable)
+        //   Funnel    = registered + published + routable in the ACTIVE version
+        //   Lifecycle = Draft -> Validate -> Publish ONLY; viewing/saving a query
+        //   draft never registers, publishes or writes the active index.
+        let regDrafts = [];     // capabilities Draft rows
+        let regCatalog = [];    // Action Universe (catalog joined to Registry)
+        let regToolSchemas = {};// runtime tool schemas: name -> {description, parameters}
+        let regSel = null;      // selected action_key
         let regTab = "overview";
+        let regView = "list";   // "list" | "detail"
+
+        // Product semantics, four orthogonal axes (never conflated):
+        //   Agent/Chat availability — the binding exists in the live ToolRuntime
+        //     (GET /admin/registry/tool-schemas). DIRECT_TOOLS membership is NOT
+        //     the test for Chat usability; Agent-only tools are perfectly usable.
+        //   Registry status        — registered / not registered.
+        //   Funnel status          — configured / not configured.
+        //   Funnel registration eligibility — whether the binding is currently
+        //     admissible as a DIRECT_TOOLS executable for Funnel routing. This
+        //     says NOTHING about Agent/Chat availability.
+        function regChatAvail(binding) {
+          return regToolSchemas[binding]
+            ? "Available — live in the Agent Runtime (ToolRuntime)"
+            : "Not visible in THIS runtime — no ToolRuntime schema for this binding (audit: *_tool.py discovery gap; separate runtime task)";
+        }
+        function regFunnelEligibility(a) {
+          return a.bindable
+            ? "Eligible — binding is in DIRECT_TOOLS"
+            : "Not eligible yet — not a DIRECT_TOOLS executable binding. This limits INTENT FUNNEL REGISTRATION ONLY; it does not affect Agent/Chat availability.";
+        }
+
+        // Known runtime-integrity findings (audit 2026-09-25) surfaced read-only
+        // on the Detail Overview — never a UI repair, always an honest warning.
+        const BINDING_WARNINGS = {
+          pdf_extract_text: "Runtime integrity: WARNING — pdf_tools.py misses the *_tool.py auto-discovery glob; this binding may not be available in the production ToolRuntime (separate runtime task).",
+          pdf_table_to_text: "Runtime integrity: WARNING — pdf_tools.py misses the *_tool.py auto-discovery glob; this binding may not be available in the production ToolRuntime (separate runtime task).",
+        };
+
+        function regCorpusCounts(d) {
+          return {
+            std: (d.standard_example || "").trim() ? 1 : 0,
+            syn: (d.synonym_examples || []).filter((s) => s.trim()).length,
+            legacy: (d.examples || []).filter((s) => s.trim()).length,
+            neg: (d.negatives || []).filter((s) => s.trim()).length,
+          };
+        }
 
         async function renderRegistryPage() {
           content.innerHTML = "";
+          try {
+            const [c, d, ts] = await Promise.all([
+              apiFetch("/admin/registry/catalog"),
+              apiFetch("/admin/registry/drafts"),
+              apiFetch("/admin/registry/tool-schemas").catch(() => ({ tools: [] })),
+            ]);
+            regCatalog = c.actions || [];
+            regDrafts = d.drafts || [];
+            regToolSchemas = {};
+            for (const t of ts.tools || []) regToolSchemas[t.name] = t;
+          } catch (e) {
+            const head = el("div", "page-head");
+            head.appendChild(el("h2", "", "Intent Registry"));
+            content.appendChild(head);
+            content.appendChild(errBox(e));
+            return;
+          }
+          if (regView === "detail" && regSel && regCatalog.some((a) => a.action_key === regSel)) {
+            await renderRegistryDetail();
+          } else {
+            regView = "list";
+            renderRegistryList();
+          }
+        }
+
+        // ── Master page: the full Action Universe ──
+        function renderRegistryList() {
           const head = el("div", "page-head");
           const t = el("div");
           t.appendChild(el("h2", "", "Intent Registry"));
-          t.appendChild(el("div", "sub", "Draft capability rows → validate → publish (Build-Then-Swap). Versions, rollback, audit and the query dry-run live under Versions."));
+          t.appendChild(el("div", "sub", "Action Universe — every user-facing Action that exists in the system. Agent/Chat availability is a runtime fact (ToolRuntime), independent of Registry/Funnel state: Agent-only actions are fully usable through Chat today. Registered + published + enabled actions ALSO route through the Intent Funnel (server gates permitting); listing them here registers nothing."));
           head.appendChild(t);
           content.appendChild(head);
 
-          try {
-            const d = await apiFetch("/admin/registry/drafts");
-            regDrafts = d.drafts || [];
-          } catch (e) { content.appendChild(errBox(e)); return; }
-          if (!regDrafts.length) { content.appendChild(emptyState("No draft capabilities yet.")); return; }
-          if (!regSel || !regDrafts.some((x) => x.capability_id === regSel)) {
-            regSel = regDrafts[0].capability_id;
-          }
+          const nReg = regCatalog.filter((a) => a.registered).length;
+          const nFunnel = regCatalog.filter((a) => a.funnel === "enabled").length;
+          const nAgent = regCatalog.filter((a) => !a.registered).length;
+          const stats = el("div", "row-actions");
+          stats.style.cssText = "margin:0 0 12px";
+          stats.append(
+            el("span", "hint", "Action Universe: "), badge(String(regCatalog.length), "accent"),
+            el("span", "hint", "  ·  Registry rows: "), badge(String(nReg), ""),
+            el("span", "hint", "  ·  Funnel enabled: "), badge(String(nFunnel), "ok"),
+            el("span", "hint", "  ·  Agent-only / not registered: "), badge(String(nAgent), ""),
+          );
+          content.appendChild(stats);
 
-          const layout = el("div");
-          layout.style.cssText = "display:flex;gap:16px;align-items:flex-start";
-          content.appendChild(layout);
+          if (!regCatalog.length) { content.appendChild(emptyState("Action Catalog is empty — migration 0011 pending?")); return; }
 
-          const left = el("div", "legacy-card");
-          left.style.cssText = "flex:0 0 300px;width:300px";
-          // The Action universe is the Registry itself — never inferred from
-          // test data. Executable = enabled + status active + kind action.
-          const nExec = regDrafts.filter((x) => x.enabled && x.status === "active" && x.intent_kind === "action").length;
-          left.appendChild(el("div", "section-title", "Actions (source: Registry)"));
-          left.appendChild(el("div", "hint", regDrafts.length + " registry rows · " + nExec + " executable"));
-          for (const d of regDrafts) {
-            const item = el("div", "nav-item" + (d.capability_id === regSel ? " active" : ""));
-            item.style.padding = "6px 8px";
-            const nStd = (d.standard_example || "").trim() ? 1 : 0;
-            const nSyn = (d.synonym_examples || []).filter((s) => s.trim()).length;
-            const nEx = (d.examples || []).filter((s) => s.trim()).length;
-            const nNeg = (d.negatives || []).filter((s) => s.trim()).length;
-            const line1 = el("div");
-            line1.style.cssText = "display:flex;justify-content:space-between;gap:6px;align-items:baseline";
-            line1.appendChild(el("strong", "", d.capability_id));
-            const st = d.enabled && d.status === "active" ? "executable"
-              : (d.status !== "active" ? d.status : "disabled");
-            line1.appendChild(el("span", "badge " + (st === "executable" ? "ok" : "accent"), st));
-            const line2 = el("div", "hint", (d.description || "—") + " · tool=" + d.tool_binding);
-            line2.style.cssText = "white-space:normal;margin:2px 0";
-            // corpus counts: Exact/Recall corpus first, then card-only fields
-            const line3 = el("div", "hint",
-              "corpus(Exact+Recall): std " + nStd + " · syn " + nSyn +
-              "  |  card-only: legacy " + nEx + " · neg " + nNeg);
-            line3.style.cssText = "white-space:normal";
-            item.append(line1, line2, line3);
-            if (!nStd && !nSyn) {
-              item.appendChild(el("div", "hint", "⚠ NO query corpus — cannot be exact-matched or recalled"));
+          const { wrap, tbody } = table(["Action", "Description", "Tool Binding", "Route", "Registry", "Funnel", "Query Corpus", "Actions"]);
+          for (const a of regCatalog) {
+            const tr = el("tr");
+            tr.style.cursor = "pointer";
+            const nameCell = el("div");
+            nameCell.appendChild(el("strong", "", a.display_name));
+            nameCell.appendChild(el("div", "hint", a.capability_id || a.action_key));
+            tr.appendChild(td(nameCell));
+            const descCell = el("div", "hint", a.description || "—");
+            descCell.style.cssText = "white-space:normal";
+            tr.appendChild(td(descCell));
+            tr.appendChild(td(a.tool_binding));
+            tr.appendChild(td(badge(a.current_route, a.current_route === "funnel" ? "ok" : "")));
+            tr.appendChild(td(badge(a.registered ? (a.published ? "Active" : "Draft") : "Not registered",
+              a.registered ? (a.published ? "ok" : "accent") : "")));
+            tr.appendChild(td(badge(a.funnel, a.funnel === "enabled" ? "ok" : "")));
+            const corpusCell = el("div");
+            if (a.registered && a.registry_corpus) {
+              const rc = a.registry_corpus;
+              corpusCell.appendChild(el("div", "", "std " + rc.standard + " · syn " + rc.similar + " · corpus " + (rc.standard + rc.similar)));
+              corpusCell.appendChild(el("div", "hint", "neg (card-only) " + rc.negatives));
+              if (rc.standard + rc.similar === 0) corpusCell.appendChild(el("div", "hint", "⚠ NO query corpus"));
+            } else if (a.query_draft) {
+              const q = a.query_draft;
+              corpusCell.appendChild(el("div", "hint", "draft: std " + q.standard + " · sim " + q.similar + " · neg " + q.negative + " · not published"));
+            } else {
+              corpusCell.appendChild(el("div", "hint", "— (no draft)"));
             }
-            item.onclick = () => { regSel = d.capability_id; regTab = "queries"; renderRegistryPage(); };
-            left.appendChild(item);
+            tr.appendChild(td(corpusCell));
+            const btnCell = el("td");
+            btnCell.style.whiteSpace = "nowrap";
+            const view = el("button", "btn sm ghost", "View");
+            view.type = "button";
+            view.onclick = (ev) => { ev.stopPropagation(); openRegDetail(a.action_key); };
+            btnCell.appendChild(view);
+            if (a.registered) {
+              const tog = el("button", "btn sm" + (a.registry_enabled ? " ghost" : " primary"),
+                a.registry_enabled ? "Disable" : "Enable");
+              tog.type = "button";
+              tog.onclick = async (ev) => {
+                ev.stopPropagation();
+                await regToggleEnabled(a.capability_id, !a.registry_enabled);
+              };
+              btnCell.appendChild(tog);
+            } else {
+              const en = el("button", "btn sm primary", "Enable in Intent Funnel");
+              en.type = "button";
+              en.title = "Opens the Registry lifecycle: configure query draft → register (Draft) → validate → publish";
+              en.onclick = (ev) => { ev.stopPropagation(); openRegDetail(a.action_key, "queries"); };
+              btnCell.appendChild(en);
+            }
+            tr.appendChild(btnCell);
+            tr.onclick = () => openRegDetail(a.action_key);
+            tbody.appendChild(tr);
           }
-          layout.appendChild(left);
+          content.appendChild(wrap);
+          content.appendChild(el("div", "hint", "Enable/Disable flips the Draft flag only — it never deletes queries; it lands on the routing table at the next Publish. Funnel routing also requires the server-side gates."));
+        }
 
-          const right = el("div");
-          right.style.cssText = "flex:1;min-width:0";
-          layout.appendChild(right);
+        function openRegDetail(key, tab) {
+          regSel = key;
+          regTab = tab || "overview";
+          regView = "detail";
+          renderRegistryPage();
+        }
 
+        // ── Sub page: Action Detail (registered or Agent-only) ──
+        async function renderRegistryDetail() {
+          const a = regCatalog.find((x) => x.action_key === regSel);
+          const draft = a.registered
+            ? regDrafts.find((d) => d.capability_id === a.capability_id) : null;
+
+          const back = el("button", "btn ghost", "← Back to Actions");
+          back.type = "button";
+          back.style.marginBottom = "10px";
+          back.onclick = () => { regView = "list"; renderRegistryPage(); };
+          content.appendChild(back);
+
+          const head = el("div", "page-head");
+          const t = el("div");
+          const titleRow = el("div");
+          titleRow.style.cssText = "display:flex;gap:8px;align-items:center";
+          titleRow.appendChild(el("h2", "", a.display_name));
+          const stateBadge = a.registered
+            ? (a.registry_enabled && a.published ? "Enabled"
+              : (a.registry_enabled ? "Enabled (draft)" : "Disabled"))
+            : "Agent-only";
+          titleRow.appendChild(badge(stateBadge, a.registered && a.registry_enabled ? "ok" : "accent"));
+          t.appendChild(titleRow);
+          t.appendChild(el("div", "sub", "Intent Registry / Actions / " + (a.capability_id || a.action_key)));
+          head.appendChild(t);
+          content.appendChild(head);
+
+          const meta = el("div", "hint");
+          meta.style.cssText = "white-space:normal;margin:0 0 10px";
+          meta.textContent = "Description: " + (a.description || "—") + "  ·  Tool: " + a.tool_binding
+            + (a.capability_id ? "  ·  Capability: " + a.capability_id : "");
+          content.appendChild(meta);
+
+          const TABS = [["overview", "Overview"], ["queries", "Queries"], ["negatives", "Negatives"], ["advanced", "Advanced"]];
+          if (a.registered) TABS.push(["versions", "Versions"]);
+          if (!a.registered && !TABS.some((x) => x[0] === regTab)) regTab = "overview";
           const tabs = el("div", "tabs");
-          for (const [key, label] of [
-            ["overview", "Overview"], ["queries", "Queries"], ["negatives", "Negatives"],
-            ["legacy", "Legacy examples"], ["params", "Params"], ["versions", "Versions"],
-          ]) {
+          for (const [key, label] of TABS) {
             const tab = el("div", "tab" + (regTab === key ? " active" : ""), label);
             tab.onclick = () => { regTab = key; renderRegistryPage(); };
             tabs.appendChild(tab);
           }
-          right.appendChild(tabs);
+          content.appendChild(tabs);
 
           const section = el("div");
-          right.appendChild(section);
-          const draft = regDrafts.find((x) => x.capability_id === regSel);
-          if (regTab === "overview") renderRegOverview(section, draft);
-          else if (regTab === "queries") await renderRegQueries(section, draft);
-          else if (regTab === "negatives") renderRegNegatives(section, draft);
-          else if (regTab === "legacy") renderRegLegacy(section, draft);
-          else if (regTab === "params") renderRegParams(section, draft);
-          else await renderRegVersions(section);
+          content.appendChild(section);
+          if (a.registered) {
+            if (regTab === "overview") renderRegOverview(section, a, draft);
+            else if (regTab === "queries") renderRegQueries(section, a, draft);
+            else if (regTab === "negatives") renderRegNegatives(section, draft);
+            else if (regTab === "advanced") await renderRegAdvanced(section, a, draft);
+            else await renderRegVersions(section);
+          } else {
+            if (regTab === "overview") renderCatalogOverview(section, a);
+            else if (regTab === "queries") await renderCatalogQueries(section, a, "queries");
+            else if (regTab === "negatives") await renderCatalogQueries(section, a, "negatives");
+            else await renderCatalogAdvanced(section, a);
+          }
         }
 
-        async function regPatch(patch) {
-          const draft = regDrafts.find((x) => x.capability_id === regSel);
+        // ── Enable/Disable: draft flag only, never touches queries ──
+        async function regToggleEnabled(capabilityId, on) {
+          const draft = regDrafts.find((x) => x.capability_id === capabilityId);
+          if (!draft) return;
+          await regPatch(capabilityId, {
+            enabled: on,
+            status: on ? "active" : "disabled",
+          }, "Enable/Disable changes the Draft row — it takes effect on the next Publish. Queries are untouched.");
+        }
+
+        // ── Draft PATCH (registry rows only) with optimistic concurrency ──
+        async function regPatch(capabilityId, patch, note) {
+          const draft = regDrafts.find((x) => x.capability_id === capabilityId);
           try {
-            await apiFetch("/admin/registry/drafts/" + encodeURIComponent(regSel), {
+            await apiFetch("/admin/registry/drafts/" + encodeURIComponent(capabilityId), {
               method: "PATCH",
               body: JSON.stringify({ patch, expected_row_version: draft.row_version }),
             });
-            toast("Draft saved: " + regSel, "ok");
+            toast("Draft saved: " + capabilityId + (note ? " — " + note : ""), "ok");
           } catch (e) {
             toast(e.message, "error");
           }
@@ -3538,10 +3736,215 @@
           return { node: wrap, get: () => rows.map((i) => i.value.trim()).filter(Boolean) };
         }
 
-        // ── Overview ──
-        function renderRegOverview(container, draft) {
+        // ── Query Corpus manager (Queries tab) — read-only-first ──
+        // Data model unchanged: standard_example + synonym_examples[] (the Exact
+        // Match + PGVector Recall corpus). Every query renders as READ-ONLY
+        // content; clicking a row's Edit puts ONLY that row in edit mode (textarea
+        // in place, Cancel / Save changes, Save disabled when unchanged). Saving
+        // persists, returns the row to read-only, and light-toasts — NO full page
+        // reload. onSave(std, sims) is the caller's persist hook (PATCH for
+        // Registry rows, PUT for pre-Registry catalog drafts); it must also update
+        // the caller's own cached data so a refresh shows the saved text.
+        function qcLang(s) { return /[一-鿿]/.test(s) ? "CN" : "EN"; }
+        function regQueriesView(container, { title, isDraft, standard, similar, onSave }) {
+          const root = el("div", "legacy-card");
+          let std = standard || "";
+          let sims = (similar || []).slice();
+          let editing = null;   // null | {kind:"std"} | {kind:"sim",idx} | {kind:"add"}
+          let busy = false;
+          const HELP = "Mechanism (read-only note): this corpus configures the Action's intent routing only. "
+            + (isDraft
+              ? "It is saved in the Action Catalog as a pre-Registry Draft Configuration — nothing reaches the active Registry, index or Funnel until Register → Validate → Publish."
+              : "It is saved on the capabilities Draft row — it reaches routing only after Validate → Publish.")
+            + " Editing here never registers, publishes or writes the active index.";
+
+          const render = () => {
+            root.innerHTML = "";
+            // Header (§9): corpus title > status badge > brief caption; mechanism prose folded into the ? tooltip (§10).
+            const head = el("div", "qc-head");
+            const t = el("div", "qc-title");
+            t.appendChild(el("span", "", title));
+            t.appendChild(badge(isDraft ? "Draft · Not Published" : "Registry · Draft", isDraft ? "warn" : "accent"));
+            const help = el("span", "qc-help", "?");
+            help.title = HELP;
+            t.appendChild(help);
+            head.appendChild(t);
+            head.appendChild(el("div", "qc-caption",
+              "Standard Query is the canonical anchor; Similar Queries are alternative natural phrasings. Together they form this Action's Query Corpus."));
+            root.appendChild(head);
+
+            const editRow = (actions) => {
+              const row = el("div", "qc-edit-actions");
+              for (const b of actions) row.appendChild(b);
+              return row;
+            };
+            const mkTextarea = (val, ph, oninput) => {
+              const ta = el("textarea");
+              ta.placeholder = ph;
+              ta.value = val;
+              ta.rows = 2;
+              if (oninput) ta.oninput = oninput;
+              requestAnimationFrame(() => ta.focus());
+              return ta;
+            };
+
+            // ── Standard Query card (§4) ──
+            const stdCard = el("div", "qc-standard" + (editing && editing.kind === "std" ? " qc-editing" : ""));
+            if (editing && editing.kind === "std") {
+              const body = el("div", "qc-edit-area");
+              const lbl = el("div", "qc-label", "Edit Standard Query");
+              body.appendChild(lbl);
+              const ta = mkTextarea(std, "standard query (canonical sentence)", () => {
+                saveBtn.disabled = busy || ta.value.trim() === std.trim() || !ta.value.trim();
+              });
+              const cancel = el("button", "btn ghost", "Cancel");
+              cancel.type = "button";
+              cancel.onclick = () => { editing = null; render(); };
+              const saveBtn = el("button", "btn primary", "Save changes");
+              saveBtn.type = "button";
+              saveBtn.disabled = true;
+              saveBtn.onclick = async () => {
+                const v = ta.value.trim();
+                if (!v || v === std) return;
+                busy = true; saveBtn.disabled = true;
+                try { await onSave(v, sims); std = v; editing = null; busy = false; render(); toast("Query updated", "ok"); }
+                catch (e) { busy = false; saveBtn.disabled = false; toast("Save failed: " + e.message, "error"); }
+              };
+              body.append(ta, editRow([cancel, saveBtn]));
+              stdCard.appendChild(body);
+            } else {
+              const body = el("div", "qc-std-body");
+              const lbl = el("div", "qc-label");
+              lbl.append(el("span", "", "Standard Query"), badge("Canonical", "accent"));
+              body.appendChild(lbl);
+              body.appendChild(el("div", "qc-text", std || "— not set —"));
+              const edit = el("button", "btn ghost sm qc-edit-btn", "Edit");
+              edit.type = "button";
+              edit.onclick = () => { editing = { kind: "std" }; render(); };
+              stdCard.append(body, edit);
+            }
+            root.appendChild(stdCard);
+
+            // ── Similar Queries: count + add in section header (§7, §8) ──
+            const bar = el("div", "qc-section-bar");
+            const cnt = el("div", "qc-count");
+            cnt.appendChild(el("span", "", "Similar Queries "));
+            cnt.appendChild(el("span", "n", "· " + sims.length));
+            bar.appendChild(cnt);
+            const addBtn = el("button", "btn ghost sm", "+ Add Similar Query");
+            addBtn.type = "button";
+            addBtn.disabled = !!editing;
+            addBtn.onclick = () => { editing = { kind: "add" }; render(); };
+            bar.appendChild(addBtn);
+            root.appendChild(bar);
+            root.appendChild(el("div", "qc-list-caption", "Alternative phrasings of the same intent — stored as synonyms of the Standard Query."));
+
+            const list = el("div");
+            sims.forEach((s, idx) => {
+              if (editing && editing.kind === "sim" && editing.idx === idx) {
+                const row = el("div", "qc-row qc-editing");
+                const area = el("div", "qc-edit-area");
+                const ta = mkTextarea(s, "similar query", () => {
+                  saveBtn.disabled = busy || !ta.value.trim() || ta.value.trim() === s.trim();
+                });
+                const cancel = el("button", "btn ghost", "Cancel");
+                cancel.type = "button";
+                cancel.onclick = () => { editing = null; render(); };
+                const saveBtn = el("button", "btn primary", "Save changes");
+                saveBtn.type = "button";
+                saveBtn.disabled = true;
+                saveBtn.onclick = async () => {
+                  const v = ta.value.trim();
+                  if (!v || v === s) return;
+                  const next = sims.slice(); next[idx] = v;
+                  busy = true; saveBtn.disabled = true;
+                  try { await onSave(std, next); sims = next; editing = null; busy = false; render(); toast("Query updated", "ok"); }
+                  catch (e) { busy = false; saveBtn.disabled = false; toast("Save failed: " + e.message, "error"); }
+                };
+                area.append(ta, editRow([cancel, saveBtn]));
+                row.appendChild(area);
+                list.appendChild(row);
+                return;
+              }
+              const row = el("div", "qc-row");
+              row.appendChild(el("span", "qc-num", String(idx + 1).padStart(2, "0")));
+              row.appendChild(el("span", "qc-lang", qcLang(s)));
+              row.appendChild(el("div", "qc-text-cell", s));
+              const edit = el("button", "btn ghost sm qc-edit-btn", "Edit");
+              edit.type = "button";
+              edit.onclick = () => { editing = { kind: "sim", idx }; render(); };
+              row.appendChild(edit);
+              list.appendChild(row);
+            });
+            if (editing && editing.kind === "add") {
+              const row = el("div", "qc-row qc-editing");
+              const area = el("div", "qc-edit-area");
+              const ta = mkTextarea("", "new similar query (Chinese or English)", () => {
+                addBtn2.disabled = busy || !ta.value.trim();
+              });
+              const cancel = el("button", "btn ghost", "Cancel");
+              cancel.type = "button";
+              cancel.onclick = () => { editing = null; render(); };
+              const addBtn2 = el("button", "btn primary", "Add Query");
+              addBtn2.type = "button";
+              addBtn2.disabled = true;
+              addBtn2.onclick = async () => {
+                const v = ta.value.trim();
+                if (!v) return;
+                const next = sims.concat([v]);
+                busy = true; addBtn2.disabled = true;
+                try { await onSave(std, next); sims = next; editing = null; busy = false; render(); toast("Query added", "ok"); }
+                catch (e) { busy = false; addBtn2.disabled = false; toast("Save failed: " + e.message, "error"); }
+              };
+              const newLbl = el("div", "qc-new-badge", "New Similar Query");
+              area.append(newLbl, ta, editRow([cancel, addBtn2]));
+              row.appendChild(area);
+              list.appendChild(row);
+            }
+            root.appendChild(list);
+          };
+          render();
+          container.appendChild(root);
+        }
+
+        // ── Read-only projection of the LIVE runtime tool schema ──
+        // Rendered from GET /admin/registry/tool-schemas (ToolRuntime.schemas()).
+        // One parameter truth: this is the same JSON Schema the model sees.
+        function regSchemaTable(container, schema) {
+          const props = (schema.parameters || {}).properties || {};
+          const required = new Set((schema.parameters || {}).required || []);
+          const names = Object.keys(props);
+          if (!names.length) {
+            container.appendChild(el("div", "hint", "This tool takes no parameters."));
+            return;
+          }
+          const { wrap, tbody } = table(["Parameter", "Type", "Required", "Description", "Default", "Enum"]);
+          for (const name of names) {
+            const p = props[name] || {};
+            const tr = el("tr");
+            tr.appendChild(td(el("strong", "", name)));
+            tr.appendChild(td(p.type || "—"));
+            tr.appendChild(td(badge(required.has(name) ? "yes" : "no", required.has(name) ? "accent" : "")));
+            const dcell = el("div", "hint", p.description || "—");
+            dcell.style.cssText = "white-space:normal";
+            tr.appendChild(td(dcell));
+            tr.appendChild(td(p.default === undefined ? "—" : JSON.stringify(p.default)));
+            tr.appendChild(td(p.enum ? p.enum.join(" | ") : "—"));
+            tbody.appendChild(tr);
+          }
+          container.appendChild(wrap);
+        }
+
+        // ── Overview (registered) ──
+        function renderRegOverview(container, a, draft) {
           const card = el("div", "legacy-card");
-          card.appendChild(el("div", "section-title", draft.capability_id));
+          card.appendChild(el("div", "section-title", "Registry Draft — " + draft.capability_id));
+          const kv0 = (k, v) => card.appendChild(el("div", "hint", k + ": " + v));
+          kv0("Agent / Chat", regChatAvail(draft.tool_binding));
+          kv0("Registry", (a.published ? "Registered — published" : "Registered — draft") + " · " + (a.registry_enabled ? "enabled" : "disabled"));
+          kv0("Intent Funnel", a.funnel);
+          kv0("Funnel registration eligibility", regFunnelEligibility(a));
+          card.appendChild(el("div", "section-sub", "Draft fields"));
           const idIn = textInput(draft.capability_id); idIn.disabled = true;
           const tool = textInput(draft.tool_binding);
           const desc = el("textarea"); desc.rows = 3; desc.value = draft.description || "";
@@ -3567,7 +3970,7 @@
           );
           const save = el("button", "btn primary", "Save");
           save.type = "button";
-          save.onclick = () => regPatch({
+          save.onclick = () => regPatch(draft.capability_id, {
             tool_binding: tool.value.trim(),
             description: desc.value,
             intent_kind: kind.value,
@@ -3581,150 +3984,286 @@
           const row = el("div", "row-actions"); row.append(save, res);
           card.appendChild(row);
           card.appendChild(el("div", "hint", "Row version: " + draft.row_version + " (optimistic token — a stale save is rejected 409, never merged)."));
-          container.appendChild(card);
-        }
-
-        // ── Queries (the shared Exact/Recall corpus) ──
-        async function renderRegQueries(container, draft) {
-          const roles = el("div", "legacy-card");
-          roles.appendChild(el("div", "section-title", "Field roles (fixed contract)"));
-          const rl = el("ul");
-          rl.style.cssText = "margin:4px 0 0 18px;padding:0";
-          for (const [k, v] of [
-            ["standard_example + synonym_examples", "Exact Match corpus AND PGVector Recall corpus (one shared set)"],
-            ["legacy examples", "ToolIntentModel card context ONLY — not Exact, not Recall"],
-            ["negatives", "ToolIntentModel card boundary ONLY — not Exact, not Recall"],
-          ]) {
-            const li = el("li", "hint");
-            li.style.cssText = "white-space:normal;margin:2px 0";
-            li.appendChild(el("strong", "", k + " = "));
-            li.appendChild(document.createTextNode(v));
-            rl.appendChild(li);
+          if (BINDING_WARNINGS[draft.tool_binding]) {
+            card.appendChild(el("div", "trace-out err", BINDING_WARNINGS[draft.tool_binding]));
           }
-          roles.appendChild(rl);
-          container.appendChild(roles);
-
-          const card = el("div", "legacy-card");
-          card.appendChild(el("div", "section-title", "Query corpus — " + draft.capability_id));
-          card.appendChild(el("div", "hint", "Feeds BOTH Exact Match and Vector Recall — one shared corpus. The standard sentence is the canonical anchor; synonyms are embedded alongside it."));
-          const std = textInput(draft.standard_example || "");
-          const syn = regListEditor(draft.synonym_examples || [], "synonym sentence");
-          card.append(
-            field("Standard example", std, "The canonical sentence (row kind = canonical)"),
-            syn.node,
-          );
-          const save = el("button", "btn primary", "Save");
-          save.type = "button";
-          save.onclick = () => regPatch({ standard_example: std.value.trim(), synonym_examples: syn.get() });
-          card.appendChild(save);
           container.appendChild(card);
-
-          const libCard = el("div", "legacy-card");
-          libCard.appendChild(el("div", "section-title", "What the library actually carries"));
-          libCard.appendChild(el("div", "hint", "Draft ≠ active: an edited sentence shows “draft only” until a publish lands it in the active index."));
-          const refresh = el("button", "btn ghost", "Refresh");
-          refresh.type = "button";
-          const out = el("div");
-          libCard.append(refresh, out);
-          container.appendChild(libCard);
-          const load = async () => {
-            out.innerHTML = "";
-            try {
-              const d = await apiFetch("/admin/registry/intent-corpus/" + encodeURIComponent(draft.capability_id));
-              out.appendChild(el("div", "hint", "active index: " + (d.qir_version || "— none published —")));
-              if (!d.sentences.length) { out.appendChild(emptyState("No intent corpus — standard_example is required before publish.")); return; }
-              const { wrap, tbody } = table(["sentence", "kind", "in active index"]);
-              for (const s of d.sentences) {
-                const tr = el("tr");
-                tr.appendChild(td(s.text));
-                tr.appendChild(td(s.kind));
-                tr.appendChild(td(badge(s.in_active_index ? "in library" : "draft only", s.in_active_index ? "ok" : "accent")));
-                tbody.appendChild(tr);
-              }
-              out.appendChild(wrap);
-              if ((d.card_only.legacy_examples || []).length) {
-                out.appendChild(el("div", "hint", "Card-only (legacy examples — never Exact/Recall): " + d.card_only.legacy_examples.join(" · ")));
-              }
-            } catch (e) { out.appendChild(errBox(e)); }
-          };
-          refresh.onclick = load;
-          await load();
-
-          // Click-through completeness: the two card-only field groups, read-only
-          // here (they are edited on their own tabs).
-          const ctx = el("div", "legacy-card");
-          ctx.appendChild(el("div", "section-title", "Card-only fields (read-only)"));
-          const listBlock = (title, items, role) => {
-            ctx.appendChild(el("div", "hint", title + " — " + role));
-            const box = el("div");
-            box.style.cssText = "margin:2px 0 10px 18px";
-            const arr = (items || []).filter((s) => s.trim());
-            if (!arr.length) { box.appendChild(el("div", "hint", "— none —")); }
-            for (const s of arr) {
-              const li = el("div", "hint", "• " + s);
-              li.style.cssText = "white-space:normal";
-              box.appendChild(li);
-            }
-            ctx.appendChild(box);
-          };
-          listBlock("Legacy examples (" + ((draft.examples || []).length) + ")", draft.examples,
-            "model card context only — never Exact Match, never Recall");
-          listBlock("Negatives (" + ((draft.negatives || []).length) + ")", draft.negatives,
-            "model card boundary only — never Exact Match, never Recall");
-          container.appendChild(ctx);
         }
 
-        // ── Negatives ──
+        // ── Overview (agent-only): product semantics first ──
+        function renderCatalogOverview(container, a) {
+          const card = el("div", "legacy-card");
+          card.appendChild(el("div", "section-title", "Action status"));
+          const kv = (k, v) => card.appendChild(el("div", "hint", k + ": " + v));
+          kv("Agent / Chat", regChatAvail(a.tool_binding));
+          kv("Registry", "Not registered");
+          kv("Intent Funnel", "Not configured");
+          kv("Funnel registration eligibility", regFunnelEligibility(a));
+          card.appendChild(el("div", "section-sub", "Implementation"));
+          kv("Tool binding", a.tool_binding);
+          kv("Implementation", a.implementation_ref);
+          card.appendChild(el("div", "hint", "Lifecycle: Agent-only → configure Query/Parameter draft → Register (creates the Registry Draft row) → Validate → Publish → Active Registry → Funnel. Registering here NEVER publishes and NEVER writes the active index. Agent-only means the action is USED through Chat/Agent today; it only says it has not entered the Funnel yet."));
+          const regBtn = el("button", "btn primary", "Register into Registry (Draft)");
+          regBtn.type = "button";
+          if (!a.bindable) {
+            regBtn.disabled = true;
+            regBtn.title = "Funnel registration eligibility only: the publish gate rejects bindings outside DIRECT_TOOLS. This does not affect Agent/Chat usage.";
+            card.appendChild(el("div", "trace-out err", "Funnel registration is unavailable: tool binding " + a.tool_binding
+              + " is not an existing DIRECT_TOOLS executable binding (the Registry cannot invent executables, and a draft row with an inadmissible binding would block EVERY publish — hard-delete is not allowed). This is a REGISTRATION eligibility limit only — the action remains usable through Agent/Chat"
+              + (regToolSchemas[a.tool_binding] ? "" : " (runtime availability for this binding should be verified separately)")
+              + ". Runtime admission is a separate task."));
+          }
+          regBtn.onclick = async () => {
+            regBtn.disabled = true;
+            try {
+              const d = await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/register", { method: "POST", body: "{}" });
+              toast("Registered as Registry Draft: " + d.draft.capability_id + " — now Validate & Publish under Versions", "ok");
+              await renderRegistryPage();
+            } catch (e) {
+              toast("Register failed: " + e.message, "error");
+              regBtn.disabled = false;
+            }
+          };
+          const row = el("div", "row-actions"); row.appendChild(regBtn);
+          card.appendChild(row);
+          container.appendChild(card);
+        }
+
+        // ── Queries (registered): the Exact + Recall corpus, nothing else ──
+        // Save = targeted PATCH; the returned Draft row refreshes regDrafts in
+        // place (new row_version included) — the page is NEVER re-rendered.
+        function renderRegQueries(container, a, draft) {
+          regQueriesView(container, {
+            title: "Exact + Recall Query Corpus",
+            isDraft: false,
+            standard: draft.standard_example,
+            similar: draft.synonym_examples || [],
+            onSave: async (std, sims) => {
+              const res = await apiFetch("/admin/registry/drafts/" + encodeURIComponent(draft.capability_id), {
+                method: "PATCH",
+                body: JSON.stringify({
+                  patch: { standard_example: std, synonym_examples: sims },
+                  expected_row_version: draft.row_version,
+                }),
+              });
+              const i = regDrafts.findIndex((x) => x.capability_id === draft.capability_id);
+              if (i >= 0 && res && res.draft) regDrafts[i] = res.draft;
+            },
+          });
+        }
+
+        // ── Queries / Negatives (agent-only): PRE-REGISTRY draft configuration ──
+        async function renderCatalogQueries(container, a, mode) {
+          let cur;
+          try {
+            cur = await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/query-draft");
+          } catch (e) { container.appendChild(errBox(e)); return; }
+          const save = async (std, sims, negs) => {
+            await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/query-draft", {
+              method: "PUT",
+              body: JSON.stringify({ standard_example: std, synonym_examples: sims, negatives: negs }),
+            });
+            cur = Object.assign({}, cur, { standard: std, similar: sims, negatives: negs });
+          };
+          if (mode === "queries") {
+            regQueriesView(container, {
+              title: "Exact + Recall Query Corpus",
+              isDraft: true,
+              standard: cur.standard,
+              similar: cur.similar,
+              onSave: (std, sims) => save(std, sims, cur.negatives),
+            });
+          } else {
+            const banner = "Draft / Not Published — saved in the Action Catalog only. Nothing here can reach the active Registry, index or Funnel until Register → Validate → Publish.";
+            const card = el("div", "legacy-card");
+            card.appendChild(el("div", "section-title", "Negative Examples (draft) — " + a.display_name));
+            card.appendChild(el("div", "hint", banner));
+            card.appendChild(el("div", "hint", "Negatives = ToolIntentModel boundary context only. Never Exact Match, never PGVector Recall."));
+            const neg = regListEditor(cur.negatives, "near-miss that is NOT this action");
+            card.appendChild(neg.node);
+            const saveBtn = el("button", "btn primary", "Save Draft");
+            saveBtn.type = "button";
+            saveBtn.onclick = async () => {
+              try { await save(cur.standard, cur.similar, neg.get()); toast("Query draft saved for " + a.action_key + " (still NOT published)", "ok"); }
+              catch (e) { toast(e.message, "error"); }
+            };
+            card.appendChild(saveBtn);
+            container.appendChild(card);
+          }
+        }
+
+        // ── Negatives (registered) ──
         function renderRegNegatives(container, draft) {
           const card = el("div", "legacy-card");
-          card.appendChild(el("div", "section-title", "Negative examples"));
-          card.appendChild(el("div", "hint", "Model-card semantic boundary ONLY — negatives never enter Exact Match or Vector Recall (they must not be recallable at all)."));
+          card.appendChild(el("div", "section-title", "Negative Examples"));
+          card.appendChild(el("div", "hint", "ToolIntentModel boundary context ONLY — negatives never enter Exact Match or Vector Recall (they must not be recallable at all)."));
           const neg = regListEditor(draft.negatives || [], "near-miss that is NOT this action");
           card.appendChild(neg.node);
           const save = el("button", "btn primary", "Save");
           save.type = "button";
-          save.onclick = () => regPatch({ negatives: neg.get() });
+          save.onclick = () => regPatch(draft.capability_id, { negatives: neg.get() });
           card.appendChild(save);
           container.appendChild(card);
         }
 
-        // ── Legacy examples (read-only) ──
-        function renderRegLegacy(container, draft) {
-          const card = el("div", "legacy-card");
-          card.appendChild(el("div", "section-title", "Legacy fields — read-only"));
-          const list = (arr) => ((arr || []).length ? (arr || []).join(" · ") : "—");
-          card.append(
-            field("Legacy examples (card context only)", textInput(list(draft.examples))),
-            el("div", "hint", "Legacy examples still reach the ToolIntentModel card as semantic context, but never Exact Match and never Vector Recall."),
-            field("Patterns (inert storage)", textInput(list(draft.patterns))),
-            field("Aliases (inert storage)", textInput(list(draft.aliases))),
-          );
-          card.appendChild(el("div", "hint", "The Intent chain no longer uses patterns/aliases — the Matcher is exact-only since the 2026-09-25 ruling. Kept for history; editable via the drafts PATCH API only."));
-          card.querySelectorAll("input").forEach((i) => { i.disabled = true; });
-          container.appendChild(card);
-        }
+        // ── Advanced (registered): runtime schema + parameters + inert fields ──
+        async function renderRegAdvanced(container, a, draft) {
+          // 1/2. Tool Binding + live runtime Tool Schema (read-only projection)
+          const tcard = el("div", "legacy-card");
+          tcard.appendChild(el("div", "section-title", "Tool Binding & runtime Schema (read-only)"));
+          const tkv = (k, v) => tcard.appendChild(el("div", "hint", k + ": " + v));
+          tkv("Action", a.display_name + " (" + a.action_key + ")");
+          tkv("Tool binding", draft.tool_binding);
+          tkv("Implementation", a.implementation_ref);
+          tkv("Agent / Chat", regChatAvail(draft.tool_binding));
+          tkv("Funnel registration eligibility", regFunnelEligibility(a));
+          if (regToolSchemas[draft.tool_binding]) {
+            tcard.appendChild(el("div", "section-sub", "Parameters — the live ToolRuntime schema the model sees"));
+            regSchemaTable(tcard, regToolSchemas[draft.tool_binding]);
+            tcard.appendChild(el("div", "hint", "Source: ToolRuntime.schemas() — the Binder validates the Registry parameters below against this runtime truth at publish."));
+          } else {
+            tcard.appendChild(el("div", "hint", "No runtime schema for this binding in THIS server process (see Agent/Chat line above)."));
+          }
+          container.appendChild(tcard);
 
-        // ── Params (JSON) ──
-        function renderRegParams(container, draft) {
-          const card = el("div", "legacy-card");
-          card.appendChild(el("div", "section-title", "Parameters & argument slots"));
-          card.appendChild(el("div", "hint", "JSON objects. parameters is the canonical argument schema the Binder validates against; arg_slots maps detected slots to parameters."));
+          // 3. Parameters / Argument Slots — the Registry's existing model (editable)
+          const pcard = el("div", "legacy-card");
+          pcard.appendChild(el("div", "section-title", "Parameters & argument slots (Registry model)"));
+          pcard.appendChild(el("div", "hint", "JSON objects. parameters is the canonical argument schema the Binder validates against; arg_slots maps detected slots to parameters."));
           const p = el("textarea"); p.rows = 8; p.value = JSON.stringify(draft.parameters || {}, null, 2);
-          const a = el("textarea"); a.rows = 8; a.value = JSON.stringify(draft.arg_slots || {}, null, 2);
-          card.append(field("parameters", p), field("arg_slots", a));
+          const sl = el("textarea"); sl.rows = 8; sl.value = JSON.stringify(draft.arg_slots || {}, null, 2);
+          pcard.append(field("parameters", p), field("arg_slots", sl));
           const save = el("button", "btn primary", "Save");
           save.type = "button";
           save.onclick = async () => {
             let pv, av;
-            try { pv = JSON.parse(p.value || "{}"); av = JSON.parse(a.value || "{}"); }
+            try { pv = JSON.parse(p.value || "{}"); av = JSON.parse(sl.value || "{}"); }
             catch { toast("Invalid JSON — not saved", "error"); return; }
-            await regPatch({ parameters: pv, arg_slots: av });
+            await regPatch(draft.capability_id, { parameters: pv, arg_slots: av });
           };
-          const res = el("div", "test-res");
-          const row = el("div", "row-actions"); row.append(save, res);
-          card.appendChild(row);
-          container.appendChild(card);
+          pcard.appendChild(save);
+          if (BINDING_WARNINGS[draft.tool_binding]) {
+            pcard.appendChild(el("div", "trace-out err", BINDING_WARNINGS[draft.tool_binding]));
+          }
+          container.appendChild(pcard);
+
+          // 4/5/6. Legacy Examples + inert Patterns/Aliases
+          const lcard = el("div", "legacy-card");
+          lcard.appendChild(el("div", "section-title", "Legacy Examples — real Registry examples field (read-only)"));
+          lcard.appendChild(el("div", "hint", "ToolIntentModel card context only — never Exact Match, never PGVector Recall. Values below are the raw examples column, NOT a copy of the query corpus."));
+          const corpus = new Set();
+          if ((draft.standard_example || "").trim()) corpus.add(draft.standard_example.trim());
+          for (const s of draft.synonym_examples || []) { if (s.trim()) corpus.add(s.trim()); }
+          const items = (draft.examples || []).filter((s) => s.trim());
+          if (!items.length) lcard.appendChild(el("div", "hint", "— none —"));
+          for (const s of items) {
+            const li = el("div", "hint", "• " + s);
+            li.style.cssText = "white-space:normal";
+            if (corpus.has(s.trim())) li.appendChild(el("span", "badge accent", "also in query corpus — DATA duplication (seed lineage), not a UI copy"));
+            lcard.appendChild(li);
+          }
+          const inert = (arr) => ((arr || []).length ? (arr || []).join(" · ") : "—");
+          lcard.append(
+            field("Patterns (inert storage)", textInput(inert(draft.patterns))),
+            field("Aliases (inert storage)", textInput(inert(draft.aliases))),
+          );
+          lcard.appendChild(el("div", "hint", "The Matcher is exact-only (2026-09-25 ruling) — patterns/aliases are history, never runtime."));
+          lcard.querySelectorAll("input").forEach((i) => { i.disabled = true; });
+          container.appendChild(lcard);
+
+          // 7. Runtime & execution
+          const rcard = el("div", "legacy-card");
+          rcard.appendChild(el("div", "section-title", "Runtime & execution"));
+          const kv = (k, v) => rcard.appendChild(el("div", "hint", k + ": " + v));
+          kv("Tool binding", draft.tool_binding);
+          kv("Execution policy", draft.execution_policy);
+          kv("Permissions", draft.permissions || "—");
+          kv("Intent kind", draft.intent_kind);
+          kv("Current route", a.current_route);
+          kv("Row version", String(draft.row_version));
+          if (BINDING_WARNINGS[draft.tool_binding]) rcard.appendChild(el("div", "trace-out err", BINDING_WARNINGS[draft.tool_binding]));
+          container.appendChild(rcard);
         }
+
+        // ── Advanced (agent-only): same seven sections; parameters are PRE-REGISTRY
+        // draft configuration (migration 0012) — not registered ≠ no parameters. ──
+        async function renderCatalogAdvanced(container, a) {
+          let cur = { parameters: {}, arg_slots: {} };
+          try {
+            cur = await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/query-draft");
+          } catch (e) { container.appendChild(errBox(e)); return; }
+          const schema = regToolSchemas[a.tool_binding];
+
+          // 1. Tool Binding
+          const bcard = el("div", "legacy-card");
+          bcard.appendChild(el("div", "section-title", "Tool Binding"));
+          const kv = (k, v) => bcard.appendChild(el("div", "hint", k + ": " + v));
+          kv("Action", a.display_name + " (" + a.action_key + ")");
+          kv("Tool binding", a.tool_binding);
+          kv("Implementation", a.implementation_ref);
+          kv("Agent / Chat", regChatAvail(a.tool_binding));
+          kv("Funnel registration eligibility", regFunnelEligibility(a));
+          bcard.appendChild(el("div", "hint", "Ineligibility for Funnel registration is a REGISTRATION status only — the tool stays a normal Agent/Chat tool. Not registered ≠ hidden schema."));
+          container.appendChild(bcard);
+
+          // 2. Parameters — live runtime schema (read-only, never a second model)
+          const scard = el("div", "legacy-card");
+          scard.appendChild(el("div", "section-title", "Tool Schema — live runtime (read-only)"));
+          if (schema) {
+            scard.appendChild(el("div", "hint", (schema.description || "").slice(0, 300)));
+            regSchemaTable(scard, schema);
+          } else {
+            scard.appendChild(el("div", "hint", "No schema for this binding in THIS server process — see the Agent/Chat line above (runtime integrity audit, separate task). The draft configuration below remains editable."));
+          }
+          container.appendChild(scard);
+
+          // 3+4. Draft Parameters / Argument Slots (same shapes as the Registry model)
+          const pcard = el("div", "legacy-card");
+          pcard.appendChild(el("div", "section-title", "Parameter configuration (draft, pre-Registry)"));
+          pcard.appendChild(el("div", "hint", "Draft / Not Published — same shapes as the Registry parameters/arg_slots fields; Register copies them 1:1 into the Draft row. Saving here never publishes and never touches the runtime schema."));
+          const seed = Object.keys(cur.parameters || {}).length ? cur.parameters
+            : (schema ? (schema.parameters || {}).properties || {} : {});
+          const p = el("textarea"); p.rows = 8; p.value = JSON.stringify(seed, null, 2);
+          const sl = el("textarea"); sl.rows = 6; sl.value = JSON.stringify(cur.arg_slots || {}, null, 2);
+          pcard.append(field("parameters", p), field("arg_slots", sl));
+          if (!Object.keys(cur.parameters || {}).length && schema) {
+            pcard.appendChild(el("div", "hint", "parameters is pre-seeded from the live tool schema for convenience — trim/adjust it into the argument contract the Funnel Binder should validate against, then Save."));
+          }
+          const save = el("button", "btn primary", "Save Draft");
+          save.type = "button";
+          save.onclick = async () => {
+            let pv, av;
+            try { pv = JSON.parse(p.value || "{}"); av = JSON.parse(sl.value || "{}"); }
+            catch { toast("Invalid JSON — not saved", "error"); return; }
+            try {
+              await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/params-draft", {
+                method: "PUT", body: JSON.stringify({ parameters: pv, arg_slots: av }),
+              });
+              toast("Parameter draft saved for " + a.action_key + " (still NOT published)", "ok");
+            } catch (e) { toast(e.message, "error"); }
+          };
+          pcard.appendChild(save);
+          if (BINDING_WARNINGS[a.tool_binding]) {
+            pcard.appendChild(el("div", "trace-out err", BINDING_WARNINGS[a.tool_binding]));
+          }
+          container.appendChild(pcard);
+
+          // 5+6+7. Legacy Examples / Patterns / Aliases — Registry-row fields
+          const lcard = el("div", "legacy-card");
+          lcard.appendChild(el("div", "section-title", "Legacy Examples · Patterns · Aliases"));
+          lcard.appendChild(el("div", "hint", "Not available yet: these three fields live on the Registry capability Draft row and appear after Register. No second storage model is invented for unregistered actions — the pre-Registry draft keeps only Queries, Negatives and Parameters (migration 0012)."));
+          container.appendChild(lcard);
+
+          // Runtime / execution summary
+          const rcard = el("div", "legacy-card");
+          rcard.appendChild(el("div", "section-title", "Runtime & execution"));
+          const kv2 = (k, v) => rcard.appendChild(el("div", "hint", k + ": " + v));
+          kv2("Execution path today", "Agent/Chat tool call via ToolRuntime (kernel loop)");
+          kv2("Intent Funnel", "Not configured — registration requires a DIRECT_TOOLS binding (separate runtime task for inadmissible ones)");
+          kv2("Versions", "Not available until registered");
+          container.appendChild(rcard);
+        }
+
 
         // ── Versions: preview / publish / rollback / audit / route dry-run ──
         async function renderRegVersions(container) {

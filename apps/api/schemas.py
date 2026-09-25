@@ -670,6 +670,27 @@ class RegistryRollbackRequest(BaseModel):
     note: str | None = None
 
 
+class RegistryQueryDraftRequest(BaseModel):
+    """Pre-Registry Draft Configuration for an Action-Catalog row (migration
+    0011). Field names mirror the Registry columns they become on an explicit
+    register: standard_example / synonym_examples / negatives. Saving this is
+    NEVER a publish — nothing here reaches capabilities/qir_examples by itself."""
+
+    standard_example: str = ""
+    synonym_examples: list[str] = []
+    negatives: list[str] = []
+
+
+class RegistryDraftParamsRequest(BaseModel):
+    """Pre-Registry parameter configuration (migration 0012). Same shapes as
+    the Registry capability fields they copy into on register: parameters
+    (slot -> spec) and arg_slots (Binder mapping). Storing a draft here is
+    NEVER a publish; the runtime tool schema is read live, never copied."""
+
+    parameters: dict = {}
+    arg_slots: dict = {}
+
+
 class RegistryPreviewRouteRequest(BaseModel):
     # §8.5 full-chain query dry-run; the chain reads the ACTIVE pair only.
     query: str = Field(min_length=1, max_length=500)
