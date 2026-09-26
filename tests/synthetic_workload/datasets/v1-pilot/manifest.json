@@ -1,0 +1,116 @@
+{
+  "changelog": {
+    "v1-pilot": "pilot: 10-scenario seeds + HN classes + fixed trajectories"
+  },
+  "dataset_version": "v1-pilot",
+  "output_hashes": {
+    "hard_negative.jsonl": "2a664708673bea0e",
+    "natural_workload.jsonl": "3fdebd40181ffa4e",
+    "query_cases.jsonl": "18fcbed73f812ab9",
+    "session_trajectories.jsonl": "dc35f4703ada4501",
+    "stress_workload.jsonl": "76621625580ee321",
+    "tool_positive.jsonl": "f755170b82ccfa37"
+  },
+  "provenance": "workload_design — designed synthetic mixture, NOT a real-user distribution",
+  "records": {
+    "hard_negative.jsonl": 49,
+    "natural_workload.jsonl": 214,
+    "query_cases.jsonl": 202,
+    "session_trajectories.jsonl": 12,
+    "stress_workload.jsonl": 75,
+    "tool_positive.jsonl": 58
+  },
+  "source_hashes": {
+    "chit_chat.yaml": "e922291c9fee0cc2",
+    "context_drift.yaml": "bde246735a113e0d",
+    "hard_negative.yaml": "4e153dfac8a7f0c9",
+    "learning.yaml": "9f7514eaedbccb44",
+    "life_assistant.yaml": "d5a6841fc5169bf8",
+    "reading.yaml": "b9dec1efc92de7f5",
+    "research.yaml": "292e87a7d2d9b878",
+    "sessions.yaml": "11d25b02cd52dc6c",
+    "tool.yaml": "50f53047cb67c1e8",
+    "watching.yaml": "e4ac1c81c9b104b3",
+    "workspace.yaml": "b6057ab3c0a70ab9",
+    "writing.yaml": "db94152d737b4bfe"
+  },
+  "turn_level_counts": {
+    "by_capability": {
+      "cap-add-term": 22,
+      "cap-create-folder": 44,
+      "cap-pdf-extract-text": 7
+    },
+    "by_difficulty": {
+      "ADVERSARIAL": 22,
+      "EASY": 100,
+      "HARD": 37,
+      "MEDIUM": 81
+    },
+    "by_expected_funnel": {
+      "ABSTAIN": 4,
+      "AGENT": 160,
+      "AMBIGUOUS": 3,
+      "TOOL": 73
+    },
+    "by_intent": {
+      "BEYOND_VIEWER_QA": 2,
+      "CHIT_CHAT": 11,
+      "CONTEXTUAL_QA": 3,
+      "CONTEXT_DRIFT": 9,
+      "DOCUMENT_GROUNDED_QA": 13,
+      "FOLLOW_UP": 9,
+      "HARD_NEGATIVE_AMBIGUOUS": 3,
+      "HARD_NEGATIVE_ASK_WHAT_TOOL_DOES": 2,
+      "HARD_NEGATIVE_CAN_YOU": 3,
+      "HARD_NEGATIVE_CAPABILITY_MENTION": 2,
+      "HARD_NEGATIVE_CONDITIONAL": 2,
+      "HARD_NEGATIVE_DEFER_EXECUTE": 3,
+      "HARD_NEGATIVE_DISCUSSING_ACTION": 2,
+      "HARD_NEGATIVE_DOC_REPORTS_ACTION": 4,
+      "HARD_NEGATIVE_DONT_EXECUTE": 2,
+      "HARD_NEGATIVE_DRIFT_TOOLISH": 3,
+      "HARD_NEGATIVE_FEATURE_QUESTION": 2,
+      "HARD_NEGATIVE_HOW_TO_ACTION": 3,
+      "HARD_NEGATIVE_HYPOTHETICAL": 2,
+      "HARD_NEGATIVE_IF_I_WANT": 2,
+      "HARD_NEGATIVE_NEGATED": 5,
+      "HARD_NEGATIVE_QUOTED_ACTION": 2,
+      "HARD_NEGATIVE_TOOL_AS_NOUN": 2,
+      "HARD_NEGATIVE_TOOL_NAME_MENTION": 2,
+      "HARD_NEGATIVE_VIEWER_TOOL_MENTION": 4,
+      "HARD_NEGATIVE_WRONG_TARGET": 2,
+      "KNOWLEDGE_QA": 16,
+      "LIFE_ASSISTANT": 11,
+      "RESEARCH": 9,
+      "TOOL_ACTION": 86,
+      "VIDEO_GROUNDED_QA": 8,
+      "WRITING": 11
+    },
+    "by_scenario": {
+      "HARD_NEGATIVE": 45,
+      "S10_LIFE_ASSISTANT": 11,
+      "S1_READING": 20,
+      "S2_WATCHING": 18,
+      "S3_LEARNING": 14,
+      "S4_RESEARCH": 12,
+      "S5_WRITING": 14,
+      "S6_WORKSPACE": 21,
+      "S7_TOOL_ACTION": 56,
+      "S8_CHIT_CHAT": 12,
+      "S9_CONTEXT_DRIFT": 17
+    },
+    "by_viewer_relation": {
+      "BEYOND_VIEWER": 2,
+      "GROUNDED_IN_VIEWER": 39,
+      "NO_VIEWER": 175,
+      "RELATED_BUT_NOT_IN_VIEWER": 13,
+      "UNRELATED_DRIFT": 11
+    },
+    "session_turn_lengths": {
+      "2-turn": 3,
+      "3-turn": 6,
+      "4-turn": 1,
+      "5-turn": 2
+    }
+  }
+}

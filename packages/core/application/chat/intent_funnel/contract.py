@@ -37,7 +37,7 @@ class TurnFacts:
     has_turn_context: bool = False  # a session-bound turn: prior context exists
 
     @classmethod
-    def of(cls, ctx) -> "TurnFacts":
+    def of(cls, ctx) -> TurnFacts:
         """Build once from the resolved turn context. ``body.viewer`` is the
         request's ViewerPayload (schemas.py); ``attach`` a dict; both may be
         absent on guest/plain turns."""
@@ -104,6 +104,13 @@ class Candidate:
     # ToolIntentModel sees the union of Recall hits and Matcher-AMBIGUOUS escalations (8.1)
     # and must know which ones carry a calibrated cosine score.
     origin: str = "recall"
+    # per-hit provenance (live-table ruling 2026-09-26): EVERY recall hit ≥
+    # threshold is kept — no MAX/AVG, no per-capability dedup — so a hit
+    # carries the exact sentence and table row that produced it.
+    query_kind: str = ""        # "standard" | "similar" ("" for matcher origins)
+    language: str = ""
+    query_id: str = ""          # row id in capability_{standard,similar}_queries
+    standard_query_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -152,7 +159,7 @@ class BoundArguments:
     args: dict | None = None
 
     @classmethod
-    def of(cls, args: dict | None) -> "BoundArguments":
+    def of(cls, args: dict | None) -> BoundArguments:
         """Adapter over the legacy ``bind_arguments`` return: dict -> COMPLETE,
         None -> MISSING (the existing C1 abstain shape, unchanged)."""
         return cls(BIND_COMPLETE, args) if args is not None else cls(BIND_MISSING, None)
@@ -166,31 +173,8 @@ class BoundArguments:
         return self.state == BIND_MISSING
 
 
-# ── Funnel output (wired in P0 over the existing qir.RouteResult) ────────────────
-
-
-@dataclass(frozen=True)
-class IntentVerdict:
-    """Routing metadata ONLY (8.8): which capability, from which registry
-    version, decided at which stage. Execution permission lives nowhere here."""
-
-    capability_id: str
-    registry_version: str
-    stage: str = "semantic+decision"
-
-    @classmethod
-    def from_qir(cls, route_result) -> "IntentVerdict":
-        """Adapter over the legacy ``qir.types.RouteResult`` (same fields)."""
-        return cls(
-            capability_id=route_result.capability_id,
-            registry_version=route_result.registry_version,
-            stage=getattr(route_result, "stage", "semantic+decision"),
-        )
-
-
-@dataclass(frozen=True)
-class AgentFallback:
-    """The zero-pollution exit: the funnel abstained, the Agent keeps the turn
-    and receives the user's text BYTE-IDENTICAL (8.10)."""
-
-    reason: str = ""  # prefixed reason code (8.10), e.g. DECISION_NONE
+# ── Funnel output ────────────────────────────────────────────────────────────────
+# The legacy QIR adapter (``IntentVerdict.from_qir`` over ``qir.RouteResult``)
+# was deleted with the QIR package (migration 0014): the funnel certifies a
+# turn by returning an ACTION TurnRequirements, everything else is the
+# fail-open original.

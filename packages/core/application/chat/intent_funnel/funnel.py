@@ -1,20 +1,16 @@
 """Intent Funnel orchestration.
 
-P0 moved the legacy QIR cascade (:func:`run_intent_stage`) out of the
-orchestrator unchanged; P1 added the Registry Matcher's shadow hook. The
-2026-09-24 chain correction pins the ACTIVE target chain to one hop:
+The 2026-09-24 chain correction pins the ACTIVE target chain to one hop and
+the 2026-09-26 live-table ruling retired the legacy QIR lane entirely:
 
     Matcher HIT  ─┐
                   ├→ ToolIntentModel (ONE call: select + extract) → Binder (validate) → Execute
     MISS/AMB → Recall ─┘
 
-every non-COMPLETE outcome exits to the Agent (8.10). The recheck second hop
-and the Decision LLM are deleted — the two online TTFBs they cost were the
-cascade timeout, and neither added information. The chain is gated by its own
-switch (``chat_funnel_enabled``, default OFF): with it closed, route() is
-byte-identical to the accepted P1 behavior and the legacy QIR path stays as it
-was — dark historical implementation, not the correctness baseline.
-"""
+every non-COMPLETE outcome exits to the Agent (8.10). The recheck second hop,
+the Decision LLM and the pre-Registry QIR cascade are all deleted. The chain
+is gated by its own switch (``chat_funnel_enabled``, default OFF): with it
+closed, route() returns the requirements object untouched."""
 from __future__ import annotations
 
 import asyncio
@@ -49,31 +45,11 @@ from .contract import (
     REASON_VERSION_MISMATCH,
     TOOL_INTENT_CONFIDENT,
     TOOL_INTENT_REJECT,
-    BoundArguments,
     Candidate,
-    IntentVerdict,
     TurnFacts,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def qir_live(requirements: TurnRequirements, deps, ctx) -> bool:
-    """Gate: QIR only ever ADDS an action route the L0 abstained from — it
-    never overrides an L0 certification, never touches web/memory-demanding
-    or research/handoff turns, and stays physically dark unless every
-    relevant switch is on."""
-    if not (settings.chat_qir_enabled and settings.chat_fast_paths_enabled
-            and settings.chat_action_fast_path_enabled and deps is not None):
-        return False
-    if requirements.requested_action is not None:  # L0 already certified
-        return False
-    if requirements.needs_web is not Signal.LOW or requirements.needs_memory:
-        return False
-    if getattr(ctx, "research_turn", False) or getattr(ctx, "effective_handoff", None):
-        return False
-    from core.application.chat.sanitization import is_pure_user_text
-    return is_pure_user_text(ctx.body.message or "")
 
 
 async def route(ctx, *, deps, requirements: TurnRequirements) -> TurnRequirements:
@@ -82,8 +58,7 @@ async def route(ctx, *, deps, requirements: TurnRequirements) -> TurnRequirement
     Returns the SAME requirements object untouched whenever the funnel is dark
     or abstains — the Agent keeps the turn, byte-identical, zero pollution.
     With the funnel gate open, hands off to the single-hop cascade
-    (:func:`_cascade`); with it closed, falls back to the legacy QIR path
-    (dark by its own gates).
+    (:func:`_cascade`).
     """
     # P1 step-5 tri-state (8.15): unless the switch is off, run the Registry
     # Matcher in the dark and log its would_* verdict. Observation only.
@@ -98,9 +73,7 @@ async def route(ctx, *, deps, requirements: TurnRequirements) -> TurnRequirement
         return requirements
     if funnel_live(requirements, deps, ctx):
         return await _cascade(ctx, deps, requirements)
-    if not qir_live(requirements, deps, ctx):
-        return requirements
-    return await run_intent_stage(ctx, deps, requirements)
+    return requirements
 
 
 def funnel_live(requirements: TurnRequirements, deps, ctx) -> bool:
@@ -128,86 +101,6 @@ def kind_enabled(kind: str) -> bool:
     if kind == "web":
         return settings.chat_funnel_web_enabled
     return False
-
-
-async def run_intent_stage(ctx, deps, requirements: TurnRequirements) -> TurnRequirements:
-    """QIR cascade + Argument Binding. Outcomes are classified, not swallowed:
-
-    * QIR abstain / C1 binding miss -> the ORIGINAL requirements (Agent keeps
-      the turn, zero pollution);
-    * C2 binding-integrity fault -> ACTION requirements carrying the
-      ``binding_integrity`` marker (executor TERMINAL, never Agent recovery);
-    * any other unexpected stage exception fail-opens to the original
-      requirements — a routing-layer crash must not sink the turn."""
-    from core.application.chat import qir
-    from core.application.chat.qir import store as qir_store
-
-    message = ctx.body.message or ""
-    try:
-        snapshot = await qir_store.active(deps.session_factory)
-        route_result = await qir.route(
-            message, snapshot=snapshot,
-            embedder=deps.embedder(), llm=deps.llm,
-            top_k=settings.chat_qir_top_k, min_score=settings.chat_qir_min_score,
-            margin=settings.chat_qir_margin,
-            decision_enabled=settings.chat_qir_decision_enabled,
-            timeout_seconds=settings.chat_qir_timeout_seconds,
-        )
-        if route_result is None:
-            return requirements
-        # P0 adapter wiring: the legacy RouteResult speaks the node contract now;
-        # downstream field-for-field identical (stage stamps stay "qir_*" keys).
-        verdict = IntentVerdict.from_qir(route_result)
-        cap = snapshot.get(verdict.capability_id) if snapshot is not None else None
-        if cap is None or not cap.enabled or cap.id != verdict.capability_id:
-            return requirements  # metadata drift between route and bind
-        from core.application.chat.actions import (
-            ActionIntegrityFailure,
-            bind_arguments,
-        )
-        try:
-            bound = BoundArguments.of(bind_arguments(cap.tool_binding, message, ctx))
-        except ActionIntegrityFailure as exc:
-            # C2 at the routing layer: the capability promises a binding the
-            # existing action table does not honor — a system inconsistency,
-            # NOT user-input incompleteness. The turn is planned as ACTION with
-            # an integrity marker so the executor issues the decided TERMINAL
-            # message; the Agent is never entered as a recovery channel.
-            logger.error("qir.binding integrity: %s", exc.reason)
-            return TurnRequirements(
-                needs_action=Signal.HIGH,
-                requested_action={
-                    "tool": cap.tool_binding, "args": None,
-                    "capability_id": cap.id,
-                    "registry_version": verdict.registry_version,
-                    "qir_stage": verdict.stage,
-                    "binding_integrity": exc.reason,
-                },
-                complexity=Complexity.LOW, confidence=Confidence.HIGH,
-                private_only=requirements.private_only,
-                external_ok=requirements.external_ok,
-            )
-        if bound.is_missing:
-            # C1: structured arguments not determinable from this sentence +
-            # context. Fall through untouched — the Agent owns understanding.
-            return requirements
-        # Same construction shape as the L0 action-hit branch (only the
-        # action fields are set; source facts ride through).
-        return TurnRequirements(
-            needs_action=Signal.HIGH,
-            requested_action={
-                "tool": cap.tool_binding, "args": bound.args,
-                "capability_id": cap.id,
-                "registry_version": verdict.registry_version,
-                "qir_stage": verdict.stage,
-            },
-            complexity=Complexity.LOW, confidence=Confidence.HIGH,
-            private_only=requirements.private_only,
-            external_ok=requirements.external_ok,
-        )
-    except Exception as exc:
-        logger.info("qir stage fail-open: %r", exc)
-        return requirements
 
 
 # ── Active chain: Matcher → (Recall) → ToolIntentModel → Binder(validate) → (Agent) ──────
@@ -240,7 +133,6 @@ def _new_trace() -> dict:
 async def _run_cascade(ctx, deps, requirements: TurnRequirements,
                        trace: dict, *,
                        recall_min_score: float | None = None,
-                       recall_top_k: int | None = None,
                        model_candidate_floor: float | None = None,
                        capture: dict | None = None) -> TurnRequirements | None:
     """One wall-clock-budgeted cascade run with 8.10-classified fail-open.
@@ -259,11 +151,11 @@ async def _run_cascade(ctx, deps, requirements: TurnRequirements,
     try:
         out = await asyncio.wait_for(
             _run_nodes(ctx, deps, requirements, trace,
-                       recall_min_score=recall_min_score, recall_top_k=recall_top_k,
+                       recall_min_score=recall_min_score,
                        model_candidate_floor=model_candidate_floor, capture=capture),
             settings.chat_funnel_timeout_seconds,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         out, trace["fallback"] = None, _stage_reason(trace["stage"], timed_out=True)
     except Exception as exc:
         out = None
@@ -423,13 +315,13 @@ async def preview(message: str, *, deps) -> dict:
 
 async def cascade_shadow(ctx, *, deps, requirements=None,
                          recall_min_score: float = 0.0,
-                         recall_top_k: int = 10,
                          model_candidate_floor: float = 0.58) -> dict:
     """Phase-E Cascade Shadow: one dry-run turn through the SAME node body as
     production (:func:`_run_nodes` — zero orchestration duplication, so the
     shadow can never drift from shipped semantics), with the raw-score seam
-    opened: Recall keeps every candidate it scored (min_score=0, top_k=10) and
-    the model-facing set re-applies a floor, so ALL threshold buckets are
+    opened: Recall keeps every candidate it scored (min_score=0; the live-table
+    ruling already keeps EVERY hit >= threshold as its own candidate) and the
+    model-facing set re-applies a floor, so ALL threshold buckets are
     recomputable OFFLINE from the captured raw scores — recall is never
     re-run per threshold. The chain stops at Binder: routing metadata only
     (8.8), no dispatch, no Runtime, no event row; usage is pinned
@@ -454,7 +346,6 @@ async def cascade_shadow(ctx, *, deps, requirements=None,
     try:
         out = await _run_cascade(ctx, deps, requirements, trace,
                                  recall_min_score=recall_min_score,
-                                 recall_top_k=recall_top_k,
                                  model_candidate_floor=model_candidate_floor,
                                  capture=capture)
     finally:
@@ -478,7 +369,6 @@ async def cascade_shadow(ctx, *, deps, requirements=None,
 
 async def _run_nodes(ctx, deps, requirements, trace, *,
                      recall_min_score: float | None = None,
-                     recall_top_k: int | None = None,
                      model_candidate_floor: float | None = None,
                      capture: dict | None = None):
     """Run the single-hop cascade body (see _run_cascade for the shadow seam).
@@ -493,23 +383,23 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
     message = ctx.body.message or ""
     facts = TurnFacts.of(ctx)
 
-    # ── Registry + Recall index (the Build-Then-Swap pair, §8.3) ──────────────
+    # ── Registry + Recall index (both read the LIVE tables, fingerprint-cached) ─
     view = await registry_active_view(session_factory=deps.session_factory)
     if view is None or not view.entries:
-        trace["fallback"] = REASON_REGISTRY_UNAVAILABLE  # nothing published: no table to consult
+        trace["fallback"] = REASON_REGISTRY_UNAVAILABLE  # no capabilities in the table yet
         return None
     trace["registry"] = view.fingerprint
     entries_by_id = {
         e.capability_id: e for e in view.entries
         if e.enabled and e.status == STATUS_ACTIVE
     }
-    # The index is loaded even for the HIT lane: the certified turn stamps its
-    # version for the executor's TOCTOU re-validation, and a Registry without
-    # its Build-Then-Swap pair is unusable regardless of lane (§8.3).
+    # The index is loaded even for the HIT lane: a Registry whose corpus is not
+    # embedded yet cannot serve Recall on the next turn, so the cascade fails
+    # open honestly now (RECALL_UNAVAILABLE) rather than half-routed.
     trace["stage"] = "recall"
     index = await recall.load_index(deps.session_factory)
     if index is None:
-        trace["fallback"] = REASON_RECALL_UNAVAILABLE  # registry without its paired index
+        trace["fallback"] = REASON_RECALL_UNAVAILABLE  # corpus not embedded yet
         return None
     trace["index"] = index.version
 
@@ -529,19 +419,21 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
     # ── One candidate set, ONE convergence point: a HIT enters ToolIntentModel with the ─
     # same semantics as a Recall lane — the direct-certification special path is
     # deleted (chain ruling 2026-09-24). Recall runs only when the table missed.
-    candidates: dict[str, Candidate] = {}
+    # Live-table ruling 2026-09-26: every recall hit >= threshold is kept AS IS
+    # (no MAX/AVG, no per-capability dedup) — the same capability may legitimately
+    # arrive several times through different sentences.
+    candidates: list[Candidate] = []
     if mres.state == MATCH_AMBIGUOUS:
         for cid in mres.candidates:
-            candidates[cid] = Candidate(cid, 0.0, origin="matcher_ambiguous")
+            candidates.append(Candidate(cid, 0.0, origin="matcher_ambiguous"))
     elif mres.state == MATCH_HIT:
-        candidates[mres.capability_id] = Candidate(
+        candidates.append(Candidate(
             mres.capability_id, 1.0, matched_example=mres.matched_literal,
-            origin="matcher_hit",
-        )
+            origin="matcher_hit", query_kind="standard",
+        ))
     if mres.state != MATCH_HIT:
         rres = await recall.recall(
             index, message, embedder=deps.embedder(),
-            top_k=settings.chat_funnel_top_k if recall_top_k is None else recall_top_k,
             min_score=(settings.chat_funnel_min_score if recall_min_score is None
                        else recall_min_score),
         )
@@ -550,36 +442,32 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
             # offline threshold sweep recomputes buckets from THIS list (Phase E).
             capture["recall_raw"] = [
                 {"capability_id": c.capability_id, "score": c.score,
-                 "origin": c.origin, "matched_example": c.matched_example}
+                 "origin": c.origin, "matched_example": c.matched_example,
+                 "query_kind": c.query_kind, "language": c.language,
+                 "query_id": c.query_id}
                 for c in rres.candidates
             ]
-        for cand in rres.candidates:  # recall scores win provenance: calibrated
-            candidates[cand.capability_id] = cand
+        candidates.extend(rres.candidates)
     trace["recall_count"] = len(candidates)
     if candidates:
-        top = max(candidates.values(), key=lambda c: c.score)
+        top = max(candidates, key=lambda c: c.score)
         trace["recall_top"] = f"{top.capability_id}@{top.score:.3f}"
-    cands = sorted(candidates.values(), key=lambda c: c.score, reverse=True)
+    cands = sorted(candidates, key=lambda c: c.score, reverse=True)
     if capture is not None:
-        # corpus kind for the console dry-run (Phase 5): position 0 of a cap's
-        # intent_corpus is the canonical sentence, the rest are synonyms.
-        ex_kind = {
-            (c.id, e): ("canonical" if i == 0 else "synonym")
-            for c in index.capabilities for i, e in enumerate(c.examples)
-        }
         capture["candidates"] = [
             {"capability_id": c.capability_id, "score": c.score, "origin": c.origin,
              "matched_example": c.matched_example,
-             "kind": ex_kind.get((c.capability_id, c.matched_example), "-")}
+             "kind": c.query_kind or "-", "language": c.language or "-",
+             "query_id": c.query_id or "-"}
             for c in cands
         ]
     if model_candidate_floor is not None:
-        # Phase-E shadow seam: production's quality gate lives INSIDE recall's
-        # (min_score, top_k); the raw lane moved them here so the model still
-        # sees exactly what production would see at a given threshold —
-        # floor-screened recall cards capped at top_k, plus every
-        # matcher-origin card (HIT 1.0 / AMBIGUOUS 0.0: table evidence, not
-        # calibrated cosine scores, exempt from both floor and cap).
+        # Phase-E shadow seam: the raw lane moved the quality gate out of
+        # recall so ALL threshold buckets are recomputable offline; the
+        # model-facing set here re-applies the floor and keeps the cards at
+        # top_k per capability appearance, plus every matcher-origin card
+        # (HIT 1.0 / AMBIGUOUS 0.0: table evidence, not calibrated cosine
+        # scores, exempt from both floor and cap).
         recall_c = [c for c in cands if c.origin == "recall"
                     and c.score >= model_candidate_floor][:settings.chat_funnel_top_k]
         cands = sorted([c for c in cands if c.origin != "recall"] + recall_c,
@@ -630,20 +518,20 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
         }.get(bound.state, REASON_BIND_MISSING)
         return None
     trace["stage"] = "certified"
-    return _certified(requirements, entry, bound.args, index.version, view.fingerprint,
+    return _certified(requirements, entry, bound.args, view.fingerprint,
                       stage="tool_intent")
 
 
-def _certified(requirements, entry, args, index_version, registry_fp, *,
+def _certified(requirements, entry, args, registry_fp, *,
                stage: str, integrity: str | None = None) -> TurnRequirements:
     """Certified turn: the same construction shape as the legacy branches
-    (only action fields set; source facts ride through). ``registry_version``
-    carries the INDEX version because the executor's TOCTOU re-validates against
-    it (known dual-namespace residue, unified in P4)."""
+    (only action fields set; source facts ride through). ``funnel_registry_version``
+    carries the LIVE Registry content fingerprint — the executor's TOCTOU
+    re-validation (8.9) checks against the same fingerprint (migration 0014:
+    single namespace, the legacy index-version stamp is gone)."""
     action = {
         "tool": entry.tool_binding, "args": args,
         "capability_id": entry.capability_id,
-        "registry_version": index_version,
         "funnel_registry_version": registry_fp,
         "funnel_stage": stage,
         "funnel_kind": entry.intent_kind,

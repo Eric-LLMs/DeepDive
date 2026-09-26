@@ -1,0 +1,35 @@
+# S9 Context Drift (single-turn probes; full trajectories in sessions.yaml).
+# Drift is BIDIRECTIONAL: unrelated away-from-task AND sudden task-intent while
+# reading/watching. Both are legitimate labels — the funnel sees only the
+# sentence + facts, so a self-contained action in a drift turn is TOOL.
+scenario: S9_CONTEXT_DRIFT
+defaults: {vrel: UNRELATED_DRIFT, intent: CONTEXT_DRIFT}
+cases:
+  - id: drift-away-life
+    viewer: {kind: video, asset_id: ast-tomato-class, title: "番茄品种分类"}
+    difficulty: EASY
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '西红柿现在多少钱一斤?'}
+      - {q: '番茄怎么做好吃?'}
+  - id: drift-away-weather
+    viewer: {kind: document, asset_id: ast-nlp-survey}
+    difficulty: EASY
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '北京今天冷不冷?'}
+      - {q: '周末适合去哪玩?'}
+  - id: drift-away-casual
+    viewer: {kind: none}
+    vrel: NO_VIEWER
+    difficulty: MEDIUM
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '算了,先不研究了,你最近怎么样?', notes: "abandon-research turn; research-lane exit is Agent territory"}
+  - id: drift-into-tool
+    difficulty: MEDIUM
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    variants:
+      - {q: '对了,帮我创建一个 notes 文件夹', args: {name: notes}, vrel: UNRELATED_DRIFT, intent: TOOL_ACTION, viewer: {kind: document, asset_id: ast-nlp-survey}, notes: "drift INTO a self-contained action: correct expectation is TOOL"}
+      - {q: '论文先放放,新建"看片笔记"目录', args: {name: 看片笔记}, vrel: UNRELATED_DRIFT, intent: TOOL_ACTION, viewer: {kind: video, asset_id: ast-ner-talk}}
+      - {q: '顺便问下,"entailment" 加入 NLP 词汇库怎么弄的,对了现在帮我加',cap: cap-add-term, args: {term: entailment, domain: NLP|NLP词汇库}, vrel: UNRELATED_DRIFT, intent: TOOL_ACTION, viewer: {kind: document, asset_id: ast-nlp-survey}, difficulty: HARD, notes: "noisy drift turn ending in a real request"}

@@ -7,11 +7,11 @@ Cards) -> Binder (normalize/validate) -> Shared Tool Runtime. Every failure
 exits to the Agent, byte-identical. ToolIntentModel is a swappable provider
 (local primary, online fallback, stub) behind the tool_intent/ ladder.
 
-Scope status: P0 moved the orchestration out of ``TurnOrchestrator`` (gate +
-legacy QIR cascade + argument binding, behavior byte-identical); P1 added the
-Registry/Matcher with its shadow hook; the funnel chain runs behind its OWN
-gate (``chat_funnel_enabled``, default OFF — the legacy lane stays historical,
-not the baseline).
+Scope status: P0 moved the orchestration out of ``TurnOrchestrator``; P1 added
+the Registry/Matcher with its shadow hook; the funnel chain runs behind its OWN
+gate (``chat_funnel_enabled``). The legacy QIR lane was deleted with migration
+0014 (live-table ruling 2026-09-26) — ``funnel_live`` + ``route`` are the whole
+public surface.
 """
 from . import contract
 
@@ -23,10 +23,10 @@ from . import contract
 # CALL time, when every module in that chain is fully initialized.
 
 def __getattr__(name: str):
-    if name in ("funnel_live", "qir_live", "route", "run_intent_stage"):
+    if name in ("funnel_live", "route"):
         from . import funnel as _funnel
         return getattr(_funnel, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["contract", "funnel_live", "qir_live", "route", "run_intent_stage"]
+__all__ = ["contract", "funnel_live", "route"]

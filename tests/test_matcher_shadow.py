@@ -1,5 +1,5 @@
-"""P1 step 3 — the Matcher node (table-only, zero business rules) and its
-coexistence shadow wiring in funnel.route.
+"""P1 step 3 — the Matcher node (live-table exact corpus only, zero business
+rules) and its coexistence shadow wiring in funnel.route.
 
 Two things these tests pin harder than anything else in P1:
 * AMBIGUOUS carries ALL candidates and the node NEVER picks (8.1);
@@ -13,7 +13,6 @@ import logging
 import types
 
 import pytest
-from core.application.chat import qir  # noqa: F401 - import order sanity for seams
 from core.application.chat.intent_funnel import funnel, matcher
 from core.application.chat.intent_funnel.contract import (
     MATCH_AMBIGUOUS,
@@ -23,7 +22,10 @@ from core.application.chat.intent_funnel.contract import (
 )
 from core.application.chat.intent_funnel.registry import content_fingerprint
 from core.application.chat.intent_funnel.registry import entry as T
-from core.application.chat.intent_funnel.registry.entry import RegistryVersionView
+from core.application.chat.intent_funnel.registry.entry import (
+    RegistryLiveView,
+    derive_language,
+)
 from core.application.chat.understanding import (
     Complexity,
     Confidence,
@@ -32,23 +34,31 @@ from core.application.chat.understanding import (
 )
 
 
+def _q(i, text, *, position=0, standard_query_id=None):
+    return T.QueryRecord(id=f"q{i}", query=text, language=derive_language(text),
+                         position=position, standard_query_id=standard_query_id)
+
+
 def _entry(cid, *, tool="create_folder", standard="", synonyms=(), patterns=(),
            aliases=(), enabled=True, status="active", examples=("做个事",)):
+    std = [_q(1, standard)] if standard else []
+    sims = [_q(10 + n, s, standard_query_id="q1" if std else None)
+            for n, s in enumerate(synonyms)]
     return T.CapabilityEntry(
         capability_id=cid, tool_binding=tool, description="d",
-        standard_example=standard, synonym_examples=tuple(synonyms),
-        patterns=tuple(patterns), aliases=tuple(aliases), examples=tuple(examples),
+        standard_queries=tuple(std), similar_queries=tuple(sims),
+        patterns=tuple(patterns), aliases=tuple(aliases),
+        request_query_examples=tuple(examples),
         enabled=enabled, status=status,
     )
 
 
-def _view(entries, version=1, fingerprint=None):
-    return RegistryVersionView(
-        version=version, state="active",
+def _view(entries, fingerprint=None):
+    return RegistryLiveView(
         # content-derived like production: distinct entry sets NEVER share the
         # cache key (a constant fake here would poison the index cache cross-test)
         fingerprint=fingerprint or content_fingerprint(list(entries)),
-        capabilities=(), entries=entries,
+        entries=tuple(entries),
     )
 
 
@@ -83,8 +93,9 @@ def test_regex_patterns_and_aliases_are_inert_storage():
     assert matcher.match("建目录", _TF, v).state == MATCH_MISS
 
 
-def test_legacy_examples_are_not_match_data():
-    v = _view([_entry("cap-a", standard="新建文件夹", examples=("请创建一个文件夹",))])
+def test_request_examples_are_not_match_data():
+    v = _view([_entry("cap-a", standard="新建文件夹",
+                      examples=("请创建一个文件夹",))])
     assert matcher.match("请创建一个文件夹", _TF, v).state == MATCH_MISS
 
 
@@ -115,6 +126,20 @@ def test_disabled_and_deprecated_caps_are_never_matched():
     assert matcher.match("建个目录", _TF, v).state == MATCH_MISS
 
 
+def test_disabled_query_rows_are_not_match_data():
+    # row-level enablement lives in intent_corpus (enabled-only): a disabled
+    # Similar row must drop out of the exact table.
+    e = T.CapabilityEntry(
+        capability_id="cap-a", tool_binding="create_folder",
+        standard_queries=(_q(1, "新建文件夹"),),
+        similar_queries=(T.QueryRecord(id="q2", query="建个目录",
+                                       language="zh", enabled=False),),
+    )
+    v = _view([e])
+    assert matcher.match("建个目录", _TF, v).state == MATCH_MISS
+    assert matcher.match("新建文件夹", _TF, v).state == MATCH_HIT
+
+
 def test_ambiguous_carries_all_candidates_and_never_picks():
     # the SAME curated sentence registered under two capabilities — exact-only
     # AMBIGUOUS can only come from human curation overlap, never from regex.
@@ -134,12 +159,12 @@ def test_blank_query_misses_and_bad_legacy_regex_is_skipped_not_fatal():
     assert matcher.match("x", _TF, v).state == MATCH_HIT  # the corpus row still works
 
 
-def test_index_is_cached_per_version_fingerprint_pair():
-    v = _view([_entry("cap-a", standard="x")], version=1)
+def test_index_is_cached_per_content_fingerprint():
+    v = _view([_entry("cap-a", standard="x")])
     matcher._INDEX_CACHE.clear()
     first = matcher.build_index(v)
-    assert matcher.build_index(v) is first  # same (version, fingerprint) -> same object
-    v2 = _view([_entry("cap-a", standard="x", synonyms=("y",))], version=2)
+    assert matcher.build_index(v) is first  # same fingerprint -> same object
+    v2 = _view([_entry("cap-a", standard="x", synonyms=("y",))])
     assert matcher.build_index(v2) is not first  # different content -> new index
 
 
@@ -158,9 +183,6 @@ def _req():
 async def test_shadow_hook_is_inert_when_the_mode_switch_is_off(monkeypatch):
     from core.config import settings
 
-    # step 5 decoupled the two: even with QIR on, matcher_mode=off must leave
-    # the shadow node physically dark.
-    monkeypatch.setattr(settings, "chat_qir_enabled", True)
     monkeypatch.setattr(settings, "chat_matcher_mode", "off")
     calls = []
     monkeypatch.setattr(
@@ -195,10 +217,10 @@ async def test_shadow_logs_would_verdict_without_touching_routing(monkeypatch, c
     assert out is req  # byte-identical turn: the shadow cannot certify an action
     line = next(r.getMessage() for r in caplog.records if "matcher_shadow" in r.getMessage())
     assert "state=HIT" in line and "would_capability=cap-a" in line
-    # the 8.15 telemetry vocabulary
+    # the 8.15 telemetry vocabulary (live-table ruling: fingerprint, no version)
     assert "would_route=t" in line and "would_stage=matcher" in line
     assert "confidence=1.0" in line and "fallback_reason=-" in line
-    assert f"registry_version={view.fingerprint}" in line
+    assert f"registry_fingerprint={view.fingerprint}" in line
     assert "pattern=新建文件夹" in line  # which exact corpus sentence produced the HIT
     assert "agreement=matcher_only" in line  # Matcher hit, L0 abstained
 
@@ -288,12 +310,14 @@ async def test_shadow_agreement_match_and_mismatch(monkeypatch, caplog):
 # ── step 5: the tri-state switch + the 8.14 cost pin ─────────────────────────────
 
 async def test_mode_on_runs_shadow_semantics_with_a_warning(monkeypatch, caplog):
-    """ON is the P2 promotion: in P1 it must NEVER route — it runs shadow and
-    warns once so a mis-set switch is loud in the logs but inert in behavior."""
+    """ON is the P2 promotion: with the funnel gate closed it must NEVER route —
+    it runs shadow and warns once so a mis-set switch is loud in the logs but
+    inert in behavior."""
     from core.application.chat.intent_funnel import shadow
     from core.config import settings
 
     monkeypatch.setattr(shadow, "_warned_on", False)
+    monkeypatch.setattr(settings, "chat_funnel_enabled", False)
     monkeypatch.setattr(settings, "chat_matcher_mode", "on")
     view = _view([_entry("cap-a", standard="新建文件夹")])
 

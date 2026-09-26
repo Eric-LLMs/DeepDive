@@ -1,0 +1,29 @@
+# S5 Writing / Creation — LLM-native work; never a tool turn.
+scenario: S5_WRITING
+defaults: {viewer: {kind: none}, vrel: NO_VIEWER, intent: WRITING, difficulty: EASY}
+cases:
+  - id: polish
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '帮我把这段摘要润色一下,别太学术腔'}
+      - {q: '这句话帮我改得更口语化:"鉴于当前情形,吾辈需未雨绸缪"'}
+      - {q: '把上面回复改写成表格形式', intent: FOLLOW_UP, difficulty: MEDIUM, notes: "references prior assistant output: Agent-only capability"}
+  - id: compose
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '写一封委婉拒绝周五会议邀请的邮件'}
+      - {q: '给这个开源项目写一段 README 开头'}
+      - {q: '为这篇博客起五个标题,要克制点的'}
+      - {q: '用鲁迅的口吻吐槽一下周一早起'}
+      - {q: '把这段中文翻译成英文:意图漏斗的误执行风险远高于普通分类任务'}
+  - id: code
+    expected: {funnel: AGENT}
+    difficulty: MEDIUM
+    variants:
+      - {q: '写一个 python 函数,解析 typst 的 figure 块'}
+      - {q: '这段 SQL 为什么走不到索引?'}
+  - id: report-gen
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '帮我把这周的进展生成一份周报草稿'}
+      - {q: '总结成 100 字以内', intent: FOLLOW_UP, difficulty: MEDIUM}

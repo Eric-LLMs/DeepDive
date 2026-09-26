@@ -20,9 +20,9 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
-    PrimaryKeyConstraint,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -846,13 +846,15 @@ class RagFeedbackModel(Base):
 
 
 class CapabilityModel(Base):
-    """Intent Registry draft row (table ``capabilities``): the ONE editable source of
-    truth for routable capabilities (QIR P1). Runtime never reads this table directly —
-    publishing freezes the rows into an immutable ``registry_versions`` payload.
+    """Intent Registry capability row (table ``capabilities``, migration 0014):
+    INTENT INFORMATION ONLY. The query corpus lives in the sibling live tables
+    ``capability_standard_queries`` / ``capability_similar_queries`` /
+    ``capability_negatives`` — those ARE the runtime truth; there is no
+    Draft -> Publish -> Projection lane any more (final ruling 2026-09-26).
 
     No hard delete (lifecycle doctrine): retiring a capability means flipping
     ``status``/``enabled``; history and audit must keep referencing it. ``row_version``
-    is the optimistic-concurrency token for draft edits — a writer must present the
+    is the optimistic-concurrency token for edits — a writer must present the
     version it read, so two editors can never silently overwrite each other.
     """
 
@@ -864,19 +866,17 @@ class CapabilityModel(Base):
     capability_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     tool_binding: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # Matcher columns (deterministic match): exact/regex patterns + alias phrases.
+    # Legacy matcher columns: NOT routing corpus (Matcher truth = the live query
+    # tables). Kept only because the DB never dropped them; new writes leave them
+    # empty.
     patterns: Mapped[list] = mapped_column(JSONB, default=list)
     aliases: Mapped[list] = mapped_column(JSONB, default=list)
-    # Recall columns: positive examples (embedded) + negatives (contrast).
-    examples: Mapped[list] = mapped_column(JSONB, default=list)
-    negatives: Mapped[list] = mapped_column(JSONB, default=list)
-    # 0007 corpus tiers: the recall corpus is standard_example + synonym_examples
-    # + examples (candidate expressions), every sentence embedded independently.
-    standard_example: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    synonym_examples: Mapped[list] = mapped_column(JSONB, default=list)
+    # Card-context request examples ONLY (renamed from ``examples`` by 0014):
+    # never part of the Matcher/Recall corpus, never embedded.
+    request_query_examples: Mapped[list] = mapped_column(JSONB, default=list)
     # Canonical parameter schema for the Candidate Card (0007):
-    # {name: {type, description, required, max_len?}} — the publish gate is the
-    # only bridge to the runtime's DIRECT_TOOLS compat layer (no double truth).
+    # {name: {type, description, required, max_len?}} — validated against the
+    # live ToolRuntime schemas on the admin write path (no double truth).
     parameters: Mapped[dict] = mapped_column(JSONB, default=dict)
     # Argument binding slots: {arg: source} — see arg_slots enum ruling (P1 ②).
     arg_slots: Mapped[dict] = mapped_column(JSONB, default=dict)
@@ -898,15 +898,115 @@ class CapabilityModel(Base):
     )
 
 
-class RegistryVersionModel(Base):
-    """Immutable published Registry version (table ``registry_versions``).
+class CapabilityStandardQueryModel(Base):
+    """Live-table Runtime truth, one canonical query per (capability, language)
+    (migration 0014). ``embedding`` is NULL until the out-of-band backfill
+    (scripts/embed_corpus.py) fills it; recall predicates filter
+    ``embedding IS NOT NULL`` so the chain honestly reports RECALL_UNAVAILABLE
+    in the meantime. ``language`` is materialized (Han char -> zh else en),
+    never inferred at read time."""
 
-    One row per publish/rollback: ``payload`` is the full frozen capability set that
-    was validated and built into the active snapshot. ``version`` is monotonically
-    increasing; history rows are NEVER updated in place (state transitions and
-    activation timestamps aside) — rollback stages a NEW version that copies an old
-    payload and records ``source_version``. The DB enforces "at most one active" via
-    a partial unique index (see migration), so a swap can never leave two actives.
+    __tablename__ = "capability_standard_queries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    capability_id: Mapped[str] = mapped_column(
+        String, ForeignKey("capabilities.capability_id"), nullable=False
+    )
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    language: Mapped[str] = mapped_column(String, nullable=False)
+    embedding: Mapped[list | None] = mapped_column(Vector(settings.embedding_dim))
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("language IN ('zh', 'en')", name="capability_standard_queries_language_check"),
+        UniqueConstraint("capability_id", "language",
+                         name="capability_standard_queries_one_per_language"),
+        Index("capability_standard_queries_embedding_hnsw", "embedding",
+              postgresql_using="hnsw", postgresql_ops={"embedding": "public.vector_cosine_ops"}),
+    )
+
+
+class CapabilitySimilarQueryModel(Base):
+    """Live-table Runtime truth, one synonym sentence per row (migration 0014).
+    A Similar belongs to a Capability ONLY through its Standard Query (A3):
+    there is deliberately NO capability_id column — a second, drift-prone
+    relation is forbidden. ``language`` must equal its Standard's language."""
+
+    __tablename__ = "capability_similar_queries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    standard_query_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("capability_standard_queries.id"),
+        nullable=False,
+    )
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    language: Mapped[str] = mapped_column(String, nullable=False)
+    embedding: Mapped[list | None] = mapped_column(Vector(settings.embedding_dim))
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("language IN ('zh', 'en')", name="capability_similar_queries_language_check"),
+        Index("capability_similar_queries_embedding_hnsw", "embedding",
+              postgresql_using="hnsw", postgresql_ops={"embedding": "public.vector_cosine_ops"}),
+        Index("capability_similar_queries_standard_idx", "standard_query_id"),
+    )
+
+
+class CapabilityNegativeModel(Base):
+    """Card-boundary contrast sentences (migration 0014). Deliberately NO
+    embedding column: negatives never participate in Recall."""
+
+    __tablename__ = "capability_negatives"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    capability_id: Mapped[str] = mapped_column(
+        String, ForeignKey("capabilities.capability_id"), nullable=False
+    )
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    language: Mapped[str] = mapped_column(String, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("language IN ('zh', 'en')", name="capability_negatives_language_check"),
+    )
+
+
+class RegistryVersionModel(Base):
+    """Registry snapshot HISTORY (table ``registry_versions``).
+
+    Since migration 0014 the live tables are the runtime truth; the publish
+    chain that read these rows back is gone. Rows remain as audit history:
+    each admin write snapshots the pre-change content here (``payload``), and
+    ``state`` keeps the historical staged/active/failed/superseded values for
+    old rows only. Rollback = restore a snapshot + re-embed, not activation.
     """
 
     __tablename__ = "registry_versions"
@@ -991,54 +1091,6 @@ class ActionCatalogModel(Base):
     )
 
 
-class ActionQueryDraftModel(Base):
-    """Draft-Configuration head for a not-yet-registered action (migration 0011).
-    Pre-Registry only: these sentences are NEVER read by the Matcher, Recall or
-    any runtime component; registration copies them into a capabilities Draft row
-    and from there ONLY the publish lifecycle can build qir_examples."""
-
-    __tablename__ = "action_query_drafts"
-
-    action_key: Mapped[str] = mapped_column(String, primary_key=True)
-    updated_by: Mapped[str | None] = mapped_column(String)
-    # Pre-Registry parameter configuration (migration 0012). Same shape as the
-    # Registry ``parameters`` field (slot -> {type, description, required, ...}),
-    # so registration copies it 1:1 — no second parameter model.
-    parameters: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    # Binder argument-slot mapping, same shape as CapabilityEntry.arg_slots.
-    arg_slots: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-
-class ActionQueryDraftItemModel(Base):
-    """One sentence of a pre-Registry query draft. kind maps 1:1 onto the
-    Registry field it would become on register:
-    standard -> standard_example, similar -> synonym_examples, negative ->
-    negatives. position orders the list editors."""
-
-    __tablename__ = "action_query_draft_items"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
-    )
-    action_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
-    kind: Mapped[str] = mapped_column(String, nullable=False)
-    text: Mapped[str] = mapped_column(Text, nullable=False)
-    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-
 class ChatFunnelEventModel(Base):
     """One row per Intent-Funnel route decision (QIR P4, docs/temp.md 8.12).
 
@@ -1081,42 +1133,6 @@ class ChatFunnelEventModel(Base):
     __table_args__ = (
         Index("ix_chat_funnel_events_created_at", "created_at"),
         Index("ix_chat_funnel_events_execution_mode", "execution_mode"),
-    )
-
-
-class QirExampleModel(Base):
-    """The SQL Intent Query Library (migration 0009, Phase 3): one row per
-    curated sentence per published version — ``standard_example`` (kind
-    ``canonical``, index 0) and ``synonym_examples`` (``synonym``) via
-    ``CapabilityEntry.intent_corpus``, each with its own embedding. Legacy
-    ``examples`` have NO path into this table (ruling 2026-09-25).
-
-    The PRIMARY KEY is (qir_version, capability_id, example_index): every ANN
-    query carries the single-version predicate, so cross-version recall is
-    physically impossible. The active pointer itself rides ``app_settings`` and
-    the rows land in the SAME Build-Then-Swap transaction as the registry
-    version activation."""
-
-    __tablename__ = "qir_examples"
-
-    capability_id: Mapped[str] = mapped_column(Text, nullable=False)
-    example_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    kind: Mapped[str] = mapped_column(String, nullable=False)
-    language: Mapped[str] = mapped_column(String, nullable=False)
-    text: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list] = mapped_column(
-        Vector(settings.embedding_dim), nullable=False
-    )
-    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    qir_version: Mapped[str] = mapped_column(String, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    __table_args__ = (
-        PrimaryKeyConstraint("qir_version", "capability_id", "example_index"),
-        CheckConstraint("kind IN ('canonical', 'synonym')", name="qir_examples_kind_check"),
-        CheckConstraint("language IN ('zh', 'en')", name="qir_examples_language_check"),
-        Index("qir_examples_version_enabled_idx", "qir_version", "enabled"),
     )
 
 

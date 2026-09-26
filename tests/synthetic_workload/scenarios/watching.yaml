@@ -1,0 +1,47 @@
+# S2 Watching / Video — user watching a video asset.
+scenario: S2_WATCHING
+defaults: {vrel: GROUNDED_IN_VIEWER, intent: VIDEO_GROUNDED_QA}
+cases:
+  - id: video-grounded
+    viewer: {kind: video, asset_id: ast-ner-talk, title: "传统 NLP 技术盘点", current_page: 200}
+    difficulty: EASY
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '视频里讲的 BiLSTM-CRF 具体是怎么组合的?'}
+      - {q: '刚才 3 分 20 秒那张图说的是什么?'}
+      - {q: '视频里举的番茄例子想说明什么?'}
+  - id: video-beyond-ner
+    viewer: {kind: video, asset_id: ast-ner-talk}
+    difficulty: MEDIUM
+    intent: KNOWLEDGE_QA
+    vrel: RELATED_BUT_NOT_IN_VIEWER
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '视频里说传统 NLP 的 NER 已经过时了,NER 到底是什么?'}
+      - {q: 'NER 和 Transformer 有什么关系?'}
+      - {q: '那现在做实体识别的主流方法是什么?'}
+  - id: video-offtopic
+    viewer: {kind: video, asset_id: ast-tomato-class, title: "番茄品种分类"}
+    difficulty: MEDIUM
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '圣女果和大番茄是同一物种吗?'}
+      - {q: '这个 up 主以前还讲过什么系列?'}
+      - {q: '视频提到的这个种植方法适合阳台吗?'}
+  - id: video-tool-mention
+    viewer: {kind: video, asset_id: ast-tool-demo, title: "效率工具演示"}
+    difficulty: HARD
+    intent: HARD_NEGATIVE_VIEWER_TOOL_MENTION
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '视频里演示的自动建目录功能用的是哪个软件?', notes: "tool mentioned INSIDE viewer content — discussion, not execution"}
+      - {q: '这个教程的提取全文方法适合扫描版吗?'}
+  - id: video-into-tool
+    viewer: {kind: video, asset_id: ast-ner-talk}
+    difficulty: MEDIUM
+    intent: TOOL_ACTION
+    vrel: RELATED_BUT_NOT_IN_VIEWER
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    variants:
+      - {q: '看完这个视频学了不少,建个"NLP笔记"文件夹记录一下', args: {name: NLP笔记}}
+      - {q: '把视频里提到的 serendipity 加入我的词汇库', cap: cap-add-term, args: {term: serendipity, domain: 词汇库|NLP}}

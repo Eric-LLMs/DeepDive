@@ -628,69 +628,71 @@ class RouteUpsertRequest(BaseModel):
     is_active: bool = True
 
 
-# ── Intent Registry admin (QIR P1) ───────────────────────────────────────────────
+# ── Intent Registry admin (live tables, migration 0014) ─────────────────────────
 
-class RegistryDraftCreateRequest(BaseModel):
-    """One Draft capability row (the editable Registry source)."""
+class RegistryCapabilityCreateRequest(BaseModel):
+    """One LIVE capability row (intent information only — the query corpus is
+    edited through the query endpoints). Admin writes go live directly: there
+    is no Draft -> Publish lane any more. The create route snapshots the
+    pre-write content into registry_versions (history) and audits itself."""
 
     capability_id: str
     tool_binding: str
     description: str = ""
-    patterns: list[str] = []
+    patterns: list[str] = []  # legacy columns: NOT match data, new writes empty
     aliases: list[str] = []
-    examples: list[str] = []
-    negatives: list[str] = []
-    # 0007 chain ruling: the recall corpus is layered (standard -> synonyms ->
-    # legacy examples) and ``parameters`` is the CANONICAL argument schema.
-    standard_example: str = ""
-    synonym_examples: list[str] = []
+    request_query_examples: list[str] = []  # card context only
     parameters: dict = {}
     arg_slots: dict = {}
     permissions: str = ""
     execution_policy: str = "auto"
-    intent_kind: str = "action"  # action | private | web (P3; gate per kind)
-    enabled: bool = True
-    status: str = "active"
+    intent_kind: str = "action"  # action | private | web (gate per kind)
+    enabled: bool = False  # a fresh row is not routable until curated + enabled
+    status: str = "disabled"
     replacement_capability_id: str | None = None
 
 
-class RegistryDraftUpdateRequest(BaseModel):
-    """Partial edit; ``expected_row_version`` is the optimistic-concurrency token
-    the editor read with the row — a stale write is rejected (409), never merged."""
+class RegistryCapabilityUpdateRequest(BaseModel):
+    """Partial edit of the capability row; ``expected_row_version`` is the
+    optimistic-concurrency token the editor read with the row — a stale write
+    is rejected (409), never merged. Corpus sentences are NOT patchable
+    here (they live in the query plane, embed-then-write)."""
 
     expected_row_version: int
     patch: dict
-
-
-class RegistryPublishRequest(BaseModel):
-    note: str | None = None
 
 
 class RegistryRollbackRequest(BaseModel):
     note: str | None = None
 
 
-class RegistryQueryDraftRequest(BaseModel):
-    """Pre-Registry Draft Configuration for an Action-Catalog row (migration
-    0011). Field names mirror the Registry columns they become on an explicit
-    register: standard_example / synonym_examples / negatives. Saving this is
-    NEVER a publish — nothing here reaches capabilities/qir_examples by itself."""
+class RegistryStandardQueryRequest(BaseModel):
+    """Embed-then-write: the vector is produced BEFORE any row change; an
+    embedder failure aborts the whole modification."""
 
-    standard_example: str = ""
-    synonym_examples: list[str] = []
-    negatives: list[str] = []
+    query: str = Field(min_length=1, max_length=500)
+    position: int = 0
 
 
-class RegistryDraftParamsRequest(BaseModel):
-    """Pre-Registry parameter configuration (migration 0012). Same shapes as
-    the Registry capability fields they copy into on register: parameters
-    (slot -> spec) and arg_slots (Binder mapping). Storing a draft here is
-    NEVER a publish; the runtime tool schema is read live, never copied."""
+class RegistrySimilarQueryRequest(BaseModel):
+    standard_query_id: str
+    query: str = Field(min_length=1, max_length=500)
+    position: int = 0
 
-    parameters: dict = {}
-    arg_slots: dict = {}
+
+class RegistryNegativeQueryRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    position: int = 0
+
+
+class RegistryQueryTextRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+
+
+class RegistryQueryEnabledRequest(BaseModel):
+    enabled: bool
 
 
 class RegistryPreviewRouteRequest(BaseModel):
-    # §8.5 full-chain query dry-run; the chain reads the ACTIVE pair only.
+    # §8.5 full-chain query dry-run; the chain reads the LIVE tables only.
     query: str = Field(min_length=1, max_length=500)

@@ -6,7 +6,8 @@ it. Input discipline (8.17 #2/#3, Action-Contract ruling 2026-09-25): query +
 TurnFacts + candidate Cards, each Card assembled from the Registry row by
 capability_id: tool binding, tool description, the CANONICAL parameter schema
 with per-slot descriptions, the capability's SEMANTIC CONTOUR (query examples =
-intent corpus first + legacy registry examples, and negative examples), the
+intent corpus first + request_query_examples as card context, and negative
+examples), the
 provenance line (table-evidence label, or recall origin+score) and matched
 example. No tools list, no skills, no conversation history — and the reply is
 only {capability_id, confidence, arguments}.
@@ -67,7 +68,7 @@ def _params_block(entry) -> str:
 
 # Card-side guardrails (Action-Contract ruling 2026-09-25): the semantic
 # contour rides every card, but a curatorial runaway must not blow the small
-# model's window — positives (intent corpus first, legacy examples after) are
+# model's window — positives (intent corpus first, request examples after) are
 # capped at 8 lines, negatives at 6, and a truncation is LOUD in the log.
 _MAX_POSITIVE_EXAMPLES = 8
 _MAX_NEGATIVE_EXAMPLES = 6
@@ -91,10 +92,10 @@ def _contour_lines(entry) -> tuple[list[str], list[str]]:
     first — those ARE the sanctioned phrasings — then legacy registry examples
     labelled as context, not recall anchors. Truncated per the caps above."""
     positives = [f"- {s}" for s in entry.intent_corpus]
-    for ex in entry.examples or ():
+    for ex in entry.request_query_examples or ():
         s = str(ex or "").strip()
         if s:
-            positives.append(f"- {s} (registry examples)")
+            positives.append(f"- {s} (request examples, card context only)")
     if len(positives) > _MAX_POSITIVE_EXAMPLES:
         logger.warning("tool_intent: card %s carries %d positive examples; "
                        "truncated to %d", entry.capability_id, len(positives),
@@ -123,11 +124,12 @@ def build_prompt(query: str, candidates, entries_by_id: dict, *, facts=None) -> 
         if matched.startswith("re:"):
             # Defense in depth (Action-Contract ruling 2026-09-25): the Matcher
             # is exact-only now, a raw regex literal reaching a card is a
-            # regression — swap in the human-readable standard sentence.
+            # regression — swap in the canonical standard-query sentence.
             logger.warning("tool_intent: regex literal leaked into card %s "
-                           "(%r); replaced by standard_example",
+                           "(%r); replaced by the canonical standard query",
                            cand.capability_id, matched[:80])
-            matched = str(getattr(entry, "standard_example", "") or "")
+            matched = next((str(q.query) for q in entry.standard_queries
+                            if q.enabled), "")
         positives, negatives = _contour_lines(entry)
         lines = [
             f"### {entry.capability_id}",

@@ -1,7 +1,7 @@
-# §8.16 Golden Set — the publish-gate regression matrix for the Intent Funnel.
+# §8.16 Golden Set — the validation-gate regression matrix for the Intent Funnel.
 #
 # This is NOT an ad-hoc test list: it is the gate that Registry content and
-# node-strategy changes must pass before Publish/Rollout (8.16). Cases run
+# node-strategy changes must pass before Rollout (8.16). Cases run
 # under execution_mode="test" (8.14: batch cost never lands on a user).
 #
 # Coverage per 8.16: deterministic match / paraphrase+multilingual / negation /

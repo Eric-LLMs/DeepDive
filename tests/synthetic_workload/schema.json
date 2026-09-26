@@ -1,0 +1,139 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Delveta Intent Funnel synthetic workload — v1 record schema",
+  "description": "Two record kinds: query_case (L1, single turn) and session_trajectory (L2/L3, whole session). Labels are DESIGN ground truth (workload_design), never real-user statistics. Provenance fields are mandatory for that reason.",
+  "oneOf": [
+    {"$ref": "#/definitions/query_case"},
+    {"$ref": "#/definitions/session_trajectory"}
+  ],
+  "definitions": {
+    "viewer_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["none", "document", "video", "audio", "office"]},
+        "asset_id": {"type": "string"},
+        "title": {"type": "string"},
+        "current_page": {"type": ["integer", "null"]},
+        "selection": {"type": "string", "description": "selected text snippet, if any"},
+        "has_attachment": {"type": "boolean"}
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["funnel"],
+      "properties": {
+        "funnel": {"enum": ["TOOL", "AGENT", "AMBIGUOUS", "ABSTAIN"]},
+        "capability_id": {"type": ["string", "null"]},
+        "arguments": {"type": ["object", "null"], "description": "exact expected binding; null when not a TOOL row. Values may reference stable virtual ids."},
+        "state_delta": {"type": ["object", "null"], "description": "virtual-state mutation a certified TOOL turn applies (Virtual Shadow State only; real workspace untouched)"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"funnel": {"const": "TOOL"}}},
+          "then": {
+            "required": ["capability_id", "arguments"],
+            "properties": {
+              "capability_id": {"enum": ["cap-create-folder", "cap-add-term", "cap-pdf-extract-text"]}
+            }
+          }
+        }
+      ]
+    },
+    "turn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id", "turn_id", "user_query", "scenario_category", "intent_category",
+        "viewer_relation", "difficulty", "expected"
+      ],
+      "properties": {
+        "case_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$", "description": "stable forever; never recycled across versions"},
+        "turn_id": {"type": "integer", "minimum": 1},
+        "user_query": {"type": "string", "minLength": 1},
+        "assistant_response": {"type": "string", "description": "canned reply kept for realism/replay; NEVER fed to funnel nodes (input discipline)"},
+        "viewer_context": {"$ref": "#/definitions/viewer_context"},
+        "scenario_category": {
+          "enum": ["S1_READING", "S2_WATCHING", "S3_LEARNING", "S4_RESEARCH", "S5_WRITING",
+                   "S6_WORKSPACE", "S7_TOOL_ACTION", "S8_CHIT_CHAT", "S9_CONTEXT_DRIFT", "S10_LIFE_ASSISTANT"]
+        },
+        "intent_category": {
+          "enum": ["TOOL_ACTION", "KNOWLEDGE_QA", "CONTEXTUAL_QA", "DOCUMENT_GROUNDED_QA",
+                   "VIDEO_GROUNDED_QA", "BEYOND_VIEWER_QA", "RESEARCH", "WRITING", "FOLLOW_UP",
+                   "CHIT_CHAT", "CONTEXT_DRIFT", "LIFE_ASSISTANT",
+                   "HARD_NEGATIVE_CAPABILITY_MENTION", "HARD_NEGATIVE_TOOL_NAME_MENTION",
+                   "HARD_NEGATIVE_ASK_WHAT_TOOL_DOES", "HARD_NEGATIVE_HOW_TO_ACTION",
+                   "HARD_NEGATIVE_DISCUSSING_ACTION", "HARD_NEGATIVE_HYPOTHETICAL",
+                   "HARD_NEGATIVE_NEGATED", "HARD_NEGATIVE_CONDITIONAL",
+                   "HARD_NEGATIVE_AMBIGUOUS", "HARD_NEGATIVE_WRONG_TARGET",
+                   "HARD_NEGATIVE_DOC_REPORTS_ACTION", "HARD_NEGATIVE_QUOTED_ACTION",
+                   "HARD_NEGATIVE_DONT_EXECUTE", "HARD_NEGATIVE_DEFER_EXECUTE",
+                   "HARD_NEGATIVE_IF_I_WANT", "HARD_NEGATIVE_CAN_YOU",
+                   "HARD_NEGATIVE_FEATURE_QUESTION", "HARD_NEGATIVE_TOOL_AS_NOUN",
+                   "HARD_NEGATIVE_VIEWER_TOOL_MENTION", "HARD_NEGATIVE_DRIFT_TOOLISH"]
+        },
+        "viewer_relation": {
+          "enum": ["NO_VIEWER", "GROUNDED_IN_VIEWER", "RELATED_BUT_NOT_IN_VIEWER",
+                   "BEYOND_VIEWER", "UNRELATED_DRIFT"]
+        },
+        "difficulty": {"enum": ["EASY", "MEDIUM", "HARD", "ADVERSARIAL"]},
+        "expected": {"$ref": "#/definitions/expected"},
+        "notes": {"type": "string"}
+      }
+    },
+    "query_case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record", "case_id", "dataset_version", "provenance", "user_query",
+                   "scenario_category", "intent_category", "viewer_relation", "difficulty", "expected"],
+      "properties": {
+        "record": {"const": "query_case"},
+        "case_id": {"$ref": "#/definitions/turn/properties/case_id"},
+        "dataset_version": {"type": "string"},
+        "provenance": {"const": "workload_design"},
+        "session_id": {"type": "string"},
+        "turn_id": {"type": "integer"},
+        "conversation_history": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["role", "content"],
+            "properties": {"role": {"enum": ["user", "assistant"]}, "content": {"type": "string"}}
+          },
+          "description": "prior turns of the originating session; empty for true singletons"
+        },
+        "user_query": {"$ref": "#/definitions/turn/properties/user_query"},
+        "viewer_context": {"$ref": "#/definitions/viewer_context"},
+        "scenario_category": {"$ref": "#/definitions/turn/properties/scenario_category"},
+        "intent_category": {"$ref": "#/definitions/turn/properties/intent_category"},
+        "viewer_relation": {"$ref": "#/definitions/turn/properties/viewer_relation"},
+        "difficulty": {"$ref": "#/definitions/turn/properties/difficulty"},
+        "expected": {"$ref": "#/definitions/expected"},
+        "notes": {"type": "string"}
+      }
+    },
+    "session_trajectory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record", "session_id", "dataset_version", "provenance", "scenario_category",
+                   "goal", "initial_context", "viewer_context", "turns"],
+      "properties": {
+        "record": {"const": "session_trajectory"},
+        "session_id": {"type": "string", "pattern": "^sess-[a-z0-9-]+$"},
+        "dataset_version": {"type": "string"},
+        "provenance": {"const": "workload_design"},
+        "scenario_category": {"$ref": "#/definitions/turn/properties/scenario_category"},
+        "goal": {"type": "string", "description": "the user goal this fixed ground-truth trajectory enacts"},
+        "initial_context": {"type": "string"},
+        "viewer_context": {"$ref": "#/definitions/viewer_context"},
+        "turns": {
+          "type": "array", "minItems": 1,
+          "items": {"$ref": "#/definitions/turn"}
+        },
+        "notes": {"type": "string"}
+      }
+    }
+  }
+}

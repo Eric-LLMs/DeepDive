@@ -1,0 +1,65 @@
+# S1 Reading / Document — user reading a PDF/Markdown/Office document.
+scenario: S1_READING
+defaults: {vrel: GROUNDED_IN_VIEWER, intent: DOCUMENT_GROUNDED_QA}
+cases:
+  - id: doc-concept
+    viewer: {kind: document, asset_id: ast-nlp-survey, title: "NLP 综述:Transformer 之后", current_page: 4}
+    difficulty: EASY
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '综述里说的自注意力机制到底在算什么?'}
+      - {q: '这一页提到的 KV Cache 是什么意思?'}
+      - {q: '文档里的 "speculative decoding" 帮我解释一下'}
+  - id: doc-qa
+    viewer: {kind: document, asset_id: ast-nlp-survey, current_page: 7}
+    difficulty: EASY
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '这篇论文的三大贡献是什么?'}
+      - {q: '作者的实验设置是什么?用的什么数据集?'}
+      - {q: '第四节的结论和前文矛盾吗?'}
+  - id: doc-summary
+    viewer: {kind: document, asset_id: ast-nlp-survey}
+    difficulty: EASY
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '用三句话总结这篇综述'}
+      - {q: '总结一下这篇文章'}
+  - id: doc-compare
+    viewer: {kind: document, asset_id: ast-nlp-survey}
+    difficulty: MEDIUM
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '文中对比的 Dense 检索和稀疏检索各有什么优劣?'}
+      - {q: '这篇综述和我上次读的 RAG 论文观点一致吗?', vrel: RELATED_BUT_NOT_IN_VIEWER, intent: CONTEXTUAL_QA, notes: "cross-document reference: needs session context, still Agent work"}
+  - id: doc-beyond
+    viewer: {kind: document, asset_id: ast-nlp-survey}
+    difficulty: MEDIUM
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '论文说 MoE 是趋势,现在业界真的都在用 MoE 吗?', vrel: RELATED_BUT_NOT_IN_VIEWER, intent: BEYOND_VIEWER_QA}
+      - {q: '这篇综述没提 2026 年的新模型,它们算什么定位?', vrel: BEYOND_VIEWER, intent: BEYOND_VIEWER_QA}
+  - id: doc-followup
+    viewer: {kind: document, asset_id: ast-nlp-survey, current_page: 9}
+    difficulty: MEDIUM
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '第二段说的"它"指的是什么?', intent: CONTEXTUAL_QA}
+      - {q: '再详细讲讲刚才那个量化方法'}
+  - id: doc-tool-discussion
+    viewer: {kind: document, asset_id: ast-eng-guide, title: "工程实践指南"}
+    difficulty: HARD
+    intent: HARD_NEGATIVE_DOC_REPORTS_ACTION
+    vrel: GROUNDED_IN_VIEWER
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '文档里说要"新建一个 config 文件夹"来组织配置,这个建议适用于 python 项目吗?', notes: "action text INSIDE the document: discussion, not a command"}
+      - {q: '指南第 3 章的提取全文流程用的是什么工具?', notes: "tool content of the document, no execution requested"}
+  - id: doc-into-tool
+    viewer: {kind: document, asset_id: ast-nlp-survey}
+    difficulty: EASY
+    intent: TOOL_ACTION
+    vrel: NO_VIEWER
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    variants:
+      - {q: '这篇综述值得反复读,帮我建个"论文精读"文件夹', args: {name: 论文精读}, vrel: RELATED_BUT_NOT_IN_VIEWER, notes: "natural switch from reading to a self-contained tool action"}

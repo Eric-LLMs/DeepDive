@@ -288,8 +288,9 @@ flowchart TB
 
 **Chat control plane — a turn's full path from transport to a terminal answer.**
 `resolve_plan` keeps only the lifecycle: the pure L0 pass runs first, then a SINGLE
-`intent_funnel.route()` call owns all routing (shadow hook, the new Intent-Funnel
-single-hop cascade, and the legacy QIR lane), and `build_execution_plan` is the sole
+`intent_funnel.route()` call owns all routing (shadow hook + the Intent-Funnel
+single-hop cascade — the legacy QIR lane was retired with migration 0014), and
+`build_execution_plan` is the sole
 policy mapper. Every PlanKind has a registered executor, every certified fast path
 dispatches through the ONE shared execution waterfall, and every uncertifiable or
 pre-commit-failing turn falls back to the Agent byte-identical. C1–C4 name the failure
@@ -312,24 +313,21 @@ flowchart TB
     subgraph resolve["TurnOrchestrator.resolve_plan — lifecycle only; routing absorbed into intent_funnel.route() (P0 move)"]
         L0["L0 lexical facts · resolve_requirements<br/>sole exact matcher · in-process · no model call"]
         RT["intent_funnel.route(ctx, deps, requirements)<br/>shadow hook first (chat_matcher_mode off/shadow/on)<br/>· L0-certified turn passes through untouched"]
-        FN["NEW target lane — Intent Funnel single-hop (chat_funnel_enabled)<br/>Registry+index pair → Matcher → (Recall) → ONE ToolIntentModel call<br/>select + extract · ladder stub→local→online → Binder validate<br/>certified ACTION {capability_id · index-version TOCTOU stamp}"]
-        QIR["LEGACY lane — QIR cascade run_intent_stage (chat_qir_enabled)<br/>snapshot → semantic candidates (cosine · min_score · margin)<br/>→ bounded decision → RouteResult → Argument Binding (extractors)<br/>C1 miss → Agent · C2 integrity → ACTION marked TERMINAL"]
+        FN["Intent Funnel single-hop (chat_funnel_enabled)<br/>LIVE Registry tables → Matcher (exact-only) → (Recall) →<br/>ONE ToolIntentModel call select + extract ·<br/>ladder stub→local→online → Binder validate<br/>certified ACTION {capability_id · fingerprint TOCTOU stamp}"]
         MAP["build_execution_plan — sole policy mapper<br/>per-kind gates · sole-demand eligibility · source_policy"]
         L0 --> RT
         RT -- "funnel_live: master + action gate + guardrails.turn_veto<br/>(negation / research / handoff vetoes as code)" --> FN --> MAP
-        RT -- "else qir_live: L0 abstained · pure user text ·<br/>no web/memory/research/handoff" --> QIR --> MAP
-        RT -- "both dark / abstain — the ORIGINAL requirements object" --> MAP
+        RT -- "gate closed / abstain — the ORIGINAL requirements object" --> MAP
     end
 
     AUTH --> L0
-    FN -. "ABSTAIN — NO_CANDIDATE · TOOL_INTENT_REJECT / UNCERTAIN / TIMEOUT ·<br/>BIND_MISSING / AMBIGUOUS / INVALID · REGISTRY / RECALL_UNAVAILABLE ·<br/>VERSION_MISMATCH · KIND_DISABLED · CASCADE_TIMEOUT — byte-identical" .-> AG
-    QIR -. "ABSTAIN — no snapshot · low score · ambiguous · NONE · timeout ·<br/>store down · C1 args undeterminable (proven pre-body)" .-> AG
+    FN -. "ABSTAIN — TOOL_INTENT_REJECT / UNCERTAIN / TIMEOUT ·<br/>BIND_MISSING / AMBIGUOUS / INVALID · REGISTRY / RECALL_UNAVAILABLE ·<br/>VERSION_MISMATCH · KIND_DISABLED · CASCADE_TIMEOUT — byte-identical" .-> AG
 
     subgraph gates["Feature gates (config.py) — ALL default OFF · dark launch"]
-        GQ["chat_funnel_enabled (target chain master) + per-kind switches<br/>chat_funnel_private/web_enabled<br/>chat_qir_enabled · chat_qir_decision_enabled (legacy lane;<br/>decision gate off ⇒ similarity alone can never route)"]
+        GQ["chat_funnel_enabled (chain master) + per-kind switches<br/>chat_funnel_private/web_enabled<br/>(the legacy chat_qir_* set was deleted with migration 0014)"]
         GF["fast_paths_enabled (master switch)<br/>+ per-kind: direct · viewer · retrieval<br/>· action (5A) · composite (5B)<br/>closed ⇒ that PlanKind never maps"]
     end
-    GQ -. "gates route()'s two lanes" .-> RT
+    GQ -. "gates route()'s cascade lane" .-> RT
     GF -. "gates build_execution_plan · all closed ⇒ every turn maps to AGENT" .-> MAP
 
     MAP --> K{"PlanKind"}
@@ -347,7 +345,7 @@ flowchart TB
         RW -- ok --> OUT["tool output"]
     end
 
-    AEX -- "stage 0 registry_version re-validation (stale ⇒ C3) · stage 0.5 binding_integrity (C2 ⇒ TERMINAL) · stage 1 schema (C1 ⇒ Agent) · then the _run_tool seam = side-effect boundary" --> RW
+    AEX -- "stage 0 funnel_registry_version (fingerprint) re-validation (stale ⇒ C3) · stage 0.5 binding_integrity (C2 ⇒ TERMINAL) · stage 1 schema (C1 ⇒ Agent) · then the _run_tool seam = side-effect boundary" --> RW
     CEX --> RW
     AG -- "every agent tool call" --> RW
     REX -. "insufficient evidence (pre-commit) + honest-disclosure note" .-> AG
@@ -367,20 +365,23 @@ flowchart TB
 </details>
 
 > **Chat control-plane invariants** — a fast path takes only turns it can certify, and its demand
-> must be the *sole* demand; abstention leaves the user text byte-identical; both routing lanes
-> (new Intent-Funnel cascade, legacy QIR) produce routing metadata only — capability + version
-> stamp — and never execute or bind at the dispatch side; snapshots publish atomically and the
-> stamped version is re-validated before dispatch; C2/C3/C4 are terminal by contract — the Agent
-> clarifies user incompleteness (C1) and is never the recovery channel for system faults, decided
-> denials, or mid-write uncertainty.
-> Design: [architecture.md §24 — Chat Control Plane](architecture.md#24-chat-control-plane--plan-resolution-fast-paths--qir-intent-routing),
+> must be the *sole* demand; abstention leaves the user text byte-identical; the routing chain
+> (Intent-Funnel cascade over the LIVE Registry tables) produces routing metadata only —
+> capability + fingerprint stamp — and never executes or binds at the dispatch side; live-table
+> writes are atomic text+embedding and the
+> stamped fingerprint is re-validated before dispatch; C2/C3/C4 are terminal by contract — the
+> Agent clarifies user incompleteness (C1) and is never the recovery channel for system faults,
+> decided denials, or mid-write uncertainty.
+> Design: [architecture.md §24 — Chat Control Plane](architecture.md#24-chat-control-plane--plan-resolution-fast-paths--intent-routing),
 > [§25 — Chat Intent Funnel](architecture.md#25-chat-intent-funnel--nodeized-routing-toolintentmodel--shared-tool-runtime).
 
 **Intent Funnel — the single-hop routing chain end to end.** `funnel.route` runs inside plan
-resolution beside the legacy QIR lane: the Registry/index pair loads first, the Matcher consults
-the table only, Recall runs on any non-HIT and nominates candidates without adjudicating, at most
-ONE ToolIntentModel call selects the capability and drafts its arguments (the stub backend makes
-no model call and extracts nothing), and the Binder only validates against the Registry schema.
+resolution: the LIVE Registry tables load first, the Matcher consults
+the curated query corpus only (exact), Recall runs on any non-HIT and nominates candidates
+without adjudicating, exactly
+ONE ToolIntentModel call selects the capability and drafts its arguments (the stub backend is
+margin rules only — no model, no extraction), and the Binder only validates against the Registry
+schema.
 Every abstain, denial or fault exits fail-open to the Agent byte-identical; execution is
 never the funnel's — a certified turn dispatches through the same shared waterfall.
 
@@ -410,12 +411,12 @@ flowchart TB
 
         subgraph cascade["Single-hop cascade (wall-clock budget chat_funnel_timeout_seconds)"]
             direction TB
-            REG["Registry active view + paired Recall index<br/>(Build-Then-Swap pair — read together or not at all)<br/>missing ⇒ REGISTRY_UNAVAILABLE / RECALL_UNAVAILABLE"]
-            M["Node 1 · Matcher — table data only<br/>patterns/aliases · re: = regex search, else the whole<br/>normalized query must equal a literal<br/>negation guard before certifying (common layer)<br/>HIT · MISS · MATCH_AMBIGUOUS (all claimants up)"]
-            R["Node 2 · Recall — cosine top_k ≥ min_score<br/>quality-gate candidates ONLY, never adjudicates<br/>(origin=recall, calibrated score)"]
-            CAND["ONE candidate set, one convergence point<br/>matcher_hit 1.0 · matcher_ambiguous 0.0 — MERGED with<br/>recall (calibrated score wins shared ids) · empty ⇒ NO_CANDIDATE"]
+            REG["LIVE Registry tables (capabilities + query rows) —<br/>the routing truth, fingerprint-cached; Recall corpus index<br/>loads on the MISS lane<br/>missing ⇒ REGISTRY_UNAVAILABLE / RECALL_UNAVAILABLE"]
+            M["Node 1 · Matcher — EXACT-only over the live query corpus<br/>(enabled Standard + Similar rows; patterns/aliases are inert<br/>legacy storage, never read — ruling 2026-09-25)<br/>negation guard before certifying (common layer)<br/>HIT · MISS · MATCH_AMBIGUOUS (one sentence under two<br/>caps — all claimants up)"]
+            R["Node 2 · Recall — TWO independent vector searches<br/>(Standard + Similar rows, ONE query embedding)<br/>every hit ≥ min_score kept with provenance — quality gate,<br/>no merge/dedup, never adjudicates (origin=recall)"]
+            CAND["ONE candidate set, one convergence point<br/>matcher_hit 1.0 · matcher_ambiguous 0.0 ride alongside<br/>recall (floor-screened, capped at top_k) · empty set STILL<br/>reaches the model — NO_CANDIDATE retired (2026-09-25)"]
             TI["Node 3 · ToolIntentModel — at most ONE model call:<br/>select capability AND draft arguments<br/>chat_tool_intent_backend picks the chain:<br/>auto = local → online → stub (Unavailable falls through)<br/>stub = margin rules, NO model, NO extraction<br/>(arguments None ⇒ schema'd turns exit BIND_MISSING)"]
-            B["Node 4 · Binder.validate — pure schema gate<br/>Registry canonical parameters · extracts nothing<br/>COMPLETE / MISSING / INVALID<br/>(AMBIGUOUS wired in contract — no producer yet)"]
+            B["Node 4 · Binder.validate — pure schema gate<br/>Registry canonical parameters · extracts nothing<br/>COMPLETE / MISSING / AMBIGUOUS / INVALID<br/>(non-COMPLETE exits straight to the Agent, BIND_*)"]
             REG --> M
             M -- "any non-HIT: MISS / AMBIGUOUS" --> R --> CAND
             M -- "HIT" --> CAND
@@ -438,17 +439,16 @@ flowchart TB
     subgraph exits["Fail-open exits — reason codes carry the stage prefix"]
         direction LR
         AG["Agent fallback — ReactLoopAgent, full autonomy<br/>original query BYTE-IDENTICAL · never a<br/>side effect precedes the fallback"]
-        REASONS["NO_CANDIDATE · REGISTRY_UNAVAILABLE · RECALL_TIMEOUT /<br/>UNAVAILABLE · TOOL_INTENT_REJECT / UNCERTAIN / TIMEOUT ·<br/>REGISTRY_VERSION_MISMATCH · FUNNEL_KIND_DISABLED ·<br/>BIND_MISSING / AMBIGUOUS / INVALID ·<br/>CASCADE_TIMEOUT / CASCADE_ERROR"]
+        REASONS["REGISTRY_UNAVAILABLE · RECALL_TIMEOUT /<br/>UNAVAILABLE · TOOL_INTENT_REJECT / UNCERTAIN / TIMEOUT ·<br/>REGISTRY_VERSION_MISMATCH · FUNNEL_KIND_DISABLED ·<br/>BIND_MISSING / AMBIGUOUS / INVALID ·<br/>CASCADE_TIMEOUT / CASCADE_ERROR"]
         REASONS -.- AG
     end
-    CAND -- empty --> AG
     GATE2 -- "REJECT / UNCERTAIN" --> AG
     GATE2 -- CONFIDENT --> POST["post-verdict gates (funnel.py, between the<br/>verdict and the Binder): entry still in the active<br/>table? · kind_enabled? — deny ⇒ fail-open to Agent"]
     POST -. "REGISTRY_VERSION_MISMATCH /<br/>FUNNEL_KIND_DISABLED" .-> AG
     POST --> B
     B -- "not COMPLETE" --> AG
 
-    CERT["Certified ACTION turn — NEW TurnRequirements<br/>requested_action {tool, args, capability_id,<br/>index-version TOCTOU stamp, funnel_stage, funnel_kind,<br/>funnel_registry_version = Registry fingerprint}"]
+    CERT["Certified ACTION turn — NEW TurnRequirements<br/>requested_action {tool, args, capability_id,<br/>funnel_registry_version = Registry fingerprint<br/>(the single TOCTOU stamp), funnel_stage, funnel_kind}"]
     B -- COMPLETE --> CERT
     CERT --> EX["ActionExecutor._dispatch — the funnel executed NOTHING,<br/>the plan stage owns this: TOCTOU re-validate the stamped<br/>fingerprint / active entry / same tool / kind still ON<br/>(drift ⇒ decided TERMINAL, never an Agent retry) ·<br/>binding_integrity marker ⇒ TERMINAL · validate_action<br/>schema gate — malformed ⇒ proven pre-body, Agent clarifies"]
 

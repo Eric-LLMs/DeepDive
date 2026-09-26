@@ -93,7 +93,7 @@
   - [22.6 Recovery, reconcile & the worker path](#226-recovery-reconcile--the-worker-path)
   - [22.7 Trade-off & configuration](#227-trade-off--configuration)
 - [23. Viewer Context Provider — The Open Document as Reference Context](#23-viewer-context-provider--the-open-document-as-reference-context)
-- [24. Chat Control Plane — Plan Resolution, Fast Paths & QIR Intent Routing](#24-chat-control-plane--plan-resolution-fast-paths--qir-intent-routing)
+- [24. Chat Control Plane — Plan Resolution, Fast Paths & Intent Routing](#24-chat-control-plane--plan-resolution-fast-paths--intent-routing)
 - [25. Chat Intent Funnel — Nodeized Routing, ToolIntentModel & Shared Tool Runtime](#25-chat-intent-funnel--nodeized-routing-toolintentmodel--shared-tool-runtime)
 
 [↑ Back to top](#table-of-contents)
@@ -119,7 +119,7 @@
 | Async enrichment | gateway + arq worker split; `jobs` table is the source of truth; frontend polls `GET /jobs/{id}`; daily `session_events` retention cron in `WorkerSettings.cron_jobs`; `run_agent_turn` job reuses the shared `AgentKernel` composition (`apps/api/agent_factory.py`) for scheduled background turns; `toolkit_generate` runs the 5-stage toolkit pipeline (file mode → workspace output; session / cloud-file modes → caller's Cloud Drive, with a custom `prompt` + `name`) |
 | Session memory | PG-backed `sessions` / `messages` / `session_events`; **client Live State (summary + tail) is the normal-turn context source — zero SQL reads on hot turns**; threshold compaction folds raw rows into one 5-section structured summary behind a dual persistence barrier (`sessions.compaction` JSONB = durable checkpoint, revision CAS); per-session async write queue (one batch INSERT/turn); deferred finalize = incremental embed + first-time-only sidebar summary/title; trigger-gated proactive recall (Lane-1 brief always on) + RRF recency weighting + importance-weighted file recall + supersede-in-place user directives + 30-day audit-event retention — see [§22](#22-chat-session-memory-v2--client-live-state-authority--zero-read-turns) |
 | Migrations | single canonical init script `migrations/0001_init.sql` (final schema + reference seeds) applied once by the asyncpg runner (replaces Alembic); dev-time incremental migrations deliberately squashed |
-| Chat | agent loop with tool use, SSE streaming; over a pure control plane — `TurnOrchestrator` resolves every turn to one `ExecutionPlan` (DIRECT / VIEWER / LOCAL_RAG / ACTION / COMPOSITE / AGENT) through the three-stage pipeline QIR → Argument Binding → policy mapping, each fast path behind its own dark-launch switch (all default-off) and every fallback byte-identical to the Agent — [§24](#24-chat-control-plane--plan-resolution-fast-paths--qir-intent-routing); the nodeized **Intent Funnel** target chain (Matcher → Recall → ToolIntentModel → Binder) rides its own dark gate beside it — [§25](#25-chat-intent-funnel--nodeized-routing-toolintentmodel--shared-tool-runtime) |
+| Chat | agent loop with tool use, SSE streaming; over a pure control plane — `TurnOrchestrator` resolves every turn to one `ExecutionPlan` (DIRECT / VIEWER / LOCAL_RAG / ACTION / COMPOSITE / AGENT): the L0 lexical pass, then the nodeized **Intent Funnel** single-hop chain (Matcher → Recall → ToolIntentModel → Binder, §25) over the LIVE capability Registry, then policy mapping; each fast path behind its own dark-launch switch (all default-off) and every fallback byte-identical to the Agent — [§24](#24-chat-control-plane--plan-resolution-fast-paths--intent-routing), [§25](#25-chat-intent-funnel--nodeized-routing-toolintentmodel--shared-tool-runtime) |
 | Viewer context | chat answers about the **open viewer**: focus chip (file · page / playhead), ±20 s media-time subtitle window with video-only FOCUS / FULL / NONE classification and honest `too_large` / `unavailable` short-circuit, pinned selections / ROI / frames as explicit P0 context (image blocks carry the captured asset's id and ship a REQUIRED `vision` directive), clickable `[Vn]` citations; **documents are never intent-matched server-side** — every followed document reaches the model as a trusted **Viewer Access Context** stub (geometry-resolved current page) routing it to `read_document` page-scoped reads (`pages` spec, ACL-before-storage, ≤16 pages) with a post-turn `viewer.reads` trace incl. failed calls — zero changes to RAG / agent runtime / memory ([§23](#23-viewer-context-provider--the-open-document-as-reference-context), features.md *Desktop Workbench*) |
 | Research OS | tasks created atomically from the desktop chat (**＋ Research**): a cloud task folder under a picked My Drive parent — `materials/` / `outputs/` / `temp/` all guaranteed at creation — with live `task_spec.json` / `session_history.json` mirrors over authoritative scratch state; session isolation (research sessions bound 1:1 to a task, DB-marked `sessions.type=1`, hidden from the Sessions sidebar); 409-guarded cascade delete (RUNNING / RAG-INDEXED blocked, cloud folder → Trash, scratch hard-removed, bound type-1 sessions deleted); **server-owned runs** (`begin_run`/`end_run` mutex with stale-window crash recovery — a client disconnect no longer cancels a research turn) with `is_running` surfaced in every task view; `POST /research/tasks` + `GET/DELETE /research/tasks/{id}` + artifact read/promote API; **deterministic execution engine** — Python owns control flow through a 10-stage contract pipeline (`DISCOVER → FRAME → EVIDENCE → DESIGN → EXECUTE → EXPLAIN → WRITE → REVIEW → REPRODUCE → PUBLISH`) with repair-once bounded attempts, per-stage declared LLM call budgets + run-level turn/cost/no-progress caps, and guard gates at the transition fence: **strict** mode (default) parks a failed gate on a PENDING human override with zero rework on resume, lenient mode records it and continues; structural violations halt terminally (`BLOCKED`); lease-based crash recovery makes interrupted runs resumable; publication finality is the `PROMOTED` record (report + compiled PDF, optional slides via toolkit); desktop Research tab + two-layer chat header; web console read-only mirror — see [§17](#17-research-os-module), [§20](#20-research-execution-from-agent-driven-control-flow-to-a-deterministic-pipeline) |
 | Workflow core (`packages/workflow`) | domain-free run engine behind Research OS: declarative `workflow_spec` (transitions / activities / cap dimensions / hooks) + state machine with lease contest, crash recovery, retry, loop-cap grading and definition-drift detection; adapter pattern (ports + ledger/lease persistence supplied by the plugin) — [§19](#19-workflow-core-packagesworkflow) |
@@ -4532,7 +4532,7 @@ and the core compatibility invariant — a kernel turn without a viewer assembly
 
 [↑ Back to top](#table-of-contents)
 
-## 24. Chat Control Plane — Plan Resolution, Fast Paths & QIR Intent Routing
+## 24. Chat Control Plane — Plan Resolution, Fast Paths & Intent Routing
 
 **Idea.** Between the HTTP transport and the executors sits a *pure decision layer*: every turn
 resolves to exactly one `ExecutionPlan` (kind + reason + policy), and a kind maps to a registered
@@ -4550,22 +4550,25 @@ lexical pass `resolve_requirements` (L0, `understanding.py`) turns hard context 
 viewer / research / handoff) and narrow phrase patterns into `TurnRequirements` — the **sole exact
 matcher**, in-process, zero model calls. The stages then run in a fixed order:
 
-1. **(1) QIR — Query Intent Routing** (`core.application.chat.qir`). Runs only when L0 abstained
-   from an action certification, all relevant gates are live, and the turn is pure user text with
-   no web/memory demand and no research/handoff binding. Cascade: read the published snapshot →
-   **semantic candidates** (in-process cosine of the raw query against the snapshot's pre-built
-   example vectors; `min_score`, `margin`, `top_k` gates — an ambiguous head race abstains
-   *without spending the decision call*) → **decision adjudication** (one `complete_json` pass
-   choosing among the top candidates or `NONE`; negation, multi-capability ambiguity, a parameter
-   that would have to be *guessed*, and prompt-injection-shaped user text are all contractually
-   `NONE`; every model-side fault collapses to `NONE`). The output is only
-   `RouteResult{capability_id, registry_version}` — no arguments, no tool handle, no authority.
-   QIR is a *routing projection* of the capability registry, never a second planner or registry.
-2. **(2) Argument Binding** — `bind_arguments(capability.tool_binding, raw query, ctx)`
-   delegates to the **existing** `DIRECT_TOOLS` extractors (`actions.py`); the binding table stays
-   thin and singular (the regex extractors are today's implementation, not a permanent shape).
-   The negation guard `is_negated_request` is enforced at **both** defense layers (L0 match and
-   binding), so "不要新建文件夹「X」" can never certify an ACTION under any gate setting.
+1. **(1) Intent routing — the funnel** (`core.application.chat.intent_funnel`, §25). Runs only
+   when L0 abstained from an action certification, all relevant gates are live, and the turn is
+   pure user text with no web/memory demand and no research/handoff binding. Cascade: read the
+   LIVE Registry tables → **Matcher** (exact-only over the curated query corpus) → **Recall**
+   (two independent vector searches, quality-gated) → **ToolIntentModel** (ONE `complete_json`
+   pass selecting a capability from the candidate cards or `NONE`; negation, multi-capability
+   ambiguity, a parameter that would have to be *guessed*, and prompt-injection-shaped user text
+   are all contractually `NONE`; every model-side fault collapses to `NONE`) → **Binder**
+   (schema validation). The output is routing metadata only — capability, stage, kind, version
+   fingerprint — never an executor, tool handle, or authority. The legacy QIR snapshot lane
+   (a separate versioned `RouteResult` projection) was retired with migration 0014 — the live
+   tables are the *only* routing namespace.
+2. **(2) Argument Binding** — on the legacy L0 ACTION lane, `bind_arguments(capability.tool_binding,
+   raw query, ctx)` delegates to the **existing** `DIRECT_TOOLS` extractors (`actions.py`); the
+   binding table stays thin and singular (the regex extractors are today's implementation, not a
+   permanent shape). On the funnel lane the ToolIntentModel drafts the arguments and the Binder
+   validates them against the canonical Registry schema. The negation guard is enforced at
+   **both** defense layers (L0 match and funnel guardrail), so "不要新建文件夹「X」" can never
+   certify an ACTION under any gate setting.
 3. **(3) `build_execution_plan`** — the sole policy mapper, unchanged: it owns the feature gates,
    per-kind eligibility (a fast path takes a turn only when its demand is the *sole* demand;
    mixed demands stay on the Agent which arbitrates), and `source_policy`.
@@ -4577,15 +4580,16 @@ outcome and its location; in particular the Agent is never a recovery channel fo
 |---|---|---|---|
 | **C1** user-input incomplete | schema miss, args undeterminable (`bind_arguments → None`), domain 0-match / >1-match preflight | executor seam proves **pre-body** | `ActionPreflightFailure → EscalateToAgent` — the Agent multi-turns the clarification; pre-commit only |
 | **C2** internal binding / integrity | `unknown_tool`, `invalid_args` (registry/runtime divergence), capability binding missing, seam not wired, `ActionIntegrityFailure` | routing layer (stamped marker) or executor | **Terminal** honest message; the plan carries `binding_integrity` so even a stage-2 C2 ends at the executor, never via the Agent |
-| **C3** governance denial | approval refused / timed out, sandbox DENY, capability disabled; `registry_version` stale at dispatch — before the Commit Point with zero side effects it gets exactly ONE re-route against the current version, and only a second stale lands here; stale is NEVER an ordinary Agent fallback | `ToolRuntime.execute` waterfall / executor stage 0 | **Terminal** — a decided denial must not be re-asked; ASK short-circuits after a rule-level DENY |
+| **C3** governance denial | approval refused / timed out, sandbox DENY, capability disabled; `funnel_registry_version` stale at dispatch (fingerprint drift, entry disabled/deprecated, binding or kind-gate change) — the executor's TOCTOU check proves it **pre-body with zero side effects** and terminates honestly; stale is NEVER an ordinary Agent fallback | `ToolRuntime.execute` waterfall / executor stage 0 | **Terminal** — a decided denial must not be re-asked; ASK short-circuits after a rule-level DENY |
 | **C4** post-body failure | any other exception after the tool body was entered | executor catch-all | **STATE_UNKNOWN terminal** — one "could not be confirmed" message, **never** a blind Agent replay (that is how duplicate folders get made) |
 
 **Unified execution — one waterfall.** Fast paths hold no execution authority. An ACTION /
 COMPOSITE dispatch traverses the *same* `ToolRuntime.execute` the Agent would — pre-execute ASK →
 approval bridge → monotonic sandbox / source-policy guards → the real tool body — through the
 `_run_tool` seam injected into `ChatDeps`. `DIRECT_TOOLS` is the single allowlist shared by L0
-certification, argument binding, and QIR publication (a draft whose `tool_binding` is not an
-existing entry is **rejected at publish** — QIR cannot invent executables).
+certification, argument binding, and every Registry write (a capability whose `tool_binding` is
+not an existing entry is **rejected at the validation gate** — the funnel cannot invent
+executables).
 
 **Commit Point.** The first user-visible content delta locks the channel. `EscalateToAgent` is
 legal only before it; after it an error can only terminate the stream with a standardized event —
@@ -4603,19 +4607,20 @@ existing turn-context funnel — RAG failure escalates to the Agent, it does **n
 web; an explicit "if nothing, search the web" leaves no fence and the normal approval funnel
 governs.
 
-**Snapshot lifecycle — publication discipline.** The capability registry (ids, tool bindings,
-descriptions, positive/negative examples) plus its derived example embeddings form one immutable
-`Snapshot`, fingerprinted `qir1-<sha256[:12]>` over the capability set. Publication (`store.publish`)
-validates the draft, embeds **all** examples, and only then writes the two `app_settings` rows
-(`qir_version` marker + `qir_active` payload) inside a **single transaction** — a reader sees the
-old pair or the new pair, never a mix; any build failure raises before the session opens, so a bad
-draft can never become Active. Reads (`store.active`) never raise: a store fault degrades to
-`None` (routing abstains, the Agent is unaffected). Coherence across workers is a *version-marker
-cache*: the per-turn read compares the cheap marker against the cached payload, and the executor
-re-validates the stamped version immediately before dispatch (route/execute TOCTOU double check).
-`unpublish` removes the pair — routing abstains everywhere, an emergency stop with no deploy.
-Capability examples are platform-level routing metadata (no user content), so the registry is
-global by construction; per-tenant example sets would filter at candidate scoring.
+**Live-table write discipline (migration 0014, final ruling 2026-09-26).** The capability
+registry is no longer a *published projection* — the LIVE tables ARE the runtime truth:
+`capabilities` plus `capability_standard_queries` / `capability_similar_queries` /
+`capability_negatives`. An admin write goes live directly — no Draft, no Publish, no
+unpublish — and the write is **atomic text+embedding**: the corpus sentence and its vector land
+in the same transaction, so a route can never point at an unembedded row. Readers never raise: a
+store fault degrades to `None` (routing abstains, the Agent is unaffected). Coherence across
+workers is a *content-fingerprint cache*: the per-turn read compares the cheap
+`live1-<sha256[:12]>` fingerprint over the live rows against the cached view, and the executor
+re-validates the stamped fingerprint immediately before dispatch (route/execute TOCTOU double
+check). `registry_versions` keeps write-time **audit history only** — rollback restores a
+historical payload into the live tables and **re-embeds** it; history never serves traffic.
+Capability rows are platform-level routing metadata (no user content), so the registry is global
+by construction; per-tenant example sets would filter at candidate scoring.
 
 **Executor registry & structural Fail-Closed.** `DIRECT / VIEWER / LOCAL_RAG / ACTION / COMPOSITE /
 AGENT` are registered branches; **no WEB executor exists anywhere**, so a retrieval branch's
@@ -4625,24 +4630,24 @@ kind degrades to AGENT, never a hard fail.
 
 **Configuration** (`core/config.py`, all default `False` / conservative):
 `chat_fast_paths_enabled` (master) · `chat_direct_fast_path_enabled` · `chat_viewer_fast_path_enabled` ·
-`chat_retrieval_fast_path_enabled` · `chat_action_fast_path_enabled` · `chat_composite_fast_path_enabled` ·
-`chat_qir_enabled` · `chat_qir_decision_enabled` · `chat_qir_timeout_seconds` (2.5 s cascade wall-clock
-budget) · `chat_qir_top_k` (3) · `chat_qir_min_score` (0.82) · `chat_qir_margin` (0.06). Seeding /
-republishing the snapshot is an ops entry point: `scripts/seed_qir_snapshot.py [--check|--unpublish]`.
+`chat_retrieval_fast_path_enabled` · `chat_action_fast_path_enabled` · `chat_composite_fast_path_enabled`.
+The intent-routing stage brings its own gate set — see §25.13. Corpus maintenance is an ops
+entry point: `scripts/embed_corpus.py` re-embeds the live query tables against the pinned
+embedding profile (`app_settings.embedding_profile`).
 
-**Structural boundaries (test-enforced).** The `qir` package never imports `api.*` / `agent.*` and
-owns no execution, no authorization, no argument extraction, no second registry (an import-boundary
-scan asserts it per module); the SSE frame contract is unchanged so `apps/web` / `apps/desktop`
+**Structural boundaries (test-enforced).** The `intent_funnel` package never imports `api.*` /
+`agent.*` and owns no execution, no authorization, no second registry (an import-boundary scan
+asserts it per module); the SSE frame contract is unchanged so `apps/web` / `apps/desktop`
 need no adaptation; `apps/api` only supplies deps (`run_tool`, embedder, session factory).
 
 **Test doctrine.** `tests/p5_validation/` carries the post-implementation bench (216 cases:
 routing matrix, action phrasing, Layer-B dispatch through the **real** `/chat/stream` + sandbox
 funnel — assertions are about *capability outcomes* (was the folder created, how many times, did
 the Agent run) rather than mocked returns; legacy-comparison pins the dark-launch
-behavior-identity), and `tests/p5_validation/test_qir_routing.py` pins the frozen boundaries:
-cascade fail-open on every shape, `RouteResult` vocabulary (no args/tool attributes), publication
-atomicity + allowlist gate, route/execute double validation, the negation guard at both layers,
-stage-2 classification (C1 → Agent vs C2 → marked terminal), and the package import boundary.
+behavior-identity). The frozen routing boundaries (cascade fail-open, certified-turn vocabulary,
+write atomicity + allowlist gate, route/execute double validation, the negation guard at both
+layers, stage-2 classification C1 → Agent vs C2 → marked terminal) moved with the QIR lane into
+the funnel suites of §25.14.
 Contract suites: `test_chat_control_plane.py` (dark launch, per-kind gating, registry degradation),
 `test_chat_action_executor.py` / `test_chat_source_policy.py` (side-effect-boundary trichotomy,
 fencing semantics), `test_chat_direct_e2e / viewer / retrieval / composite` per branch.
@@ -4731,7 +4736,7 @@ Filter low-relevance queries
                          │
                          ▼
               Add validated Query
-              to synonym_examples
+              to the Similar rows
                          │
                          ▼
                   Re-embed Corpus
@@ -4773,7 +4778,7 @@ Threshold           ↓                 Action Recall ↑
 
 When a genuine Tool Action is missed, the preferred remediation is to add
 a validated natural-language Query to that capability's
-`synonym_examples`, rather than immediately lowering the global threshold.
+Similar Query rows, rather than immediately lowering the global threshold.
 
 This allows Delveta to progressively improve semantic coverage while
 keeping the candidate filtering boundary stable.
@@ -4783,7 +4788,7 @@ Over time:
 ```text
 More real-world Action Queries
             ↓
-More diverse synonym_examples
+More diverse Similar Query rows
             ↓
 Better semantic coverage
             ↓
@@ -4970,23 +4975,28 @@ per-kind gate in §25.11.
 
 Cascade body (`_run_nodes`, one wall-clock budget `chat_funnel_timeout_seconds`):
 
-1. **Registry + Index first** (the Build-Then-Swap pair, §8.3): read the active
-   view; no published table → `REGISTRY_UNAVAILABLE` exit. The index loads even
-   on the HIT lane — the certified turn stamps its version for the executor's
-   TOCTOU re-validation, and a Registry without its paired index is unusable in
-   any lane.
-2. **Matcher** (Node 1): `patterns`/`aliases` from the active row only
-   (`re:`-prefixed literals compile to regex, every other literal is an exact
-   normalized phrase; compiled index cached keyed by `(version, fingerprint)` —
-   a swapped version is a different cache key by construction). The negation
+1. **Registry + Index first** (live tables ARE the runtime truth, §25.5): read the
+   fingerprint-cached live view; no capability rows → `REGISTRY_UNAVAILABLE` exit.
+   On a Matcher MISS the Recall corpus index loads; an empty/unembedded corpus →
+   `RECALL_UNAVAILABLE` exit. (A HIT skips Recall but still spends the model call.)
+2. **Matcher** (Node 1): **exact-only** normalized lookup over the enabled
+   Standard + Similar query rows (`intent_corpus`); the legacy `patterns`/`aliases`
+   columns are INERT storage — the Matcher never reads them (Action-Contract ruling
+   2026-09-25). Lookup index cached keyed by the content fingerprint alone — a
+   swapped view is a different cache key by construction. The negation
    guard applies *before* a HIT can certify. States: `HIT` (one capability),
-   `MISS`, `MATCH_AMBIGUOUS` (carries ALL candidate ids upward — the Matcher
-   never picks).
+   `MISS`, `MATCH_AMBIGUOUS` (one curated sentence claimed by TWO capabilities —
+   the only ambiguity exact matching can produce; carries ALL candidate ids
+   upward — the Matcher never picks).
 3. **One candidate set, one convergence point**: a HIT enters the model with the
    same semantics as a Recall lane (`origin="matcher_hit"`, score 1.0); AMBIGUOUS
    escalates all claimants (`origin="matcher_ambiguous"`, score 0.0). Recall
-   (Node 2) runs only when the table missed; calibrated cosine scores win
-   provenance on merge. Empty candidate set → `NO_CANDIDATE` exit. The legacy
+   (Node 2) runs only when the table missed: **two independent vector searches**
+   (Standard rows + Similar rows) against ONE query embedding — no per-capability
+   merge, no dedup; every hit ≥ `chat_funnel_min_score` is KEPT with provenance
+   (quality gate, not a selector). An EMPTY candidate set still reaches the
+   model — `NO_CANDIDATE` is retired (2026-09-25): the honest exit of "nothing on
+   the table" is the model's own `NONE` → `TOOL_INTENT_REJECT`. The legacy
    direct-certification special path (Matcher HIT skipping the model) is deleted
    — both lanes are structurally identical, one model call each.
 4. **ToolIntentModel** (Node 3, `tool_intent/`): the ONE model call of the turn
@@ -5004,11 +5014,12 @@ Cascade body (`_run_nodes`, one wall-clock budget `chat_funnel_timeout_seconds`)
    capability the active table no longer honors → `REGISTRY_VERSION_MISMATCH`;
    a kind not switched on → `FUNNEL_KIND_DISABLED`.
 6. **Certified turn**: a *new* `TurnRequirements` carrying
-   `requested_action = {tool, args, capability_id, registry_version (= index
-   version, the executor's TOCTOU stamp), funnel_registry_version (= view
-   fingerprint), funnel_stage, funnel_kind}` — the same construction shape the
-   legacy ACTION branches use, so executors and the governance waterfall are
-   untouched.
+   `requested_action = {tool, args, capability_id, funnel_registry_version (= view
+   fingerprint, the executor's TOCTOU stamp), funnel_stage, funnel_kind}` —
+   the live-table ruling deleted the legacy index-version `registry_version`
+   stamp: the Registry content fingerprint is the ONE routing namespace. Same
+   construction shape the legacy ACTION branches use, so executors and the
+   governance waterfall are untouched.
 
 **Session object vocabulary**: the only conversation objects are a file
 explicitly open in the main-window viewer (say "summarize this page" and it
@@ -5021,10 +5032,10 @@ Node I/O lives in `contract.py` (frozen dataclasses; nodes speak nothing else):
 
 | Node | Input | Output | Discipline / replaceable point |
 |---|---|---|---|
-| **Matcher** | `query, TurnFacts, active view` | `MatchResult(HIT/MISS/MATCH_AMBIGUOUS, capability_id?, candidates, matched_literal)` | zero in-node business rules — table data only; global guards live in the funnel common layer; engine replaceable (exact → AC automaton → fastText prefilter) without touching the interface |
-| **Recall** | `index, query, top_k, min_score` | `RecallResult(Candidate(capability_id, score, matched_example, origin))` | **candidates only, never adjudicates** — thresholds are a *quality gate* (filter obvious garbage), "which one" belongs to the model; today in-process cosine over the platform-curated corpus, a vector DB / reranker later replaces this module alone |
+| **Matcher** | `query, TurnFacts, active view` | `MatchResult(HIT/MISS/MATCH_AMBIGUOUS, capability_id?, candidates, matched_literal)` | zero in-node business rules — table data only, EXACT over the enabled Standard+Similar rows (patterns/aliases are inert legacy storage); global guards live in the funnel common layer; engine replaceable (exact → AC automaton → fastText prefilter) without touching the interface |
+| **Recall** | `index, query, embedder, min_score` | `RecallResult(Candidate(capability_id, score, origin, matched_example, query_kind, language, query_id))` | **candidates only, never adjudicates** — two independent vector searches (Standard rows + Similar rows) over ONE query embedding, no merge/dedup, every hit ≥ the *quality gate* kept with per-row provenance; "which one" belongs to the model; today in-process cosine over the platform-curated corpus, a vector DB / reranker later replaces this module alone |
 | **ToolIntentModel** | `query, candidates, entries_by_id, TurnFacts` | `ToolIntentVerdict(CONFIDENT/UNCERTAIN/REJECT, capability_id, arguments)` | pluggable backend ladder `stub / local / online / auto(=local→online→stub)` via `chat_tool_intent_backend`; call discipline (8.17): thinking off, minimal card payload in, `{capability_id, confidence, arguments}` out — nothing more |
-| **Binder** | `entry, arguments` | `BoundArguments(COMPLETE/MISSING/AMBIGUOUS/INVALID, args)` | validates against the Registry schema; four states, never a naked `None` (§8.7); executes nothing (§8.8); `bind()` (plugin extraction) stays for the legacy L0/QIR lanes |
+| **Binder** | `entry, arguments` | `BoundArguments(COMPLETE/MISSING/AMBIGUOUS/INVALID, args)` | validates against the Registry schema; four states, never a naked `None` (§8.7); executes nothing (§8.8); `bind()` (plugin extraction) stays for the legacy L0 lane |
 
 `TurnFacts` carries the turn's already-resolved structured context
 (`has_attachment / viewer_asset_id / has_viewer / …`) — the Matcher contract was
@@ -5034,14 +5045,22 @@ lexical puzzle. Nodes never re-parse conversation history.
 **`CapabilityEntry`** (`registry/entry.py`) — one row per capability:
 
 ```python
-CapabilityEntry:
+CapabilityEntry:                          # hydrated from the LIVE rows (0014)
     capability_id: str              # e.g. "cap-create-folder"
-    tool_binding: str               # registered tool name; missing at publish -> rejected
+    tool_binding: str               # registered tool name; absent at write -> rejected
     description: str
-    patterns / aliases: tuple[str]  # Matcher literals ("re:"-prefixed = regex)
-    standard_example / synonym_examples / examples:  # layered recall corpus (0007):
-                                    # every sentence embedded on its own, all map back
-    negatives: tuple[str]           # counter-examples (publish gate: no deterministic conflict)
+    patterns / aliases: tuple[str]  # INERT legacy storage — the exact-only Matcher
+                                    # never reads them (ruling 2026-09-25)
+    standard_queries: tuple[QueryRecord]   # THE corpus: one row per sentence,
+    similar_queries: tuple[QueryRecord]    # UNIQUE(capability_id, language) on the
+                                    # Standard side; Similar rows FK to a Standard and
+                                    # must carry its language; language materialized by
+                                    # the frozen rule (Han char -> 'zh' else 'en')
+    request_query_examples: tuple[str]     # card context ONLY (renamed from
+                                    # ``examples``): never embedded, never match data
+    negatives: tuple[str]           # capability_negatives rows — card boundary
+                                    # context; never in Recall (validation gate:
+                                    # no deterministic conflict with the corpus)
     parameters: dict                # CANONICAL param schema — the Candidate Card and the
                                     # Binder both source from HERE (type/description/required/max_len)
     arg_slots: dict                 # slot -> source declaration, incl. "plugin:<name>" (8.1-b)
@@ -5052,24 +5071,26 @@ CapabilityEntry:
     row_version: int                # optimistic concurrency — silent overwrite impossible
 ```
 
-Publication discipline (§8.2–§8.4, `registry/store.py` + `registry/snapshot.py`
-+ `migrations/0002_registry.sql`):
+Live-table write discipline (`registry/store.py` + `registry/queries.py` +
+`registry/snapshot.py` + `migrations/0014_live_table_corpus.sql`):
 
 ```
-Draft → Validate → Preview (build outside any tx, zero writes)
-      → stage immutable registry_versions row → SHORT TRANSACTION atomic swap:
-          old active -> superseded | staged -> active | paired qir index version
-      → activated   (any build failure: staged -> FAILED, old pair keeps serving)
+Admin write → validate_entries (pure gate, zero writes)
+            → embed the sentence FIRST (profile-pinned)
+            → SHORT TRANSACTION: row + embedding land together (or nothing does)
+            → fingerprint shifts -> every worker's cached view is stale by key
 ```
 
-Monotonic versions, full history kept, **rollback mints a new version** (never
-rewrites history), a partial unique index makes a second active row a hard DB
-error. The publish gate refuses: a `tool_binding` absent from the runtime
-registry (the funnel can never invent an executable), an unknown
-`plugin:<name>` (validated against the `registry/plugins.py` roster), empty or
-unindexable recall corpus, deterministic pattern conflicts, a disabled
-capability becoming a new active route. `unpublish` pulls the pair — routing
-abstains everywhere, an emergency stop with no deploy.
+`registry_versions` records a write-time **snapshot for audit only** — routing never reads it.
+**Rollback = restore + re-embed**: a historical payload is written back into the live tables
+through the SAME gate and re-embedded against the current profile; history never serves
+traffic directly. The write gate refuses: a `tool_binding` absent from the runtime
+registry (the funnel can never invent an executable), an unknown `plugin:<name>`
+(validated against the `registry/plugins.py` roster), a Similar row whose language
+diverges from its Standard parent, a duplicate Standard for one (capability, language),
+a negative that deterministically collides with the corpus. A kind flip (`enabled`,
+`status`, per-kind switch) is the only emergency stop — routing abstains, an ordinary
+Agent turn, no deploy.
 
 **Extractor roster** (`registry/plugins.py`, ruling 8.1-b): the table registers
 *which* extractor a slot uses; the extractor bodies — the "look at context,
@@ -5177,11 +5198,15 @@ Reason codes carry their stage prefix (8.10; bare `AMBIGUOUS` is banned — it
 collides with `Confidence.AMBIGUOUS`):
 
 ```
-NO_CANDIDATE · MATCH_AMBIGUOUS · REGISTRY_UNAVAILABLE · RECALL_TIMEOUT · RECALL_UNAVAILABLE
+REGISTRY_UNAVAILABLE · RECALL_TIMEOUT · RECALL_UNAVAILABLE
 TOOL_INTENT_REJECT · TOOL_INTENT_UNCERTAIN · TOOL_INTENT_TIMEOUT
 REGISTRY_VERSION_MISMATCH · FUNNEL_KIND_DISABLED
 BIND_MISSING · BIND_AMBIGUOUS · BIND_INVALID · CASCADE_TIMEOUT · CASCADE_ERROR
 ```
+
+(`NO_CANDIDATE` is retired vocabulary — the Action-Contract ruling of 2026-09-25
+removed the empty-set exit; an empty candidate table is answered by the model's
+own `NONE` → `TOOL_INTENT_REJECT`.)
 
 Any funnel-internal fault ends: original query **byte-identical** → Agent —
 never after a side effect, never polluting conversation state, never dressing
@@ -5193,9 +5218,11 @@ Binder failures exit straight to the Agent with `BIND_*` reasons — the
 2026-09-23 "escalate for recheck" hop was deleted by the chain ruling after
 profiling showed the second call repeats the first verdict verbatim while
 costing a full second TTFB; the Agent's clarification loop is the recovery
-channel. **Stale dispatch is never ordinary Agent fallback**: pre-Commit-Point
-with zero side effects it gets exactly one re-route against the current
-version; a second stale is Terminal/C3 (§24 table, §8.9).
+channel. **Stale dispatch is never ordinary Agent fallback**: the executor's
+TOCTOU re-validation proves the drift **pre-body with zero side effects** and
+terminates honestly (C3, §24 table) — a routed turn never executes on blind
+trust, and a stale route is never replayed through the Agent (that is how
+duplicate folders get made).
 
 ### 25.8 Observability, Execution Modes & Shadow (§8.12, §8.14, §8.15)
 
@@ -5235,27 +5262,30 @@ usage lands `execution_mode=preview`.
 ```
 packages/core/application/chat/
 ├── turn_orchestrator.py            # turn lifecycle only; the funnel absorbs all
-│                                   #   intent/QIR orchestration:
+│                                   #   intent orchestration:
 │                                   #   context → funnel.route → plan → executor/runtime → lifecycle
 └── intent_funnel/                  # ★ the funnel — one decoupled package
     ├── funnel.py                   # pure chain orchestration + route()/cascade/preview
     ├── contract.py                 # node-to-node slips: MatchResult, Candidate,
     │                               #   RecallResult, ToolIntentVerdict, BoundArguments,
-    │                               #   IntentVerdict, AgentFallback, TurnFacts, reason codes
+    │                               #   TurnFacts, reason codes
     ├── guardrails.py               # §8.1-a system-wide vetoes (negation / context), code not data
     ├── registry/
-    │   ├── entry.py                #   CapabilityEntry + kinds + RE_PREFIX
-    │   ├── store.py                #   Draft/optimistic-concurrency; stage + activate primitives
-    │   ├── snapshot.py             #   Validate / Preview / Build-Then-Swap publish pipeline
+    │   ├── entry.py                #   CapabilityEntry + QueryRecord + RegistryLiveView
+    │   │                           #   + kinds + derive_language (frozen language rule)
+    │   ├── store.py                #   fingerprint-cached live view + capability-row edits
+    │   ├── queries.py              #   corpus writes: embed-then-write atomicity, per row
+    │   ├── catalog.py              #   runtime tool-schema projection over DIRECT_TOOLS
+    │   ├── snapshot.py             #   the pure validation gate in front of every write
     │   └── plugins.py              #   §8.1-b extractor roster (PLUGINS) + DirectToolSpec +
     │                               #   DIRECT_TOOLS; the DAG leaf of the funnel
-    ├── matcher/__init__.py         # Node 1
-    ├── recall/__init__.py          # Node 2
+    ├── matcher/__init__.py         # Node 1 — exact-only over intent_corpus
+    ├── recall/__init__.py          # Node 2 — dual vector search, quality gate, provenance
     ├── tool_intent/                # Node 3 (the Judge slot of the brief, post chain ruling)
     │   ├── __init__.py             #   ladder + verdict gate
     │   ├── base.py                 #   card payload + ToolIntentUnavailable
     │   ├── stub.py / local.py / online.py
-    ├── binder/__init__.py          # Node 4 (validate on the active path; bind for legacy lanes)
+    ├── binder/__init__.py          # Node 4 (validate on the active path; bind for the L0 lane)
     └── shadow.py                   # §8.15 dark-run telemetry
 ```
 
@@ -5270,16 +5300,17 @@ Legacy → node mapping (the P0 move, done):
 
 | Where it used to live | Now |
 |---|---|
-| `understanding.py` ACTION/DIRECT regexes | Registry `patterns` data + `matcher/` lookup code |
+| `understanding.py` ACTION/DIRECT regexes | Registry live query rows + `matcher/` exact lookup |
 | `actions.py` `match_direct_tool` | `matcher/` |
 | `actions.py` `_extract_create_folder / _extract_add_term` | `registry/plugins.py` (registered in the roster) |
 | `actions.py` `bind_arguments` / `validate_action` | `binder/` |
 | `understanding.py` negation / context vetoes | `guardrails.py` |
-| `turn_orchestrator.py` `_qir_intent_stage` | `funnel.py` (orchestrator is a pure caller) |
+| `turn_orchestrator.py` `_qir_intent_stage` | `funnel.py` (orchestrator is a pure caller; the QIR lane itself was deleted with migration 0014) |
 
 **Three standing constraints**: (1) nodes speak only through `contract.py`
 structures; (2) replacing any node's implementation (local model ↔ online,
-regex ↔ semantic) touches no other node; (3) the funnel never executes tools —
+exact ↔ automaton, cosine ↔ vector DB) touches no other node; (3) the funnel
+never executes tools —
 execution stays on the existing Shared Tool Runtime path. A fourth, added as
 the master constraint (2026-09-24): intent understanding must remain a
 **pluggable pipeline, never a merged black box** — structured contracts between
@@ -5287,25 +5318,26 @@ nodes with no shared internal state; each node carries its own switches and
 backend selection; each node is unit-testable against fake contracts; tuning
 one node's thresholds/model/prompt must leave every other node's tests and
 behavior untouched, and an implementation that cannot demonstrate that is an
-architecture violation to be split, not a detail to argue about. (The legacy
-QIR semantic layer entangling cosine scoring with adjudication is the named
-counter-example this unbundles.)
+architecture violation to be split, not a detail to argue about. (The retired
+QIR semantic layer — one function entangling cosine scoring with adjudication —
+is the named counter-example this unbundles.)
 
-### 25.10 Publish-Gate & Safety Digest (8.4 / 8.6 / 8.8)
+### 25.10 Write-Gate & Safety Digest (8.4 / 8.6 / 8.8)
 
 - **Lifecycle** — no hard deletes: `ACTIVE / DISABLED / DEPRECATED` +
-  optional `replacement_capability_id`; history, published snapshots and audits
+  optional `replacement_capability_id`; history, write-time snapshots and audits
   survive a disable. A disabled/deprecated capability is never an executable
   candidate; admin/audit views still see it (ruling 4, pinned in
   `test_intent_registry`).
-- **Publish validation** — the §25.5 checklist; any single failure refuses the
-  publish before anything is written.
+- **Write validation** — the §25.5 gate; any single failure refuses the
+  write before anything is committed.
 - **Safety boundary** — intent nodes never hold execution permission. The
   unified chain is
   `Intent / Agent → Capability → Auth → Argument Binding → Schema Validation →
   Execution Policy → Approval (if required) → Tool Runtime → State / Events /
-  Audit`; `IntentVerdict` may carry only
-  `capability_id · registry_version · routing stage · confidence · routing metadata`
+  Audit`; the certified `requested_action` slip may carry only
+  `capability_id · funnel_registry_version · funnel_stage · funnel_kind ·
+  confidence · routing metadata`
   — never an executor, a tool instance, or an authorization bypass.
 
 ### 25.11 Full Intent Space & Rollout (§6 / §8.19–§8.20)
@@ -5317,14 +5349,16 @@ widened kind carries its own rollout switch, default OFF —
 master gate + the plan-level action switch); an unknown kind routes nothing.
 Gray-release discipline per kind consumes Shadow data and the §8.16 Golden Set:
 registry/matcher/recall/tool-intent strategy changes must pass the golden
-regression (`tests/golden/intent_funnel_golden.yaml`) before publish or
-rollout; coverage spans deterministic matches, paraphrase/multilingual,
+regression (`tests/golden/intent_funnel_golden.yaml`) before rollout; coverage
+spans deterministic matches, paraphrase/multilingual,
 negation, ambiguity/multi-intent, missing parameters, viewer/attachment/memory
 context, private/web constraints, sequence dependence and Agent fallback.
 
 Stage discipline as executed: **P0** pure relocation (behavior byte-identical,
 contract-first with adapter wrappers); **P1** Registry data-ification +
-Draft/Publish/Version + Build-Then-Swap + Shadow delivered at P1 end; **P2**
+Draft/Publish/Version + Build-Then-Swap + Shadow delivered at P1 end (the
+Draft/Publish pipeline was later retired by the live-table ruling — migration
+0014 — leaving the validation gate and the write-time snapshots as audit); **P2**
 the four-node cascade behind `chat_funnel_enabled`, the uncertain-escalates
 correction, node-independent unit tests; **P3** full intent space (kind in the
 table, per-kind gates present and OFF); **P4** preview endpoint, golden gate,
@@ -5339,8 +5373,8 @@ adjudicated and written back into the text above:
 
 | # | The problem | The ruling | Lives in |
 |---|---|---|---|
-| **a** | "no hardcoded rules in a node" would also ban the safety guards | guards stay code in the funnel common layer, not table data; the config table is human-readable match patterns; what cannot be decided escalates and the model layers bottom out | 8.1 |
-| **b** | argument extractors' "look at context, abstain if wrong" judgement cannot be tabulated | the table registers `plugin:<name>` (which extractor); bodies stay code with roster/enable/version discipline owned by the Registry (publish validates membership); an extractor abstention escalates, it never jumps straight to the Agent | 8.1 |
+| **a** | "no hardcoded rules in a node" would also ban the safety guards | guards stay code in the funnel common layer, not table data; the config table is human-readable query corpus; what cannot be decided escalates and the model layers bottom out | 8.1 |
+| **b** | argument extractors' "look at context, abstain if wrong" judgement cannot be tabulated | the table registers `plugin:<name>` (which extractor); bodies stay code with roster/enable/version discipline owned by the Registry (the write gate validates membership); an extractor abstention escalates, it never jumps straight to the Agent | 8.1 |
 | **c** | parameter-failure: terminal refusal vs Agent clarification, drafted both ways | neither as drafted — non-COMPLETE exits toward the clarification channel, never an in-place "reject"; after the chain ruling the exit is the Agent itself (`BIND_*`), and anomalies after any commit stay C4 | 8.7 / 25.5 |
 | **d** | "three layers under 50 ms" was never measured | clause voided — no time limit for now; every node keeps recording latency; a future threshold ships as configuration from Shadow measurements, never as prose in this document | 8.13 |
 | **e** | who receives a multi-capability match was left unstated | upward with ALL candidates (Matcher → model); session objects are only the open viewer file or the session context — there is no "web page" candidate class | 8.1 / 25.2 |
@@ -5358,9 +5392,12 @@ chat_tool_intent_local_mode="prompt_json"
 chat_tool_intent_online_model/_base_url/_api_key=""   chat_tool_intent_timeout_seconds=4.0
 ```
 
-The `chat_funnel_*` knobs are deliberately INDEPENDENT of the legacy
-`chat_qir_*` set — the new chain is tuned on its own merits; the legacy QIR
-lane (§24) stays byte-identical while the funnel gate is closed.
+`chat_funnel_min_score` is the Recall **quality gate** (every hit ≥ it is kept —
+no top-k cut inside Recall, live-table ruling); `chat_funnel_top_k` caps only the
+model-facing candidate set (the floor-screened recall-origin slice; matcher
+candidates are exempt). The retired QIR lane's `chat_qir_*` set no longer exists
+(migration 0014) — this table is the whole routing knob surface, tuned on its own
+merits.
 
 ### 25.14 Test Doctrine
 
@@ -5373,9 +5410,13 @@ non-COMPLETE), `test_funnel_p3.py` (intent kinds + per-kind gates),
 `test_funnel_p4.py` (preview/golden/rollback surface), `test_golden_funnel.py`
 over `tests/golden/intent_funnel_golden.yaml`, `test_matcher_shadow.py`
 (shadow tri-state + agreement telemetry), `test_funnel_e2e.py` (authenticated
-full-chain legs), plus the control-plane suites of §24 unchanged. The
-chain-shape pins that make regressions loud: the recheck second hop is gone, a
-certified turn stamps the index version for TOCTOU, and fail-open returns the
+full-chain legs), `tests/synthetic_workload/` (the Phase-E shadow runner: whole
+workload replay through the production node body, offline threshold buckets
+recomputed from the captured raw lane), plus the control-plane suites of §24
+unchanged. The chain-shape pins that make regressions loud: the recheck second
+hop is gone, a certified turn stamps the Registry **content fingerprint** (the
+legacy index-version stamp is deleted) for TOCTOU, an empty candidate set still
+spends the one model hop, and fail-open returns the
 *same object* (identity assertion).
 
 [↑ Back to top](#table-of-contents)

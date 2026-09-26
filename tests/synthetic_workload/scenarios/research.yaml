@@ -1,0 +1,28 @@
+# S4 Research — research OS traffic.
+# ABSTAIN = entry-gate veto lane (research demand handoff): the cascade must not
+# even run. AGENT = research-ish questions the Agent answers directly.
+scenario: S4_RESEARCH
+defaults: {viewer: {kind: none}, vrel: NO_VIEWER, intent: RESEARCH, difficulty: MEDIUM}
+cases:
+  - id: research-light
+    expected: {funnel: AGENT}
+    variants:
+      - {q: 'Rust 和 Go 在后端场景怎么选?给点论据'}
+      - {q: '间隔重复记忆法真的有研究支持吗?'}
+      - {q: '这个假设有没有反例?帮我找找'}
+      - {q: '帮我对比一下 pgvector 和 milvus 的检索精度'}
+      - {q: '分析论文一般看哪几个部分?'}
+  - id: research-deep-veto
+    expected: {funnel: ABSTAIN}
+    difficulty: EASY
+    variants:
+      - {q: '开一个研究课题:系统综述 RAG 从 2020 到 2026 的演进', notes: "research OS handoff lane: entry gate vetoes, funnel never runs"}
+      - {q: '把这个题目立项跟踪起来,每周帮我推进'}
+      - {q: '启动深度研究:2026 年半导体的国产替代进展'}
+  - id: research-into-tool
+    intent: TOOL_ACTION
+    vrel: NO_VIEWER
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    difficulty: MEDIUM
+    variants:
+      - {q: '调研结果有点多,建个"课题资料"文件夹归拢一下', args: {name: 课题资料}}

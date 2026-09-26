@@ -1,17 +1,17 @@
-"""§8.16 Golden Set runner — executes the publish-gate matrix in
+"""§8.16 Golden Set runner — executes the validation-gate regression matrix in
 ``tests/golden/intent_funnel_golden.yaml`` against the REAL single-hop cascade
 (Matcher HIT / Recall -> ONE ToolIntentModel call -> Binder validate -> certified).
 
 Design of the fake world (kept deterministic on purpose — a golden that can
 flap is worse than no golden):
 
-* the Registry table carries exactly the four capabilities the matrix names:
-  ``cap-folder`` (exact standard sentence + curated synonyms; a legacy ``re:``
+* the LIVE table carries exactly the four capabilities the matrix names:
+  ``cap-folder`` (Standard query row + curated Similar rows; a legacy ``re:``
   pattern stays in storage as INERT proof — the exact-only Matcher (ruling
-  2026-09-25) never reads it; example vector [1,0]),
-  ``cap-vocab`` (own standard + the shared multi-intent synonym — two caps
+  2026-09-25) never reads it; corpus vector [1,0]),
+  ``cap-vocab`` (own Standard + the shared multi-intent Similar — two caps
   curating one sentence is what produces MATCH_AMBIGUOUS now),
-  ``cap-private`` / ``cap-web`` (exact standards behind widened kind gates);
+  ``cap-private`` / ``cap-web`` (exact Standards behind widened kind gates);
 * the embedder is a vector map: the two sanctioned paraphrases score 1.0
   against cap-folder, EVERYTHING else falls to [0.7,0.7] — cosine 0.707
   against either axis, under the 0.82 quality gate. Recall therefore never
@@ -41,8 +41,8 @@ import yaml
 from core.application.chat.intent_funnel import funnel
 from core.application.chat.intent_funnel.contract import (
     REASON_BIND_MISSING,
-    REASON_TOOL_INTENT_REJECT,
     REASON_KIND_DISABLED,
+    REASON_TOOL_INTENT_REJECT,
 )
 from core.application.chat.intent_funnel.registry import content_fingerprint
 from core.application.chat.intent_funnel.registry.entry import (
@@ -50,7 +50,9 @@ from core.application.chat.intent_funnel.registry.entry import (
     KIND_PRIVATE,
     KIND_WEB,
     CapabilityEntry,
-    RegistryVersionView,
+    QueryRecord,
+    RegistryLiveView,
+    derive_language,
 )
 from core.infrastructure.request_context import (
     get_request_execution_mode,
@@ -95,17 +97,23 @@ def _load_cases() -> list[dict]:
 CASES = _load_cases()
 
 
+def _q(qid, text, *, parent=None, position=0):
+    return QueryRecord(id=qid, query=text, language=derive_language(text),
+                       position=position, standard_query_id=parent)
+
+
 def _table() -> tuple[CapabilityEntry, ...]:
     return (
         CapabilityEntry(
             capability_id="cap-folder", tool_binding="create_folder",
             description="新建一个带引号名称的文件夹。",
-            standard_example=MSG_FOLDER,
-            synonym_examples=(MSG_BARE_FOLDER, MSG_MULTI_INTENT),
+            standard_queries=(_q("s1", MSG_FOLDER),),
+            similar_queries=(_q("m1", MSG_BARE_FOLDER, parent="s1", position=1),
+                             _q("m2", MSG_MULTI_INTENT, parent="s1", position=2)),
             # INERT legacy storage: the exact-only Matcher never reads these
             # (ruling 2026-09-25) — kept here so the goldens prove it
             patterns=("re:新建文件夹",), aliases=(MSG_FOLDER,),
-            examples=(MSG_FOLDER,),
+            request_query_examples=(MSG_FOLDER,),
             parameters={"name": {"type": "string", "required": True,
                                  "max_len": 120, "description": "folder name"}},
             arg_slots={"name": {"source": "user_input"}},
@@ -114,10 +122,10 @@ def _table() -> tuple[CapabilityEntry, ...]:
         CapabilityEntry(
             capability_id="cap-vocab", tool_binding="add_term",
             description="把一个词加入指定领域的词汇库。",
-            standard_example=MSG_VOCAB_EXAMPLE,
-            synonym_examples=(MSG_MULTI_INTENT,),
+            standard_queries=(_q("s2", MSG_VOCAB_EXAMPLE),),
+            similar_queries=(_q("m3", MSG_MULTI_INTENT, parent="s2"),),
             patterns=("re:加入我的.*词汇库",), aliases=(),
-            examples=(MSG_VOCAB_EXAMPLE,),
+            request_query_examples=(MSG_VOCAB_EXAMPLE,),
             parameters={"term": {"type": "string", "required": True,
                                  "max_len": 120, "description": "the term"},
                         "domain": {"type": "string", "required": True,
@@ -129,9 +137,8 @@ def _table() -> tuple[CapabilityEntry, ...]:
         CapabilityEntry(
             capability_id="cap-private", tool_binding="create_folder",
             description="在私有空间创建文件夹(演示 private kind 开关)。",
-            standard_example=MSG_PRIVATE,
+            standard_queries=(_q("s3", MSG_PRIVATE),),
             patterns=(), aliases=(),
-            examples=(),
             parameters={"name": {"type": "string", "required": True,
                                  "max_len": 120, "description": "folder name"}},
             arg_slots={"name": {"source": "user_input"}},
@@ -140,9 +147,8 @@ def _table() -> tuple[CapabilityEntry, ...]:
         CapabilityEntry(
             capability_id="cap-web", tool_binding="web_search",
             description="查询词源等外部知识(演示 web kind 开关)。",
-            standard_example=MSG_WEB,
+            standard_queries=(_q("s4", MSG_WEB),),
             patterns=(), aliases=(),
-            examples=(),
             parameters={"query": {"type": "string", "required": True,
                                   "max_len": 200, "description": "search request"}},
             intent_kind=KIND_WEB,
@@ -152,27 +158,26 @@ def _table() -> tuple[CapabilityEntry, ...]:
 
 def _view():
     entries = _table()
-    return RegistryVersionView(
-        version=1, state="active", fingerprint=content_fingerprint(list(entries)),
-        capabilities=(), entries=entries,
+    return RegistryLiveView(
+        fingerprint=content_fingerprint(list(entries)), entries=entries,
     )
 
 
 def _index():
-    # Build-Then-Swap side: only the two ACTION capabilities carry examples that
-    # were embedded; private/web are table-only (exact-alias) rows by design.
+    # the LIVE Recall corpus: only the two ACTION capabilities carry embedded
+    # rows; private/web are exact-Standard rows by design (backfill aside).
     return types.SimpleNamespace(
-        version="idx-9",
-        capabilities=[
-            types.SimpleNamespace(id="cap-folder", examples=(MSG_FOLDER,)),
-            types.SimpleNamespace(id="cap-vocab", examples=(MSG_VOCAB_EXAMPLE,)),
-        ],
-        example_vectors=[
-            types.SimpleNamespace(capability_id="cap-folder", example_index=0,
-                                  vector=[1.0, 0.0]),
-            types.SimpleNamespace(capability_id="cap-vocab", example_index=0,
-                                  vector=[0.0, 1.0]),
-        ],
+        version="corpus1-golden",
+        corpus=(
+            types.SimpleNamespace(
+                kind="standard", query_id="s1", capability_id="cap-folder",
+                query=MSG_FOLDER, language="zh", standard_query_id=None,
+                vector=[1.0, 0.0]),
+            types.SimpleNamespace(
+                kind="standard", query_id="s2", capability_id="cap-vocab",
+                query=MSG_VOCAB_EXAMPLE, language="zh", standard_query_id=None,
+                vector=[0.0, 1.0]),
+        ),
     )
 
 

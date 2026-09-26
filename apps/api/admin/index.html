@@ -3461,15 +3461,16 @@
         }
 
         // ───────────────────────── Intent Registry console ─────────────────────────
-        // IA (Action-Universe ruling 2026-09-25): Action Universe list → Action
-        // Detail (Overview / Queries / Negatives / Advanced / Versions).
-        // Four concepts, never conflated:
+        // IA (live-table ruling 2026-09-26): Action Universe list → Action Detail
+        // (Overview / Queries / Negatives / Advanced / History).
+        // Three concepts, never conflated:
         //   Universe  = action_catalog (every user-facing action; inventory only)
-        //   Registry  = capabilities Draft rows (registered, editable)
-        //   Funnel    = registered + published + routable in the ACTIVE version
-        //   Lifecycle = Draft -> Validate -> Publish ONLY; viewing/saving a query
-        //   draft never registers, publishes or writes the active index.
-        let regDrafts = [];     // capabilities Draft rows
+        //   Registry  = capabilities live rows — an edit IS the runtime truth
+        //   Funnel    = registered + enabled + active (gates permitting routing)
+        // There is no Draft → Validate → Publish lane any more: every write here
+        // is gated by server-side validation, snapshotted into history, audited,
+        // and goes live on the next turn.
+        let regCaps = [];       // live capabilities (payload shape + row_version)
         let regCatalog = [];    // Action Universe (catalog joined to Registry)
         let regToolSchemas = {};// runtime tool schemas: name -> {description, parameters}
         let regSel = null;      // selected action_key
@@ -3503,25 +3504,16 @@
           pdf_table_to_text: "Runtime integrity: WARNING — pdf_tools.py misses the *_tool.py auto-discovery glob; this binding may not be available in the production ToolRuntime (separate runtime task).",
         };
 
-        function regCorpusCounts(d) {
-          return {
-            std: (d.standard_example || "").trim() ? 1 : 0,
-            syn: (d.synonym_examples || []).filter((s) => s.trim()).length,
-            legacy: (d.examples || []).filter((s) => s.trim()).length,
-            neg: (d.negatives || []).filter((s) => s.trim()).length,
-          };
-        }
-
         async function renderRegistryPage() {
           content.innerHTML = "";
           try {
             const [c, d, ts] = await Promise.all([
               apiFetch("/admin/registry/catalog"),
-              apiFetch("/admin/registry/drafts"),
+              apiFetch("/admin/registry/capabilities"),
               apiFetch("/admin/registry/tool-schemas").catch(() => ({ tools: [] })),
             ]);
             regCatalog = c.actions || [];
-            regDrafts = d.drafts || [];
+            regCaps = d.capabilities || [];
             regToolSchemas = {};
             for (const t of ts.tools || []) regToolSchemas[t.name] = t;
           } catch (e) {
@@ -3544,7 +3536,7 @@
           const head = el("div", "page-head");
           const t = el("div");
           t.appendChild(el("h2", "", "Intent Registry"));
-          t.appendChild(el("div", "sub", "Action Universe — every user-facing Action that exists in the system. Agent/Chat availability is a runtime fact (ToolRuntime), independent of Registry/Funnel state: Agent-only actions are fully usable through Chat today. Registered + published + enabled actions ALSO route through the Intent Funnel (server gates permitting); listing them here registers nothing."));
+          t.appendChild(el("div", "sub", "Action Universe — every user-facing Action that exists in the system. Agent/Chat availability is a runtime fact (ToolRuntime), independent of Registry/Funnel state: Agent-only actions are fully usable through Chat today. Registered + enabled + active actions ALSO route through the Intent Funnel (server gates permitting); listing them here registers nothing."));
           head.appendChild(t);
           content.appendChild(head);
 
@@ -3576,20 +3568,17 @@
             tr.appendChild(td(descCell));
             tr.appendChild(td(a.tool_binding));
             tr.appendChild(td(badge(a.current_route, a.current_route === "funnel" ? "ok" : "")));
-            tr.appendChild(td(badge(a.registered ? (a.published ? "Active" : "Draft") : "Not registered",
-              a.registered ? (a.published ? "ok" : "accent") : "")));
+            tr.appendChild(td(badge(a.registered ? (a.registry_status === "active" && a.registry_enabled ? "Active" : a.registry_status) : "Not registered",
+              a.registered ? (a.registry_status === "active" && a.registry_enabled ? "ok" : "accent") : "")));
             tr.appendChild(td(badge(a.funnel, a.funnel === "enabled" ? "ok" : "")));
             const corpusCell = el("div");
             if (a.registered && a.registry_corpus) {
               const rc = a.registry_corpus;
-              corpusCell.appendChild(el("div", "", "std " + rc.standard + " · syn " + rc.similar + " · corpus " + (rc.standard + rc.similar)));
+              corpusCell.appendChild(el("div", "", "std " + rc.standard + " · sim " + rc.similar + " · corpus " + (rc.standard + rc.similar)));
               corpusCell.appendChild(el("div", "hint", "neg (card-only) " + rc.negatives));
               if (rc.standard + rc.similar === 0) corpusCell.appendChild(el("div", "hint", "⚠ NO query corpus"));
-            } else if (a.query_draft) {
-              const q = a.query_draft;
-              corpusCell.appendChild(el("div", "hint", "draft: std " + q.standard + " · sim " + q.similar + " · neg " + q.negative + " · not published"));
             } else {
-              corpusCell.appendChild(el("div", "hint", "— (no draft)"));
+              corpusCell.appendChild(el("div", "hint", "— (no capability row)"));
             }
             tr.appendChild(td(corpusCell));
             const btnCell = el("td");
@@ -3608,10 +3597,10 @@
               };
               btnCell.appendChild(tog);
             } else {
-              const en = el("button", "btn sm primary", "Enable in Intent Funnel");
+              const en = el("button", "btn sm primary", "Add to Registry");
               en.type = "button";
-              en.title = "Opens the Registry lifecycle: configure query draft → register (Draft) → validate → publish";
-              en.onclick = (ev) => { ev.stopPropagation(); openRegDetail(a.action_key, "queries"); };
+              en.title = "Create the capability row (born disabled); curate its Queries, then Enable to route";
+              en.onclick = (ev) => { ev.stopPropagation(); openRegDetail(a.action_key, "overview"); };
               btnCell.appendChild(en);
             }
             tr.appendChild(btnCell);
@@ -3619,7 +3608,7 @@
             tbody.appendChild(tr);
           }
           content.appendChild(wrap);
-          content.appendChild(el("div", "hint", "Enable/Disable flips the Draft flag only — it never deletes queries; it lands on the routing table at the next Publish. Funnel routing also requires the server-side gates."));
+          content.appendChild(el("div", "hint", "Enable/Disable flips the live capability row — immediate, no Publish step; it never deletes queries. Funnel routing also requires the server-side gates."));
         }
 
         function openRegDetail(key, tab) {
@@ -3632,8 +3621,8 @@
         // ── Sub page: Action Detail (registered or Agent-only) ──
         async function renderRegistryDetail() {
           const a = regCatalog.find((x) => x.action_key === regSel);
-          const draft = a.registered
-            ? regDrafts.find((d) => d.capability_id === a.capability_id) : null;
+          const cap = a.registered
+            ? regCaps.find((c) => c.capability_id === a.capability_id) : null;
 
           const back = el("button", "btn ghost", "← Back to Actions");
           back.type = "button";
@@ -3647,10 +3636,10 @@
           titleRow.style.cssText = "display:flex;gap:8px;align-items:center";
           titleRow.appendChild(el("h2", "", a.display_name));
           const stateBadge = a.registered
-            ? (a.registry_enabled && a.published ? "Enabled"
-              : (a.registry_enabled ? "Enabled (draft)" : "Disabled"))
+            ? (cap.enabled && cap.status === "active" ? "Enabled"
+              : (cap.enabled ? "Enabled (" + cap.status + ")" : "Disabled"))
             : "Agent-only";
-          titleRow.appendChild(badge(stateBadge, a.registered && a.registry_enabled ? "ok" : "accent"));
+          titleRow.appendChild(badge(stateBadge, a.registered && cap.enabled && cap.status === "active" ? "ok" : "accent"));
           t.appendChild(titleRow);
           t.appendChild(el("div", "sub", "Intent Registry / Actions / " + (a.capability_id || a.action_key)));
           head.appendChild(t);
@@ -3662,9 +3651,12 @@
             + (a.capability_id ? "  ·  Capability: " + a.capability_id : "");
           content.appendChild(meta);
 
-          const TABS = [["overview", "Overview"], ["queries", "Queries"], ["negatives", "Negatives"], ["advanced", "Advanced"]];
-          if (a.registered) TABS.push(["versions", "Versions"]);
-          if (!a.registered && !TABS.some((x) => x[0] === regTab)) regTab = "overview";
+          if (!a.registered) {
+            renderCatalogOverview(content, a);
+            return;
+          }
+          const TABS = [["overview", "Overview"], ["queries", "Queries"], ["negatives", "Negatives"], ["advanced", "Advanced"], ["history", "History"]];
+          if (!TABS.some((x) => x[0] === regTab)) regTab = "overview";
           const tabs = el("div", "tabs");
           for (const [key, label] of TABS) {
             const tab = el("div", "tab" + (regTab === key ? " active" : ""), label);
@@ -3675,236 +3667,109 @@
 
           const section = el("div");
           content.appendChild(section);
-          if (a.registered) {
-            if (regTab === "overview") renderRegOverview(section, a, draft);
-            else if (regTab === "queries") renderRegQueries(section, a, draft);
-            else if (regTab === "negatives") renderRegNegatives(section, draft);
-            else if (regTab === "advanced") await renderRegAdvanced(section, a, draft);
-            else await renderRegVersions(section);
-          } else {
-            if (regTab === "overview") renderCatalogOverview(section, a);
-            else if (regTab === "queries") await renderCatalogQueries(section, a, "queries");
-            else if (regTab === "negatives") await renderCatalogQueries(section, a, "negatives");
-            else await renderCatalogAdvanced(section, a);
-          }
+          if (regTab === "overview") renderRegOverview(section, a, cap);
+          else if (regTab === "queries") await renderRegQueries(section, cap);
+          else if (regTab === "negatives") await renderRegNegatives(section, cap);
+          else if (regTab === "advanced") await renderRegAdvanced(section, a, cap);
+          else await renderRegHistory(section);
         }
 
-        // ── Enable/Disable: draft flag only, never touches queries ──
+        // ── Enable/Disable: the live row, immediate; never touches queries ──
         async function regToggleEnabled(capabilityId, on) {
-          const draft = regDrafts.find((x) => x.capability_id === capabilityId);
-          if (!draft) return;
           await regPatch(capabilityId, {
             enabled: on,
             status: on ? "active" : "disabled",
-          }, "Enable/Disable changes the Draft row — it takes effect on the next Publish. Queries are untouched.");
+          }, "Live immediately — queries untouched. Routing also needs the server-side gates.");
         }
 
-        // ── Draft PATCH (registry rows only) with optimistic concurrency ──
+        // ── Capability PATCH (live row) with optimistic concurrency ──
         async function regPatch(capabilityId, patch, note) {
-          const draft = regDrafts.find((x) => x.capability_id === capabilityId);
+          const cap = regCaps.find((x) => x.capability_id === capabilityId);
           try {
-            await apiFetch("/admin/registry/drafts/" + encodeURIComponent(capabilityId), {
+            const res = await apiFetch("/admin/registry/capabilities/" + encodeURIComponent(capabilityId), {
               method: "PATCH",
-              body: JSON.stringify({ patch, expected_row_version: draft.row_version }),
+              body: JSON.stringify({ patch, expected_row_version: cap ? cap.row_version : 0 }),
             });
-            toast("Draft saved: " + capabilityId + (note ? " — " + note : ""), "ok");
+            const i = regCaps.findIndex((x) => x.capability_id === capabilityId);
+            if (i >= 0 && res && res.capability) regCaps[i] = res.capability;
+            toast("Saved (live): " + capabilityId + (note ? " — " + note : ""), "ok");
           } catch (e) {
             toast(e.message, "error");
           }
           await renderRegistryPage();
         }
 
-        function regListEditor(values, placeholder) {
-          const wrap = el("div");
-          const rows = [];
-          const addRow = (v) => {
-            const row = el("div", "kv-row");
-            const i = textInput(v || "", { placeholder });
-            i.style.flex = "1";
-            const del = el("button", "btn ghost", "✕");
-            del.type = "button";
-            del.onclick = () => { row.remove(); const k = rows.indexOf(i); if (k >= 0) rows.splice(k, 1); };
-            row.append(i, del);
-            wrap.appendChild(row);
-            rows.push(i);
-          };
-          (values || []).forEach(addRow);
-          const add = el("button", "btn ghost", "+ Add sentence");
-          add.type = "button";
-          add.onclick = () => addRow("");
-          wrap.appendChild(add);
-          return { node: wrap, get: () => rows.map((i) => i.value.trim()).filter(Boolean) };
+        function qcLang(s) { return /[一-鿿]/.test(s) ? "zh" : "en"; }
+
+        // ── Query-row editor helpers (live-table corpus plane) ──
+        // ONE sentence = ONE row = ONE write: text edits re-embed atomically
+        // server-side (embed-then-write); enable/disable and delete are row ops.
+        // The UI never batch-saves a corpus any more, mirroring the API.
+        async function qcWrite(url, opts, okMsg, onDone) {
+          try {
+            await apiFetch(url, opts);
+            toast(okMsg, "ok");
+            await onDone();
+          } catch (e) { toast(e.message, "error"); }
         }
 
-        // ── Query Corpus manager (Queries tab) — read-only-first ──
-        // Data model unchanged: standard_example + synonym_examples[] (the Exact
-        // Match + PGVector Recall corpus). Every query renders as READ-ONLY
-        // content; clicking a row's Edit puts ONLY that row in edit mode (textarea
-        // in place, Cancel / Save changes, Save disabled when unchanged). Saving
-        // persists, returns the row to read-only, and light-toasts — NO full page
-        // reload. onSave(std, sims) is the caller's persist hook (PATCH for
-        // Registry rows, PUT for pre-Registry catalog drafts); it must also update
-        // the caller's own cached data so a refresh shows the saved text.
-        function qcLang(s) { return /[一-鿿]/.test(s) ? "CN" : "EN"; }
-        function regQueriesView(container, { title, isDraft, standard, similar, onSave }) {
-          const root = el("div", "legacy-card");
-          let std = standard || "";
-          let sims = (similar || []).slice();
-          let editing = null;   // null | {kind:"std"} | {kind:"sim",idx} | {kind:"add"}
-          let busy = false;
-          const HELP = "Mechanism (read-only note): this corpus configures the Action's intent routing only. "
-            + (isDraft
-              ? "It is saved in the Action Catalog as a pre-Registry Draft Configuration — nothing reaches the active Registry, index or Funnel until Register → Validate → Publish."
-              : "It is saved on the capabilities Draft row — it reaches routing only after Validate → Publish.")
-            + " Editing here never registers, publishes or writes the active index.";
-
-          const render = () => {
-            root.innerHTML = "";
-            // Header (§9): corpus title > status badge > brief caption; mechanism prose folded into the ? tooltip (§10).
-            const head = el("div", "qc-head");
-            const t = el("div", "qc-title");
-            t.appendChild(el("span", "", title));
-            t.appendChild(badge(isDraft ? "Draft · Not Published" : "Registry · Draft", isDraft ? "warn" : "accent"));
-            const help = el("span", "qc-help", "?");
-            help.title = HELP;
-            t.appendChild(help);
-            head.appendChild(t);
-            head.appendChild(el("div", "qc-caption",
-              "Standard Query is the canonical anchor; Similar Queries are alternative natural phrasings. Together they form this Action's Query Corpus."));
-            root.appendChild(head);
-
-            const editRow = (actions) => {
-              const row = el("div", "qc-edit-actions");
-              for (const b of actions) row.appendChild(b);
-              return row;
+        function qcRow(row, { lang, text, embedded, enabled, onEditText, onToggle, onDelete, parent }) {
+          row.appendChild(el("span", "qc-lang", lang || qcLang(text)));
+          if (parent) row.appendChild(el("span", "hint", "↳ " + parent));
+          const cell = el("div", "qc-text-cell", text);
+          cell.style.cssText = "white-space:normal;flex:1";
+          row.appendChild(cell);
+          if (embedded === false) row.appendChild(el("span", "badge warn", "no vector — backfill"));
+          if (!enabled) row.appendChild(el("span", "badge", "disabled"));
+          if (onEditText) {
+            const edit = el("button", "btn ghost sm qc-edit-btn", "Edit");
+            edit.type = "button";
+            edit.onclick = () => {
+              cell.innerHTML = "";
+              const inp = textInput(text);
+              inp.style.flex = "1";
+              const save = el("button", "btn primary sm", "Save");
+              const cancel = el("button", "btn ghost sm", "Cancel");
+              save.type = cancel.type = "button";
+              cancel.onclick = () => { cell.textContent = text; };
+              save.onclick = () => onEditText(inp.value.trim(), () => { text = inp.value.trim(); cell.textContent = text; });
+              const rw = el("div", "row-actions"); rw.append(inp, save, cancel);
+              cell.appendChild(rw);
             };
-            const mkTextarea = (val, ph, oninput) => {
-              const ta = el("textarea");
-              ta.placeholder = ph;
-              ta.value = val;
-              ta.rows = 2;
-              if (oninput) ta.oninput = oninput;
-              requestAnimationFrame(() => ta.focus());
-              return ta;
+            row.appendChild(edit);
+          }
+          if (onToggle) {
+            const tg = el("button", "btn ghost sm", enabled ? "Disable" : "Enable");
+            tg.type = "button";
+            tg.onclick = () => onToggle(!enabled);
+            row.appendChild(tg);
+          }
+          if (onDelete) {
+            let armed = false;
+            const del = el("button", "btn ghost sm", "✕");
+            del.type = "button";
+            del.onclick = async () => {
+              if (!armed) { armed = true; del.textContent = "Sure?"; del.className = "btn danger sm"; return; }
+              await onDelete();
             };
+            row.appendChild(del);
+          }
+          return row;
+        }
 
-            // ── Standard Query card (§4) ──
-            const stdCard = el("div", "qc-standard" + (editing && editing.kind === "std" ? " qc-editing" : ""));
-            if (editing && editing.kind === "std") {
-              const body = el("div", "qc-edit-area");
-              const lbl = el("div", "qc-label", "Edit Standard Query");
-              body.appendChild(lbl);
-              const ta = mkTextarea(std, "standard query (canonical sentence)", () => {
-                saveBtn.disabled = busy || ta.value.trim() === std.trim() || !ta.value.trim();
-              });
-              const cancel = el("button", "btn ghost", "Cancel");
-              cancel.type = "button";
-              cancel.onclick = () => { editing = null; render(); };
-              const saveBtn = el("button", "btn primary", "Save changes");
-              saveBtn.type = "button";
-              saveBtn.disabled = true;
-              saveBtn.onclick = async () => {
-                const v = ta.value.trim();
-                if (!v || v === std) return;
-                busy = true; saveBtn.disabled = true;
-                try { await onSave(v, sims); std = v; editing = null; busy = false; render(); toast("Query updated", "ok"); }
-                catch (e) { busy = false; saveBtn.disabled = false; toast("Save failed: " + e.message, "error"); }
-              };
-              body.append(ta, editRow([cancel, saveBtn]));
-              stdCard.appendChild(body);
-            } else {
-              const body = el("div", "qc-std-body");
-              const lbl = el("div", "qc-label");
-              lbl.append(el("span", "", "Standard Query"), badge("Canonical", "accent"));
-              body.appendChild(lbl);
-              body.appendChild(el("div", "qc-text", std || "— not set —"));
-              const edit = el("button", "btn ghost sm qc-edit-btn", "Edit");
-              edit.type = "button";
-              edit.onclick = () => { editing = { kind: "std" }; render(); };
-              stdCard.append(body, edit);
-            }
-            root.appendChild(stdCard);
-
-            // ── Similar Queries: count + add in section header (§7, §8) ──
-            const bar = el("div", "qc-section-bar");
-            const cnt = el("div", "qc-count");
-            cnt.appendChild(el("span", "", "Similar Queries "));
-            cnt.appendChild(el("span", "n", "· " + sims.length));
-            bar.appendChild(cnt);
-            const addBtn = el("button", "btn ghost sm", "+ Add Similar Query");
-            addBtn.type = "button";
-            addBtn.disabled = !!editing;
-            addBtn.onclick = () => { editing = { kind: "add" }; render(); };
-            bar.appendChild(addBtn);
-            root.appendChild(bar);
-            root.appendChild(el("div", "qc-list-caption", "Alternative phrasings of the same intent — stored as synonyms of the Standard Query."));
-
-            const list = el("div");
-            sims.forEach((s, idx) => {
-              if (editing && editing.kind === "sim" && editing.idx === idx) {
-                const row = el("div", "qc-row qc-editing");
-                const area = el("div", "qc-edit-area");
-                const ta = mkTextarea(s, "similar query", () => {
-                  saveBtn.disabled = busy || !ta.value.trim() || ta.value.trim() === s.trim();
-                });
-                const cancel = el("button", "btn ghost", "Cancel");
-                cancel.type = "button";
-                cancel.onclick = () => { editing = null; render(); };
-                const saveBtn = el("button", "btn primary", "Save changes");
-                saveBtn.type = "button";
-                saveBtn.disabled = true;
-                saveBtn.onclick = async () => {
-                  const v = ta.value.trim();
-                  if (!v || v === s) return;
-                  const next = sims.slice(); next[idx] = v;
-                  busy = true; saveBtn.disabled = true;
-                  try { await onSave(std, next); sims = next; editing = null; busy = false; render(); toast("Query updated", "ok"); }
-                  catch (e) { busy = false; saveBtn.disabled = false; toast("Save failed: " + e.message, "error"); }
-                };
-                area.append(ta, editRow([cancel, saveBtn]));
-                row.appendChild(area);
-                list.appendChild(row);
-                return;
-              }
-              const row = el("div", "qc-row");
-              row.appendChild(el("span", "qc-num", String(idx + 1).padStart(2, "0")));
-              row.appendChild(el("span", "qc-lang", qcLang(s)));
-              row.appendChild(el("div", "qc-text-cell", s));
-              const edit = el("button", "btn ghost sm qc-edit-btn", "Edit");
-              edit.type = "button";
-              edit.onclick = () => { editing = { kind: "sim", idx }; render(); };
-              row.appendChild(edit);
-              list.appendChild(row);
-            });
-            if (editing && editing.kind === "add") {
-              const row = el("div", "qc-row qc-editing");
-              const area = el("div", "qc-edit-area");
-              const ta = mkTextarea("", "new similar query (Chinese or English)", () => {
-                addBtn2.disabled = busy || !ta.value.trim();
-              });
-              const cancel = el("button", "btn ghost", "Cancel");
-              cancel.type = "button";
-              cancel.onclick = () => { editing = null; render(); };
-              const addBtn2 = el("button", "btn primary", "Add Query");
-              addBtn2.type = "button";
-              addBtn2.disabled = true;
-              addBtn2.onclick = async () => {
-                const v = ta.value.trim();
-                if (!v) return;
-                const next = sims.concat([v]);
-                busy = true; addBtn2.disabled = true;
-                try { await onSave(std, next); sims = next; editing = null; busy = false; render(); toast("Query added", "ok"); }
-                catch (e) { busy = false; addBtn2.disabled = false; toast("Save failed: " + e.message, "error"); }
-              };
-              const newLbl = el("div", "qc-new-badge", "New Similar Query");
-              area.append(newLbl, ta, editRow([cancel, addBtn2]));
-              row.appendChild(area);
-              list.appendChild(row);
-            }
-            root.appendChild(list);
+        function qcAddRow(ph, label, onSubmit) {
+          const row = el("div", "kv-row");
+          const inp = textInput("", { placeholder: ph });
+          inp.style.flex = "1";
+          const btn = el("button", "btn primary sm", label);
+          btn.type = "button";
+          btn.onclick = async () => {
+            const v = inp.value.trim();
+            if (!v) return;
+            await onSubmit(v, () => { inp.value = ""; });
           };
-          render();
-          container.appendChild(root);
+          row.append(inp, btn);
+          return { row, input: inp };
         }
 
         // ── Read-only projection of the LIVE runtime tool schema ──
@@ -3935,25 +3800,25 @@
           container.appendChild(wrap);
         }
 
-        // ── Overview (registered) ──
-        function renderRegOverview(container, a, draft) {
+        // ── Overview (registered): the LIVE capability row ──
+        function renderRegOverview(container, a, cap) {
           const card = el("div", "legacy-card");
-          card.appendChild(el("div", "section-title", "Registry Draft — " + draft.capability_id));
+          card.appendChild(el("div", "section-title", "Capability (live) — " + cap.capability_id));
           const kv0 = (k, v) => card.appendChild(el("div", "hint", k + ": " + v));
-          kv0("Agent / Chat", regChatAvail(draft.tool_binding));
-          kv0("Registry", (a.published ? "Registered — published" : "Registered — draft") + " · " + (a.registry_enabled ? "enabled" : "disabled"));
+          kv0("Agent / Chat", regChatAvail(cap.tool_binding));
+          kv0("Registry", "Registered — live row · " + cap.status + " · " + (cap.enabled ? "enabled" : "disabled"));
           kv0("Intent Funnel", a.funnel);
           kv0("Funnel registration eligibility", regFunnelEligibility(a));
-          card.appendChild(el("div", "section-sub", "Draft fields"));
-          const idIn = textInput(draft.capability_id); idIn.disabled = true;
-          const tool = textInput(draft.tool_binding);
-          const desc = el("textarea"); desc.rows = 3; desc.value = draft.description || "";
-          const kind = select([{ label: "action", value: "action" }, { label: "private", value: "private" }, { label: "web", value: "web" }], draft.intent_kind);
-          const status = select([{ label: "active", value: "active" }, { label: "disabled", value: "disabled" }, { label: "deprecated", value: "deprecated" }], draft.status);
-          const repl = textInput(draft.replacement_capability_id || "");
-          const perms = textInput(draft.permissions || "");
-          const policy = textInput(draft.execution_policy || "auto");
-          let enabled = draft.enabled;
+          card.appendChild(el("div", "section-sub", "Intent fields"));
+          const idIn = textInput(cap.capability_id); idIn.disabled = true;
+          const tool = textInput(cap.tool_binding);
+          const desc = el("textarea"); desc.rows = 3; desc.value = cap.description || "";
+          const kind = select([{ label: "action", value: "action" }, { label: "private", value: "private" }, { label: "web", value: "web" }], cap.intent_kind);
+          const status = select([{ label: "active", value: "active" }, { label: "disabled", value: "disabled" }, { label: "deprecated", value: "deprecated" }], cap.status);
+          const repl = textInput(cap.replacement_capability_id || "");
+          const perms = textInput(cap.permissions || "");
+          const policy = textInput(cap.execution_policy || "auto");
+          let enabled = cap.enabled;
           const sw = switchToggle(enabled, (on) => { enabled = on; });
           const enLabel = el("label", "field");
           enLabel.append(sw, el("span", "", "enabled"));
@@ -3968,9 +3833,9 @@
             field("Execution policy", policy),
             enLabel,
           );
-          const save = el("button", "btn primary", "Save");
+          const save = el("button", "btn primary", "Save (live)");
           save.type = "button";
-          save.onclick = () => regPatch(draft.capability_id, {
+          save.onclick = () => regPatch(cap.capability_id, {
             tool_binding: tool.value.trim(),
             description: desc.value,
             intent_kind: kind.value,
@@ -3983,9 +3848,9 @@
           const res = el("div", "test-res");
           const row = el("div", "row-actions"); row.append(save, res);
           card.appendChild(row);
-          card.appendChild(el("div", "hint", "Row version: " + draft.row_version + " (optimistic token — a stale save is rejected 409, never merged)."));
-          if (BINDING_WARNINGS[draft.tool_binding]) {
-            card.appendChild(el("div", "trace-out err", BINDING_WARNINGS[draft.tool_binding]));
+          card.appendChild(el("div", "hint", "Row version: " + cap.row_version + " (optimistic token — a stale save is rejected 409, never merged). Save goes straight to the live table: the next turn routes with it — no Publish step."));
+          if (BINDING_WARNINGS[cap.tool_binding]) {
+            card.appendChild(el("div", "trace-out err", BINDING_WARNINGS[cap.tool_binding]));
           }
           container.appendChild(card);
         }
@@ -4002,25 +3867,25 @@
           card.appendChild(el("div", "section-sub", "Implementation"));
           kv("Tool binding", a.tool_binding);
           kv("Implementation", a.implementation_ref);
-          card.appendChild(el("div", "hint", "Lifecycle: Agent-only → configure Query/Parameter draft → Register (creates the Registry Draft row) → Validate → Publish → Active Registry → Funnel. Registering here NEVER publishes and NEVER writes the active index. Agent-only means the action is USED through Chat/Agent today; it only says it has not entered the Funnel yet."));
-          const regBtn = el("button", "btn primary", "Register into Registry (Draft)");
+          card.appendChild(el("div", "hint", "Lifecycle: Agent-only → Create capability row (born disabled) → curate Queries (one enabled Standard per zh + en, plus Similars) → Validate → Enable → live on the next turn. There is no Draft, no Publish, no Projection — the live tables ARE the runtime truth. Agent-only means the action is USED through Chat/Agent today; it only says it has not entered the Funnel yet."));
+          const regBtn = el("button", "btn primary", "Create capability row (live, disabled)");
           regBtn.type = "button";
           if (!a.bindable) {
             regBtn.disabled = true;
-            regBtn.title = "Funnel registration eligibility only: the publish gate rejects bindings outside DIRECT_TOOLS. This does not affect Agent/Chat usage.";
+            regBtn.title = "Funnel registration eligibility only: create refuses bindings outside DIRECT_TOOLS. This does not affect Agent/Chat usage.";
             card.appendChild(el("div", "trace-out err", "Funnel registration is unavailable: tool binding " + a.tool_binding
-              + " is not an existing DIRECT_TOOLS executable binding (the Registry cannot invent executables, and a draft row with an inadmissible binding would block EVERY publish — hard-delete is not allowed). This is a REGISTRATION eligibility limit only — the action remains usable through Agent/Chat"
+              + " is not an existing DIRECT_TOOLS executable binding (the Registry cannot invent executables, and a capability row with an inadmissible binding would fail EVERY write-gate validation). This is a REGISTRATION eligibility limit only — the action remains usable through Agent/Chat"
               + (regToolSchemas[a.tool_binding] ? "" : " (runtime availability for this binding should be verified separately)")
               + ". Runtime admission is a separate task."));
           }
           regBtn.onclick = async () => {
             regBtn.disabled = true;
             try {
-              const d = await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/register", { method: "POST", body: "{}" });
-              toast("Registered as Registry Draft: " + d.draft.capability_id + " — now Validate & Publish under Versions", "ok");
+              const d = await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/create", { method: "POST", body: "{}" });
+              toast("Capability row created: " + d.capability.capability_id + " — curate its Queries, then Enable to route", "ok");
               await renderRegistryPage();
             } catch (e) {
-              toast("Register failed: " + e.message, "error");
+              toast("Create failed: " + e.message, "error");
               regBtn.disabled = false;
             }
           };
@@ -4029,287 +3894,244 @@
           container.appendChild(card);
         }
 
-        // ── Queries (registered): the Exact + Recall corpus, nothing else ──
-        // Save = targeted PATCH; the returned Draft row refreshes regDrafts in
-        // place (new row_version included) — the page is NEVER re-rendered.
-        function renderRegQueries(container, a, draft) {
-          regQueriesView(container, {
-            title: "Exact + Recall Query Corpus",
-            isDraft: false,
-            standard: draft.standard_example,
-            similar: draft.synonym_examples || [],
-            onSave: async (std, sims) => {
-              const res = await apiFetch("/admin/registry/drafts/" + encodeURIComponent(draft.capability_id), {
-                method: "PATCH",
-                body: JSON.stringify({
-                  patch: { standard_example: std, synonym_examples: sims },
-                  expected_row_version: draft.row_version,
-                }),
-              });
-              const i = regDrafts.findIndex((x) => x.capability_id === draft.capability_id);
-              if (i >= 0 && res && res.draft) regDrafts[i] = res.draft;
-            },
-          });
-        }
-
-        // ── Queries / Negatives (agent-only): PRE-REGISTRY draft configuration ──
-        async function renderCatalogQueries(container, a, mode) {
+        // ── Queries (registered): the Exact + Recall corpus, ONE row per write ──
+        // Every op goes straight to the query plane: add / text-edit re-embed
+        // server-side (embed-then-write — a failed embed leaves the row
+        // untouched, the write 503s); enable/disable and delete are row ops.
+        // The UI never batch-saves a corpus: there is nothing to Publish.
+        async function renderRegQueries(container, cap) {
           let cur;
           try {
-            cur = await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/query-draft");
+            cur = await apiFetch("/admin/registry/capabilities/" + encodeURIComponent(cap.capability_id) + "/queries");
           } catch (e) { container.appendChild(errBox(e)); return; }
-          const save = async (std, sims, negs) => {
-            await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/query-draft", {
-              method: "PUT",
-              body: JSON.stringify({ standard_example: std, synonym_examples: sims, negatives: negs }),
+          const refresh = () => renderRegistryPage();
+          const rowStyle = "display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+
+          const stdCard = el("div", "legacy-card");
+          stdCard.appendChild(el("div", "section-title", "Standard Queries — the canonical sentence per language"));
+          stdCard.appendChild(el("div", "hint", "The Matcher exact set is the ENABLED Standard + Similar rows. A routable capability needs one enabled Standard in zh AND one in en; language is derived (Han char → zh), never entered."));
+          for (const r of cur.standard) {
+            const row = el("div", "kv-row"); row.style.cssText = rowStyle;
+            qcRow(row, {
+              lang: r.language, text: r.query, embedded: r.has_embedding, enabled: r.enabled,
+              onEditText: (v, done) => qcWrite("/admin/registry/queries/standard/" + r.id,
+                { method: "PATCH", body: JSON.stringify({ query: v }) },
+                "Saved + re-embedded (live)", done),
+              onToggle: (on) => qcWrite("/admin/registry/queries/standard/" + r.id + "/enabled",
+                { method: "POST", body: JSON.stringify({ enabled: on }) },
+                (on ? "Enabled" : "Disabled") + " (live)", refresh),
+              onDelete: () => qcWrite("/admin/registry/queries/standard/" + r.id + "?cascade_similar=true",
+                { method: "DELETE" }, "Standard deleted with its Similars (live)", refresh),
             });
-            cur = Object.assign({}, cur, { standard: std, similar: sims, negatives: negs });
-          };
-          if (mode === "queries") {
-            regQueriesView(container, {
-              title: "Exact + Recall Query Corpus",
-              isDraft: true,
-              standard: cur.standard,
-              similar: cur.similar,
-              onSave: (std, sims) => save(std, sims, cur.negatives),
-            });
-          } else {
-            const banner = "Draft / Not Published — saved in the Action Catalog only. Nothing here can reach the active Registry, index or Funnel until Register → Validate → Publish.";
-            const card = el("div", "legacy-card");
-            card.appendChild(el("div", "section-title", "Negative Examples (draft) — " + a.display_name));
-            card.appendChild(el("div", "hint", banner));
-            card.appendChild(el("div", "hint", "Negatives = ToolIntentModel boundary context only. Never Exact Match, never PGVector Recall."));
-            const neg = regListEditor(cur.negatives, "near-miss that is NOT this action");
-            card.appendChild(neg.node);
-            const saveBtn = el("button", "btn primary", "Save Draft");
-            saveBtn.type = "button";
-            saveBtn.onclick = async () => {
-              try { await save(cur.standard, cur.similar, neg.get()); toast("Query draft saved for " + a.action_key + " (still NOT published)", "ok"); }
-              catch (e) { toast(e.message, "error"); }
-            };
-            card.appendChild(saveBtn);
-            container.appendChild(card);
+            stdCard.appendChild(row);
           }
+          const addStd = qcAddRow("new standard sentence (zh or en)", "Add Standard", (v, done) =>
+            qcWrite("/admin/registry/capabilities/" + encodeURIComponent(cap.capability_id) + "/queries/standard",
+              { method: "POST", body: JSON.stringify({ query: v }) },
+              "Added + embedded (live)", () => { done(); refresh(); }));
+          stdCard.appendChild(addStd.row);
+          container.appendChild(stdCard);
+
+          const byId = {};
+          for (const r of cur.standard) byId[r.id] = r.query;
+          const simCard = el("div", "legacy-card");
+          simCard.appendChild(el("div", "section-title", "Similar Queries — Recall corpus, attached to a Standard"));
+          simCard.appendChild(el("div", "hint", "Each Similar rides on one Standard and must share its language. Recall keeps EVERY vector hit ≥ the threshold with provenance (query_kind=standard/similar) — no per-capability merge."));
+          for (const r of cur.similar) {
+            const row = el("div", "kv-row"); row.style.cssText = rowStyle;
+            qcRow(row, {
+              lang: r.language, text: r.query, embedded: r.has_embedding, enabled: r.enabled,
+              parent: (byId[r.standard_query_id] || r.standard_query_id).slice(0, 40),
+              onEditText: (v, done) => qcWrite("/admin/registry/queries/similar/" + r.id,
+                { method: "PATCH", body: JSON.stringify({ query: v }) },
+                "Saved + re-embedded (live)", done),
+              onToggle: (on) => qcWrite("/admin/registry/queries/similar/" + r.id + "/enabled",
+                { method: "POST", body: JSON.stringify({ enabled: on }) },
+                (on ? "Enabled" : "Disabled") + " (live)", refresh),
+              onDelete: () => qcWrite("/admin/registry/queries/similar/" + r.id,
+                { method: "DELETE" }, "Row deleted (live)", refresh),
+            });
+            simCard.appendChild(row);
+          }
+          const simAdd = qcAddRow("new similar sentence", "Add Similar", (v, done) => {
+            if (!parentSel.value) { toast("Create a Standard query first — every Similar attaches to one", "error"); return; }
+            qcWrite("/admin/registry/capabilities/" + encodeURIComponent(cap.capability_id) + "/queries/similar",
+              { method: "POST", body: JSON.stringify({ standard_query_id: parentSel.value, query: v }) },
+              "Added + embedded (live)", () => { done(); refresh(); });
+          });
+          const parentSel = select(cur.standard.map((r) => ({ label: "[" + r.language + "] " + r.query.slice(0, 50), value: r.id })), (cur.standard[0] || {}).id || "");
+          simAdd.row.prepend(parentSel);
+          if (!cur.standard.length) simAdd.row.appendChild(el("span", "badge warn", "needs a Standard first"));
+          simCard.appendChild(simAdd.row);
+          container.appendChild(simCard);
         }
 
-        // ── Negatives (registered) ──
-        function renderRegNegatives(container, draft) {
+        // ── Negatives (registered): boundary rows, never match data ──
+        async function renderRegNegatives(container, cap) {
+          let cur;
+          try {
+            cur = await apiFetch("/admin/registry/capabilities/" + encodeURIComponent(cap.capability_id) + "/queries");
+          } catch (e) { container.appendChild(errBox(e)); return; }
+          const refresh = () => renderRegistryPage();
           const card = el("div", "legacy-card");
-          card.appendChild(el("div", "section-title", "Negative Examples"));
-          card.appendChild(el("div", "hint", "ToolIntentModel boundary context ONLY — negatives never enter Exact Match or Vector Recall (they must not be recallable at all)."));
-          const neg = regListEditor(draft.negatives || [], "near-miss that is NOT this action");
-          card.appendChild(neg.node);
-          const save = el("button", "btn primary", "Save");
-          save.type = "button";
-          save.onclick = () => regPatch(draft.capability_id, { negatives: neg.get() });
-          card.appendChild(save);
+          card.appendChild(el("div", "section-title", "Negative Queries"));
+          card.appendChild(el("div", "hint", "ToolIntentModel card boundary ONLY — negatives are never embedded, never Exact Match, never Recall (they must not be recallable at all)."));
+          for (const r of cur.negative) {
+            const row = el("div", "kv-row");
+            row.style.cssText = "display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+            qcRow(row, {
+              lang: r.language, text: r.query, enabled: r.enabled,
+              onToggle: (on) => qcWrite("/admin/registry/queries/negative/" + r.id + "/enabled",
+                { method: "POST", body: JSON.stringify({ enabled: on }) },
+                (on ? "Enabled" : "Disabled") + " (live)", refresh),
+              onDelete: () => qcWrite("/admin/registry/queries/negative/" + r.id,
+                { method: "DELETE" }, "Row deleted (live)", refresh),
+            });
+            card.appendChild(row);
+          }
+          const add = qcAddRow("near-miss that is NOT this action", "Add Negative", (v, done) =>
+            qcWrite("/admin/registry/capabilities/" + encodeURIComponent(cap.capability_id) + "/queries/negative",
+              { method: "POST", body: JSON.stringify({ query: v }) },
+              "Added (live, card context only)", () => { done(); refresh(); }));
+          card.appendChild(add.row);
           container.appendChild(card);
         }
 
-        // ── Advanced (registered): runtime schema + parameters + inert fields ──
-        async function renderRegAdvanced(container, a, draft) {
+        // ── Advanced (registered): runtime schema + parameters + card context ──
+        async function renderRegAdvanced(container, a, cap) {
           // 1/2. Tool Binding + live runtime Tool Schema (read-only projection)
           const tcard = el("div", "legacy-card");
           tcard.appendChild(el("div", "section-title", "Tool Binding & runtime Schema (read-only)"));
           const tkv = (k, v) => tcard.appendChild(el("div", "hint", k + ": " + v));
           tkv("Action", a.display_name + " (" + a.action_key + ")");
-          tkv("Tool binding", draft.tool_binding);
+          tkv("Tool binding", cap.tool_binding);
           tkv("Implementation", a.implementation_ref);
-          tkv("Agent / Chat", regChatAvail(draft.tool_binding));
+          tkv("Agent / Chat", regChatAvail(cap.tool_binding));
           tkv("Funnel registration eligibility", regFunnelEligibility(a));
-          if (regToolSchemas[draft.tool_binding]) {
+          if (regToolSchemas[cap.tool_binding]) {
             tcard.appendChild(el("div", "section-sub", "Parameters — the live ToolRuntime schema the model sees"));
-            regSchemaTable(tcard, regToolSchemas[draft.tool_binding]);
-            tcard.appendChild(el("div", "hint", "Source: ToolRuntime.schemas() — the Binder validates the Registry parameters below against this runtime truth at publish."));
+            regSchemaTable(tcard, regToolSchemas[cap.tool_binding]);
+            tcard.appendChild(el("div", "hint", "Source: ToolRuntime.schemas() — the validation gate cross-checks the Registry parameters below against this runtime truth at EVERY write (intent is never authorization; DIRECT_TOOLS stays a runtime concern)."));
           } else {
             tcard.appendChild(el("div", "hint", "No runtime schema for this binding in THIS server process (see Agent/Chat line above)."));
           }
           container.appendChild(tcard);
 
-          // 3. Parameters / Argument Slots — the Registry's existing model (editable)
+          // 3. Parameters / Argument Slots — live capability row (editable)
           const pcard = el("div", "legacy-card");
-          pcard.appendChild(el("div", "section-title", "Parameters & argument slots (Registry model)"));
-          pcard.appendChild(el("div", "hint", "JSON objects. parameters is the canonical argument schema the Binder validates against; arg_slots maps detected slots to parameters."));
-          const p = el("textarea"); p.rows = 8; p.value = JSON.stringify(draft.parameters || {}, null, 2);
-          const sl = el("textarea"); sl.rows = 8; sl.value = JSON.stringify(draft.arg_slots || {}, null, 2);
+          pcard.appendChild(el("div", "section-title", "Parameters & argument slots (live row)"));
+          pcard.appendChild(el("div", "hint", "JSON objects. parameters is the canonical argument schema the Binder validates against; arg_slots maps detected slots to parameters. Saving goes live immediately (gate + history snapshot run server-side)."));
+          const p = el("textarea"); p.rows = 8; p.value = JSON.stringify(cap.parameters || {}, null, 2);
+          const sl = el("textarea"); sl.rows = 8; sl.value = JSON.stringify(cap.arg_slots || {}, null, 2);
           pcard.append(field("parameters", p), field("arg_slots", sl));
-          const save = el("button", "btn primary", "Save");
+          const save = el("button", "btn primary", "Save (live)");
           save.type = "button";
           save.onclick = async () => {
             let pv, av;
             try { pv = JSON.parse(p.value || "{}"); av = JSON.parse(sl.value || "{}"); }
             catch { toast("Invalid JSON — not saved", "error"); return; }
-            await regPatch(draft.capability_id, { parameters: pv, arg_slots: av });
+            await regPatch(cap.capability_id, { parameters: pv, arg_slots: av });
           };
           pcard.appendChild(save);
-          if (BINDING_WARNINGS[draft.tool_binding]) {
-            pcard.appendChild(el("div", "trace-out err", BINDING_WARNINGS[draft.tool_binding]));
+          if (BINDING_WARNINGS[cap.tool_binding]) {
+            pcard.appendChild(el("div", "trace-out err", BINDING_WARNINGS[cap.tool_binding]));
           }
           container.appendChild(pcard);
 
-          // 4/5/6. Legacy Examples + inert Patterns/Aliases
+          // 4. Request query examples — card context, NOT corpus
           const lcard = el("div", "legacy-card");
-          lcard.appendChild(el("div", "section-title", "Legacy Examples — real Registry examples field (read-only)"));
-          lcard.appendChild(el("div", "hint", "ToolIntentModel card context only — never Exact Match, never PGVector Recall. Values below are the raw examples column, NOT a copy of the query corpus."));
-          const corpus = new Set();
-          if ((draft.standard_example || "").trim()) corpus.add(draft.standard_example.trim());
-          for (const s of draft.synonym_examples || []) { if (s.trim()) corpus.add(s.trim()); }
-          const items = (draft.examples || []).filter((s) => s.trim());
-          if (!items.length) lcard.appendChild(el("div", "hint", "— none —"));
-          for (const s of items) {
-            const li = el("div", "hint", "• " + s);
-            li.style.cssText = "white-space:normal";
-            if (corpus.has(s.trim())) li.appendChild(el("span", "badge accent", "also in query corpus — DATA duplication (seed lineage), not a UI copy"));
-            lcard.appendChild(li);
-          }
+          lcard.appendChild(el("div", "section-title", "Request query examples (card context only)"));
+          lcard.appendChild(el("div", "hint", "request_query_examples on the capability row — ToolIntentModel card context only. Never Exact Match, never Recall: the corpus is the Queries plane (Standard/Similar rows), nothing else."));
+          const ex = el("textarea"); ex.rows = 6; ex.value = JSON.stringify(cap.request_query_examples || [], null, 2);
+          lcard.appendChild(field("request_query_examples (JSON array)", ex));
+          const exSave = el("button", "btn primary", "Save (live)");
+          exSave.type = "button";
+          exSave.onclick = async () => {
+            let ev;
+            try {
+              ev = JSON.parse(ex.value || "[]");
+              if (!Array.isArray(ev)) throw new Error("not an array");
+            } catch { toast("Invalid JSON array — not saved", "error"); return; }
+            await regPatch(cap.capability_id, { request_query_examples: ev });
+          };
+          lcard.appendChild(exSave);
           const inert = (arr) => ((arr || []).length ? (arr || []).join(" · ") : "—");
           lcard.append(
-            field("Patterns (inert storage)", textInput(inert(draft.patterns))),
-            field("Aliases (inert storage)", textInput(inert(draft.aliases))),
+            field("Patterns (inert storage)", textInput(inert(cap.patterns))),
+            field("Aliases (inert storage)", textInput(inert(cap.aliases))),
           );
           lcard.appendChild(el("div", "hint", "The Matcher is exact-only (2026-09-25 ruling) — patterns/aliases are history, never runtime."));
           lcard.querySelectorAll("input").forEach((i) => { i.disabled = true; });
           container.appendChild(lcard);
 
-          // 7. Runtime & execution
+          // 5. Runtime & execution
           const rcard = el("div", "legacy-card");
           rcard.appendChild(el("div", "section-title", "Runtime & execution"));
           const kv = (k, v) => rcard.appendChild(el("div", "hint", k + ": " + v));
-          kv("Tool binding", draft.tool_binding);
-          kv("Execution policy", draft.execution_policy);
-          kv("Permissions", draft.permissions || "—");
-          kv("Intent kind", draft.intent_kind);
+          kv("Tool binding", cap.tool_binding);
+          kv("Execution policy", cap.execution_policy);
+          kv("Permissions", cap.permissions || "—");
+          kv("Intent kind", cap.intent_kind);
           kv("Current route", a.current_route);
-          kv("Row version", String(draft.row_version));
-          if (BINDING_WARNINGS[draft.tool_binding]) rcard.appendChild(el("div", "trace-out err", BINDING_WARNINGS[draft.tool_binding]));
-          container.appendChild(rcard);
-        }
-
-        // ── Advanced (agent-only): same seven sections; parameters are PRE-REGISTRY
-        // draft configuration (migration 0012) — not registered ≠ no parameters. ──
-        async function renderCatalogAdvanced(container, a) {
-          let cur = { parameters: {}, arg_slots: {} };
-          try {
-            cur = await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/query-draft");
-          } catch (e) { container.appendChild(errBox(e)); return; }
-          const schema = regToolSchemas[a.tool_binding];
-
-          // 1. Tool Binding
-          const bcard = el("div", "legacy-card");
-          bcard.appendChild(el("div", "section-title", "Tool Binding"));
-          const kv = (k, v) => bcard.appendChild(el("div", "hint", k + ": " + v));
-          kv("Action", a.display_name + " (" + a.action_key + ")");
-          kv("Tool binding", a.tool_binding);
-          kv("Implementation", a.implementation_ref);
-          kv("Agent / Chat", regChatAvail(a.tool_binding));
-          kv("Funnel registration eligibility", regFunnelEligibility(a));
-          bcard.appendChild(el("div", "hint", "Ineligibility for Funnel registration is a REGISTRATION status only — the tool stays a normal Agent/Chat tool. Not registered ≠ hidden schema."));
-          container.appendChild(bcard);
-
-          // 2. Parameters — live runtime schema (read-only, never a second model)
-          const scard = el("div", "legacy-card");
-          scard.appendChild(el("div", "section-title", "Tool Schema — live runtime (read-only)"));
-          if (schema) {
-            scard.appendChild(el("div", "hint", (schema.description || "").slice(0, 300)));
-            regSchemaTable(scard, schema);
-          } else {
-            scard.appendChild(el("div", "hint", "No schema for this binding in THIS server process — see the Agent/Chat line above (runtime integrity audit, separate task). The draft configuration below remains editable."));
-          }
-          container.appendChild(scard);
-
-          // 3+4. Draft Parameters / Argument Slots (same shapes as the Registry model)
-          const pcard = el("div", "legacy-card");
-          pcard.appendChild(el("div", "section-title", "Parameter configuration (draft, pre-Registry)"));
-          pcard.appendChild(el("div", "hint", "Draft / Not Published — same shapes as the Registry parameters/arg_slots fields; Register copies them 1:1 into the Draft row. Saving here never publishes and never touches the runtime schema."));
-          const seed = Object.keys(cur.parameters || {}).length ? cur.parameters
-            : (schema ? (schema.parameters || {}).properties || {} : {});
-          const p = el("textarea"); p.rows = 8; p.value = JSON.stringify(seed, null, 2);
-          const sl = el("textarea"); sl.rows = 6; sl.value = JSON.stringify(cur.arg_slots || {}, null, 2);
-          pcard.append(field("parameters", p), field("arg_slots", sl));
-          if (!Object.keys(cur.parameters || {}).length && schema) {
-            pcard.appendChild(el("div", "hint", "parameters is pre-seeded from the live tool schema for convenience — trim/adjust it into the argument contract the Funnel Binder should validate against, then Save."));
-          }
-          const save = el("button", "btn primary", "Save Draft");
-          save.type = "button";
-          save.onclick = async () => {
-            let pv, av;
-            try { pv = JSON.parse(p.value || "{}"); av = JSON.parse(sl.value || "{}"); }
-            catch { toast("Invalid JSON — not saved", "error"); return; }
-            try {
-              await apiFetch("/admin/registry/catalog/" + encodeURIComponent(a.action_key) + "/params-draft", {
-                method: "PUT", body: JSON.stringify({ parameters: pv, arg_slots: av }),
-              });
-              toast("Parameter draft saved for " + a.action_key + " (still NOT published)", "ok");
-            } catch (e) { toast(e.message, "error"); }
-          };
-          pcard.appendChild(save);
-          if (BINDING_WARNINGS[a.tool_binding]) {
-            pcard.appendChild(el("div", "trace-out err", BINDING_WARNINGS[a.tool_binding]));
-          }
-          container.appendChild(pcard);
-
-          // 5+6+7. Legacy Examples / Patterns / Aliases — Registry-row fields
-          const lcard = el("div", "legacy-card");
-          lcard.appendChild(el("div", "section-title", "Legacy Examples · Patterns · Aliases"));
-          lcard.appendChild(el("div", "hint", "Not available yet: these three fields live on the Registry capability Draft row and appear after Register. No second storage model is invented for unregistered actions — the pre-Registry draft keeps only Queries, Negatives and Parameters (migration 0012)."));
-          container.appendChild(lcard);
-
-          // Runtime / execution summary
-          const rcard = el("div", "legacy-card");
-          rcard.appendChild(el("div", "section-title", "Runtime & execution"));
-          const kv2 = (k, v) => rcard.appendChild(el("div", "hint", k + ": " + v));
-          kv2("Execution path today", "Agent/Chat tool call via ToolRuntime (kernel loop)");
-          kv2("Intent Funnel", "Not configured — registration requires a DIRECT_TOOLS binding (separate runtime task for inadmissible ones)");
-          kv2("Versions", "Not available until registered");
+          kv("Row version", String(cap.row_version));
+          if (BINDING_WARNINGS[cap.tool_binding]) rcard.appendChild(el("div", "trace-out err", BINDING_WARNINGS[cap.tool_binding]));
           container.appendChild(rcard);
         }
 
 
-        // ── Versions: preview / publish / rollback / audit / route dry-run ──
-        async function renderRegVersions(container) {
-          // Publish-build dry-run (embeddings included, zero writes)
-          const buildCard = el("div", "legacy-card");
-          buildCard.appendChild(el("div", "section-title", "Validate / preview build"));
-          buildCard.appendChild(el("div", "hint", "Dry-runs the publish build — validation issues plus real embeddings — without writing anything."));
-          const pvBtn = el("button", "btn ghost", "Preview build");
-          pvBtn.type = "button";
-          const pvOut = el("div");
-          buildCard.append(pvBtn, pvOut);
-          container.appendChild(buildCard);
-          pvBtn.onclick = async () => {
-            pvOut.innerHTML = "";
+
+
+        // ── History: live-set checks, query dry-run, snapshots, rollback, audit ──
+        async function renderRegHistory(container) {
+          // Validation gate against the LIVE set (zero writes)
+          const valCard = el("div", "legacy-card");
+          valCard.appendChild(el("div", "section-title", "Validate live set"));
+          valCard.appendChild(el("div", "hint", "Runs the same gate every write goes through (cross-checked against the live ToolRuntime roster) — see the current verdict without writing anything."));
+          const valBtn = el("button", "btn ghost", "Run validation");
+          valBtn.type = "button";
+          const valOut = el("div");
+          valCard.append(valBtn, valOut);
+          container.appendChild(valCard);
+          valBtn.onclick = async () => {
+            valOut.innerHTML = "";
             try {
-              const d = await apiFetch("/admin/registry/preview");
-              pvOut.appendChild(el("div", "hint", "capabilities=" + d.capabilities + " · routable=" + d.routable + " · snapshot=" + (d.snapshot_version || "—")));
+              const d = await apiFetch("/admin/registry/validate");
+              valOut.appendChild(el("div", "hint", "capabilities=" + d.capabilities));
               const issues = d.issues || [];
-              if (!issues.length) pvOut.appendChild(badge("no issues", "ok"));
-              else for (const s of issues) pvOut.appendChild(el("div", "trace-out err", s));
-            } catch (e) { pvOut.appendChild(errBox(e)); }
+              if (!issues.length) valOut.appendChild(badge("no issues", "ok"));
+              else for (const s of issues) valOut.appendChild(el("div", "trace-out err", s));
+            } catch (e) { valOut.appendChild(errBox(e)); }
           };
 
-          // Publish
-          const pubCard = el("div", "legacy-card");
-          pubCard.appendChild(el("div", "section-title", "Publish"));
-          pubCard.appendChild(el("div", "hint", "Build-Then-Swap: registry version, QIR pointer and the example rows land in ONE transaction. Rejected publishes are audit-recorded and leave no version row."));
-          const note = textInput("", { placeholder: "optional note for the audit trail" });
-          const pubBtn = el("button", "btn primary", "Publish");
-          pubBtn.type = "button";
-          pubBtn.onclick = async () => {
-            pubBtn.disabled = true;
-            try {
-              const d = await apiFetch("/admin/registry/publish", { method: "POST", body: JSON.stringify({ note: note.value.trim() || null }) });
-              toast("Published v" + d.version + " (" + d.state + ")", "ok");
-              await renderRegistryPage();
-            } catch (e) { toast("Publish failed: " + e.message, "error"); pubBtn.disabled = false; }
-          };
-          const prow = el("div", "row-actions"); prow.append(field("Note", note), pubBtn);
-          pubCard.appendChild(prow);
-          container.appendChild(pubCard);
+          // Corpus health: embeddings + what the runtime actually sees
+          const embCard = el("div", "legacy-card");
+          embCard.appendChild(el("div", "section-title", "Corpus health (embeddings + runtime view)"));
+          const embOut = el("div");
+          embCard.appendChild(embOut);
+          container.appendChild(embCard);
+          try {
+            const [st, lv] = await Promise.all([
+              apiFetch("/admin/registry/embedding-status"),
+              apiFetch("/admin/registry/live-view"),
+            ]);
+            embOut.appendChild(el("div", "hint", "standard: " + st.standard.embedded + "/" + st.standard.total
+              + " · similar: " + st.similar.embedded + "/" + st.similar.total
+              + " · pending: " + (st.pending || 0)
+              + (st.pending ? " — run scripts/embed_corpus.py to backfill" : "")));
+            if (st.embedding_profile) {
+              embOut.appendChild(el("div", "hint", "embedding profile: " + st.embedding_profile.model
+                + " · dim " + st.embedding_profile.dim + " · " + st.embedding_profile.provider));
+            }
+            embOut.appendChild(el("div", "hint", "runtime live view: "
+              + (lv.fingerprint ? maskHash(lv.fingerprint) : "— (no capabilities)")
+              + " · routable: " + (lv.capabilities || []).filter((c) => c.routable).length
+              + "/" + (lv.capabilities || []).length));
+          } catch (e) { embOut.appendChild(errBox(e)); }
 
-          // Full-chain query dry-run against the ACTIVE pair
+          // Full-chain query dry-run against the LIVE tables
           const routeCard = el("div", "legacy-card");
-          routeCard.appendChild(el("div", "section-title", "Query dry-run (active Registry + Index)"));
-          routeCard.appendChild(el("div", "hint", "Matcher → Recall → ToolIntentModel → Binder → Final Route, side-effect free; model/embedding usage is billed as preview."));
+          routeCard.appendChild(el("div", "section-title", "Query dry-run (live tables)"));
+          routeCard.appendChild(el("div", "hint", "Matcher → Recall → ToolIntentModel → Binder → Final Route over the live corpus, side-effect free; model/embedding usage is billed as preview."));
           const q = el("textarea"); q.rows = 2; q.placeholder = "e.g. 创建一个叫 notes 的文件夹";
           const runBtn = el("button", "btn ghost", "Run");
           runBtn.type = "button";
@@ -4330,7 +4152,7 @@
                 + (d.binder_state ? " · binder=" + d.binder_state : "")
                 + " · final_route=" + d.final_route
                 + (d.fallback_reason && d.fallback_reason !== "-" ? " · fallback=" + d.fallback_reason : "")
-                + " · " + d.total_ms + " ms · registry=" + (d.registry_version || "—") + " index=" + (d.index_version || "—");
+                + " · " + d.total_ms + " ms · live fingerprint=" + (d.registry_version || "—");
               routeOut.appendChild(sum);
               const cands = d.candidates || [];
               if (cands.length) {
@@ -4339,7 +4161,7 @@
                   const tr = el("tr");
                   tr.appendChild(td(c.capability_id));
                   tr.appendChild(td(c.origin));
-                  tr.appendChild(td(c.kind || "—"));
+                  tr.appendChild(td(c.kind || c.query_kind || "—"));
                   tr.appendChild(td(c.matched_example || "—"));
                   tr.appendChild(td(c.origin === "recall" ? Number(c.score).toFixed(3) : "table"));
                   tbody.appendChild(tr);
@@ -4356,41 +4178,40 @@
             runBtn.disabled = false;
           };
 
-          // Version history + rollback
+          // Version snapshots (history only) + rollback = restore + re-embed
           const verCard = el("div", "legacy-card");
-          verCard.appendChild(el("div", "section-title", "Version history"));
+          verCard.appendChild(el("div", "section-title", "Version snapshots (history)"));
+          verCard.appendChild(el("div", "hint", "Every accepted mutation first stores the PRE-change content here — history only, nothing is activated from it. Rollback replays a snapshot into the live tables and re-embeds; an embedder failure reports the partial restore honestly (503)."));
           const verOut = el("div");
           verCard.appendChild(verOut);
           container.appendChild(verCard);
           try {
             const d = await apiFetch("/admin/registry/versions");
-            const { wrap, tbody } = table(["version", "state", "fingerprint", "source", "actor", "caps", "routable", "note", ""]);
+            const { wrap, tbody } = table(["version", "fingerprint", "source", "actor", "caps", "note", "when", ""]);
             for (const v of (d.versions || [])) {
               const tr = el("tr");
               tr.appendChild(td("v" + v.version));
-              tr.appendChild(td(badge(v.state, v.state === "active" ? "ok" : v.state === "failed" ? "danger" : "")));
               tr.appendChild(td(maskHash(v.fingerprint)));
               tr.appendChild(td(v.source_version != null ? "v" + v.source_version : "—"));
               tr.appendChild(td(v.actor_username || "—"));
               tr.appendChild(td(String(v.capabilities)));
-              tr.appendChild(td(String(v.routable)));
               tr.appendChild(td(v.note || (v.error ? "✗ " + v.error : "—")));
+              tr.appendChild(td((v.created_at || "").replace("T", " ").slice(0, 19)));
               const cell = el("td");
-              if (v.state !== "active") {
-                let armed = false;
-                const rb = el("button", "btn sm ghost", "Rollback");
-                rb.type = "button";
-                rb.onclick = async () => {
-                  if (!armed) { armed = true; rb.textContent = "Confirm?"; rb.className = "btn sm danger"; return; }
-                  rb.disabled = true;
-                  try {
-                    await apiFetch("/admin/registry/versions/" + v.version + "/rollback", { method: "POST", body: JSON.stringify({}) });
-                    toast("Rolled back to v" + v.version, "ok");
-                    await renderRegistryPage();
-                  } catch (e) { toast("Rollback failed: " + e.message, "error"); rb.disabled = false; }
-                };
-                cell.appendChild(rb);
-              }
+              let armed = false;
+              const rb = el("button", "btn sm ghost", "Rollback");
+              rb.type = "button";
+              rb.onclick = async () => {
+                if (!armed) { armed = true; rb.textContent = "Confirm?"; rb.className = "btn sm danger"; return; }
+                rb.disabled = true;
+                try {
+                  const r = await apiFetch("/admin/registry/versions/" + v.version + "/rollback", { method: "POST", body: JSON.stringify({}) });
+                  toast("Restored v" + r.restored_version + " (" + r.capabilities + " caps)"
+                    + ((r.issues || []).length ? " — " + r.issues.length + " validation issues remain" : ""), "ok");
+                  await renderRegistryPage();
+                } catch (e) { toast("Rollback failed: " + e.message, "error"); rb.disabled = false; }
+              };
+              cell.appendChild(rb);
               tr.appendChild(cell);
               tbody.appendChild(tr);
             }

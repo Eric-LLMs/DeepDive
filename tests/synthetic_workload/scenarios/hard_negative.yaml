@@ -1,0 +1,151 @@
+# Hard negatives — queries that mention tools/actions but must NOT certify.
+# expected_funnel AGENT (= fail-open at some stage) unless explicitly AMBIGUOUS.
+# Each intent_category below maps to one of the 20 required hard-negative classes.
+scenario: HARD_NEGATIVE
+defaults: {viewer: {kind: none}, vrel: NO_VIEWER, intent: HARD_NEGATIVE}
+cases:
+  - id: hn-capability-mention
+    intent: HARD_NEGATIVE_CAPABILITY_MENTION
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: 'Delveta 的"创建文件夹"能力最近好像升级了?'}
+      - {q: '提取全文这个能力你们是怎么做到跨页的?'}
+  - id: hn-tool-name-mention
+    intent: HARD_NEGATIVE_TOOL_NAME_MENTION
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: 'create_folder 这个工具名起得真随便'}
+      - {q: 'add_term 的接口设计合理吗?'}
+  - id: hn-ask-what-tool-does
+    intent: HARD_NEGATIVE_ASK_WHAT_TOOL_DOES
+    difficulty: MEDIUM
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '这个功能是干什么的?新建文件夹那个'}
+      - {q: 'cap-add-term 是干嘛用的?'}
+  - id: hn-how-to-action
+    intent: HARD_NEGATIVE_HOW_TO_ACTION
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '如果我要创建文件夹应该怎么做?'}
+      - {q: '怎么把 PDF 里的文字提取出来?'}
+      - {q: '我想加个词,应该点哪里?'}
+  - id: hn-discussing-action
+    intent: HARD_NEGATIVE_DISCUSSING_ACTION
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '昨天我们聊到要不要建文件夹的事,你当时怎么说的?'}
+      - {q: '关于提取全文这一步,业界一般怎么处理表格?'}
+  - id: hn-hypothetical
+    intent: HARD_NEGATIVE_HYPOTHETICAL
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '假如我建了一个叫 papers 的文件夹,然后往里放了 50 个 PDF,该怎么分类?'}
+      - {q: '要是能一次提取整个书架的文本,会有什么风险?'}
+  - id: hn-negated
+    intent: HARD_NEGATIVE_NEGATED
+    difficulty: ADVERSARIAL
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '不要创建这个文件夹'}
+      - {q: '别新建"临时"文件夹了,我已经有两个了'}
+      - {q: '我不想把 idempotent 加入词汇库'}
+      - {q: '不要把这份 PDF 的文字提取出来,太慢了'}
+  - id: hn-conditional
+    intent: HARD_NEGATIVE_CONDITIONAL
+    difficulty: ADVERSARIAL
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '如果明天要交报告,就建一个"周报存档"文件夹'}
+      - {q: '要是这个文档超过十页,就提取全文,否则只提第一页'}
+  - id: hn-ambiguous
+    intent: HARD_NEGATIVE_AMBIGUOUS
+    difficulty: ADVERSARIAL
+    expected: {funnel: AMBIGUOUS}
+    variants:
+      - {q: '新建文件夹"季度报告"并把"keystone"加入我的工程词汇库', notes: "two real actions in one sentence; the single ToolIntentModel hop must answer NONE"}
+      - {q: '把这份文档提取一下,再建个目录放,对了还有个词要加'}
+  - id: hn-wrong-target
+    intent: HARD_NEGATIVE_WRONG_TARGET
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '提取全文', viewer: {kind: video, asset_id: ast-ner-talk}, notes: "no document/attachment present: the extraction capability does not apply"}
+      - {q: '把这篇视频的语音转成文字', viewer: {kind: video, asset_id: ast-ner-talk}, notes: "sounds like extract-text but no such capability published for video"}
+  - id: hn-doc-reports-action
+    intent: HARD_NEGATIVE_DOC_REPORTS_ACTION
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '论文里说可以创建一个目录来组织中间结果,这是什么意思?', viewer: {kind: document, asset_id: ast-nlp-survey}, vrel: GROUNDED_IN_VIEWER}
+      - {q: '这份文档提到的自动建文件夹功能是怎么实现的?', viewer: {kind: document, asset_id: ast-nlp-survey}, vrel: GROUNDED_IN_VIEWER}
+  - id: hn-quoted-action
+    intent: HARD_NEGATIVE_QUOTED_ACTION
+    difficulty: ADVERSARIAL
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '我同事说"帮我建个 notes 文件夹",他到底想要什么?'}
+      - {q: '邮件里写的"请把这段文字提取出来"指的是哪一段?'}
+  - id: hn-dont-execute
+    intent: HARD_NEGATIVE_DONT_EXECUTE
+    difficulty: ADVERSARIAL
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '把"keystone"加入工程词汇库——等等,先别执行,我再想想'}
+      - {q: '刚才说的建文件夹,取消吧'}
+  - id: hn-defer-execute
+    intent: HARD_NEGATIVE_DEFER_EXECUTE
+    difficulty: ADVERSARIAL
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '暂时别创建文件夹,等我整理完再说'}
+      - {q: '提取全文这事先放着,不急'}
+  - id: hn-if-i-want
+    intent: HARD_NEGATIVE_IF_I_WANT
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '如果我要创建一个叫 research 的文件夹,应该怎么说你才听得懂?'}
+      - {q: '如果我想要把 quorum 收进词汇库,得提供哪些信息?'}
+  - id: hn-can-you
+    intent: HARD_NEGATIVE_CAN_YOU
+    difficulty: MEDIUM
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '你能不能创建文件夹?'}
+      - {q: '你能提取 PDF 的全文吗?'}
+      - {q: '你会把单词加入词汇库吗?'}
+  - id: hn-feature-question
+    intent: HARD_NEGATIVE_FEATURE_QUESTION
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '"创建文件夹"这个功能是干什么的?'}
+      - {q: '提取全文会保留格式吗?'}
+  - id: hn-tool-as-noun
+    intent: HARD_NEGATIVE_TOOL_AS_NOUN
+    difficulty: ADVERSARIAL
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '我电脑里全是"文件夹",要不要清理一下?'}
+      - {q: '这个词像"术语"一样被用滥了'}
+  - id: hn-viewer-tool-mention
+    intent: HARD_NEGATIVE_VIEWER_TOOL_MENTION
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '视频里演示的那个建目录的插件叫什么名字?', viewer: {kind: video, asset_id: ast-tool-demo}, vrel: GROUNDED_IN_VIEWER}
+      - {q: '这个教程讲的提取全文方法适合扫描版 PDF 吗?', viewer: {kind: video, asset_id: ast-tool-demo}, vrel: GROUNDED_IN_VIEWER}
+  - id: hn-drift-toolish
+    intent: HARD_NEGATIVE_DRIFT_TOOLISH
+    difficulty: ADVERSARIAL
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '番茄炒蛋要先放蛋还是先放番茄?', viewer: {kind: video, asset_id: ast-tomato-class}, vrel: UNRELATED_DRIFT}
+      - {q: '北京今天冷不冷?', viewer: {kind: document, asset_id: ast-nlp-survey}, vrel: UNRELATED_DRIFT, notes: "contains no tool word; pure drift probe"}
+      - {q: '帮我把这篇文章里的"实体"都标出来,我记得你有个建文件夹的功能挺好用', viewer: {kind: document, asset_id: ast-nlp-survey}, vrel: RELATED_BUT_NOT_IN_VIEWER, notes: "tool mention is incidental; the actual ask is annotation (Agent/LLM work)"}

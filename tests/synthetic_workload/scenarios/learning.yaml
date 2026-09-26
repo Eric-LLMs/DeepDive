@@ -1,0 +1,32 @@
+# S3 Learning — concept questions, comparisons, teaching dialogue.
+# Almost all belongs to Agent/LLM; the funnel must fall through.
+scenario: S3_LEARNING
+defaults: {viewer: {kind: none}, vrel: NO_VIEWER, intent: KNOWLEDGE_QA, difficulty: EASY}
+cases:
+  - id: concept-explain
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '什么是向量数据库?'}
+      - {q: '用通俗的话讲讲 CAP 定理'}
+      - {q: '怎么理解"幂等"这个概念?'}
+      - {q: '熵能不能举个生活里的例子?'}
+      - {q: '为什么 Transformer 比 RNN 好?'}
+      - {q: 'JWT 和 Session 认证各有什么优缺点?'}
+  - id: example-ask
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '给我出几道集合论的练习题'}
+      - {q: '能举个实际项目里用消息队列的例子吗?'}
+  - id: teaching-followup
+    difficulty: MEDIUM
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '再讲讲刚才说的注意力机制,还是没太懂', intent: FOLLOW_UP, notes: "multi-turn teaching: history lives upstream, not in the funnel"}
+      - {q: '那这个和昨天学的反向传播有什么联系?', intent: FOLLOW_UP}
+      - {q: '所以你的意思是先学线性代数再学机器学习?', intent: FOLLOW_UP}
+  - id: study-planning
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '我该先学 Python 还是 C++?'}
+      - {q: '零基础转 AI 方向,一年时间够吗?'}
+      - {q: '帮我制定一个学习 Transformer 的路线', difficulty: MEDIUM}

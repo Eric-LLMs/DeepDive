@@ -1,34 +1,49 @@
-"""Node 2 — Recall: query -> top-k candidates, evidence only, never adjudicates.
+"""Node 2 — Recall: query -> scored hits, evidence only, never adjudicates.
 
-Discipline (design §3 Node 2 + §8.17): cosine here is a QUALITY GATE (filter
-obvious garbage), the "which one" decision belongs to the ToolIntentModel. The legacy
-QIR semantic layer mixed both roles — that entanglement is exactly what this
-node unbundles. The index is the Recall side of the Registry's Build-Then-Swap
-(§8.3): snapshot vectors are published in the SAME transaction as the registry
-version, so (view.version, index.version) are observed together or not at all.
+Discipline (chain ruling 2026-09-24 + live-table ruling 2026-09-26): cosine
+here is a QUALITY GATE (filter obvious garbage), the "which one" decision
+belongs to the ToolIntentModel. The index is the LIVE corpus itself —
+``capability_standard_queries`` / ``capability_similar_queries`` are the
+runtime truth, so there is no version predicate and no snapshot pair any more.
 
-Phase 3 (ruling 2026-09-25): the sentence embeddings live in the SQL
-``qir_examples`` table (the Intent Query Library). This node PREFERS the pgvector
-ANN path — one query pinned to the ACTIVE version (``qir_version = <active> AND
-enabled``; cross-version recall is physically excluded). If the ANN query faults
-(missing extension, connection trouble), recall degrades HONESTLY to in-process
-cosine over the same version's rows loaded by ``load_index``, with a WARNING —
-never to the retired blob lane.
+Two INDEPENDENT vector searches per turn (Standard path + Similar path) over
+ONE user-query embedding; the hit sets are simply concatenated. The retired
+per-capability MAX/AVG merge is GONE by construction: every hit at or above
+``min_score`` is kept as its own candidate with full provenance (capability,
+sentence, kind, language, row ids).
+
+Predicates: row enabled AND capability enabled+active AND embedding IS NOT
+NULL — so until the out-of-band backfill (scripts/embed_corpus.py) has run,
+the corpus is empty for scoring purposes and this node honestly reports
+RECALL_UNAVAILABLE (8.10), never a half-index.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import types
+
+from sqlalchemy import text as sql_text
 
 from ..contract import Candidate, RecallResult
 
 logger = logging.getLogger(__name__)
 
-# ANN reads a wide neighborhood so the per-capability best-example merge is
-# taken from a real pool, not a candidate-starved top slice (semantics identical
-# to the exact cosine scan, which scores every example).
-_ANN_POOL_FACTOR = 8
+# ANN reads a wide neighborhood; it is an ANN WIDTH, not a candidate cap —
+# everything >= min_score inside the pool is kept.
+_ANN_POOL = 64
+
+_MARKER_SQL = sql_text(
+    "SELECT"
+    " (SELECT count(*) || ':' || coalesce(max(updated_at)::text, '-') FROM capabilities),"
+    " (SELECT count(*) || ':' || coalesce(max(updated_at)::text, '-') FROM capability_standard_queries),"
+    " (SELECT count(*) || ':' || coalesce(max(updated_at)::text, '-') FROM capability_similar_queries)"
+)
+
+# marker -> index (fingerprint + vector rows); swapped by construction when any
+# live corpus row changes (the store bumps updated_at on every write).
+_INDEX_CACHE: dict[str, types.SimpleNamespace] = {}
 
 
 def _cosine(a, b) -> float:
@@ -40,54 +55,133 @@ def _cosine(a, b) -> float:
     return dot / (na * nb)
 
 
-def _rank(best: dict[str, tuple[float, str]], *, top_k: int,
-          min_score: float) -> RecallResult:
-    """Cap-merge outcome -> the node's contract: quality gate, score order,
-    top_k cut. Shared by the ANN and the in-process lanes so the two can never
-    drift in WHAT they return, only in HOW they scored."""
-    ranked = sorted(
-        (
-            Candidate(capability_id=cid, score=round(s, 6), matched_example=ex)
-            for cid, (s, ex) in best.items()
-            if s >= min_score
-        ),
-        key=lambda c: c.score, reverse=True,
-    )[: max(1, top_k)]
-    return RecallResult(candidates=tuple(ranked))
+_LOAD_ROWS_SQL = sql_text(
+    "SELECT 'standard' AS kind, s.id, s.capability_id, s.query, s.language,"
+    "       NULL AS standard_query_id, s.embedding"
+    "  FROM capability_standard_queries s"
+    "  JOIN capabilities c ON c.capability_id = s.capability_id"
+    " WHERE s.enabled AND c.enabled AND c.status = 'active' AND s.embedding IS NOT NULL"
+    " UNION ALL"
+    "SELECT 'similar', q.id, s.capability_id, q.query, q.language,"
+    "       q.standard_query_id, q.embedding"
+    "  FROM capability_similar_queries q"
+    "  JOIN capability_standard_queries s ON s.id = q.standard_query_id"
+    "  JOIN capabilities c ON c.capability_id = s.capability_id"
+    " WHERE q.enabled AND s.enabled AND c.enabled AND c.status = 'active'"
+    "   AND q.embedding IS NOT NULL"
+)
 
 
-async def _ann_recall(index, qvec, *, top_k: int, min_score: float):
-    """pgvector lane: distance-ordered neighbours, one version predicate,
-    best-example merge per capability. Returns None to signal 'degrade'."""
-    from sqlalchemy import text as sql_text
-
-    q_literal = "[" + ",".join(repr(float(x)) for x in qvec) + "]"
-    sql = sql_text(
-        "SELECT capability_id, example_index, text,"
-        "       1 - (embedding <=> CAST(:q AS vector)) AS score"
-        "  FROM qir_examples"
-        " WHERE qir_version = :version AND enabled"
-        " ORDER BY embedding <=> CAST(:q AS vector)"
-        " LIMIT :lim"
+async def load_index(session_factory):
+    """Load the LIVE Recall index (fingerprint + embedded rows for the
+    degraded in-process lane), or None when NO embedded row is routable —
+    the funnel reports that as RECALL_UNAVAILABLE until the backfill runs.
+    Test doubles that patch this seam hand plain duck-typed indexes and stay
+    on the in-process lane (8.17 node isolation)."""
+    async with session_factory() as session:
+        marker_row = (await session.execute(_MARKER_SQL)).first()
+    marker = "|".join(str(x) for x in (marker_row or ()))
+    cached = _INDEX_CACHE.get(marker)
+    if cached is not None:
+        return cached
+    async with session_factory() as session:
+        rows = (await session.execute(_LOAD_ROWS_SQL)).all()
+    corpus = tuple(
+        types.SimpleNamespace(
+            kind=str(r[0]), query_id=str(r[1]), capability_id=str(r[2]),
+            query=str(r[3]), language=str(r[4]),
+            standard_query_id=str(r[5]) if r[5] is not None else None,
+            vector=list(r[6]),
+        )
+        for r in rows
     )
+    if not corpus:
+        _INDEX_CACHE.clear()
+        return None
+    digest = hashlib.sha256(
+        "|".join(f"{c.kind}:{c.capability_id}:{c.language}:{c.query}"
+                 for c in sorted(corpus, key=lambda c: c.query_id))
+        .encode("utf-8")
+    ).hexdigest()[:12]
+    index = types.SimpleNamespace(
+        version="corpus1-" + digest,
+        corpus=corpus,
+        session_factory=session_factory,
+    )
+    if len(_INDEX_CACHE) >= 8:
+        _INDEX_CACHE.clear()
+    _INDEX_CACHE[marker] = index
+    return index
+
+
+_STANDARD_SQL = sql_text(
+    "SELECT s.capability_id, s.id, s.query, s.language,"
+    "       1 - (s.embedding <=> CAST(:q AS vector)) AS score"
+    "  FROM capability_standard_queries s"
+    "  JOIN capabilities c ON c.capability_id = s.capability_id"
+    " WHERE s.enabled AND c.enabled AND c.status = 'active'"
+    "   AND s.embedding IS NOT NULL"
+    " ORDER BY s.embedding <=> CAST(:q AS vector)"
+    " LIMIT :pool"
+)
+_SIMILAR_SQL = sql_text(
+    "SELECT s.capability_id, q.id, q.query, q.language, q.standard_query_id,"
+    "       1 - (q.embedding <=> CAST(:q AS vector)) AS score"
+    "  FROM capability_similar_queries q"
+    "  JOIN capability_standard_queries s ON s.id = q.standard_query_id"
+    "  JOIN capabilities c ON c.capability_id = s.capability_id"
+    " WHERE q.enabled AND s.enabled AND c.enabled AND c.status = 'active'"
+    "   AND q.embedding IS NOT NULL"
+    " ORDER BY q.embedding <=> CAST(:q AS vector)"
+    " LIMIT :pool"
+)
+
+
+def _q_literal(qvec) -> str:
+    return "[" + ",".join(repr(float(x)) for x in qvec) + "]"
+
+
+def _hits_from_rows(rows, kind: str) -> list[Candidate]:
+    out: list[Candidate] = []
+    for r in rows:
+        out.append(Candidate(
+            capability_id=str(r[0]), score=round(float(r[-1]), 6),
+            matched_example=str(r[2]), origin="recall",
+            query_kind=kind, language=str(r[3]), query_id=str(r[1]),
+            standard_query_id=(str(r[4]) if kind == "similar" and r[4] is not None
+                               else None),
+        ))
+    return out
+
+
+async def _ann_recall(index, qvec, *, min_score: float) -> RecallResult:
+    """pgvector lane: TWO independent distance-ordered searches (Standard
+    path, Similar path). No per-capability merge — hits are concatenated as
+    they came back, every one >= min_score kept."""
+    q_literal = _q_literal(qvec)
     async with index.session_factory() as session:
-        rows = (await session.execute(
-            sql, {"q": q_literal, "version": index.version,
-                  "lim": max(1, top_k) * _ANN_POOL_FACTOR},
-        )).all()
-    best: dict[str, tuple[float, str]] = {}
-    for cid, _idx, ex, score in rows:
-        s = float(score)
-        prev = best.get(cid)
-        if prev is None or s > prev[0]:
-            best[cid] = (s, str(ex))
-    return _rank(best, top_k=top_k, min_score=min_score)
+        std_rows = (await session.execute(
+            _STANDARD_SQL, {"q": q_literal, "pool": _ANN_POOL})).all()
+        sim_rows = (await session.execute(
+            _SIMILAR_SQL, {"q": q_literal, "pool": _ANN_POOL})).all()
+    hits = _hits_from_rows(std_rows, "standard") + _hits_from_rows(sim_rows, "similar")
+    return _gate(hits, min_score=min_score)
 
 
-async def recall(index, query: str, *, embedder, top_k: int,
+def _gate(hits: list[Candidate], *, min_score: float) -> RecallResult:
+    """The quality gate + score order. EVERY hit >= min_score is a candidate
+    (a capability may appear several times, through different sentences)."""
+    kept = sorted((c for c in hits if c.score >= min_score),
+                  key=lambda c: c.score, reverse=True)
+    return RecallResult(candidates=tuple(kept))
+
+
+async def recall(index, query: str, *, embedder,
                  min_score: float) -> RecallResult:
-    """Top-k capabilities by best-example score. Raises on embedder failure —
-    the funnel maps that to RECALL_UNAVAILABLE and falls open to the Agent."""
+    """All live-corpus hits at or above the quality gate, score-ordered.
+    The user query is embedded EXACTLY ONCE for both paths. Raises on
+    embedder failure — the funnel maps that to RECALL_UNAVAILABLE and falls
+    open to the Agent."""
     if not (query or "").strip():
         return RecallResult(candidates=())
     vectors = await embedder.embed([query])
@@ -98,49 +192,19 @@ async def recall(index, query: str, *, embedder, top_k: int,
 
     if getattr(index, "session_factory", None) is not None:
         try:
-            return await _ann_recall(index, qvec, top_k=top_k, min_score=min_score)
+            return await _ann_recall(index, qvec, min_score=min_score)
         except Exception as exc:  # noqa: BLE001 - honest degrade, loud WARNING
             logger.warning("recall: ANN query failed (%r); falling back to "
-                           "in-process cosine over this version's rows", exc)
+                           "in-process cosine over the live corpus rows", exc)
 
-    # In-process lane: exact cosine over the ACTIVE version's example vectors
-    # (loaded from qir_examples by load_index — the same rows, scanned here).
-    # Test doubles and blob-less fakes hand the vectors in directly.
-    best: dict[str, tuple[float, str]] = {}
-    examples = {
-        (c.id, i): e for c in index.capabilities for i, e in enumerate(c.examples)
-    }
-    for ev in index.example_vectors:
-        key = (ev.capability_id, ev.example_index)
-        if key not in examples:
-            continue  # vector without a matching example — refuse to score it
-        score = _cosine(qvec, ev.vector)
-        prev = best.get(ev.capability_id)
-        if prev is None or score > prev[0]:
-            best[ev.capability_id] = (score, examples[key])
-    return _rank(best, top_k=top_k, min_score=min_score)
-
-
-async def load_index(session_factory):
-    """Load the ACTIVE Recall index.
-
-    The publish pipeline (Registry Build-Then-Swap) writes the qir_examples
-    rows and the version pointer in the SAME transaction; this seam reads the
-    pair back: metadata from the (vector-free) blob, embeddings from the
-    active version's rows. An active version without rows is a fault — None,
-    which the funnel reports as RECALL_UNAVAILABLE (8.10: no silent half-index,
-    and no blob-vector fallback since the 2026-09-25 ruling). The returned
-    index carries session_factory so recall() can take the ANN lane; doubles
-    that patch this seam hand plain duck-typed indexes and stay on the
-    in-process lane (8.17 node isolation)."""
-    from core.application.chat.qir import store as qir_store
-
-    snap = await qir_store.active(session_factory)
-    if snap is None:
-        return None
-    return types.SimpleNamespace(
-        version=snap.version,
-        capabilities=snap.capabilities,
-        example_vectors=snap.example_vectors,
-        session_factory=session_factory,
-    )
+    # In-process lane: exact cosine over the SAME rows load_index read
+    # (test doubles and ANN faults land here; two paths, no merge).
+    hits: list[Candidate] = []
+    for c in getattr(index, "corpus", ()):
+        hits.append(Candidate(
+            capability_id=c.capability_id, score=round(_cosine(qvec, c.vector), 6),
+            matched_example=c.query, origin="recall", query_kind=c.kind,
+            language=c.language, query_id=c.query_id,
+            standard_query_id=c.standard_query_id,
+        ))
+    return _gate(hits, min_score=min_score)

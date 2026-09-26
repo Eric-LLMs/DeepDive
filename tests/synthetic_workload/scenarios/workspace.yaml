@@ -1,0 +1,41 @@
+# S6 Knowledge Base / Workspace — where tool intent is naturally dense,
+# BUT: only 3 capabilities are published. "move/delete/rename/list" requests
+# are HONEST AGENT expectations (cap not published) — future caps must come
+# with a dataset version bump, never silent relabeling.
+scenario: S6_WORKSPACE
+defaults: {viewer: {kind: none}, vrel: NO_VIEWER, intent: TOOL_ACTION, difficulty: EASY}
+cases:
+  - id: ws-create-folder
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    variants:
+      - {q: '建个"项目资料"文件夹', args: {name: 项目资料}}
+      - {q: '在根目录建一个"2026计划"文件夹', args: {name: 2026计划}}
+      - {q: '新建"实验数据"目录', args: {name: 实验数据}}
+      - {q: '建个文件夹叫 "tmp-test"', args: {name: tmp-test}}
+  - id: ws-add-term
+    expected: {funnel: TOOL, cap: cap-add-term}
+    variants:
+      - {q: '把 "embedding" 加进向量检索词汇库', args: {term: embedding, domain: 向量检索|向量检索词汇库}}
+      - {q: '把 ephemeral 收进文学词汇库', args: {term: ephemeral, domain: 文学|文学词汇库}}
+      - {q: '往工程词汇库加 "backpressure"', args: {term: backpressure, domain: 工程|工程词汇库}}
+  - id: ws-extract
+    viewer: {kind: document, asset_id: ast-vocab-notes, has_attachment: true}
+    vrel: GROUNDED_IN_VIEWER
+    expected: {funnel: TOOL, cap: cap-pdf-extract-text}
+    variants:
+      - {q: '把这份笔记的全文提出来', args: {asset_id: ast-vocab-notes}}
+  - id: ws-unpublished-cap-move
+    expected: {funnel: AGENT}
+    difficulty: MEDIUM
+    variants:
+      - {q: '把这篇论文移动到 papers 文件夹', intent: TOOL_ACTION, notes: "no move-file capability published; Agent explains/asks — future v2 label candidate"}
+      - {q: '刚建的文件夹位置不对,挪到"归档"下面去', notes: "same: move not published"}
+  - id: ws-unpublished-cap-manage
+    expected: {funnel: AGENT}
+    difficulty: MEDIUM
+    variants:
+      - {q: '我的网盘里有几个文件夹?', notes: "no list capability published"}
+      - {q: '把"临时草稿"文件夹删掉', notes: "no delete capability published"}
+      - {q: '"会议纪要2026"改个名,去掉年份', notes: "no rename capability published"}
+      - {q: '搜索我的文档里提到 NER 的文件', notes: "search via Agent/retrieval, not funnel"}
+      - {q: '打开我的"读书笔记"文件夹', notes: "open/browse not published"}

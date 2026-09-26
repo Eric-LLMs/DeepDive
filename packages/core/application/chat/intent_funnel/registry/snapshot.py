@@ -1,40 +1,23 @@
-"""Publish pipeline — Validate / Preview / Build-Then-Swap (QIR P1 step 2).
+"""Validation gate for live-table writes (migration 0014, final ruling 2026-09-26).
 
-The fixed flow of docs/temp.md 8.2/8.3, as one callable:
+The Draft -> Validate -> Build -> Publish lane is retired: the live tables ARE
+the runtime truth and admin writes go live directly. What survives is the
+VALIDATE half, now the gate in front of every write path and the "check"
+button of the admin console:
 
-    Draft -> validate -> [preview: build outside any tx, zero writes]
-          -> stage registry version -> SHORT TRANSACTION:
-               old active -> superseded | staged -> active | qir index pair
-          -> activated  (or: staged -> FAILED, old active keeps serving)
-
-Two properties the code is built to guarantee, not just document:
-
-* NOTHING is written until every derived artifact (embeddings, snapshot) built
-  successfully — an embedding failure costs zero DB rows (ruling 7: the live
-  Registry vN + Index vN pair keeps serving; there is no vN+1/vN mix).
-* the registry version swap and the QIR active-snapshot pair land in the SAME
-  commit (``qir.store.write_active`` on the caller's session), so "Registry v43
-  with Index v42" is not a state the database can ever show.
-
-Validation is stricter than qir's snapshot gate because Registry rows carry the
-extra vocabulary (patterns/aliases/arg_slots/policy): a draft that only QIR
-would accept can still be rejected here (8.4).
+* ``validate_entries(entries, tool_schemas=...)`` — pure function, every rule
+  as an issue string; empty list == consistent.
+* The tool roster is NOT the code allowlist: the source of truth is the live
+  ``ToolRuntime.schemas()`` projection passed in by the caller (admin API).
+  A tool existing is NOT the same as an action being registered, and the
+  DIRECT_TOOLS dispatch allowlist stays untouched — intent is never
+  authorization.
 """
 from __future__ import annotations
 
-import logging
 import re
-from typing import Any, Sequence
-
-from sqlalchemy import func, update
-
-# ``build_snapshot`` is late-bound inside preview/publish: a top-level import
-# here cycles when the entry point is ``qir.snapshot`` itself (qir.snapshot
-# needs registry.plugins -> registry/__init__ -> this module, which would then
-# re-enter a half-built qir.snapshot).
-from core.application.chat.qir import store as qir_store
-from core.application.chat.qir.types import Snapshot
-from core.infrastructure.db import RegistryVersionModel
+from collections.abc import Sequence
+from typing import Any
 
 from .entry import (
     RE_PREFIX,
@@ -44,28 +27,13 @@ from .entry import (
     VALID_KINDS,
     CapabilityEntry,
 )
-from .plugins import DIRECT_TOOLS, PLUGINS  # same package: the action roster (leaf)
-from .store import (
-    STATE_ACTIVE,
-    STATE_STAGED,
-    STATE_SUPERSEDED,
-    RegistryError,
-    RegistryStateError,
-    RegistryVersionView,
-    _factory,
-    get_version,
-    invalidate_cache,
-    mark_failed,
-    stage_version,
-)
-
-logger = logging.getLogger(__name__)
+from .plugins import PLUGINS  # extractor roster (leaf)
 
 # arg_slots.source minimal enum (P1 ruling 2 — no speculative additions).
 # plugin:<name> is the seventh form: the table registers WHICH extractor, the
-# extractor itself stays in code (8.1-b) — and since the 2026-09-24 wiring the
-# name MUST exist in PLUGINS (roster membership = the "启停/版本归 Registry 管"
-# discipline: an unregistered extractor can never pass the publish gate).
+# extractor itself stays in code (8.1-b) — the name MUST exist in PLUGINS
+# (roster membership = the "启停/版本归 Registry 管" discipline: an unregistered
+# extractor can never pass the gate).
 VALID_SOURCES = frozenset({
     "user_input", "viewer.current_page", "viewer.selection",
     "attachment", "turn_context", "fixed",
@@ -74,8 +42,8 @@ VALID_POLICIES = frozenset({"auto", "approval", "sandbox"})
 VALID_STATUSES = frozenset({STATUS_ACTIVE, STATUS_DISABLED, STATUS_DEPRECATED})
 
 
-class PublishRejectedError(RegistryError):
-    """Publish gate closed: the draft set failed validation. Carries every issue
+class RegistryValidationError(Exception):
+    """Write gate closed: the entry set failed validation. Carries every issue
     (not just the first) so the editor fixes one round, not one page."""
 
     def __init__(self, issues: Sequence[str]):
@@ -83,13 +51,19 @@ class PublishRejectedError(RegistryError):
         self.issues = list(issues)
 
 
-# ── Validate (8.4) ────────────────────────────────────────────────────────────────
+# ── Validate ─────────────────────────────────────────────────────────────────────
 
-def validate_entries(entries: Sequence[CapabilityEntry]) -> list[str]:
-    """Every rule of 8.4 as a pure function; empty list == publishable."""
+def validate_entries(
+    entries: Sequence[CapabilityEntry],
+    *,
+    tool_schemas: dict[str, dict[str, int]] | None = None,
+) -> list[str]:
+    """Every rule as a pure function; empty list == consistent. ``tool_schemas``
+    maps runtime tool name -> {arg: max_len} (from ToolRuntime.schemas()); when
+    None the tool-existence cross-check is skipped (unit tests)."""
     issues: list[str] = []
     if not entries:
-        return ["refusing to publish an empty Registry"]
+        return ["refusing an empty Registry: no capability is registered"]
     seen: set[str] = set()
     for e in entries:
         cid = e.capability_id.strip()
@@ -102,20 +76,32 @@ def validate_entries(entries: Sequence[CapabilityEntry]) -> list[str]:
         seen.add(cid)
         if not e.tool_binding.strip():
             issues.append(f"{cid}: tool_binding is required")
-        elif e.tool_binding not in DIRECT_TOOLS:
+        elif tool_schemas is not None and e.tool_binding not in tool_schemas:
             issues.append(
-                f"{cid}: tool_binding {e.tool_binding!r} is not an existing DIRECT_TOOLS "
-                "binding (the Registry cannot invent executables)"
+                f"{cid}: tool_binding {e.tool_binding!r} is not a tool in the "
+                "live ToolRuntime roster (the Registry cannot invent executables)"
             )
         if not e.description.strip():
             issues.append(f"{cid}: description is required (ToolIntentModel card source)")
-        if not e.intent_corpus:
+        if not e.intent_corpus and _routable(e):
+            # A non-routable row (disabled/deprecated — e.g. freshly created
+            # from the Catalog before its corpus is curated) may lawfully have
+            # no sentences; a ROUTABLE one must never be inert.
             issues.append(
-                f"{cid}: intent corpus must be non-empty and indexable "
-                "(standard_example / synonym_examples — legacy examples no "
-                "longer feed Exact or Recall, ruling 2026-09-25)"
+                f"{cid}: query corpus must be non-empty (capability_standard_"
+                "queries / capability_similar_queries — request examples and "
+                "negatives are never match or recall anchors)"
             )
-        issues.extend(f"{cid}: {msg}" for msg in _parameter_issues(e))
+        if _routable(e):
+            langs = {r.language for r in e.standard_queries
+                     if r.enabled and str(r.query or "").strip()}
+            if langs != {"zh", "en"}:
+                issues.append(
+                    f"{cid}: routable capability needs exactly one enabled "
+                    f"Standard per language, found {sorted(langs) or 'none'}"
+                )
+        issues.extend(f"{cid}: {msg}" for msg in
+                      _parameter_issues(e, tool_schemas))
         if e.status not in VALID_STATUSES:
             issues.append(f"{cid}: status {e.status!r} not in {sorted(VALID_STATUSES)}")
         if e.enabled and e.status != STATUS_ACTIVE:
@@ -147,8 +133,26 @@ def validate_entries(entries: Sequence[CapabilityEntry]) -> list[str]:
             issues.extend(
                 f"{cid}: arg_slots[{slot!r}] {msg}" for msg in _slot_issues(source)
             )
-    issues.extend(_pattern_conflicts(entries))
+        for rec in (*e.standard_queries, *e.similar_queries):
+            if not str(rec.query or "").strip():
+                issues.append(f"{cid}: blank query row {rec.id}")
+            elif rec.language != _derive(rec.query):
+                issues.append(
+                    f"{cid}: query {rec.id} language {rec.language!r} violates "
+                    "the frozen derivation rule"
+                )
+        for sim in e.similar_queries:
+            if not any(st.id == sim.standard_query_id for st in e.standard_queries):
+                issues.append(
+                    f"{cid}: similar query {sim.id} points outside this "
+                    "capability's Standard set"
+                )
+    issues.extend(_corpus_conflicts(entries))
     return issues
+
+
+def _derive(text: str) -> str:
+    return "zh" if any("一" <= ch <= "鿿" for ch in str(text or "")) else "en"
 
 
 def _slot_issues(source: Any) -> list[str]:
@@ -174,27 +178,32 @@ def _routable(e: CapabilityEntry) -> bool:
     return e.enabled and e.status == STATUS_ACTIVE
 
 
-def _parameter_issues(e: CapabilityEntry) -> list[str]:
-    """Registry is the CANONICAL parameter-schema source (0007 chain ruling);
-    DIRECT_TOOLS.arg_schema is the runtime compat layer. This gate is the only
-    bridge: a mechanical cross-check, so no human sync burden exists. Rules:
-    slot-name sets must agree, ``max_len`` (when given) must match the runtime
-    bound, and every parameter carries the Card-minimal shape."""
+def _parameter_issues(e: CapabilityEntry,
+                      tool_schemas: dict[str, dict[str, int]] | None) -> list[str]:
+    """Registry is the CANONICAL parameter-schema source; ToolRuntime.schemas()
+    is the live tool roster. This gate is the only bridge: a mechanical
+    cross-check against the passed-in projection, so no human sync burden
+    exists. Rules: slot-name sets must agree, ``max_len`` (when given) must
+    match the runtime bound, and every parameter carries the Card-minimal
+    shape."""
     issues: list[str] = []
-    spec = DIRECT_TOOLS.get(e.tool_binding)
-    if spec is None:
-        return issues  # tool_binding membership already reported above
-    runtime: dict[str, int] = dict(spec.arg_schema or {})
+    runtime: dict[str, int] | None = None
+    if tool_schemas is not None and e.tool_binding in tool_schemas:
+        runtime = dict(tool_schemas[e.tool_binding] or {})
+    if runtime is None:
+        pass  # no roster (unit tests) or tool unlisted: membership reported above
+    else:
+        declared_slots = set(e.parameters or {})
+        for slot in sorted(set(runtime) - declared_slots):
+            issues.append(
+                f"parameters missing runtime slot {slot!r} of {e.tool_binding!r} "
+                "(Registry must carry the full schema — dual sources forbidden)"
+            )
+        for slot in sorted(declared_slots - set(runtime)):
+            issues.append(
+                f"parameters declares {slot!r}, unknown to runtime tool {e.tool_binding!r}"
+            )
     declared: dict[str, Any] = dict(e.parameters or {})
-    for slot in sorted(set(runtime) - set(declared)):
-        issues.append(
-            f"parameters missing runtime slot {slot!r} of {e.tool_binding!r} "
-            "(Registry must carry the full schema — dual sources forbidden)"
-        )
-    for slot in sorted(set(declared) - set(runtime)):
-        issues.append(
-            f"parameters declares {slot!r}, unknown to runtime tool {e.tool_binding!r}"
-        )
     for slot, raw in sorted(declared.items()):
         if not isinstance(raw, dict):
             issues.append(f"parameters[{slot!r}] must be an object")
@@ -206,7 +215,10 @@ def _parameter_issues(e: CapabilityEntry) -> list[str]:
         if not isinstance(raw.get("required"), bool):
             issues.append(f"parameters[{slot!r}].required must be a bool")
         max_len = raw.get("max_len")
-        if max_len is not None and slot in runtime and int(max_len) != int(runtime[slot]):
+        # The roster's maxLength is authoritative only when it states a bound;
+        # a schema without maxLength carries no runtime bound to contradict.
+        if (max_len is not None and runtime is not None and slot in runtime
+                and runtime[slot] and int(max_len) != int(runtime[slot])):
             issues.append(
                 f"parameters[{slot!r}].max_len={max_len} contradicts runtime "
                 f"bound {runtime[slot]} of {e.tool_binding!r}"
@@ -214,137 +226,24 @@ def _parameter_issues(e: CapabilityEntry) -> list[str]:
     return issues
 
 
-def _pattern_conflicts(entries: Sequence[CapabilityEntry]) -> list[str]:
-    """Deterministic-match collision: the same literal in two ROUTABLE capabilities
-    makes the Matcher ambiguous by construction — reject at the gate instead."""
+def _corpus_conflicts(entries: Sequence[CapabilityEntry]) -> list[str]:
+    """Deterministic-match collision: the same corpus sentence in two ROUTABLE
+    capabilities makes the Matcher ambiguous by construction — report it."""
     owner: dict[str, str] = {}
     issues: list[str] = []
     for e in entries:
         if not _routable(e):
             continue
-        for lit in (*e.patterns, *e.aliases):
+        for lit in (*e.intent_corpus, *e.patterns, *e.aliases):
             lit = str(lit).strip()
             if not lit:
-                issues.append(f"{e.capability_id}: blank pattern/alias entry")
+                issues.append(f"{e.capability_id}: blank corpus/pattern entry")
                 continue
-            prev = owner.setdefault(lit, e.capability_id)
+            key = lit.casefold()
+            prev = owner.setdefault(key, e.capability_id)
             if prev != e.capability_id:
                 issues.append(
                     f"deterministic conflict: {lit!r} claimed by {prev!r} and "
                     f"{e.capability_id!r}"
                 )
     return issues
-
-
-def to_qir_draft(entries: Sequence[CapabilityEntry]) -> dict:
-    """Project Registry rows into the qir snapshot-builder's draft shape (the
-    routing subset only — 8.4 gate already ran, qir re-checks its own structure)."""
-    return {
-        "capabilities": [
-            {
-                "id": e.capability_id,
-                "tool_binding": e.tool_binding,
-                "description": e.description,
-                "examples": list(e.intent_corpus),
-                "negatives": list(e.negatives),
-                "enabled": e.enabled and e.status == STATUS_ACTIVE,
-            }
-            for e in entries
-        ]
-    }
-
-
-# ── Preview (8.5, primitive) ──────────────────────────────────────────────────────
-
-async def preview_draft(
-    entries: Sequence[CapabilityEntry], embedder,
-) -> tuple[list[str], Snapshot | None]:
-    """Dry-run the BUILD half of publishing: validation + real embedding cost,
-    ZERO writes. The full-funnel query preview (Matcher->...->Route) rides on the
-    returned snapshot once the step-3 Matcher reads the Registry; tool execution
-    is never in reach of this function (8.8: intent nodes hold no execution)."""
-    from core.application.chat.qir.snapshot import build_snapshot  # late-bound, see top
-
-    issues = validate_entries(entries)
-    if issues:
-        return issues, None
-    snap = await build_snapshot(to_qir_draft(entries), embedder)
-    return [], snap
-
-
-# ── Build-Then-Swap publish (8.3) ─────────────────────────────────────────────────
-
-async def publish_draft(
-    embedder,
-    *,
-    drafts: Sequence[CapabilityEntry] | None = None,
-    actor_user_id: Any = None,
-    actor_username: str | None = None,
-    note: str | None = None,
-    session_factory: Any = None,
-) -> RegistryVersionView:
-    """The one publish entry point (Draft table is the source when ``drafts`` is None).
-
-    Raises PublishRejectedError / SnapshotError BEFORE any write; after staging,
-    any swap failure marks the new version FAILED (history shows why) and the old
-    active pair keeps serving untouched."""
-    from core.application.chat.qir.snapshot import build_snapshot  # late-bound, see top
-
-    from .store import list_drafts  # local to keep the import graph flat
-
-    factory = _factory(session_factory)
-    entries_list = (
-        await list_drafts(session_factory=factory)
-        if drafts is None else list(drafts)
-    )
-
-    issues = validate_entries(entries_list)
-    if issues:
-        raise PublishRejectedError(issues)
-
-    # -- outside any transaction: the expensive derived artifact ------------------
-    snap = await build_snapshot(to_qir_draft(entries_list), embedder)
-
-    staged = await stage_version(
-        entries_list, actor_user_id=actor_user_id, actor_username=actor_username,
-        note=note, session_factory=factory,
-    )
-
-    # -- the single short transaction: swap BOTH stores together --------------------
-    try:
-        async with factory() as session:
-            await session.execute(
-                update(RegistryVersionModel)
-                .where(RegistryVersionModel.state == STATE_ACTIVE)
-                .values(state=STATE_SUPERSEDED)
-            )
-            res = await session.execute(
-                update(RegistryVersionModel)
-                .where(
-                    RegistryVersionModel.version == staged.version,
-                    RegistryVersionModel.state == STATE_STAGED,
-                )
-                .values(state=STATE_ACTIVE, activated_at=func.now())
-            )
-            if res.rowcount == 0:
-                raise RegistryStateError(
-                    f"version {staged.version} left staged state mid-publish "
-                    "(concurrent publish? refusing to half-swap)"
-                )
-            await qir_store.write_active(session, snap)
-            await session.commit()
-    except Exception as exc:  # noqa: BLE001 - record, keep old active serving, re-raise
-        try:
-            await mark_failed(
-                staged.version, f"activation swap failed: {exc!r}",
-                session_factory=factory,
-            )
-        except Exception:  # noqa: BLE001 - never mask the original failure
-            logger.exception("registry v%d: could not record the failed activation", staged.version)
-        raise
-    invalidate_cache()
-    logger.info(
-        "registry published v%d (qir %s) caps=%d actor=%s",
-        staged.version, snap.version, len(entries_list), actor_username,
-    )
-    return await get_version(staged.version, session_factory=factory)

@@ -13,8 +13,9 @@ Pinning the P4 rulings:
 * 8.12: one event row per route (production and preview), best-effort — a
   telemetry fault never sinks a turn;
 * TOCTOU (8.9) speaks the ROUTER's namespace: a funnel-certified turn
-  re-validates against the Registry fingerprint (the old dual-namespace where
-  the index version stood in for "the registry" is retired for new routes);
+  re-validates against the Registry content fingerprint — the live tables are
+  the only routing namespace (the QIR index-version branch was deleted by
+  migration 0014);
 * a kind gate flipped OFF between routing and dispatch kills the dispatch —
   the rollout promise holds at the side-effect boundary too.
 """
@@ -35,7 +36,9 @@ from core.application.chat.intent_funnel.registry.entry import (
     KIND_ACTION,
     KIND_PRIVATE,
     CapabilityEntry,
-    RegistryVersionView,
+    QueryRecord,
+    RegistryLiveView,
+    derive_language,
 )
 
 MSG = '新建文件夹"季度报告"'
@@ -43,15 +46,18 @@ MSG = '新建文件夹"季度报告"'
 
 def _entry(cid, *, tool="create_folder", corpus=(), patterns=(), aliases=(),
            kind=KIND_ACTION, description=None, **kw):
-    # corpus = the exact-set sentences (standard + synonyms, ruling 2026-09-25)
+    # corpus = the exact-set sentences (Standard + Similar live rows)
     corpus = tuple(corpus)
+    std = (QueryRecord(id="q1", query=corpus[0],
+                       language=derive_language(corpus[0])),) if corpus else ()
+    sims = tuple(QueryRecord(id=f"q{10 + n}", query=s, language=derive_language(s),
+                             position=n, standard_query_id="q1" if std else None)
+                 for n, s in enumerate(corpus[1:]))
     return CapabilityEntry(
         capability_id=cid, tool_binding=tool,
         description=description or f"does {cid}",
-        standard_example=corpus[0] if corpus else "",
-        synonym_examples=corpus[1:],
+        standard_queries=std, similar_queries=sims,
         patterns=tuple(patterns), aliases=tuple(aliases),
-        examples=("做个事",),
         parameters={"name": {"type": "string", "required": True,
                              "max_len": 120, "description": "folder name"}},
         arg_slots={"name": {"source": "user_input"}},
@@ -60,10 +66,9 @@ def _entry(cid, *, tool="create_folder", corpus=(), patterns=(), aliases=(),
 
 
 def _view(entries, version=1):
-    return RegistryVersionView(
-        version=version, state="active",
+    return RegistryLiveView(
         fingerprint=content_fingerprint(list(entries)),
-        capabilities=(), entries=tuple(entries),
+        entries=tuple(entries),
     )
 
 
@@ -77,7 +82,7 @@ def _ctx(msg, session_id="s-1", **body_kw):
 
 
 def _index():
-    return types.SimpleNamespace(version="idx-9", capabilities=[], example_vectors=[])
+    return types.SimpleNamespace(version="corpus1-test", corpus=())
 
 
 class _Embedder:
@@ -172,7 +177,7 @@ async def test_preview_certifies_and_reports_the_whole_chain(monkeypatch):
     assert res["deepest_stage"] == "certified"
     assert res["execution_mode"] == "preview"
     assert res["registry_version"] == view.fingerprint
-    assert res["index_version"] == "idx-9"
+    assert res["index_version"] == "corpus1-test"
     assert res["route"]["capability_id"] == "cap-a"
     assert res["route"]["tool"] == "create_folder"
     assert res["route"]["args"] == {"name": "季度报告"}
@@ -279,7 +284,7 @@ async def test_certified_turn_writes_production_event(monkeypatch):
     assert ev.execution_mode == "production"
     assert ev.final_route == "action" and ev.capability_id == "cap-a"
     assert ev.session_id == "s-1"
-    assert ev.registry_version == view.fingerprint and ev.index_version == "idx-9"
+    assert ev.registry_version == view.fingerprint and ev.index_version == "corpus1-test"
     assert ev.total_ms >= 0
 
 
@@ -340,11 +345,12 @@ async def test_preview_event_lands_with_preview_mode(monkeypatch):
 
 
 def _action(view, *, kind=KIND_ACTION, tool="create_folder"):
+    # the _certified action shape (live-table ruling): the ONE Registry stamp is
+    # funnel_registry_version — the legacy "registry_version" key no longer exists
     return {
         "tool": tool, "args": {"name": "x"}, "capability_id": "cap-a",
-        "registry_version": "idx-9",            # legacy stamp rides along (P2 shape)
         "funnel_registry_version": view.fingerprint,
-        "funnel_stage": "matcher", "funnel_kind": kind,
+        "funnel_stage": "tool_intent", "funnel_kind": kind,
     }
 
 
@@ -444,27 +450,20 @@ async def test_private_gate_flipped_off_kills_dispatch(monkeypatch):
     assert calls == ["create_folder"]            # the flip prevented the SECOND call
 
 
-async def test_legacy_stamped_turn_keeps_the_old_qir_check(monkeypatch):
-    # a P2/legacy action (no funnel_registry_version) must NOT consult the
-    # Registry view — its namespace is the qir index version, checked there.
-    from core.application.chat.qir import store as qir_store
-
-    snap = types.SimpleNamespace(version="idx-9", capabilities=[])
-    snap.get = lambda cid: None                  # capability gone from the index
-    async def fake_qir_active(sf):
-        return snap
-
-    monkeypatch.setattr(qir_store, "active", fake_qir_active)
+async def test_action_without_funnel_stamp_skips_the_registry_check(monkeypatch):
+    # QIR retirement (migration 0014): the legacy ``registry_version``/qir_store
+    # re-validation branch is GONE — the live view is consulted ONLY for turns
+    # the funnel certified (funnel_registry_version present). An L0-native
+    # action rides the schema gate alone, never the Registry namespace.
     monkeypatch.setattr(
         "core.application.chat.intent_funnel.registry.active_view",
-        lambda **kw: pytest.fail("legacy turns stay in the legacy namespace"),
+        lambda **kw: pytest.fail("only funnel-stamped turns consult the view"),
     )
 
-    async def run_tool(*a):
-        raise AssertionError("must not execute")
+    async def run_tool(tool, args, ctx):
+        return {"ok": True, "output": "done"}
 
     action = {"tool": "create_folder", "args": {"name": "x"},
               "capability_id": "cap-a", "registry_version": "idx-9"}
     ex, req = _exec_req(action, run_tool, session_factory=None)
-    from core.application.chat.executors.action import _TERMINAL_STALE_ROUTE
-    assert await ex._dispatch(req) == _TERMINAL_STALE_ROUTE
+    assert await ex._dispatch(req) == "done"

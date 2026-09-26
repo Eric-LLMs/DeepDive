@@ -1,0 +1,27 @@
+# S10 Life Assistant / Direct Entry — no viewer, no published tool intent.
+# Main purpose: verify the funnel falls back cleanly with zero context.
+scenario: S10_LIFE_ASSISTANT
+defaults: {viewer: {kind: none}, vrel: NO_VIEWER, intent: LIFE_ASSISTANT, difficulty: EASY}
+cases:
+  - id: life-query
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '明天天气怎么样?'}
+      - {q: '附近有什么好吃的川菜馆?'}
+      - {q: '机场打车和地铁哪个划算?'}
+      - {q: '早睡早起真的有用吗?'}
+      - {q: '买 MacBook 还是 Windows 笔记本?'}
+  - id: life-planning
+    expected: {funnel: AGENT}
+    difficulty: MEDIUM
+    variants:
+      - {q: '提醒我下午三点开会', notes: "no reminder capability published — future cap candidate"}
+      - {q: '帮我看看这周六的安排', notes: "no calendar capability published"}
+      - {q: '制定一个七天减脂食谱'}
+      - {q: '下周去上海出差,帮我规划一下行程'}
+  - id: life-toolish-words
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '我的手机存储满了,要不要删点文件夹?', notes: "folder word, user's own device, no Delveta action"}
+      - {q: '整理衣柜有什么技巧?感觉像整理文件一样'}

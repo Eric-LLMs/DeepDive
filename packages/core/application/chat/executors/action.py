@@ -77,19 +77,16 @@ class ActionExecutor(DirectExecutor):
         action = req.plan.action or {}
         tool, args = action.get("tool"), action.get("args")
 
-        # 0. Route/execute TOCTOU re-validation (8.9), in the namespace the
-        #    ROUTER actually certified (P4 unification):
-        #    * a funnel-certified turn stamps ``funnel_registry_version`` — the
-        #      Registry content fingerprint — and re-validates against the
-        #      active Registry view: same fingerprint, capability still active
-        #      and enabled, same tool binding, allowlisted tool, and the kind
-        #      gate still open (a mid-turn flip to OFF must not execute a
-        #      widened kind — 入表≠开闸 holds at dispatch too);
-        #    * a legacy QIR/L0 turn stamps ``registry_version`` (the qir index
-        #      version) — the historical check, byte-unchanged.
-        #    Any drift is C3 TERMINAL: a historical RouteResult never executes
-        #    on blind trust.
-        registry_version = action.get("registry_version")
+        # 0. Route/execute TOCTOU re-validation (8.9). The funnel-certified turn
+        #    stamps ``funnel_registry_version`` — the Registry content fingerprint
+        #    of the live view — and re-validates against the active view: same
+        #    fingerprint, capability still active and enabled, same tool binding,
+        #    allowlisted tool, and the kind gate still open (a mid-turn flip to
+        #    OFF must not execute a widened kind — 入表≠开闸 holds at dispatch
+        #    too). Any drift is C3 TERMINAL: a routed turn never executes on
+        #    blind trust. (QIR retirement, migration 0014: the legacy
+        #    ``registry_version``/qir_store branch is gone — the live tables are
+        #    the only routing namespace.)
         funnel_fp = action.get("funnel_registry_version")
         cap_id = str(action.get("capability_id") or "")
         if funnel_fp is not None:
@@ -113,28 +110,9 @@ class ActionExecutor(DirectExecutor):
                     cap_id, funnel_fp, view.fingerprint if view else None,
                 )
                 return _TERMINAL_STALE_ROUTE
-        elif registry_version is not None:
-            from core.application.chat.qir import store as qir_store
-
-            snapshot = await qir_store.active(req.deps.session_factory)
-            cap = (
-                snapshot.get(cap_id)
-                if snapshot is not None and snapshot.version == str(registry_version)
-                else None
-            )
-            if (
-                cap is None or not cap.enabled
-                or cap.tool_binding != tool or tool not in DIRECT_TOOLS
-            ):
-                logger.warning(
-                    "chat.action route-stale capability=%s stamped=%s active=%s",
-                    cap_id, registry_version,
-                    snapshot.version if snapshot else None,
-                )
-                return _TERMINAL_STALE_ROUTE
 
         # 0.5 Routing-stage binding integrity (stage-2 C2, stamped in
-        #     resolve_plan): the QIR route promised a capability whose binding the
+        #     resolve_plan): the route promised a capability whose binding the
         #     action table does not honor. Decided TERMINAL — the Agent must not
         #     re-plan around a system inconsistency. Checked BEFORE the schema gate
         #     because such an action intentionally carries no args.

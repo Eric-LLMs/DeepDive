@@ -50,16 +50,18 @@ from api.routers import chat as chat_mod
 from core.application.chat import understanding as understanding_mod
 from core.application.chat.intent_funnel.contract import (
     REASON_BIND_MISSING,
-    REASON_TOOL_INTENT_REJECT,
-    REASON_TOOL_INTENT_UNCERTAIN,
     REASON_RECALL_TIMEOUT,
     REASON_REGISTRY_UNAVAILABLE,
+    REASON_TOOL_INTENT_REJECT,
+    REASON_TOOL_INTENT_UNCERTAIN,
 )
 from core.application.chat.intent_funnel.registry import content_fingerprint
 from core.application.chat.intent_funnel.registry.entry import (
     KIND_ACTION,
     CapabilityEntry,
-    RegistryVersionView,
+    QueryRecord,
+    RegistryLiveView,
+    derive_language,
 )
 from core.config import settings
 from core.infrastructure.db import ChatFunnelEventModel
@@ -89,16 +91,27 @@ STEP = {"content": ["Agent took over."], "tool_calls": None}
 
 # ── the fake production world ─────────────────────────────────────────────────────
 
+def _std(qid, text):
+    return QueryRecord(id=qid, query=text, language=derive_language(text))
+
+
+def _sim(qid, text, parent):
+    return QueryRecord(id=qid, query=text, language=derive_language(text),
+                       standard_query_id=parent)
+
+
 def _entries() -> tuple[CapabilityEntry, ...]:
     return (
         CapabilityEntry(
             capability_id="cap-folder", tool_binding="create_folder",
             description="新建一个带引号名称的文件夹。",
-            # exact corpus (ruling 2026-09-25): the two canonical phrasings are
-            # HIT-able; the stored regex/alias fields are inert legacy storage.
-            standard_example=MSG_FOLDER, synonym_examples=(MSG_BARE, MSG_COMPOUND),
+            # exact corpus = the live query rows (ruling 2026-09-26): the
+            # canonical phrasings are HIT-able; the stored regex/alias fields
+            # are inert legacy storage.
+            standard_queries=(_std("s1", MSG_FOLDER),),
+            similar_queries=(_sim("m1", MSG_BARE, "s1"), _sim("m2", MSG_COMPOUND, "s1")),
             patterns=("re:新建文件夹",), aliases=(MSG_FOLDER,),
-            examples=(MSG_FOLDER,),
+            request_query_examples=(MSG_FOLDER,),
             parameters={"name": {"type": "string", "required": True,
                                  "max_len": 120, "description": "folder name"}},
             arg_slots={"name": {"source": "user_input"}},
@@ -107,10 +120,10 @@ def _entries() -> tuple[CapabilityEntry, ...]:
         CapabilityEntry(
             capability_id="cap-vocab", tool_binding="add_term",
             description="把一个词加入词汇库。",
-            standard_example='把"keystone"加入我的词汇库',
-            synonym_examples=(MSG_COMPOUND,),
+            standard_queries=(_std("s2", '把"keystone"加入我的词汇库'),),
+            similar_queries=(_sim("m3", MSG_COMPOUND, "s2"),),
             patterns=("re:加入我的.*词汇库",), aliases=(),
-            examples=('把"keystone"加入我的词汇库',),
+            request_query_examples=('把"keystone"加入我的词汇库',),
             parameters={"term": {"type": "string", "required": True,
                                  "max_len": 120, "description": "the term"},
                         "domain": {"type": "string", "required": True,
@@ -123,26 +136,23 @@ def _entries() -> tuple[CapabilityEntry, ...]:
 
 
 class _Index:
-    version = "idx-e2e"
+    """The LIVE Recall corpus rows (in-process lane: no session_factory)."""
+
+    version = "corpus1-e2e"
 
     def __init__(self):
-        self.capabilities = [
-            _Cap("cap-folder", (MSG_FOLDER,)),
-            _Cap("cap-vocab", ('把"keystone"加入我的词汇库',)),
-        ]
-        self.example_vectors = [
-            _Vec("cap-folder", 0, [1.0, 0.0]),
-            _Vec("cap-vocab", 0, [0.0, 1.0]),
-        ]
+        self.corpus = (
+            _row("cap-folder", MSG_FOLDER, [1.0, 0.0]),
+            _row("cap-vocab", '把"keystone"加入我的词汇库', [0.0, 1.0]),
+        )
 
 
-def _Cap(cid, examples):
-    return type("C", (), {"id": cid, "examples": examples})()
-
-
-def _Vec(cid, i, vector):
-    return type("V", (), {"capability_id": cid, "example_index": i,
-                          "vector": vector})()
+def _row(cid, query, vector):
+    return type("R", (), {
+        "kind": "standard", "query_id": f"row-{cid}", "capability_id": cid,
+        "query": query, "language": derive_language(query),
+        "standard_query_id": None, "vector": vector,
+    })()
 
 
 class FunnelEmbed:
@@ -197,7 +207,6 @@ def _funnel_gates(monkeypatch, *, mode="on", timeout=5.0, tool_intent_backend="s
     monkeypatch.setattr(settings, "chat_funnel_margin", 0.06)
     monkeypatch.setattr(settings, "chat_funnel_private_enabled", False)
     monkeypatch.setattr(settings, "chat_funnel_web_enabled", False)
-    monkeypatch.setattr(settings, "chat_qir_enabled", False)
 
 
 def _wire_world(monkeypatch, *, embedder, view=None, index=True, boom=False):
@@ -207,10 +216,9 @@ def _wire_world(monkeypatch, *, embedder, view=None, index=True, boom=False):
         monkeypatch.setattr(
             "core.application.chat.intent_funnel.registry.active_view", raising)
     else:
-        v = view if view is not None else RegistryVersionView(
-            version=1, state="active",
+        v = view if view is not None else RegistryLiveView(
             fingerprint=content_fingerprint(list(_entries())),
-            capabilities=(), entries=_entries())
+            entries=_entries())
 
         async def fake_active(**kw):
             return v
@@ -274,7 +282,7 @@ def _events(db) -> list:
 # ── 1+2+3+11: plain chat with the gate ON — funnel abstains, Agent verbatim ────────
 
 async def test_plain_chat_abstains_and_lands_one_production_event(monkeypatch, caplog):
-    app, port, spy, db, emb, _ = _setup(monkeypatch)
+    app, port, spy, db, _emb, _ = _setup(monkeypatch)
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     msg = "hello there"
     await sse(app, msg)
@@ -293,7 +301,7 @@ async def test_plain_chat_abstains_and_lands_one_production_event(monkeypatch, c
     assert ev.execution_mode == "production" and ev.final_route == "agent"
     assert ev.fallback_reason == REASON_TOOL_INTENT_REJECT
     assert ev.session_id                                        # real turn: session stamped
-    assert ev.index_version == "idx-e2e"
+    assert ev.index_version == "corpus1-e2e"
 
 
 # ── 4+8+9: Matcher HIT -> one ToolIntentModel call (select+extract) -> executes through the
@@ -301,7 +309,7 @@ async def test_plain_chat_abstains_and_lands_one_production_event(monkeypatch, c
 async def test_matcher_certified_turn_executes_through_sandbox(monkeypatch, caplog):
     jd = ToolIntentDouble([{"capability_id": "cap-folder", "confidence": 0.9,
                        "arguments": {"name": "季度报告"}}])
-    app, port, spy, db, emb, broker = _setup(monkeypatch, retire=True,
+    app, port, spy, db, emb, _broker = _setup(monkeypatch, retire=True,
                                              tool_intent=jd, tool_intent_backend="online")
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     res = await sse(app, MSG_FOLDER)
@@ -330,7 +338,7 @@ async def test_trace_capture_lands_only_when_the_switch_is_on(monkeypatch):
     full prompt), from the same capture seam the shadow/preview lanes use."""
     jd = ToolIntentDouble([{"capability_id": "cap-folder", "confidence": 0.9,
                             "arguments": {"name": "季度报告"}}])
-    app, port, spy, db, emb, _ = _setup(monkeypatch, retire=True,
+    app, _port, _spy, db, _emb, _ = _setup(monkeypatch, retire=True,
                                         tool_intent=jd, tool_intent_backend="online")
     await sse(app, MSG_FOLDER)
     assert _events(db)[0].trace_json is None
@@ -346,7 +354,7 @@ async def test_trace_capture_lands_only_when_the_switch_is_on(monkeypatch):
     assert tj["query"] == MSG_FOLDER
     hit = tj["candidates"][0]
     assert hit["capability_id"] == "cap-folder" and hit["origin"] == "matcher_hit"
-    assert hit["kind"] == "canonical"                  # MSG_FOLDER is the standard example
+    assert hit["kind"] == "standard"                   # MSG_FOLDER is the Standard row
     assert tj["model_verdict"]["decision"] == "CONFIDENT"
     assert tj["binder_state"] == "COMPLETE"
     assert "entry" in tj and tj["entry"]["tool_binding"] == "create_folder"
@@ -357,7 +365,7 @@ async def test_trace_capture_lands_only_when_the_switch_is_on(monkeypatch):
 async def test_paraphrase_routes_through_recall_and_tool_intent(monkeypatch, caplog):
     jd = ToolIntentDouble([{"capability_id": "cap-folder", "confidence": 0.9,
                        "arguments": {"name": "资料归档"}}])
-    app, port, spy, db, emb, _ = _setup(monkeypatch, mode="off", retire=True,
+    app, port, spy, _db, emb, _ = _setup(monkeypatch, mode="off", retire=True,
                                         tool_intent=jd, tool_intent_backend="online")
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     await sse(app, MSG_PARAPHRASE)
@@ -384,7 +392,7 @@ async def test_paraphrase_routes_through_recall_and_tool_intent(monkeypatch, cap
 async def test_tool_intent_negative_exits_send_the_turn_to_the_agent(monkeypatch, caplog,
                                                                  reply, reason):
     jd = ToolIntentDouble([reply])
-    app, port, spy, db, emb, _ = _setup(monkeypatch, tool_intent=jd, retire=True,
+    app, port, spy, _db, _emb, _ = _setup(monkeypatch, tool_intent=jd, retire=True,
                                         tool_intent_backend="online")
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     await sse(app, MSG_COMPOUND)
@@ -401,7 +409,7 @@ async def test_ambiguous_choice_without_arguments_exits_bind_missing(monkeypatch
     # no argument draft the Binder's schema gate abstains — the Agent owns the
     # half-done compound demand (8.7).
     jd = ToolIntentDouble([{"capability_id": "cap-folder", "confidence": 0.9}])
-    app, port, spy, db, emb, _ = _setup(monkeypatch, tool_intent=jd, retire=True,
+    app, port, spy, _db, _emb, _ = _setup(monkeypatch, tool_intent=jd, retire=True,
                                         tool_intent_backend="online")
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     await sse(app, MSG_COMPOUND)
@@ -417,7 +425,7 @@ async def test_stub_hit_without_extraction_escalates_bind_missing(monkeypatch, c
     # backend stub (the transition default): the matcher HIT enters the one
     # ToolIntentModel hop, the stub certifies WHICH but has no argument power, so the
     # Binder's validate exits BIND_MISSING — zero LLM calls on the whole turn.
-    app, port, spy, db, emb, _ = _setup(monkeypatch)           # L0 live: it abstains here too
+    app, port, spy, _db, _emb, _ = _setup(monkeypatch)           # L0 live: it abstains here too
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     await sse(app, MSG_BARE)
 
@@ -432,7 +440,7 @@ async def test_stub_hit_without_extraction_escalates_bind_missing(monkeypatch, c
 # ── 11: every fault shape fails OPEN — the turn never sinks ────────────────────────
 
 async def test_registry_fault_fails_open_to_the_agent(monkeypatch, caplog):
-    app, port, spy, db, emb, _ = _setup(monkeypatch, boom=True)
+    app, port, _spy, _db, _emb, _ = _setup(monkeypatch, boom=True)
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     msg = "帮我建个东西吧"
     res = await sse(app, msg)
@@ -442,7 +450,7 @@ async def test_registry_fault_fails_open_to_the_agent(monkeypatch, caplog):
 
 
 async def test_slow_recall_times_out_fails_open(monkeypatch, caplog):
-    app, port, spy, db, emb, _ = _setup(monkeypatch, timeout=0.05, delay=0.3)
+    app, port, _spy, db, _emb, _ = _setup(monkeypatch, timeout=0.05, delay=0.3)
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     msg = "随便聊聊"
     res = await sse(app, msg)
@@ -458,7 +466,7 @@ async def test_slow_recall_times_out_fails_open(monkeypatch, caplog):
 async def test_multi_turn_routing_does_not_leak_state(monkeypatch, caplog):
     jd = ToolIntentDouble([{"capability_id": "cap-folder", "confidence": 0.9,
                        "arguments": {"name": "季度报告"}}])
-    app, port, spy, db, emb, _ = _setup(monkeypatch, retire=True,
+    app, port, spy, db, _emb, _ = _setup(monkeypatch, retire=True,
                                         tool_intent=jd, tool_intent_backend="online")
     session = str(uuid4())
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)

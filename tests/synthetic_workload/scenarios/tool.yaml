@@ -1,0 +1,108 @@
+# S7 Tool / Action — positives for the 3 published capabilities.
+# Labels cover ONLY currently published caps (cap-create-folder / cap-add-term /
+# cap-pdf-extract-text); binder slots verified against tool bindings.
+scenario: S7_TOOL_ACTION
+defaults: {viewer: {kind: none}, vrel: NO_VIEWER, intent: TOOL_ACTION}
+cases:
+  - id: create-folder-direct
+    difficulty: EASY
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    variants:
+      - {q: '创建一个叫"research"的文件夹', args: {name: research}}
+      - {q: '新建文件夹"周报存档"', args: {name: 周报存档}}
+      - {q: '建一个名字是 papers 的文件夹', args: {name: papers}}
+      - {q: '在网盘里创建名为"实验记录"的文件夹', args: {name: 实验记录}}
+      - {q: 'Create a folder named "Release Notes"', args: {name: Release Notes}}
+  - id: create-folder-colloquial
+    difficulty: EASY
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    variants:
+      - {q: '帮我建个 research 文件夹', args: {name: research}}
+      - {q: '给我弄个"临时草稿"的目录', args: {name: 临时草稿}}
+      - {q: '新开个文件夹放会议纪要,就叫"会议纪要2026"', args: {name: 会议纪要2026}}
+      - {q: '建个文件夹呗,名字叫"资料归档"', args: {name: 资料归档}}
+      - {q: '手头东西太乱了,先给我建个"归档"文件夹', args: {name: 归档}}
+  - id: create-folder-synonym
+    difficulty: MEDIUM
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    variants:
+      - {q: '新建一个名为"读书笔记"的目录', args: {name: 读书笔记}}
+      - {q: '生成一个叫"数据备份"的文件夹', args: {name: 数据备份}}
+      - {q: '增加一个"项目素材"目录', args: {name: 项目素材}}
+      - {q: '开一个"阅读清单"的文件夹出来', args: {name: 阅读清单}}
+  - id: create-folder-paraphrase
+    difficulty: MEDIUM
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    variants:
+      - {q: '我需要一个叫"论文草稿"的文件夹来放材料', args: {name: 论文草稿}}
+      - {q: '想建个目录,名字就叫"课程表"', args: {name: 课程表}}
+      - {q: '建一个专门放截图的地方,叫"截图存档"', args: {name: 截图存档}}
+      - {q: '建文件夹,名字用 "keystone-notes"', args: {name: keystone-notes}}
+  - id: create-folder-implicit-clear
+    difficulty: HARD
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    variants:
+      - {q: '我准备把论文都放到一个新的 research 文件夹里,先帮我建一下', args: {name: research}}
+      - {q: '这些 PDF 太乱了,建个"文献库"文件夹收拢一下', args: {name: 文献库}}
+      - {q: '周报快到了,先把"周报存档"的窝建好', args: {name: 周报存档}}
+      - {q: '想把背单词的东西分开放,建个"词汇本"目录', args: {name: 词汇本}}
+  - id: create-folder-mixed-lang
+    difficulty: MEDIUM
+    expected: {funnel: TOOL, cap: cap-create-folder}
+    variants:
+      - {q: 'make a new folder called "DeepDive notes"', args: {name: DeepDive notes}}
+      - {q: '在 workspace 里 create a folder "papers"', args: {name: papers}}
+      - {q: '新建一个 folder 叫"混合测试"', args: {name: 混合测试}}
+      - {q: 'please create a folder named "2026 Q3"', args: {name: 2026 Q3}}
+  - id: create-folder-missing-name
+    difficulty: EASY
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '帮我新建一个文件夹', notes: "Binder exits BIND_MISSING; Agent owns the clarification"}
+      - {q: '建个目录呗', notes: "no name given; expected BIND_MISSING path"}
+  - id: add-term-basic
+    difficulty: EASY
+    expected: {funnel: TOOL, cap: cap-add-term}
+    variants:
+      - {q: '把"keystone"加入工程词汇库', args: {term: keystone, domain: 工程|工程词汇库}}
+      - {q: '将"idempotent"录入幂等相关词汇库', args: {term: idempotent, domain: 幂等相关|幂等相关词汇库}}
+      - {q: '帮我把 quarterly review 收进汇报词汇库', args: {term: quarterly review, domain: 汇报|汇报词汇库}}
+      - {q: '"serendipity"这个词加到文学词汇本', args: {term: serendipity, domain: 文学|文学词汇本}}
+      - {q: '把 latency 添加到性能词库', args: {term: latency, domain: 性能|性能词库}}
+  - id: add-term-colloquial
+    difficulty: MEDIUM
+    expected: {funnel: TOOL, cap: cap-add-term}
+    variants:
+      - {q: '我的水果词汇库加一个 durian', args: {term: durian, domain: 水果|水果词汇库}}
+      - {q: '记一个生词 "quixotic",放文学词汇', args: {term: quixotic, domain: 文学|文学词汇}}
+      - {q: '"robust"收录到工程词汇里', args: {term: robust, domain: 工程|工程词汇}}
+      - {q: '把 backpressure 加进消息队列词库', args: {term: backpressure, domain: 消息队列|消息队列词库}}
+      - {q: '添加单词 ephemeral 到文学词汇库', args: {term: ephemeral, domain: 文学|文学词汇库}}
+      - {q: 'add "shard" to my database vocabulary', args: {term: shard, domain: database}}
+      - {q: '把"quorum"收进分布式词汇库', args: {term: quorum, domain: 分布式|分布式词汇库}}
+  - id: add-term-missing-slot
+    difficulty: MEDIUM
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '帮我加个词到我的词汇库', notes: "term+domain both absent -> BIND_MISSING"}
+      - {q: '把 "throughput" 加进词汇库', notes: "domain missing -> BIND_MISSING"}
+  - id: extract-text-viewer
+    difficulty: EASY
+    expected: {funnel: TOOL, cap: cap-pdf-extract-text}
+    variants:
+      - {q: '提取全文', viewer: {kind: document, asset_id: ast-paper-nlp, has_attachment: true},
+         vrel: GROUNDED_IN_VIEWER, args: {asset_id: ast-paper-nlp},
+         notes: "asset_id resolved from viewer fact, not the sentence"}
+      - {q: '把这份 PDF 的文字抽出来', viewer: {kind: document, asset_id: ast-paper-nlp, has_attachment: true},
+         vrel: GROUNDED_IN_VIEWER, args: {asset_id: ast-paper-nlp}}
+      - {q: '帮我把当前文档的文本提取出来', viewer: {kind: document, asset_id: ast-spec-en, has_attachment: true},
+         vrel: GROUNDED_IN_VIEWER, args: {asset_id: ast-spec-en}}
+      - {q: 'extract the text of this document', viewer: {kind: document, asset_id: ast-spec-en, has_attachment: true},
+         vrel: GROUNDED_IN_VIEWER, args: {asset_id: ast-spec-en}}
+      - {q: '导出这个 pdf 的纯文本', viewer: {kind: document, asset_id: ast-paper-nlp, has_attachment: true},
+         vrel: GROUNDED_IN_VIEWER, args: {asset_id: ast-paper-nlp}}
+  - id: extract-text-no-target
+    difficulty: HARD
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '提取全文', notes: "no viewer/attachment: asset_id unfillable -> fail-open (Binder MISSING)"}

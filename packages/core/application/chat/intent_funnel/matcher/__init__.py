@@ -1,12 +1,12 @@
-"""Node 1 — Matcher: deterministic EXACT hits from the Registry table ONLY.
+"""Node 1 — Matcher: deterministic EXACT hits from the LIVE tables ONLY.
 
-Action-Contract ruling (2026-09-25): the Matcher is Exact Positive Match only.
-The exact set is ``entry.intent_corpus`` — standard_example + synonym_examples,
-normalized for comparison; a HIT means the turn's sentence IS one of the
-human-curated canonical phrasings, so ``matched_literal`` is always a readable
-sentence, never a regex literal. Regexes, legacy ``examples``, patterns and
-aliases are NOT match data: they cannot produce a HIT at all (the storage /
-publish-gate validation of ``re:`` entries stays, the runtime consumes nothing).
+Live-table ruling (2026-09-26): the exact set is the enabled Standard +
+Similar query sentences (``entry.intent_corpus`` over
+capability_standard_queries / capability_similar_queries), normalized for
+comparison; a HIT means the turn's sentence IS one of the human-curated
+canonical phrasings, so ``matched_literal`` is always a readable sentence,
+never a regex literal. Regexes, patterns, aliases and request examples are
+NOT match data: they cannot produce a HIT at all.
 
 A HIT proves the sentence was CURATED as this action — it does not prove a new,
 similar sentence is an action; everything non-exact escalates to Recall +
@@ -27,9 +27,9 @@ from ..contract import MATCH_AMBIGUOUS, MATCH_HIT, MATCH_MISS, MatchResult, Turn
 
 logger = logging.getLogger(__name__)
 
-# (version, fingerprint) -> compiled index; the fingerprint key makes staleness
-# impossible: a swapped active version is a different cache entry by construction.
-_INDEX_CACHE: dict[tuple[int, str], dict] = {}
+# fingerprint -> compiled index; the content key makes staleness impossible:
+# any corpus change is a different fingerprint (and thus entry) by construction.
+_INDEX_CACHE: dict[str, dict] = {}
 _CACHE_MAX = 16
 
 
@@ -43,7 +43,7 @@ def build_index(view) -> dict:
     Only routable entries (enabled AND status active) are indexed — ruling 4:
     a disabled capability is not a candidate for ANY node, deterministic
     included."""
-    key = (view.version, view.fingerprint)
+    key = view.fingerprint
     cached = _INDEX_CACHE.get(key)
     if cached is not None:
         return cached

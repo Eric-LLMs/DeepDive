@@ -1,53 +1,69 @@
-"""Intent Registry console (admin): drafts CRUD, validate/preview, publish,
-version history and rollback (QIR P1 step 4).
+"""Intent Registry console (admin) — the LIVE-table plane (migration 0014).
 
-Permission posture (P1 ruling 5, ratified): NO new RBAC framework — every route
-here rides the existing console admin gate (``require_admin``), and the admin
-username is recorded as the audit actor on every mutation. Fine-grained
-EDIT/VALIDATE/PUBLISH/ROLLBACK separation is deferred; §8.18's hard constraint
-is met: ordinary users cannot reach this router at all, and Publish/Rollback
-(plus rejected attempts, which leave no version row) are audit-recorded.
+No Draft, no Publish, no Projection: an admin write goes straight into
+``capabilities`` / ``capability_standard_queries`` / ``capability_similar_queries``
+/ ``capability_negatives`` and is live on the next turn (invalidate_cache +
+content marker make a stale corpus impossible). What the old lifecycle
+guaranteed is re-established here as write discipline:
+
+* every mutation is gated by ``validate_entries`` against the LIVE
+  ``ToolRuntime.schemas()`` roster projection (intent is never authorization —
+  DIRECT_TOOLS stays a runtime concern, this router writes nothing to it);
+* every accepted mutation first appends the pre-change content to
+  ``registry_versions`` (history only; rollback = restore a snapshot +
+  re-embed) and is audit-recorded;
+* query writes are embed-then-write (text + vector are one unit).
+
+Permission posture (ratified, unchanged): no new RBAC — every route rides the
+console admin gate (``require_admin``) and the admin username is the audit
+actor on every mutation.
 """
 from __future__ import annotations
+
+from dataclasses import replace
 
 from api.auth import AuthAdmin, require_admin
 from api.deps import _embedder
 from api.schemas import (
-    RegistryDraftCreateRequest,
-    RegistryDraftUpdateRequest,
-    RegistryDraftParamsRequest,
+    RegistryCapabilityCreateRequest,
+    RegistryCapabilityUpdateRequest,
+    RegistryNegativeQueryRequest,
     RegistryPreviewRouteRequest,
-    RegistryPublishRequest,
-    RegistryQueryDraftRequest,
+    RegistryQueryEnabledRequest,
+    RegistryQueryTextRequest,
     RegistryRollbackRequest,
+    RegistrySimilarQueryRequest,
+    RegistryStandardQueryRequest,
 )
 from core.application.chat.intent_funnel.registry import (
     CapabilityEntry,
-    PublishRejectedError,
     RegistryConflictError,
     RegistryError,
+    RegistryLiveView,
     RegistryNotFoundError,
-    RegistryStateError,
     active_view,
     audit,
-    create_draft,
+    create_capability,
+    derive_language,
+    embedding_status,
+    get_capability,
     get_version,
     list_audit,
-    list_drafts,
+    list_capabilities,
     list_versions,
-    preview_draft,
-    publish_draft,
-    rollback,
-    update_draft,
+    load_live_view,
+    queries,
+    snapshot_history,
+    update_capability,
+    validate_entries,
+    version_entries,
 )
-from core.application.chat.intent_funnel.registry import catalog
+from core.application.chat.intent_funnel.registry.catalog import get_catalog, list_catalog
+from core.application.chat.intent_funnel.registry.entry import QueryRecord
 from core.application.chat.intent_funnel.registry.plugins import DIRECT_TOOLS
+from core.application.chat.intent_funnel.registry.store import CAPABILITY_PATCH_FIELDS
 from core.infrastructure.db import SessionLocal
-from core.infrastructure.request_context import (
-    reset_request_execution_mode,
-    set_request_execution_mode,
-)
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 router = APIRouter(tags=["registry-admin"])
 
@@ -56,68 +72,138 @@ def _entry_json(e: CapabilityEntry) -> dict:
     return {**e.to_payload(), "row_version": e.row_version}
 
 
-# ── drafts (editable source of truth) ─────────────────────────────────────────────
+def _roster() -> dict[str, dict[str, int]]:
+    """The validation source of truth (final ruling): the LIVE tool roster
+    projected from ``ToolRuntime.schemas()`` — tool name -> {slot: max_len}
+    (0 = the runtime schema states no length bound; the gate then compares
+    slot names only)."""
+    from api.deps import get_agent_kernel
 
-@router.get("/admin/registry/drafts")
-async def get_drafts(_: AuthAdmin = Depends(require_admin)) -> dict:
-    return {"drafts": [_entry_json(e) for e in await list_drafts(session_factory=SessionLocal)]}
+    out: dict[str, dict[str, int]] = {}
+    for s in get_agent_kernel().runtime.schemas():
+        props = (s.get("parameters") or {}).get("properties") or {}
+        out[str(s["name"])] = {
+            str(k): int((v or {}).get("maxLength") or 0)
+            for k, v in props.items()
+        }
+    return out
 
 
-@router.post("/admin/registry/drafts")
-async def post_draft(
-    body: RegistryDraftCreateRequest, admin: AuthAdmin = Depends(require_admin)
+async def _gated(entries: list[CapabilityEntry]) -> None:
+    """The validation gate in front of every write: issues == [] or 422."""
+    issues = validate_entries(entries, tool_schemas=_roster())
+    if issues:
+        raise HTTPException(status_code=422, detail={"issues": issues})
+
+
+def _override(view: RegistryLiveView, entry: CapabilityEntry) -> list[CapabilityEntry]:
+    """The live entry set with one entry projected to its post-write form."""
+    hit = False
+    out = []
+    for e in view.entries:
+        if e.capability_id == entry.capability_id:
+            out.append(entry)
+            hit = True
+        else:
+            out.append(e)
+    if not hit:
+        out.append(entry)
+    return out
+
+
+# ── capabilities (intent information; live) ──────────────────────────────────────
+
+@router.get("/admin/registry/capabilities")
+async def get_capabilities(_: AuthAdmin = Depends(require_admin)) -> dict:
+    caps = await list_capabilities(session_factory=SessionLocal)
+    return {"capabilities": [_entry_json(e) for e in caps]}
+
+
+@router.get("/admin/registry/capabilities/{capability_id}")
+async def get_one_capability(
+    capability_id: str, _: AuthAdmin = Depends(require_admin)
+) -> dict:
+    entry = await get_capability(capability_id, session_factory=SessionLocal)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"no capability {capability_id!r}")
+    return {"capability": _entry_json(entry)}
+
+
+@router.post("/admin/registry/capabilities")
+async def post_capability(
+    body: RegistryCapabilityCreateRequest, admin: AuthAdmin = Depends(require_admin)
 ) -> dict:
     entry = CapabilityEntry(
         capability_id=body.capability_id.strip(),
         tool_binding=body.tool_binding.strip(),
         description=body.description,
         patterns=tuple(body.patterns), aliases=tuple(body.aliases),
-        examples=tuple(body.examples), negatives=tuple(body.negatives),
-        standard_example=body.standard_example,
-        synonym_examples=tuple(body.synonym_examples),
-        parameters=dict(body.parameters),
-        arg_slots=dict(body.arg_slots), permissions=body.permissions,
-        execution_policy=body.execution_policy, intent_kind=body.intent_kind,
-        enabled=body.enabled,
-        status=body.status, replacement_capability_id=body.replacement_capability_id,
+        request_query_examples=tuple(body.request_query_examples),
+        parameters=dict(body.parameters), arg_slots=dict(body.arg_slots),
+        permissions=body.permissions, execution_policy=body.execution_policy,
+        intent_kind=body.intent_kind, enabled=body.enabled, status=body.status,
+        replacement_capability_id=body.replacement_capability_id,
     )
+    view = await load_live_view(session_factory=SessionLocal)
+    await _gated(_override(view, entry))
+    await snapshot_history(view.entries, actor_username=admin.username,
+                           note=f"before create {entry.capability_id}",
+                           session_factory=SessionLocal)
     try:
-        created = await create_draft(entry, session_factory=SessionLocal)
+        created = await create_capability(entry, session_factory=SessionLocal)
     except RegistryConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    await audit("draft_create", actor_username=admin.username,
-                target=body.capability_id, session_factory=SessionLocal)
-    return {"draft": _entry_json(created)}
+    await audit("capability_create", actor_username=admin.username,
+                target=entry.capability_id, session_factory=SessionLocal)
+    return {"capability": _entry_json(created)}
 
 
-@router.patch("/admin/registry/drafts/{capability_id}")
-async def patch_draft(
-    capability_id: str, body: RegistryDraftUpdateRequest,
+@router.patch("/admin/registry/capabilities/{capability_id}")
+async def patch_capability(
+    capability_id: str, body: RegistryCapabilityUpdateRequest,
     admin: AuthAdmin = Depends(require_admin),
 ) -> dict:
+    patch = dict(body.patch)
+    unknown = set(patch) - set(CAPABILITY_PATCH_FIELDS)
+    if unknown:
+        raise HTTPException(status_code=422,
+                            detail=f"non-capability fields in patch: {sorted(unknown)}")
+    current = await get_capability(capability_id, session_factory=SessionLocal)
+    if current is None:
+        raise HTTPException(status_code=404, detail=f"no capability {capability_id!r}")
+    projected = replace(
+        current,
+        **{k: (tuple(v) if k in ("patterns", "aliases", "request_query_examples")
+               else v) for k, v in patch.items()},
+    )
+    view = await load_live_view(session_factory=SessionLocal)
+    await _gated(_override(view, projected))
+    await snapshot_history(view.entries, actor_username=admin.username,
+                           note=f"before update {capability_id}",
+                           session_factory=SessionLocal)
     try:
-        updated = await update_draft(
-            capability_id, body.patch, body.expected_row_version,
+        updated = await update_capability(
+            capability_id, patch, body.expected_row_version,
             session_factory=SessionLocal,
         )
     except RegistryNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RegistryConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:  # non-draft field in patch
+    except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    await audit("draft_update", actor_username=admin.username, target=capability_id,
-                detail={"patch": body.patch, "row_version": updated.row_version},
+    await audit("capability_update", actor_username=admin.username,
+                target=capability_id,
+                detail={"patch": patch, "row_version": updated.row_version},
                 session_factory=SessionLocal)
-    return {"draft": _entry_json(updated)}
+    return {"capability": _entry_json(updated)}
 
 
 # ── Tool Schema (runtime truth, read-only) ────────────────────────────────────────
 # The Advanced tab renders PARAMETERS from the SAME schema the Agent loop hands the
 # model (``ToolRuntime.schemas()`` -> ``ToolDefinition.parameters`` JSON Schema).
 # This endpoint is a projection, not a second parameter model: it writes nothing,
-# and a tool that is absent here has no runtime binding (Registry inadmissibility
-# is derived separately from DIRECT_TOOLS — never inferred from this listing).
+# and it is also the roster the validation gate above cross-checks against.
 
 @router.get("/admin/registry/tool-schemas")
 async def get_tool_schemas(_: AuthAdmin = Depends(require_admin)) -> dict:
@@ -135,317 +221,416 @@ async def get_tool_schemas(_: AuthAdmin = Depends(require_admin)) -> dict:
     ]}
 
 
-# ── Action Catalog (Action Universe, migration 0011) ─────────────────────────────
-# Inventory + PRE-REGISTRY query drafts. These routes can never publish or write
-# the runtime corpus: register copies a Draft Configuration into a capabilities
-# DRAFT row, and from there the ONLY way to active is the existing
-# Draft -> Validate -> Publish lifecycle below.
+# ── Action Catalog (inventory only, migration 0011) ──────────────────────────────
+# The Catalog is the ACTION UNIVERSE: what the system can do. It never feeds
+# routing — join to the Registry is a read-time tool_binding join, and a
+# not-yet-registered action becomes routable only after a capability row is
+# created (from the Catalog, below) AND its corpus is curated AND it is
+# enabled: 入表≠开闸, three independent switches.
 
 async def _catalog_view() -> dict:
-    """Catalog rows joined to the Registry: registered / published / funnel
-    eligibility computed at read time (no stored second truth)."""
-    rows = await catalog.list_catalog(session_factory=SessionLocal)
-    drafts = await list_drafts(session_factory=SessionLocal)
-    by_tool = {d.tool_binding: d for d in drafts}
-    view = await active_view(session_factory=SessionLocal)
-    published = {
-        e.capability_id for e in (view.entries if view is not None else ())
-        if e.enabled and e.status == "active"
-    }
-    counts = await catalog.draft_counts(SessionLocal)
+    rows = await list_catalog(session_factory=SessionLocal)
+    caps = await list_capabilities(session_factory=SessionLocal)
+    by_tool = {c.tool_binding: c for c in caps}
     actions = []
     for r in rows:
-        d = by_tool.get(r["tool_binding"])
-        funnel = "not configured"
-        route = r["route"]
-        if d is not None:
-            routable = d.enabled and d.status == "active" and d.intent_kind == "action"
-            funnel = "enabled" if (routable and d.capability_id in published) else (
-                "disabled" if not d.enabled or d.status != "active" else "draft (not published)")
-            route = "funnel" if funnel == "enabled" else "agent"
+        c = by_tool.get(r["tool_binding"])
+        if c is None:
+            funnel, current_route = "not registered", "agent"
+        elif c.enabled and c.status == "active":
+            funnel = "enabled"
+            current_route = "funnel" if c.intent_kind == "action" else f"funnel ({c.intent_kind})"
+        else:
+            funnel = c.status
+            current_route = "agent"
         actions.append({
             **r,
             "bindable": r["tool_binding"] in DIRECT_TOOLS,
-            "registered": d is not None,
-            "capability_id": d.capability_id if d else None,
-            "registry_status": d.status if d else None,
-            "registry_enabled": d.enabled if d else None,
-            "intent_kind": d.intent_kind if d else None,
-            "published": bool(d and d.capability_id in published),
+            "registered": c is not None,
+            "capability_id": c.capability_id if c else None,
+            "registry_status": c.status if c else None,
+            "registry_enabled": c.enabled if c else None,
+            "intent_kind": c.intent_kind if c else None,
             "funnel": funnel,
-            "current_route": route,
-            "registry_corpus": (
-                {
-                    "standard": 1 if (d.standard_example or "").strip() else 0,
-                    "similar": len([s for s in d.synonym_examples if str(s).strip()]),
-                    "negatives": len([s for s in d.negatives if str(s).strip()]),
-                } if d is not None else None
-            ),
-            "query_draft": counts.get(r["action_key"]),
+            "current_route": current_route,
+            "registry_corpus": ({
+                "standard": len(c.standard_queries),
+                "similar": len(c.similar_queries),
+                "negatives": len(c.negatives),
+            } if c is not None else None),
         })
-    # Draft rows whose binding has no catalog row (added via the raw drafts API)
-    # must still show up — the Universe never silently loses a routable action.
     catalog_tools = {r["tool_binding"] for r in rows}
-    for d in drafts:
-        if d.tool_binding in catalog_tools:
+    for c in caps:  # capabilities without a catalog row must still show up
+        if c.tool_binding in catalog_tools:
             continue
         actions.append({
-            "action_key": d.capability_id, "display_name": d.capability_id,
-            "description": d.description, "tool_binding": d.tool_binding,
-            "route": "agent", "implementation_ref": "(no catalog row — drafts API only)",
+            "action_key": c.capability_id, "display_name": c.capability_id,
+            "description": c.description, "tool_binding": c.tool_binding,
+            "route": "agent", "implementation_ref": "(no catalog row)",
             "status": "user_facing",
-            "bindable": d.tool_binding in DIRECT_TOOLS,
-            "registered": True, "capability_id": d.capability_id,
-            "registry_status": d.status, "registry_enabled": d.enabled,
-            "intent_kind": d.intent_kind,
-            "published": d.capability_id in published,
-            "funnel": "draft (not published)", "current_route": "agent",
+            "bindable": c.tool_binding in DIRECT_TOOLS,
+            "registered": True, "capability_id": c.capability_id,
+            "registry_status": c.status, "registry_enabled": c.enabled,
+            "intent_kind": c.intent_kind,
+            "funnel": "enabled" if (c.enabled and c.status == "active") else c.status,
+            "current_route": "funnel" if (c.enabled and c.status == "active") else "agent",
             "registry_corpus": {
-                "standard": 1 if (d.standard_example or "").strip() else 0,
-                "similar": len([s for s in d.synonym_examples if str(s).strip()]),
-                "negatives": len([s for s in d.negatives if str(s).strip()]),
+                "standard": len(c.standard_queries),
+                "similar": len(c.similar_queries),
+                "negatives": len(c.negatives),
             },
-            "query_draft": None,
         })
     return {"actions": actions}
 
 
 @router.get("/admin/registry/catalog")
-async def get_catalog(_: AuthAdmin = Depends(require_admin)) -> dict:
+async def get_catalog_view(_: AuthAdmin = Depends(require_admin)) -> dict:
     return await _catalog_view()
 
 
-@router.get("/admin/registry/catalog/{action_key}/query-draft")
-async def get_catalog_query_draft(
-    action_key: str, _: AuthAdmin = Depends(require_admin)
-) -> dict:
-    cat = await catalog.get_catalog(action_key, session_factory=SessionLocal)
-    if cat is None:
-        raise HTTPException(status_code=404, detail=f"unknown action {action_key!r}")
-    draft = await catalog.get_query_draft(action_key, session_factory=SessionLocal)
-    drafts = await list_drafts(session_factory=SessionLocal)
-    draft["registered"] = any(d.tool_binding == cat["tool_binding"] for d in drafts)
-    return draft
-
-
-@router.put("/admin/registry/catalog/{action_key}/query-draft")
-async def put_catalog_query_draft(
-    action_key: str, body: RegistryQueryDraftRequest,
-    admin: AuthAdmin = Depends(require_admin),
-) -> dict:
-    """Save the PRE-REGISTRY Draft Configuration. Registered actions are
-    rejected: one editor per sentence, their corpus lives in the capabilities
-    Draft row (Queries tab) — no second lifecycle, no silent divergence."""
-    drafts = await list_drafts(session_factory=SessionLocal)
-    rows = await catalog.list_catalog(session_factory=SessionLocal)
-    me = next((r for r in rows if r["action_key"] == action_key), None)
-    if me is None:
-        raise HTTPException(status_code=404, detail=f"unknown action {action_key!r}")
-    if any(d.tool_binding == me["tool_binding"] for d in drafts):
-        raise HTTPException(
-            status_code=409,
-            detail=f"{action_key} is registered — edit its Query corpus on the "
-                   "Registry draft (Queries tab), not as a catalog draft",
-        )
-    try:
-        saved = await catalog.upsert_query_draft(
-            action_key,
-            standard=body.standard_example,
-            similar=body.synonym_examples,
-            negatives=body.negatives,
-            updated_by=admin.username,
-            session_factory=SessionLocal,
-        )
-    except RegistryNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    await audit("query_draft_update", actor_username=admin.username, target=action_key,
-                detail={"similar": len(saved["similar"]), "negatives": len(saved["negatives"])},
-                session_factory=SessionLocal)
-    saved["registered"] = False
-    return saved
-
-
-@router.put("/admin/registry/catalog/{action_key}/params-draft")
-async def put_catalog_params_draft(
-    action_key: str, body: RegistryDraftParamsRequest,
-    admin: AuthAdmin = Depends(require_admin),
-) -> dict:
-    """Save the PRE-REGISTRY parameter configuration (migration 0012). Same
-    shapes as the Registry capability fields — register copies them 1:1. The
-    runtime TOOL SCHEMA is never stored here; it is read live via
-    GET /admin/registry/tool-schemas. Registered actions are rejected: their
-    parameters live in the capabilities Draft row (one editor per field)."""
-    drafts = await list_drafts(session_factory=SessionLocal)
-    rows = await catalog.list_catalog(session_factory=SessionLocal)
-    me = next((r for r in rows if r["action_key"] == action_key), None)
-    if me is None:
-        raise HTTPException(status_code=404, detail=f"unknown action {action_key!r}")
-    if any(d.tool_binding == me["tool_binding"] for d in drafts):
-        raise HTTPException(
-            status_code=409,
-            detail=f"{action_key} is registered — edit its parameters on the "
-                   "Registry draft (Advanced tab), not as a catalog draft",
-        )
-    try:
-        saved = await catalog.upsert_draft_parameters(
-            action_key,
-            parameters=body.parameters, arg_slots=body.arg_slots,
-            updated_by=admin.username,
-            session_factory=SessionLocal,
-        )
-    except RegistryNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    await audit("params_draft_update", actor_username=admin.username, target=action_key,
-                detail={"parameters": len(saved["parameters"]),
-                        "arg_slots": len(saved["arg_slots"])},
-                session_factory=SessionLocal)
-    saved["registered"] = False
-    return saved
-
-
-@router.post("/admin/registry/catalog/{action_key}/register")
-async def post_catalog_register(
+@router.post("/admin/registry/catalog/{action_key}/create")
+async def post_catalog_create(
     action_key: str, admin: AuthAdmin = Depends(require_admin)
 ) -> dict:
-    """Agent-only -> Registry DRAFT (the Enable-in-Intent-Funnel admission).
-    Copies the Draft Configuration into a new capabilities row; the action then
-    walks the existing Draft -> Validate -> Publish path like any other. This
-    endpoint never publishes and never touches the active index."""
-    rows = await catalog.list_catalog(session_factory=SessionLocal)
-    me = next((r for r in rows if r["action_key"] == action_key), None)
+    """Create the capability row from a Catalog entry — the admission step.
+    The row is born DISABLED with an empty corpus: it becomes routable only
+    after its Standard queries (zh + en) are curated and it is enabled.
+    Parameters default to the mechanical ``spec.arg_schema`` projection."""
+    me = await get_catalog(action_key, session_factory=SessionLocal)
     if me is None:
         raise HTTPException(status_code=404, detail=f"unknown action {action_key!r}")
-    drafts = await list_drafts(session_factory=SessionLocal)
-    if any(d.tool_binding == me["tool_binding"] for d in drafts):
-        raise HTTPException(status_code=409, detail=f"{action_key} is already registered")
     spec = DIRECT_TOOLS.get(me["tool_binding"])
     if spec is None:
-        # Honest refusal: the publish gate rejects non-DIRECT_TOOLS bindings,
-        # and with no hard-delete a premature row would block EVERY publish.
-        # Admitting a tool to DIRECT_TOOLS is a separate RUNTIME task.
         raise HTTPException(
             status_code=409,
             detail=f"tool {me['tool_binding']!r} is not an executable DIRECT_TOOLS "
                    "binding yet — Registry cannot invent executables. Runtime "
                    "admission of this tool is a separate task.",
         )
-    draft = await catalog.get_query_draft(action_key, session_factory=SessionLocal)
-    if not draft["standard"]:
-        raise HTTPException(
-            status_code=422,
-            detail="configure a Standard Query before registering "
-                   "(publish gate requires a non-empty intent corpus)",
-        )
-    capability_id = f"cap-{action_key}"
-    # Parameters: the admin's pre-Registry configuration (Advanced tab) wins;
-    # with none saved, fall back to the mechanical spec.arg_schema projection
-    # so registration never produces a parameter-less action.
-    parameters = dict(draft.get("parameters") or {})
-    if not parameters:
-        parameters = {
-            slot: {
-                "type": "string",
-                "description": f"{slot} argument of {me['tool_binding']}",
-                "required": True,
-                "max_len": int(bound),
-            }
-            for slot, bound in (spec.arg_schema or {}).items()
+    if await get_capability(f"cap-{action_key}", session_factory=SessionLocal) is not None:
+        raise HTTPException(status_code=409, detail=f"{action_key} is already registered")
+    parameters = {
+        slot: {
+            "type": "string",
+            "description": f"{slot} argument of {me['tool_binding']}",
+            "required": True,
+            "max_len": int(bound),
         }
+        for slot, bound in (spec.arg_schema or {}).items()
+    }
     entry = CapabilityEntry(
-        capability_id=capability_id,
+        capability_id=f"cap-{action_key}",
         tool_binding=me["tool_binding"],
         description=me["description"] or me["display_name"],
-        standard_example=draft["standard"],
-        synonym_examples=tuple(draft["similar"]),
-        negatives=tuple(draft["negatives"]),
         parameters=parameters,
-        arg_slots=dict(draft.get("arg_slots") or {}),
         intent_kind="action",
-        enabled=True,
-        status="active",
+        enabled=False, status="disabled",
     )
-    try:
-        created = await create_draft(entry, session_factory=SessionLocal)
-    except RegistryConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    await audit("catalog_register", actor_username=admin.username,
-                target=capability_id,
+    view = await load_live_view(session_factory=SessionLocal)
+    await _gated(_override(view, entry))
+    await snapshot_history(view.entries, actor_username=admin.username,
+                           note=f"before catalog-create {entry.capability_id}",
+                           session_factory=SessionLocal)
+    created = await create_capability(entry, session_factory=SessionLocal)
+    await audit("catalog_create", actor_username=admin.username,
+                target=created.capability_id,
                 detail={"action_key": action_key, "from": "action_catalog"},
                 session_factory=SessionLocal)
-    return {"draft": _entry_json(created)}
+    return {"capability": _entry_json(created)}
 
 
-# ── validate / preview / publish / rollback ───────────────────────────────────────
+# ── query corpus plane (embed-then-write, atomic) ────────────────────────────────
 
-@router.get("/admin/registry/intent-corpus/{capability_id}")
-async def get_intent_corpus(
-    capability_id: str, _: AuthAdmin = Depends(require_admin),
-) -> dict:
-    """Phase 4 read-only view: WHICH sentences of this draft row feed the Exact
-    Match set and the vector library (qir_examples, migration 0009), and which
-    of them the CURRENTLY ACTIVE index actually carries. Draft ≠ active: a
-    freshly edited sentence shows in_library=false until a publish lands it."""
-    from core.application.chat.qir import store as qir_store
-
-    drafts = await list_drafts(session_factory=SessionLocal)
-    entry = next(
-        (e for e in drafts if e.capability_id == capability_id), None)
-    if entry is None:
-        raise HTTPException(status_code=404, detail=f"no draft for {capability_id!r}")
-    snap = await qir_store.active(SessionLocal)
-    cap = snap.get(capability_id) if snap is not None else None
-    active_sentences = set(cap.examples) if cap is not None else set()
-    return {
-        "capability_id": capability_id,
-        "qir_version": snap.version if snap is not None else None,
-        "sentences": [
-            {"text": s,
-             "kind": "canonical" if i == 0 else "synonym",
-             "in_active_index": s in active_sentences}
-            for i, s in enumerate(entry.intent_corpus)
-        ],
-        "card_only": {
-            "legacy_examples": list(entry.examples),
-            "negatives": list(entry.negatives),
-        },
-        "legacy_inert": {"patterns": list(entry.patterns),
-                         "aliases": list(entry.aliases)},
-    }
-
-
-@router.get("/admin/registry/preview")
-async def get_preview(_: AuthAdmin = Depends(require_admin)) -> dict:
-    """Dry-run the publish BUILD (validation + real embeddings) with zero writes.
-    8.5's full-funnel query preview rides on top once step 5 marks execution_mode."""
-    drafts = await list_drafts(session_factory=SessionLocal)
-    # 8.14: the build's embedding calls are preview usage, not anyone's bill.
-    token = set_request_execution_mode("preview")
+@router.get("/admin/registry/capabilities/{capability_id}/queries")
+async def get_queries(capability_id: str,
+                      _: AuthAdmin = Depends(require_admin)) -> dict:
     try:
-        issues, snap = await preview_draft(drafts, _embedder())
-    finally:
-        reset_request_execution_mode(token)
+        return await queries.list_queries(capability_id, session_factory=SessionLocal)
+    except RegistryNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+async def _entry_of(capability_id: str) -> CapabilityEntry:
+    entry = await get_capability(capability_id, session_factory=SessionLocal)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"no capability {capability_id!r}")
+    return entry
+
+
+@router.post("/admin/registry/capabilities/{capability_id}/queries/standard")
+async def post_standard_query(
+    capability_id: str, body: RegistryStandardQueryRequest,
+    admin: AuthAdmin = Depends(require_admin),
+) -> dict:
+    entry = await _entry_of(capability_id)
+    text = body.query.strip()
+    provisional = replace(
+        entry,
+        standard_queries=entry.standard_queries + (QueryRecord(
+            id="pending", query=text, language=derive_language(text),
+            position=body.position),),
+    )
+    view = await load_live_view(session_factory=SessionLocal)
+    await _gated(_override(view, provisional))
+    await snapshot_history(view.entries, actor_username=admin.username,
+                           note=f"before add standard {capability_id}",
+                           session_factory=SessionLocal)
+    try:
+        saved = await queries.add_standard_query(
+            capability_id, text, embedder=_embedder(),
+            position=body.position, session_factory=SessionLocal)
+    except RegistryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RegistryError as exc:  # embedder failure: NOTHING was written
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await audit("query_add", actor_username=admin.username, target=capability_id,
+                detail={"table": "standard", "id": saved["id"], "language": saved["language"]},
+                session_factory=SessionLocal)
+    return {"query": saved}
+
+
+@router.post("/admin/registry/capabilities/{capability_id}/queries/similar")
+async def post_similar_query(
+    capability_id: str, body: RegistrySimilarQueryRequest,
+    admin: AuthAdmin = Depends(require_admin),
+) -> dict:
+    entry = await _entry_of(capability_id)
+    text = body.query.strip()
+    provisional = replace(
+        entry,
+        similar_queries=entry.similar_queries + (QueryRecord(
+            id="pending", query=text, language=derive_language(text),
+            position=body.position,
+            standard_query_id=body.standard_query_id),),
+    )
+    view = await load_live_view(session_factory=SessionLocal)
+    await _gated(_override(view, provisional))
+    await snapshot_history(view.entries, actor_username=admin.username,
+                           note=f"before add similar {capability_id}",
+                           session_factory=SessionLocal)
+    try:
+        saved = await queries.add_similar_query(
+            body.standard_query_id, text, embedder=_embedder(),
+            position=body.position, session_factory=SessionLocal)
+    except RegistryNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RegistryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RegistryError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await audit("query_add", actor_username=admin.username, target=capability_id,
+                detail={"table": "similar", "id": saved["id"], "language": saved["language"]},
+                session_factory=SessionLocal)
+    return {"query": saved}
+
+
+@router.post("/admin/registry/capabilities/{capability_id}/queries/negative")
+async def post_negative_query(
+    capability_id: str, body: RegistryNegativeQueryRequest,
+    admin: AuthAdmin = Depends(require_admin),
+) -> dict:
+    await _entry_of(capability_id)  # existence check
+    view = await load_live_view(session_factory=SessionLocal)
+    await snapshot_history(view.entries, actor_username=admin.username,
+                           note=f"before add negative {capability_id}",
+                           session_factory=SessionLocal)
+    try:
+        saved = await queries.add_negative_query(
+            capability_id, body.query, position=body.position,
+            session_factory=SessionLocal)
+    except RegistryNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await audit("query_add", actor_username=admin.username, target=capability_id,
+                detail={"table": "negative", "id": saved["id"]},
+                session_factory=SessionLocal)
+    return {"query": saved}
+
+
+async def _owner_of(table: str, query_id: str) -> CapabilityEntry:
+    """The capability owning a query row (for the gate projection). Negatives
+    are not match data and need no projection — they resolve by capability."""
+    if table not in ("standard", "similar"):
+        raise HTTPException(status_code=422,
+                            detail="text edits are for standard/similar rows")
+    caps = await list_capabilities(session_factory=SessionLocal)
+    for c in caps:
+        pool = c.standard_queries if table == "standard" else c.similar_queries
+        if any(r.id == query_id for r in pool):
+            return c
+    raise HTTPException(status_code=404, detail=f"no {table} query {query_id!r}")
+
+
+@router.patch("/admin/registry/queries/{table}/{query_id}")
+async def patch_query_text(
+    table: str, query_id: str, body: RegistryQueryTextRequest,
+    admin: AuthAdmin = Depends(require_admin),
+) -> dict:
+    entry = await _owner_of(table, query_id)
+    text = body.query.strip()
+    language = derive_language(text)
+    field = "standard_queries" if table == "standard" else "similar_queries"
+    rows = tuple(
+        replace(r, query=text, language=language) if r.id == query_id else r
+        for r in getattr(entry, field)
+    )
+    view = await load_live_view(session_factory=SessionLocal)
+    await _gated(_override(view, replace(entry, **{field: rows})))
+    await snapshot_history(view.entries, actor_username=admin.username,
+                           note=f"before text edit {table}/{query_id}",
+                           session_factory=SessionLocal)
+    try:
+        saved = await queries.update_query_text(
+            table, query_id, text, embedder=_embedder(),
+            session_factory=SessionLocal)
+    except RegistryNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RegistryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RegistryError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await audit("query_update", actor_username=admin.username,
+                target=f"{table}/{query_id}",
+                detail={"language": saved["language"]}, session_factory=SessionLocal)
+    return {"query": saved}
+
+
+@router.post("/admin/registry/queries/{table}/{query_id}/enabled")
+async def patch_query_enabled(
+    table: str, query_id: str, body: RegistryQueryEnabledRequest,
+    admin: AuthAdmin = Depends(require_admin),
+) -> dict:
+    entry: CapabilityEntry | None = None
+    if table in ("standard", "similar"):
+        entry = await _owner_of(table, query_id)
+        field = "standard_queries" if table == "standard" else "similar_queries"
+        rows = tuple(
+            replace(r, enabled=body.enabled) if r.id == query_id else r
+            for r in getattr(entry, field)
+        )
+        view = await load_live_view(session_factory=SessionLocal)
+        await _gated(_override(view, replace(entry, **{field: rows})))
+        await snapshot_history(view.entries, actor_username=admin.username,
+                               note=f"before enable {table}/{query_id}",
+                               session_factory=SessionLocal)
+    else:
+        view = await load_live_view(session_factory=SessionLocal)
+        await snapshot_history(view.entries, actor_username=admin.username,
+                               note=f"before enable {table}/{query_id}",
+                               session_factory=SessionLocal)
+    try:
+        saved = await queries.set_query_enabled(
+            table, query_id, body.enabled, session_factory=SessionLocal)
+    except RegistryNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RegistryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await audit("query_toggle", actor_username=admin.username,
+                target=f"{table}/{query_id}",
+                detail={"enabled": body.enabled}, session_factory=SessionLocal)
+    return {"query": saved}
+
+
+@router.delete("/admin/registry/queries/{table}/{query_id}")
+async def delete_query_row(
+    table: str, query_id: str,
+    cascade_similar: bool = Query(default=False),
+    admin: AuthAdmin = Depends(require_admin),
+) -> dict:
+    if table in ("standard", "similar"):
+        entry = await _owner_of(table, query_id)
+        if table == "standard":
+            projected = replace(
+                entry,
+                standard_queries=tuple(r for r in entry.standard_queries
+                                       if r.id != query_id),
+                similar_queries=tuple(
+                    s for s in entry.similar_queries
+                    if s.standard_query_id != query_id),
+            )
+        else:
+            projected = replace(
+                entry,
+                similar_queries=tuple(r for r in entry.similar_queries
+                                      if r.id != query_id),
+            )
+        view = await load_live_view(session_factory=SessionLocal)
+        await _gated(_override(view, projected))
+        await snapshot_history(view.entries, actor_username=admin.username,
+                               note=f"before delete {table}/{query_id}",
+                               session_factory=SessionLocal)
+    else:
+        view = await load_live_view(session_factory=SessionLocal)
+        await snapshot_history(view.entries, actor_username=admin.username,
+                               note=f"before delete {table}/{query_id}",
+                               session_factory=SessionLocal)
+    try:
+        saved = await queries.delete_query(
+            table, query_id, cascade_similar=cascade_similar,
+            session_factory=SessionLocal)
+    except RegistryNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RegistryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await audit("query_delete", actor_username=admin.username,
+                target=f"{table}/{query_id}", session_factory=SessionLocal)
+    return {"deleted": saved}
+
+
+# ── corpus / embedding state (honest reporting) ──────────────────────────────────
+
+@router.get("/admin/registry/embedding-status")
+async def get_embedding_status(_: AuthAdmin = Depends(require_admin)) -> dict:
+    status = await embedding_status(session_factory=SessionLocal)
+    status["pending"] = len(await queries.pending_embeddings(
+        session_factory=SessionLocal))
+    return status
+
+
+@router.get("/admin/registry/validate")
+async def get_validate(_: AuthAdmin = Depends(require_admin)) -> dict:
+    """The check button: validate the LIVE set against the roster, zero writes."""
+    caps = await list_capabilities(session_factory=SessionLocal)
+    return {"capabilities": len(caps),
+            "issues": validate_entries(caps, tool_schemas=_roster())}
+
+
+@router.get("/admin/registry/live-view")
+async def get_live_view(_: AuthAdmin = Depends(require_admin)) -> dict:
+    """What the RUNTIME sees right now: the active live view's fingerprint and
+    per-capability routability (enabled+active) — plus the Recall index state."""
+    view = await active_view(session_factory=SessionLocal)
     return {
-        "issues": issues,
-        "capabilities": len(drafts),
-        "snapshot_version": snap.version if snap else None,
-        "routable": len(snap.capabilities) if snap else 0,
+        "fingerprint": view.fingerprint if view else None,
+        "capabilities": [
+            {"capability_id": e.capability_id, "routable": bool(e.enabled and e.status == "active"),
+             "corpus": len(e.intent_corpus)}
+            for e in (view.entries if view else ())
+        ],
     }
 
+
+# ── preview (§8.5 full-chain dry-run) ────────────────────────────────────────────
 
 @router.post("/admin/registry/preview-route")
 async def post_preview_route(
     body: RegistryPreviewRouteRequest, _: AuthAdmin = Depends(require_admin),
 ) -> dict:
-    """§8.5 full-chain query dry-run against the ACTIVE (Registry, Index)
-    pair: Matcher → Recall → ToolIntentModel → Binder → Final Route.
+    """Matcher -> Recall -> ToolIntentModel -> Binder against the LIVE tables.
     Side-effect-free by construction (the funnel never touches run_tool, 8.8)
     and writes nothing; every embedding/LLM call it makes is billed under
-    ``execution_mode=preview`` (8.14). Read-only like GET /preview, so no
-    audit row — the routing event itself lands with mode=preview (8.12)."""
+    ``execution_mode=preview`` (8.14)."""
     import types as _types
 
     from api.deps import llm
@@ -457,59 +642,81 @@ async def post_preview_route(
     return await funnel.preview(body.query.strip(), deps=deps)
 
 
-@router.post("/admin/registry/publish")
-async def post_publish(
-    body: RegistryPublishRequest, admin: AuthAdmin = Depends(require_admin)
-) -> dict:
-    try:
-        view = await publish_draft(
-            _embedder(), actor_username=admin.username, note=body.note,
-            session_factory=SessionLocal,
-        )
-    except PublishRejectedError as exc:
-        # the rejection itself is the audit-worthy event (no version row exists)
-        await audit("publish_rejected", actor_username=admin.username, ok=False,
-                    detail={"issues": exc.issues}, session_factory=SessionLocal)
-        raise HTTPException(status_code=422, detail={"issues": exc.issues}) from exc
-    except (RegistryConflictError, RegistryStateError) as exc:
-        await audit("publish", actor_username=admin.username, ok=False,
-                    detail={"error": str(exc)}, session_factory=SessionLocal)
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    await audit("publish", actor_username=admin.username, target=f"v{view.version}",
-                detail={"fingerprint": view.fingerprint, "capabilities": len(view.entries),
-                        "note": body.note}, session_factory=SessionLocal)
-    return {"version": view.version, "state": view.state, "fingerprint": view.fingerprint}
-
+# ── registry_versions: HISTORY only (rollback = restore + re-embed) ─────────────
 
 @router.get("/admin/registry/versions")
 async def get_versions(_: AuthAdmin = Depends(require_admin)) -> dict:
-    versions = await list_versions(session_factory=SessionLocal)
-    return {
-        "versions": [
-            {
-                "version": v.version, "state": v.state, "fingerprint": v.fingerprint,
-                "source_version": v.source_version, "actor_username": v.actor_username,
-                "note": v.note, "error": v.error,
-                "capabilities": len(v.entries),
-                "routable": len(v.capabilities),
-            }
-            for v in versions
-        ]
-    }
+    return {"versions": await list_versions(session_factory=SessionLocal)}
 
 
 @router.get("/admin/registry/versions/{version}")
 async def get_one_version(version: int, _: AuthAdmin = Depends(require_admin)) -> dict:
     try:
-        v = await get_version(version, session_factory=SessionLocal)
+        return await get_version(version, session_factory=SessionLocal)
     except RegistryNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {
-        "version": v.version, "state": v.state, "fingerprint": v.fingerprint,
-        "source_version": v.source_version, "actor_username": v.actor_username,
-        "note": v.note, "error": v.error,
-        "entries": [e.to_payload() for e in v.entries],
-    }
+
+
+async def _restore_corpus(cap_id: str, target: CapabilityEntry, embedder) -> None:
+    """Corpus reconciliation of one capability against a history snapshot:
+    every sentence write goes through the embed-then-write query plane."""
+    cur = await queries.list_queries(cap_id, session_factory=SessionLocal)
+    for r in cur["similar"]:  # similars first: they ride on their Standard
+        await queries.delete_query("similar", r["id"], session_factory=SessionLocal)
+    cur_std = {r["language"]: r for r in cur["standard"]}
+    want_std = {r.language: r for r in target.standard_queries}
+    std_id_by_lang: dict[str, str] = {}
+    for lang, w in want_std.items():
+        if lang in cur_std:
+            row = cur_std[lang]
+            std_id_by_lang[lang] = row["id"]
+            if row["query"] != w.query:
+                await queries.update_query_text("standard", row["id"], w.query,
+                                                embedder=embedder,
+                                                session_factory=SessionLocal)
+            if row["enabled"] != w.enabled:
+                await queries.set_query_enabled("standard", row["id"], w.enabled,
+                                                session_factory=SessionLocal)
+        else:
+            added = await queries.add_standard_query(cap_id, w.query,
+                                                     embedder=embedder,
+                                                     position=w.position,
+                                                     session_factory=SessionLocal)
+            std_id_by_lang[lang] = added["id"]
+    for lang, row in cur_std.items():
+        if lang not in want_std:
+            await queries.delete_query("standard", row["id"],
+                                       session_factory=SessionLocal)
+    for s in target.similar_queries:
+        std_id = std_id_by_lang.get(s.language)
+        if std_id is None:  # snapshot-internal inconsistency: orphan similar
+            continue
+        added = await queries.add_similar_query(std_id, s.query, embedder=embedder,
+                                                position=s.position,
+                                                session_factory=SessionLocal)
+        if not s.enabled:
+            await queries.set_query_enabled("similar", added["id"], False,
+                                            session_factory=SessionLocal)
+    # negatives: no embeddings, plain rows — rebuild to the snapshot's set
+    neg_cur = await queries.list_queries(cap_id, session_factory=SessionLocal)
+    for r in neg_cur["negative"]:
+        await queries.delete_query("negative", r["id"], session_factory=SessionLocal)
+    for pos, text in enumerate(target.negatives):
+        await queries.add_negative_query(cap_id, text, position=pos,
+                                         session_factory=SessionLocal)
+
+
+def _intent_patch(current: CapabilityEntry, target: CapabilityEntry) -> dict:
+    patch: dict = {}
+    for f in CAPABILITY_PATCH_FIELDS:
+        cv, tv = getattr(current, f), getattr(target, f)
+        if f in ("patterns", "aliases", "request_query_examples"):
+            cv, tv = list(cv or []), list(tv or [])
+        elif f in ("parameters", "arg_slots"):
+            cv, tv = dict(cv or {}), dict(tv or {})
+        if cv != tv:
+            patch[f] = tv
+    return patch
 
 
 @router.post("/admin/registry/versions/{version}/rollback")
@@ -517,18 +724,61 @@ async def post_rollback(
     version: int, body: RegistryRollbackRequest,
     admin: AuthAdmin = Depends(require_admin),
 ) -> dict:
+    """Restore = replay a history snapshot into the live tables + re-embed.
+    Capabilities absent from the snapshot are SOFT-DISABLED (no hard delete).
+    Embedder failure mid-way leaves a partial restore and is reported — an
+    honest 503, never a fake success."""
     try:
-        view = await rollback(
-            version, actor_username=admin.username, session_factory=SessionLocal,
-        )
+        targets = await version_entries(version, session_factory=SessionLocal)
     except RegistryNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except (RegistryConflictError, RegistryStateError, RegistryError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    await audit("rollback", actor_username=admin.username, target=f"v{view.version}",
-                detail={"from_version": version, "fingerprint": view.fingerprint},
+    embedder = _embedder()
+    view = await load_live_view(session_factory=SessionLocal)
+    await snapshot_history(view.entries, actor_username=admin.username,
+                           note=f"before rollback to v{version}",
+                           session_factory=SessionLocal)
+    target_ids = {t.capability_id for t in targets}
+    restored = 0
+    try:
+        for t in targets:
+            current = await get_capability(t.capability_id,
+                                           session_factory=SessionLocal)
+            if current is None:
+                await create_capability(replace(t, enabled=False, status="disabled"),
+                                        session_factory=SessionLocal)
+                current = await get_capability(t.capability_id,
+                                               session_factory=SessionLocal)
+            await _restore_corpus(t.capability_id, t, embedder)
+            current = await get_capability(t.capability_id,
+                                           session_factory=SessionLocal)
+            patch = _intent_patch(current, t)  # enabled/status land last
+            if patch:
+                await update_capability(t.capability_id, patch,
+                                        current.row_version,
+                                        session_factory=SessionLocal)
+            restored += 1
+        for e in view.entries:  # live rows outside the snapshot: soft-disable
+            if e.capability_id in target_ids:
+                continue
+            if e.enabled or e.status != "disabled":
+                fresh = await get_capability(e.capability_id,
+                                             session_factory=SessionLocal)
+                await update_capability(e.capability_id,
+                                        {"enabled": False, "status": "disabled"},
+                                        fresh.row_version,
+                                        session_factory=SessionLocal)
+    except (RegistryError, RegistryConflictError, RegistryNotFoundError) as exc:
+        await audit("rollback", actor_username=admin.username, ok=False,
+                    target=f"v{version}", detail={"error": str(exc)},
+                    session_factory=SessionLocal)
+        raise HTTPException(status_code=503,
+                            detail=f"partial restore at v{version}: {exc}") from exc
+    final = await list_capabilities(session_factory=SessionLocal)
+    issues = validate_entries(final, tool_schemas=_roster())
+    await audit("rollback", actor_username=admin.username, target=f"v{version}",
+                detail={"restored": restored, "issues": issues},
                 session_factory=SessionLocal)
-    return {"version": view.version, "state": view.state, "source_version": version}
+    return {"restored_version": version, "capabilities": restored, "issues": issues}
 
 
 # ── audit read (admin visibility of the trail itself) ─────────────────────────────

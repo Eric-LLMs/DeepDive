@@ -1,0 +1,23 @@
+# S8 Casual / Chit-chat — natural negatives for the funnel.
+scenario: S8_CHIT_CHAT
+defaults: {viewer: {kind: none}, vrel: NO_VIEWER, intent: CHIT_CHAT, difficulty: EASY}
+cases:
+  - id: greeting
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '你好啊'}
+      - {q: '在吗?'}
+      - {q: '晚安啦'}
+  - id: opinion-joke
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '你觉得远程办公好还是坐班好?'}
+      - {q: '给我讲个程序员的冷笑话'}
+      - {q: '你会多少种语言?'}
+      - {q: '无聊,说点什么有意思的'}
+  - id: emotion
+    expected: {funnel: AGENT}
+    variants:
+      - {q: '今天心情不好,陪我聊两句'}
+      - {q: '刚被 leader 批评了,有点丧'}
+      - {q: '谢谢你呀,帮大忙了'}

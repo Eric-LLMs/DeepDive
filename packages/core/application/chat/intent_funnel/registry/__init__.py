@@ -1,51 +1,84 @@
-"""Intent Registry (QIR P1): the versioned, DB-backed source of routable capabilities.
+"""Intent Registry (migration 0014, final ruling 2026-09-26): the LIVE-table
+source of routable capabilities.
 
-Layering (docs/temp.md §8.2/§8.3):
+Layering:
 
-* ``capabilities`` rows are the editable Draft (this package's ``store`` CRUD);
-* publishing freezes the whole draft set into an immutable ``registry_versions``
-  payload; runtime reads ONLY the active version (never the draft table);
-* Validate/Preview/Build-Then-Swap around these primitives is step 2; the Matcher
-  starts reading this Registry (shadow) in step 3.
+* ``capabilities`` + ``capability_standard_queries`` /
+  ``capability_similar_queries`` / ``capability_negatives`` ARE the runtime
+  truth — no Draft, no Publish, no Projection;
+* :mod:`.store` reads them (fingerprint-cached live view) and edits the
+  intent rows; :mod:`.queries` edits the corpus with embed-then-write
+  atomicity;
+* :mod:`.snapshot` is the pure validation gate in front of every write;
+* ``registry_versions`` keeps write-time history only.
 """
-from .snapshot import (
-    PublishRejectedError,
-    VALID_POLICIES,
-    VALID_SOURCES,
-    preview_draft,
-    publish_draft,
-    to_qir_draft,
-    validate_entries,
-)
 from .entry import (
-    STATE_ACTIVE,
-    STATE_FAILED,
-    STATE_STAGED,
-    STATE_SUPERSEDED,
     STATUS_ACTIVE,
     STATUS_DEPRECATED,
     STATUS_DISABLED,
     CapabilityEntry,
-    RegistryVersionView,
+    QueryRecord,
+    RegistryLiveView,
+    derive_language,
+)
+from .snapshot import (
+    VALID_POLICIES,
+    VALID_SOURCES,
+    RegistryValidationError,
+    validate_entries,
 )
 from .store import (
     RegistryConflictError,
     RegistryError,
     RegistryNotFoundError,
-    RegistryStateError,
-    activate_version,
     active_view,
     audit,
     content_fingerprint,
-    create_draft,
-    get_draft,
+    create_capability,
+    embedding_status,
+    get_capability,
     get_version,
     invalidate_cache,
     list_audit,
-    list_drafts,
+    list_capabilities,
     list_versions,
-    mark_failed,
-    rollback,
-    stage_version,
-    update_draft,
+    load_live_view,
+    snapshot_history,
+    update_capability,
+    version_entries,
 )
+
+__all__ = [
+    # entry
+    "STATUS_ACTIVE",
+    "STATUS_DEPRECATED",
+    "STATUS_DISABLED",
+    # snapshot (the write-time validation gate)
+    "VALID_POLICIES",
+    "VALID_SOURCES",
+    "CapabilityEntry",
+    "QueryRecord",
+    # store (live-table read/edit + fingerprint cache + audit)
+    "RegistryConflictError",
+    "RegistryError",
+    "RegistryLiveView",
+    "RegistryNotFoundError",
+    "RegistryValidationError",
+    "active_view",
+    "audit",
+    "content_fingerprint",
+    "create_capability",
+    "derive_language",
+    "embedding_status",
+    "get_capability",
+    "get_version",
+    "invalidate_cache",
+    "list_audit",
+    "list_capabilities",
+    "list_versions",
+    "load_live_view",
+    "snapshot_history",
+    "update_capability",
+    "validate_entries",
+    "version_entries",
+]

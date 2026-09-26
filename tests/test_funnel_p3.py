@@ -2,10 +2,10 @@
 
 Pinning the P3 ruling ("扩表不改接口,逐开关灰度"):
 
-* the kind is Registry DATA: it rides the draft row, the published payload and
-  the content fingerprint (changing a kind changes the version);
-* pre-P3 payloads and rows default to ACTION — an old active version can never
-  route a widened kind;
+* the kind is Registry DATA: it rides the live capability row, the snapshot
+  payload and the content fingerprint (changing a kind changes the fingerprint);
+* pre-P3 payloads and rows default to ACTION — a historical snapshot can never
+  restore a widened kind that the gates do not honor;
 * an enabled-looking verdict on a CLOSED kind exits with FUNNEL_KIND_DISABLED
   and the Agent turn stays byte-identical (8.10);
 * the interface: nothing outside the Registry changed — the cascade, the binder
@@ -26,19 +26,25 @@ from core.application.chat.intent_funnel.registry.entry import (
     KIND_PRIVATE,
     KIND_WEB,
     CapabilityEntry,
-    RegistryVersionView,
+    QueryRecord,
+    RegistryLiveView,
+    derive_language,
 )
 
 MSG = '新建文件夹"季度报告"'
 
 
 def _entry(cid, *, tool="create_folder", corpus=(), kind=KIND_ACTION, **kw):
-    # corpus = the exact-set sentences (standard + synonyms, ruling 2026-09-25)
+    # corpus = the exact-set sentences (Standard + Similar live rows)
     corpus = tuple(corpus)
+    std = (QueryRecord(id="q1", query=corpus[0], language=derive_language(corpus[0])),) \
+        if corpus else ()
+    sims = tuple(QueryRecord(id=f"q{10 + n}", query=s, language=derive_language(s),
+                             position=n, standard_query_id="q1" if std else None)
+                 for n, s in enumerate(corpus[1:]))
     return CapabilityEntry(
         capability_id=cid, tool_binding=tool, description=f"does {cid}",
-        standard_example=corpus[0] if corpus else "",
-        synonym_examples=corpus[1:], examples=("做个事",),
+        standard_queries=std, similar_queries=sims,
         parameters={"name": {"type": "string", "required": True,
                              "max_len": 120, "description": "folder name"}},
         arg_slots={"name": {"source": "user_input"}}, intent_kind=kind, **kw,
@@ -46,10 +52,9 @@ def _entry(cid, *, tool="create_folder", corpus=(), kind=KIND_ACTION, **kw):
 
 
 def _view(entries, version=1):
-    return RegistryVersionView(
-        version=version, state="active",
+    return RegistryLiveView(
         fingerprint=content_fingerprint(list(entries)),
-        capabilities=(), entries=tuple(entries),
+        entries=tuple(entries),
     )
 
 
@@ -59,8 +64,8 @@ def _view(entries, version=1):
 def test_kind_round_trips_through_payload_and_defaults_to_action():
     e = _entry("cap-p", kind=KIND_PRIVATE)
     assert CapabilityEntry.from_payload(e.to_payload()).intent_kind == KIND_PRIVATE
-    # a pre-P3 published payload has no kind field at all -> ACTION, the safe
-    # historical default (an old version must not route a widened kind)
+    # a pre-P3 history payload has no kind field at all -> ACTION, the safe
+    # historical default (an old snapshot can never restore a widened kind)
     legacy = {k: v for k, v in e.to_payload().items() if k != "intent_kind"}
     assert CapabilityEntry.from_payload(legacy).intent_kind == KIND_ACTION
 
@@ -71,7 +76,7 @@ def test_kind_is_content_so_it_moves_the_fingerprint():
     assert a.fingerprint != p.fingerprint
 
 
-def test_publish_gate_rejects_unknown_kind():
+def test_validation_gate_rejects_unknown_kind():
     issues = pub.validate_entries([_entry("cap-x", kind="quantum")])
     assert any("intent_kind" in s for s in issues)
     # the three real kinds pass the kind rule (other rules may still apply)
@@ -111,7 +116,10 @@ def _ctx(msg):
 
 def _req():
     from core.application.chat.understanding import (
-        Complexity, Confidence, Signal, TurnRequirements,
+        Complexity,
+        Confidence,
+        Signal,
+        TurnRequirements,
     )
     return TurnRequirements(complexity=Complexity.LOW, confidence=Confidence.LOW,
                             needs_web=Signal.LOW, needs_memory=False)
@@ -162,8 +170,7 @@ def _wire(monkeypatch, *, view, llm=None):
         return view
 
     async def fake_load(sf):
-        return types.SimpleNamespace(version="idx-9", capabilities=[],
-                                     example_vectors=[])
+        return types.SimpleNamespace(version="corpus1-test", corpus=())
 
     monkeypatch.setattr(
         "core.application.chat.intent_funnel.registry.active_view", fake_active)

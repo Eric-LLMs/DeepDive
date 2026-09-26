@@ -86,15 +86,17 @@ async def _match_and_log(ctx, deps, requirements, mode: str) -> None:
 
     view = await active_view(session_factory=deps.session_factory)
     if view is None:
-        return  # nothing published yet — no comparison possible
+        return  # no capabilities in the live table yet — no comparison possible
     res = matcher.match(getattr(ctx.body, "message", "") or "",
                         TurnFacts.of(ctx), view)
     l0_tool = (requirements.requested_action or {}).get("tool")
+    # live-table ruling (2026-09-26): there is no version number any more — the
+    # Registry view IS the live corpus, identified by its content fingerprint.
     logger.info(
-        "matcher_shadow mode=%s version=%d state=%s registry_version=%s "
+        "matcher_shadow mode=%s state=%s registry_fingerprint=%s "
         "would_route=%s would_capability=%s would_stage=%s confidence=%s "
         "fallback_reason=%s candidates=%s pattern=%s l0_tool=%s agreement=%s",
-        mode, view.version, res.state, view.fingerprint,
+        mode, res.state, view.fingerprint,
         "t" if res.state == MATCH_HIT else "f",
         res.capability_id or "-", _WOULD_STAGE,
         _confidence(res),

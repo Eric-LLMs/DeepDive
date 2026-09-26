@@ -123,17 +123,6 @@ class Settings(BaseSettings):
     chat_direct_max_chars: int = 400            # a pure user message must be <= this
     # LOCAL_RAG recall depth — same default as the agent's rag_search tool (top_k=5).
     chat_retrieval_top_k: int = 5
-    # ── QIR (Intent Routing stage of resolve_plan): semantic + decision levels ──
-    # All OFF by default = dark launch: with the gate closed, resolve_plan behaves
-    # byte-identically to the pre-QIR L0 funnel. QIR Fail-Opens — any abstain /
-    # timeout / fault leaves the original Agent path untouched; the cascade can
-    # only ever ADD a certified ACTION, never alter a turn the L0 already routed.
-    chat_qir_enabled: bool = False           # master gate for the QIR cascade
-    chat_qir_decision_enabled: bool = False  # arbiter OFF = no routing at all
-    chat_qir_timeout_seconds: float = 2.5    # whole-cascade wall clock, then abstain
-    chat_qir_top_k: int = 3                  # semantic candidate width
-    chat_qir_min_score: float = 0.82         # cosine floor for a capability to lead
-    chat_qir_margin: float = 0.06            # leader must beat runner-up by this much
     # ── Shadow Mode (8.15, P1 step 5): the Registry Matcher's tri-state switch ──
     # off     — the node never runs (dark-launch default);
     # shadow  — runs every turn, logs the would_* verdict next to L0's outcome,
@@ -142,11 +131,11 @@ class Settings(BaseSettings):
     #           behaves as shadow with a warning: a mis-set switch must never
     #           silently hand routing to a node that only ever measured in the dark.
     chat_matcher_mode: str = "off"
-    # ── Intent Funnel (P2 target architecture, docs/temp.md §3/§8): the single-hop ──
+    # ── Intent Funnel (docs/temp.md §3/§8): the single-hop ──
     # chain Matcher→Recall→ToolIntentModel(select+extract)→Binder(verify-only) with
-    # fail-open Agent fallback. Dark launch: chat_funnel_enabled=False keeps the
-    # legacy path byte-identical; the knobs below are INDEPENDENT of chat_qir_*
-    # (the legacy cascade) on purpose — the new chain is tuned on its own merits.
+    # fail-open Agent fallback. chat_funnel_enabled=False keeps plain Agent
+    # handling; the QIR legacy cascade was deleted with migration 0014 — this is
+    # the only table-driven routing lane.
     chat_funnel_enabled: bool = False            # master gate for the new cascade
     chat_funnel_timeout_seconds: float = 5.0     # whole-cascade wall clock, then Agent
     chat_funnel_top_k: int = 3                   # Recall candidate width

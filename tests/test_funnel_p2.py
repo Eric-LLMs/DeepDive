@@ -27,23 +27,23 @@ from core.application.chat.intent_funnel.contract import (
     BIND_COMPLETE,
     BIND_INVALID,
     BIND_MISSING,
-    TOOL_INTENT_CONFIDENT,
-    TOOL_INTENT_REJECT,
-    TOOL_INTENT_UNCERTAIN,
     MATCH_HIT,
     REASON_BIND_MISSING,
-    REASON_TOOL_INTENT_REJECT,
-    REASON_TOOL_INTENT_UNCERTAIN,
     REASON_RECALL_TIMEOUT,
     REASON_RECALL_UNAVAILABLE,
     REASON_REGISTRY_UNAVAILABLE,
+    REASON_TOOL_INTENT_REJECT,
+    REASON_TOOL_INTENT_UNCERTAIN,
     REASON_VERSION_MISMATCH,
+    TOOL_INTENT_CONFIDENT,
+    TOOL_INTENT_REJECT,
+    TOOL_INTENT_UNCERTAIN,
     Candidate,
     TurnFacts,
 )
-from core.application.chat.intent_funnel.tool_intent import base as jbase
 from core.application.chat.intent_funnel.registry import content_fingerprint
 from core.application.chat.intent_funnel.registry import entry as T
+from core.application.chat.intent_funnel.tool_intent import base as jbase
 from core.application.chat.understanding import (
     Complexity,
     Confidence,
@@ -54,17 +54,27 @@ from core.application.chat.understanding import (
 # ════════════════════════ shared fakes (contract-shaped, minimal) ═══════════════
 
 
+def _q(i, text, *, position=0, standard_query_id=None, kind="standard"):
+    return T.QueryRecord(id=f"q{i}", query=text,
+                         language=T.derive_language(text), position=position,
+                         standard_query_id=standard_query_id)
+
+
 def _entry(cid, *, tool="create_folder", corpus=(), patterns=(), aliases=(),
            arg_slots=None, enabled=True, status="active", examples=("做个事",),
            negatives=(), parameters=None):
-    # ``corpus`` feeds the EXACT set (standard + synonyms, ruling 2026-09-25);
+    # ``corpus`` feeds the EXACT set: the live-table ruling hydrates it as
+    # Standard (first row) + Similar query rows (ruling 2026-09-25/26);
     # patterns/aliases stay storable but are inert as far as the Matcher goes.
     corpus = tuple(corpus)
+    sims = tuple(_q(10 + n, s, position=n, standard_query_id="q1" if corpus else None)
+                 for n, s in enumerate(corpus[1:]))
     return T.CapabilityEntry(
         capability_id=cid, tool_binding=tool, description=f"does {cid}",
-        standard_example=corpus[0] if corpus else "",
-        synonym_examples=corpus[1:],
-        patterns=tuple(patterns), aliases=tuple(aliases), examples=tuple(examples),
+        standard_queries=(_q(1, corpus[0]),) if corpus else (),
+        similar_queries=sims,
+        patterns=tuple(patterns), aliases=tuple(aliases),
+        request_query_examples=tuple(examples),
         negatives=tuple(negatives), arg_slots=arg_slots if arg_slots is not None
         else {"name": {"source": "user_input"}},
         parameters=dict(parameters) if parameters is not None else {},
@@ -83,10 +93,11 @@ _TERM_SCHEMA = {
 
 
 def _view(entries, version=1):
-    return T.RegistryVersionView(
-        version=version, state="active",
+    # live-table ruling 2026-09-26: the read model IS the live corpus, keyed
+    # only by its content fingerprint (the ``version`` arg is call-site noise).
+    return T.RegistryLiveView(
         fingerprint=content_fingerprint(list(entries)),
-        capabilities=(), entries=tuple(entries),
+        entries=tuple(entries),
     )
 
 
@@ -122,34 +133,34 @@ class _LLM:
         return r
 
 
-def _index(caps, *, version="idx-9"):
-    """caps: [(capability_id, [examples], [example vectors])]. Mirrors the
-    published qir-store snapshot shape the real recall consumes."""
-    capabilities, vectors = [], []
+def _index(caps, *, version="corpus1-test"):
+    """caps: [(capability_id, [sentences], [sentence vectors])]. Mirrors the
+    LIVE corpus rows the real recall's in-process lane consumes (no
+    session_factory on the fake -> no pgvector ANN in unit tests)."""
+    corpus = []
     for cid, examples, vecs in caps:
-        capabilities.append(types.SimpleNamespace(id=cid, examples=tuple(examples)))
-        for i, v in enumerate(vecs):
-            vectors.append(types.SimpleNamespace(
-                capability_id=cid, example_index=i, vector=list(v),
+        for i, (q, v) in enumerate(zip(examples, vecs)):
+            corpus.append(types.SimpleNamespace(
+                kind="standard", query_id=f"{cid}-{i}", capability_id=cid,
+                query=q, language=T.derive_language(q),
+                standard_query_id=None, vector=list(v),
             ))
-    return types.SimpleNamespace(
-        version=version, capabilities=capabilities, example_vectors=vectors,
-    )
+    return types.SimpleNamespace(version=version, corpus=tuple(corpus))
 
 
 def _ctx(msg, **kw):
-    base = dict(
-        body=types.SimpleNamespace(message=msg, attach=None, viewer=None),
-        owned_asset_id=None, research_turn=False, effective_handoff=None,
-        session_id="s-1",
-    )
+    base = {
+        "body": types.SimpleNamespace(message=msg, attach=None, viewer=None),
+        "owned_asset_id": None, "research_turn": False, "effective_handoff": None,
+        "session_id": "s-1",
+    }
     base.update(kw)
     return types.SimpleNamespace(**base)
 
 
 def _req(**kw):
-    base = dict(complexity=Complexity.LOW, confidence=Confidence.LOW,
-                needs_web=Signal.LOW, needs_memory=False)
+    base = {"complexity": Complexity.LOW, "confidence": Confidence.LOW,
+                "needs_web": Signal.LOW, "needs_memory": False}
     base.update(kw)
     return TurnRequirements(**base)
 
@@ -207,22 +218,25 @@ def test_negation_guard_is_a_pure_predicate():
 # ═══════════════════════════════ recall (quality gate only) ════════════════════
 
 
-async def test_recall_scores_gate_truncate_and_never_adjudicates():
+async def test_recall_keeps_every_hit_with_provenance_and_never_adjudicates():
     from core.application.chat.intent_funnel import recall as recall_node
 
     idx = _index([
-        ("cap-a", ["做a"], [[1.0, 0.0], [0.9, 0.1]]),   # best-example wins
-        ("cap-b", ["做b"], [[0.95, 0.0]]),
-        ("cap-c", ["做c"], [[0.1, 0.9]]),                # below min_score
+        ("cap-a", ["做a1", "做a2"], [[1.0, 0.0], [1.0, 0.1]]),  # BOTH kept
+        ("cap-b", ["加个词"], [[1.0, 0.5]]),
+        ("cap-c", ["闲聊"], [[1.0, 2.0]]),                      # below min_score
     ])
-    res = await recall_node.recall(
-        idx, "新建文件夹", embedder=_Embedder([1.0, 0.0]), top_k=2, min_score=0.82,
-    )
+    emb = _Embedder([1.0, 0.0])
+    res = await recall_node.recall(idx, "新建文件夹", embedder=emb, min_score=0.82)
     ids = [c.capability_id for c in res.candidates]
-    assert ids == ["cap-a", "cap-b"]          # ranked, NOT margin-aborted
-    assert res.candidates[0].matched_example == "做a"
-    assert res.candidates[0].origin == "recall"
-    # near-ties survive: recall proposes, the ToolIntentModel disposes (design §3)
+    scores = [c.score for c in res.candidates]
+    assert scores == sorted(scores, reverse=True)  # ranked, NOT margin-aborted
+    assert ids.count("cap-a") == 2                 # no per-capability MAX merge:
+    assert "cap-c" not in ids                      # every hit >= gate is its own candidate
+    top = res.candidates[0]
+    assert top.matched_example == "做a1" and top.origin == "recall"
+    assert top.query_kind == "standard" and top.language == "zh" and top.query_id
+    assert emb.calls == 1                          # ONE embedding for BOTH paths
 
 
 async def test_recall_blank_query_and_embedder_fault():
@@ -230,24 +244,25 @@ async def test_recall_blank_query_and_embedder_fault():
 
     idx = _index([("cap-a", ["做a"], [[1.0, 0.0]])])
     assert (await recall_node.recall(idx, "  ", embedder=_Embedder([1.0]),
-                                     top_k=3, min_score=0.5)).candidates == ()
+                                     min_score=0.5)).candidates == ()
     with pytest.raises(RuntimeError):
         await recall_node.recall(idx, "做a", embedder=_Embedder([1.0], fail=True),
-                                 top_k=3, min_score=0.5)
+                                 min_score=0.5)
     with pytest.raises(RuntimeError):
         await recall_node.recall(idx, "做a", embedder=_Embedder([]),
-                                 top_k=3, min_score=0.5)
+                                 min_score=0.5)
 
 
-async def test_recall_refuses_vectors_without_examples():
+async def test_recall_gate_is_inclusive_near_ties_survive():
     from core.application.chat.intent_funnel import recall as recall_node
 
-    idx = _index([("cap-a", ["做a"], [[1.0, 0.0]])])
-    idx.example_vectors.append(types.SimpleNamespace(
-        capability_id="cap-a", example_index=5, vector=[1.0, 0.0]))  # orphan row
-    res = await recall_node.recall(idx, "做a", embedder=_Embedder([1.0, 0.0]),
-                                   top_k=3, min_score=0.5)
-    assert [c.score for c in res.candidates] == [1.0]  # orphan never scored
+    # recall proposes, the ToolIntentModel disposes (design §3): the gate is a
+    # >= filter, nothing more — no margin cut, no winner pick.
+    idx = _index([("cap-a", ["a"], [[1.0, 0.0]]),
+                  ("cap-b", ["b"], [[1.0, 0.02]])])
+    res = await recall_node.recall(idx, "q", embedder=_Embedder([1.0, 0.0]),
+                                   min_score=1.0)
+    assert [c.capability_id for c in res.candidates] == ["cap-a"]  # exact 1.0 kept
 
 
 # ═══════════════════════════════ tool_intent: stub + ladder ═══════════════════════════
@@ -720,8 +735,9 @@ def test_tool_intent_card_carries_tool_schema_score_and_origin():
 
 def test_card_shows_all_four_semantic_fields():
     """Action-Contract ruling 2026-09-25: the model must SEE the capability's
-    semantic contour — standard/synonym examples, legacy registry examples and
-    negatives are all on the card (only the first two feed Exact/Recall)."""
+    semantic contour — the intent corpus (Standard + Similar rows) and the
+    renamed request_query_examples are all on the card, the request rows
+    labelled card-context-only (only the corpus feeds Exact/Recall)."""
     entry = _entry("cap-a", corpus=("新建文件夹", "建个文件夹"),
                    examples=("创建目录",), negatives=("不要新建文件夹",),
                    parameters=_NAME_SCHEMA)
@@ -731,7 +747,7 @@ def test_card_shows_all_four_semantic_fields():
     assert "query examples:" in p
     for s in ("新建文件夹", "建个文件夹", "创建目录"):
         assert s in p                                  # all positives visible
-    assert "(registry examples)" in p                  # legacy labelled as such
+    assert "(request examples, card context only)" in p  # labelled, not an anchor
     assert "negative examples:" in p and "不要新建文件夹" in p
     assert "re:" not in p                              # no regex ever reaches a card
 
@@ -925,7 +941,6 @@ async def test_gate_closed_cascade_is_physically_dark(monkeypatch):
     from core.config import settings
 
     monkeypatch.setattr(settings, "chat_matcher_mode", "off")
-    monkeypatch.setattr(settings, "chat_qir_enabled", False)
     monkeypatch.setattr(
         "core.application.chat.intent_funnel.registry.active_view",
         lambda **kw: pytest.fail("registry must not be read"),
@@ -1013,7 +1028,9 @@ async def test_matcher_hit_single_hop_certifies(monkeypatch, caplog):
     act = out.requested_action
     assert act["tool"] == "create_folder" and act["args"] == {"name": "季度报告"}
     assert act["capability_id"] == "cap-a"
-    assert act["registry_version"] == "idx-9"          # executor TOCTOU namespace
+    # live-table ruling: the ONLY Registry stamp is the content fingerprint
+    # (the legacy index-version action stamp is gone from the action shape).
+    assert "registry_version" not in act
     assert act["funnel_registry_version"] == view.fingerprint
     assert act["funnel_stage"] == "tool_intent"
     assert out.needs_action is Signal.HIGH and out.complexity is Complexity.LOW
