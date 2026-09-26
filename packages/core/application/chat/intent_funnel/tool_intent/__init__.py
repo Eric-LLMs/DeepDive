@@ -91,10 +91,11 @@ async def select_and_extract(query: str, candidates, *, entries_by_id: dict,
                      llm=None, facts=None) -> ToolIntentVerdict:
     """Run the ONE ToolIntentModel pass under the configured backend ladder.
 
-    Action Detection is unconditional (ruling 2026-09-25): an EMPTY candidate
-    list is a legitimate input — the model sees the explicit "(none registered
-    for this turn)" card set and can only answer NONE -> REJECT. There is no
-    pre-model short-circuit any more."""
+    Per the 2026-09-26 ruling the funnel only calls this hop when the
+    model-facing candidate set is NON-EMPTY (an empty set short-circuits to
+    NO_CANDIDATE before any spend). An empty list remains a legitimate
+    defensive input: the prompt renders the explicit "(none registered for
+    this turn)" card set and the model can only answer NONE -> REJECT."""
     from core.config import settings
 
     backend = _backend()

@@ -36,6 +36,7 @@ from .contract import (
     REASON_CASCADE_ERROR,
     REASON_CASCADE_TIMEOUT,
     REASON_KIND_DISABLED,
+    REASON_NO_CANDIDATE,
     REASON_RECALL_TIMEOUT,
     REASON_RECALL_UNAVAILABLE,
     REASON_REGISTRY_UNAVAILABLE,
@@ -464,18 +465,22 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
     if model_candidate_floor is not None:
         # Phase-E shadow seam: the raw lane moved the quality gate out of
         # recall so ALL threshold buckets are recomputable offline; the
-        # model-facing set here re-applies the floor and keeps the cards at
-        # top_k per capability appearance, plus every matcher-origin card
-        # (HIT 1.0 / AMBIGUOUS 0.0: table evidence, not calibrated cosine
-        # scores, exempt from both floor and cap).
+        # model-facing set here re-applies the floor and keeps EVERY hit at or
+        # above it (candidate-count cap retired by the 2026-09-26 ruling),
+        # plus every matcher-origin card (HIT 1.0 / AMBIGUOUS 0.0: table
+        # evidence, not calibrated cosine scores, exempt from the floor).
         recall_c = [c for c in cands if c.origin == "recall"
-                    and c.score >= model_candidate_floor][:settings.chat_funnel_top_k]
+                    and c.score >= model_candidate_floor]
         cands = sorted([c for c in cands if c.origin != "recall"] + recall_c,
                        key=lambda c: c.score, reverse=True)
-    # Action Detection is UNCONDITIONAL (ruling 2026-09-25): an empty candidate
-    # set no longer short-circuits to the Agent. The model faces the empty
-    # table, can only answer NONE -> REJECT. REASON_NO_CANDIDATE is therefore
-    # never produced on this lane any more.
+    # Empty candidate set -> Agent, no model hop (ruling 2026-09-26, supersedes
+    # the 2026-09-25 "Action Detection is UNCONDITIONAL" note): with no Matcher
+    # HIT/AMBIGUOUS card AND no Recall hit at/above the quality gate there is
+    # nothing for the single hop to select from. NO_CANDIDATE is back as the
+    # honest deepest-stage=recall exit; the byte-identical turn goes to Agent.
+    if not cands:
+        trace["fallback"] = REASON_NO_CANDIDATE
+        return None
 
     # ── Node 2: ToolIntentModel — the ONE model call of the turn (select + extract) ────
     trace["stage"] = "tool_intent"

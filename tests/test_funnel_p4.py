@@ -28,8 +28,8 @@ import pytest
 from core.application.chat.intent_funnel import funnel
 from core.application.chat.intent_funnel.contract import (
     REASON_KIND_DISABLED,
+    REASON_NO_CANDIDATE,
     REASON_REGISTRY_UNAVAILABLE,
-    REASON_TOOL_INTENT_REJECT,
 )
 from core.application.chat.intent_funnel.registry import content_fingerprint
 from core.application.chat.intent_funnel.registry.entry import (
@@ -193,7 +193,7 @@ async def test_preview_abstains_with_the_reason_and_no_route(monkeypatch):
     deps = _wire(monkeypatch, view=view)
     res = await funnel.preview("完全无关的一句话", deps=deps)
     assert res["final_route"] == "agent"
-    assert res["fallback_reason"] == REASON_TOOL_INTENT_REJECT
+    assert res["fallback_reason"] == REASON_NO_CANDIDATE
     assert "route" not in res
 
 
@@ -306,7 +306,7 @@ async def test_abstain_writes_the_fallback_event(monkeypatch):
     out = await funnel.route(_ctx("无关句子"), deps=deps, requirements=requirements)
     assert out is requirements
     assert rows[0].final_route == "agent"
-    assert rows[0].fallback_reason == REASON_TOOL_INTENT_REJECT
+    assert rows[0].fallback_reason == REASON_NO_CANDIDATE
 
 
 async def test_event_write_failure_never_sinks_the_turn(monkeypatch):
@@ -354,7 +354,7 @@ def _action(view, *, kind=KIND_ACTION, tool="create_folder"):
     }
 
 
-def _exec_req(action, run_tool, session_factory):
+def _exec_req(action, run_tool, session_factory, *, roster=None):
     from core.application.chat.execution_plan import ExecutionPlan, PlanKind
     from core.application.chat.executors.action import ActionExecutor
     from core.application.chat.executors.base import ChatDeps, TurnRequest
@@ -364,14 +364,27 @@ def _exec_req(action, run_tool, session_factory):
             pass
 
     ctx = types.SimpleNamespace(user_text=MSG, session_memory=_SM(), history=[])
+    # the executor's tool-existence/schema truth is deps.agent.runtime.schemas()
+    # (ruling 2026-09-26); the unit world fakes it — default carries create_folder.
+    schemas = lambda: (_DEFAULT_ROSTER if roster is None else roster)
+    kernel = types.SimpleNamespace(
+        runtime=types.SimpleNamespace(schemas=schemas))
     deps = ChatDeps(
-        session_factory=session_factory, queue=None, drive=None, agent=None,
+        session_factory=session_factory, queue=None, drive=None, agent=kernel,
         llm=None, embedder=None, viewer=None, new_approval_bridge=None,
         persist_turn_meta=None, log_usage=None, resolve_research=None,
         run_tool=run_tool,
     )
     plan = ExecutionPlan(kind=PlanKind.ACTION, action=action)
     return ActionExecutor(), TurnRequest(ctx=ctx, deps=deps, plan=plan)
+
+
+_DEFAULT_ROSTER = [
+    {"name": "create_folder", "description": "d",
+     "parameters": {"type": "object",
+                    "properties": {"name": {"type": "string", "maxLength": 120}},
+                    "required": ["name"]}},
+]
 
 
 async def _patch_view(monkeypatch, view):
@@ -428,6 +441,49 @@ async def test_capability_disabled_mid_air_is_terminal_stale(monkeypatch):
 
     ex, req = _exec_req(_action(after), run_tool, session_factory=None)
     assert await ex._dispatch(req) == _TERMINAL_STALE_ROUTE
+
+
+async def test_tool_missing_from_runtime_roster_is_terminal_stale(monkeypatch):
+    """Ruling 2026-09-26 (point 3): the drift check runs against the LIVE
+    ToolRuntime roster, not the legacy DIRECT_TOOLS table — a stamped route
+    whose tool has vanished from the runtime dies pre-commit."""
+    _open(monkeypatch, mode="on")
+    view = _view([_entry("cap-a", corpus=(MSG,))])
+    await _patch_view(monkeypatch, view)
+    calls = []
+
+    async def run_tool(tool, args, ctx):
+        calls.append(tool)
+        return {"ok": True, "output": "done"}
+
+    ex, req = _exec_req(_action(view), run_tool, session_factory=None, roster=[])
+    from core.application.chat.executors.action import _TERMINAL_STALE_ROUTE
+    assert await ex._dispatch(req) == _TERMINAL_STALE_ROUTE
+    assert calls == []
+
+
+async def test_roster_tool_absent_from_direct_tools_still_dispatches(monkeypatch):
+    """…and the converse: a capability bound to a runtime tool the legacy
+    DIRECT_TOOLS table never listed dispatches fine — the roster is the truth
+    and DIRECT_TOOLS was never expanded for this to work."""
+    _open(monkeypatch, mode="on")
+    from core.application.chat.intent_funnel.registry.plugins import DIRECT_TOOLS
+    assert "list_documents" not in DIRECT_TOOLS
+    view = _view([_entry("cap-a", corpus=(MSG,), tool="list_documents")])
+    await _patch_view(monkeypatch, view)
+    calls = []
+
+    async def run_tool(tool, args, ctx):
+        calls.append(tool)
+        return {"ok": True, "output": "done"}
+
+    action = dict(_action(view, tool="list_documents"), args={})
+    roster = [{"name": "list_documents", "description": "d",
+               "parameters": {"type": "object", "properties": {},
+                              "required": []}}]
+    ex, req = _exec_req(action, run_tool, session_factory=None, roster=roster)
+    assert await ex._dispatch(req) == "done"
+    assert calls == ["list_documents"]
 
 
 async def test_private_gate_flipped_off_kills_dispatch(monkeypatch):

@@ -56,9 +56,9 @@ class TurnFacts:
 # ── 8.10 fallback reason codes (prefixed, never bare words) ───────────────────────
 # The new cascade's ONLY downward exits. Any of these on a funnel_trace line means
 # the turn went to the Agent with the user text BYTE-IDENTICAL (8.10).
-# Retired on the new lane (Action-Contract ruling 2026-09-25): an empty
-# candidate set must still pass ToolIntentModel, so the funnel never emits this
-# reason any more. Constant kept so archived traces/A-B rows stay decodable.
+# In service again per the 2026-09-26 ruling (supersedes 2026-09-25): an empty
+# model-facing candidate set short-circuits to the Agent — the single hop is
+# spent only when there is at least one card to select from.
 REASON_NO_CANDIDATE = "NO_CANDIDATE"
 REASON_RECALL_TIMEOUT = "RECALL_TIMEOUT"
 REASON_RECALL_UNAVAILABLE = "RECALL_UNAVAILABLE"

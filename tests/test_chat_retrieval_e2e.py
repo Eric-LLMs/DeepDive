@@ -82,9 +82,25 @@ class FakePort:
         yield {"type": "usage", "data": {"total_tokens": 2}}
 
 
+class _Runtime:
+    """The live ToolRuntime double — since the 2026-09-26 ruling the executor's
+    tool-existence/schema truth is deps.agent.runtime.schemas(), so the fake
+    kernel must expose the roster exactly like AgentKernel does."""
+
+    def schemas(self):
+        return [
+            {"name": "create_folder", "description": "d",
+             "parameters": {"type": "object",
+                            "properties": {"name": {"type": "string", "maxLength": 120},
+                                           "parent_path": {"type": "string"}},
+                            "required": ["name"]}},
+        ]
+
+
 class _Agent:
     def __init__(self, port):
         self.loop = SimpleNamespace(llm=port)
+        self.runtime = _Runtime()
         self.agent_stream_calls = 0
         self.user_texts: list[str] = []
         self.contexts: list[dict | None] = []

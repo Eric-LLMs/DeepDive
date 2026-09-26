@@ -369,7 +369,7 @@ def test_live_view_none_when_tables_empty(client, monkeypatch):
     assert out["fingerprint"] is None and out["capabilities"] == []
 
 
-def test_tool_schemas_projection_flags_direct_bindings(client, monkeypatch):
+def test_tool_schemas_projection_is_the_pure_roster(client, monkeypatch):
     from api import deps
 
     fake_schema = {"name": "create_folder", "description": "d",
@@ -380,7 +380,10 @@ def test_tool_schemas_projection_flags_direct_bindings(client, monkeypatch):
         lambda: SimpleNamespace(runtime=SimpleNamespace(
             schemas=lambda: [fake_schema])))
     out = client.get("/admin/registry/tool-schemas").json()["tools"]
-    assert out[0]["name"] == "create_folder" and out[0]["in_direct_tools"] is True
+    # pure ToolRuntime.schemas() projection (ruling 2026-09-26): the legacy
+    # DIRECT_TOOLS cross-check flag is retired — the roster is the truth.
+    assert out[0]["name"] == "create_folder"
+    assert "in_direct_tools" not in out[0]
 
 
 # ── catalog (inventory -> capability row admission) ───────────────────────────────
@@ -428,7 +431,9 @@ def test_catalog_create_is_born_disabled(client, audits, writes, monkeypatch):
     e = captured["entry"]
     assert e.capability_id == "cap-create-folder"
     assert e.enabled is False and e.status == "disabled"
-    # parameters default to the mechanical spec.arg_schema projection
+    # parameters default to the mechanical ToolRuntime roster projection (the
+    # 120 bound lives on the runtime schema; it happens to equal the legacy
+    # L0 spec, which is now only a value reference, never the truth)
     assert e.parameters["name"]["max_len"] == DIRECT_TOOLS["create_folder"].arg_schema["name"]
     assert audits[0]["action"] == "catalog_create"
 
@@ -441,7 +446,7 @@ def test_catalog_create_refuses_non_executable_binding(client, writes, monkeypat
     monkeypatch.setattr(ra, "get_catalog", fake_catalog)
     r = client.post("/admin/registry/catalog/x/create", json={})
     assert r.status_code == 409
-    assert "DIRECT_TOOLS" in r.json()["detail"]
+    assert "ToolRuntime" in r.json()["detail"]
 
 
 # ── history + rollback (restore + re-embed) ───────────────────────────────────────

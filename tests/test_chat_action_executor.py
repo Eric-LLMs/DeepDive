@@ -40,12 +40,25 @@ def _req(action, run_tool):
         ],
     )
     deps = ChatDeps(
-        session_factory=None, queue=None, drive=None, agent=None, llm=None,
+        session_factory=None, queue=None, drive=None, agent=_FAKE_KERNEL, llm=None,
         embedder=None, viewer=None, new_approval_bridge=None, persist_turn_meta=None,
         log_usage=None, resolve_research=None, run_tool=run_tool,
     )
     plan = ExecutionPlan(kind=PlanKind.ACTION, action=action)
     return TurnRequest(ctx=ctx, deps=deps, plan=plan)
+
+
+# the roster the executor gates on is deps.agent.runtime.schemas() (ruling
+# 2026-09-26: the live ToolRuntime is the ONE tool existence/schema truth) —
+# the unit world fakes exactly the one tool its cases dispatch.
+_FAKE_KERNEL = SimpleNamespace(runtime=SimpleNamespace(schemas=lambda: [
+    {"name": "create_folder", "description": "d",
+     "parameters": {
+         "type": "object",
+         "properties": {"name": {"type": "string", "maxLength": 120},
+                        "parent_path": {"type": "string"}},
+         "required": ["name"]}},
+]))
 
 
 GOOD = {"tool": "create_folder", "args": {"name": "x"}}
@@ -87,10 +100,29 @@ async def test_malformed_action_escalates_and_never_touches_the_seam():
         calls.append(a)
         return {"ok": True}
 
-    req = _req({"tool": "rm_rf", "args": {}}, run_tool)
+    # a roster tool with a missing REQUIRED slot is the user-input class: the
+    # Agent owns the clarification (the roster itself says the tool exists).
+    req = _req({"tool": "create_folder", "args": {}}, run_tool)
     with pytest.raises(EscalateToAgent, match="schema"):
         await _drain(req)
     assert calls == []  # pre-execution failure: the seam was NEVER entered
+
+
+async def test_certified_tool_missing_from_roster_is_terminal_integrity():
+    # (ruling 2026-09-26) tool existence is a C2 system-integrity fact: a turn
+    # naming a tool the live roster does not register terminates honestly —
+    # the Agent must never re-plan around a missing executable.
+    calls = []
+
+    async def run_tool(*a):
+        calls.append(a)
+        return {"ok": True}
+
+    req = _req({"tool": "rm_rf", "args": {}}, run_tool)
+    events = await _drain(req)
+    assert calls == []
+    assert [e["type"] for e in events] == ["content", "done"]
+    assert "not available" in events[0]["data"].lower()
 
 
 async def test_seam_not_wired_terminates_as_integrity_never_escalates():

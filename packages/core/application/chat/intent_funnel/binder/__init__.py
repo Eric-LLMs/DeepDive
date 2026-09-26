@@ -109,22 +109,38 @@ def bind_arguments(tool_binding: str, text: str, ctx, *,
     return (extract or spec.extract)((text or "").strip(), ctx)
 
 
-def validate_action(tool: str, args: dict) -> dict:
-    """Final schema gate (executor, BEFORE the seam): the tool must be on the allowlist,
-    every required slot present, str, stripped, within length bounds. Raises
-    :class:`ActionSchemaError` — a pre-execution, side-effect-free failure the executor
-    may safely escalate (the Agent owns the clarification)."""
-    spec = DIRECT_TOOLS.get(tool)
-    if spec is None:
-        raise ActionSchemaError(f"tool not on the direct-call allowlist: {tool!r}")
+def validate_action(tool: str, args: dict, *,
+                    tool_schemas: dict[str, dict[str, dict]]) -> dict:
+    """Final schema gate (executor, BEFORE the seam): the tool must exist on the
+    LIVE runtime roster, every REQUIRED slot present, str, stripped, within
+    length bounds. Raises :class:`ActionSchemaError` — a pre-execution,
+    side-effect-free failure the executor may safely escalate (the Agent owns
+    the clarification).
+
+    ``tool_schemas`` is the caller's ``ToolRuntime.schemas()`` projection
+    (tool -> {slot: {"max_len": int, "required": bool}}, max_len 0 = the schema
+    states no bound). Ruling 2026-09-26: the runtime roster is the ONE
+    tool-existence/schema truth — the legacy L0 ``DIRECT_TOOLS`` table is
+    never consulted here, so routing can never validate against one table and
+    execute against another."""
+    schema = tool_schemas.get(tool)
+    if schema is None:
+        raise ActionSchemaError(f"tool not in the live ToolRuntime roster: {tool!r}")
     if not isinstance(args, dict):
         raise ActionSchemaError("args must be a mapping")
     out: dict[str, str] = {}
-    for slot, max_len in spec.arg_schema.items():
+    for slot, spec in schema.items():
+        required = bool((spec or {}).get("required", True))
+        max_len = int((spec or {}).get("max_len") or 0)
         val = args.get(slot)
-        if not isinstance(val, str) or not (val := val.strip()):
-            raise ActionSchemaError(f"missing slot: {slot}")
-        if len(val) > max_len:
+        if val is None or (isinstance(val, str) and not val.strip()):
+            if required:
+                raise ActionSchemaError(f"missing slot: {slot}")
+            continue
+        if not isinstance(val, str):
+            raise ActionSchemaError(f"slot not a string: {slot}")
+        val = val.strip()
+        if max_len and len(val) > max_len:
             raise ActionSchemaError(f"slot too long: {slot} (>{max_len})")
         out[slot] = val
     return {"tool": tool, "args": out}

@@ -7,8 +7,9 @@ content marker make a stale corpus impossible). What the old lifecycle
 guaranteed is re-established here as write discipline:
 
 * every mutation is gated by ``validate_entries`` against the LIVE
-  ``ToolRuntime.schemas()`` roster projection (intent is never authorization —
-  DIRECT_TOOLS stays a runtime concern, this router writes nothing to it);
+  ``ToolRuntime.schemas()`` roster projection (intent is never authorization;
+  the roster is the ONE tool existence/schema truth since the 2026-09-26
+  ruling — the legacy L0 ``DIRECT_TOOLS`` table is not consulted here);
 * every accepted mutation first appends the pre-change content to
   ``registry_versions`` (history only; rollback = restore a snapshot +
   re-embed) and is audit-recorded;
@@ -60,7 +61,6 @@ from core.application.chat.intent_funnel.registry import (
 )
 from core.application.chat.intent_funnel.registry.catalog import get_catalog, list_catalog
 from core.application.chat.intent_funnel.registry.entry import QueryRecord
-from core.application.chat.intent_funnel.registry.plugins import DIRECT_TOOLS
 from core.application.chat.intent_funnel.registry.store import CAPABILITY_PATCH_FIELDS
 from core.infrastructure.db import SessionLocal
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -215,7 +215,6 @@ async def get_tool_schemas(_: AuthAdmin = Depends(require_admin)) -> dict:
             "name": s["name"],
             "description": s.get("description", ""),
             "parameters": s.get("parameters", {}),
-            "in_direct_tools": s["name"] in DIRECT_TOOLS,
         }
         for s in sorted(schemas, key=lambda x: x["name"])
     ]}
@@ -245,7 +244,7 @@ async def _catalog_view() -> dict:
             current_route = "agent"
         actions.append({
             **r,
-            "bindable": r["tool_binding"] in DIRECT_TOOLS,
+            "bindable": r["tool_binding"] in _roster(),
             "registered": c is not None,
             "capability_id": c.capability_id if c else None,
             "registry_status": c.status if c else None,
@@ -268,7 +267,7 @@ async def _catalog_view() -> dict:
             "description": c.description, "tool_binding": c.tool_binding,
             "route": "agent", "implementation_ref": "(no catalog row)",
             "status": "user_facing",
-            "bindable": c.tool_binding in DIRECT_TOOLS,
+            "bindable": c.tool_binding in _roster(),
             "registered": True, "capability_id": c.capability_id,
             "registry_status": c.status, "registry_enabled": c.enabled,
             "intent_kind": c.intent_kind,
@@ -295,16 +294,18 @@ async def post_catalog_create(
     """Create the capability row from a Catalog entry — the admission step.
     The row is born DISABLED with an empty corpus: it becomes routable only
     after its Standard queries (zh + en) are curated and it is enabled.
-    Parameters default to the mechanical ``spec.arg_schema`` projection."""
+    Parameters default to the mechanical projection of the LIVE runtime tool
+    schema (``ToolRuntime.schemas()`` — the one existence/schema truth since
+    the 2026-09-26 ruling; a tool absent from the roster is not executable)."""
     me = await get_catalog(action_key, session_factory=SessionLocal)
     if me is None:
         raise HTTPException(status_code=404, detail=f"unknown action {action_key!r}")
-    spec = DIRECT_TOOLS.get(me["tool_binding"])
-    if spec is None:
+    slots = _roster().get(me["tool_binding"])
+    if slots is None:
         raise HTTPException(
             status_code=409,
-            detail=f"tool {me['tool_binding']!r} is not an executable DIRECT_TOOLS "
-                   "binding yet — Registry cannot invent executables. Runtime "
+            detail=f"tool {me['tool_binding']!r} is not a registered ToolRuntime "
+                   "executable — Registry cannot invent executables. Runtime "
                    "admission of this tool is a separate task.",
         )
     if await get_capability(f"cap-{action_key}", session_factory=SessionLocal) is not None:
@@ -314,9 +315,9 @@ async def post_catalog_create(
             "type": "string",
             "description": f"{slot} argument of {me['tool_binding']}",
             "required": True,
-            "max_len": int(bound),
+            **({"max_len": bound} if bound > 0 else {}),
         }
-        for slot, bound in (spec.arg_schema or {}).items()
+        for slot, bound in slots.items()
     }
     entry = CapabilityEntry(
         capability_id=f"cap-{action_key}",

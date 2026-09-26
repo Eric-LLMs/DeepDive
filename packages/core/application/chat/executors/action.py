@@ -7,9 +7,12 @@ unnecessary flow — the seam calls the SAME ``ToolRuntime.execute`` the Agent w
 
 Stage order encodes the side-effect boundary isolation (Phase 5 hard constraint 1):
 
-  1. schema gate (:func:`validate_action`) — pre-execution, side-effect-free; a
-     malformed request escalates and the Agent owns the clarification; a
-     routing-stamped ``binding_integrity`` marker (stage-2 C2) terminates first;
+  1. existence + schema gate (live ``ToolRuntime.schemas()`` roster, then
+     :func:`validate_action`) — pre-execution, side-effect-free; a tool the roster
+     does not register is a C2 TERMINAL (the Agent never re-plans around a system
+     fault); a malformed REQUEST (argument shape) escalates and the Agent owns the
+     clarification; a routing-stamped ``binding_integrity`` marker (stage-2 C2)
+     terminates first;
   2. seam presence — not wired ⇒ escalate (LLM fallback intact, capability unchanged);
   3. the seam call is the SIDE-EFFECT BOUNDARY. Before it: anything the seam can PROVE
      did not execute raises :class:`ActionPreflightFailure` ⇒ escalate. After the tool
@@ -30,7 +33,6 @@ import logging
 from collections.abc import AsyncIterator
 
 from core.application.chat.actions import (
-    DIRECT_TOOLS,
     ActionIntegrityFailure,
     ActionPreflightFailure,
     ActionSchemaError,
@@ -68,6 +70,29 @@ _TERMINAL_STALE_ROUTE = (
 )
 
 
+def _tool_roster(deps) -> dict[str, dict[str, dict]] | None:
+    """tool -> {slot: {"max_len": int, "required": bool}} projected from the
+    live ``ToolRuntime.schemas()`` — the one tool existence/schema truth since
+    the 2026-09-26 ruling (max_len 0 = the schema states no length bound). A
+    schema with no ``required`` list is treated as fully required (fail
+    closed). None when no runtime is reachable — callers fail closed honestly."""
+    runtime = getattr(getattr(deps, "agent", None), "runtime", None)
+    if runtime is None:
+        return None
+    out: dict[str, dict[str, dict]] = {}
+    for s in runtime.schemas():
+        params = s.get("parameters") or {}
+        props = params.get("properties") or {}
+        req = params.get("required")
+        required_all = req is None
+        out[str(s["name"])] = {
+            str(k): {"max_len": int((v or {}).get("maxLength") or 0),
+                     "required": bool(required_all or (k in (req or [])))}
+            for k, v in props.items()
+        }
+    return out
+
+
 class ActionExecutor(DirectExecutor):
     kind = PlanKind.ACTION
 
@@ -77,11 +102,17 @@ class ActionExecutor(DirectExecutor):
         action = req.plan.action or {}
         tool, args = action.get("tool"), action.get("args")
 
+        # Tool existence/schema truth (ruling 2026-09-26): the LIVE
+        # ``ToolRuntime.schemas()`` roster — the legacy DIRECT_TOOLS table is
+        # no longer consulted anywhere on the dispatch path.
+        roster = _tool_roster(req.deps)
+
         # 0. Route/execute TOCTOU re-validation (8.9). The funnel-certified turn
         #    stamps ``funnel_registry_version`` — the Registry content fingerprint
         #    of the live view — and re-validates against the active view: same
         #    fingerprint, capability still active and enabled, same tool binding,
-        #    allowlisted tool, and the kind gate still open (a mid-turn flip to
+        #    tool present on the live ToolRuntime roster, and the kind gate still
+        #    open (a mid-turn flip to
         #    OFF must not execute a widened kind — 入表≠开闸 holds at dispatch
         #    too). Any drift is C3 TERMINAL: a routed turn never executes on
         #    blind trust. (QIR retirement, migration 0014: the legacy
@@ -102,7 +133,7 @@ class ActionExecutor(DirectExecutor):
             if (
                 view is None or view.fingerprint != str(funnel_fp)
                 or entry is None or not entry.enabled or entry.status != STATUS_ACTIVE
-                or entry.tool_binding != tool or tool not in DIRECT_TOOLS
+                or entry.tool_binding != tool or tool not in (roster or {})
                 or not funnel_mod.kind_enabled(entry.intent_kind)
             ):
                 logger.warning(
@@ -123,9 +154,25 @@ class ActionExecutor(DirectExecutor):
             )
             return _TERMINAL_INTEGRITY
 
+        # 0.6 Tool existence on the LIVE roster is a C2 system-integrity fact, not
+        #     a user-input problem: a certified turn naming a tool the runtime does
+        #     not register means the route promised a capability the system lacks —
+        #     honest terminal, seam never entered, the Agent must NOT re-plan around
+        #     a system fault (same doctrine as the binding-integrity marker above).
+        #     The legacy DIRECT_TOOLS table is not consulted anywhere on this path.
+        if roster is not None and str(tool or "") not in roster:
+            logger.error("chat.action integrity: tool=%s not on the live ToolRuntime "
+                         "roster", tool)
+            return _TERMINAL_INTEGRITY
+
         # 1. final schema gate, BEFORE the seam — malformed ⇒ nothing executed.
+        #    Argument-shape problems are the user-input class: escalate and let the
+        #    Agent clarify. The roster is the schema truth (ruling 2026-09-26); a
+        #    missing roster fails closed through the schema error.
         try:
-            validated = validate_action(str(tool or ""), args if isinstance(args, dict) else {})
+            validated = validate_action(str(tool or ""),
+                                        args if isinstance(args, dict) else {},
+                                        tool_schemas=roster or {})
         except ActionSchemaError as exc:
             raise EscalateToAgent(f"action schema: {exc}") from exc
 

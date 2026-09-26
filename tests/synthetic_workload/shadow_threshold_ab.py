@@ -9,10 +9,9 @@ Method (2026-09-25, "full replay" ruling + 0.58 anchor):
     PRODUCTION ENTRY ``funnel.cascade_shadow`` (Registry -> Matcher -> Recall
     raw -> floor t -> ToolIntentModel -> Binder -> STOP). No reuse: even when
     the candidate set equals the baseline's, the real model is called again
-    (this also exposes model non-determinism honestly). Action Detection is
-    UNCONDITIONAL since the 2026-09-25 ruling — an empty candidate set still
-    reaches the model (it can only answer NONE), so every row costs one live
-    call and NO_CANDIDATE never fires;
+    (this also exposes model non-determinism honestly). Per the 2026-09-26
+    ruling an EMPTY model-facing candidate set short-circuits to NO_CANDIDATE
+    BEFORE the hop — rows whose set is empty at threshold t cost zero calls;
   * thresholds sweep INDEPENDENTLY, one metric table per t (the 0.58 column is
     the baseline's real operating point); the production gate 0.82 and the
     dataset are never touched.
@@ -81,7 +80,8 @@ def grade_binary(expected: dict, actual: dict) -> str | None:
 
 # ── one (turn, t): FULL production replay ─────────────────────────────────────────
 
-async def replay_one(turn: dict, t: float, deps, funnel_mod, top_k: int) -> dict:
+async def replay_one(turn: dict, t: float, deps, funnel_mod,
+                     top_k: int | None = None) -> dict:
     res = await funnel_mod.cascade_shadow(
         _ctx_for(turn), deps=deps,
         **dict(R.SHADOW_RECALL, model_candidate_floor=t))
@@ -174,15 +174,12 @@ def _ctx_for(turn: dict):
 
 async def run_ab(baseline: list[dict], deps, *, funnel_mod, margin: float,
                  buckets=AB_BUCKETS) -> list[dict]:
-    from core.config import settings
-
-    top_k = settings.chat_funnel_top_k
     out: list[dict] = []
     t0 = time.monotonic()
     n_model = n_short = 0
     for turn in baseline:
         for t in buckets:
-            row = await replay_one(turn, t, deps, funnel_mod, top_k)
+            row = await replay_one(turn, t, deps, funnel_mod)
             row["grade_exact"] = grade_exact(row["expected"], row["actual"])
             row["grade_binary"] = grade_binary(row["expected"], row["actual"])
             row["cause"] = attribute(row, margin)
@@ -194,7 +191,7 @@ async def run_ab(baseline: list[dict], deps, *, funnel_mod, margin: float,
                   f"({n_model} model calls) {time.monotonic()-t0:.0f}s", flush=True)
     print(f"AB done: {len(out)} rows, {n_model} real model calls, "
           f"{n_short} rows without a model call "
-          f"(expected 0 — Action Detection is unconditional), "
+          f"(NO_CANDIDATE short-circuits + gated-off turns, ruling 2026-09-26), "
           f"in {time.monotonic()-t0:.0f}s", flush=True)
     return out
 
@@ -389,9 +386,10 @@ def summarize(rows: list[dict]) -> dict:
             "key_cases": _key_case_track(rows),
             "sessions_by_threshold": _sessions(rows),
             "note": ("every row is a REAL production cascade_shadow replay at "
-                     "its threshold (no reuse; Action Detection is UNCONDITIONAL "
-                     "per the 2026-09-25 ruling — empty candidate sets reach the "
-                     "model and can only answer NONE); ABSTAIN/AMBIGUOUS are "
+                     "its threshold (no reuse; per the 2026-09-26 ruling an "
+                     "empty candidate set short-circuits to NO_CANDIDATE before "
+                     "the hop, so only rows with at least one card pay a live "
+                     "call); ABSTAIN/AMBIGUOUS are "
                      "held out of the binary and never relabelled; WRONG_CAP "
                      "counts in both FP and FN. This measures model "
                      "discrimination under benchmark 8s/10s guards; production "
@@ -435,9 +433,9 @@ async def _main() -> int:
         "ab_run": out.name, "baseline_run": base_dir.name,
         "dataset_version": "v1-pilot",
         "policy": ("FULL replay per (turn,threshold) through funnel.cascade_shadow "
-                   "— no reuse; Action Detection unconditional (2026-09-25 "
-                   "ruling): expected model calls == rows, the empty-set "
-                   "short-circuit is retired"),
+                   "— no reuse; empty-set NO_CANDIDATE short-circuit (2026-09-26 "
+                   "ruling): model calls == rows with a non-empty set at t; "
+                   "empty_set_short_circuits counts the zero-hop rows"),
         "buckets": [round(b, 2) for b in AB_BUCKETS],
         "model_calls": sum(1 for r in rows if r["model_called"]),
         # kept as EVIDENCE, not policy: under the new contract this must be 0;
@@ -452,8 +450,7 @@ async def _main() -> int:
                 settings.chat_funnel_timeout_seconds,
             "note": "benchmark-only runtime env overrides; production defaults untouched"},
         "production_settings_untouched": {
-            "chat_funnel_min_score": settings.chat_funnel_min_score,
-            "chat_funnel_top_k": settings.chat_funnel_top_k},
+            "chat_funnel_min_score": settings.chat_funnel_min_score},
         "dataset_hashes": {p.name: R.sha16(p)
                            for p in sorted((R.DATA / "v1-pilot").iterdir())},
         "baseline_hashes": {p.name: R.sha16(p)

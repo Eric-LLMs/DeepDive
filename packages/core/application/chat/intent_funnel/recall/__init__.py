@@ -198,9 +198,18 @@ async def recall(index, query: str, *, embedder,
                            "in-process cosine over the live corpus rows", exc)
 
     # In-process lane: exact cosine over the SAME rows load_index read
-    # (test doubles and ANN faults land here; two paths, no merge).
+    # (test doubles and ANN faults land here; two paths, no merge). A dim
+    # mismatch between the query vector and any corpus row is a PROFILE/DIM
+    # CONFIG FAULT, not a business result: silently truncating (zip) would
+    # turn it into garbage scores or a fake-empty set that exits as
+    # NO_CANDIDATE. Raise instead — the funnel maps it to RECALL_UNAVAILABLE.
     hits: list[Candidate] = []
     for c in getattr(index, "corpus", ()):
+        if len(c.vector) != len(qvec):
+            raise RuntimeError(
+                f"recall: dim mismatch — query {len(qvec)} vs corpus row "
+                f"{c.query_id} ({c.capability_id}) {len(c.vector)}; embedder "
+                "profile and stored vectors must share one dimension")
         hits.append(Candidate(
             capability_id=c.capability_id, score=round(_cosine(qvec, c.vector), 6),
             matched_example=c.query, origin="recall", query_kind=c.kind,

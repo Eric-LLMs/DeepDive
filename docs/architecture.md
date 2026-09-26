@@ -4586,10 +4586,14 @@ outcome and its location; in particular the Agent is never a recovery channel fo
 **Unified execution — one waterfall.** Fast paths hold no execution authority. An ACTION /
 COMPOSITE dispatch traverses the *same* `ToolRuntime.execute` the Agent would — pre-execute ASK →
 approval bridge → monotonic sandbox / source-policy guards → the real tool body — through the
-`_run_tool` seam injected into `ChatDeps`. `DIRECT_TOOLS` is the single allowlist shared by L0
-certification, argument binding, and every Registry write (a capability whose `tool_binding` is
-not an existing entry is **rejected at the validation gate** — the funnel cannot invent
-executables).
+`_run_tool` seam injected into `ChatDeps`. **Tool existence/schema truth is the
+live `ToolRuntime.schemas()` roster** (ruling 2026-09-26): the Registry write
+gate, the executor's final schema gate, and the pre-dispatch TOCTOU re-check all
+consult it — a capability whose `tool_binding` is not in the roster is
+**rejected at the validation gate** (the funnel cannot invent executables), and
+the roster is never mirrored into a second allowlist. The legacy L0
+`DIRECT_TOOLS` table survives only as the L0 certification/extractor binding
+lane; it is not consulted by any existence/schema check.
 
 **Commit Point.** The first user-visible content delta locks the channel. `EscalateToAgent` is
 legal only before it; after it an error can only terminate the stream with a standardized event —
@@ -4977,8 +4981,12 @@ Cascade body (`_run_nodes`, one wall-clock budget `chat_funnel_timeout_seconds`)
 
 1. **Registry + Index first** (live tables ARE the runtime truth, §25.5): read the
    fingerprint-cached live view; no capability rows → `REGISTRY_UNAVAILABLE` exit.
-   On a Matcher MISS the Recall corpus index loads; an empty/unembedded corpus →
-   `RECALL_UNAVAILABLE` exit. (A HIT skips Recall but still spends the model call.)
+   On a Matcher MISS the Recall corpus index loads; an empty/unembedded corpus or
+   any Recall system fault (embedder error, embedder/corpus dim mismatch, a
+   pgvector failure the in-process lane cannot survive either) →
+   `RECALL_UNAVAILABLE` exit — faults and business results never share a reason
+   code (ruling 2026-09-26).
+   (A HIT skips Recall but still spends the model call.)
 2. **Matcher** (Node 1): **exact-only** normalized lookup over the enabled
    Standard + Similar query rows (`intent_corpus`); the legacy `patterns`/`aliases`
    columns are INERT storage — the Matcher never reads them (Action-Contract ruling
@@ -4994,11 +5002,15 @@ Cascade body (`_run_nodes`, one wall-clock budget `chat_funnel_timeout_seconds`)
    (Node 2) runs only when the table missed: **two independent vector searches**
    (Standard rows + Similar rows) against ONE query embedding — no per-capability
    merge, no dedup; every hit ≥ `chat_funnel_min_score` is KEPT with provenance
-   (quality gate, not a selector). An EMPTY candidate set still reaches the
-   model — `NO_CANDIDATE` is retired (2026-09-25): the honest exit of "nothing on
-   the table" is the model's own `NONE` → `TOOL_INTENT_REJECT`. The legacy
+   (quality gate, not a selector; no width cap — `chat_funnel_top_k` is deleted,
+   ruling 2026-09-26). An EMPTY model-facing candidate set short-circuits to the
+   Agent as `NO_CANDIDATE` BEFORE any model hop (ruling 2026-09-26, superseding
+   2026-09-25): with no Matcher card and no Recall hit at/above the gate there is
+   nothing to select from and the hop is not spent; `TOOL_INTENT_REJECT` now
+   always means the model WAS called and answered `NONE`. The legacy
    direct-certification special path (Matcher HIT skipping the model) is deleted
-   — both lanes are structurally identical, one model call each.
+   — every lane that reaches the model is structurally identical, one model
+   call each.
 4. **ToolIntentModel** (Node 3, `tool_intent/`): the ONE model call of the turn
    selects the capability *and* drafts its arguments. Verdict gate
    (`_verdict_from_reply`): `NONE`/empty → `REJECT`; a capability **outside the
@@ -5091,6 +5103,157 @@ diverges from its Standard parent, a duplicate Standard for one (capability, lan
 a negative that deterministically collides with the corpus. A kind flip (`enabled`,
 `status`, per-kind switch) is the only emergency stop — routing abstains, an ordinary
 Agent turn, no deploy.
+
+#### 25.5.1 Live-table schema reference (migration 0014)
+
+Six tables carry the whole Registry. The first four ARE the runtime truth; the
+last two are history the runtime never reads.
+
+**`capabilities`** — one row per capability (intent information, no corpus):
+
+| Column | Type / constraint | Meaning |
+|---|---|---|
+| `id` | uuid PK | surrogate key |
+| `capability_id` | text UNIQUE NOT NULL | business identity, `cap-<action-key>` |
+| `tool_binding` | text NOT NULL | executable name; must be in the runtime roster or the write gate refuses |
+| `description` | text | card description |
+| `patterns` / `aliases` | jsonb | INERT legacy columns (never dropped from the DB); no node reads them — new writes leave them empty |
+| `request_query_examples` | jsonb | renamed from `examples` by 0014; card context ONLY, never embedded, never match data |
+| `parameters` | jsonb | canonical schema `{name: {type, description, required, max_len?}}`; validated against the LIVE ToolRuntime schemas on the admin write path (no double truth) |
+| `arg_slots` | jsonb | slot → source declaration, incl. `plugin:<name>` |
+| `permissions` / `execution_policy` | text | policy reference (`auto` default) |
+| `intent_kind` | text, server_default `action` | `action` \| `private` \| `web` (P3, §25.11) |
+| `enabled` | bool | disabled ⇒ excluded from routing at EVERY node (predicates + re-validation) |
+| `status` | text | `active` \| `disabled` \| `deprecated` (+ `replacement_capability_id`) |
+| `row_version` | int | optimistic-concurrency token |
+| `created_at` / `updated_at` | timestamptz | `updated_at` feeds the coherence marker below |
+
+**`capability_standard_queries`** — the canonical sentence, one per
+(capability, language):
+
+| Column | Type / constraint |
+|---|---|
+| `id` | uuid PK |
+| `capability_id` | text FK → `capabilities.capability_id`, NOT NULL |
+| `query` | text NOT NULL |
+| `language` | text CHECK IN (`zh`,`en`) — MATERIALIZED on write by the frozen rule (contains a Han char U+4E00–U+9FFF → `zh`, else `en`); no languages table |
+| `embedding` | `vector(1024)`, NULL until the out-of-band backfill; every recall predicate filters `IS NOT NULL` |
+| `enabled` / `position` | soft switch / stable ordering |
+| `created_at` / `updated_at` | |
+
+Constraints & indexes: **UNIQUE (capability_id, language)** (exactly one
+Standard per language per capability — the 36-row corpus is 18 zh + 18 en);
+HNSW `vector_cosine_ops` on `embedding`.
+
+**`capability_similar_queries`** — one synonym sentence per row:
+
+| Column | Type / constraint |
+|---|---|
+| `id` | uuid PK |
+| `standard_query_id` | uuid FK → `capability_standard_queries.id`, NOT NULL — **deliberately NO `capability_id` column** (A3: a Similar belongs to a Capability ONLY through its Standard; a second, drift-prone relation is forbidden) |
+| `query` / `embedding` / `enabled` / `position` | as in Standard |
+| `language` | CHECK IN (`zh`,`en`); the write layer refuses any row whose derived language diverges from its Standard parent |
+
+Indexes: HNSW `vector_cosine_ops` on `embedding`; btree on `standard_query_id`.
+Current corpus: 514 rows (266 zh / 248 en), all embedded.
+
+**`capability_negatives`** — contrast sentences (`id / capability_id FK / query /
+language / enabled / position / timestamps`). **No embedding column on purpose**:
+negatives never participate in Recall — card boundary context only, and the write
+gate refuses any negative that deterministically collides with the corpus.
+
+**`registry_versions`** — write-time history ONLY (25 rows as of the 0014
+cutover): `version` bigint PK (max+1, PK-race retry) · `state` (new rows are
+`historical`; `staged/active/failed/superseded` exist only in pre-0014 rows) ·
+`payload` jsonb (pre-change content snapshot) · `fingerprint` ·
+`source_version` (rollback provenance) · `actor_user_id` (NO FK — audit survives
+user deletes) · `actor_username` / `note` / `error` · timestamps. Each admin
+write appends one row BEFORE mutating; routing never reads this table.
+
+**`registry_audit`** — every admin-plane attempt INCLUDING gate rejections and
+draft edits: `action / actor_username (denormalized, no FK) / target / ok /
+detail jsonb / created_at`. A rejected write leaves no version row; without this
+table the failed door-knocking would be invisible.
+
+#### 25.5.2 Coherence markers (why a stale corpus cannot serve)
+
+Three layers, each keyed so that staleness is impossible **by construction**:
+
+```
+same process     admin write → invalidate_cache()          (zero round-trips)
+cross process    active_view(): marker SQL over the FOUR live tables —
+                   count(*) || ':' || max(updated_at) per table, joined;
+                   marker unchanged -> cached RegistryLiveView;
+                   marker moved    -> full hydrate + content_fingerprint
+ANN row pool     recall.load_index(): its own 3-table marker keys the
+                   compiled index (corpus1-<sha12> content digest); any
+                   write bumps updated_at -> new marker -> reload
+downstream caches  Matcher compiles its exact dict keyed by the VIEW fingerprint;
+                   the certified action carries funnel_registry_version = that
+                   fingerprint, re-validated before any side effect
+```
+
+`content_fingerprint` addresses CONTENT (`"live1-" + sha256(canonical
+payload)[:12]`, row ids and row_versions excluded) — it says WHAT the corpus
+is, never WHICH rows.
+
+#### 25.5.3 Recall predicates (the enabled chain, in SQL)
+
+Both lanes (pgvector ANN and the in-process cosine fallback) share identical
+predicates. The **Standard** path checks one hop up:
+
+```sql
+WHERE s.enabled AND c.enabled AND c.status = 'active' AND s.embedding IS NOT NULL
+```
+
+The **Similar** path must satisfy the WHOLE transitive chain — the row itself,
+its Standard parent, and the Standard's Capability — via chained JOINs:
+
+```sql
+FROM capability_similar_queries q
+  JOIN capability_standard_queries s ON s.id = q.standard_query_id
+  JOIN capabilities c ON c.capability_id = s.capability_id
+ WHERE q.enabled AND s.enabled AND c.enabled AND c.status = 'active'
+   AND q.embedding IS NOT NULL
+```
+
+i.e. a Similar is recallable **only while its Standard is enabled AND that
+Standard's capability is enabled+active**. Enabled flags are INDEPENDENT
+(ruling 2026-09-26): disabling a Standard neither auto-disables its Similar
+children nor is refused by them — the children simply stop being recallable
+while the parent is off, and still-enabled children resume as soon as the
+Standard is re-enabled.
+
+#### 25.5.4 Write-plane operations (admin API surface)
+
+Capability rows (`store.py`) — corpus NOT patchable here:
+
+* `create_capability(entry)` — insert; duplicate `capability_id` →
+  `RegistryConflictError`.
+* `update_capability(capability_id, patch, expected_row_version)` —
+  `UPDATE … WHERE row_version = expected`; rowcount 0 distinguishes
+  NotFound vs. Conflict (whoever wrote first wins; silent overwrite is
+  structurally impossible); patch keys restricted to
+  `CAPABILITY_PATCH_FIELDS`.
+
+Query rows (`queries.py`, embed-then-write is the ONLY path into the corpus):
+
+| Operation | Gate / order of effects |
+|---|---|
+| `add_standard_query` | derive language → capability must exist → the (capability, language) slot must be FREE (else "edit it instead") → **embed FIRST** → short INSERT of row+vector |
+| `add_similar_query` | derive language → parent Standard exists → derived language **must equal** the Standard's (refused, never auto-fixed) → embed FIRST → INSERT |
+| `update_query_text` | re-derive language → Standard: no sibling holds the new language / Similar: parent still matches → embed FIRST → UPDATE text+vector as ONE unit |
+| `set_query_enabled` | enabling REFUSED while `embedding IS NULL` (no active query without a vector — run backfill); otherwise a pure flag flip — Standard and Similar enabled states are INDEPENDENT (ruling 2026-09-26): disabling a Standard is never refused or cascaded by its Similar children, the Recall chain (§25.5.3) does the rest |
+| `delete_query` | hard delete (sentences are editable assets, not history); Standard with children refused unless `cascade_similar` deletes them in the same transaction |
+| `pending_embeddings` / `store_embedding` | the backfill work list + per-row vector write (`scripts/embed_corpus.py` against the pinned `app_settings.embedding_profile`); filling a vector never changes routing content, so per-row atomicity suffices |
+
+Every successful write: append `registry_versions` history row (pre-change
+content) → mutate → `invalidate_cache()` → append `registry_audit`
+(fire-and-forget — audit must never mask the operation it describes).
+**Rollback** = read a historical payload → rebuild entries via `from_payload`
+(live-table bookkeeping is re-created, not restored) → write back through the
+SAME gate → re-embed against the current profile. History never serves traffic
+directly.
 
 **Extractor roster** (`registry/plugins.py`, ruling 8.1-b): the table registers
 *which* extractor a slot uses; the extractor bodies — the "look at context,
@@ -5198,15 +5361,20 @@ Reason codes carry their stage prefix (8.10; bare `AMBIGUOUS` is banned — it
 collides with `Confidence.AMBIGUOUS`):
 
 ```
-REGISTRY_UNAVAILABLE · RECALL_TIMEOUT · RECALL_UNAVAILABLE
+REGISTRY_UNAVAILABLE · RECALL_TIMEOUT · RECALL_UNAVAILABLE · NO_CANDIDATE
 TOOL_INTENT_REJECT · TOOL_INTENT_UNCERTAIN · TOOL_INTENT_TIMEOUT
 REGISTRY_VERSION_MISMATCH · FUNNEL_KIND_DISABLED
 BIND_MISSING · BIND_AMBIGUOUS · BIND_INVALID · CASCADE_TIMEOUT · CASCADE_ERROR
 ```
 
-(`NO_CANDIDATE` is retired vocabulary — the Action-Contract ruling of 2026-09-25
-removed the empty-set exit; an empty candidate table is answered by the model's
-own `NONE` → `TOOL_INTENT_REJECT`.)
+(`NO_CANDIDATE` is in service again per the ruling of 2026-09-26, superseding
+2026-09-25: an EMPTY model-facing candidate set short-circuits to the Agent at
+`deepest_stage=recall` with NO model hop — it is the honest business result of
+"nothing on the table". The fault/empty split is strict: an empty set that
+Recall executed normally → `NO_CANDIDATE`; ANY recall system fault — no
+embedded corpus, embedder error, embedder/corpus dim mismatch (profile config
+error), un-survivable pgvector failure → `RECALL_UNAVAILABLE` fail-open.
+`TOOL_INTENT_REJECT` now always means the model WAS called and answered `NONE`.)
 
 Any funnel-internal fault ends: original query **byte-identical** → Agent —
 never after a side effect, never polluting conversation state, never dressing
@@ -5275,7 +5443,7 @@ packages/core/application/chat/
     │   │                           #   + kinds + derive_language (frozen language rule)
     │   ├── store.py                #   fingerprint-cached live view + capability-row edits
     │   ├── queries.py              #   corpus writes: embed-then-write atomicity, per row
-    │   ├── catalog.py              #   runtime tool-schema projection over DIRECT_TOOLS
+    │   ├── catalog.py              #   Action Catalog store (admin-editable action rows)
     │   ├── snapshot.py             #   the pure validation gate in front of every write
     │   └── plugins.py              #   §8.1-b extractor roster (PLUGINS) + DirectToolSpec +
     │                               #   DIRECT_TOOLS; the DAG leaf of the funnel
@@ -5383,7 +5551,7 @@ adjudicated and written back into the text above:
 
 ```
 chat_funnel_enabled=False          chat_funnel_timeout_seconds=5.0
-chat_funnel_top_k=3                chat_funnel_min_score=0.82   chat_funnel_margin=0.06
+chat_funnel_min_score=0.82         chat_funnel_margin=0.06
 chat_funnel_private_enabled=False  chat_funnel_web_enabled=False
 chat_matcher_mode="off"            (shadow tri-state, 8.15)
 chat_tool_intent_backend="stub"    chat_tool_intent_min_confidence=0.75
@@ -5392,10 +5560,10 @@ chat_tool_intent_local_mode="prompt_json"
 chat_tool_intent_online_model/_base_url/_api_key=""   chat_tool_intent_timeout_seconds=4.0
 ```
 
-`chat_funnel_min_score` is the Recall **quality gate** (every hit ≥ it is kept —
-no top-k cut inside Recall, live-table ruling); `chat_funnel_top_k` caps only the
-model-facing candidate set (the floor-screened recall-origin slice; matcher
-candidates are exempt). The retired QIR lane's `chat_qir_*` set no longer exists
+`chat_funnel_min_score` is the Recall **quality gate** — every hit ≥ it reaches
+the model (no width cap; `chat_funnel_top_k` is deleted, ruling 2026-09-26) — and
+an EMPTY model-facing set short-circuits to `NO_CANDIDATE` before any hop. The
+retired QIR lane's `chat_qir_*` set no longer exists
 (migration 0014) — this table is the whole routing knob surface, tuned on its own
 merits.
 
@@ -5415,8 +5583,10 @@ workload replay through the production node body, offline threshold buckets
 recomputed from the captured raw lane), plus the control-plane suites of §24
 unchanged. The chain-shape pins that make regressions loud: the recheck second
 hop is gone, a certified turn stamps the Registry **content fingerprint** (the
-legacy index-version stamp is deleted) for TOCTOU, an empty candidate set still
-spends the one model hop, and fail-open returns the
+legacy index-version stamp is deleted) for TOCTOU, an empty candidate set spends
+ZERO model hops (`NO_CANDIDATE` short-circuit), a Recall fault always reports
+`RECALL_UNAVAILABLE` — never a fake-empty `NO_CANDIDATE` — and the executor's
+tool-existence truth is the live `ToolRuntime.schemas()` roster, and fail-open returns the
 *same object* (identity assertion).
 
 [↑ Back to top](#table-of-contents)

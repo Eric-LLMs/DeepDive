@@ -266,9 +266,11 @@ async def update_query_text(table: str, query_id: str, new_query: str, *,
 async def set_query_enabled(table: str, query_id: str, enabled: bool, *,
                             session_factory: Any = None) -> dict:
     """Soft disable/enable. Enabling is REFUSED while the embedding is NULL
-    (no active query without a vector). Disabling a Standard that still has
-    enabled Similar rows is refused too — the Similar would lose its only
-    Capability relation."""
+    (no active query without a vector). Standard and Similar enabled flags are
+    INDEPENDENT (ruling 2026-09-26): disabling a Standard neither auto-disables
+    nor is refused because of its Similar children — recall SQL chains through
+    the parent, so the children simply stop participating until the Standard
+    is re-enabled (then still-enabled children recall again)."""
     if table not in _TABLES:
         raise ValueError(f"unknown table {table!r}")
     factory = _factory(session_factory)
@@ -282,16 +284,6 @@ async def set_query_enabled(table: str, query_id: str, enabled: bool, *,
             raise RegistryConflictError(
                 f"{table} query {query_id!r} has no embedding yet; "
                 "run the backfill before enabling")
-        if (not enabled and table == "standard"
-                and (await session.execute(
-                    select(CapabilitySimilarQueryModel.id).where(
-                        CapabilitySimilarQueryModel.standard_query_id == pk,
-                        CapabilitySimilarQueryModel.enabled.is_(True),
-                    )
-                )).scalar_one_or_none() is not None):
-            raise RegistryConflictError(
-                f"standard query {query_id!r} still has enabled similar rows; "
-                "disable those first")
         row.enabled = bool(enabled)
         row.updated_at = func.now()
         await session.commit()

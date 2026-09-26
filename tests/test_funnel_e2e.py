@@ -50,6 +50,7 @@ from api.routers import chat as chat_mod
 from core.application.chat import understanding as understanding_mod
 from core.application.chat.intent_funnel.contract import (
     REASON_BIND_MISSING,
+    REASON_NO_CANDIDATE,
     REASON_RECALL_TIMEOUT,
     REASON_REGISTRY_UNAVAILABLE,
     REASON_TOOL_INTENT_REJECT,
@@ -202,7 +203,6 @@ def _funnel_gates(monkeypatch, *, mode="on", timeout=5.0, tool_intent_backend="s
     monkeypatch.setattr(settings, "chat_tool_intent_online_api_key", "")
     monkeypatch.setattr(settings, "chat_tool_intent_timeout_seconds", 4.0)
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", timeout)
-    monkeypatch.setattr(settings, "chat_funnel_top_k", 3)
     monkeypatch.setattr(settings, "chat_funnel_min_score", 0.82)
     monkeypatch.setattr(settings, "chat_funnel_margin", 0.06)
     monkeypatch.setattr(settings, "chat_funnel_private_enabled", False)
@@ -291,15 +291,15 @@ async def test_plain_chat_abstains_and_lands_one_production_event(monkeypatch, c
     assert port.requests[-1][-1]["content"] == msg             # 8.10 byte-identical
     trace = _trace(caplog)
     assert _field(trace, "matcher") == "MISS:-"
-    # unconditional Action Detection (ruling 2026-09-25): no candidate is NOT an
-    # exit — the model sees the empty table and answers NONE
-    assert _field(trace, "fallback_reason") == REASON_TOOL_INTENT_REJECT
+    # ruling 2026-09-26: Matcher MISS + no Recall hit >= the gate is an EMPTY
+    # model-facing set — the turn exits honestly at NO_CANDIDATE, no hop spent
+    assert _field(trace, "fallback_reason") == REASON_NO_CANDIDATE
     assert _field(trace, "final_route") == "agent"
     evs = _events(db)
     assert len(evs) == 1                                       # 8.12 one row per route
     ev = evs[0]
     assert ev.execution_mode == "production" and ev.final_route == "agent"
-    assert ev.fallback_reason == REASON_TOOL_INTENT_REJECT
+    assert ev.fallback_reason == REASON_NO_CANDIDATE
     assert ev.session_id                                        # real turn: session stamped
     assert ev.index_version == "corpus1-e2e"
 
@@ -477,13 +477,14 @@ async def test_multi_turn_routing_does_not_leak_state(monkeypatch, caplog):
     assert spy.folders_created == [(str(USER), "季度报告")]
     assert port.steps == 1 and port.requests[-1][-1]["content"] == "换个话题吧"
     assert r2.answer == "Agent took over."
-    assert jd.calls == 2                                        # turn 2 also pays the
-    # unconditional Action check: empty table -> the model answers NONE (REJECT)
+    assert jd.calls == 1                                        # turn 1's hop was the only
+    # spend: turn 2's empty candidate set exits at NO_CANDIDATE before the model
+    # (ruling 2026-09-26) — a no-candidate turn costs zero hops.
     evs = _events(db)
     assert len(evs) == 2                                        # one row per routed turn
     assert evs[0].final_route == "action" and evs[0].capability_id == "cap-folder"
     assert evs[1].final_route == "agent"
-    assert evs[0].fallback_reason == "-" and evs[1].fallback_reason == REASON_TOOL_INTENT_REJECT
+    assert evs[0].fallback_reason == "-" and evs[1].fallback_reason == REASON_NO_CANDIDATE
     assert evs[0].session_id == evs[1].session_id == session
 
 
@@ -533,8 +534,9 @@ async def test_single_hop_spends_exactly_one_tool_intent_call(monkeypatch, caplo
 
 async def test_negated_demand_is_missed_before_certification(monkeypatch, caplog):
     # a negated demand is not one of the curated exact sentences, so the table
-    # misses it on its own; the 8.1-a guard stays as defense in depth. The
-    # empty recall set still reaches the model, which answers NONE (REJECT).
+    # misses it on its own; the 8.1-a guard stays as defense in depth. With the
+    # HIT vetoed and recall empty the set is empty -> NO_CANDIDATE short-circuit
+    # before any hop (ruling 2026-09-26).
     app, port, spy, _db, _emb, _ = _setup(monkeypatch, retire=True)
     caplog.set_level(logging.INFO, logger=FUNNEL_LOGGER)
     res = await sse(app, MSG_NEGATED)
@@ -543,7 +545,7 @@ async def test_negated_demand_is_missed_before_certification(monkeypatch, caplog
     assert port.steps == 1 and port.requests[-1][-1]["content"] == MSG_NEGATED
     trace = _trace(caplog)
     assert _field(trace, "matcher") == "MISS:-"
-    assert _field(trace, "fallback_reason") == REASON_TOOL_INTENT_REJECT
+    assert _field(trace, "fallback_reason") == REASON_NO_CANDIDATE
     assert res.answer == "Agent took over."
 
 

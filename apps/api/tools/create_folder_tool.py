@@ -41,7 +41,8 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
             parameters={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Folder name (single name, no '/')."},
+                    "name": {"type": "string", "maxLength": 120,
+                             "description": "Folder name (single name, no '/')."},
                     "parent_path": {
                         "type": "string",
                         "description": "Optional existing folder path to create it under "

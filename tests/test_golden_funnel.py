@@ -21,7 +21,8 @@ flap is worse than no golden):
   "online", deps.llm = _ScriptedToolIntent): it parses its own card prompt, keeps
   the single-candidate rule, and extracts by quote-stripping — the same
   contract a deployed small model serves, made flap-free. Its scripted NONE on
-  a split card set is the only negative the matrix exercises;
+  a split card set is the only negative that reaches the model; the empty-set
+  negatives exit BEFORE it with NO_CANDIDATE (ruling 2026-09-26, zero calls);
 * every run is pinned ``execution_mode="test"`` (8.14: a batch of goldens must
   never land cost on a user) and the embedder PROVES the pin rode every call.
 
@@ -42,6 +43,7 @@ from core.application.chat.intent_funnel import funnel
 from core.application.chat.intent_funnel.contract import (
     REASON_BIND_MISSING,
     REASON_KIND_DISABLED,
+    REASON_NO_CANDIDATE,
     REASON_TOOL_INTENT_REJECT,
 )
 from core.application.chat.intent_funnel.registry import content_fingerprint
@@ -64,9 +66,12 @@ FUNNEL_LOGGER = "core.application.chat.intent_funnel.funnel"
 GOLDEN_PATH = Path(__file__).parent / "golden" / "intent_funnel_golden.yaml"
 
 # YAML token -> the contract constant actually logged as fallback_reason.
-# FUNNEL_NO_CANDIDATE is retired (ruling 2026-09-25): an empty candidate set
-# now reaches ToolIntentModel, whose NONE lands on FUNNEL_TOOL_INTENT_REJECT.
+# FUNNEL_NO_CANDIDATE is in service (ruling 2026-09-26): an empty candidate
+# set (Matcher MISS + Recall below the gate) short-circuits to the Agent with
+# NO model hop; FUNNEL_TOOL_INTENT_REJECT now means the model was actually
+# called and answered NONE (e.g. the AMBIGUOUS split-pair case).
 FALLBACK_CODES = {
+    "FUNNEL_NO_CANDIDATE": REASON_NO_CANDIDATE,
     "FUNNEL_TOOL_INTENT_REJECT": REASON_TOOL_INTENT_REJECT,
     "FUNNEL_BIND_MISSING": REASON_BIND_MISSING,
     "FUNNEL_KIND_DISABLED": REASON_KIND_DISABLED,
@@ -261,8 +266,8 @@ def _wire(monkeypatch, embedder: _Embedder):
     monkeypatch.setattr(settings, "chat_tool_intent_online_base_url", "")
     monkeypatch.setattr(settings, "chat_tool_intent_online_api_key", "")
     monkeypatch.setattr(settings, "chat_funnel_timeout_seconds", 5.0)
-    # pin the ladder geometry so an env-tweaked default can never flap a golden
-    monkeypatch.setattr(settings, "chat_funnel_top_k", 3)
+    # pin the quality gate so an env-tweaked default can never flap a golden
+    # (the model-facing candidate set is UNCAPPED — ruling 2026-09-26)
     monkeypatch.setattr(settings, "chat_funnel_min_score", 0.82)
     return view, types.SimpleNamespace(
         session_factory=None, embedder=lambda: embedder, llm=_ScriptedToolIntent(),
@@ -337,6 +342,8 @@ async def test_golden_case(monkeypatch, caplog, case):
         assert out is requirements                      # 8.10: byte-identical hand-off
         assert out.requested_action is None
         assert fb_field == FALLBACK_CODES[expect["fallback"]], trace
+        if expect["fallback"] == "FUNNEL_NO_CANDIDATE":
+            assert deps.llm.calls == 0, "the empty set must not spend the hop"
 
     # Whenever the Matcher did NOT certify directly, the cascade went through
     # Recall — which embeds. A golden that silently skipped Recall has changed

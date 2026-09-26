@@ -133,20 +133,25 @@ def agrees(expected: dict, actual: dict) -> bool:
 
 # ── offline threshold buckets (from the RAW capture; no recall re-run) ────────────
 
-def model_set_at(capture: dict, t: float, top_k: int) -> list[str]:
+def model_set_at(capture: dict, t: float, top_k: int | None = None) -> list[str]:
     """Production's model-facing set AT threshold t, recomputed from raw
-    scores: matcher-origin cards are exempt from the floor and the cap;
-    recall cards floor-screen then top_k (the shadow-floor rule in funnel.py)."""
+    scores: matcher-origin cards are exempt from the floor; recall cards are
+    floor-screened and EVERY survivor rides (the width cap was retired by the
+    2026-09-26 ruling; ``top_k`` remains only as an optional offline what-if
+    axis)."""
     recall_c = sorted((c for c in capture.get("recall_raw", [])
                        if c["score"] >= t), key=lambda c: c["score"],
-                      reverse=True)[:top_k]
+                      reverse=True)
+    if top_k is not None:
+        recall_c = recall_c[:top_k]
     ids = {c["capability_id"] for c in capture.get("candidates", [])
            if c["origin"] != "recall"}
     ids.update(c["capability_id"] for c in recall_c)
     return sorted(ids)
 
 
-def bucket_attribution(capture: dict, buckets=BUCKETS, top_k: int = 3) -> dict:
+def bucket_attribution(capture: dict, buckets=BUCKETS,
+                       top_k: int | None = None) -> dict:
     """Per-bucket attribution of the ONE observed model pick: picked cap in
     the bucket's set -> valid; no pick -> no_pick; pick outside the set ->
     unobserved (this turn provides no evidence for that bucket)."""
@@ -204,15 +209,9 @@ async def replay_records(*, version: str = "v1-pilot", limit: int | None = None,
             "matcher": result["matcher"], "tool_intent": result["tool_intent"],
             "total_ms": result["total_ms"],
             "capture": capture,
-            "buckets": bucket_attribution(capture, top_k=_top_k()),
+            "buckets": bucket_attribution(capture),
         })
     return out
-
-
-def _top_k() -> int:
-    from core.config import settings
-
-    return settings.chat_funnel_top_k
 
 
 # module-level, set by main() for the real run; tests pass their own deps via
@@ -381,14 +380,13 @@ def write_run(turns: list[dict], session_rows: list[dict], report: dict, *,
 
     manifest = {
         "run_id": run_id, "dataset_version": version,
-        "shadow_params": dict(SHADOW_RECALL, top_k=_top_k(), buckets=list(BUCKETS)),
+        "shadow_params": dict(SHADOW_RECALL, buckets=list(BUCKETS)),
         "backend_pins": {
             "chat_tool_intent_backend": settings.chat_tool_intent_backend,
             "chat_matcher_mode": getattr(settings, "chat_matcher_mode", None),
         },
         "production_settings_untouched": {
             "chat_funnel_min_score": settings.chat_funnel_min_score,
-            "chat_funnel_top_k": settings.chat_funnel_top_k,
         },
         "timeout_guards": {
             "production_tool_intent_timeout_seconds": 4.0,

@@ -321,7 +321,7 @@ flowchart TB
     end
 
     AUTH --> L0
-    FN -. "ABSTAIN — TOOL_INTENT_REJECT / UNCERTAIN / TIMEOUT ·<br/>BIND_MISSING / AMBIGUOUS / INVALID · REGISTRY / RECALL_UNAVAILABLE ·<br/>VERSION_MISMATCH · KIND_DISABLED · CASCADE_TIMEOUT — byte-identical" .-> AG
+    FN -. "ABSTAIN — NO_CANDIDATE · TOOL_INTENT_REJECT / UNCERTAIN / TIMEOUT ·<br/>BIND_MISSING / AMBIGUOUS / INVALID · REGISTRY / RECALL_UNAVAILABLE ·<br/>VERSION_MISMATCH · KIND_DISABLED · CASCADE_TIMEOUT — byte-identical" .-> AG
 
     subgraph gates["Feature gates (config.py) — ALL default OFF · dark launch"]
         GQ["chat_funnel_enabled (chain master) + per-kind switches<br/>chat_funnel_private/web_enabled<br/>(the legacy chat_qir_* set was deleted with migration 0014)"]
@@ -414,7 +414,7 @@ flowchart TB
             REG["LIVE Registry tables (capabilities + query rows) —<br/>the routing truth, fingerprint-cached; Recall corpus index<br/>loads on the MISS lane<br/>missing ⇒ REGISTRY_UNAVAILABLE / RECALL_UNAVAILABLE"]
             M["Node 1 · Matcher — EXACT-only over the live query corpus<br/>(enabled Standard + Similar rows; patterns/aliases are inert<br/>legacy storage, never read — ruling 2026-09-25)<br/>negation guard before certifying (common layer)<br/>HIT · MISS · MATCH_AMBIGUOUS (one sentence under two<br/>caps — all claimants up)"]
             R["Node 2 · Recall — TWO independent vector searches<br/>(Standard + Similar rows, ONE query embedding)<br/>every hit ≥ min_score kept with provenance — quality gate,<br/>no merge/dedup, never adjudicates (origin=recall)"]
-            CAND["ONE candidate set, one convergence point<br/>matcher_hit 1.0 · matcher_ambiguous 0.0 ride alongside<br/>recall (floor-screened, capped at top_k) · empty set STILL<br/>reaches the model — NO_CANDIDATE retired (2026-09-25)"]
+            CAND["ONE candidate set, one convergence point<br/>matcher_hit 1.0 · matcher_ambiguous 0.0 ride alongside<br/>recall (every hit ≥ min_score — no width cap) · EMPTY set<br/>short-circuits to NO_CANDIDATE, zero model hops (2026-09-26)"]
             TI["Node 3 · ToolIntentModel — at most ONE model call:<br/>select capability AND draft arguments<br/>chat_tool_intent_backend picks the chain:<br/>auto = local → online → stub (Unavailable falls through)<br/>stub = margin rules, NO model, NO extraction<br/>(arguments None ⇒ schema'd turns exit BIND_MISSING)"]
             B["Node 4 · Binder.validate — pure schema gate<br/>Registry canonical parameters · extracts nothing<br/>COMPLETE / MISSING / AMBIGUOUS / INVALID<br/>(non-COMPLETE exits straight to the Agent, BIND_*)"]
             REG --> M
@@ -439,7 +439,7 @@ flowchart TB
     subgraph exits["Fail-open exits — reason codes carry the stage prefix"]
         direction LR
         AG["Agent fallback — ReactLoopAgent, full autonomy<br/>original query BYTE-IDENTICAL · never a<br/>side effect precedes the fallback"]
-        REASONS["REGISTRY_UNAVAILABLE · RECALL_TIMEOUT /<br/>UNAVAILABLE · TOOL_INTENT_REJECT / UNCERTAIN / TIMEOUT ·<br/>REGISTRY_VERSION_MISMATCH · FUNNEL_KIND_DISABLED ·<br/>BIND_MISSING / AMBIGUOUS / INVALID ·<br/>CASCADE_TIMEOUT / CASCADE_ERROR"]
+        REASONS["REGISTRY_UNAVAILABLE · RECALL_TIMEOUT /<br/>UNAVAILABLE · NO_CANDIDATE (empty set, zero hops) ·<br/>TOOL_INTENT_REJECT / UNCERTAIN / TIMEOUT ·<br/>REGISTRY_VERSION_MISMATCH · FUNNEL_KIND_DISABLED ·<br/>BIND_MISSING / AMBIGUOUS / INVALID ·<br/>CASCADE_TIMEOUT / CASCADE_ERROR"]
         REASONS -.- AG
     end
     GATE2 -- "REJECT / UNCERTAIN" --> AG

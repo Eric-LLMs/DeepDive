@@ -29,6 +29,7 @@ from core.application.chat.intent_funnel.contract import (
     BIND_MISSING,
     MATCH_HIT,
     REASON_BIND_MISSING,
+    REASON_NO_CANDIDATE,
     REASON_RECALL_TIMEOUT,
     REASON_RECALL_UNAVAILABLE,
     REASON_REGISTRY_UNAVAILABLE,
@@ -828,8 +829,10 @@ def test_prompt_defensively_replaces_leaked_regex_literal(caplog):
 
 
 def test_prompt_empty_candidate_set_is_explicit_not_silent():
-    # the unconditional-Action-Detection contract needs the model to SEE that
-    # the table offered nothing — an honest empty line, never an empty section.
+    # defensive reachability: since ruling 2026-09-26 the funnel short-circuits
+    # an empty set BEFORE the hop, so build_prompt only sees () if a caller
+    # bypasses that guard — the prompt must still say so honestly, never render
+    # an empty section.
     p = jbase.build_prompt("随便聊聊", (), {})
     assert "Candidates:\n\n(none registered for this turn)" in p
     assert "<user_sentence>随便聊聊</user_sentence>" in p
@@ -985,10 +988,10 @@ async def test_registry_unavailable_fails_open(monkeypatch, caplog):
     assert "deepest_stage=registry" in line and "final_route=agent" in line
 
 
-async def test_index_unavailable_and_empty_set_still_reaches_model(monkeypatch, caplog):
-    """Action Detection is unconditional (ruling 2026-09-25): no index is a
-    fault (RECALL_UNAVAILABLE), but an EMPTY candidate set is not — the model
-    must still see the turn and answer NONE; NO_CANDIDATE is never produced."""
+async def test_index_unavailable_is_fault_empty_set_is_business(monkeypatch, caplog):
+    """Ruling 2026-09-26: a missing index is a FAULT (RECALL_UNAVAILABLE);
+    an EMPTY candidate set is a normal business result — it short-circuits to
+    the Agent at deepest_stage=recall and the one model hop is NOT spent."""
     _open(monkeypatch)
     req = _req()
     _, deps = _wire(monkeypatch, view=_view(CAP), index=None,
@@ -1005,10 +1008,43 @@ async def test_index_unavailable_and_empty_set_still_reaches_model(monkeypatch, 
     with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
         assert await funnel.route(_ctx("随便聊聊"), deps=deps, requirements=req) is req
     line = caplog.records[-1].getMessage()
-    assert f"fallback_reason={REASON_TOOL_INTENT_REJECT}" in line
+    assert f"fallback_reason={REASON_NO_CANDIDATE}" in line
+    assert "deepest_stage=recall" in line and "tool_intent=-" in line
+    assert llm.prompts == []                        # the hop was NOT spent
+
+
+async def test_recall_faults_report_unavailable_never_fake_empty(monkeypatch, caplog):
+    """Ruling 2026-09-26 (point 2): a system fault in recall — embedder error
+    or embedder/corpus DIM mismatch (profile config error) — must report
+    RECALL_UNAVAILABLE, never the business-result NO_CANDIDATE; no hop spent."""
+    _open(monkeypatch)
+    req = _req()
+    idx = _index([("cap-a", [MSG], [[1.0, 0.0]])])
+
+    boom_emb = _Embedder([1.0, 0.0], fail=True)
+    _, deps = _wire(monkeypatch, view=_view(CAP), index=idx,
+                    embedder=boom_emb, llm=_LLM())
+    with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
+        assert await funnel.route(_ctx("随便聊聊"), deps=deps, requirements=req) is req
+    line = next(r.getMessage() for r in caplog.records if "funnel_trace" in r.getMessage())
+    assert f"fallback_reason={REASON_RECALL_UNAVAILABLE}" in line
     assert "NO_CANDIDATE" not in line
-    assert len(llm.prompts) == 1                      # the model WAS called…
-    assert "(none registered for this turn)" in llm.prompts[0]  # …on an empty card set
+    assert deps.llm.prompts == []
+
+    # dim mismatch: 2-d query vector vs 3-d corpus row — a profile/dim config
+    # fault, not a silent truncation that would fake its way to an empty set.
+    wide_idx = _index([("cap-a", [MSG], [[1.0, 0.0, 0.0]])])
+    llm = _LLM()
+    _, deps = _wire(monkeypatch, view=_view(CAP), index=wide_idx,
+                    embedder=_Embedder([1.0, 0.0]), llm=llm)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
+        assert await funnel.route(_ctx("随便聊聊"), deps=deps, requirements=req) is req
+    line = next(r.getMessage() for r in caplog.records if "funnel_trace" in r.getMessage())
+    assert f"fallback_reason={REASON_RECALL_UNAVAILABLE}" in line
+    assert "dim mismatch" in "\n".join(
+        r.getMessage() for r in caplog.records if "fail-open" in r.getMessage())
+    assert llm.prompts == []
 
 
 async def test_matcher_hit_single_hop_certifies(monkeypatch, caplog):
@@ -1197,8 +1233,9 @@ async def _view_ok():
 async def test_negated_matcher_hit_is_forced_to_miss(monkeypatch, caplog):
     _open(monkeypatch, mode="on")
     # the corpus itself contains the negated sentence: an exact HIT WOULD fire —
-    # only the 8.1-a guard can veto it. Then the empty recall lane still must
-    # reach the model (unconditional Action Detection), which answers NONE.
+    # only the 8.1-a guard can veto it. With the HIT vetoed and recall empty,
+    # the model-facing set is empty -> NO_CANDIDATE short-circuit (ruling
+    # 2026-09-26); the hop is never spent on a turn with no card to select.
     view = _view([_entry("cap-a", corpus=("不要新建文件夹",))])
     llm = _LLM([{"capability_id": "NONE"}])
     _, deps = _wire(monkeypatch, view=view, index=_index([]),
@@ -1209,8 +1246,8 @@ async def test_negated_matcher_hit_is_forced_to_miss(monkeypatch, caplog):
     assert out is req
     line = next(r.getMessage() for r in caplog.records if "funnel_trace" in r.getMessage())
     assert "matcher=MISS" in line
-    assert f"fallback_reason={REASON_TOOL_INTENT_REJECT}" in line
-    assert len(llm.prompts) == 1 and "(none registered for this turn)" in llm.prompts[0]
+    assert f"fallback_reason={REASON_NO_CANDIDATE}" in line
+    assert llm.prompts == []
 
 
 async def test_ambiguous_carries_all_candidates_into_the_one_call(monkeypatch):

@@ -472,17 +472,30 @@ async def test_enable_refused_while_vector_missing():
                                   session_factory=factory(s))
 
 
-async def test_disable_standard_with_enabled_similar_children_refused():
+async def test_disable_standard_is_independent_of_enabled_similar_children():
+    """Ruling 2026-09-26: Standard/Similar enabled flags are independent. A
+    Standard with an enabled Similar child disables cleanly; the child's own
+    flag is untouched (recall SQL chains through the parent, so the child
+    merely stops participating until the Standard is re-enabled)."""
     row = SimpleNamespace(id="x", embedding=[0.1], enabled=True)
+    kid = SimpleNamespace(id="kid", enabled=True)
     qid = "00000000-0000-0000-0000-000000000002"
     s = FakeSession(
         get_map={(reg_store.CapabilityStandardQueryModel, UUID(qid)): row},
-        results=[_Result(scalar="kid")],  # an enabled Similar still hangs off it
     )
-    with pytest.raises(reg.RegistryConflictError, match="enabled similar rows"):
-        await q.set_query_enabled("standard", qid, False,
-                                  session_factory=factory(s))
-    assert s.commits == 0
+    out = await q.set_query_enabled("standard", qid, False,
+                                    session_factory=factory(s))
+    assert out == {"id": qid, "enabled": False}
+    assert row.enabled is False and s.commits == 1
+    assert kid.enabled is True                     # no cascade onto the child
+    # and re-enabling the Standard is a plain flag flip (embedding present)
+    s2 = FakeSession(
+        get_map={(reg_store.CapabilityStandardQueryModel, UUID(qid)): row},
+    )
+    out2 = await q.set_query_enabled("standard", qid, True,
+                                     session_factory=factory(s2))
+    assert out2 == {"id": qid, "enabled": True}
+    assert row.enabled is True and s2.commits == 1
 
 
 async def test_delete_standard_with_children_needs_cascade():
