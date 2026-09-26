@@ -4593,7 +4593,14 @@ consult it — a capability whose `tool_binding` is not in the roster is
 **rejected at the validation gate** (the funnel cannot invent executables), and
 the roster is never mirrored into a second allowlist. The legacy L0
 `DIRECT_TOOLS` table survives only as the L0 certification/extractor binding
-lane; it is not consulted by any existence/schema check.
+lane; it is not consulted by any existence/schema check. Gate ORDER encodes the
+C1/C2 split: tool EXISTENCE on the roster is checked before the argument schema
+gate — a certified turn naming a tool the runtime does not register is a system
+promise the system cannot keep (C2 terminal, seam never entered), while a
+malformed ARGUMENT shape is user input (C1, escalate and let the Agent
+clarify). Per-length bounds live in the tool schemas themselves (e.g.
+`create_folder.name maxLength 120`): with the roster as the single truth, a
+bound the executable does not state does not exist.
 
 **Commit Point.** The first user-visible content delta locks the channel. `EscalateToAgent` is
 legal only before it; after it an error can only terminate the stream with a standardized event —
@@ -4958,7 +4965,7 @@ point**. Four principles:
 ```
 Matcher HIT ──┐
               ├─→ ToolIntentModel (ONE call: select + extract) → Binder (validate) → Runtime → Tool
-Recall top-k ─┘                          └── REJECT / UNCERTAIN / no verdict ─────────────→ Agent
+Recall ≥ gate ┘     empty set ⇒ NO_CANDIDATE (zero hops); non-COMPLETE ⇒ Agent
 ```
 
 The funnel's one orchestrator entry is `funnel.route(ctx, deps, requirements)`,
@@ -5107,7 +5114,15 @@ Agent turn, no deploy.
 #### 25.5.1 Live-table schema reference (migration 0014)
 
 Six tables carry the whole Registry. The first four ARE the runtime truth; the
-last two are history the runtime never reads.
+last two are history the runtime never reads. Two companion tables complete the
+intent-management plane — `action_catalog` (inventory, §25.5.5) and
+`chat_funnel_events` (telemetry, §25.8.1). Three invariants bind the plane
+together: the corpus is ONE table-set shared by the exact Matcher and the
+vector Recall; tool existence/schema truth is the live `ToolRuntime.schemas()`
+roster at every checkpoint (write gate, executor schema gate, TOCTOU — the
+roster is never mirrored into a second allowlist); and 入表≠开闸 — an `enabled`
+row only participates once its per-kind switch and the funnel gate are also
+open.
 
 **`capabilities`** — one row per capability (intent information, no corpus):
 
@@ -5174,6 +5189,25 @@ write appends one row BEFORE mutating; routing never reads this table.
 draft edits: `action / actor_username (denormalized, no FK) / target / ok /
 detail jsonb / created_at`. A rejected write leaves no version row; without this
 table the failed door-knocking would be invisible.
+
+Column-level summary of the runtime corpus tables (the two vector lanes):
+
+```
+capability_standard_queries          capability_similar_queries
+  id                    uuid PK        id                    uuid PK
+  capability_id  FK→capabilities       standard_query_id FK→standard  (NO capability_id — A3)
+  query                 text           query                 text
+  language     CHECK zh|en (derived)   language  CHECK zh|en = parent's (derived)
+  embedding vector(1024) NULLable      embedding vector(1024) NULLable
+  enabled / position                   enabled / position
+  created_at / updated_at              created_at / updated_at
+  UNIQUE(capability_id, language)      idx standard_query_id (btree)
+  HNSW embedding vector_cosine_ops     HNSW embedding vector_cosine_ops
+```
+
+A NULL `embedding` is honestly invisible to recall (every predicate filters
+`IS NOT NULL`) — the chain reports `RECALL_UNAVAILABLE` rather than pretend an
+un-embedded corpus is an empty result set.
 
 #### 25.5.2 Coherence markers (why a stale corpus cannot serve)
 
@@ -5268,6 +5302,28 @@ every node, deliberately NOT table data — the configuration table is meant to 
 read and edited by humans, and logic that cannot be honestly tabulated is not
 stuffed into it; what a node cannot decide escalates, and the model layers
 bottom out.
+
+#### 25.5.5 Action Catalog — inventory, never routing (`action_catalog`, migration 0011)
+
+The Action Universe: every USER-FACING action that exists in the system.
+Deliberately separate from `capabilities` — catalog membership is INVENTORY;
+an action becomes routable only by an explicit register → validate → live-corpus
+sequence. The admin console derives each action's live route by a READ-TIME
+join on `capabilities.tool_binding`, so no second truth can drift.
+
+| Column | Type / constraint | Meaning |
+|---|---|---|
+| `action_key` | text PK | stable user-facing identity |
+| `display_name` / `description` | text | console presentation |
+| `tool_binding` | text NOT NULL | the executable it runs on; joining-capability lookup keys off it |
+| `route` | text default `agent` | declared product route (`agent` \| `fast` \| …) — a DISPLAY fact; enforcement stays in the kind gates |
+| `implementation_ref` | text | pointer into the codebase for operators |
+| `status` | text default `user_facing` | `user_facing` \| `deprecated` — no hard delete (8.6 doctrine) |
+| `created_at` / `updated_at` | timestamptz | |
+
+Creating a capability from a Catalog entry copies `tool_binding`/description
+into the new `capabilities` row; the entry's corpus is then edited exclusively
+through the live query plane (§25.5.4).
 
 ### 25.6 ToolIntentModel — Backends, Wire Discipline & Output Adapters
 
@@ -5424,6 +5480,32 @@ Matcher → Recall → ToolIntentModel → Binder → final route — and receiv
 trace as a verdict. Executing nothing is structural: the chain only produces
 routing metadata, `run_tool` is not on the preview object graph at all, and
 usage lands `execution_mode=preview`.
+
+#### 25.8.1 `chat_funnel_events` — the persisted trace (telemetry, not history)
+
+One row per route decision, mirroring the `funnel_trace` log line 1:1:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | uuid PK | |
+| `execution_mode` | text default `production` | `production` \| `shadow` \| `preview` \| `test` (8.14) — separates real turns from dark runs |
+| `user_id` / `session_id` | uuid / text, **no FK** | events survive user/session deletes (same doctrine as `registry_audit`) |
+| `deepest_stage` | text default `registry` | how far the cascade got (`registry` \| `matcher` \| `recall` \| `tool_intent` \| `binder`) |
+| `matcher` | text NULL | HIT/MISS/AMBIGUOUS card state |
+| `recall_count` / `recall_top` | int / text | candidate volume + best score (threshold tuning panel) |
+| `tool_intent` | text NULL | verdict; `-` when the NO_CANDIDATE short-circuit skipped the hop entirely |
+| `final_route` | text default `agent` | where the turn actually went |
+| `fallback_reason` | text NULL | the reason code (§25.7) — faults and business results never share one |
+| `registry_version` | text NULL | content fingerprint of the certified corpus |
+| `index_version` | text NULL | ANN corpus digest (`corpus1-<sha12>`) |
+| `capability_id` | text NULL | certified winner, if any |
+| `total_ms` | int | wall-clock of the cascade |
+| `trace_json` | jsonb NULL | Phase-6 dark capture (`chat_funnel_trace_capture`): rebuilt candidate-card summary + query + verdict — never the full prompt (that stays in the log tooling) |
+| `created_at` | timestamptz; indexed with `execution_mode` | |
+
+Nothing in the request path reads this table back and the write is
+**best-effort** — a DB fault must never sink a turn. The raw query text is
+deliberately NOT stored (8.12 privacy line).
 
 ### 25.9 Repository Structure (implemented)
 
