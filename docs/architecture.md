@@ -5040,7 +5040,8 @@ Cascade body (`_run_nodes`, one wall-clock budget `chat_funnel_timeout_seconds`)
    **two independent vector searches** (Standard rows + Similar rows) against
    ONE query embedding. Its contract is the RAW stage: no per-capability merge,
    no dedup, every hit ≥ `chat_funnel_min_score` is KEPT with per-row
-   provenance (quality gate, not a selector; no width cap — `chat_funnel_top_k`
+   provenance (quality gate, not a selector; ANN pool is an internal retrieval
+   width, not a final model-candidate/top-k limit — `chat_funnel_top_k`
    is deleted, ruling 2026-09-26). `User Original Query → query-level raw hits`.
 4. **Capability Candidate Aggregation** (between Raw Recall and the model,
    final semantics 2026-09-26): the query-level hits are grouped by
