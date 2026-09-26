@@ -4963,10 +4963,42 @@ point**. Four principles:
 ### 25.4 The Active Chain
 
 ```
-Matcher HIT ──┐
-              ├─→ ToolIntentModel (ONE call: select + extract) → Binder (validate) → Runtime → Tool
-Recall ≥ gate ┘     empty set ⇒ NO_CANDIDATE (zero hops); non-COMPLETE ⇒ Agent
+                         User Original Query
+                                ↓
+                            Matcher (exact-only)
+              ┌─────────────────┴──────────────────┐
+        Exact HIT                          MISS / AMBIGUOUS
+              ↓                                     ↓
+              │                          Recall index load
+              │                          (None/fault ⇒ RECALL_UNAVAILABLE → Agent)
+              │                                     ↓
+              │                             Raw Recall
+              │                     (every hit ≥ gate, per-query provenance,
+              │                       no capability dedup at this stage)
+              │                                     ↓
+              │                    Capability Candidate Aggregation
+              │                  (ONE candidate per capability_id:
+              │                    score = max of its raw hits,
+              │                    winning hit's provenance rides)
+              └─────────────────┬──────────────────┘
+                                ↓
+                ToolIntentModel (at most ONE call per turn —
+             non-empty candidate set ⇒ exactly one hop; empty set ⇒
+                  NO_CANDIDATE, zero calls, straight to Agent)
+              judgment on the User Original Query + argument extraction
+                 ┌──────────────┴───────────────┐
+              NONE / UNCERTAIN              CONFIDENT
+                 ↓                              ↓
+              Agent                 Action/Capability + Extracted Arguments
+                                                ↓
+                                   Binder (validate) → Runtime → Tool
 ```
+
+Both lanes converge on the SAME ToolIntentModel hop: an exact HIT is not an
+execution permit (chain ruling 2026-09-24) — it still rides the one model call
+because the hop owns **argument extraction**. What an exact HIT wins is
+independence from Recall: it never calls `recall.load_index()` and cannot be
+vetoed by an unembedded or faulting corpus (final-semantics ruling 2026-09-26).
 
 The funnel's one orchestrator entry is `funnel.route(ctx, deps, requirements)`,
 called by the turn orchestrator inside plan resolution (§24). It is
@@ -4986,59 +5018,89 @@ per-kind gate in §25.11.
 
 Cascade body (`_run_nodes`, one wall-clock budget `chat_funnel_timeout_seconds`):
 
-1. **Registry + Index first** (live tables ARE the runtime truth, §25.5): read the
-   fingerprint-cached live view; no capability rows → `REGISTRY_UNAVAILABLE` exit.
-   On a Matcher MISS the Recall corpus index loads; an empty/unembedded corpus or
-   any Recall system fault (embedder error, embedder/corpus dim mismatch, a
-   pgvector failure the in-process lane cannot survive either) →
-   `RECALL_UNAVAILABLE` exit — faults and business results never share a reason
-   code (ruling 2026-09-26).
-   (A HIT skips Recall but still spends the model call.)
+1. **Registry first** (live tables ARE the runtime truth, §25.5): read the
+   fingerprint-cached live view; no capability rows → `REGISTRY_UNAVAILABLE`
+   exit. The Recall index is NOT loaded here — it is a MISS/AMBIGUOUS-lane
+   dependency only (step 3).
 2. **Matcher** (Node 1): **exact-only** normalized lookup over the enabled
    Standard + Similar query rows (`intent_corpus`); the legacy `patterns`/`aliases`
    columns are INERT storage — the Matcher never reads them (Action-Contract ruling
    2026-09-25). Lookup index cached keyed by the content fingerprint alone — a
    swapped view is a different cache key by construction. The negation
-   guard applies *before* a HIT can certify. States: `HIT` (one capability),
+   guard applies *before* a HIT can certify (a negated HIT is forced to MISS and
+   flows into the Recall lane). States: `HIT` (one capability),
    `MISS`, `MATCH_AMBIGUOUS` (one curated sentence claimed by TWO capabilities —
    the only ambiguity exact matching can produce; carries ALL candidate ids
    upward — the Matcher never picks).
-3. **One candidate set, one convergence point**: a HIT enters the model with the
-   same semantics as a Recall lane (`origin="matcher_hit"`, score 1.0); AMBIGUOUS
-   escalates all claimants (`origin="matcher_ambiguous"`, score 0.0). Recall
-   (Node 2) runs only when the table missed: **two independent vector searches**
-   (Standard rows + Similar rows) against ONE query embedding — no per-capability
-   merge, no dedup; every hit ≥ `chat_funnel_min_score` is KEPT with provenance
-   (quality gate, not a selector; no width cap — `chat_funnel_top_k` is deleted,
-   ruling 2026-09-26). An EMPTY model-facing candidate set short-circuits to the
-   Agent as `NO_CANDIDATE` BEFORE any model hop (ruling 2026-09-26, superseding
-   2026-09-25): with no Matcher card and no Recall hit at/above the gate there is
-   nothing to select from and the hop is not spent; `TOOL_INTENT_REJECT` now
-   always means the model WAS called and answered `NONE`. The legacy
-   direct-certification special path (Matcher HIT skipping the model) is deleted
-   — every lane that reaches the model is structurally identical, one model
-   call each.
-4. **ToolIntentModel** (Node 3, `tool_intent/`): the ONE model call of the turn
-   selects the capability *and* drafts its arguments. Verdict gate
+3. **Recall lane** (Node 2 — only on MISS/AMBIGUOUS): the corpus index loads
+   now; index `None` (corpus not embedded) or any Recall system fault (embedder
+   error, embedder/corpus dim mismatch, a pgvector failure the in-process lane
+   cannot survive either) → `RECALL_UNAVAILABLE` exit — faults and business
+   results never share a reason code (ruling 2026-09-26). Recall itself is
+   **two independent vector searches** (Standard rows + Similar rows) against
+   ONE query embedding. Its contract is the RAW stage: no per-capability merge,
+   no dedup, every hit ≥ `chat_funnel_min_score` is KEPT with per-row
+   provenance (quality gate, not a selector; no width cap — `chat_funnel_top_k`
+   is deleted, ruling 2026-09-26). `User Original Query → query-level raw hits`.
+4. **Capability Candidate Aggregation** (between Raw Recall and the model,
+   final semantics 2026-09-26): the query-level hits are grouped by
+   `capability_id` and collapsed to **ONE capability-level Candidate per
+   capability** — score = the highest similarity among that capability's raw
+   hits, and the winning hit's own provenance (matched_example, query_id, kind,
+   language) rides. Matcher seeds (HIT 1.0 / AMBIGUOUS 0.0) join the same
+   grouping; ties keep the earlier arrival. The Raw ruling above is *not*
+   narrowed: it scopes to the raw stage; this aggregation is its own, later
+   stage. No top_k, nothing dropped per capability. Telemetry shape:
+   `capture["recall_raw"]` always records the FULL raw hit list (aggregation
+   never overwrites it — the offline threshold sweep recomputes from it), while
+   `capture["candidates"]` records the aggregated, capability-level
+   model-facing set. `query-level raw hits → capability-level candidates`.
+5. **One candidate set, one convergence point**: both lanes hand the model a
+   sorted candidate list — a HIT rides as `origin="matcher_hit"` (score 1.0,
+   table evidence shown as a label, not a calibrated cosine), AMBIGUOUS
+   escalates all claimants (`origin="matcher_ambiguous", score 0.0`). An EMPTY
+   model-facing candidate set short-circuits to the Agent as `NO_CANDIDATE`
+   BEFORE any model hop (ruling 2026-09-26, superseding 2026-09-25): with no
+   Matcher card and no Recall hit at/above the gate there is nothing to select
+   from and the hop is not spent; `TOOL_INTENT_REJECT` now always means the
+   model WAS called and answered `NONE`. The legacy direct-certification
+   special path (Matcher HIT skipping the model) is deleted — every lane that
+   reaches the model is structurally identical, one model call each.
+6. **ToolIntentModel** (Node 3, `tool_intent/`): the ONE model call of the
+   turn. Its inputs are the **User Original Query** plus, per capability-level
+   candidate, the capability's action information — bound tool
+   (`tool_binding`), capability/tool description, the canonical parameter
+   schema, curated query examples and negatives — and the Recall
+   score/provenance ONLY as candidate evidence. The judgment it makes is:
+   *"is the user's original sentence itself a request for this Action — and if
+   so, extract that Action's arguments from the original query / current turn
+   context per the parameter schema."* It is explicitly NOT: deciding the
+   Action from the matched corpus sentence, from `matched_example`, or from a
+   Recall score (the SYSTEM prompt pins this: "Card evidence and recall scores
+   are candidate PROVENANCE, never proof of action"). It never executes
+   anything (§8.8). No candidate truly fits the original sentence → `NONE` →
+   the byte-identical turn goes to the Agent; a confirmed Action →
+   `CONFIDENT(capability_id, arguments)` → Binder → Runtime. Verdict gate
    (`_verdict_from_reply`): `NONE`/empty → `REJECT`; a capability **outside the
    candidate set** → `UNCERTAIN` (off-card invention is never a verdict);
    confidence below `chat_tool_intent_min_confidence` → `UNCERTAIN`; else
    `CONFIDENT` with the argument draft. Anything but CONFIDENT exits to the
    Agent (`TOOL_INTENT_REJECT` / `TOOL_INTENT_UNCERTAIN` / `TOOL_INTENT_TIMEOUT`).
    Backend ladder and wire disciplines: §25.6.
-5. **Binder** (Node 4, `binder/`): `validate(entry, arguments)` against the
+7. **Binder** (Node 4, `binder/`): `validate(entry, arguments)` against the
    Registry's **canonical parameter schema** — pure validation, the Binder
    extracts nothing on the active path. Non-COMPLETE states exit straight to the
    Agent with the `BIND_*` reason (§8.7 as amended by the chain ruling); a
    capability the active table no longer honors → `REGISTRY_VERSION_MISMATCH`;
    a kind not switched on → `FUNNEL_KIND_DISABLED`.
-6. **Certified turn**: a *new* `TurnRequirements` carrying
+8. **Certified turn**: a *new* `TurnRequirements` carrying
    `requested_action = {tool, args, capability_id, funnel_registry_version (= view
    fingerprint, the executor's TOCTOU stamp), funnel_stage, funnel_kind}` —
    the live-table ruling deleted the legacy index-version `registry_version`
    stamp: the Registry content fingerprint is the ONE routing namespace. Same
    construction shape the legacy ACTION branches use, so executors and the
-   governance waterfall are untouched.
+   governance waterfall are untouched. On the HIT lane no index was ever
+   loaded, so the trace/event honestly record `index_version = "-"`.
 
 **Session object vocabulary**: the only conversation objects are a file
 explicitly open in the main-window viewer (say "summarize this page" and it
@@ -5359,7 +5421,7 @@ every backend, so providers are interchangeable above this module.
 
 **Local output disciplines** (`chat_tool_intent_local_mode`) — the Adapter
 normalizes whatever the model emits into the ONE internal reply shape
-`{capability_id, confidence, arguments}`; the verdict gate (§25.4 step 4) and
+`{capability_id, confidence, arguments}`; the verdict gate (§25.4 step 6) and
 the Binder stay the sole correctness owners either way — an off-card id is
 still `UNCERTAIN`, never an auto-pass:
 
