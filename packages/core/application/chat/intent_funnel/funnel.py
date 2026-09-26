@@ -368,6 +368,20 @@ async def cascade_shadow(ctx, *, deps, requirements=None,
     return result
 
 
+def _aggregate_by_capability(candidates: list[Candidate]) -> list[Candidate]:
+    """Collapse query-level candidates to ONE per capability_id: the highest-
+    scoring hit rides with ITS own provenance; ties keep the earlier arrival
+    (matcher seed first). Raw Recall keeps every >= threshold hit — this stage
+    sits strictly between the raw assembly and ToolIntentModel, so the model
+    only ever sees capability-level cards."""
+    best: dict[str, Candidate] = {}
+    for c in candidates:
+        cur = best.get(c.capability_id)
+        if cur is None or c.score > cur.score:
+            best[c.capability_id] = c
+    return list(best.values())
+
+
 async def _run_nodes(ctx, deps, requirements, trace, *,
                      recall_min_score: float | None = None,
                      model_candidate_floor: float | None = None,
@@ -384,7 +398,7 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
     message = ctx.body.message or ""
     facts = TurnFacts.of(ctx)
 
-    # ── Registry + Recall index (both read the LIVE tables, fingerprint-cached) ─
+    # ── Registry (reads the LIVE table, fingerprint-cached) ──────────────────────
     view = await registry_active_view(session_factory=deps.session_factory)
     if view is None or not view.entries:
         trace["fallback"] = REASON_REGISTRY_UNAVAILABLE  # no capabilities in the table yet
@@ -394,18 +408,14 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
         e.capability_id: e for e in view.entries
         if e.enabled and e.status == STATUS_ACTIVE
     }
-    # The index is loaded even for the HIT lane: a Registry whose corpus is not
-    # embedded yet cannot serve Recall on the next turn, so the cascade fails
-    # open honestly now (RECALL_UNAVAILABLE) rather than half-routed.
-    trace["stage"] = "recall"
-    index = await recall.load_index(deps.session_factory)
-    if index is None:
-        trace["fallback"] = REASON_RECALL_UNAVAILABLE  # corpus not embedded yet
-        return None
-    trace["index"] = index.version
 
     # ── Node 1: Matcher (table-only; the negation guard applies BEFORE it ───────
     # can certify anything, ruling 8.1-a) ────────────────────────────────────────
+    # E2 (final semantics 2026-09-26): the HIT lane NEVER touches the Recall
+    # index — exact table evidence certifies independently of Recall
+    # availability. load_index lives in the MISS/AMBIGUOUS branch below, so an
+    # index fault or an unembedded corpus can only ever degrade the Recall lane
+    # (RECALL_UNAVAILABLE there, unchanged).
     mres = matcher.match(message, facts, view)
     if mres.state != MATCH_MISS and guardrails.negated(message):
         mres = matcher.MatchResult(state=MATCH_MISS, registry_version=mres.registry_version)
@@ -420,9 +430,12 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
     # ── One candidate set, ONE convergence point: a HIT enters ToolIntentModel with the ─
     # same semantics as a Recall lane — the direct-certification special path is
     # deleted (chain ruling 2026-09-24). Recall runs only when the table missed.
-    # Live-table ruling 2026-09-26: every recall hit >= threshold is kept AS IS
-    # (no MAX/AVG, no per-capability dedup) — the same capability may legitimately
-    # arrive several times through different sentences.
+    # Live-table ruling 2026-09-26 (RAW lane): every recall hit >= threshold is
+    # kept AS IS at the raw stage — no MAX/AVG, no per-capability dedup THERE —
+    # a capability may legitimately arrive several times through different
+    # sentences. The no-dedup ruling scopes to Raw Recall only: the Capability
+    # Candidate Aggregation below (Raw Recall -> ToolIntentModel) then collapses
+    # the raw hits into ONE capability-level candidate per capability_id.
     candidates: list[Candidate] = []
     if mres.state == MATCH_AMBIGUOUS:
         for cid in mres.candidates:
@@ -433,14 +446,22 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
             origin="matcher_hit", query_kind="standard",
         ))
     if mres.state != MATCH_HIT:
+        # E2: Recall availability is ONLY a MISS/AMBIGUOUS-lane dependency.
+        trace["stage"] = "recall"
+        index = await recall.load_index(deps.session_factory)
+        if index is None:
+            trace["fallback"] = REASON_RECALL_UNAVAILABLE  # corpus not embedded yet
+            return None
+        trace["index"] = index.version
         rres = await recall.recall(
             index, message, embedder=deps.embedder(),
             min_score=(settings.chat_funnel_min_score if recall_min_score is None
                        else recall_min_score),
         )
         if capture is not None:
-            # the RAW lane: every candidate recall scored, pre any floor — the
-            # offline threshold sweep recomputes buckets from THIS list (Phase E).
+            # the RAW lane: every candidate recall scored, pre any floor AND pre
+            # aggregation — the offline threshold sweep recomputes buckets from
+            # THIS list (Phase E); aggregation must never overwrite it.
             capture["recall_raw"] = [
                 {"capability_id": c.capability_id, "score": c.score,
                  "origin": c.origin, "matched_example": c.matched_example,
@@ -453,7 +474,16 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
     if candidates:
         top = max(candidates, key=lambda c: c.score)
         trace["recall_top"] = f"{top.capability_id}@{top.score:.3f}"
-    cands = sorted(candidates, key=lambda c: c.score, reverse=True)
+    # ── Capability Candidate Aggregation (final semantics 2026-09-26) ──────────
+    # Between Raw Recall and ToolIntentModel: group the query-level candidates
+    # by capability_id and keep ONE candidate per capability — the highest-
+    # scoring hit rides, carrying ITS provenance (matched_example, query_id,
+    # kind, language); on a tie the earlier-arriving card wins (matcher seed
+    # first, then hits in descending order). The model therefore sees
+    # capability-level cards: summary .94/.91/.89 + mindmap .86 arrive as
+    # summary .94 + mindmap .86.
+    cands = sorted(_aggregate_by_capability(candidates),
+                   key=lambda c: c.score, reverse=True)
     if capture is not None:
         capture["candidates"] = [
             {"capability_id": c.capability_id, "score": c.score, "origin": c.origin,
@@ -465,9 +495,12 @@ async def _run_nodes(ctx, deps, requirements, trace, *,
     if model_candidate_floor is not None:
         # Phase-E shadow seam: the raw lane moved the quality gate out of
         # recall so ALL threshold buckets are recomputable offline; the
-        # model-facing set here re-applies the floor and keeps EVERY hit at or
-        # above it (candidate-count cap retired by the 2026-09-26 ruling),
-        # plus every matcher-origin card (HIT 1.0 / AMBIGUOUS 0.0: table
+        # model-facing set here re-applies the floor to the aggregated
+        # (capability-level) cards and keeps every capability whose WINNING
+        # hit is at or above it — set-equivalent to screening the raw hits,
+        # since the representative carries the max score (candidate-count cap
+        # retired by the 2026-09-26 ruling) — plus every matcher-origin card
+        # (HIT 1.0 / AMBIGUOUS 0.0: table
         # evidence, not calibrated cosine scores, exempt from the floor).
         recall_c = [c for c in cands if c.origin == "recall"
                     and c.score >= model_candidate_floor]

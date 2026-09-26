@@ -169,6 +169,56 @@ async def test_shadow_lane_keeps_raw_scores_and_floors_the_model_set(wired):
 
 
 @pytest.mark.asyncio
+async def test_aggregation_collapses_hits_but_recall_raw_stays_raw(wired, monkeypatch):
+    """E1 (final semantics 2026-09-26): the Capability Candidate Aggregation sits
+    AFTER the raw capture — capture["recall_raw"] keeps EVERY >= gate hit
+    (cap-add-term arrives twice), while the model-facing set carries ONE
+    capability-level card per capability: the winning hit's score AND
+    provenance ride, the losing duplicate is gone, the offline sweep is
+    unaffected."""
+    dup_rows = [
+        SimpleNamespace(kind="standard", query_id="add-hi",
+                        capability_id="cap-add-term", query="ex-hi", language="en",
+                        standard_query_id=None,
+                        vector=(0.95, math.sqrt(1 - 0.95 ** 2))),
+        SimpleNamespace(kind="standard", query_id="add-lo",
+                        capability_id="cap-add-term", query="ex-lo", language="en",
+                        standard_query_id=None,
+                        vector=(0.90, math.sqrt(1 - 0.90 ** 2))),
+        SimpleNamespace(kind="standard", query_id="fold-1",
+                        capability_id="cap-create-folder", query="ex one",
+                        language="en", standard_query_id=None,
+                        vector=(0.60, math.sqrt(1 - 0.60 ** 2))),
+    ]
+    dup_index = SimpleNamespace(version="ix-dup", corpus=tuple(dup_rows))
+
+    async def fake_load(session_factory):
+        return dup_index
+
+    monkeypatch.setattr(recall_mod, "load_index", fake_load)
+    llm = _LLM({"cap": {"capability_id": "cap-add-term", "confidence": 0.9,
+                        "arguments": {"term": "keystone", "domain": "工程"}}})
+    ctx = R.ctx_for("把 keystone 加入工程词汇库", None, session_bound=False)
+    trace = funnel._new_trace()
+    capture: dict = {}
+    out = await funnel._run_cascade(ctx, _deps(llm), _req(), trace,
+                                    recall_min_score=0.5, capture=capture)
+    assert out is not None and out.requested_action["capability_id"] == "cap-add-term"
+    # raw capture: untouched by aggregation — BOTH cap-add-term hits ride
+    raw = [(c["capability_id"], c["score"], c["matched_example"])
+           for c in capture["recall_raw"]]
+    assert raw.count(("cap-add-term", 0.95, "ex-hi")) == 1
+    assert raw.count(("cap-add-term", 0.9, "ex-lo")) == 1
+    assert trace["recall_count"] == 3            # the raw count, pre aggregation
+    # model-facing set: capability-level — one cap-add-term card at the WIN
+    add = [c for c in capture["candidates"] if c["capability_id"] == "cap-add-term"]
+    assert len(add) == 1 and add[0]["score"] == 0.95 and add[0]["matched_example"] == "ex-hi"
+    prompt = llm.calls[0]["prompt"]
+    assert prompt.count("### cap-add-term") == 1     # 0.90 duplicate collapsed
+    assert "ex-lo" not in prompt                    # loser provenance is gone
+
+
+@pytest.mark.asyncio
 async def test_shadow_abstains_never_dispatches_never_persists(wired):
     """A REJECT verdict is an Agent exit with metadata only — no would_execute."""
     llm = _LLM({"今天天气": {"capability_id": "NONE"}})

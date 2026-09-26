@@ -177,7 +177,9 @@ async def test_preview_certifies_and_reports_the_whole_chain(monkeypatch):
     assert res["deepest_stage"] == "certified"
     assert res["execution_mode"] == "preview"
     assert res["registry_version"] == view.fingerprint
-    assert res["index_version"] == "corpus1-test"
+    # E2 (final semantics 2026-09-26): an exact HIT never touches the Recall
+    # index — the HIT-lane preview/report carries NO index version.
+    assert res["index_version"] == "-"
     assert res["route"]["capability_id"] == "cap-a"
     assert res["route"]["tool"] == "create_folder"
     assert res["route"]["args"] == {"name": "季度报告"}
@@ -284,7 +286,10 @@ async def test_certified_turn_writes_production_event(monkeypatch):
     assert ev.execution_mode == "production"
     assert ev.final_route == "action" and ev.capability_id == "cap-a"
     assert ev.session_id == "s-1"
-    assert ev.registry_version == view.fingerprint and ev.index_version == "corpus1-test"
+    assert ev.registry_version == view.fingerprint
+    # E2: this certified turn rode the HIT lane — no Recall index was loaded,
+    # so the event row honestly records no index version.
+    assert ev.index_version == "-"
     assert ev.total_ms >= 0
 
 

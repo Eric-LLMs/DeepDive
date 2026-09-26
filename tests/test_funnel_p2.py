@@ -991,13 +991,15 @@ async def test_registry_unavailable_fails_open(monkeypatch, caplog):
 async def test_index_unavailable_is_fault_empty_set_is_business(monkeypatch, caplog):
     """Ruling 2026-09-26: a missing index is a FAULT (RECALL_UNAVAILABLE);
     an EMPTY candidate set is a normal business result — it short-circuits to
-    the Agent at deepest_stage=recall and the one model hop is NOT spent."""
+    the Agent at deepest_stage=recall and the one model hop is NOT spent.
+    E2 (final semantics): only the MISS/AMBIGUOUS lane depends on the index,
+    so both legs run on a non-corpus sentence."""
     _open(monkeypatch)
     req = _req()
     _, deps = _wire(monkeypatch, view=_view(CAP), index=None,
                     embedder=_Embedder([1, 0]), llm=_LLM())
     with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
-        assert await funnel.route(_ctx(MSG), deps=deps, requirements=req) is req
+        assert await funnel.route(_ctx("随便聊聊"), deps=deps, requirements=req) is req
     assert f"fallback_reason={REASON_RECALL_UNAVAILABLE}" in caplog.records[-1].getMessage()
 
     empty_idx = _index([])
@@ -1218,8 +1220,10 @@ async def test_cascade_timeout_is_attributed_to_its_stage(monkeypatch, caplog):
     deps = types.SimpleNamespace(session_factory=None,
                                  embedder=lambda: _Embedder([1.0, 0.0]), llm=_LLM())
     req = _req()
+    # E2: the HIT lane never loads the index, so the recall-stage timeout can
+    # only be reached by a MISS — a HIT here would skip slow_load entirely.
     with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
-        out = await funnel.route(_ctx(MSG), deps=deps, requirements=req)
+        out = await funnel.route(_ctx("随便聊聊"), deps=deps, requirements=req)
     assert out is req
     line = next(r.getMessage() for r in caplog.records if "funnel_trace" in r.getMessage())
     assert f"fallback_reason={REASON_RECALL_TIMEOUT}" in line
@@ -1265,3 +1269,74 @@ async def test_ambiguous_carries_all_candidates_into_the_one_call(monkeypatch):
     assert "evidence: exact standard-query match (table; several candidates)" in llm.prompts[0]
     assert out.requested_action["capability_id"] == "cap-b"
     assert out.requested_action["args"] == {"term": "季度汇总", "domain": "财务"}
+
+
+# ═══════════ E1/E2 — final semantics landing (2026-09-26 audit) ═════════════════
+
+
+def test_aggregate_by_capability_keeps_the_winning_candidate():
+    """E1 unit: ONE capability-level candidate per capability_id — the highest-
+    scoring hit rides WITH ITS OWN provenance; ties keep the earlier arrival
+    (the matcher seed is seeded first, so table evidence wins a tie); distinct
+    capabilities are all preserved (no top_k, no dropping)."""
+    from core.application.chat.intent_funnel.funnel import _aggregate_by_capability
+
+    low = Candidate("cap-a", 0.89, matched_example="低", query_id="q2")
+    win = Candidate("cap-a", 0.94, matched_example="高", query_id="q1")
+    other = Candidate("cap-b", 0.86, matched_example="图", query_id="q3")
+    amb = Candidate("cap-a", 0.0, origin="matcher_ambiguous")
+    out = _aggregate_by_capability([amb, low, win, other])
+    assert len(out) == 2                       # summary x3 + mindmap -> summary + mindmap
+    assert out[0] is win and out[1] is other   # max rides with its provenance
+    t1 = Candidate("cap-a", 0.90, matched_example="先")
+    t2 = Candidate("cap-a", 0.90, matched_example="后")
+    assert _aggregate_by_capability([t1, t2])[0] is t1
+
+
+async def test_capability_aggregation_collapses_duplicate_hits_into_one_card(monkeypatch):
+    """E1 integration: Raw Recall keeps every >= threshold hit (pinned at the
+    recall node above), but the model-facing list is capability-level — cap-a
+    arrives twice (cos 1.000 + 0.981), the prompt carries ONE cap-a card at the
+    WINNING score/provenance, and cap-b is untouched."""
+    _open(monkeypatch)
+    llm = _LLM([{"capability_id": "cap-a", "confidence": 0.9,
+                 "arguments": {"name": "季度报告"}}])
+    idx = _index([("cap-a", ["近a", "远b"], [[1.0, 0.0], [1.0, 0.2]]),
+                  ("cap-b", ["加个词"], [[1.0, 0.4]])])
+    view = _view([_entry("cap-a", examples=("做个事",), parameters=_NAME_SCHEMA),
+                  _entry("cap-b", tool="add_term", examples=("写个词",),
+                         parameters=_TERM_SCHEMA)])
+    _, deps = _wire(monkeypatch, view=view, index=idx,
+                    embedder=_Embedder([1.0, 0.0]), llm=llm)
+    out = await funnel.route(_ctx("随便聊聊"), deps=deps, requirements=_req())
+    prompt = llm.prompts[0]
+    assert len(llm.prompts) == 1
+    assert prompt.count("### cap-a") == 1        # 1.000 + 0.981 collapsed to one
+    assert prompt.count("### cap-b") == 1        # the different capability survives
+    assert "score=1.000" in prompt and "score=0.981" not in prompt
+    assert "近a" in prompt and "远b" not in prompt  # winning provenance rides alone
+    assert out.requested_action["capability_id"] == "cap-a"
+
+
+async def test_matcher_hit_never_touches_the_recall_index(monkeypatch, caplog):
+    """E2 (final semantics): an exact HIT certifies INDEPENDENTLY of Recall
+    availability — the HIT lane never calls load_index, so an unembedded or
+    faulting corpus can never veto a table-proven turn. The MISS lane keeps
+    the RECALL_UNAVAILABLE semantics (pinned above)."""
+    _open(monkeypatch)
+    llm = _LLM([{"capability_id": "cap-a", "confidence": 0.95,
+                 "arguments": {"name": "季度报告"}}])
+    _, deps = _wire(monkeypatch, view=_view(CAP), index=None,
+                    embedder=_Embedder([1.0, 0.0]), llm=llm)
+
+    async def boom_load(sf):
+        raise AssertionError("E2: the HIT lane must never load the Recall index")
+
+    monkeypatch.setattr(
+        "core.application.chat.intent_funnel.recall.load_index", boom_load)
+    with caplog.at_level(logging.INFO, logger="core.application.chat.intent_funnel"):
+        out = await funnel.route(_ctx(MSG), deps=deps, requirements=_req())
+    assert out.requested_action["capability_id"] == "cap-a"
+    assert len(llm.prompts) == 1
+    line = next(r.getMessage() for r in caplog.records if "funnel_trace" in r.getMessage())
+    assert "index_version=-" in line and "final_route=action" in line
