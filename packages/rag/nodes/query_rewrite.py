@@ -28,6 +28,13 @@ class QueryRewriteNode(Node):
 
     async def run(self, ctx, deps) -> NodeStatus:
         query = ctx.request.query
+        # Chat fast lane (RagRequest.opts {"llm": False}): passthrough the raw query,
+        # zero LLM. Chosen at the call site, never per-request by the model.
+        if (ctx.request.opts or {}).get("llm") is False:
+            ctx.set("variants", [query])
+            ctx.set("hyde_doc", None)
+            ctx.set_out("query_rewrite", {"queries": [query], "hyde": False, "skipped": "chat_lane"})
+            return NodeStatus.OK
         if deps.llm is None:
             ctx.set("variants", [query])
             ctx.set("hyde_doc", None)

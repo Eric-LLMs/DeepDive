@@ -40,6 +40,27 @@ request_execution_mode: ContextVar[str] = ContextVar(
     "request_execution_mode", default=BILLABLE_MODE
 )
 
+# ── RAG lane ─────────────────────────────────────────────────────────────────────
+# Which retrieval lane this request's rag_search tool takes. Set ONCE by the /chat
+# entry point; the worker / research agent / admin never set it, so their context
+# keeps the default full lane (query rewrite + CRAG judge). This is still a
+# compile-time distinction — the value is written by OUR router code at request
+# entry, never by a model-generated argument.
+request_rag_fast_lane: ContextVar[bool] = ContextVar("request_rag_fast_lane", default=False)
+
+
+def get_rag_fast_lane() -> bool:
+    """True when the current request's context pinned the chat fast lane."""
+    return request_rag_fast_lane.get()
+
+
+def set_rag_fast_lane(on: bool) -> Token:
+    return request_rag_fast_lane.set(bool(on))
+
+
+def reset_rag_fast_lane(token: Token) -> None:
+    request_rag_fast_lane.reset(token)
+
 
 def get_request_user_id() -> uuid.UUID | None:
     """Return the current request's user id, or ``None`` for a guest / no request."""

@@ -61,12 +61,24 @@ class RAGPipeline:
         result = await self._run(query, top_k, filters)
         return result["hits"]
 
+    async def retrieve_chat(self, query: str, top_k: int = 5, filters: dict | None = None) -> list[dict]:
+        """Chat fast lane: the same node graph with the LLM stages short-circuited.
+
+        This is a COMPILE-TIME lane — only the chat tool's call site uses it. Research
+        (worker direct seam + research agent tool), the admin console and the staged
+        fast-RAG executor keep :meth:`retrieve` (query rewrite / CRAG judge included);
+        recall + fusion + rerank stay identical in both lanes.
+        """
+        result = await self._run(query, top_k, filters, opts={"llm": False})
+        return result["hits"]
+
     async def trace(self, query: str, top_k: int = 5, filters: dict | None = None) -> dict:
         """Run the pipeline and return hits + per-node trace + errors (admin console)."""
         return await self._run(query, top_k, filters)
 
-    async def _run(self, query: str, top_k: int, filters: dict | None) -> dict:
-        ctx = PipelineContext(RagRequest(query=query, top_k=top_k, filters=filters))
+    async def _run(self, query: str, top_k: int, filters: dict | None,
+                   opts: dict | None = None) -> dict:
+        ctx = PipelineContext(RagRequest(query=query, top_k=top_k, filters=filters, opts=opts))
 
         nodes = self.config.enabled_nodes
         i = 0

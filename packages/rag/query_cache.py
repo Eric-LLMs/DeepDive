@@ -69,10 +69,41 @@ class CachedRetriever:
         self._inner = retriever
         self._ttl = ttl_seconds
 
-    def _key(self, query: str, top_k: int, filters: dict | None) -> str:
-        payload = [query, top_k, filters or {}, config_version()]
+    def _key(self, query: str, top_k: int, filters: dict | None, lane: str = "") -> str:
+        payload = [lane, query, top_k, filters or {}, config_version()]
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
         return f"rag:qc:{digest}"
+
+    async def retrieve_chat(self, query: str, top_k: int = 5, filters: dict | None = None) -> list[dict]:
+        """Chat fast lane passthrough with its OWN cache namespace.
+
+        Fast-lane hits differ in quality (no rewrite / no CRAG judge) so they must
+        never serve — or be served by — the full-lane cache entries. An inner
+        retriever without ``retrieve_chat`` (gRPC client, test doubles) degrades to
+        its full ``retrieve`` rather than failing the turn.
+        """
+        inner_chat = getattr(self._inner, "retrieve_chat", None)
+        if inner_chat is None:
+            return await self._inner.retrieve(query, top_k, filters)
+        redis = _redis()
+        if redis is None:
+            return await inner_chat(query, top_k, filters)
+        base_key = self._key(query, top_k, filters, lane="chat")
+        try:
+            version = await redis.get(_CORPUS_VERSION_KEY) or "0"
+            raw = await redis.get(f"{base_key}:{version}")
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            logger.warning("rag query cache read failed", exc_info=True)
+        hits = await inner_chat(query, top_k, filters)
+        try:
+            await redis.setex(
+                f"{base_key}:{version}", self._ttl, json.dumps(hits, ensure_ascii=False, default=str)
+            )
+        except Exception:
+            logger.warning("rag query cache write failed", exc_info=True)
+        return hits
 
     async def retrieve(self, query: str, top_k: int = 5, filters: dict | None = None) -> list[dict]:
         redis = _redis()

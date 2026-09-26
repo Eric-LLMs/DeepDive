@@ -23,6 +23,11 @@ class RagRequest:
     # scoping) and, when domain filtering is enabled, ``domain_id`` are honored by the
     # recall nodes.
     filters: dict | None = None
+    # Per-request execution options set ONLY by compile-time call sites that need a
+    # cheaper lane. ``{"llm": False}`` short-circuits the LLM stages (query_rewrite /
+    # crg_check) to passthrough; ``None`` — every existing caller — runs the full
+    # pipeline unchanged.
+    opts: dict | None = None
 
 
 @dataclass

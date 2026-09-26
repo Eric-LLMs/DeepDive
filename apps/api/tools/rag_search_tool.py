@@ -5,7 +5,7 @@ import json
 import logging
 
 from agent import Context, ToolExecution, ToolOutput, ToolRuntime, define_tool, text_block
-from core.infrastructure.request_context import get_request_user_id
+from core.infrastructure.request_context import get_request_user_id, get_rag_fast_lane
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,14 @@ def register(runtime: ToolRuntime, ctx: Context, llm) -> None:
         if args.get("domain"):
             filters["domain_id"] = str(args["domain"])
         try:
+            # Lane fork (compile-time: /chat pins it at request entry, worker/admin
+            # never do). Chat = fast lane (no LLM rewrite/CRAG, ~0.5s); research agent
+            # & every other context = the original full retrieve(). hasattr keeps
+            # test doubles / the gRPC client (no chat lane yet) on the safe full path.
+            if get_rag_fast_lane() and hasattr(retriever, "retrieve_chat"):
+                return await retriever.retrieve_chat(
+                    args.get("query", ""), args.get("top_k", 5), filters
+                )
             return await retriever.retrieve(
                 args.get("query", ""), args.get("top_k", 5), filters
             )

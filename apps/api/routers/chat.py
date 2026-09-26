@@ -88,6 +88,7 @@ from core.infrastructure.memory import SessionMemoryStore
 from core.infrastructure.request_context import (
     set_request_llm_channel,
     set_request_user,
+    set_rag_fast_lane,
 )
 from core.infrastructure.security import authorize_usage, get_role
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -217,6 +218,10 @@ async def _resolve_identity(request: Request, body: ChatRequest, user: AuthUser 
     # default client — one turn, one channel, host and worker alike. The SSE generator runs
     # later in the request's captured context, so setting it here covers every tool call.
     set_request_llm_channel((model, base_url or None, api_key or None))
+    # Chat lane: rag_search takes the fast lane (no LLM rewrite / CRAG judge) for
+    # this request's context. Written by OUR entry code, not by the model; the worker
+    # and admin contexts never pin it and keep the full lane.
+    set_rag_fast_lane(True)
     return {
         "user_id": user_id, "guest_token": guest_token, "log_user": log_user,
         "tier": tier, "notice": notice, "model": model,

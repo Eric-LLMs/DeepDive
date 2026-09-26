@@ -15,7 +15,7 @@ class ToolPermission(Enum):
 
     READ = "read"        # read-only access (files, search, lookup) — the session default
     WRITE = "write"      # mutating access (edit_file, save, delete, side effects)
-    NETWORK = "network"  # external I/O (bash network calls, web_search, HTTP)
+    NETWORK = "network"  # external I/O (bash network calls, search_social, HTTP)
 
 
 PERMISSION_ALL = frozenset(p for p in ToolPermission)

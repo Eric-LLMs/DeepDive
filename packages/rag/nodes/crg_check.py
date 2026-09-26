@@ -66,6 +66,10 @@ class CrgCheckNode(Node):
             return NodeStatus.SKIP
         if deps.llm is None:
             return NodeStatus.SKIP
+        # Chat fast lane: no judge call, hits pass through unjudged (same posture as
+        # an LLM-less deployment, which also SKIPs rather than dropping).
+        if (ctx.request.opts or {}).get("llm") is False:
+            return NodeStatus.SKIP
 
         max_chars = int(self.params.get("max_evidence_chars", 800))
         evidence = "\n".join(h.text[:max_chars] for h in hits[:3])

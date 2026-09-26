@@ -6,9 +6,11 @@ These prove the Fail-Closed / honesty contracts the charter names:
     the Agent is never entered);
   * empty recall / an irrelevant verdict / a seam error escalate to the Agent, and the
     honest-retrieval note rides ONLY a branch that actually searched the corpus;
-  * the escalated Agent stays fenced by the ORIGINAL request's source policy — a
-    ``private_only`` turn's ``web_search`` is HARD-DENIED by the sandbox (beating both
-    ``grant`` and ALLOW rules), so a retrieval failure never silently widens to the web.
+  * the escalated Agent inherits the ORIGINAL request's source policy. Since the
+    2026-09-26 operator ruling web_search is READ-classed (never pops an approval), so
+    the fence (which HARD-DENYs the NETWORK class) no longer stops it — pinned below as
+    the accepted opt-out; the fence mechanism itself stays covered for NETWORK tools in
+    tests/test_chat_source_policy.py and tests/test_sandbox_research.py.
 """
 from __future__ import annotations
 
@@ -79,27 +81,27 @@ async def test_rag_seam_error_escalates_fail_closed(monkeypatch):
     assert res.answer == "Agent fallback."
 
 
-async def test_escalated_turn_is_fenced_by_original_private_only_policy(monkeypatch):
-    """THE crown-jewel fence (commit b3c0311): a private_only turn whose retrieval is
-    empty escalates to the Agent, but the ORIGINAL policy keeps HARD-DENYing NETWORK —
-    so the Agent's web_search never executes, even with WRITE/NETWORK granted."""
+async def test_escalated_private_only_turn_runs_web_search_by_ruling(monkeypatch):
+    """Operator ruling 2026-09-26 (replaces the b3c0311 crown-jewel expectation): web_search
+    is READ-classed so Chat never pops an approval for it; the knowingly-accepted
+    consequence is that the private_only / private_first HARD DENY — which fences the
+    NETWORK class — no longer stops it. A fenced, escalated turn therefore DOES reach the
+    web. The fence mechanism itself remains pinned for real NETWORK tools in
+    tests/test_chat_source_policy.py / tests/test_sandbox_research.py."""
     port = ScriptedPort(steps=[
         {"content": [], "tool_calls": [{"name": "web_search",
                                         "arguments": {"query": "gradient descent"}}]},
         AGENT_STEP,
     ])
     spy = Spy()
-    # Grant NETWORK to prove the fence BEATS grant; seam empty forces escalation.
-    kernel, _, _, broker = build_kernel(
-        monkeypatch, port, spy, grant=[ToolPermission.NETWORK, ToolPermission.WRITE],
-    )
+    kernel, _, _, broker = build_kernel(monkeypatch, port, spy)
     _gate(monkeypatch, retrieval=True)
     monkeypatch.setattr(settings, "chat_fast_paths_enabled", True, raising=False)
     app = build_app(monkeypatch, port, FakeSeam([]), kernel, broker)
     msg = "answer only from my knowledge base, no web: what is gradient descent"
     res = await sse(app, msg)
-    assert spy.web_queries == []                        # provider.search NEVER called
-    assert port.steps >= 1                              # the Agent did take the turn
+    assert spy.web_queries == ["gradient descent"]      # READ-classed: fence does not stop it
+    assert port.steps >= 1                              # the Agent took the turn
     assert res.types[-1] == "done"
 
 
